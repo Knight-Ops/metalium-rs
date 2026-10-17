@@ -3,7 +3,7 @@
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile": **the matmuls' bandwidth**. Written 2026-10-16 against
 `5ef99ca` plus the row-scatter work (`step189`). Status (2026-10-16): **P0-P2 done** (a 1.7B decode step
 57.21 / 59.64 / 62.81 -> 49.78 / 52.27 / 55.44 ms; matmuls 33.8 -> 26.3 ms a step); **P3 done** (47.90 / 50.37 /
-53.53 ms; matmuls 24.0 ms). The fused `gate|up` reads at ~490 GB/s, GDDR's ceiling; the narrow products on 64 units
+53.53 ms; matmuls 24.0 ms). The fused `gate|up` was taken to read at ~490 GB/s, GDDR's ceiling (counted, 367: [decode-step-bandwidth.md](decode-step-bandwidth.md) B0); the narrow products on 64 units
 (`o`, `down`) at ~300 GB/s, bound by what the in-flight cap lets a unit hold (next, "What is left").
 
 ## Why this item
@@ -196,7 +196,8 @@ the rest is entries. Next:
   - **Profile `1792162257`:**
     - `qkv` 180 us, against three products of 74 (37 us of it unit 0 waiting at the barrier: 192 columns go 2 to
       72 units and 1 to 48);
-    - `gate|up` 426 us, against two of 241: ~490 GB/s card-wide, the ceiling;
+    - `gate|up` 426 us, against two of 241: ~490 GB/s card-wide, the ceiling. **Refuted by the byte count**
+      ([decode-step-bandwidth.md](decode-step-bandwidth.md) B0): 155 MB in 428 us, 367 GB/s;
     - all products 26.32 -> 24.01 ms a step.
   - **Program cache:** 157.2 KB of 240 KB.
 
@@ -212,7 +213,8 @@ the rest is entries. Next:
   - **Next:** the probe P0 planned (a unit's `B` stream alone, `READ_RUN`, on 64 and 120 units, and with the
     columns spread over channels), then a placement that spreads a job's `B` tiles if channels are the bound.
 - `qkv`'s uneven last round (2 and 1 columns).
-- `A` read again by every job (~70 KB a job, thin).
+- `A` read again by every job (~70 KB a job, thin). A unit's later rounds are
+  [decode-step-bandwidth.md](decode-step-bandwidth.md) B1; every unit reading it once is that plan's B2 (G7).
 
 The original P3 items, done as above (`step188` not rerun: `step191` covers the 135M checkpoint fused):
 
@@ -226,9 +228,11 @@ The original P3 items, done as above (`step188` not rerun: `step191` covers the 
 
 ### P5. Why a narrow product's unit reads ~9 GB/s (open; next session)
 
-After P3 the products are 24.0 of a 47.5 ms 1.7B step (`1792162257`): `gate|up` reads at ~490 GB/s, but `o` (74 us)
+After P3 the products are 24.0 of a 47.5 ms 1.7B step (`1792162257`): `gate|up` reads at 367 GB/s (byte count, decode-step-bandwidth B0; ~490 was estimated), and `o` (74 us)
 and `down` (268 us), on 64 units, move ~300 GB/s, and `qkv` (120 units) ~330. GDDR's ceiling for the step's ~9.5
 GB of products is ~19.8 ms, the weights' alone ~14.3. The in-flight cap is ruled out (P3, "What is left").
+
+**Refuted (2026-10-17, [decode-to-bandwidth.md](decode-to-bandwidth.md) Phase 0, `silicon_probe_decode_stream`):** dealt a column a unit, a weight's stream alone reads at 446-458 GB/s on 64 units, ~7% below consecutive tiles (485-489). The products' gap is `A`'s reads, the kernel tail and the deal, not channels. The original hypothesis, kept:
 
 **The leading hypothesis: one channel a column.** Tile `t` of a tensor is on channel `t % 8` (`Placement::slot`)
 and tile `(kk, j)` is `t = kk ct + j`, so with `ct % 8 == 0` (every decode weight: 64, 256, 1536 tile columns) a

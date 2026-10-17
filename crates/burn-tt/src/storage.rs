@@ -76,6 +76,7 @@ impl TtTensor {
                 plain: Default::default(),
             }),
             transposed: src.transposed,
+            generation: 0,
         };
         Self::on_device(dram, input.shape(), DType::F32, input.device)
     }

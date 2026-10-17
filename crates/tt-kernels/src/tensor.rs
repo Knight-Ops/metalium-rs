@@ -1230,8 +1230,23 @@ pub fn matmul_dram(
         allow_mop,
         pipeline,
         None,
-        true,
+        Reads {
+            thin: true,
+            resident_a: false,
+        },
     )
+}
+
+/// How a GDDR matmul reads `A` ([`matmul_dram_limited`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Reads {
+    /// `A`'s last tile row is read as only its [`thin_rows`] (off, whole tiles: the output's
+    /// padding rows are then what `A`'s held).
+    pub thin: bool,
+    /// A unit's later blocks of the same `A` rows do not read it again
+    /// ([`record::GATHER_A_RESIDENT`]): with `K` whole under [`Staging::Slots`], `A` is at the
+    /// same slots for every block.
+    pub resident_a: bool,
 }
 
 /// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
@@ -1245,9 +1260,7 @@ pub fn thin_rows(m: usize, a_transposed: bool) -> u32 {
     }
 }
 
-/// [`matmul_dram`] with `K` blocked to at most `max_k_tiles`, and `thin`: whether
-/// `A`'s last tile row is read as only its [`thin_rows`] (off, whole tiles: the
-/// output's padding rows are then what `A`'s held).
+/// [`matmul_dram`] with `K` blocked to at most `max_k_tiles`, reading `A` as `reads` says.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_dram_limited(
     alloc: &mut DramAlloc,
@@ -1261,7 +1274,7 @@ pub(crate) fn matmul_dram_limited(
     allow_mop: bool,
     pipeline: bool,
     max_k_tiles: Option<std::num::NonZeroUsize>,
-    thin: bool,
+    reads: Reads,
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -1315,7 +1328,12 @@ pub(crate) fn matmul_dram_limited(
         route,
         fidelity,
         allow_mop,
-        thin: if thin { thin_rows(m, a_transposed) } else { 0 },
+        thin: if reads.thin {
+            thin_rows(m, a_transposed)
+        } else {
+            0
+        },
+        resident_a: reads.resident_a && staging == Staging::Slots,
         col_runs,
     };
     if let Err(e) = plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed]) {
@@ -1338,6 +1356,10 @@ struct BlockPlan {
     allow_mop: bool,
     /// [`thin_rows`] of `op(A)`, set on the gathers of its last tile row.
     thin: u32,
+    /// Mark a block [`record::GATHER_A_RESIDENT`] when its unit's previous block of the same
+    /// `push_jobs` read the same `A` rows to the same slots. Only under [`Staging::Slots`]:
+    /// [`Staging::SlotsHalf`] moves `A` between halves.
+    resident_a: bool,
     /// The output's columns, one run a job in dealing order, when [`thin_runs`]
     /// deals them (instead of `block`'s width).
     col_runs: Option<Vec<std::ops::Range<usize>>>,
@@ -1390,6 +1412,9 @@ impl BlockPlan {
         let [mc, nc] = self.block;
         let (units, staging) = (self.units, self.staging);
         let (in_fmt, out_fmt) = self.route.formats();
+        // Per unit, the `A` rows and slots its last block here read: a session deals job `j` to
+        // unit `j % units`, and a unit runs its jobs in order with nothing between them.
+        let mut last_a: Vec<Option<(usize, usize, u64)>> = vec![None; units.max(1)];
         let col_blocks: Vec<(usize, usize)> = match &self.col_runs {
             Some(runs) => runs.iter().map(|r| (r.start, r.len())).collect(),
             None => (0..nt)
@@ -1418,10 +1443,19 @@ impl BlockPlan {
                     init,
                 } = layout;
                 let thin = if i0 + rows == mt { self.thin } else { 0 };
+                let unit = jobs.len() % units.max(1);
+                let resident =
+                    self.resident_a && half.is_none() && last_a[unit] == Some((i0, rows, a_at));
+                last_a[unit] = Some((i0, rows, a_at));
                 let flags = u32::from(a_transposed)
                     | u32::from(b_transposed) << 1
                     | record::gather_rows(thin)
-                    | (kt as u32) << 8;
+                    | (kt as u32) << 8
+                    | if resident {
+                        record::GATHER_A_RESIDENT
+                    } else {
+                        0
+                    };
                 let gather = [
                     [
                         record::GATHER,
@@ -1826,6 +1860,7 @@ pub(crate) fn matmul_dram_batched_limited(
         // Whole tiles: attention's products are not the decode weights' reads
         // (decode-matmul-bandwidth P1), and their padding claims stay as they were.
         thin: 0,
+        resident_a: false,
         col_runs: None,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
@@ -2175,6 +2210,7 @@ pub fn sfpu_eltwise_blocks(
     let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind))?;
     let [rt, ct] = a.grid();
     let ro = out.tensor_ref();
+    let rows = eltwise_rows(op.kind, a.rows);
     // Pipelined (checklist 9.15): runs in alternating halves of the arena,
     // so a unit's mover moves one run while the roles compute another.
     let piped = pipelined_runs(
@@ -2190,7 +2226,7 @@ pub fn sfpu_eltwise_blocks(
     for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
         let half = pipelined.then(|| half_of(j, units));
-        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len, half) {
+        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len, half, rows) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -2258,6 +2294,18 @@ pub fn sfpu_eltwise_blocks(
         ]);
     }
     Ok(Some(Work { out, jobs }))
+}
+
+/// The rows of each tile an element-wise op on a tensor of `rows` rows computes
+/// ([`crate::sfpu::ops::code_for_rows`]): a single tile row's own rows (a decode step's `[1, W]`
+/// activation is one of 32) for a [`crate::sfpu::ops::row_limited`] kind, else 32. Below 32 the
+/// output's padding rows are whatever `Dst` held: `Pad::Undefined`.
+pub fn eltwise_rows(kind: u32, rows: usize) -> u32 {
+    if rows < 32 && crate::sfpu::ops::row_limited(kind) {
+        rows as u32
+    } else {
+        32
+    }
 }
 
 /// Checked full-width integer division. The packer publishes canonical
@@ -2616,6 +2664,7 @@ fn sfpu_programs(
     operands: crate::sfpu::kernel::Operands,
     len: usize,
     half: Option<u8>,
+    rows: u32,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -2626,6 +2675,7 @@ fn sfpu_programs(
         crate::sfpu::ops::Broadcast,
         usize,
         Option<u8>,
+        u32,
     );
     type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
@@ -2636,6 +2686,7 @@ fn sfpu_programs(
         bcast,
         len,
         half,
+        rows,
     );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
@@ -2647,7 +2698,7 @@ fn sfpu_programs(
             .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
     }
     .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
+    let (_, math) = crate::sfpu::ops::code_for_rows(op.kind, [op.scalar, op.scalar2], bcast, rows)
         .expect("checked by the caller");
     let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
     let p = (layout, Arc::new(roles), Arc::new(loops));
@@ -4616,6 +4667,63 @@ mod tests {
     /// busiest unit runs, and the bytes its gathers read of `A` and of `B`.
     /// `cargo test -p tt-kernels decode_products -- --nocapture` prints the table.
     #[test]
+    fn resident_a_is_read_once_a_unit() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let units = 120;
+        let count = |k: usize, n: usize, resident_a: bool| {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+            let reads = super::Reads {
+                thin: true,
+                resident_a,
+            };
+            let work = super::matmul_dram_limited(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                None,
+                reads,
+            )
+            .unwrap();
+            let mut per_unit = vec![crate::profile_mode::OpBytes::default(); units];
+            for (j, job) in work.jobs.iter().enumerate() {
+                for step in job {
+                    if let Step::List { entries, .. } = step {
+                        per_unit[j % units].count(entries);
+                    }
+                }
+            }
+            (work.jobs, per_unit)
+        };
+        // `gate|up` (three rounds on some units), `q` (one), `down` (K-blocked: never resident).
+        for [k, n] in [[2048, 16384], [2048, 2048], [8192, 2048]] {
+            let (jobs, off) = count(k, n, false);
+            let (resident_jobs, on) = count(k, n, true);
+            assert_eq!(jobs.len(), resident_jobs.len());
+            // The thin `A` of `K` whole: one `1024 + 64`-byte read a tile.
+            let a_once = (k as u64 / 32) * (1024 + 64);
+            for u in 0..units {
+                let (off, on) = (off[u], on[u]);
+                assert_eq!(on.b, off.b, "[{k}, {n}] unit {u}: B unchanged");
+                if k == 8192 || off.a == 0 {
+                    assert_eq!(on, off, "[{k}, {n}] unit {u}");
+                } else {
+                    assert_eq!(on.a, a_once, "[{k}, {n}] unit {u}: A once");
+                    assert_eq!(off.reads - on.reads, (off.a - a_once) / 1088, "unit {u}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decode_products_jobs_rounds_and_bytes() {
         use crate::matmul::{Fidelity, SrcRoute};
         use tt_isa::dm::TILE_SLOT;
@@ -4626,6 +4734,9 @@ mod tests {
             ("gate/up", [2048, 8192], false),
             ("down", [8192, 2048], false),
             ("head", [2048, 49152], true),
+            // `Llama::fused`'s products (1.7B): `q|k|v` and `gate|up` as one each.
+            ("qkv", [2048, 6144], false),
+            ("gate|up", [2048, 16384], false),
         ];
         let mut rows = Vec::new();
         for (name, [k, n], bt) in shapes {
@@ -4650,6 +4761,9 @@ mod tests {
             )
             .unwrap();
             let (mut a_bytes, mut b_bytes, mut gathers) = (0u64, 0u64, 0usize);
+            let (mut a_whole, mut gather_reads) = (0u64, 0u64);
+            // The profile mode's count of the same lists, records expanded.
+            let mut counted = crate::profile_mode::OpBytes::default();
             let mut per_unit = vec![0usize; units];
             for (j, job) in work.jobs.iter().enumerate() {
                 per_unit[j % units] += 1;
@@ -4657,18 +4771,30 @@ mod tests {
                     let Step::List { entries, .. } = step else {
                         continue;
                     };
+                    counted.count(entries);
                     for e in entries.iter().filter(|e| e[0] == record::GATHER) {
-                        let kt = u64::from(e[1] >> 8);
+                        let kt = u64::from(record::gather_kt(e[1]));
                         let [rows, cols] = [u64::from(e[5]), u64::from(e[7])];
                         // A thin last tile row reads through row `r` of face 1.
                         let r = u64::from(e[1] >> record::GATHER_ROWS_SHIFT & 0x1f);
                         let last = if r == 0 { TILE_SLOT } else { 1024 + 64 * r };
                         a_bytes += ((rows - 1) * TILE_SLOT + last) * kt;
+                        a_whole += rows * TILE_SLOT * kt;
                         b_bytes += kt * cols * TILE_SLOT;
+                        gather_reads += (rows + cols) * kt;
                         gathers += 1;
                     }
                 }
             }
+            // The counter agrees with the headers, operand by operand; the control is `A` read as
+            // whole tiles, which a thin product's count must not match.
+            assert_eq!((counted.a, counted.b), (a_bytes, b_bytes), "{name}");
+            assert_ne!(
+                counted.a, a_whole,
+                "{name}: thin reads counted as whole tiles"
+            );
+            assert!(counted.reads >= gather_reads, "{name}");
+            assert!(counted.read >= a_bytes + b_bytes, "{name}");
             let plan = crate::matmul::plan_in(
                 [1, k, n],
                 SrcRoute::Tf32FromFp32,
@@ -4682,11 +4808,14 @@ mod tests {
             let two = per_unit.iter().filter(|&&n| n > 1).count();
             rows.push(format!(
                 "{name:8} plan {plan:?} jobs {:4} gathers {gathers:4} busy {busy:3} rounds {rounds} \
-                 (units with >1 job: {two:3}) A {:6.1} MB  B {:6.1} MB  A share {:4.1}%",
+                 (units with >1 job: {two:3}) A {:6.1} MB  B {:6.1} MB  A share {:4.1}%  \
+                 reads {:6} written {:5.2} MB",
                 work.jobs.len(),
                 a_bytes as f64 / 1e6,
                 b_bytes as f64 / 1e6,
                 100.0 * a_bytes as f64 / (a_bytes + b_bytes) as f64,
+                counted.reads,
+                counted.write as f64 / 1e6,
             ));
             // `B`'s whole tiles are read once: blocks never share a column.
             assert_eq!(b_bytes, (k as u64 / 32) * (n as u64 / 32) * TILE_SLOT);

@@ -12,6 +12,12 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Element-wise ops on a decode row's row groups](#element-wise-ops-on-a-decode-rows-row-groups-2026-10-17-cards-0-and-1) | 2026-10-17 | lanewise SFPU kinds on a `[1, W]` row run 1 of 8 row groups: a 1.7B decode step 38.93 / 41.38 / 44.58 -> **37.69 / 40.20 / 43.41 ms**, 135M -> **17.51 / 17.97 / 18.76** |
+| [Captured barriers on the units an op ran on](#captured-barriers-on-the-units-an-op-ran-on-2026-10-17-cards-0-and-1) | 2026-10-17 | a captured op's barrier counts the units it ran on (waits for a unit that sat ops out, in its stream): no step time change (1.7B 38.93 / 41.38 / 44.58 ms); the condition for a cross-op prefetch |
+| [A traced cache written in place](#a-traced-cache-written-in-place-2026-10-17-cards-0-and-1) | 2026-10-17 | a traced step's cache donated and written in place (no tile copy, no write-back; a stale read refused by name), the write's indices read as a row: a 1.7B decode step 41.83 / 44.25 / 47.40 -> **38.97 / 41.41 / 44.58 ms**, 135M 20.03-21.19 -> **18.59 / 19.07 / 19.79** |
+| [Decode products against their weight stream](#decode-products-against-their-weight-stream-2026-10-17-card-0) | 2026-10-17 | the card reads a weight at **~488 GB/s** (95% of 512) as consecutive tiles on 120 units, 446-458 dealt a column a unit (one channel a column: ~7%, not P5's bound); 64 units saturate; an `m = 1` product takes 1.2-1.8x its weights' stream (`o` 74 against 38 us, `down` 269 against 150): `A`'s reads, a ~15 us kernel tail, the last round |
+| [The 1.7B against its roofline, and a prefill product's rate](#the-17b-against-its-roofline-and-a-prefill-products-rate-2026-10-17-cards-0-and-1) | 2026-10-17 | 1.7B prefill re-measured: **315 / 741 / 861 tokens/s** (was 267 / 657 / 771), decode unchanged (41.80-47.44 ms); a prefill-shaped product reaches 2.0-4.2 TFLOPS (~2.5% of HiFi4's ~166), bound by GDDR: `B` re-read per tile row of `A`, `A` per column block (3.2 GB for 77 MB of operands at 390 GB/s) |
+| [A decode step in bytes, and the activation once a unit](#a-decode-step-in-bytes-and-the-activation-once-a-unit-2026-10-17-cards-0-and-1) | 2026-10-17 | the profile mode counts every captured op's GDDR bytes and entries (`ops.tsv`, a "Step budget" a trace): a 1.7B step moves 9.6 GB, 20.5 ms at 469 GB/s, against 42.3 ms; its weights 14.8 ms; `A` 1.25 GB; the cache copies 0.83 GB; `gate\|up` at 367 GB/s, not ~490. A unit's later blocks of a product skip `A` (`GATHER_A_RESIDENT`): 1.7B **41.83 / 44.25 / 47.40 ms**. Cross-op prefetch into L1 capped at ~4.4 ms a step |
 | [RMSNorm's statistic over a decode row's row groups](#rmsnorms-statistic-over-a-decode-rows-row-groups-2026-10-16-cards-0-and-1) | 2026-10-16 | the statistic kernel runs only the row groups a tile row's rows occupy (1 of 8 for a decode row): its kernel 14.95 -> 5.58 us a norm; a 1.7B decode step 43.42 / 45.85 / 49.00 -> **42.97 / 45.41 / 48.59 ms**, 135M 20.20-21.34 -> **19.94 / 20.42 / 21.11**. Reading only the rows used (a thin `READ_RUN`, ~74% fewer bytes) made the read slower, 19.15 -> 21.01 us, and was reverted |
 | [Decode fusers: sigmoid, SiLU and RMSNorm](#decode-fusers-sigmoid-silu-and-rmsnorm-2026-10-16-cards-0-and-1) | 2026-10-16 | decode runs on `Tt` (burn-fusion), with three chain fusers bit for bit `TtBackend`: Burn's sigmoid composition as the native sigmoid, `silu(gate) * up` as one SFPU pass, RMSNorm's statistic as one reduction kernel. A 1.7B decode step 45.23 / 47.71 / 50.78 -> **43.42 / 45.85 / 49.00 ms** (23.0-20.4 tokens/s), 135M 22.46-23.63 -> **20.20 / 20.66 / 21.34**. A norm that also divided in one kernel was 640 us a norm (71.5 ms a 1.7B step): one unit pushed `DIV`'s instructions for 64 tiles |
 | [Block views: RoPE and SiLU without repacks or copies](#block-views-rope-and-silu-without-repacks-or-copies-2026-10-16-cards-0-and-1) | 2026-10-16 | element-wise ops read a block of a buffer in place, RoPE runs in the projection's layout (its table laid over the heads once a step, its halves swapped by tile copies): a 1.7B decode step 47.90 / 50.37 / 53.53 -> **45.23 / 47.71 / 50.78 ms** (22.1-19.7 tokens/s), 135M 22.91-23.98 -> **22.46 / 22.95 / 23.63**; RoPE's four repacks a layer gone, the key write now repacks (S1d); F0: the step under burn-fusion is +1.5 / +2.2 ms (its sigmoid is Burn's 8-op composition) |
@@ -73,6 +79,7 @@ the top). Use each section's own date, and this table for the chronology.
 
 | Date | Run | Change | Scoreboard effect |
 |---|---|---|---|
+| 2026-10-17 | 1792258449 / 1792258565 / 1792258604 | Roofline check for SmolLM2-1.7B (F32, one card): the generation re-measured (prefill 315 / 741 / 861 tokens/s, decode 41.80 / 44.24 / 47.44 ms) and a new traced product bench, `matmul_throughput` (2.0-4.2 TFLOPS at prefill shapes, GDDR-bound by operand re-reads). | New Roofline section; 1.7B prefill row and a matmul-rate row updated. |
 | 2026-10-16 | 1792170667 / 1792171171 / 1792172763 / 1792174412 / 1792174499 / 1792172342 / 1792174906 | Block views (`decode-small-ops.md` S1, S2a; gate `step192`): element-wise ops on a block of a buffer read in place (`Session::eltwise_blocks`), RoPE in the projection's layout (`Strided::layout_moves`: the table laid over the heads once a step, the halves swapped by tile copies), a regrouped GQA `q` made plain once for attention. SmolLM2-1.7B decode 47.90 / 50.37 / 53.53 -> **45.23 / 47.71 / 50.78 ms**; 135M 22.91-23.98 -> **22.46 / 22.95 / 23.63** (burn-flex 29.5-31.0); card 1, every tile. F0: the same steps on `Fusion<TtBackend>` 47.49 / 49.90 / 53.08 and 24.00 / 24.52 / 25.15. | Decode rows updated. |
 | 2026-10-16 | 1792161551 / 1792161623 / 1792162031 / 1792162257 | Fused projections (`decode-matmul-bandwidth.md` P3, `Llama::fused`, gate `step191`): a layer's 7 products become 4, bit for bit. SmolLM2-1.7B decode 49.78 / 52.27 / 55.44 -> **47.90 / 50.37 / 53.53 ms**; 135M 24.14-25.25 -> **22.91 / 23.35 / 23.98** (burn-flex 26.43-30.65); card 1, every tile. | Decode rows updated. |
 | 2026-10-16 | 1792114379 / 1792114782 / 1792115180 / 1792115571 / 1792115848 / 1792118484 / 1792118871 / 1792119119 | Decode matmul bandwidth (`decode-matmul-bandwidth.md` P1, P2): thin `A` reads (`record::gather_rows`), first as two face-row reads a tile (1.7B 55.69-61.30 ms, 135M *slower*, 25.43-26.51), then as one prefix read (1.7B 51.15-56.71, 135M 24.07-25.21), then the last round of a one-tile-row product spread over the units (`tensor::thin_runs`). SmolLM2-1.7B decode 57.21 / 59.64 / 62.81 -> **49.78 / 52.27 / 55.44 ms**; 135M 24.40-25.53 -> 24.14-25.25 (burn-flex 26.05-30.44); card 1, every tile. | 1.7B decode row updated. |
@@ -321,6 +328,220 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Element-wise ops on a decode row's row groups (2026-10-17, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3. A lanewise SFPU kind on a single tile row of
+fewer than 32 rows runs its programs over only the row groups its rows occupy: one of eight for a decode step's
+`[1, W]`. RMSNorm's statistic already did this. The output's padding is claimed `Undefined`.
+- **Kinds:** add, subtract, multiply, divide, the scalar add and multiply, sigmoid, `silu(gate) * up`.
+- **Gates:** unit `row_limited_programs_keep_the_computed_rows`; `step200_row_limited_eltwise` (card 0
+  `1792268664`).
+- **Measured** (card 1, release, every tile, burn-flex in the same runs):
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792266392`, `1792266789`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 38.93 / 41.38 / 44.58 | **37.69 / 40.20 / 43.41** (`1792268720`) | 295.4 / 312.5 / 335.4 |
+| SmolLM2-135M | 18.59 / 19.03 / 19.81 | **17.51 / 17.97 / 18.76** (`1792269106`) | 27.3 / 30.1 / 31.2 |
+
+- **Against the prediction:** -1.2 ms a 1.7B step, against ~1 ms predicted (the kernels of `DIV`, `SILU_MUL`, the
+  muls and adds were ~1.24 ms a step in profile `1792210770`).
+
+## Captured barriers on the units an op ran on (2026-10-17, cards 0 and 1)
+
+[replay-fixed-cost.md](../plans/replay-fixed-cost.md) P1.
+- **The change:** a captured op's barrier counts the units it ran on. A unit that sat ops out waits (a wait-only
+  `BARRIER` in its stream) before its next op and at the trace's end, and a replay adds the arrivals the capture
+  counted.
+- **Gate:** `step176` (ttsim; card 0 `1792266278`, 43 trace gates; `step188` `1792266393`).
+- **Measured** (card 1, burn-flex in the same runs):
+  - 1.7B 38.97 / 41.41 / 44.58 -> **38.93 / 41.38 / 44.58 ms** (`1792266392`);
+  - 135M 18.59 / 19.07 / 19.79 -> **18.59 / 19.03 / 19.81** (`1792266789`).
+- **No change, below P0's ~1.5 ms estimate:** an idle unit's arrival at a barrier did not delay the units that
+  waited at it.
+- **What it is for:** a unit can stream between ops without holding their barriers, which is the condition for
+  decode-step-bandwidth B2's prefetch.
+- **On silicon, a trace with the waits dropped still gave the right bits** (unit 0 on a 1,024-tile `K` chain, units
+  1-3 reading its output next). The replay's start closes that window, so the gate checks the streams' barrier
+  entries instead.
+
+## A traced cache written in place (2026-10-17, cards 0 and 1)
+
+[in-place-cache-write.md](../plans/in-place-cache-write.md) D1-D4, Phase 1 of
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md).
+- **The change:** a `SharedStateTraces` capture donates its state before the step runs, and a row scatter into a
+  donated cache writes the cache's own buffer. That removes the scatter's tile copy of the cache and the write-back
+  after the step.
+- **Safety:** buffer generations refuse by name a read of the cache after its write.
+- **Also:** the write's index column, a `[1, kv]` buffer read transposed, is read as a row, not copied by a one-tile
+  block copy (11.6 us, twice a layer).
+- **Gate:** `step199_in_place_cache_write`.
+
+**Measured** (card 1, release, every tile, `silicon_bench_models::traced_generation`, burn-flex in the same run):
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792209913`, `1792210419`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 41.83 / 44.25 / 47.40 | **38.97 / 41.41 / 44.58** (`1792263398`) | 300.5 / 309.2 / 324.6 |
+| SmolLM2-135M | 20.03 / 20.55 / 21.19 | **18.59 / 19.07 / 19.79** (`1792263801`) | 26.11 / 28.53 / 31.02 |
+
+- **Against the prediction:** -2.83 ms a 1.7B step, against -2.26 predicted for the two cache copies (profile
+  `1792210770`) plus -0.56 for the index copies.
+- **The decode weight bandwidth:** 164 -> 176 GB/s at 32 tokens.
+- **Profile `1792264052`** (`Step(64)`): the replay 41.16 -> 38.28 ms, its ops 1,152 -> 1,008. `scatter_nd` is 5.94 -> 3.03 ms: the k/v repack (1.83) and the row scatter (1.2). The step's barriers are 4.77 -> 4.01 ms, and everything but the products is 14.56 ms over 863 ops.
+- **Validated:**
+  - card 0: `step199`, `step187` (with the 135M checkpoint), `step189`, `step193`, `step186` (`1792263323`) and
+    `step188` (`1792263379`);
+  - ttsim: those and `step191`, `step197`.
+
+## Decode products against their weight stream (2026-10-17, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 0. `silicon_probe_decode_stream`, card 0, release,
+every tile (120), runs `1792261830` (first), `1792261878` (repeat, within ~1%), `1792261957` (the unit sweep) and
+`1792262011` (with the heads).
+- **Method:**
+  - each op is captured `REPS` = 8 times in one trace and once in another;
+  - the op's time is the difference over 7, medians of 9 replays after 2 warm-ups;
+  - rates are 4,160-byte slots over that time.
+- **Validated:** every replayed product equals the eager product bit for bit, and a stream's last slots equal `B`'s
+  tiles in GDDR on the first and last unit.
+- **Products:** `Session::matmul_dram`, the decode path (thin `A`, `K` whole or K-blocked for `down`), at
+  `Spread::Fixed(u)`.
+- **Streams:** `Session::probe_stream`, every tile of `B` read once into 64 slots at the top of `DATA`:
+  - *Columns:* a unit reads columns `u, u + units, ..` down their `K` tiles, the product's deal;
+  - *Rows:* a contiguous share of consecutive tiles.
+
+| SmolLM2-1.7B product, `m = 1` | Product, 64 units | Product, 120 | `B` alone, Columns, 64 | `B` alone, Columns, 120 | `B` alone, Rows, 120 |
+|---|--:|--:|--:|--:|--:|
+| `qkv` `[2048, 6144]`, 51 MB | 160 us (320 GB/s) | 180 (284) | 113 (454) | 112 (458) | 105 (489) |
+| `o` `[2048, 2048]`, 17 MB | 74 (229) | 73 (232) | 38 (446) | — (64 columns) | 36 (471) |
+| `gate\|up` `[2048, 16384]`, 136 MB | 352 (387) | 383 (355) | 300 (454) | 306 (445) | 280 (487) |
+| `down` `[8192, 2048]`, 68 MB | 269 (253) | 269 (253) | 150 (453) | — (64 columns) | 141 (485) |
+
+The unit sweep for a product (us; 32 / 48 / 64 / 80 / 96 / 104 / 120 units):
+
+| Product | 32 | 48 | 64 | 80 | 96 | 104 | 120 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `qkv` | 221 | 188 | **160** | 180 | 163 | 171 | 179 |
+| `o` | 88 | 91 | 74 | 74 | 74 | 74 | 74 |
+| `gate\|up` | 556 | 434 | **352** | 398 | 395 | 391 | 384 |
+| `down` | 433 | 449 | 269 | 270 | 270 | 269 | 269 |
+| head `[2048, 49152]`, 403 MB | 1,625 | 1,159 | **1,024** | 1,080 | 1,082 | 1,091 | 1,051 |
+| 135M head `[576, 49152]`, 113 MB | 343 | **302** | 318 | 307 | 302 | 305 | 308 |
+
+**What it shows:**
+- **The ceiling:** reads reach ~488 GB/s, 95% of 512, in the default image.
+- **Channels:** a column-dealt stream is ~7% below that, and P5's "one channel a column" is not what holds the
+  products back.
+- **Units:** 64 units saturate GDDR.
+- **The products:** 1.2-1.8x their own weight stream. The profile mode (`1792210770`) splits the gap into `A`'s
+  reads (an entry a `K` tile on every unit), a ~15 us kernel tail, and the barrier of an uneven last round.
+
+**Per layer** (1.7B, today's deal):
+- the products take ~907 us;
+- their weights stream in ~600 us at the column-dealt rate, ~550 us at 488 GB/s.
+
+## The 1.7B against its roofline, and a prefill product's rate (2026-10-17, cards 0 and 1)
+
+Where SmolLM2-1.7B (F32, one card) stands against a roofline for it (the scoreboard's
+[Roofline](performance-scoreboard.md#roofline-smollm2-17b-f32-one-card) holds the targets and their derivation).
+
+**The generation, re-measured** (`silicon_bench_models::traced_generation`, `TT_GEN_MODEL=smollm2-1.7b-instruct
+TT_TILES=all TT_GEN_FLEX_SAMPLES=1`, card 1, release, run `1792258449`, `c69b9c1+dirty` with B0/B1):
+
+| Prompt + 64 tokens | Prefill (first token) | Decode step | burn-flex: prefill / step |
+|---|---|---|---|
+| 32 | **315 tokens/s** (101.7 ms) | 41.80 ms | 6.0 tokens/s / 299.1 ms |
+| 128 | **741** (172.6) | 44.24 | 19.0 / 309.6 |
+| 256 | **861** (297.4) | 47.44 | 21.9 / 328.1 |
+
+- Decode is unchanged from `1792209913` (41.83 / 44.25 / 47.40).
+- Prefill was last measured at 267 / 657 / 771 tokens/s (`1792082994`, 2026-10-15). It gained from the decode work
+  since (fused projections, block views, the fusers), none of which targeted it.
+- A chunk costs about **48 ms + 0.98 ms a token** (from the 128 and 256 prompts). The marginal token is ~3.5 TFLOPS of
+  products.
+
+**A prefill product's rate** (new: `silicon_bench_tensix_ops::matmul_throughput`, card 0, every tile, TF32/HiFi4, run
+`1792258604`):
+- **Validated:** a grid of elements equals exact integer arithmetic, and every replay equals the eager product bit
+  for bit.
+- **Timing:** the replay of one traced product, with the input write and output read excluded.
+- **Bytes:** counted at capture (`set_count_trace_bytes`).
+
+| Product | Replay | TFLOPS | GDDR read (`A` / `B`) | Of the operands' bytes | Read rate | Entries |
+|---|--:|--:|--:|--:|--:|--:|
+| `[256,2048] @ [2048,2048]` | 1,066 us | 2.0 | 204 MB (68 / 136) | 32x `A`, 8x `B` | 192 GB/s | 49,152 |
+| `[256,2048] @ [2048,8192]` | 2,433 us | 3.5 | 801 MB (256 / 545) | 120x `A`, 8x `B` | 329 GB/s | 192,512 |
+| `[1024,2048] @ [2048,2048]` | 2,504 us | 3.4 | 818 MB (273 / 545) | 32x `A`, 32x `B` | 327 GB/s | 196,608 |
+| `[1024,2048] @ [2048,8192]` | 8,224 us | 4.2 | 3,203 MB (1,022 / 2,181) | 120x `A`, 32x `B` | 390 GB/s | 770,048 |
+
+All four run on 120 units, one op each. Eager, the same products take 1.56 / 5.03 / 5.10 / 16.64 ms.
+
+**Reading:**
+- **The products are bound by GDDR, not by the Matrix Unit.**
+  - `B` is read once per tile row of `A` (`m / 32` times).
+  - `A` is read once per two-column output block, at most once per unit: 32x at `N` = 2048, 120x at 8192.
+  - The largest product moves 3.2 GB for 77 MB of operands, at 83% of the 469 GB/s read ceiling.
+- **Its arithmetic alone would take ~0.21 ms:** 524,288 tile products over 120 units at ~64 cycles each (HiFi4),
+  1,350 MHz. That is ~2.5% of the replay.
+- **So the product is ~40x from compute-bound.** About 4x of that is per-unit blocking: with an `A` strip and a `B`
+  strip held in L1, each unit reads its operands once, ~0.8 GB in all. The rest is multicast, which shares the
+  strips along the grid's rows and columns so each operand leaves GDDR once.
+- **The peak of ~166 TFLOPS** (HiFi4, 120 units) is derived from the published figure, not measured: 774 TFLOPS at
+  LoFi on 140 tiles at 1,350 MHz is 4,096 FLOP a cycle a tile, and HiFi4 runs four phases.
+
+## A decode step in bytes, and the activation once a unit (2026-10-17, cards 0 and 1)
+
+[decode-step-bandwidth.md](../plans/decode-step-bandwidth.md) B0 and B1.
+
+**B0: the count.** With the profile mode on, each captured op's GDDR traffic is counted when its trace is stored:
+- every unit's stream and both sections of each `PAIR_CALL`;
+- records expanded as the movers expand them;
+- a gather's reads split into its `A` slots and its `B` slots.
+
+`ops.tsv` gains `read_bytes`, `write_bytes`, `reads`, `writes`, `a_bytes`, `b_bytes` and `gbps`, and each trace in
+`summary.md` a by-label traffic table and a "Step budget". The gate is `step197_trace_bytes`: a traced step's
+products read each weight's tile slots once.
+
+**The 1.7B step in bytes** (profile `1792202359`, `Step(64)`, card 1, 42.27 ms):
+
+| | Ops | ms | GDDR MB (read + written) | GB/s |
+|---|--:|--:|--:|--:|
+| Products | 97 | 24.00 | 8,218 + 107 (`B` 6,952, `A` 1,247) | 347 |
+| Attention's products | 144 | 2.93 | 64 + 26 | 31 |
+| The cache write and its write-back | 240 | 5.93 | 423 + 403 | 139 |
+| Everything else | 671 | 9.40 | 241 + 122 | 39 |
+
+- **The whole step:** at 469 GB/s its bytes would take 20.5 ms, and the weights alone 14.8.
+- **The products by shape:** 120 units 355 GB/s, `o` on 64 units 292, the K-blocked `down` 324.
+- **One layer:** `qkv` 335 GB/s, `o` 295, `gate|up` **367** (396 over its data phase), `down` 327.
+- **Refuted:** "`gate|up` at ~490 GB/s" (decode-matmul-bandwidth P3, below) does not hold.
+
+**B1: the activation once a unit.** A product's later blocks on a unit skip `A` (`GATHER_A_RESIDENT`), bit for bit
+(gate `step198`).
+- **Where it applies:** `gate|up`, 272 blocks on 120 units, and the head, 816. The other products run one block a unit.
+- **Bytes and entries** (profile `1792210770`):
+  - `A` 1,247 -> 944 MB a step;
+  - `gate|up` 50,176 -> 40,448 entries, 428 -> 383 us;
+  - the head 1,223 -> 1,049 us;
+  - the products 24.00 -> 22.83 ms, the replay 42.27 -> 41.16.
+
+**Bench:** `TT_TILES=all TT_GEN_MODEL=<model> TT_GEN_FLEX_SAMPLES=1 cargo xtask bench --device 1 --filter
+silicon_bench_models::traced_generation`; release, card 1, every tile, 2 warm-ups, 9 samples, burn-flex in the same
+run.
+
+| decode step, ms, 32 / 128 / 256-token prompt | before (`1792189445`) | B1 | burn-flex, same run |
+|---|--:|--:|--:|
+| SmolLM2-1.7B | 42.97 / 45.41 / 48.59 | **41.83 / 44.25 / 47.40** (`1792209913`) | 301.7 / 310.8 / 329.4 |
+| SmolLM2-135M | 19.94 / 20.42 / 21.11 | 20.03 / 20.55 / 21.19 (`1792210419`) | 26.5 / 28.4 / 31.5 |
+
+**The prefetch probe** (`silicon_probe_prefetch_overlap`, card 0, `1792210511` and after):
+- Weight tiles streamed by units 64-119 into the top of `DATA` land bit for bit, and adds on units 0-63 under them
+  keep their bits.
+- Eagerly, overlap cannot be seen. An add takes ~290 us of host time to queue on 64 units, and the stream's ~300 us is
+  its own queueing on 56 units, so "both" is the sum (2.53 + 0.30 -> 2.84 ms).
+- In a replay, a captured barrier involves every unit, so the prefetch first needs replay-fixed-cost P1.
+- **The ceiling:** L1 above a product's `A` is ~630 KB a unit, ~75 MB across the card, against 273 MB of weights a
+  layer. That caps the prefetch at ~4.4 ms a step.
 
 ## RMSNorm's statistic over a decode row's row groups (2026-10-16, cards 0 and 1)
 

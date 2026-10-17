@@ -29,7 +29,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-pub use tt_kernels::profile_mode::{Detail, OpTime, ProfileOptions, ProfileReport};
+pub use tt_kernels::profile_mode::{
+    Detail, OpBytes, OpTime, ProfileOptions, ProfileReport, CARD_READ_GBPS,
+};
 
 use crate::error::TtError;
 use crate::{server, TtDevice};

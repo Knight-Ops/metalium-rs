@@ -160,6 +160,27 @@ pub struct Program {
     policy: LoopPolicy,
     /// The runner's block repeats over `ins` (`crate::code::Loop`).
     repeats: Vec<crate::code::Loop>,
+    /// The tensor rows of a tile a whole-tile row loop runs over ([`with_rows`]): 32, or
+    /// fewer for a program built for tiles whose rows past these are padding.
+    rows: u32,
+}
+
+std::thread_local! {
+    /// The row limit programs built now take ([`with_rows`]).
+    static ROWS: std::cell::Cell<u32> = const { std::cell::Cell::new(32) };
+}
+
+/// `f`'s programs, built for tiles of which only the first `rows` (1..=32) tensor rows are
+/// computed: each whole-tile row loop (`for_each_row_group(64, ..)`) runs only the row groups
+/// that hold them ([`reduce::row_offsets`]), unrolled, and the other rows of `Dst` are left as
+/// they were. Only for a program that never moves a value between row groups (a lanewise
+/// element-wise kind, `ops::row_limited`): the computed rows then keep their bits.
+pub fn with_rows<R>(rows: u32, f: impl FnOnce() -> R) -> R {
+    assert!((1..=32).contains(&rows), "{rows} rows of a tile");
+    let old = ROWS.with(|r| r.replace(rows));
+    let out = f();
+    ROWS.with(|r| r.set(old));
+    out
 }
 
 impl Default for Program {
@@ -185,6 +206,7 @@ impl Program {
             loops: Vec::new(),
             policy,
             repeats: Vec::new(),
+            rows: ROWS.with(|r| r.get()),
         };
         // `SFPENCC_MOD1_EI | SFPENCC_MOD1_RI`, both immediate bits set.
         p.push(encode::sfpencc(3, 0, 2 | 8).unwrap());
@@ -723,6 +745,7 @@ impl Program {
             loops: Vec::new(),
             policy: self.policy,
             repeats: Vec::new(),
+            rows: self.rows,
         };
         body(&mut b, 0);
         assert_eq!(
@@ -745,6 +768,14 @@ impl Program {
                 .first()
                 .is_some_and(|i| !i.stalls_automatically_after_mad());
         let fits = b.ins.len() + usize::from(wraps_nop) <= frontend::REPLAY_BUFFER as usize;
+        if rows == 64 && self.rows < 32 {
+            // Built for tiles of `self.rows` rows ([`with_rows`]): their row groups, unrolled.
+            for o in reduce::row_offsets(self.rows) {
+                body(self, o);
+            }
+            self.loops.push(LoopForm::Unrolled { body: b.ins.len() });
+            return;
+        }
         if self.policy == LoopPolicy::Unrolled {
             for k in 0..iterations {
                 body(self, 2 * k);

@@ -310,7 +310,16 @@ fn scatter_rows_native(
     } else {
         (nd_flat_rows(data, indices, nd), false)
     };
-    let (t, i, v) = (plain_dram(table), plain_dram(&index), plain_dram(rows));
+    // An `[n, 1]` column that is a `[1, n]` buffer read transposed (a `[n]` index reshaped, as a
+    // cache write's rows are) is read as the row it is: the record takes either, so no copy.
+    let (i, column) = match index.dram() {
+        Some(d) if column && d.transposed && [d.buffer.rows, d.buffer.cols] == [1, nd.n] => (
+            crate::tensor::DramRef::of(d.buffer.clone(), false, d.generation),
+            false,
+        ),
+        _ => (plain_dram(&index), column),
+    };
+    let (t, v) = (plain_dram(table), plain_dram(rows));
     let words = |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
     let index_dims = if column { [nd.n, 1] } else { [1, nd.n] };
     if !words(&t)
@@ -321,6 +330,24 @@ fn scatter_rows_native(
         || [v.buffer.rows, v.buffer.cols] != [nd.n, nd.rest]
     {
         return None;
+    }
+    // A table the open capture owns as its state (a traced decode step's cache) is written in
+    // place: the step's result is the state's own buffer, at the generation the write made, so
+    // the trace needs neither the copy nor a write-back. Everything else, and every eager
+    // call, writes a copy and leaves `table` as it was.
+    if !t.transposed
+        && t.buffer.parent.is_none()
+        && crate::server::donated_since(t.buffer.id).is_some()
+    {
+        let generation =
+            crate::server::scatter_rows_into(device, t.buffer.id, i.buffer.id, v.buffer.id, column)
+                .unwrap_or_else(|e| crate::unsupported::fail("scatter_nd", e));
+        return Some(TtTensor::on_device(
+            crate::tensor::DramRef::of(t.buffer.clone(), false, generation),
+            vec![nd.rows, nd.rest].into(),
+            data.dtype(),
+            device,
+        ));
     }
     let (id, dims) = crate::server::scatter_rows(
         device,

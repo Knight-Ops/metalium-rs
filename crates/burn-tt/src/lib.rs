@@ -70,7 +70,7 @@ pub use server::{
 pub use tensor::TtHandle;
 pub use tensor::{TtQTensor, TtTensor};
 #[doc(hidden)]
-pub use trace::set_profile_buffer;
+pub use trace::{set_count_trace_bytes, set_profile_buffer, set_state_in_place};
 pub use trace::{
     SetFootprint, SharedStateTraces, StepTiming, Trace, TracedInference, TracedTrainingStep,
 };
@@ -100,6 +100,7 @@ pub use traffic::{
 pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
 pub use tt_kernels::tensor::{Block, BlockMove};
+pub use tt_kernels::trace::OpRecord;
 
 use burn_backend::{
     Backend, BackendTypes, DType, DTypeUsage, DTypeUsageSet, DeviceId, DeviceOps, ExecutionError,

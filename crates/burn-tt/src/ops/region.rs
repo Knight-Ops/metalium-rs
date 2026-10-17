@@ -385,13 +385,7 @@ mod tests {
             storage: crate::storage::StorageFormat::F32,
             plain: Default::default(),
         });
-        let v = Strided::of(
-            &DramRef {
-                buffer: buffer.clone(),
-                transposed: false,
-            },
-            shape,
-        );
+        let v = Strided::of(&DramRef::of(buffer.clone(), false, 0), shape);
         // Never dropped: dropping would free the buffer on a device no one attached.
         std::mem::forget(buffer);
         v

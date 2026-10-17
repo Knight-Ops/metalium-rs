@@ -1032,6 +1032,40 @@ From [decode-matmul-bandwidth.md](../plans/decode-matmul-bandwidth.md) P1 (log:
   `C^T @ C` non-finite.
 - **B's image:** 25,724 -> 26,528 bytes of 43,008 (default build); NC unchanged at 15,088.
 
+## A decode product's weights: what the card reads at (2026-10-17, card 0)
+
+From [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 0 (log:
+[decode products against their weight stream](performance-log.md#decode-products-against-their-weight-stream-2026-10-17-card-0)).
+The probe is `silicon_probe_decode_stream`, traced, so the times are the card's.
+
+- **The read ceiling is ~488 GB/s, 95% of 512.**
+  - **Pattern:** every tile of a weight read once as `READ_RUN`s of consecutive tiles, on 120 units: 485-489 GB/s
+    for 17-137 MB.
+  - **Method:** whole 4,160-byte slots, record-expanded, in the default (safe) image, so `fast-reads` is not needed
+    for it.
+  - **Against the scoreboard:** above its 469 GB/s.
+- **One channel a column costs ~7%, not more.** Each unit reads whole columns down their `K` tiles, as an `m = 1`
+  product deals `B`, so all of a column's tiles are on channel `j % 8`. That pattern reads at 440-458 GB/s, on 64
+  units and on 120 alike.
+  - **This refutes** decode-matmul-bandwidth P5's leading hypothesis, that channels bind the narrow products.
+- **64 units saturate GDDR.** One unit streams ~7 GB/s (a 266 KB column share in ~38 us), so ~64 units reach the
+  ceiling.
+  - **Past 64, units buy no bandwidth.** An `m = 1` product on 120 units is no faster than on 64:
+    - `o` and `down` are the same;
+    - `qkv` 180 against 160 us, `gate|up` 383 against 352, the 1.7B head 1,051 against 1,024.
+  - **The 135M head is the exception.** At `K` = 576 it prefers 48-120 units.
+- **So the products' gap is not the read stream.** A product takes 1.2-1.8x its weights' stream on the same units:
+  - `o` 74 against 38 us;
+  - `down` 269 against 150;
+  - `qkv` 160 against 113;
+  - `gate|up` 352 against 300.
+- **The profile mode shows the same.** It splits a product into the mover's data phase, a ~15 us kernel tail and
+  the barrier. The data phase is `B`'s stream plus `A`'s reads.
+- **What the gap is made of:**
+  - **`A`'s reads:** one entry a `K` tile on every unit. That is 64 at `K` = 2048 and 256 for `down`'s 8192;
+  - **the compute after the last read:** ~15 us an op, not overlapped;
+  - **a deal's last round:** uneven on 120 units.
+
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 
 - **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of

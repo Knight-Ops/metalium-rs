@@ -362,6 +362,31 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   - ~30% in ~1,200 small ops.
 
   **Next, by that profile:**
+  - [ ] **Decode at GDDR's bandwidth** ([decode-to-bandwidth.md](decode-to-bandwidth.md), 2026-10-17): the umbrella
+    plan. The target is a step at **90-95% of GDDR's bandwidth** (~14.5-15.5 ms a 1.7B step, F32, batch 1, bit for
+    bit), not the roofline's 65%. It orders the items below:
+    - Phase 0: the read ceiling;
+    - Phase 1: the cache write;
+    - Phase 2: [decode-attention.md](decode-attention.md);
+    - Phase 3: barriers, row-limited element-wise ops, fusers;
+    - Phase 4: the products at the ceiling;
+    - Phase 5: the weight prefetch under the small ops.
+  - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
+    - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
+      - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.
+      - Its weights alone take 14.8 ms.
+      - The products run at 347 GB/s; `gate|up` at 367, not ~490.
+      - The activation is 1.25 GB a step, and the cache copies 0.83 GB.
+      - The other 1,007 ops take 18.3 ms and move little.
+    - **B1, done:** a unit's later blocks of a product read `A` once (`GATHER_A_RESIDENT`, gate `step198`, bit for
+      bit). A 1.7B step **42.97 / 45.41 / 48.59 -> 41.83 / 44.25 / 47.40 ms** (`1792209913`); the 135M step is
+      unchanged.
+    - **B2, designed:** a cross-op weight prefetch into L1.
+      - Capped at ~4.4 ms a step: L1 holds ~75 MB, against 273 MB of weights a layer.
+      - It needs barriers on the units an op ran on first (replay-fixed-cost P1).
+      - Recommended next: P1, then G7 (the activation multicast), then the prefetch if a replay probe shows it hides.
+
+    The items below continue under their own plans.
   - [x] a row write at a device-held position for the cache (2026-10-16; decode-length-cost B3): `scatter_nd` with
     `Assign` is one row scatter at resident indices (NC's `SCATTER_ROWS`, `Session::scatter_rows`, gate `step189`),
     and `FixedCache` writes a step's `kv` rows with it. A 1.7B decode step **73.65 / 76.08 / 79.30 -> 57.21 / 59.64 /
@@ -410,9 +435,32 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         (`1792189939`). Reading only those rows too was slower (19.2 -> 21.0 us) and was reverted.
       - Found: a chain must be able to begin one op into a block (a residual `Add` holds the norm's first op), and
         `ElementWiseFuser` lost its match to any later op while another fuser was open.
-  - [ ] **The cache write's two whole-cache copies, 2.25 ms** ([in-place-cache-write.md](in-place-cache-write.md),
-    scheduled 2026-10-16, phases D1-D5): donation declared before capture, buffer generations, then
-    `scatter_rows_into`.
+  - [x] **The cache write's two whole-cache copies** ([in-place-cache-write.md](in-place-cache-write.md) D1-D4,
+    2026-10-17, gate `step199`): donation declared before capture, buffer generations, then `scatter_rows_into`;
+    the write's indices read as a row. A 1.7B step **41.83 / 44.25 / 47.40 -> 38.97 / 41.41 / 44.58 ms**
+    (`1792263398`), 135M **18.59 / 19.07 / 19.79** (`1792263801`). D5 (the k/v repack) moved to
+    [decode-attention.md](decode-attention.md).
+  - [ ] **The roofline** (2026-10-17, [scoreboard](../learnings/performance-scoreboard.md#roofline-smollm2-17b-f32-one-card),
+    [log](../learnings/performance-log.md#the-17b-against-its-roofline-and-a-prefill-products-rate-2026-10-17-cards-0-and-1)).
+    For F32 on one card, the "realistic" targets are 25 ms a decode step and ~21 ms for a 256-token prefill; we are at
+    47.44 ms and 297.4 ms (`1792258449`). Decode closes through the items above. Two items are new:
+    - [ ] **Prefill products that reuse their operands.**
+      - **Now:** a prefill-shaped product reaches 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,
+        `1792258604`). It is bound by GDDR because each unit gathers its own tiles: `B` is read `m / 32` times, `A`
+        once per two-column block, up to once a unit. The largest product reads 3.2 GB for 77 MB.
+      - **Step 1:** a 2-D blocked product. Each unit holds an `A` strip and a `B` strip in L1 and streams `K`,
+        keeping each tile's `K` chain in order, so it stays bit for bit. This is ~4x fewer bytes.
+      - **Step 2:** multicast along the grid's rows and columns, so each operand leaves GDDR about once. This is the
+        same mechanism as G7 in [decode-step-bandwidth.md](decode-step-bandwidth.md). ttsim refuses
+        non-rectangular multicast.
+      - **Target:** the products compute-bound, ~40x from today.
+    - [ ] **Batched decode.**
+      - **Now:** `TracedGenerator` is batch 1, so the roofline's batch 4-32 rows (132-863 tokens/s "realistic") are
+        unreachable.
+      - **Why it pays:** a step is mostly per-op fixed cost, and an `m <= 16` product's thin reads cost the same
+        entries. So batch 2-16 should cost little more a step.
+      - **It needs:** a batch dimension in `FixedShapeDecoder`; a cache per sequence, with each sequence's position
+        and attended length; and the row scatter per sequence.
   - BF16 weights (half the bytes a token);
   - Llama-3.2-1B or Qwen2.5-1.5B for grouped-query attention, RoPE scaling and QKV biases.
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still

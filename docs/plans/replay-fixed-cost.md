@@ -53,12 +53,34 @@ stays bit for bit the eager step (`step185_fixed_decode`).
 - [x] **Device breakdown of the real replay** on unit 0, mover stamps only, mapped back to labelled `OpRecord`s:
   device time by op class and by layer.
 
-### P1. Barriers in a capture on the units an op ran on (waits: P0 put its share at ~1.5 ms a step)
+### P1. Barriers in a capture on the units an op ran on (done 2026-10-17)
 
-- [ ] A captured op's barrier counts only the units it ran on; a unit that sat out ops waits (a wait-only `BARRIER`
-  entry in its stream) before its next op, as eager execution's catch-up does. A replay advances the barrier counter by
-  the arrivals the capture counted, and ends with every unit's arrival so `sync` still means every unit is done.
-- [ ] Gate `step186_trace_barrier_participants` (ttsim, then card 0), with a negative control on ttsim only.
+- [x] **The change** (`Session::enqueue_work_inner`, `end_trace`, `replay`):
+  - a captured op's barrier counts only the units it ran on;
+  - a unit that sat out ops gets a wait-only `BARRIER` in its stream, relative to the capture's first as the firmware
+    relocates every `BARRIER`, before its next op. The capture's own run catches it up eagerly;
+  - at `end_trace` a unit still behind waits for the last barrier, so a replay leaves every unit it ran on past all
+    of them;
+  - a replay adds the arrivals the capture counted (`Trace::barriers`), not `barriers * n`.
+
+  Unit 0 runs every op's first job, so it still arrives at every barrier, which the profile mode's split of a replay
+  relies on.
+- [x] **Gate:** `step176_barrier_participants::a_captured_op_s_barrier_counts_the_units_it_ran_on` (ttsim; card 0
+  `1792266278`). The name `step186` was taken.
+  - the arrivals are each op's units, fewer than ops x units;
+  - unit 0's stream holds 4 arrivals; units 1-3's hold 2 arrivals and 2 waits (`Session::trace_barrier_entries`);
+  - three replays with fresh operands give the host's products, and so does an eager op after each.
+  - **Watched failing:**
+    - the replay adding one arrival too many (the next barrier never completes);
+    - the waits dropped from the streams (the stream counts).
+  - **On silicon, dropping the waits did not give wrong bits** (card 0, with unit 0's op lengthened to 1,024 `K`
+    tiles). The replay's start (~170 us a unit before its first op) closes the window there, so the stream check is
+    the control.
+- [x] **Measured** (card 1): 1.7B 38.97 / 41.41 / 44.58 -> 38.93 / 41.38 / 44.58 ms (`1792266392`); 135M 18.59 /
+  19.07 / 19.79 -> 18.59 / 19.03 / 19.81 (`1792266789`).
+  - **Within noise, below P0's ~1.5 ms:** an idle unit's arrival costs the others almost nothing.
+  - **What it buys is the condition for a prefetch** (decode-step-bandwidth B2.0): a unit can now stream between ops
+    without holding their barriers.
 
 ### P2. What the P0 table showed, largest first
 

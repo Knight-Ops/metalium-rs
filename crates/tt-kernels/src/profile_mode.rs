@@ -99,6 +99,103 @@ pub struct OpTime {
     pub other: u64,
 }
 
+/// The card's measured GDDR read rate, 120 tiles (performance scoreboard, "GDDR6 reads, card,
+/// 120 tiles"): what a step's bytes are held against.
+pub const CARD_READ_GBPS: f64 = 469.0;
+
+/// What one captured op moves through GDDR, summed over its units: counted from its entries when
+/// the trace is stored, with records expanded as the movers expand them. Bytes are requested
+/// lengths; host and L1-only entries are not counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpBytes {
+    /// Bytes read from GDDR.
+    pub read: u64,
+    /// Bytes written to GDDR.
+    pub write: u64,
+    /// Read entries: the mover's cost is per entry as much as per byte.
+    pub reads: u64,
+    /// Write entries.
+    pub writes: u64,
+    /// Of `read`, what `GATHER`s read into their `A` operand's slots (a product's activation).
+    pub a: u64,
+    /// Of `read`, what `GATHER`s read into their `B` operand's slots (its weights, or a cache).
+    pub b: u64,
+}
+
+impl OpBytes {
+    pub fn add(&mut self, o: &OpBytes) {
+        self.read += o.read;
+        self.write += o.write;
+        self.reads += o.reads;
+        self.writes += o.writes;
+        self.a += o.a;
+        self.b += o.b;
+    }
+
+    /// Count `entries` (a list, a stream or a section; `PAIR` headers, credits and control entries
+    /// move nothing) into `self`. A record that does not expand is counted as nothing: the capture
+    /// validated it, so that does not happen.
+    pub fn count(&mut self, entries: &[[u32; 8]]) {
+        use tt_isa::dm::{record, TILE_SLOT};
+        let mut i = 0;
+        while i < entries.len() {
+            let head = entries[i];
+            let n = record::len(head[0]).max(1);
+            if record::is_record(head[0]) {
+                let Some(rec) = entries.get(i..i + n) else {
+                    return;
+                };
+                // A gather's `A` slots, from its header: `rows x kt` slots from `a_at`.
+                let a_slots = (head[0] == record::GATHER).then(|| {
+                    let (a_at, rows, kt) = (
+                        head[2] as u64,
+                        head[5] as u64,
+                        record::gather_kt(head[1]) as u64,
+                    );
+                    a_at..a_at + rows * kt * TILE_SLOT
+                });
+                let _ = record::expand(rec, |e| {
+                    let len = self.entry(e);
+                    if len > 0 {
+                        match &a_slots {
+                            Some(a) if a.contains(&(e[4] as u64)) => self.a += len,
+                            Some(_) => self.b += len,
+                            None => {}
+                        }
+                    }
+                    Ok(())
+                });
+            } else {
+                self.entry(head);
+            }
+            i += n;
+        }
+    }
+
+    /// Count one plain entry: the bytes it reads from GDDR (returned), or writes.
+    fn entry(&mut self, e: [u32; 8]) -> u64 {
+        match e[0] {
+            // A transposed or broadcast read is one tile slot, its length in the same word.
+            op::READ | op::READ_TRANSPOSED | op::READ_BROADCAST_COL => {
+                self.read += e[5] as u64;
+                self.reads += 1;
+                e[5] as u64
+            }
+            op::READ_ENCODED => {
+                self.read += e[7] as u64;
+                self.reads += 1;
+                e[7] as u64
+            }
+            op::WRITE => {
+                self.write += e[5] as u64;
+                self.writes += 1;
+                0
+            }
+            _ => 0,
+        }
+    }
+}
+
 impl OpTime {
     fn finish(mut self, detail: Detail, data: u64) -> Self {
         let known = self.barrier + self.kernels + self.control;
@@ -230,6 +327,8 @@ pub struct OpInfo {
     pub what: &'static str,
     /// Units that ran a share of it.
     pub units: usize,
+    /// What it moves through GDDR.
+    pub bytes: OpBytes,
 }
 
 /// A trace's ops and their samples, one per replay that stamped them.
@@ -440,6 +539,15 @@ pub struct ProfileReport {
     pub traces: BTreeMap<u64, TraceSamples>,
 }
 
+/// `bytes` moved in `us` microseconds, in GB/s (`0` for no time).
+fn gbps(bytes: u64, us: f64) -> f64 {
+    if us > 0.0 {
+        bytes as f64 / us / 1e3
+    } else {
+        0.0
+    }
+}
+
 fn median(mut v: Vec<u64>) -> u64 {
     if v.is_empty() {
         return 0;
@@ -541,6 +649,114 @@ impl ProfileReport {
         }
     }
 
+    /// A trace's GDDR traffic (counted when it was stored, in the profile mode) against its covered
+    /// ops' median spans: by label, then the step budget -- its bytes at [`CARD_READ_GBPS`] against
+    /// its time, the products (ops that gathered a `B` operand) apart from everything else.
+    fn bytes_tables(&self, out: &mut String, t: &TraceSamples, medians: &[Option<OpTime>]) {
+        let covered: Vec<(&OpInfo, &OpTime)> = t
+            .ops
+            .iter()
+            .zip(medians)
+            .filter_map(|(o, m)| m.as_ref().map(|m| (o, m)))
+            .collect();
+        if covered.iter().all(|(o, _)| o.bytes == OpBytes::default()) {
+            return;
+        }
+        #[derive(Default)]
+        struct Sum {
+            ops: u64,
+            span: u64,
+            barrier: u64,
+            bytes: OpBytes,
+        }
+        impl Sum {
+            fn add(&mut self, o: &OpInfo, m: &OpTime) {
+                self.ops += 1;
+                self.span += m.span;
+                self.barrier += m.barrier;
+                self.bytes.add(&o.bytes);
+            }
+        }
+        let mb = |b: u64| b as f64 / 1e6;
+        let mut labels: BTreeMap<&str, Sum> = BTreeMap::new();
+        for (o, m) in &covered {
+            labels.entry(o.label).or_default().add(o, m);
+        }
+        let mut labels: Vec<_> = labels.into_iter().collect();
+        labels.sort_by_key(|(_, s)| std::cmp::Reverse(s.bytes.read + s.bytes.write));
+        let _ = writeln!(
+            out,
+            "\nGDDR traffic by label (all units; `A`/`B`: what gathers read into a product's operands):\n\n\
+             | label | ops | us | read MB | write MB | reads | writes | A MB | B MB | GB/s |\n\
+             |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|"
+        );
+        for (label, s) in &labels {
+            let b = &s.bytes;
+            let _ = writeln!(
+                out,
+                "| {} | {} | {:.1} | {:.1} | {:.1} | {} | {} | {:.1} | {:.1} | {:.0} |",
+                if label.is_empty() {
+                    "(unlabelled)"
+                } else {
+                    label
+                },
+                s.ops,
+                self.us(s.span),
+                mb(b.read),
+                mb(b.write),
+                b.reads,
+                b.writes,
+                mb(b.a),
+                mb(b.b),
+                gbps(b.read + b.write, self.us(s.span)),
+            );
+        }
+        let (mut products, mut rest, mut all) = (Sum::default(), Sum::default(), Sum::default());
+        for (o, m) in &covered {
+            all.add(o, m);
+            if o.bytes.b > 0 {
+                products.add(o, m)
+            } else {
+                rest.add(o, m)
+            }
+        }
+        let floor = |bytes: u64| bytes as f64 / CARD_READ_GBPS / 1e3;
+        let _ = writeln!(
+            out,
+            "\nStep budget ({} of {} ops covered): {:.1} us, {:.1} MB read and {:.1} MB written; \
+             at {CARD_READ_GBPS} GB/s those bytes take {:.1} us, the products' `B` alone {:.1} us. \
+             Barriers {:.1} us.\n\n\
+             | part | ops | us | MB moved | entries | GB/s | us at {CARD_READ_GBPS} GB/s | us over it |\n\
+             |---|--:|--:|--:|--:|--:|--:|--:|",
+            covered.len(),
+            t.ops.len(),
+            self.us(all.span),
+            mb(all.bytes.read),
+            mb(all.bytes.write),
+            floor(all.bytes.read + all.bytes.write),
+            floor(all.bytes.b),
+            self.us(all.barrier),
+        );
+        for (part, s) in [
+            ("products", &products),
+            ("everything else", &rest),
+            ("all", &all),
+        ] {
+            let moved = s.bytes.read + s.bytes.write;
+            let _ = writeln!(
+                out,
+                "| {part} | {} | {:.1} | {:.1} | {} | {:.0} | {:.1} | {:.1} |",
+                s.ops,
+                self.us(s.span),
+                mb(moved),
+                s.bytes.reads + s.bytes.writes,
+                gbps(moved, self.us(s.span)),
+                floor(moved),
+                self.us(s.span) - floor(moved),
+            );
+        }
+    }
+
     /// The report as markdown: eager ops by label, then each trace by label and its costliest ops.
     /// `name` names a trace by its session id.
     pub fn summary(&self, name: &dyn Fn(u64) -> String) -> String {
@@ -602,6 +818,7 @@ impl ProfileReport {
                     .filter_map(|(o, m)| m.as_ref().map(|m| (o.label, m))),
             );
             self.label_table(&mut out, &rows, "ops");
+            self.bytes_tables(&mut out, t, &medians);
             let mut top: Vec<(usize, &OpTime)> = medians
                 .iter()
                 .enumerate()
@@ -636,12 +853,18 @@ impl ProfileReport {
     /// (medians over their samples). Microseconds.
     pub fn tsv(&self, name: &dyn Fn(u64) -> String) -> String {
         let mut out = String::from(
-            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\n",
+            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\n",
         );
-        let mut row = |source: &str, i: usize, o: (&str, &str, usize), n: usize, t: &OpTime| {
+        let none = OpBytes::default();
+        let mut row = |source: &str,
+                       i: usize,
+                       o: (&str, &str, usize, &OpBytes),
+                       n: usize,
+                       t: &OpTime| {
+            let b = o.3;
             let _ = writeln!(
                 out,
-                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
+                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
                 o.0,
                 o.1,
                 o.2,
@@ -650,11 +873,18 @@ impl ProfileReport {
                 self.us(t.kernels),
                 self.us(t.control),
                 self.us(t.data),
-                self.us(t.other)
+                self.us(t.other),
+                b.read,
+                b.write,
+                b.reads,
+                b.writes,
+                b.a,
+                b.b,
+                gbps(b.read + b.write, self.us(t.span)),
             );
         };
         for (i, s) in self.eager.iter().enumerate() {
-            row("eager", i, (s.label, s.what, 0), 1, &s.time);
+            row("eager", i, (s.label, s.what, 0, &none), 1, &s.time);
         }
         for (&id, t) in &self.traces {
             let source = name(id);
@@ -663,7 +893,7 @@ impl ProfileReport {
                     row(
                         &source,
                         i,
-                        (o.label, o.what, o.units),
+                        (o.label, o.what, o.units, &o.bytes),
                         t.samples[i].len(),
                         &m,
                     );
@@ -795,6 +1025,7 @@ mod tests {
                         label: "x",
                         what: "y",
                         units: 1,
+                        bytes: OpBytes::default(),
                     })
                     .collect(),
                 vec![9; n],

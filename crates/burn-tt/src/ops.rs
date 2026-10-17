@@ -1238,12 +1238,13 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
     )
 }
 
-/// A device result that reads `parent`'s slots, keeping it alive.
+/// A device result that reads `parent`'s slots, keeping it alive: a view of the contents
+/// `parent` names ([`crate::tensor::DramRef::generation`]).
 fn device_view(
     device: TtDevice,
     id: crate::server::BufferId,
     [m, n]: [usize; 2],
-    parent: Option<std::sync::Arc<crate::tensor::Buffer>>,
+    parent: Option<&crate::tensor::DramRef>,
     dtype: DType,
 ) -> TtTensor {
     let buffer = std::sync::Arc::new(crate::tensor::Buffer {
@@ -1251,17 +1252,12 @@ fn device_view(
         device,
         rows: m,
         cols: n,
-        storage: parent
-            .as_ref()
-            .map_or(crate::storage::StorageFormat::F32, |p| p.storage),
+        storage: parent.map_or(crate::storage::StorageFormat::F32, |p| p.buffer.storage),
         plain: Default::default(),
-        parent,
+        parent: parent.map(|p| p.buffer.clone()),
     });
     TtTensor::on_device(
-        crate::tensor::DramRef {
-            buffer,
-            transposed: false,
-        },
+        crate::tensor::DramRef::of(buffer, false, parent.map_or(0, |p| p.generation)),
         burn_backend::Shape::from(vec![m, n]),
         dtype,
         device,
@@ -1749,10 +1745,7 @@ fn swapped_view(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor>
         return None;
     }
     let d = tensor.dram()?;
-    let d = crate::tensor::DramRef {
-        buffer: d.buffer.clone(),
-        transposed: !d.transposed,
-    };
+    let d = crate::tensor::DramRef::of(d.buffer.clone(), !d.transposed, d.generation);
     let s = tensor.shape().to_vec();
     Some(TtTensor::on_device(
         d,
@@ -1791,10 +1784,7 @@ pub(crate) fn reshaped(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor
             if target == [c, r] && (r == 1 || c == 1) {
                 let plain = plain_dram(&tensor);
                 let view = TtTensor::on_device(
-                    crate::tensor::DramRef {
-                        buffer: plain.buffer,
-                        transposed: true,
-                    },
+                    crate::tensor::DramRef::of(plain.buffer, true, plain.generation),
                     burn_backend::Shape::new([c, r]),
                     tensor.dtype(),
                     tensor.device,
@@ -3135,7 +3125,7 @@ pub mod float {
             tensor.device,
             id,
             dims,
-            Some(d.buffer.clone()),
+            Some(d),
             tensor.dtype(),
         ))
     }

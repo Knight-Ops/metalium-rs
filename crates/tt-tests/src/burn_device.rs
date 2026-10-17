@@ -619,6 +619,16 @@ fn sim_factory(
             self.buffers
                 .scatter_rows(&mut self.session, table, indices, values, column)
         }
+        fn scatter_rows_into(
+            &mut self,
+            table: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+            values: burn_tt::BufferId,
+            column: bool,
+        ) -> Result<(), TtError> {
+            self.buffers
+                .scatter_rows_into(&mut self.session, table, indices, values, column)
+        }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }
@@ -646,6 +656,10 @@ fn sim_factory(
         }
         fn trace_ops(&mut self, trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
             self.buffers.trace_ops(&self.session, trace)
+        }
+        fn set_count_trace_bytes(&mut self, on: bool) -> Result<(), TtError> {
+            self.session.set_count_trace_bytes(on);
+            Ok(())
         }
         fn trace_footprint(
             &mut self,

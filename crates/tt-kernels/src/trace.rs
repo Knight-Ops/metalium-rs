@@ -125,11 +125,14 @@ pub struct OpRecord {
     pub label: &'static str,
     /// Per unit, the range of that unit's stream its lists took.
     pub entries: Vec<core::ops::Range<usize>>,
-    /// Whether a barrier followed it on every unit.
+    /// Whether a barrier followed it, on the units it ran on.
     pub barrier: bool,
     /// The events it could stamp in the profile mode on its busiest unit, at most:
     /// `[Detail::Ops, Detail::Full]` (`crate::profile_mode`). Set when the trace is stored.
     pub stamps: [u32; 2],
+    /// What it moves through GDDR on all its units. Counted when the trace is stored, in the
+    /// profile mode only; zero otherwise.
+    pub bytes: crate::profile_mode::OpBytes,
 }
 
 /// What a stored stream is made of: how many entries it holds, how many of those
@@ -277,7 +280,7 @@ pub(crate) struct Capture {
     pub(crate) epoch: u64,
     /// The session's barrier count when it began.
     pub(crate) barriers_base: u32,
-    /// Barriers captured.
+    /// Arrivals at the barriers captured: each barrier's units, the ones its op ran on.
     pub(crate) barriers: u32,
     pub(crate) units: Vec<UnitCapture>,
     /// Frees during the capture, deferred to the trace's release.
@@ -305,13 +308,15 @@ pub(crate) struct UnitTrace {
     pub(crate) composition: Composition,
     pub(crate) top_level_entries: u32,
     pub(crate) gddr_bytes: u64,
+    /// Its stream's `BARRIER` entries: `[arrivals, wait-only]`.
+    pub(crate) barriers: [u32; 2],
 }
 
 /// A finished trace: see the module documentation.
 pub(crate) struct Trace {
     pub(crate) epoch: u64,
     pub(crate) units: Vec<Option<UnitTrace>>,
-    /// Barriers a replay takes.
+    /// Arrivals a replay adds to the barrier counter ([`Capture::barriers`]).
     pub(crate) barriers: u32,
     /// GDDR's free space when the capture ended: whatever was not free, the
     /// trace holds.

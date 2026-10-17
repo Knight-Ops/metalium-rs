@@ -22,7 +22,8 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// rows, j0, cols]` + `A` + `B`. Row `i` of the block's `A` tiles, `K` tile
 /// `kk`, goes to `a_at + (i * kt + kk) * TILE_SLOT`; `K` tile `kk` of its
 /// column `j` of `B` to `b_at + (kk * cols + j) * TILE_SLOT`. `flags`: bit 0
-/// `A` is read transposed, bit 1 `B`, bits 8.. `kt`. Bit 2 selects packed
+/// `A` is read transposed, bit 1 `B`, bits 8..=24 `kt` ([`gather_kt`]), bit 25
+/// [`GATHER_A_RESIDENT`]; bits 26-31 zero. Bit 2 selects packed
 /// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
 /// logical rows/columns and words 6/7 their tile row/column origins.
 /// GDDR slots are 2112 bytes; L1 slots remain 4160.
@@ -38,6 +39,19 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// then undefined. 0: whole tiles.
 pub const GATHER: u32 = 0x10;
 pub const GATHER_BF16: u32 = 1 << 2;
+/// [`GATHER`]'s flag for a block whose `A` is already in its slots: the same
+/// unit's previous gather of the op read the same `A` block to the same `a_at`,
+/// and nothing since wrote there (a product's later rounds on a unit, under one
+/// staging). Only `B` is read; `A`'s slots keep what they hold.
+pub const GATHER_A_RESIDENT: u32 = 1 << 25;
+/// [`GATHER`]'s flag bits that are not `kt`.
+const GATHER_FLAG_BITS: u32 = GATHER_A_RESIDENT | 0xff;
+
+/// [`GATHER`]'s `kt`, from its flags (bits 26-31 set make it too large for
+/// [`MAX_EXTENT`], so a record with them is refused).
+pub const fn gather_kt(flags: u32) -> u32 {
+    (flags & !GATHER_FLAG_BITS) >> 8
+}
 /// Where [`GATHER`]'s `r` sits in its flags.
 pub const GATHER_ROWS_SHIFT: u32 = 3;
 
@@ -408,7 +422,8 @@ fn expand_for<const READS: bool, const WRITES: bool>(
     match h[0] {
         GATHER => {
             let [_, flags, a_at, b_at, i0, rows, j0, cols] = h;
-            let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(flags >> 8)?);
+            let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(gather_kt(flags))?);
+            let resident = flags & GATHER_A_RESIDENT != 0;
             let (rows, cols) = (extent(rows)?, extent(cols)?);
             let (a, b) = (tensor(rec, 1)?, tensor(rec, 3)?);
             if flags & GATHER_BF16 != 0 {
@@ -418,7 +433,10 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 for (x, meta, r0, nr, c0, nc, at) in [
                     (&a, rec[1], i0, rows, 0, kt, a_at),
                     (&b, rec[3], 0, kt, j0, cols, b_at),
-                ] {
+                ]
+                .into_iter()
+                .skip(usize::from(resident))
+                {
                     let (height, width) = (meta[4], meta[5]);
                     let r0 = r0.checked_add(meta[6]).ok_or(super::error::RANGE)?;
                     let c0 = c0.checked_add(meta[7]).ok_or(super::error::RANGE)?;
@@ -508,7 +526,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             if thin > 16 || (thin != 0 && a_t) {
                 return Err(super::error::RANGE);
             }
-            for i in 0..rows {
+            for i in (0..rows).filter(|_| !resident) {
                 let mut row = if a_t {
                     None
                 } else {
@@ -1218,6 +1236,61 @@ mod tests {
         assert_eq!(gather(0).unwrap(), whole, "0 is whole tiles");
         for bad in [gather_rows(17), gather_rows(31), gather_rows(1) | 1] {
             assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
+        }
+    }
+
+    /// A gather with `A` resident is the same gather without `A`'s entries -- whole, thin,
+    /// transposed and packed BF16 -- with `B`'s unchanged; `kt` is read past the flag; and a flag
+    /// bit above it is refused.
+    #[test]
+    fn a_resident_gather_reads_only_b() {
+        let mut a = t(3, 5);
+        a.first = 2;
+        let mut b = t(3, 7);
+        b.first = 4;
+        let [a0, a1] = a.encode();
+        let [b0, b1] = b.encode();
+        let (i0, rows, j0, cols, kt) = (1u32, 2u32, 2u32, 3u32, 4u32);
+        let gather = |flags: u32, a0: [u32; 8], b0: [u32; 8]| {
+            let head = [
+                GATHER,
+                flags | kt << 8,
+                0x2_0000,
+                0x6_0000,
+                i0,
+                rows,
+                j0,
+                cols,
+            ];
+            let mut got = Vec::new();
+            expand(&[head, a0, a1, b0, b1], |e| {
+                got.push(e);
+                Ok(())
+            })
+            .map(|_| got)
+        };
+        let a_entries = (rows * kt) as usize;
+        for flags in [0, 1, 2, 3, gather_rows(1), gather_rows(16) | 2] {
+            let whole = gather(flags, a0, b0).unwrap();
+            let resident = gather(flags | GATHER_A_RESIDENT, a0, b0).unwrap();
+            assert_eq!(resident, whole[a_entries..], "flags {flags:#x}");
+            assert!(resident.iter().all(|e| e[4] >= 0x6_0000), "only B's slots");
+        }
+        // Packed BF16, both operands ragged (`A` 70 x 150, `B` 110 x 200): the fills go with the
+        // tiles they pad.
+        let (mut pa, mut pb) = (a0, b0);
+        [pa[4], pa[5], pb[4], pb[5]] = [70, 150, 110, 200];
+        let whole = gather(GATHER_BF16, pa, pb).unwrap();
+        let resident = gather(GATHER_BF16 | GATHER_A_RESIDENT, pa, pb).unwrap();
+        let first_b = whole.iter().position(|e| e[4] >= 0x6_0000).unwrap();
+        assert_eq!(resident, whole[first_b..]);
+        assert_eq!(gather_kt(GATHER_A_RESIDENT | 7 << 8 | 0xff), 7);
+        for bad in [1 << 26, 1 << 31] {
+            assert_eq!(
+                gather(bad, a0, b0),
+                Err(super::super::error::LENGTH),
+                "{bad:#x}"
+            );
         }
     }
 

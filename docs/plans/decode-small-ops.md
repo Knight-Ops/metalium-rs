@@ -3,7 +3,8 @@
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile". Written 2026-10-16 against `7e9def9`. Status: **S1, S2a, F0, S2b and S3
 done (2026-10-16; a 1.7B step 42.97 / 45.41 / 48.59 ms on `Tt` with S3's row-limited statistic, run `1792189445`);
 S1d, S4, S5 open.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
-[in-place-cache-write.md](in-place-cache-write.md) (the cache write's copies).
+[in-place-cache-write.md](in-place-cache-write.md) (the cache write's copies). The whole step's byte budget, and the
+weight prefetch that would overlap these ops, are [decode-step-bandwidth.md](decode-step-bandwidth.md).
 
 ## Why this item
 
@@ -234,6 +235,8 @@ projection), or `FixedWrite` taking the rows before the head split.
     kernels run (what that saves there is unmeasured).
 
 ### S4. Attention's non-product ops (~4.5 ms)
+
+Superseded by [decode-attention.md](decode-attention.md) (2026-10-17), which takes both items below.
 
 - [ ] The `qk`/`pv` row gathers (1.12 + 1.13 ms) gather the operands into tile rows every call
   ([attention-jobs.md](../completed-plans/attention-jobs.md) P1-P2). For a decode step's single query, check whether

@@ -565,6 +565,21 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             .collect()
     }
 
+    /// Each trace's ops as captured (`burn_tt::TracedInference::ops`), named as `footprint` names
+    /// the traces (`Step(64)`, `Chunk(32)`): with their GDDR bytes when the capture counted them
+    /// (the profile mode, or `burn_tt::set_count_trace_bytes`).
+    pub fn trace_ops(&self) -> Result<Vec<(String, Vec<burn_tt::OpRecord>)>, GenerateError> {
+        let mut out = Vec::new();
+        for set in &self.sets {
+            for key in set.keys() {
+                if let Some(t) = set.get(key) {
+                    out.push((format!("{key:?}"), t.ops()?));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Feed `prompt` from position 0 (as [`schedule`] says) and return the logits after its last
     /// token. Whatever the cache held is overwritten as it is reached.
     pub fn prefill(&self, prompt: &[i32]) -> Result<Vec<f32>, GenerateError> {

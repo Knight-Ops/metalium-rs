@@ -21,7 +21,7 @@ flowchart TD
         PL8["kernel-fusion.md (B12 & B13a-c Burn Fusion)"]
         PL9["mixed-bfp-storage.md (BFP8/4/2 Contract & PRNG Diagnostics)"]
         PL10["ttinsn-push-experiment.md (done: result go)"]
-        PL11["decode-matmul-bandwidth.md, decode-small-ops.md, in-place-cache-write.md (LLM decode performance)"]
+        PL11["decode-to-bandwidth.md, decode-attention.md, decode-matmul-bandwidth.md, decode-small-ops.md, in-place-cache-write.md (LLM decode performance)"]
     end
 
     subgraph Tier1["Tier 1: docs/learnings/ (Ground Truth & Learnings)"]
@@ -85,6 +85,7 @@ Actionable technical specifications, interface contracts, and execution checklis
   - [`traced-execution.md`](plans/traced-execution.md): Comprehensive implementation plan for generalized multi-input inference and whole training step hardware traces (`TracedInference`, `TracedTrainingStep`).
   - [`kernel-fusion.md`](plans/kernel-fusion.md): Actionable specification and execution checklist for Burn backend kernel fusion milestones B12 and B13a–B13c.
   - [`decode-matmul-bandwidth.md`](plans/decode-matmul-bandwidth.md): an LLM decode step's `m = 1` products against GDDR's bandwidth (P0-P3 done: thin activation reads, an even last round, fused projections; P5 open: one channel a column).
+  - [`decode-to-bandwidth.md`](plans/decode-to-bandwidth.md): the umbrella plan for single-user decode at 90-95% of GDDR's bandwidth, ordering the decode plans below; with [`decode-attention.md`](plans/decode-attention.md) (attention reading the cache in place).
   - [`decode-small-ops.md`](plans/decode-small-ops.md): the decode step's non-matmul half (RMSNorm, RoPE, attention, SiLU): repack fixes first, then where fusion lives.
   - [`in-place-cache-write.md`](plans/in-place-cache-write.md): writing a traced key/value cache in place (no whole-cache copy a write), and the donation and buffer-generation rules that make a read of the overwritten cache an error by name (was a proposal).
 

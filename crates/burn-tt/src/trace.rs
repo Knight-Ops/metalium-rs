@@ -178,6 +178,38 @@ impl Trace {
     }
 }
 
+/// Whether a capture with state named up front writes it in place
+/// ([`set_state_in_place`]); on unless a gate turns it off.
+static STATE_IN_PLACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn off (or back on) writing a capture's state in place, process-wide: off, a
+/// [`SharedStateTraces`] capture copies its cache and writes it back after the step, as
+/// [`TracedInference::capture_with_state`] does. For gates' negative controls. Dev-facing.
+#[doc(hidden)]
+pub fn set_state_in_place(on: bool) {
+    STATE_IN_PLACE.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The buffers a capture owns as its state while its step runs ([`server::donate`]), given
+/// back when it is dropped, so an error or a panic inside the step cannot leave one donated.
+#[derive(Default)]
+struct Donation(Vec<server::BufferId>);
+
+impl Donation {
+    fn give(&mut self, id: server::BufferId) {
+        server::donate(id);
+        self.0.push(id);
+    }
+}
+
+impl Drop for Donation {
+    fn drop(&mut self) {
+        for &id in &self.0 {
+            server::undonate(id);
+        }
+    }
+}
+
 impl Drop for Trace {
     fn drop(&mut self) {
         let id = self.id;
@@ -222,6 +254,21 @@ impl TracedInference {
         inputs: &[&TtTensor],
         f: impl FnOnce() -> (Vec<TtTensor>, Vec<(TtTensor, TtTensor)>),
     ) -> Result<(Self, Vec<server::OutputPayload>), TtError> {
+        Self::capture_donating(inputs, &[], f)
+    }
+
+    /// [`TracedInference::capture_with_state`] of a step whose state is named before it runs:
+    /// `state`, each tensor owning its buffer, is the capture's to write in place
+    /// (`docs/plans/in-place-cache-write.md`). A row scatter into one (`scatter_nd` with
+    /// `Assign`, a cache write) then writes the state's own buffer instead of a copy of it,
+    /// and a `(new, state)` pair over one buffer needs no write-back. A read of a state tensor
+    /// after its write, or of a view of it taken before, is refused by name: the step must
+    /// read what the write returned. The donation ends with the step, also on an error.
+    pub(crate) fn capture_donating(
+        inputs: &[&TtTensor],
+        state: &[&TtTensor],
+        f: impl FnOnce() -> (Vec<TtTensor>, Vec<(TtTensor, TtTensor)>),
+    ) -> Result<(Self, Vec<server::OutputPayload>), TtError> {
         let Some(first_in) = inputs.first() else {
             return Err(TtError::Device(
                 "a trace needs at least one input tensor".into(),
@@ -251,9 +298,36 @@ impl TracedInference {
             server::written_in_place(d.buffer.id);
         }
 
+        let mut donation = Donation::default();
+        for t in state {
+            if t.device != device {
+                return Err(TtError::Device(
+                    "state tensors must belong to the trace device".into(),
+                ));
+            }
+            if !t.is_storable() || t.storage_format() != crate::storage::StorageFormat::F32 {
+                return Err(TtError::Device(
+                    "state written in place must be storable, unpacked tensors".into(),
+                ));
+            }
+            let d = t.to_dram();
+            if d.transposed || d.buffer.parent.is_some() {
+                return Err(TtError::Device(
+                    "state written in place must own its buffer: not a transposed or row view"
+                        .into(),
+                ));
+            }
+            if STATE_IN_PLACE.load(std::sync::atomic::Ordering::SeqCst) {
+                donation.give(d.buffer.id);
+            }
+        }
+
         server::run(device, |e, _| e.begin_trace())?;
         let mut guard = Capturing::new(device, false);
         let (outs, updates) = f();
+        // From here nothing reads the state as the step's: the write-back below reads it as
+        // the buffer the next replay finds.
+        drop(donation);
         let mut out_info = Vec::with_capacity(outs.len());
         for out in &outs {
             if out.device != device {
@@ -290,7 +364,13 @@ impl TracedInference {
                     "state must own its buffer, and neither side be a transposed view".into(),
                 ));
             }
-            server::copy_into(device, new_d.buffer.id, state_d.buffer.id)?;
+            if new_d.buffer.id == state_d.buffer.id {
+                // The step wrote the state's own buffer in place: nothing to write back. The
+                // buffer is still one whose contents change after it is made.
+                server::written_in_place(state_d.buffer.id);
+            } else {
+                server::copy_into(device, new_d.buffer.id, state_d.buffer.id)?;
+            }
             held_state.push(new);
             held_state.push(state);
         }
@@ -511,7 +591,8 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
         }
         let state = self.state.clone();
         let mut mismatch = None;
-        let (trace, first) = TracedInference::capture_with_state(inputs, || {
+        let donated: Vec<&TtTensor> = self.state.iter().collect();
+        let (trace, first) = TracedInference::capture_donating(inputs, &donated, || {
             let (outs, new) = f();
             if new.len() != state.len() {
                 mismatch = Some(format!(
@@ -603,6 +684,14 @@ impl<K> SetFootprint<K> {
 #[doc(hidden)]
 pub fn set_profile_buffer(device: TtDevice, bytes: Option<u64>) -> Result<(), TtError> {
     server::run(device, move |e, _| e.set_profile_buffer(bytes))
+}
+
+/// Count what each op of every trace captured on `device` from here on moves through GDDR, as the
+/// profile mode does, without it (`Session::set_count_trace_bytes`): read back as each op's
+/// `bytes` from [`TracedInference::ops`]. Host work only, so the simulator runs it. Dev-facing.
+#[doc(hidden)]
+pub fn set_count_trace_bytes(device: TtDevice, on: bool) -> Result<(), TtError> {
+    server::run(device, move |e, _| e.set_count_trace_bytes(on))
 }
 
 /// Detailed timing breakdown of a traced training step.

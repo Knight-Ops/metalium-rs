@@ -252,6 +252,14 @@ pub const SMOKE: &[&str] = &[
     "step195_fused_rms_norm::",
     // RMSNorm's statistic over only the row groups a tile row's rows occupy (decode-small-ops.md S3).
     "step196_row_limited_rms::",
+    // A traced decode step's GDDR bytes, counted at its store: each weight read once
+    // (decode-step-bandwidth.md B0).
+    "step197_trace_bytes::",
+    // A traced decode step's cache written in place, a stale read refused by name
+    // (in-place-cache-write.md D1-D3).
+    "step199_in_place_cache_write::",
+    // Element-wise ops on a decode row's row groups only (decode-to-bandwidth.md Phase 3).
+    "step200_row_limited_eltwise::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

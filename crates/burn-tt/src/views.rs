@@ -55,10 +55,7 @@ impl Strided {
             strides = vec![[0, 1], [1, 0]];
         }
         Strided {
-            src: DramRef {
-                buffer: d.buffer.clone(),
-                transposed: false,
-            },
+            src: DramRef::of(d.buffer.clone(), false, d.generation),
             base: [0, 0],
             strides,
         }
@@ -147,16 +144,18 @@ impl Strided {
                 .all(|((a, b), &n)| n == 1 || a == b)
         };
         if stored_dims(shape) == Some(dims) && same(&plain_strides(shape)) {
-            return Some(DramRef {
-                buffer: self.src.buffer.clone(),
-                transposed: false,
-            });
+            return Some(DramRef::of(
+                self.src.buffer.clone(),
+                false,
+                self.src.generation,
+            ));
         }
         if shape.len() == 2 && [shape[1], shape[0]] == dims && same(&[[0, 1], [1, 0]]) {
-            return Some(DramRef {
-                buffer: self.src.buffer.clone(),
-                transposed: true,
-            });
+            return Some(DramRef::of(
+                self.src.buffer.clone(),
+                true,
+                self.src.generation,
+            ));
         }
         None
     }
@@ -514,13 +513,7 @@ mod tests {
             storage: crate::storage::StorageFormat::F32,
             plain: Default::default(),
         });
-        let v = Strided::of(
-            &DramRef {
-                buffer: buffer.clone(),
-                transposed: false,
-            },
-            shape,
-        );
+        let v = Strided::of(&DramRef::of(buffer.clone(), false, 0), shape);
         // Never dropped: dropping would free buffer 0 on a device no one
         // attached.
         std::mem::forget(buffer);

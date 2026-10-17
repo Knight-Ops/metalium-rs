@@ -75,6 +75,11 @@ pub(crate) struct Cell {
 pub(crate) struct DramRef {
     pub(crate) buffer: Arc<Buffer>,
     pub(crate) transposed: bool,
+    /// The generation of the buffer's contents this handle names: how many times a capture
+    /// had written the buffer (its [`Buffer::root`]) in place when the handle was made
+    /// ([`server::write_generation`]). A handle made from another carries its generation, so
+    /// a view taken before a write stays behind it; a new buffer's handles are 0.
+    pub(crate) generation: u64,
 }
 
 /// A row-major `[rows, cols]` matrix of stored device elements, freed when the last
@@ -105,7 +110,50 @@ pub(crate) struct PlainTranspose {
     copy: Option<DramRef>,
 }
 
+impl Buffer {
+    /// The buffer whose slots this one reads: itself, or its parent's root for a view.
+    pub(crate) fn root(&self) -> &Buffer {
+        let mut b = self;
+        while let Some(p) = &b.parent {
+            b = p;
+        }
+        b
+    }
+}
+
 impl DramRef {
+    /// A handle over `buffer` (`transposed` as it is read) that names `generation` of its
+    /// contents: the handle it was made from's ([`DramRef::generation`]).
+    pub(crate) fn of(buffer: Arc<Buffer>, transposed: bool, generation: u64) -> Self {
+        DramRef {
+            buffer,
+            transposed,
+            generation,
+        }
+    }
+
+    /// This handle, refused by name if a capture has written its buffer in place since the
+    /// handle was made (`docs/plans/in-place-cache-write.md`): a read of a cache the step
+    /// already overwrote, or of a view of it taken before the write, which would read rows
+    /// from the step's future. Only a buffer the open capture owns as its state
+    /// ([`server::donated_since`]) is written in place, so for every other buffer this is one
+    /// atomic load.
+    #[track_caller]
+    pub(crate) fn current(&self) -> &Self {
+        let root = self.buffer.root();
+        if let Some(base) = server::donated_since(root.id) {
+            let now = server::write_generation(root.id);
+            if self.generation.max(base) < now {
+                panic!(
+                    "burn-tt: a read of buffer {} ([{}, {}]) after this capture wrote it in place: \
+                     a state tensor (a cache) read after its own write, or a view of it taken \
+                     before the write. Read the tensor the write returned.",
+                    root.id, root.rows, root.cols
+                );
+            }
+        }
+        self
+    }
     /// What a matmul reads as `B`: this, or for a transposed view of a buffer that
     /// another use has already read this way, that buffer's transpose as a plain
     /// matrix, made by `transpose` (a block copy) and kept beside the buffer while
@@ -268,11 +316,16 @@ impl TtTensor {
     /// This tensor's device copy as a view, without materialising anything:
     /// its own view, or a plain view of its device copy. `None` if it has
     /// neither.
+    #[track_caller]
     pub(crate) fn as_strided(&self) -> Option<Strided> {
         if let Some(d) = self.cell.dram.get() {
-            return Some(Strided::of(d, &self.cell.shape.to_vec()));
+            return Some(Strided::of(d.current(), &self.cell.shape.to_vec()));
         }
-        self.cell.strided.clone()
+        let v = self.cell.strided.clone();
+        if let Some(v) = &v {
+            v.src.current();
+        }
+        v
     }
 
     /// Does this tensor have device storage and, so far, no host copy?
@@ -490,9 +543,10 @@ impl TtTensor {
 
     /// The device copy, if there is one already -- or, for a strided view,
     /// made now ([`TtTensor::to_dram`]).
+    #[track_caller]
     pub(crate) fn dram(&self) -> Option<&DramRef> {
         match (self.cell.dram.get(), &self.cell.strided) {
-            (Some(d), _) => Some(d),
+            (Some(d), _) => Some(d.current()),
             (None, Some(_)) => Some(self.to_dram()),
             (None, None) => None,
         }
@@ -532,15 +586,38 @@ impl TtTensor {
     /// [`stored_dims`] gives. Only for an F32 tensor of rank one or more:
     /// callers check [`TtTensor::is_stored_f32`] (or the stricter
     /// [`TtTensor::is_matrix_f32`]).
+    #[track_caller]
     pub(crate) fn to_dram(&self) -> &DramRef {
-        self.cell.dram.get_or_init(|| {
-            let [rows, cols] =
-                stored_dims(&self.cell.shape.to_vec()).expect("callers check the rank");
-            if let Some(v) = &self.cell.strided {
-                let shape = self.cell.shape.to_vec();
-                if let Some(moves) = v.tile_moves(&shape, &shape) {
+        self.cell
+            .dram
+            .get_or_init(|| {
+                let [rows, cols] =
+                    stored_dims(&self.cell.shape.to_vec()).expect("callers check the rank");
+                if let Some(v) = &self.cell.strided {
+                    v.src.current();
+                    let shape = self.cell.shape.to_vec();
+                    if let Some(moves) = v.tile_moves(&shape, &shape) {
+                        let (id, dims) =
+                            server::copy_blocks(self.device, v.src.buffer.id, moves, [rows, cols]);
+                        return DramRef {
+                            buffer: Arc::new(Buffer {
+                                id,
+                                device: self.device,
+                                rows: dims[0],
+                                cols: dims[1],
+                                parent: None,
+                                storage: crate::storage::StorageFormat::F32,
+                                plain: Default::default(),
+                            }),
+                            transposed: false,
+                            generation: 0,
+                        };
+                    }
+                    let sources = (0..self.cell.shape.num_elements())
+                        .map(|f| v.at(&shape, f))
+                        .collect();
                     let (id, dims) =
-                        server::copy_blocks(self.device, v.src.buffer.id, moves, [rows, cols]);
+                        server::repack(self.device, v.src.buffer.id, sources, [rows, cols]);
                     return DramRef {
                         buffer: Arc::new(Buffer {
                             id,
@@ -552,74 +629,59 @@ impl TtTensor {
                             plain: Default::default(),
                         }),
                         transposed: false,
+                        generation: 0,
                     };
                 }
-                let sources = (0..self.cell.shape.num_elements())
-                    .map(|f| v.at(&shape, f))
-                    .collect();
-                let (id, dims) =
-                    server::repack(self.device, v.src.buffer.id, sources, [rows, cols]);
-                return DramRef {
+                let data = self.host().clone().into_data();
+                let id = if is_half(self.cell.dtype) {
+                    let mut data = data;
+                    data.dtype = DType::U16;
+                    let bits = data.to_vec::<u16>().expect("two-byte storage bits");
+                    server::upload_bf16(self.device, bits, rows, cols)
+                } else {
+                    match device_elem(self.cell.dtype) {
+                        Some(Elem::F32) => {
+                            let values = data
+                                .to_vec::<f32>()
+                                .expect("an F32 tensor reads back as f32");
+                            server::upload(self.device, values, rows, cols)
+                        }
+                        Some(Elem::I32) => {
+                            let v = data
+                                .to_vec::<i32>()
+                                .expect("an I32 tensor reads back as i32");
+                            let bits = v.into_iter().map(|x| x as u32).collect();
+                            server::upload_bits(self.device, bits, rows, cols, Elem::I32)
+                        }
+                        Some(Elem::Bool) => {
+                            let v = data
+                                .convert_dtype(DType::Bool(burn_backend::BoolStore::Native))
+                                .to_vec::<bool>()
+                                .expect("a bool tensor reads back as bool");
+                            let bits = v.into_iter().map(u32::from).collect();
+                            server::upload_bits(self.device, bits, rows, cols, Elem::Bool)
+                        }
+                        None => panic!(
+                            "callers check the dtype: {:?} is not stored",
+                            self.cell.dtype
+                        ),
+                    }
+                };
+                DramRef {
                     buffer: Arc::new(Buffer {
                         id,
                         device: self.device,
-                        rows: dims[0],
-                        cols: dims[1],
+                        rows,
+                        cols,
                         parent: None,
                         storage: crate::storage::StorageFormat::F32,
                         plain: Default::default(),
                     }),
                     transposed: false,
-                };
-            }
-            let data = self.host().clone().into_data();
-            let id = if is_half(self.cell.dtype) {
-                let mut data = data;
-                data.dtype = DType::U16;
-                let bits = data.to_vec::<u16>().expect("two-byte storage bits");
-                server::upload_bf16(self.device, bits, rows, cols)
-            } else {
-                match device_elem(self.cell.dtype) {
-                    Some(Elem::F32) => {
-                        let values = data
-                            .to_vec::<f32>()
-                            .expect("an F32 tensor reads back as f32");
-                        server::upload(self.device, values, rows, cols)
-                    }
-                    Some(Elem::I32) => {
-                        let v = data
-                            .to_vec::<i32>()
-                            .expect("an I32 tensor reads back as i32");
-                        let bits = v.into_iter().map(|x| x as u32).collect();
-                        server::upload_bits(self.device, bits, rows, cols, Elem::I32)
-                    }
-                    Some(Elem::Bool) => {
-                        let v = data
-                            .convert_dtype(DType::Bool(burn_backend::BoolStore::Native))
-                            .to_vec::<bool>()
-                            .expect("a bool tensor reads back as bool");
-                        let bits = v.into_iter().map(u32::from).collect();
-                        server::upload_bits(self.device, bits, rows, cols, Elem::Bool)
-                    }
-                    None => panic!(
-                        "callers check the dtype: {:?} is not stored",
-                        self.cell.dtype
-                    ),
+                    generation: 0,
                 }
-            };
-            DramRef {
-                buffer: Arc::new(Buffer {
-                    id,
-                    device: self.device,
-                    rows,
-                    cols,
-                    parent: None,
-                    storage: crate::storage::StorageFormat::F32,
-                    plain: Default::default(),
-                }),
-                transposed: false,
-            }
-        })
+            })
+            .current()
     }
 
     /// An F32 tensor the device can hold: any rank but zero, not empty, as the

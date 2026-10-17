@@ -1,6 +1,8 @@
 # Writing a traced cache in place
 
-Status: **planned, not started** (scheduled 2026-10-16; was `docs/proposals/in-place-cache-write.md`). It follows
+Status: **D1-D4 done (2026-10-17): a 1.7B decode step 41.83 / 44.25 / 47.40 -> 38.97 / 41.41 / 44.58 ms
+(`1792263398`), 135M 20.03-21.19 -> 18.59-19.79 (`1792263801`); D5 moved to
+[decode-attention.md](decode-attention.md).** Scheduled 2026-10-16; was `docs/proposals/in-place-cache-write.md`). It follows
 the cache write of one row a head (roadmap Track 2 item 6, step 6;
 [performance log](../learnings/performance-log.md#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1)). The
 phases and checklist are at the end ("Plan"); the design above them is the proposal's, unchanged. Read the current
@@ -163,38 +165,58 @@ Code facts to start from (checked 2026-10-16):
 
 Phases, each on ttsim then card 0, each gate watched failing:
 
-- [ ] **D1. Donation up front.** `capture_with_state` and `SharedStateTraces::capture` take the state before `f`. They
-  check it (owned, untransposed, not a row view), mark it donated under a guard that ends with the capture (also on
-  error), and call `written_in_place` for each donated buffer at donation.
-  - **Gates:** errors end donation; no stale kept transpose (the proposal's gate list).
-  - **No behaviour change yet:** the write still copies.
-- [ ] **D2. Buffer generations.** `tensor::Buffer` gets a generation, each `TtTensor` records its own, and `dram()` /
-  `to_dram()` refuse a stale one by name. Views made after a write take the new generation, and capture end brings
-  each state handle current.
-  - **Gate:** a read of the old cache, and of a view taken before the write, fails by name. Watched failing (a wrong
-    token) with the check removed.
-  - Costs one compare a read; measure that the 135M step does not move.
-- [ ] **D3. The write in place.** `scatter_rows_native` calls `Session::scatter_rows_into` when the table is donated,
-  at its current generation, owned and untransposed; every other call copies, as now. When `new` and `state` are one
-  buffer, `capture_with_state` records no `copy_into`.
-  - **Gates:**
-    - equal results (`step185`, `step187`, `step188` bit for bit);
-    - the copies are gone (no `copy list` before a donated scatter and no state `copy_into`, from
-      `TracedInference::ops` labels);
-    - eager unchanged (`step189`);
-    - two writes to one buffer in a step chain;
-    - the negative controls still diverge (`step185` `stateful = false`, `step187` private prefill).
-- [ ] **D4. Measure** as above. Rows go into the performance log and scoreboard.
-- [ ] **D5 (separate, optional): the value's layout** (0.92 + 0.56 ms). **Now the key's too** (2026-10-16): since
-  RoPE runs in the projection's layout ([decode-small-ops.md](decode-small-ops.md) S1), the key reaches the write
-  as a view and repacks there as well (+0.9 ms a 1.7B step, profile `1792171171`). This is decode-small-ops S1d.
-  - **Why it repacks:** `v` is a view of parts of rows (a column block of the fused `qkv` product, then
-    `reshape`/`swap_dims` into heads, `Layer::forward`), so the write's `new.reshape([kv, d])` and `scatter_nd`'s
-    restack (`ops/index.rs` `restack`) fall to an element repack (`mapped_native`).
-  - **The block copy:** which op makes the 48 block copies is not pinned down: `plain_dram`'s `copy_blocks`
-    (`ops.rs`) or a region view's materialisation. Read the `TracedInference::ops` labels first.
-  - **The fix to try:** a `SCATTER_ROWS` that reads its value rows from a strided view (the record already names a
-    tensor), or `FixedWrite` taking the value before the head split.
+- [x] **D1. Donation up front** (2026-10-17).
+  - **Where:** `TracedInference::capture_donating` (`burn-tt/src/trace.rs`, crate-private) takes the state before `f`;
+    `capture_with_state` is it with no state, and `SharedStateTraces::capture` donates its state.
+  - **Checks:** each donated tensor must own its buffer (untransposed, not a row view, unpacked).
+  - **The donation:** `server::donate` calls `written_in_place` and records the buffer's generation. The guard
+    (`Donation`) gives the buffers back on drop: after `f`, and on an error or a panic.
+  - **Switch:** `burn_tt::set_state_in_place(false)` keeps the copying path, for gates' negative controls.
+- [x] **D2. Buffer generations.** As designed, with two changes:
+  - **The generation lives in a side table.** `server::GENERATIONS` counts in-place writes a buffer, and each handle
+    (`DramRef::generation`) names the generation it was made at. A handle made from another (a view, a transposed
+    view, a row view through `device_view`, `Strided::of` and `as_plain`) carries that one's.
+  - **`DramRef::current` checks only a donated buffer:** a handle is stale when `max(its generation, the generation at
+    donation)` is below the buffer's. `to_dram`, `dram` and `as_strided` (with a view's source) call it.
+  - **So nothing is "brought current" at the capture's end:** outside a donation nothing is checked, and at the next
+    donation every handle older than it counts as current.
+  - **Cost:** outside a capture with state, one atomic load a read.
+- [x] **D3. The write in place.** `scatter_rows_native` writes a donated, owned, untransposed table through
+  `server::scatter_rows_into` (`Session::scatter_rows_into`). The result is a handle over the state's own `Buffer`
+  at the new generation. A `(new, state)` pair over one buffer records no `copy_into`.
+  - **Found on the way:** the write's index column (`[kv]` reshaped to `[kv, 1]`, a `[1, kv]` buffer read
+    transposed) was copied by a one-tile block copy at every write (11.6 us, 48 a 1.7B step). It is now read as the
+    row it is (the record takes either). That was the "block copy" of D5.
+  - **Gate `step199_in_place_cache_write`** (ttsim; card 0 `1792263323`; in `--smoke`):
+    - the step's outputs and state equal the copying step's, bit for bit, at the capture and on three replays, and
+      equal the host's cache;
+    - the copying trace has one `copy list` and one `copy_into list`, the in-place trace none;
+    - two writes to one state in a step chain in place;
+    - a read of the cache after its write, and of a view taken before it, are refused by name, and a later eager
+      scatter copies (the donation ended);
+    - a transpose kept beside the state from eager use is not read;
+    - a synthetic Llama's `TracedGenerator` has no copies, write-backs or index copies in its steps, with the
+      copying generation's tokens and logits bit for bit.
+  - **Watched failing:**
+    - `DramRef::current`'s check off (the stale reads are not refused);
+    - `donate`'s `written_in_place` removed (the kept transpose is read);
+    - the index read as a row off (the index copies come back).
+  - **Regression:**
+    - ttsim: `step186`, `step187`, `step189`, `step191`, `step193`, `step197`;
+    - card 0: `step186`, `step187` (with SmolLM2-135M), `step189`, `step193`, `step199` (`1792263323`) and
+      `step188` (`1792263379`).
+    - `step185` uses `capture_with_state` without state donated, so its path is unchanged.
+- [x] **D4. Measured** (card 1, every tile, burn-flex in the same run):
+  - **1.7B:** 41.83 / 44.25 / 47.40 -> **38.97 / 41.41 / 44.58 ms** (`1792263398`; burn-flex 300.5 / 309.2 / 324.6).
+    That is -2.83 ms a step, against -2.26 predicted for the copies plus -0.56 for the index copies.
+  - **Profile `1792264052`:** the replay 41.16 -> 38.28 ms, its ops 1,152 -> 1,008, the cache write 5.94 -> 3.03 ms
+    (the repack and the row scatter).
+  - **135M:** 20.03 / 20.55 / 21.19 -> **18.59 / 19.07 / 19.79** (`1792263801`; burn-flex 26.11 / 28.53 / 31.02).
+- [ ] **D5. The key's and value's repack** (38 us each, 1.83 ms a 1.7B step). It is the cache's head-major layout:
+  a head's row is a column block of the projection's one row, and no tile copy moves it into a row of its own.
+  - **Ruled out:** values read in place by face-row reads, ~128 entries a write, about the repack's cost.
+  - **The fix is a layout:** a position-major cache, `[L, kv * d]`, makes the write the projection's row as it is.
+    It changes what attention reads, so it is decided in [decode-attention.md](decode-attention.md).
 
 Documentation on completion: the roadmap (Track 2 item 6, step 6), the performance log and scoreboard,
 `docs/README.md`, and this file moved to `completed-plans/`.

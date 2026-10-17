@@ -2869,6 +2869,39 @@ fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operan
     Some(Operands::Unary)
 }
 
+/// Whether `kind`'s program computes each `Dst` row group from the same group of its operands
+/// alone, so it may be built for tiles of fewer rows ([`code_for_rows`]): the element-wise
+/// kinds a decode step's `[1, W]` activations run, each checked against its whole-tile program
+/// (`row_limited_programs_keep_the_computed_rows`).
+pub fn row_limited(kind: u32) -> bool {
+    matches!(
+        kind,
+        kind::ADD
+            | kind::SUB
+            | kind::MUL
+            | kind::MUL_SCALAR
+            | kind::ADD_SCALAR
+            | kind_sfpu::DIV
+            | kind_sfpu::SIGMOID
+            | kind_sfpu::SILU_MUL
+    )
+}
+
+/// [`code_for`] for tiles of which only the first `rows` tensor rows are computed
+/// (`super::with_rows`): the other rows of the output tile are left as `Dst` held them. 32, or a
+/// kind not [`row_limited`], is [`code_for`].
+pub fn code_for_rows(
+    kind: u32,
+    scalars: [f32; 2],
+    bcast: Broadcast,
+    rows: u32,
+) -> Option<(Operands, crate::code::Code)> {
+    if rows >= 32 || !row_limited(kind) {
+        return code_for(kind, scalars, bcast);
+    }
+    super::with_rows(rows, || code_for(kind, scalars, bcast))
+}
+
 /// The program for `kind` with its second operand broadcast as `bcast`, and
 /// what operands it takes; `None` where there is none. A row broadcast reads
 /// the row's two faces from where the kernel lays them, which depends on the
@@ -5421,5 +5454,150 @@ mod silu {
                 "control, seed {seed}: (x y) s is s x y everywhere"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod row_limited_tests {
+    use super::super::interp::Vector;
+    use super::*;
+    use tt_isa::dm::face_index;
+
+    /// Ordinary values of several magnitudes with every special value among them.
+    fn tile(seed: u32) -> Vec<u32> {
+        const SPECIAL: [u32; 10] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x807f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc1_2345,
+            0x7f7f_ffff,
+            0x1f80_0000,
+            0x6080_0000,
+        ];
+        let mut s = seed | 1;
+        (0..1024)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if i % 13 == 5 {
+                    return SPECIAL[(s >> 8) as usize % SPECIAL.len()];
+                }
+                let scale = [1.0e-3f32, 1.0, 37.0, 1.0e4][i % 4];
+                (((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * scale).to_bits()
+            })
+            .collect()
+    }
+
+    /// `math` run over `Dst` holding the operands `operands` takes (a broadcast's as its
+    /// kernel lays them) and NaN wherever the output goes: the output tile.
+    fn run(math: &[Instruction], operands: Operands) -> Vec<u32> {
+        let mut v = Vector::new();
+        v.put_tile(OUT_ROW as usize, &vec![0x7fc0_dead; 1024]);
+        v.put_tile(A_ROW as usize, &tile(1));
+        match operands {
+            Operands::Unary => {}
+            Operands::Binary | Operands::ColBroadcast => v.put_tile(B_ROW as usize, &tile(2)),
+            Operands::RowBroadcast => {
+                let t = tile(3);
+                for r in 0..4 {
+                    v.dst[(B_ROW + r) as usize] = std::array::from_fn(|c| t[c]);
+                    v.dst[(B_ROW + 4 + r) as usize] = std::array::from_fn(|c| t[256 + c]);
+                }
+            }
+            Operands::Ternary => panic!("no ternary kind is row limited"),
+        }
+        v.run(math).unwrap();
+        v.tile(OUT_ROW as usize)
+    }
+
+    /// Each row-limited kind's program, built for tiles of `rows` rows, computes those rows (and
+    /// the rest of their row groups of four) bit for bit as its whole-tile program does and
+    /// leaves the others as `Dst` held them, at
+    /// every row count across the faces' and row groups' boundaries, with every broadcast
+    /// the kind takes. Control: the row after the last is not computed.
+    #[test]
+    fn row_limited_programs_keep_the_computed_rows() {
+        let kinds = [
+            kind::ADD,
+            kind::SUB,
+            kind::MUL,
+            kind::MUL_SCALAR,
+            kind::ADD_SCALAR,
+            kind_sfpu::DIV,
+            kind_sfpu::SIGMOID,
+            kind_sfpu::SILU_MUL,
+        ];
+        for kind in kinds {
+            assert!(row_limited(kind), "{kind:#x}");
+            let mut checked = 0;
+            for bcast in [Broadcast::None, Broadcast::Row, Broadcast::Col] {
+                let scalars = [0.75, 0.0];
+                let Some((operands, full)) = code_for(kind, scalars, bcast) else {
+                    continue;
+                };
+                let full = run(&full.expand(), operands);
+                checked += 1;
+                for rows in [1u32, 2, 3, 4, 5, 8, 15, 16, 17, 20, 31] {
+                    let (o, limited) = code_for_rows(kind, scalars, bcast, rows).unwrap();
+                    assert_eq!(o, operands);
+                    let limited = limited.expand();
+                    let got = run(&limited, operands);
+                    for r in 0..32 {
+                        for c in 0..32 {
+                            let i = face_index(r, c);
+                            // A row group (four rows) is computed whole.
+                            let computed = ((r - r % 4) as u32) < rows;
+                            let want = if computed { full[i] } else { 0x7fc0_dead };
+                            assert_eq!(
+                                got[i], want,
+                                "{kind:#x} {bcast:?}, {rows} rows: datum ({r}, {c})"
+                            );
+                        }
+                    }
+                    // The first row of the next group is not computed.
+                    let next = rows.div_ceil(4) as usize * 4;
+                    if next < 32 {
+                        let i = face_index(next, 0);
+                        assert_ne!(got[i], full[i], "{kind:#x} {bcast:?}: row {next} computed");
+                    }
+                }
+            }
+            assert!(checked > 0, "{kind:#x}: no program checked");
+        }
+    }
+
+    /// A kind not on the list, and 32 rows, are the whole-tile program.
+    #[test]
+    fn other_kinds_and_whole_tiles_are_unchanged() {
+        let whole = code_for(kind::ADD, [0.0; 2], Broadcast::None)
+            .unwrap()
+            .1
+            .expand();
+        let at32 = code_for_rows(kind::ADD, [0.0; 2], Broadcast::None, 32)
+            .unwrap()
+            .1
+            .expand();
+        assert_eq!(whole.len(), at32.len());
+        let exp = code_for(kind_sfpu::EXP, [0.0; 2], Broadcast::None)
+            .unwrap()
+            .1
+            .expand();
+        let exp1 = code_for_rows(kind_sfpu::EXP, [0.0; 2], Broadcast::None, 1)
+            .unwrap()
+            .1
+            .expand();
+        assert_eq!(exp.len(), exp1.len());
+        let add1 = code_for_rows(kind::ADD, [0.0; 2], Broadcast::None, 1)
+            .unwrap()
+            .1
+            .expand();
+        assert!(
+            add1.len() < whole.len(),
+            "{} against {}",
+            add1.len(),
+            whole.len()
+        );
     }
 }

@@ -87,6 +87,18 @@ pub enum Spread {
     Work { share: usize, min: usize },
 }
 
+/// How [`Session::probe_stream`] deals a tensor's tiles over its units.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamOrder {
+    /// Unit `u` reads columns `u, u + units, ..`, each down its tile rows: how an `m = 1`
+    /// product deals its `B`, a column a job.
+    Columns,
+    /// Each unit reads one contiguous share of the tiles, row-major: consecutive tiles, so
+    /// consecutive channels.
+    Rows,
+}
+
 impl Spread {
     /// The units an op with `work` (as [`Spread::Work`] counts it) runs on, of `units`.
     pub fn units_for(self, work: usize, units: usize) -> usize {
@@ -432,6 +444,8 @@ pub struct Session<T: Transport> {
     matmul_k_block_limit: Option<std::num::NonZeroUsize>,
     /// [`Session::set_thin_matmul_reads`].
     thin_matmul_reads: bool,
+    /// [`Session::set_resident_matmul_a`].
+    resident_matmul_a: bool,
     /// [`Session::host_times`].
     host: HostTimes,
     /// Host memory the card moves tensors through ([`Session::host_dma`]),
@@ -466,6 +480,9 @@ pub struct Session<T: Transport> {
     /// The profile mode ([`Session::profile_mode`]): what the stamps are attributed to, and each
     /// unit's stamps since the last attribution.
     profiler: Option<crate::profile_mode::Profiler>,
+    /// Count what each captured op moves through GDDR when its trace is stored
+    /// ([`Session::set_count_trace_bytes`]); the profile mode counts whether or not it is set.
+    count_trace_bytes: bool,
     profile_drained: Vec<Vec<tt_device::trace::TraceEvent>>,
     /// Where each unit's timestamper stream goes, and its bytes
     /// ([`Session::set_profile_buffer`]): the fixed trace buffer unless moved.
@@ -1245,8 +1262,11 @@ fn l1_footprint(entries: &[[u32; 8]], gather: bool) -> Option<Vec<std::ops::Rang
                 record::READ_RUN if gather => ranges.push(slots(head[3], head[2] as u64)),
                 record::WRITE_RUN if !gather => ranges.push(slots(head[3], head[2] as u64)),
                 record::GATHER if gather => {
-                    let kt = (head[1] >> 8) as u64;
-                    ranges.push(slots(head[2], head[5] as u64 * kt));
+                    let kt = record::gather_kt(head[1]) as u64;
+                    // A resident `A` is not written: its slots hold what an earlier gather read.
+                    if head[1] & record::GATHER_A_RESIDENT == 0 {
+                        ranges.push(slots(head[2], head[5] as u64 * kt));
+                    }
                     ranges.push(slots(head[3], kt * head[7] as u64));
                 }
                 record::SCATTER if !gather => {
@@ -1316,6 +1336,21 @@ fn admitted(words: usize, cache: u64) -> bool {
 /// reader section (NC's writes wait on credits only the reader and the roles release, so
 /// they follow it too), or first in a plain list. `false`, and `seg` unchanged, if the
 /// list is already as long as a list may be.
+/// A captured stream's top-level `BARRIER` entries: `[arrivals, wait-only]` (`dm::op::BARRIER`
+/// word 4).
+fn barrier_entries(stream: &[[u32; 8]]) -> [u32; 2] {
+    let mut out = [0u32; 2];
+    let mut i = 0;
+    while i < stream.len() {
+        let e = stream[i];
+        if e[0] == tt_isa::dm::op::BARRIER {
+            out[(e[4] == 1) as usize] += 1;
+        }
+        i += tt_isa::dm::record::len(e[0]).max(1);
+    }
+    out
+}
+
 fn lead_with(seg: &mut Segment, entry: [u32; 8]) -> bool {
     if seg.entries.len() >= tt_isa::dm::LIST_MAX as usize {
         return false;
@@ -1751,6 +1786,30 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2
     count
 }
 
+/// Add what unit stream `uc`'s entries `range` move through GDDR to `bytes`: for a `PAIR_CALL`, both
+/// its sections (B runs the reader's, NC the writer's).
+fn op_bytes(
+    uc: &trace::UnitCapture,
+    range: core::ops::Range<usize>,
+    bytes: &mut crate::profile_mode::OpBytes,
+) {
+    let mut i = range.start;
+    while i < range.end.min(uc.stream.len()) {
+        let head = uc.stream[i][0];
+        let n = (tt_isa::dm::record::len(head) as usize).max(1);
+        if head == tt_isa::dm::op::PAIR_CALL {
+            if let Some(k) = uc.pair_calls.iter().position(|&at| at == i) {
+                for section in uc.pending_sections.iter().skip(2 * k).take(2) {
+                    bytes.count(section);
+                }
+            }
+        } else {
+            bytes.count(&uc.stream[i..(i + n).min(uc.stream.len())]);
+        }
+        i += n;
+    }
+}
+
 impl<T: Transport> Session<T> {
     /// Bring `dev` up for compute on the tiles `choice` names.
     ///
@@ -1816,6 +1875,7 @@ impl<T: Transport> Session<T> {
             spread: Spread::All,
             matmul_k_block_limit: None,
             thin_matmul_reads: true,
+            resident_matmul_a: true,
             host: HostTimes::new(),
             staging: None,
             host_dma: true,
@@ -1830,6 +1890,7 @@ impl<T: Transport> Session<T> {
             dram: None,
             profiling: None,
             profiler: None,
+            count_trace_bytes: false,
             profile_drained: Vec::new(),
             profile_buffer: (
                 tt_isa::mailbox::TRACE_BUFFER,
@@ -2866,6 +2927,156 @@ impl<T: Transport> Session<T> {
         Ok(at)
     }
 
+    /// A development probe (`docs/plans/decode-step-bandwidth.md` B2, the cross-op weight
+    /// prefetch): read `t`'s tiles into L1 on `units`, `per_unit` consecutive tiles a unit (one
+    /// `READ_RUN` each, unit `units.start + k` reading tiles `k * per_unit..`) into slots from
+    /// `at`, queued without a barrier, so ops queued after it on other units do not wait for it;
+    /// [`Session::sync`] does. What a prefetch on units an op leaves idle would issue. Nothing
+    /// reads the slots, and an op on those units plans over them.
+    #[doc(hidden)]
+    pub fn probe_prefetch(
+        &mut self,
+        t: &DramTensor,
+        units: std::ops::Range<usize>,
+        at: u64,
+        per_unit: usize,
+    ) -> Result<(), TensorError> {
+        use tt_isa::dm::{record, TILE_SLOT};
+        let refuse = |why: String| Err(TensorError::Shape(format!("probe_prefetch: {why}")));
+        let [rt, ct] = t.grid();
+        let data = tt_isa::l1::DATA;
+        if self.capture.is_some() {
+            return refuse("not in a capture".into());
+        }
+        if units.is_empty() || units.end > self.units.len() || per_unit == 0 {
+            return refuse(format!("units {units:?} of {}", self.units.len()));
+        }
+        if units.len() * per_unit > rt * ct {
+            return refuse(format!("{} tiles of {}", units.len() * per_unit, rt * ct));
+        }
+        if at % 64 != 0 || at < data.base || at + per_unit as u64 * TILE_SLOT > data.end {
+            return refuse(format!("{per_unit} slots at {at:#x}"));
+        }
+        let x = t.tensor_ref();
+        let jobs = (0..units.end)
+            .map(|u| match u.checked_sub(units.start) {
+                None => Vec::new(),
+                Some(k) => {
+                    let mut entries = vec![[
+                        record::READ_RUN,
+                        (k * per_unit) as u32,
+                        per_unit as u32,
+                        at as u32,
+                        0,
+                        ct as u32,
+                        0,
+                        0,
+                    ]];
+                    entries.extend(x.encode());
+                    vec![Step::List {
+                        what: "probe prefetch",
+                        entries,
+                    }]
+                }
+            })
+            .collect();
+        self.unbarriered = true;
+        let r = self.submit_jobs_on(jobs, units.end, RESET_BUDGET);
+        self.unbarriered = false;
+        r
+    }
+
+    /// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 0, the read ceiling): every
+    /// tile of `t` read once into L1 on the first `units` units, as one op with its barrier, so it
+    /// can be captured and replayed and its time is the card's. `order` deals the tiles as
+    /// [`StreamOrder`] says; each unit reads them as `READ_RUN`s of at most `window` tiles into the
+    /// same `window` slots at the top of `DATA`, which nothing reads. Returns, for each unit, the
+    /// tiles `(i, j)` its last run left in slots `0..` (for the caller to check).
+    #[doc(hidden)]
+    pub fn probe_stream(
+        &mut self,
+        t: &DramTensor,
+        units: usize,
+        order: StreamOrder,
+        window: usize,
+    ) -> Result<Vec<Vec<[usize; 2]>>, TensorError> {
+        use tt_isa::dm::{record, TILE_SLOT};
+        let refuse = |why: String| Err(TensorError::Shape(format!("probe_stream: {why}")));
+        let [rt, ct] = t.grid();
+        let data = tt_isa::l1::DATA;
+        if units == 0 || units > self.units.len() {
+            return refuse(format!("{units} units of {}", self.units.len()));
+        }
+        if window == 0 || data.base + window as u64 * TILE_SLOT > data.end {
+            return refuse(format!("{window} slots"));
+        }
+        let at = (data.end - window as u64 * TILE_SLOT) as u32;
+        let x = t.tensor_ref();
+        // Each unit's runs, as `(first, count, column_major)` over `t`'s grid.
+        let runs: Vec<Vec<(usize, usize, bool)>> = match order {
+            StreamOrder::Columns => (0..units)
+                .map(|u| {
+                    (u..ct)
+                        .step_by(units)
+                        .flat_map(|j| {
+                            (0..rt)
+                                .step_by(window)
+                                .map(move |i| (j * rt + i, window.min(rt - i), true))
+                        })
+                        .collect()
+                })
+                .collect(),
+            StreamOrder::Rows => tensor::runs(rt * ct, units, usize::MAX)
+                .into_iter()
+                .map(|r| {
+                    r.clone()
+                        .step_by(window)
+                        .map(|n| (n, window.min(r.end - n), false))
+                        .collect()
+                })
+                .collect(),
+        };
+        let mut last = Vec::with_capacity(units);
+        let mut jobs: Vec<tensor::Job> = Vec::with_capacity(units);
+        for unit_runs in &runs {
+            let mut entries = Vec::new();
+            for &(first, count, column_major) in unit_runs {
+                entries.push([
+                    record::READ_RUN,
+                    first as u32,
+                    count as u32,
+                    at,
+                    if column_major { 4 } else { 0 },
+                    ct as u32,
+                    if column_major { rt as u32 } else { 0 },
+                    0,
+                ]);
+                entries.extend(x.encode());
+            }
+            last.push(unit_runs.last().map_or(Vec::new(), |&(first, count, cm)| {
+                (first..first + count)
+                    .map(|n| {
+                        if cm {
+                            [n % rt, n / rt]
+                        } else {
+                            [n / ct, n % ct]
+                        }
+                    })
+                    .collect()
+            }));
+            jobs.push(if entries.is_empty() {
+                Vec::new()
+            } else {
+                vec![Step::List {
+                    what: "probe stream",
+                    entries,
+                }]
+            });
+        }
+        self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
+        Ok(last)
+    }
+
     /// Run a transfer's jobs to their end, without a barrier (nothing is
     /// queued behind them before the sync).
     fn submit_dma(&mut self, jobs: Vec<tensor::Job>, units: usize) -> Result<(), TensorError> {
@@ -3071,14 +3282,8 @@ impl<T: Transport> Session<T> {
         if self.units.len() < 2 || self.units[u].barrier_seen == target {
             return Ok(());
         }
-        // A capture's barriers involve every unit, and it starts synced, so no
-        // tile is behind inside one; a catch-up there would be a list the trace
-        // does not hold.
-        if self.capture.is_some() {
-            return Err(TensorError::Shape(
-                "a tile is behind the barrier counter inside a capture".into(),
-            ));
-        }
+        // Inside a capture this is the capture's own run catching up: the trace's
+        // stream holds its own wait (`enqueue_work_inner`).
         self.ensure_unit(u)?;
         let entry = self.barrier_wait(target);
         let Session { dev, units, .. } = self;
@@ -3259,6 +3464,7 @@ impl<T: Transport> Session<T> {
                     .collect(),
                 barrier: self.units.len() > 1,
                 stamps: [0; 2],
+                bytes: Default::default(),
             });
         }
         result
@@ -3281,15 +3487,12 @@ impl<T: Transport> Session<T> {
         for (j, job) in jobs.into_iter().enumerate() {
             queues[j % spread].extend(job);
         }
-        // The units that arrive at this op's barrier: the ones it runs on, except in
-        // a capture, whose barriers keep every unit so a replay's streams all agree on
-        // the count whatever each op used. Nothing below loops over the session's
-        // other units: on many tiles that was a host cost every op paid.
+        // The units that arrive at this op's barrier: the ones it runs on, in a capture
+        // too, whose trace then records how many arrived (`Capture::barriers`) for its
+        // replay to count. Nothing below loops over the session's other units: on many
+        // tiles that was a host cost every op paid.
         let capturing = self.capture.is_some();
-        let arriving: Vec<usize> = match capturing {
-            true => (0..n).collect(),
-            false => (0..spread).filter(|&u| !queues[u].is_empty()).collect(),
-        };
+        let arriving: Vec<usize> = (0..spread).filter(|&u| !queues[u].is_empty()).collect();
         // What each unit the op runs on must wait for first: the latest barrier
         // before this op, if it sat out the ops up to it. Taken before this op's
         // barrier is counted, since that target includes the unit's own arrival,
@@ -3302,12 +3505,6 @@ impl<T: Transport> Session<T> {
             }
             for (u, b) in behind.iter_mut().enumerate() {
                 if !queues[u].is_empty() && self.units[u].barrier_seen != self.barriers {
-                    // A capture's barriers involve every unit, and it starts synced.
-                    if capturing {
-                        return Err(TensorError::Shape(
-                            "a tile is behind the barrier counter inside a capture".into(),
-                        ));
-                    }
                     *b = Some(self.barriers);
                 }
             }
@@ -3361,7 +3558,17 @@ impl<T: Transport> Session<T> {
                         *what = seg.what;
                     }
                     if let Some(target) = behind[u].take() {
-                        if lead_with(&mut seg, self.barrier_wait(target)) {
+                        if capturing {
+                            // The trace's stream waits for the barrier, relative to the
+                            // capture's first as every captured target is; the capture's own
+                            // run waits now, in a list of its own the trace does not hold.
+                            let c = self.capture.as_ref().unwrap();
+                            let wait = self.barrier_wait(target.wrapping_sub(c.barriers_base));
+                            self.capture.as_mut().unwrap().units[u].stream.push(wait);
+                            let start = self.mark();
+                            self.catch_up_to(u, target)?;
+                            self.stage(HostStage::Barrier, start);
+                        } else if lead_with(&mut seg, self.barrier_wait(target)) {
                             self.units[u].barrier_seen = target;
                         } else {
                             // A list already as long as a list may be: the wait goes
@@ -3387,12 +3594,14 @@ impl<T: Transport> Session<T> {
         if let Some(entry) = barrier {
             let start = self.mark();
             if let Some(c) = self.capture.as_mut() {
-                // Relative to the capture's first: a replay adds its own. Every
-                // unit arrives at a captured barrier, so the k-th is k * n.
+                // Relative to the capture's first: a replay adds its own. Only the
+                // units the op ran on arrive; one that sat it out waits before its
+                // next op (above) and at the trace's end (`end_trace`).
                 let rel = entry[1].wrapping_sub(c.barriers_base);
-                c.barriers += 1;
-                for uc in &mut c.units {
-                    uc.stream
+                c.barriers += arrivals;
+                for &u in &arriving {
+                    c.units[u]
+                        .stream
                         .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
                 }
             }
@@ -3853,9 +4062,17 @@ impl<T: Transport> Session<T> {
     /// GDDR. On any failure nothing is kept, and what the capture held is
     /// given back.
     pub fn end_trace(&mut self) -> Result<TraceId, TensorError> {
-        let Some(capture) = self.capture.take() else {
+        let Some(mut capture) = self.capture.take() else {
             return Err(TraceError::NotCapturing.into());
         };
+        // A unit that sat out the trace's last ops waits for its last barrier at the end of
+        // its stream, so a replay leaves every unit it ran on past all of its barriers.
+        let last = self.barriers.wrapping_sub(capture.barriers_base);
+        for (u, uc) in capture.units.iter_mut().enumerate() {
+            if !uc.stream.is_empty() && self.units[u].barrier_seen != self.barriers {
+                uc.stream.push(self.barrier_wait(last));
+            }
+        }
         let held: Vec<Vec<(u64, u64)>> = capture
             .units
             .iter()
@@ -3892,6 +4109,15 @@ impl<T: Transport> Session<T> {
                 most = [most[0].max(s[0]), most[1].max(s[1])];
             }
             op.stamps = most;
+        }
+        // In the profile mode, what each op moves through GDDR: its records expanded on the host,
+        // as the movers expand them. The streams are not kept once stored.
+        if self.profiler.is_some() || self.count_trace_bytes {
+            for op in &mut ops {
+                for (uc, range) in units.iter().zip(&op.entries) {
+                    op_bytes(uc, range.clone(), &mut op.bytes);
+                }
+            }
         }
         // What the capture deferred is the session's to give back now.
         let give_back = |s: &mut Self, freed: Vec<tensor::Placement>| {
@@ -4029,6 +4255,7 @@ impl<T: Transport> Session<T> {
             composition,
             top_level_entries: words.len() as u32,
             gddr_bytes: range.len(),
+            barriers: barrier_entries(&uc.stream),
             stream: region,
         })
     }
@@ -4064,7 +4291,6 @@ impl<T: Transport> Session<T> {
             })
             .collect();
         let barriers = t.barriers;
-        let n = self.units.len() as u32;
         // Every unit that runs the trace starts after the ops before it.
         for (u, call) in calls.iter().enumerate() {
             if call.is_some() {
@@ -4115,8 +4341,8 @@ impl<T: Transport> Session<T> {
             // the host.
             r.forget_tile_state();
         }
-        // Every unit arrives at each of the trace's barriers.
-        self.barriers = self.barriers.wrapping_add(barriers.wrapping_mul(n));
+        // The arrivals the capture counted: each captured barrier's units.
+        self.barriers = self.barriers.wrapping_add(barriers);
         if barriers > 0 {
             let target = self.barriers;
             for (unit, ran) in self.units.iter_mut().zip(ran) {
@@ -4155,6 +4381,7 @@ impl<T: Transport> Session<T> {
                         .iter()
                         .filter(|r| r.len() > o.barrier as usize)
                         .count(),
+                    bytes: o.bytes,
                 })
                 .collect();
             let stamps = ops.iter().map(|o| o.stamps[detail]).collect();
@@ -4196,6 +4423,27 @@ impl<T: Transport> Session<T> {
     /// charged back to it. Nothing else reads it.
     pub fn set_op_label(&mut self, label: &'static str) {
         self.op_label = label;
+    }
+
+    /// The arrivals a replay of trace `id` adds to the barrier counter: each captured op's
+    /// barrier counts the units the op ran on.
+    #[doc(hidden)]
+    pub fn trace_arrivals(&self, id: TraceId) -> Result<u32, TensorError> {
+        self.traces
+            .get(&id.0)
+            .map(|t| t.barriers)
+            .ok_or_else(|| TraceError::Unknown(id.0).into())
+    }
+
+    /// For each unit, the `BARRIER` entries in trace `id`'s stream: `[arrivals, waits]`
+    /// (`None` for a unit the trace does not run on).
+    #[doc(hidden)]
+    pub fn trace_barrier_entries(&self, id: TraceId) -> Result<Vec<Option<[u32; 2]>>, TensorError> {
+        let t = self.traces.get(&id.0).ok_or(TraceError::Unknown(id.0))?;
+        Ok(t.units
+            .iter()
+            .map(|u| u.as_ref().map(|u| u.barriers))
+            .collect())
     }
 
     /// The ops trace `id` captured, in order (`crate::trace::OpRecord`).
@@ -4429,7 +4677,11 @@ impl<T: Transport> Session<T> {
             )));
         };
         let out = self.execute_on(work, units, RESET_BUDGET)?;
-        out.set_pad(op.produces(&[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>()));
+        out.set_pad(match tensor::eltwise_rows(kind, a.rows) {
+            // Rows past `a`'s are left as `Dst` held them.
+            32 => op.produces(&[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>()),
+            _ => tensor::Pad::Undefined,
+        });
         Ok(out)
     }
 
@@ -4461,7 +4713,12 @@ impl<T: Transport> Session<T> {
             .flatten()
             .map(|x| x.shape_only())
             .collect();
-        out.set_pad(op.produces(&shapes.iter().collect::<Vec<_>>()));
+        let (kind, _) = tensor::broadcast_of(op, &shapes[0], b.is_some().then(|| &shapes[1]))?;
+        out.set_pad(match tensor::eltwise_rows(kind, a.dims[0]) {
+            // Rows past `a`'s are left as `Dst` held them.
+            32 => op.produces(&shapes.iter().collect::<Vec<_>>()),
+            _ => tensor::Pad::Undefined,
+        });
         Ok(out)
     }
 
@@ -5252,6 +5509,7 @@ impl<T: Transport> Session<T> {
         let max_k_tiles = self.matmul_k_block_limit;
         let m = if a_transposed { a.cols } else { a.rows };
         let thin = self.thin_matmul_reads && tensor::thin_rows(m, a_transposed) != 0;
+        let resident_a = self.resident_matmul_a;
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -5267,7 +5525,7 @@ impl<T: Transport> Session<T> {
                     allow_mop,
                     pipeline,
                     max_k_tiles,
-                    thin,
+                    tensor::Reads { thin, resident_a },
                 )
             })
             .and_then(|work| self.execute_on(work, units, budget));
@@ -5713,6 +5971,13 @@ impl<T: Transport> Session<T> {
         self.thin_matmul_reads = on;
     }
 
+    /// Whether a GDDR matmul's later blocks on a unit skip reading the `A` rows its previous block
+    /// there read to the same slots ([`tt_isa::dm::record::GATHER_A_RESIDENT`]; on by default).
+    /// Off, every block reads its `A`: the gates compare the two.
+    pub fn set_resident_matmul_a(&mut self, on: bool) {
+        self.resident_matmul_a = on;
+    }
+
     /// How the transcendentals run from the next element-wise op on
     /// (`sfpu::approx::MathMode`, S10; `TT_MATH=approx` sets it at open).
     /// `Precise`, the default, is the full-accuracy programs; `Approx` runs
@@ -5824,6 +6089,13 @@ impl<T: Transport> Session<T> {
     /// (`docs/plans/replay-fixed-cost.md`). Refused while a capture is open, a trace
     /// lives (it holds programs in the cache) or a profile runs.
     #[doc(hidden)]
+    /// Count what each op of every trace stored from here on moves through GDDR
+    /// ([`trace::OpRecord::bytes`]), as the profile mode does, without the profile mode: host
+    /// work at the trace's store, nothing on the card, so it runs on the simulator too.
+    pub fn set_count_trace_bytes(&mut self, on: bool) {
+        self.count_trace_bytes = on;
+    }
+
     pub fn set_profile_buffer(&mut self, bytes: Option<u64>) -> Result<(), TensorError> {
         let full = tt_isa::l1::PROGRAM_CACHE;
         let refuse = |why: &str| Err(TensorError::Shape(format!("set_profile_buffer: {why}")));

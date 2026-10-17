@@ -10,6 +10,12 @@
 //! tolerance. The controls: the first op ran on one unit (or the case tests nothing), the
 //! others enqueued nothing for it, and the same pair, repeated with fresh operands, is right
 //! every time.
+//!
+//! A capture keeps the rule (`docs/plans/replay-fixed-cost.md` P1): a captured op's barrier
+//! counts the units it ran on, a unit that sat ops out waits (a wait-only `BARRIER` in its
+//! stream) before its next op and at the trace's end, and a replay adds the arrivals the
+//! capture counted. Held to the host's products on fresh operands at every replay, with ops
+//! after the replay that read its results on other units.
 
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, TileChoice};
@@ -153,6 +159,92 @@ fn a_unit_that_sat_an_op_out_waits_for_it_before_reading_its_output() {
             for t in [x, w, z, slow, out] {
                 s.free(t).unwrap();
             }
+        }
+    });
+}
+
+/// A capture's barriers count only the units each op ran on: the slow op on unit 0 adds one
+/// arrival, the reader four. Every replay, with fresh operands copied in, gives the host's
+/// products: units 1-3 wait for the slow op inside the trace. After each replay an op on units
+/// 1-3's side reads its result, and the counter the replay left is the one every unit reached
+/// (or the next op's barrier would never complete).
+#[test]
+fn a_captured_op_s_barrier_counts_the_units_it_ran_on() {
+    const UNITS: usize = 4;
+    with_tiles(UNITS, |s| {
+        // K long enough (256 tiles on one unit) that the slow op is still running when units 1-3,
+        // were they not to wait, would read its output.
+        let (m1, k1, n1) = (32, 8192, 32);
+        let (m2, k2) = (128, 32);
+        let x = s.upload(&bits(m1 * k1, 1), m1, k1).unwrap();
+        let w = s.upload(&bits(k1 * n1, 2), k1, n1).unwrap();
+        let z = s.upload(&bits(m2 * k2, 3), m2, k2).unwrap();
+        let q = s.upload(&bits(m1 * m2, 4), m1, m2).unwrap();
+        s.begin_trace().unwrap();
+        // Unit 0 alone, then all four reading it, then unit 0 alone again reading what all four
+        // wrote (one output tile), then all four again reading that: units 1-3 sit out two ops.
+        let slow = mm(s, &x, &w);
+        let out = mm(s, &z, &slow);
+        let again = mm(s, &q, &out);
+        let wide = mm(s, &z, &again);
+        let trace = s.end_trace().unwrap();
+        let ops = s.trace_ops(trace).unwrap().to_vec();
+        let ran: Vec<usize> = ops
+            .iter()
+            .map(|o| o.entries.iter().filter(|r| !r.is_empty()).count())
+            .collect();
+        assert!(
+            ran.contains(&1) && ran.contains(&UNITS),
+            "the case needs ops on one unit and on all: {ran:?}"
+        );
+        let arrivals = s.trace_arrivals(trace).unwrap();
+        assert_eq!(
+            arrivals as usize,
+            ran.iter().filter(|&&u| u > 0).sum::<usize>(),
+            "a captured barrier counts its op's units: {ran:?}"
+        );
+        assert!((arrivals as usize) < ops.len() * UNITS);
+        // Unit 0 arrives at all four barriers; units 1-3 at two, and wait before each op after one
+        // they sat out (`out`, `wide`): the waits a replay needs, in the streams.
+        let entries = s.trace_barrier_entries(trace).unwrap();
+        assert_eq!(entries[0], Some([4, 0]), "unit 0's stream");
+        for (u, e) in entries.iter().enumerate().skip(1) {
+            assert_eq!(*e, Some([2, 2]), "unit {u}'s stream");
+        }
+        for round in 0..3 {
+            let (a1, b1, a2) = (
+                bits(m1 * k1, 10 + round),
+                bits(k1 * n1, 20 + round),
+                bits(m2 * k2, 30 + round),
+            );
+            for (t, v, r, c) in [(&x, &a1, m1, k1), (&w, &b1, k1, n1), (&z, &a2, m2, k2)] {
+                let fresh = s.upload(v, r, c).unwrap();
+                s.copy_into(&fresh, t).unwrap();
+                s.free(fresh).unwrap();
+            }
+            s.replay(trace).unwrap();
+            // Read the replay's result on units 1-3's side, eagerly.
+            let after = mm(s, &z, &again);
+            let want_slow = host_matmul(&a1, &b1, m1, k1, n1);
+            let want_out = host_matmul(&a2, &want_slow, m2, k2, n1);
+            let want_again = host_matmul(&bits(m1 * m2, 4), &want_out, m1, m2, n1);
+            let want_wide = host_matmul(&a2, &want_again, m2, k2, n1);
+            let as_bits = |v: Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                as_bits(s.download(&wide).unwrap()),
+                as_bits(want_wide.clone()),
+                "round {round}: the replay's last product"
+            );
+            assert_eq!(
+                as_bits(s.download(&after).unwrap()),
+                as_bits(want_wide),
+                "round {round}: an eager op after the replay"
+            );
+            s.free(after).unwrap();
+        }
+        s.release_trace(trace).unwrap();
+        for t in [x, w, z, q, slow, out, again, wide] {
+            s.free(t).unwrap();
         }
     });
 }

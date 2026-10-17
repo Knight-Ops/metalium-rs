@@ -338,6 +338,16 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// [`Engine::scatter_rows`] into `table` itself (`Session::scatter_rows_into`).
+    fn scatter_rows_into(
+        &mut self,
+        _table: BufferId,
+        _indices: BufferId,
+        _values: BufferId,
+        _column: bool,
+    ) -> Result<(), TtError> {
+        Err(unsupported())
+    }
     /// The sum over rows of `a`, `[1, cols]`, left on the device.
     fn sum_rows(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
@@ -488,6 +498,12 @@ pub trait Engine {
     /// traces (a model of one layer); a larger one fails its sync. Silicon only.
     #[doc(hidden)]
     fn set_profile_buffer(&mut self, _bytes: Option<u64>) -> Result<(), TtError> {
+        Err(no_traces())
+    }
+    /// Count what each op of every trace captured from here on moves through GDDR
+    /// (`Session::set_count_trace_bytes`), read back with [`Engine::trace_ops`].
+    #[doc(hidden)]
+    fn set_count_trace_bytes(&mut self, _on: bool) -> Result<(), TtError> {
         Err(no_traces())
     }
     #[doc(hidden)]
@@ -1312,6 +1328,26 @@ impl DramBuffers {
             .scatter_rows(&tt, &ti, &tv, column)
             .map_err(TtError::from)?;
         Ok(self.insert(c))
+    }
+
+    pub fn scatter_rows_into<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(), TtError> {
+        for b in [table, values] {
+            if self.bf16.contains_key(&b) || self.bfp.contains_key(&b) {
+                return Err(TtError::Device(
+                    "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
+                ));
+            }
+        }
+        let (tt, ti, tv) = (self.get(table)?, self.get(indices)?, self.get(values)?);
+        s.scatter_rows_into(tt, ti, tv, column)
+            .map_err(TtError::from)
     }
 
     pub fn repack<T: tt_device::Transport>(
@@ -3614,6 +3650,16 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.scatter_rows(&mut self.session, table, indices, values, column)
     }
+    fn scatter_rows_into(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.scatter_rows_into(&mut self.session, table, indices, values, column)
+    }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())
     }
@@ -3674,6 +3720,10 @@ impl Engine for KmdEngine {
         self.session
             .set_profile_buffer(bytes)
             .map_err(TtError::from)
+    }
+    fn set_count_trace_bytes(&mut self, on: bool) -> Result<(), TtError> {
+        self.session.set_count_trace_bytes(on);
+        Ok(())
     }
     fn profile_generic_trace(
         &mut self,
@@ -3743,6 +3793,81 @@ pub(crate) fn written_in_place(id: BufferId) {
 /// Has `id` been written after it was made ([`written_in_place`])?
 pub(crate) fn is_written_in_place(id: BufferId) -> bool {
     locked(&WRITTEN).as_ref().is_some_and(|w| w.contains(&id))
+}
+
+/// Buffers an open capture owns as its state and may write in place
+/// (`trace::Donation`), each with its [`write_generation`] when donated. Empty outside a
+/// capture with state, so [`donated_since`] is then one atomic load.
+static DONATED: Mutex<Option<HashMap<BufferId, u64>>> = Mutex::new(None);
+static DONATED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many times a capture has written each buffer in place ([`scatter_rows_into`]).
+static GENERATIONS: Mutex<Option<HashMap<BufferId, u64>>> = Mutex::new(None);
+
+/// Give `id` to the open capture as state it may write in place. Anything derived from it
+/// and kept is dropped ([`written_in_place`]): the capture changes its contents.
+pub(crate) fn donate(id: BufferId) {
+    written_in_place(id);
+    let generation = write_generation(id);
+    let mut d = locked(&DONATED);
+    if d.get_or_insert_with(Default::default)
+        .insert(id, generation)
+        .is_none()
+    {
+        DONATED_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// End `id`'s donation ([`donate`]).
+pub(crate) fn undonate(id: BufferId) {
+    let mut d = locked(&DONATED);
+    if d.as_mut().is_some_and(|d| d.remove(&id).is_some()) {
+        DONATED_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `id`'s generation when the open capture was given it, if it was ([`donate`]).
+pub(crate) fn donated_since(id: BufferId) -> Option<u64> {
+    if DONATED_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return None;
+    }
+    locked(&DONATED).as_ref().and_then(|d| d.get(&id).copied())
+}
+
+/// How many times a capture has written `id` in place.
+pub(crate) fn write_generation(id: BufferId) -> u64 {
+    locked(&GENERATIONS)
+        .as_ref()
+        .and_then(|g| g.get(&id).copied())
+        .unwrap_or(0)
+}
+
+/// `table` with `values`' row `i` written at its row `indices[i]`, in place
+/// (`Session::scatter_rows_into`), for a buffer the open capture owns as its state
+/// ([`donate`]). Returns the generation of `table`'s contents after the write: handles made
+/// before it are refused from then on ([`crate::tensor::DramRef::current`]).
+pub(crate) fn scatter_rows_into(
+    device: TtDevice,
+    table: BufferId,
+    indices: BufferId,
+    values: BufferId,
+    column: bool,
+) -> Result<u64, TtError> {
+    if donated_since(table).is_none() {
+        return Err(TtError::Device(format!(
+            "buffer {table} is not state of the open capture: it is not written in place"
+        )));
+    }
+    run(device, move |engine, ids| {
+        ids.healthy()?;
+        engine.scatter_rows_into(ids.get(table)?, ids.get(indices)?, ids.get(values)?, column)
+    })?;
+    let mut g = locked(&GENERATIONS);
+    let n = g
+        .get_or_insert_with(Default::default)
+        .entry(table)
+        .or_insert(0);
+    *n += 1;
+    Ok(*n)
 }
 
 pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), TtError> {
@@ -4461,6 +4586,22 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.scatter_rows(
+            self.fabric.chips[0].session(),
+            table,
+            indices,
+            values,
+            column,
+        )
+    }
+    fn scatter_rows_into(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.scatter_rows_into(
             self.fabric.chips[0].session(),
             table,
             indices,
