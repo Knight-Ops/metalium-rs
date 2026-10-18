@@ -199,6 +199,18 @@ fn execute_chain(
         }
         // One kernel where the separate ops would be SFPU ops on plain F32 and the row fits a
         // job, else those ops: `eps` converted as `float_add_scalar` converts it.
+        // One SFPU pass where the separate ops would be SFPU ops on plain F32, else those ops.
+        ChainKind::MulAdd => {
+            let first = TtBackend::float_mul(inputs[0].clone(), inputs[1].clone());
+            let (c, d) = (&inputs[2], &inputs[3]);
+            let fused = {
+                let _op = crate::report::enter(m.kind.name(), true);
+                crate::ops::float::float_mul_add(c, d, &first)
+            };
+            fused.unwrap_or_else(|| {
+                TtBackend::float_add(first, TtBackend::float_mul(c.clone(), d.clone()))
+            })
+        }
         ChainKind::RmsNorm => {
             let x = &inputs[0];
             let eps = bound[0];
@@ -382,6 +394,7 @@ impl FusionRuntime for TtFusionRuntime {
             Box::new(ElementWiseFuser::default()),
             Box::new(ChainFuser::new(&chain::SILU_MUL)),
             Box::new(ChainFuser::new(&chain::RMS_NORM)),
+            Box::new(ChainFuser::new(&chain::MUL_ADD)),
         ]
     }
 }

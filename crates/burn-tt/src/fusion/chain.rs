@@ -26,6 +26,8 @@ use super::TtOptimization;
 pub(crate) enum Arg {
     /// The previous step's result.
     Chain,
+    /// Step `k`'s result (from 0), an earlier step than the previous one.
+    Step(usize),
     /// The `k`th tensor from outside the chain, bound where it is first read. Input 0 is what
     /// the first step reads.
     Input(usize),
@@ -55,6 +57,7 @@ pub(crate) enum Step {
     /// The mean over the last dimension.
     MeanLast,
     Mul(Arg, Arg),
+    Add(Arg, Arg),
     Div(Arg, Arg),
 }
 
@@ -69,6 +72,8 @@ pub enum ChainKind {
     SiluMul,
     /// Burn's `RmsNorm` without its scale: `x / sqrt(mean(x x) + eps)` over the last dimension.
     RmsNorm,
+    /// `a b + c d`, both products dying in the sum (RoPE's `x cos + rotate(x) sin`).
+    MulAdd,
 }
 
 impl ChainKind {
@@ -79,6 +84,7 @@ impl ChainKind {
             ChainKind::Silu => "tt_silu",
             ChainKind::SiluMul => "tt_silu_mul",
             ChainKind::RmsNorm => "tt_rms_norm",
+            ChainKind::MulAdd => "tt_mul_add",
         }
     }
 }
@@ -129,6 +135,19 @@ pub(crate) const RMS_NORM: Pattern = Pattern {
         Step::Div(Arg::Input(0), Arg::Chain),
     ],
     ends: &[(5, ChainKind::RmsNorm)],
+};
+
+/// `a b + c d`, each product read only by the sum: RoPE's `x cos + cat(x2, x1) sin`, which
+/// reaches the stream as `Mul(x, cos)`, `Mul(rotated, sin)`, `Add(first, second)` (the `cat`
+/// before them ends the block before). The first product runs as itself and the second with
+/// the sum as one pass of `MUL_ADD` (`a b` its `c`): one op fewer, bit for bit.
+pub(crate) const MUL_ADD: Pattern = Pattern {
+    steps: &[
+        Step::Mul(Arg::Input(0), Arg::Input(1)),
+        Step::Mul(Arg::Input(2), Arg::Input(3)),
+        Step::Add(Arg::Step(0), Arg::Chain),
+    ],
+    ends: &[(3, ChainKind::MulAdd)],
 };
 
 /// Most operations a block may hold before a chain begins. burn-fusion groups an operation
@@ -330,6 +349,10 @@ impl ChainFuser {
                 OperationIr::NumericFloat(_, NumericOperationIr::Mul(BinaryOpIr { lhs, rhs, out })),
             )
             | (
+                Step::Add(a, b),
+                OperationIr::NumericFloat(_, NumericOperationIr::Add(BinaryOpIr { lhs, rhs, out })),
+            )
+            | (
                 Step::Div(a, b),
                 OperationIr::NumericFloat(_, NumericOperationIr::Div(BinaryOpIr { lhs, rhs, out })),
             ) => {
@@ -381,6 +404,11 @@ impl Progress {
         match arg {
             Arg::Chain => {
                 if self.chain.as_ref().map(|c| c.id) != Some(tensor.id) {
+                    return false;
+                }
+            }
+            Arg::Step(k) => {
+                if self.made.get(k).map(|(id, _)| *id) != Some(tensor.id) {
                     return false;
                 }
             }
@@ -601,6 +629,51 @@ mod tests {
         // `x` as last read: the match consumes it.
         assert_eq!(m.inputs[0].status, RW);
         assert!(f.status() == FuserStatus::Closed);
+    }
+
+    /// RoPE's `x cos + rotate(x) sin` after its `cat`: `Mul(x, cos)`, `Mul(rotated, sin)`,
+    /// `Add(first, second)` is `MulAdd` over the four inputs in that order. A product read
+    /// again later, or the sum's operands the other way round, is not.
+    #[test]
+    fn a_sum_of_two_products_is_mul_add() {
+        let add = |lhs, rhs, out| {
+            OperationIr::NumericFloat(F32, NumericOperationIr::Add(BinaryOpIr { lhs, rhs, out }))
+        };
+        let fuse = |ops: &[OperationIr]| {
+            let mut f = ChainFuser::new(&MUL_ADD);
+            for op in ops {
+                f.fuse(op);
+            }
+            f
+        };
+        let rope = |first: TensorStatus, swap: bool| {
+            let (l, r) = (t(10, first, F32), t(11, RW, F32));
+            vec![
+                mul(t(1, RW, F32), t(2, RO, F32), t(10, NEW, F32)),
+                mul(t(3, RW, F32), t(4, RO, F32), t(11, NEW, F32)),
+                if swap {
+                    add(r, l, t(12, NEW, F32))
+                } else {
+                    add(l, r, t(12, NEW, F32))
+                },
+            ]
+        };
+        let f = fuse(&rope(RW, false));
+        let m = f.best.clone().unwrap();
+        assert_eq!((m.kind, m.num_ops), (ChainKind::MulAdd, 3));
+        assert_eq!(
+            m.inputs.iter().map(|t| t.id.value()).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(m.out.id, TensorId::new(12));
+        assert!(
+            fuse(&rope(RO, false)).best.is_none(),
+            "the first product read again"
+        );
+        assert!(
+            fuse(&rope(RW, true)).best.is_none(),
+            "the sum the other way round"
+        );
     }
 
     #[test]

@@ -235,6 +235,15 @@ pub mod kind_sfpu {
     pub const SILU: u32 = 0x1f1;
     /// `silu(x) * y`: `SILU` then `MUL(t, y)`, in one pass, bit for bit the three ops.
     pub const SILU_MUL: u32 = 0x1f2;
+    /// `exp(x - y)`: `SUB` then `EXP` in one pass, the difference kept in a register -- bit for
+    /// bit the two ops (every `SFPMAD` result is flushed, so the difference is never a
+    /// denormal the FP32 store would keep). A softmax's numerator, `y` its row's maximum as a
+    /// column broadcast.
+    pub const SUB_EXP: u32 = 0x1f3;
+    /// `c + a * b`: `MUL` then `ADD(c, product)`, in one pass, two roundings -- bit for bit the
+    /// two ops (the product is an `SFPMAD` result, flushed, so its FP32 store would keep no
+    /// denormal). RoPE's `x cos + rotate(x) sin`, `c` the first product.
+    pub const MUL_ADD: u32 = 0x1f4;
     /// End of the original contiguous activation range. Additional kinds
     /// occupy the documented integer, rounding and index ranges below.
     pub const LAST: u32 = BOOL_TO_I32;
@@ -310,6 +319,7 @@ pub fn elems(kind: u32) -> Sig {
         kind_sfpu::EQ_S..=kind_sfpu::IS_INF => sig(&[F32], Bool),
         kind_sfpu::MASK_FILL => sig(&[F32, Bool], F32),
         kind_sfpu::MASK_WHERE => sig(&[F32, Bool, F32], F32),
+        kind_sfpu::MUL_ADD => sig(&[F32, F32, F32], F32),
         kind_sfpu::INT_MASK_FILL => sig(&[Elem::I32, Bool], Elem::I32),
         kind_sfpu::INT_MASK_WHERE => sig(&[Elem::I32, Bool, Elem::I32], Elem::I32),
         kind_sfpu::BOOL_MASK_FILL => sig(&[Bool, Bool], Bool),
@@ -354,6 +364,7 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::SIGMOID
         | kind_sfpu::SILU
         | kind_sfpu::SILU_MUL
+        | kind_sfpu::SUB_EXP
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
@@ -2355,6 +2366,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
     Some(match kind {
         kind::ADD
         | kind_sfpu::ADD_RELU
+        | kind_sfpu::SUB_EXP
         | kind::SUB
         | kind::MUL
         | kind::RELU_BACKWARD
@@ -2374,9 +2386,10 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::LOG_SIGMOID_BACKWARD
         | kind_sfpu::SILU_MUL
         | kind_sfpu::ATAN2 => Operands::Binary,
-        kind_sfpu::MASK_WHERE | kind_sfpu::INT_MASK_WHERE | kind_sfpu::BOOL_MASK_WHERE => {
-            Operands::Ternary
-        }
+        kind_sfpu::MASK_WHERE
+        | kind_sfpu::INT_MASK_WHERE
+        | kind_sfpu::BOOL_MASK_WHERE
+        | kind_sfpu::MUL_ADD => Operands::Ternary,
         kind_sfpu::REM => Operands::Binary,
         kind_sfpu::REM_S => Operands::Unary,
         kind::MUL_SCALAR
@@ -2465,6 +2478,7 @@ pub fn broadcasts(kind: u32) -> bool {
         kind,
         kind::ADD
             | kind_sfpu::ADD_RELU
+            | kind_sfpu::SUB_EXP
             | kind::SUB
             | kind::MUL
             | kind_sfpu::DIV
@@ -2489,7 +2503,12 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
     // The exact ops of S2 move raw bits too: an FP32 store would flush a
     // denormal Flex keeps.
     let fmt = match kind {
-        kind::ADD | kind_sfpu::ADD_RELU | kind::SUB | kind::MUL | kind_sfpu::DIV => Format::Fp32,
+        kind::ADD
+        | kind_sfpu::ADD_RELU
+        | kind_sfpu::SUB_EXP
+        | kind::SUB
+        | kind::MUL
+        | kind_sfpu::DIV => Format::Fp32,
         _ => Format::Int32,
     };
     p.load(LReg::L0, fmt, a_at);
@@ -2552,6 +2571,12 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
         kind::SUB => {
             p.sub(LReg::L0, LReg::L1, LReg::L2);
             LReg::L2
+        }
+        // `SUB`'s difference, then `EXP`'s program on it where `EXP` would load it.
+        kind_sfpu::SUB_EXP => {
+            p.sub(LReg::L0, LReg::L1, LReg::L2);
+            exp_program(p, LReg::L2, LReg::L7);
+            LReg::L7
         }
         kind::MUL => {
             p.mul(LReg::L0, LReg::L1, LReg::L2);
@@ -2656,13 +2681,35 @@ fn canonical(bits: u32) -> u32 {
 
 /// The program for an exact S2 op (10.2c) over a tile, or `None` for a kind
 /// that is not one -- or a `CLAMP` whose bounds `f32::clamp` would refuse.
-fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operands> {
+fn exact_program(p: &mut Program, kind: u32, scalars: [f32; 2]) -> Option<Operands> {
+    exact_program_at(p, kind, scalars, A_ROW, OUT_ROW)
+}
+
+/// The exact (raw-bit) program of an exact unary kind (a clamp, `NEG`, `ABS`, ...), in place on
+/// the tile at `Dst` row `row`: what a reduction appends to its finish to apply the kind to its
+/// result before the pack, bit for bit the kind run on the stored result (it moves raw bits, so
+/// no store or load between them changes one). `None` for a kind with no exact unary program.
+pub fn exact_in_place(kind: u32, scalars: [f32; 2], row: u32) -> Option<Vec<Instruction>> {
+    let mut p = Program::new();
+    match exact_program_at(&mut p, kind, scalars, row, row)? {
+        Operands::Unary => Some(p.finish()),
+        _ => None,
+    }
+}
+
+fn exact_program_at(
+    p: &mut Program,
+    kind: u32,
+    [s, s2]: [f32; 2],
+    in_row: u32,
+    out_row: u32,
+) -> Option<Operands> {
     use kind_sfpu::*;
     let (x, out, ax) = (LReg::L0, LReg::L2, LReg::L3);
     let (mask, inf) = (LReg::L4, LReg::L5);
     let (load, store) = (
-        move |p: &mut Program, o: u32| p.load(x, Format::Int32, A_ROW + o),
-        move |p: &mut Program, o: u32| p.store(out, Format::Int32, OUT_ROW + o),
+        move |p: &mut Program, o: u32| p.load(x, Format::Int32, in_row + o),
+        move |p: &mut Program, o: u32| p.store(out, Format::Int32, out_row + o),
     );
     match kind {
         // Two's complement `|x|`: negate the negative lanes, wrapping, so
@@ -2798,7 +2845,7 @@ fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operan
             p.loadi_bits(LReg::L7, s2.to_bits());
             p.loadi(LReg::L1, 1.0);
             p.for_each_row_group(64, |p, o| {
-                p.load(x, Format::Fp32, A_ROW + o);
+                p.load(x, Format::Fp32, in_row + o);
                 p.mul(LReg::L6, x, out);
                 p.add(out, LReg::L7, out);
                 // `.clamp(0, 1)`: a NaN stays, `-0` stays.
@@ -2884,6 +2931,7 @@ pub fn row_limited(kind: u32) -> bool {
             | kind_sfpu::DIV
             | kind_sfpu::SIGMOID
             | kind_sfpu::SILU_MUL
+            | kind_sfpu::MUL_ADD
     )
 }
 
@@ -3056,6 +3104,7 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
     let operands = match kind {
         kind::ADD
         | kind_sfpu::ADD_RELU
+        | kind_sfpu::SUB_EXP
         | kind::SUB
         | kind::MUL
         | kind_sfpu::DIV
@@ -3238,6 +3287,19 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
         // store and reload them as FP32: neither is ever a denormal (every
         // `SFPMAD` result is flushed, and sigmoid's other results are 0.5 or a
         // NaN), so the store would change no bit.
+        // `MUL`'s product, then `ADD`'s sum with `c` as its left operand, as the separate ops
+        // compute `c + a * b`.
+        kind_sfpu::MUL_ADD => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                p.load(LReg::L1, Format::Fp32, B_ROW + o);
+                p.mul(LReg::L0, LReg::L1, LReg::L2);
+                p.load(LReg::L0, Format::Fp32, super::kernel::C_ROW + o);
+                p.add(LReg::L0, LReg::L2, LReg::L2);
+                p.store(LReg::L2, Format::Fp32, OUT_ROW + o);
+            });
+            Operands::Ternary
+        }
         kind_sfpu::SILU | kind_sfpu::SILU_MUL => {
             p.for_each_row_group(64, |p, o| {
                 p.load(LReg::L0, Format::Fp32, A_ROW + o);
@@ -3690,6 +3752,7 @@ mod fit {
         for k in [
             kind::ADD,
             kind_sfpu::ADD_RELU,
+            kind_sfpu::SUB_EXP,
             kind_sfpu::SILU,
             kind_sfpu::SILU_MUL,
             kind::SUB,
@@ -5506,7 +5569,10 @@ mod row_limited_tests {
                     v.dst[(B_ROW + 4 + r) as usize] = std::array::from_fn(|c| t[256 + c]);
                 }
             }
-            Operands::Ternary => panic!("no ternary kind is row limited"),
+            Operands::Ternary => {
+                v.put_tile(B_ROW as usize, &tile(2));
+                v.put_tile(super::super::kernel::C_ROW as usize, &tile(4));
+            }
         }
         v.run(math).unwrap();
         v.tile(OUT_ROW as usize)
@@ -5528,6 +5594,7 @@ mod row_limited_tests {
             kind_sfpu::DIV,
             kind_sfpu::SIGMOID,
             kind_sfpu::SILU_MUL,
+            kind_sfpu::MUL_ADD,
         ];
         for kind in kinds {
             assert!(row_limited(kind), "{kind:#x}");
@@ -5599,5 +5666,88 @@ mod row_limited_tests {
             add1.len(),
             whole.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod sub_exp_tests {
+    use super::*;
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Ordinary values, every special value, and pairs whose difference is a denormal.
+    fn values(seed: u32, n: usize) -> Vec<f32> {
+        const SPECIAL: [u32; 10] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x807f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc1_2345,
+            0x7f7f_ffff,
+            0x0080_0000,
+            0xc2b0_0000,
+        ];
+        let mut s = seed | 1;
+        (0..n)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                match i % 11 {
+                    3 => f32::from_bits(SPECIAL[(s >> 8) as usize % SPECIAL.len()]),
+                    // Near the smallest normal: a difference with its neighbour is a denormal.
+                    7 => f32::from_bits(0x0080_0000 + (s >> 28)),
+                    _ => ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * [0.1f32, 4.0, 90.0][i % 3],
+                }
+            })
+            .collect()
+    }
+
+    /// `MUL_ADD` is `MUL` then `ADD(c, product)`, bit for bit, on special values and products
+    /// that are denormals.
+    #[test]
+    fn mul_add_is_mul_then_add_bit_for_bit() {
+        for (rows, cols) in [(32, 64), (33, 70), (1, 2048)] {
+            let n = rows * cols;
+            let (a, b, c) = (values(1, n), values(2, n), values(3, n));
+            let none = Broadcast::None;
+            let t = reference_op(kind::MUL, [0.0; 2], none, &[&a, &b], rows, cols);
+            let want = reference_op(kind::ADD, [0.0; 2], none, &[&c, &t], rows, cols);
+            let got = reference_op(
+                kind_sfpu::MUL_ADD,
+                [0.0; 2],
+                none,
+                &[&a, &b, &c],
+                rows,
+                cols,
+            );
+            assert_eq!(bits(&got), bits(&want), "[{rows}, {cols}]");
+        }
+    }
+
+    /// `SUB_EXP` is `SUB` then `EXP`, bit for bit, plain and with its second operand a row or a
+    /// column broadcast (a softmax's row maximum).
+    #[test]
+    fn sub_exp_is_sub_then_exp_bit_for_bit() {
+        for (rows, cols) in [(32, 64), (33, 70), (3, 512), (1, 40)] {
+            let x = values((rows * 100 + cols) as u32, rows * cols);
+            for (bcast, n) in [
+                (Broadcast::None, rows * cols),
+                (Broadcast::Col, rows),
+                (Broadcast::Row, cols),
+            ] {
+                if bcast != Broadcast::None && (rows == 1 || cols == 1) {
+                    continue;
+                }
+                let y = values(7 + n as u32, n);
+                let d = reference_for(kind::SUB, 0.0, bcast, &x, Some(&y), rows, cols);
+                let want =
+                    reference_for(kind_sfpu::EXP, 0.0, Broadcast::None, &d, None, rows, cols);
+                let got = reference_for(kind_sfpu::SUB_EXP, 0.0, bcast, &x, Some(&y), rows, cols);
+                assert_eq!(bits(&got), bits(&want), "[{rows}, {cols}] {bcast:?}");
+            }
+        }
     }
 }

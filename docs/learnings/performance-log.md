@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [RoPE's sum as one op](#ropes-sum-as-one-op-2026-10-18-cards-0-and-1) | 2026-10-18 | `x cos + rotate(x) sin`'s second product and sum in one pass (`MUL_ADD`, a chain fuser), bit for bit: a 1.7B decode step -> **35.64 / 36.22 / 37.20 ms**, 135M -> **14.43 / 14.92 / 15.46** |
+| [Attention's softmax in four ops](#attentions-softmax-in-four-ops-2026-10-18-cards-0-and-1) | 2026-10-18 | `exp(x - max)` in one pass and each clamp on its reduction, bit for bit: a 1.7B decode step -> **36.12 / 36.52 / 37.54 ms**, 135M -> **14.80 / 15.29 / 15.86** |
 | [The bound on a decode product's `A` reads](#the-bound-on-a-decode-products-a-reads-2026-10-18-card-0) | 2026-10-18 | every block reading only `B` (a timing probe): a 1.7B layer's products ~143 us faster (`down` 270 -> 198 us), ~3.4 ms a step at most for reading `A` once a product |
 | [A stacked product's tail rows left unread](#a-stacked-products-tail-rows-left-unread-2026-10-17-cards-0-and-1) | 2026-10-17 | a batched product's padded left blocks no longer read their tail rows as zeros under a stacked output: a 1.7B decode step -> **36.89 / 37.30 / 38.36 ms**, 135M -> **16.05 / 16.48 / 17.29** |
 | [A transposed `B` transposed by the unpacker](#a-transposed-b-transposed-by-the-unpacker-2026-10-17-cards-0-and-1) | 2026-10-17 | a matmul's transposed `B` read as it lies and transposed by unpacker 0 (`Haloize_mode`, faces swapped), not by the mover at ~10 us a tile: bit for bit; a 1.7B decode step -> **37.24 / 38.66 / 40.50 ms**, 135M -> **17.10 / 17.52 / 18.25** |
@@ -331,6 +333,28 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## RoPE's sum as one op (2026-10-18, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3.
+- **The change:** `x cos + rotate(x) sin`'s second product and its sum run as one pass (`MUL_ADD`, the `MulAdd`
+  chain fuser), bit for bit.
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792287482`, `1792287884`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 36.12 / 36.52 / 37.54 | **35.64 / 36.22 / 37.20** (`1792290295`) | — |
+| SmolLM2-135M | 14.80 / 15.29 / 15.86 | **14.43 / 14.92 / 15.46** (`1792290681`) | 26.9 / 29.1 / 31.1 |
+
+## Attention's softmax in four ops (2026-10-18, cards 0 and 1)
+
+[decode-attention.md](../plans/decode-attention.md) A4a.
+- **The change:** `exp(x - max)` is one pass (`SUB_EXP`), and each clamp rides on its reduction
+  (`Session::reduce_then`), bit for bit the seven ops.
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792280991`, `1792281384`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 36.39 / 37.02 / 37.98 | **36.12 / 36.52 / 37.54** (`1792287482`) | — |
+| SmolLM2-135M | 15.33 / 15.79 / 16.47 | **14.80 / 15.29 / 15.86** (`1792287884`) | 26.6 / 29.0 / 31.4 |
 
 ## The bound on a decode product's `A` reads (2026-10-18, card 0)
 

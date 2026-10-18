@@ -2040,6 +2040,24 @@ pub mod float {
     // an SFPU approximation (`tt_kernels::sfpu::ops::kind_sfpu::DIV`).
     binary!(float_div, tt_kernels::sfpu::ops::kind_sfpu::DIV);
 
+    /// `exp(lhs - rhs)` in one SFPU pass (`kind_sfpu::SUB_EXP`), bit for bit the two ops: a
+    /// softmax's numerator, `rhs` its rows' maximum. Burn's composition where the pass does not
+    /// apply.
+    pub fn float_sub_exp(
+        lhs: FloatTensor<TtBackend>,
+        rhs: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_eltwise(
+            tt_kernels::sfpu::ops::kind_sfpu::SUB_EXP,
+            0.0,
+            &lhs,
+            Some(&rhs),
+        ) {
+            return t;
+        }
+        float_exp(float_sub(lhs, rhs))
+    }
+
     /// Compound fused addition and ReLU (`relu(lhs + rhs)`) executed in a single SFPU pass.
     pub fn float_add_relu(
         lhs: FloatTensor<TtBackend>,
@@ -2081,6 +2099,44 @@ pub mod float {
             kind_sfpu::SILU
         };
         device_eltwise(kind, 0.0, x, y)
+    }
+
+    /// `c + a * b` in one SFPU pass (`kind_sfpu::MUL_ADD`), bit for bit `float_mul` then
+    /// `float_add(c, product)` where those run as SFPU ops on plain F32 of one shape. `None`
+    /// elsewhere: the caller runs the separate ops.
+    pub fn float_mul_add(a: &TtTensor, b: &TtTensor, c: &TtTensor) -> Option<TtTensor> {
+        use tt_kernels::sfpu::ops::kind_sfpu;
+        let f32 = |t: &TtTensor| {
+            t.dtype() == DType::F32 && t.storage_format() == crate::storage::StorageFormat::F32
+        };
+        // A `b` that broadcasts to `a` (RoPE's table over the heads) laid out as `a` is, by the
+        // tile copies `float_mul` makes and keeps beside it (`relaid`): the kernel then reads
+        // three operands of one layout.
+        let laid;
+        let b = if b.shape() == a.shape() {
+            b
+        } else {
+            let v = a.as_strided()?;
+            laid = super::relaid(b, &a.shape().to_vec(), &v.strides)?;
+            &laid
+        };
+        if !f32(a)
+            || !f32(b)
+            || !f32(c)
+            || c.shape() != a.shape()
+            || matches!(
+                crate::server::elementwise_mode(a.device),
+                crate::ElementwiseMode::Matrix { .. }
+            )
+        {
+            return None;
+        }
+        let op = tt_kernels::tensor::Eltwise {
+            kind: kind_sfpu::MUL_ADD,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        device_op(op, a, Some(b), Some(c))
     }
 
     /// Burn's `RmsNorm` without its scale, `x / sqrt(mean(x x) + eps)` over the last dimension,
@@ -2856,6 +2912,48 @@ pub mod float {
         dim: usize,
     ) -> Option<TtTensor> {
         device_reduce_ungated(tensor, op, dim)
+    }
+
+    /// `clamp_min(reduce(tensor, dim), min)`, a softmax's guarded maximum and sum: one op over the
+    /// last dimension (`Session::reduce_then`, the clamp applied to the result before its pack),
+    /// bit for bit the two ops; the two ops elsewhere.
+    pub(crate) fn reduce_clamp_min(
+        tensor: TtTensor,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+        dim: usize,
+        min: f32,
+    ) -> TtTensor {
+        use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+        let shape = tensor.shape().to_vec();
+        let then = Some((kind_sfpu::CLAMP_MIN, min.to_bits()));
+        let fits = dim + 1 == shape.len()
+            && !shape.contains(&0)
+            && tensor.is_storable()
+            && tensor.elem() == Some(op.elem())
+            && crate::server::supports_dram(tensor.device)
+            && crate::tensor::stored_dims(&shape).is_some_and(|dims| {
+                tt_kernels::tensor::reduce_then_fits(op, Axis::Cols, dims, then)
+            });
+        if fits {
+            let device = tensor.device;
+            let d = plain_dram(&tensor);
+            let mut out_shape = shape;
+            out_shape[dim] = 1;
+            let (id, dims) = crate::server::reduce_then(device, d.buffer.id, op, Axis::Cols, then);
+            return device_result_shaped(
+                device,
+                id,
+                dims,
+                burn_backend::Shape::from(out_shape),
+                tensor.dtype(),
+            );
+        }
+        let reduced = match op {
+            ReduceOp::Max => float::float_max_dim(tensor, dim),
+            ReduceOp::Sum => float::float_sum_dim(tensor, dim),
+            _ => unreachable!("a softmax's maximum or sum"),
+        };
+        float::float_clamp_min(reduced, min.into())
     }
 
     /// The sum over a leading dimension `dim` with nothing before it (`[n,
@@ -3759,12 +3857,18 @@ pub mod module {
         drop(_part);
         let probabilities = {
             let _part = part("attention/softmax");
-            let max =
-                float::float_clamp_min(float::float_max_dim(scores.clone(), 3), (-f32::MAX).into());
-            let exp = float::float_exp(float::float_sub(scores, max));
-            let sum = float::float_clamp_min(
-                float::float_sum_dim(exp.clone(), 3),
-                f32::MIN_POSITIVE.into(),
+            let max = float::reduce_clamp_min(
+                scores.clone(),
+                tt_kernels::sfpu::reduce::ReduceOp::Max,
+                3,
+                -f32::MAX,
+            );
+            let exp = float::float_sub_exp(scores, max);
+            let sum = float::reduce_clamp_min(
+                exp.clone(),
+                tt_kernels::sfpu::reduce::ReduceOp::Sum,
+                3,
+                f32::MIN_POSITIVE,
             );
             float::float_div(exp, sum)
         };
@@ -3907,12 +4011,18 @@ pub mod module {
         }
         let probabilities = {
             let _part = part("attention/softmax");
-            let max =
-                float::float_clamp_min(float::float_max_dim(scores.clone(), 1), (-f32::MAX).into());
-            let exp = float::float_exp(float::float_sub(scores, max));
-            let sum = float::float_clamp_min(
-                float::float_sum_dim(exp.clone(), 1),
-                f32::MIN_POSITIVE.into(),
+            let max = float::reduce_clamp_min(
+                scores.clone(),
+                tt_kernels::sfpu::reduce::ReduceOp::Max,
+                1,
+                -f32::MAX,
+            );
+            let exp = float::float_sub_exp(scores, max);
+            let sum = float::reduce_clamp_min(
+                exp.clone(),
+                tt_kernels::sfpu::reduce::ReduceOp::Sum,
+                1,
+                f32::MIN_POSITIVE,
             );
             float::float_div(exp, sum)
         };
@@ -4151,13 +4261,16 @@ pub mod activation {
             t
         };
         let max = reduce(t, ReduceOp::Max, dim)?;
-        let shifted = device_eltwise_ungated(kind::SUB, 0.0, t, Some(&max))?;
-        let exp = device_eltwise_ungated(kind_sfpu::EXP, 0.0, &shifted, None)?;
-        let sum = reduce(&exp, ReduceOp::Sum, dim)?;
         if log {
+            let shifted = device_eltwise_ungated(kind::SUB, 0.0, t, Some(&max))?;
+            let exp = device_eltwise_ungated(kind_sfpu::EXP, 0.0, &shifted, None)?;
+            let sum = reduce(&exp, ReduceOp::Sum, dim)?;
             let log_sum = device_eltwise_ungated(kind_sfpu::LOG, 0.0, &sum, None)?;
             device_eltwise_ungated(kind::SUB, 0.0, &shifted, Some(&log_sum))
         } else {
+            // `exp(t - max)` in one pass, bit for bit `SUB` then `EXP`.
+            let exp = device_eltwise_ungated(kind_sfpu::SUB_EXP, 0.0, t, Some(&max))?;
+            let sum = reduce(&exp, ReduceOp::Sum, dim)?;
             device_eltwise_ungated(kind_sfpu::DIV, 0.0, &exp, Some(&sum))
         }
     }

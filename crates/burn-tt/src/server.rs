@@ -359,6 +359,7 @@ pub trait Engine {
         _a: BufferId,
         _op: tt_kernels::sfpu::reduce::ReduceOp,
         _axis: tt_kernels::sfpu::reduce::Axis,
+        _then: tt_kernels::tensor::ReduceThen,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -1607,9 +1608,10 @@ impl DramBuffers {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
+        then: tt_kernels::tensor::ReduceThen,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
-        let c = s.reduce(&ta, op, axis).map_err(TtError::from)?;
+        let c = s.reduce_then(&ta, op, axis, then).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -2886,6 +2888,18 @@ pub(crate) fn reduce(
     op: tt_kernels::sfpu::reduce::ReduceOp,
     axis: tt_kernels::sfpu::reduce::Axis,
 ) -> (BufferId, [usize; 2]) {
+    reduce_then(device, a, op, axis, None)
+}
+
+/// [`reduce`] with `then`'s exact unary kind on the result before its pack
+/// (`tt_kernels::tensor::sfpu_reduce_then`): a softmax's clamps.
+pub(crate) fn reduce_then(
+    device: TtDevice,
+    a: BufferId,
+    op: tt_kernels::sfpu::reduce::ReduceOp,
+    axis: tt_kernels::sfpu::reduce::Axis,
+    then: tt_kernels::tensor::ReduceThen,
+) -> (BufferId, [usize; 2]) {
     use tt_kernels::sfpu::reduce::Axis;
     let [r, c] = dims_of(a);
     let dims = match axis {
@@ -2897,7 +2911,7 @@ pub(crate) fn reduce(
         device,
         dims,
         move || format!("{op:?} over {axis:?}"),
-        move |engine, ids| engine.reduce(ids.get(a)?, op, axis),
+        move |engine, ids| engine.reduce(ids.get(a)?, op, axis, then),
     )
 }
 
@@ -3470,9 +3484,10 @@ impl Engine for KmdEngine {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
+        then: tt_kernels::tensor::ReduceThen,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
-        bufs.reduce(&mut self.session, a, op, axis)
+        bufs.reduce(&mut self.session, a, op, axis, then)
     }
     fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
@@ -4216,9 +4231,9 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         let result = (|| {
             let input = self.upload(values, r, c)?;
             temporary.push(input);
-            let (column, _) = self.reduce(input, ReduceOp::Sum, Axis::Cols)?;
+            let (column, _) = self.reduce(input, ReduceOp::Sum, Axis::Cols, None)?;
             temporary.push(column);
-            let (mut scalar, _) = self.reduce(column, ReduceOp::Sum, Axis::Rows)?;
+            let (mut scalar, _) = self.reduce(column, ReduceOp::Sum, Axis::Rows, None)?;
             temporary.push(scalar);
             if mean {
                 (scalar, _) = self.eltwise(
@@ -4384,9 +4399,10 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
+        then: tt_kernels::tensor::ReduceThen,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
-        bufs.reduce(self.fabric.chips[0].session(), a, op, axis)
+        bufs.reduce(self.fabric.chips[0].session(), a, op, axis, then)
     }
     fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;

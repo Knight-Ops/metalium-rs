@@ -224,3 +224,86 @@ fn a_row_limited_result_feeds_a_sum_and_a_product_exactly() {
         }
     });
 }
+
+/// `SUB_EXP` (a softmax's `exp(x - max)` in one pass) is `SUB` then `EXP` on the card, bit for
+/// bit: scores of 32 rows over 64 and 70 columns, the row maxima a column broadcast, every special
+/// value, over NaN-primed slots.
+#[test]
+fn sub_exp_is_sub_then_exp_on_the_card() {
+    with_session(|s| {
+        for (rows, cols) in [(32usize, 64usize), (32, 70), (3, 512)] {
+            let x = floats((rows * 7 + cols) as u64, rows * cols);
+            let m = floats(rows as u64 + 3, rows);
+            let a = s.upload(&x, rows, cols).unwrap();
+            let b = s.upload(&m, rows, 1).unwrap();
+            let nan = s.upload(&vec![f32::NAN; 32 * cols], 32, cols).unwrap();
+            let nan_b = s.upload(&[f32::NAN; 32], 32, 1).unwrap();
+            let primed = s
+                .eltwise(op(kind_sfpu::SUB_EXP, 0.0), &nan, Some(&nan_b))
+                .unwrap();
+            let fused = s
+                .eltwise(op(kind_sfpu::SUB_EXP, 0.0), &a, Some(&b))
+                .unwrap();
+            let d = s.eltwise(op(kind::SUB, 0.0), &a, Some(&b)).unwrap();
+            let composed = s.eltwise(op(kind_sfpu::EXP, 0.0), &d, None).unwrap();
+            let (f, c) = (s.download(&fused).unwrap(), s.download(&composed).unwrap());
+            assert_eq!(
+                f.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "[{rows}, {cols}]"
+            );
+            for t in [a, b, nan, nan_b, primed, fused, d, composed] {
+                s.free(t).unwrap();
+            }
+        }
+    });
+}
+
+/// A reduction with a clamp applied before its pack (`Session::reduce_then`: a softmax's
+/// `clamp_min(max(x), -MAX)` and `clamp_min(sum(e), MIN_POSITIVE)`) is the reduction then
+/// `CLAMP_MIN`, bit for bit: rows that are all `-inf` (a masked row's maximum, clamped up), all
+/// zeros (a sum clamped up), NaN, and ordinary ones, over 64, 70 and 512 columns.
+#[test]
+fn a_reduction_then_a_clamp_is_the_two_ops_on_the_card() {
+    use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+    with_session(|s| {
+        for cols in [64usize, 70, 512] {
+            let rows = 32;
+            let mut x = floats(cols as u64 + 11, rows * cols);
+            for c in 0..cols {
+                x[c] = f32::NEG_INFINITY;
+                x[cols + c] = 0.0;
+            }
+            x[2 * cols + 5] = f32::NAN;
+            let a = s.upload(&x, rows, cols).unwrap();
+            for (op, min) in [
+                (ReduceOp::Max, -f32::MAX),
+                (ReduceOp::Sum, f32::MIN_POSITIVE),
+            ] {
+                let then = Some((kind_sfpu::CLAMP_MIN, min.to_bits()));
+                let fused = s.reduce_then(&a, op, Axis::Cols, then).unwrap();
+                let r = s.reduce(&a, op, Axis::Cols).unwrap();
+                let composed = s.eltwise(op_clamp(min), &r, None).unwrap();
+                let (f, c) = (s.download(&fused).unwrap(), s.download(&composed).unwrap());
+                assert_eq!(
+                    f.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{op:?} over {cols} columns"
+                );
+                if op == ReduceOp::Max {
+                    assert_eq!(f[0], -f32::MAX, "a masked row's maximum is clamped");
+                } else {
+                    assert_eq!(f[1], f32::MIN_POSITIVE, "a zero sum is clamped");
+                }
+                for t in [fused, r, composed] {
+                    s.free(t).unwrap();
+                }
+            }
+            s.free(a).unwrap();
+        }
+    });
+}
+
+fn op_clamp(min: f32) -> Eltwise {
+    op(kind_sfpu::CLAMP_MIN, min)
+}

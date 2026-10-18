@@ -132,12 +132,29 @@ Every phase is bit for bit with today's attention, and each head's positions kee
   - The cache keeps tile-aligned per-head blocks at every attended length.
   - `qk` and `pv` are dealt over 120 units by head, with each head's positions on one unit.
   - **Target:** ≥300 GB/s on the cache. **Worth:** −3 ms at 512.
-- [ ] **A4. Softmax, scale and mask as one op, in the same order:** the existing device softmax
-  (`device_softmax_matrix`), or a reduce-map as RMSNorm's statistic is (S3). Scale and mask fold in where the bits
-  allow.
-  - **Worth:** −1.5 ms.
-  - **Gate:** bit for bit the 7-op composition, with masked rows, `-inf`, and a row of all-equal scores. The
-    control: the sum reversed.
+- [x] **A4a. The softmax in four ops, not seven** (2026-10-18). Each fusion keeps the composition's bits, and
+  the order-sensitive sum stays its own reduction.
+  - **`kind_sfpu::SUB_EXP`:** `exp(x - max)` in one pass. Every `SFPMAD` result is flushed and the FP32 store is
+    exact, so it is the subtract then `EXP`.
+  - **`Session::reduce_then`:** a reduction with an exact unary kind (`sfpu::ops::exact_in_place`) applied to its
+    result before the pack. Each of the softmax's clamps (`clamp_min(max, -MAX)`, `clamp_min(sum, MIN_POSITIVE)`)
+    rides on its reduction. `tensor::reduce_then_fits` keeps a reduction too long for one tile on the two ops.
+  - **Where:** both softmaxes in burn-tt's attention (`float::reduce_clamp_min`, `float::float_sub_exp`), and the
+    device softmax's numerator.
+  - **Gates:**
+    - unit `sub_exp_is_sub_then_exp_bit_for_bit` (watched failing with `exp` on the wrong register);
+    - `step200::sub_exp_is_sub_then_exp_on_the_card`;
+    - `step200::a_reduction_then_a_clamp_is_the_two_ops_on_the_card` (all-`-inf` and all-zero rows, NaN; watched
+      failing with the clamp dropped).
+  - **Regression:** card 0 `1792287238` (`step183`, `step184`, `step187`, `step193`, `step166`, `step188`,
+    `step200`); Burn conformance 2,973 passed, 52 as expected; `step12_mnist`; `--smoke` 1,118 of 1,118
+    (`1792288287`).
+  - **Measured** (card 1):
+    - 1.7B 36.39 / 37.02 / 37.98 -> **36.12 / 36.52 / 37.54 ms** (`1792287482`);
+    - 135M 15.33 / 15.79 / 16.47 -> **14.80 / 15.29 / 15.86** (`1792287884`, burn-flex 26.6 / 29.0 / 31.4).
+- [ ] **A4b. Scale and mask into the softmax** (two ops a layer, ~0.3 ms a 1.7B step). Scale is a multiply,
+  `SFPMAD`, flushed; the mask fill is a select. Both could ride in `SUB_EXP`'s pass only if the maximum were taken
+  after them, so they need a kernel that scales and masks before the reduction.
 - [ ] **A5. Decision (ask the user):** split-position (flash-decode) attention, if A0-A4 leave attention exposed. It
   changes the softmax's and `pv`'s accumulation order, so it needs a derived bound.
 

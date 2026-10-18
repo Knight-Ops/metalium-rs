@@ -443,8 +443,9 @@ fn sim_factory(
             a: burn_tt::BufferId,
             op: tt_kernels::sfpu::reduce::ReduceOp,
             axis: tt_kernels::sfpu::reduce::Axis,
+            then: tt_kernels::tensor::ReduceThen,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
-            self.buffers.reduce(&mut self.session, a, op, axis)
+            self.buffers.reduce(&mut self.session, a, op, axis, then)
         }
         fn rms(
             &mut self,

@@ -5392,13 +5392,32 @@ impl<T: Transport> Session<T> {
         op: crate::sfpu::reduce::ReduceOp,
         axis: crate::sfpu::reduce::Axis,
     ) -> Result<DramTensor, TensorError> {
+        self.reduce_then(a, op, axis, None)
+    }
+
+    /// [`Session::reduce`] with `then`'s exact unary kind applied to the result before its pack
+    /// ([`tensor::sfpu_reduce_then`]): one op where there were two, bit for bit. Refused for a
+    /// sum over rows (Flex's order, its own kernel) and a reduction too long for one tile.
+    pub fn reduce_then(
+        &mut self,
+        a: &DramTensor,
+        op: crate::sfpu::reduce::ReduceOp,
+        axis: crate::sfpu::reduce::Axis,
+        then: tensor::ReduceThen,
+    ) -> Result<DramTensor, TensorError> {
         use crate::sfpu::reduce::{Axis, ReduceOp};
         if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
+            if then.is_some() {
+                return Err(TensorError::Shape(
+                    "a sum over rows takes no finishing kind".into(),
+                ));
+            }
             return self.sum_rows(a);
         }
         let units = self.spread_for(tiles_of(a));
         let overlap = self.overlap();
-        let work = tensor::sfpu_reduce(&mut self.dram_state()?.alloc, a, op, axis, units, overlap)?;
+        let alloc = &mut self.dram_state()?.alloc;
+        let work = tensor::sfpu_reduce_then(alloc, a, op, axis, units, overlap, then)?;
         let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)

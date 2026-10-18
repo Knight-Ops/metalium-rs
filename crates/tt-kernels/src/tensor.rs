@@ -2774,6 +2774,22 @@ pub fn sfpu_reduce(
     units: usize,
     overlap: Overlap,
 ) -> Result<Work> {
+    sfpu_reduce_then(alloc, a, op, axis, units, overlap, None)
+}
+
+/// [`sfpu_reduce`] with `then`'s exact unary kind applied to the result before the pack
+/// ([`ReduceThen`]): bit for bit the kind run on the stored result. A softmax's
+/// `clamp_min(max(x))` and `clamp_min(sum(e))` are each one op so. Refused for a reduction too
+/// long for one tile's programs (the chunked form has no finish to add to).
+pub fn sfpu_reduce_then(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    units: usize,
+    overlap: Overlap,
+    then: ReduceThen,
+) -> Result<Work> {
     a.expect("a reduction", op.elem())?;
     use crate::sfpu::reduce::Axis;
     let per = match axis {
@@ -2790,9 +2806,15 @@ pub fn sfpu_reduce(
         per,
         if valid == 0 { 32 } else { valid as u32 },
         false,
+        then,
     )
     .is_none()
     {
+        if then.is_some() {
+            return Err(TensorError::Shape(
+                "a reduction too long for one tile's programs takes no finishing kind".into(),
+            ));
+        }
         return reduce_chunked(alloc, a, op, axis, units);
     }
     let [rt, ct] = a.grid();
@@ -2811,7 +2833,7 @@ pub fn sfpu_reduce(
         ),
     };
     let valid = if valid == 0 { 32 } else { valid as u32 };
-    let group = match reduce_group(op, axis, per, valid, false) {
+    let group = match reduce_group(op, axis, per, valid, false, then) {
         Some(g) => g,
         None => {
             alloc.free(&out.placement);
@@ -2823,7 +2845,7 @@ pub fn sfpu_reduce(
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     // Pipelined as element-wise runs are ([`sfpu_eltwise`]).
     let piped = {
-        let half = reduce_group(op, axis, per, valid, true).unwrap_or(0);
+        let half = reduce_group(op, axis, per, valid, true, then).unwrap_or(0);
         pipelined_runs(outs, per, units, half, overlap)
     };
     let pipelined = piped.is_some();
@@ -2832,7 +2854,7 @@ pub fn sfpu_reduce(
     for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
         let half = pipelined.then(|| half_of(j, units));
-        let (layout, roles) = match reduce_programs(op, axis, len, per, valid, half) {
+        let (layout, roles) = match reduce_programs(op, axis, len, per, valid, half, then) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -3174,24 +3196,64 @@ type ReducePrograms = (crate::sfpu::reduce::Layout, Arc<[Vec<Instruction>; 3]>);
 /// Most output tiles one reduce run may take, from the slots the data arena
 /// (half of it, if `half`) holds and the role programs' length per output
 /// tile; `None` if not even one fits.
+/// An exact unary kind and its scalar's bits, applied to a reduction's result before its pack
+/// ([`sfpu_reduce_then`]).
+pub type ReduceThen = Option<(u32, u32)>;
+
+/// A reduction's finishing program: the fold, then `then`'s kind in place on the result
+/// (`sfpu::ops::exact_in_place`). `None` if `then` names no exact unary kind.
+fn finishing(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    then: ReduceThen,
+) -> Option<Vec<tt_isa::isa::Instruction>> {
+    let mut fin = crate::sfpu::reduce::finish(op, axis);
+    if let Some((kind, s)) = then {
+        fin.extend(crate::sfpu::ops::exact_in_place(
+            kind,
+            [f32::from_bits(s), 0.0],
+            crate::sfpu::kernel::OUT_ROW,
+        )?);
+    }
+    Some(fin)
+}
+
+/// Whether a reduction of a `[rows, cols]` tensor over `axis` with `then` runs as one tile's
+/// programs a run ([`sfpu_reduce_then`] takes it), not chunked.
+pub fn reduce_then_fits(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    [rows, cols]: [usize; 2],
+    then: ReduceThen,
+) -> bool {
+    use crate::sfpu::reduce::Axis;
+    let (per, valid) = match axis {
+        Axis::Cols => (cols.div_ceil(32), cols % 32),
+        Axis::Rows => (rows.div_ceil(32), rows % 32),
+    };
+    let valid = if valid == 0 { 32 } else { valid as u32 };
+    reduce_group(op, axis, per, valid, false, then).is_some()
+}
+
 fn reduce_group(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     per: usize,
     valid: u32,
     half: bool,
+    then: ReduceThen,
 ) -> Option<usize> {
     use crate::sfpu::reduce::{Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32, bool), Option<usize>>>;
+    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32, bool, ReduceThen), Option<usize>>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, per, valid, half);
+    let key = (op, axis, per, valid, half, then);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
     }
-    let g = measure_reduce_group(op, axis, per, valid, half);
+    let g = measure_reduce_group(op, axis, per, valid, half, then);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, g);
@@ -3204,6 +3266,7 @@ fn measure_reduce_group(
     per: usize,
     valid: u32,
     half: bool,
+    then: ReduceThen,
 ) -> Option<usize> {
     use crate::sfpu::reduce::{math_programs, plan_layout, roles};
     const GROUP: usize = 64;
@@ -3217,7 +3280,8 @@ fn measure_reduce_group(
     if by_slots == 0 {
         return None;
     }
-    let (inputs, fin) = math_programs(op, axis, per, valid);
+    let (inputs, _) = math_programs(op, axis, per, valid);
+    let fin = finishing(op, axis, then)?;
     let lens = |n: usize| -> Option<[usize; 3]> {
         let layout = plan_layout(n, per).ok()?;
         Some(roles(&layout, &inputs, &fin).map(|p| p.len()))
@@ -3249,14 +3313,15 @@ fn reduce_programs(
     per: usize,
     valid: u32,
     half: Option<u8>,
+    then: ReduceThen,
 ) -> Result<ReducePrograms> {
     use crate::sfpu::reduce::{math_programs, plan_layout, plan_layout_in, roles, Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (ReduceOp, Axis, usize, usize, u32, Option<u8>);
+    type Key = (ReduceOp, Axis, usize, usize, u32, Option<u8>, ReduceThen);
     type Memo = Mutex<HashMap<Key, ReducePrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, len, per, valid, half);
+    let key = (op, axis, len, per, valid, half, then);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
@@ -3267,7 +3332,9 @@ fn reduce_programs(
             .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
     }
     .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (inputs, fin) = math_programs(op, axis, per, valid);
+    let (inputs, _) = math_programs(op, axis, per, valid);
+    let fin = finishing(op, axis, then)
+        .ok_or_else(|| TensorError::Shape("a reduction's finishing kind is no exact one".into()))?;
     let p = (layout.clone(), Arc::new(roles(&layout, &inputs, &fin)));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -3295,7 +3362,7 @@ pub fn sum_rows(
         0 => 32,
         v => v,
     };
-    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid, false).is_some() {
+    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid, false, None).is_some() {
         return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units, overlap);
     }
     // Longer columns stay plain: each chunk gathers the sums the chunk before

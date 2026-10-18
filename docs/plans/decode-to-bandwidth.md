@@ -1,13 +1,14 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-17): **a 1.7B step 41.83 / 44.25 / 47.40 -> 36.39 / 37.02 / 37.98 ms (`1792280991`), 135M
-20.03 / 20.55 / 21.19 -> 15.33 / 15.79 / 16.47 (`1792281384`).**
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-18): **a 1.7B step 41.83 / 44.25 / 47.40 -> 35.64 / 36.22 / 37.20 ms (`1792290295`), 135M
+20.03 / 20.55 / 21.19 -> 14.43 / 14.92 / 15.46 (`1792290681`).**
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
 - **Phase 1:** the copies are done; the k/v repack moved to Phase 2.
-- **Phase 3:** the capture barriers and the row-limited element-wise ops are done.
+- **Phase 3:** the capture barriers, the row-limited element-wise ops and RoPE's sum fuser are done.
 - **Phase 2:** A0 found the transposed reads of the key cache; `B` is now transposed by the unpacker (A0b), and a
-  stacked product's tail rows are no longer read (A2a), nor its padding off `K` filled (A1).
+  stacked product's tail rows are no longer read (A2a), nor its padding off `K` filled (A1); the softmax is four
+  ops (A4a).
 - **Next:** Phase 2's A1-A2 (the batched path's padding, no regathering), then Phase 3's fusers. This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
 - [in-place-cache-write.md](in-place-cache-write.md) (D1-D5);
@@ -144,12 +145,32 @@ Burn model gains.
   - **Measured** (card 1, burn-flex in the same runs):
     - 1.7B 38.93 / 41.38 / 44.58 -> **37.69 / 40.20 / 43.41 ms** (`1792268720`);
     - 135M 18.59 / 19.03 / 19.81 -> **17.51 / 17.97 / 18.76** (`1792269106`, burn-flex 27.3 / 30.1 / 31.2).
-- [ ] **Chain fusers** (`burn-tt` `fusion/chain.rs`). Each is bit for bit the composition it replaces, with a negative
-  control.
-  - RMSNorm's `x / stat * gamma` as one body: −49 ops.
-  - RoPE's `x cos + cat(x2, x1) sin` as one op over block views (`cat_in_layout`'s tile permutation): −144 ops.
-  - The residual `Add` fused into the next norm's statistic: −48 ops, and the norm no longer reads its row on one
-    unit.
+- [x] **RoPE's sum as one op** (2026-10-18).
+  - **The kernel:** `kind_sfpu::MUL_ADD`, `c + a b`: `MUL` then `ADD`'s instruction with `c` as its left operand,
+    two roundings, so bit for bit the two ops.
+  - **The fuser:** a `MulAdd` chain (`fusion/chain.rs`, with `Arg::Step(k)`, an earlier step's result) matches
+    burn-fusion's `Mul(x, cos)`, `Mul(rotated, sin)`, `Add(first, second)`. The `cat` ends the block before it.
+    The first product runs as itself; the second and the sum run as `MUL_ADD`.
+  - **The table:** relaid into the operand's layout (`relaid`, the copy `float_mul` keeps). Where it cannot be
+    (halves of 16 columns), the sum runs as itself.
+  - **Gates:**
+    - unit `mul_add_is_mul_then_add_bit_for_bit` (watched failing with one fused `SFPMAD`);
+    - the row-limit unit gate, now with ternary kinds;
+    - fuser unit `a_sum_of_two_products_is_mul_add` (a product read again, or the sum's operands reversed, is not
+      fused);
+    - `step193::tt_and_tt_backend_compared`, now with a `head_dim` 64 config: every RoPE sum fuses there, one
+      `add` fewer each, and the generations stay `TtBackend`'s bit for bit.
+  - **Regression:**
+    - ttsim: `step187`, `step191`, `step192`, `step194`, `step195`, `step12_mnist`;
+    - Burn conformance: plain 2,973 passed, 52 as expected; `--fusion` 2,970 passed, 55 as expected, 0 unexpected;
+    - card 0: 34 gates (`1792290020`); `--smoke` 1,118 of 1,118 (`1792290851`).
+  - **Measured** (card 1):
+    - 1.7B 36.12 / 36.52 / 37.54 -> **35.64 / 36.22 / 37.20 ms** (`1792290295`);
+    - 135M 14.80 / 15.29 / 15.86 -> **14.43 / 14.92 / 15.46** (`1792290681`, burn-flex 26.9 / 29.1 / 31.1).
+- [ ] **The other chain fusers** (`burn-tt` `fusion/chain.rs`):
+  - RMSNorm's `x / stat * gamma` as one body. Today `gamma`'s `Reshape` puts the product in a block of its own, so
+    the fuser cannot see it (decode-small-ops S3, R0).
+  - The residual `Add` fused into the next norm's statistic.
 - [ ] **What is left per op** (decode-small-ops S5). With ~300 ops left, ~3.5 us of control an op is ~1 ms.
   - Measure it.
   - Then decide on a firmware change, such as one `PAIR_CALL` launch and its credits shared by back-to-back small

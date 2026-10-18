@@ -77,6 +77,16 @@ fn configs() -> Vec<(&'static str, LlamaConfig)> {
                 ..base
             },
         ),
+        (
+            "head width 64, multi-head",
+            LlamaConfig {
+                hidden: 128,
+                heads: 2,
+                kv_heads: 2,
+                head_dim: 64,
+                ..base
+            },
+        ),
     ]
 }
 
@@ -228,6 +238,21 @@ fn tt_and_tt_backend_compared() {
                 (calls(&native, "float_mean_dim"), 0),
                 "{what}: every RMSNorm fused"
             );
+            // Each RoPE application's `x cos + rotate(x) sin` is one `MUL_ADD` on `Tt` where its
+            // halves are whole tiles (`head_dim` 64): an `add` fewer for each. At 32 the table does
+            // not lie over the heads by tile copies, and the sum runs as itself. The generations
+            // are `TtBackend`'s bit for bit either way (below).
+            // (A single key head's table needs no relaying: its sums fuse at 32 too.)
+            let mul_adds = calls(&on_tt, "tt_mul_add");
+            assert!(mul_adds > 0, "{what}: RoPE's sums matched");
+            let saved = calls(&native, "float_add") - calls(&on_tt, "float_add");
+            assert!(
+                saved <= mul_adds,
+                "{what}: {saved} adds saved by {mul_adds} sums"
+            );
+            if config.head_dim % 64 == 0 {
+                assert_eq!(saved, mul_adds, "{what}: every sum fused");
+            }
             for ((len, a), (_, b)) in native.generations.iter().zip(&on_tt.generations) {
                 assert_same(b, a, &format!("{what}, prompt {len}, Tt against TtBackend"));
             }
