@@ -1,12 +1,13 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-17): **a 1.7B step 41.83 / 44.25 / 47.40 -> 37.24 / 38.66 / 40.50 ms (`1792272596`), 135M
-20.03 / 20.55 / 21.19 -> 17.10 / 17.52 / 18.25 (`1792273005`).**
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-17): **a 1.7B step 41.83 / 44.25 / 47.40 -> 36.39 / 37.02 / 37.98 ms (`1792280991`), 135M
+20.03 / 20.55 / 21.19 -> 15.33 / 15.79 / 16.47 (`1792281384`).**
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
 - **Phase 1:** the copies are done; the k/v repack moved to Phase 2.
 - **Phase 3:** the capture barriers and the row-limited element-wise ops are done.
-- **Phase 2:** A0 found the transposed reads of the key cache; `B` is now transposed by the unpacker (A0b).
+- **Phase 2:** A0 found the transposed reads of the key cache; `B` is now transposed by the unpacker (A0b), and a
+  stacked product's tail rows are no longer read (A2a), nor its padding off `K` filled (A1).
 - **Next:** Phase 2's A1-A2 (the batched path's padding, no regathering), then Phase 3's fusers. This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
 - [in-place-cache-write.md](in-place-cache-write.md) (D1-D5);

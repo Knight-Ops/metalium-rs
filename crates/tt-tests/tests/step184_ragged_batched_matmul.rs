@@ -14,6 +14,8 @@
 //!   over sequence lengths 1, 31, 32, 33 and 70, `K^T` read transposed;
 //! - a block that is the product's `K` along its rows (`V`, and a transposed left operand), whose
 //!   tail rows must be zero -- the next block's rows lie there in the source;
+//! - an untransposed left block's tail rows, which a stacked output leaves out, are not read at
+//!   all (`tensor::GATHER_HOLE`): each check first fills the gather's staging with NaN;
 //! - one block shared by several products (grouped heads).
 //!
 //! Watched failing (2026-10-14, ttsim): the stacking gather reading product `i` from row `i m` (all
@@ -117,6 +119,16 @@ fn check<T: tt_device::Transport>(
     [m, k, n]: [usize; 3],
     what: &str,
 ) {
+    // A row gather of NaN first, as wide as each operand: the staging slots a padded block's
+    // gather leaves unread (an untransposed left block's tail rows, under a stacked output) hold
+    // NaN, which must reach no product's rows.
+    for cols in [a.dims[1], b.dims[1]] {
+        let nan = s.upload(&vec![f32::NAN; 64 * cols], 64, cols).unwrap();
+        let rows: Vec<(usize, usize)> = (0..64).map(|r| (0, r)).collect();
+        let primed = s.gather_rows(&[&nan], &rows, cols).unwrap();
+        s.free(primed).unwrap();
+        s.free(nan).unwrap();
+    }
     let da = s.upload(a.data, a.dims[0], a.dims[1]).unwrap();
     let db = s.upload(b.data, b.dims[0], b.dims[1]).unwrap();
     let items: Vec<_> = a
@@ -290,5 +302,74 @@ fn shared_blocks_and_a_transposed_k_side() {
             blocks: (0..count).map(|i| plain([i * t, 0])).collect(),
         };
         check(s, &aa, &bb, [m, t, n], "a^t b");
+    });
+}
+
+/// Padding off `K` is used as it is (`docs/plans/decode-attention.md` A1): a decode step's `Q`
+/// (`[heads m, d]`, `d` whole tiles) whose padding rows hold a bias (`x + b` with `b` a row: the
+/// padding rows are `b`), against `K^T` blocks, queues the same ops as the clean `Q` -- no fill
+/// before the product -- and every product stays bit for bit its block computed alone. With `K`
+/// ragged (`d` = 40) the dirty padding is along `K` and is filled, so the products still match.
+#[test]
+fn padding_off_k_is_used_as_it_is() {
+    use tt_kernels::kind;
+    use tt_kernels::tensor::{Eltwise, Pad};
+    with_session(|s| {
+        let add_row = Eltwise {
+            kind: kind::ADD_ROW,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let (heads, t) = (4usize, 40usize);
+        for dk in [64usize, 40] {
+            let q = floats(41, heads * dk);
+            let bias = floats(42, dk);
+            let kv = floats(43, heads * t * dk);
+            let x = s.upload(&q, heads, dk).unwrap();
+            let b = s.upload(&bias, 1, dk).unwrap();
+            let xb = s.eltwise(add_row, &x, Some(&b)).unwrap();
+            assert_eq!(xb.pad(), Pad::Undefined, "the bias is in the padding rows");
+            let kk = s.upload(&kv, heads * t, dk).unwrap();
+            let items: Vec<_> = (0..heads)
+                .map(|h| (plain([h, 0]), transposed([h * t, 0])))
+                .collect();
+            let run = |s: &mut Session<_>, a: &tt_kernels::tensor::DramTensor| {
+                let before = s.host_times().ops;
+                let out = s
+                    .matmul_dram_batched(a, &kk, &items, [1, dk, t], ROUTE, Fidelity::HiFi4, BUDGET)
+                    .unwrap();
+                let ops = s.host_times().ops - before;
+                let v = s.download(&out).unwrap();
+                s.free(out).unwrap();
+                (v, ops)
+            };
+            let host: Vec<f32> = s.download(&xb).unwrap();
+            let clean = s.upload(&host, heads, dk).unwrap();
+            // A clean product first: it makes what is kept once (the zero row `K^T`'s tails read).
+            let _ = run(s, &clean);
+            let (_, clean_ops) = run(s, &clean);
+            let (got, dirty_ops) = run(s, &xb);
+            if dk % 32 == 0 {
+                assert_eq!(dirty_ops, clean_ops, "d {dk}: a fill before the product");
+            }
+            for h in 0..heads {
+                let pa = s.upload(&host[h * dk..(h + 1) * dk], 1, dk).unwrap();
+                let pb = s
+                    .upload(&block(&kv, dk, [h * t, 0], [t, dk], true), dk, t)
+                    .unwrap();
+                let want = s
+                    .matmul_dram(&pa, false, &pb, false, ROUTE, Fidelity::HiFi4, BUDGET)
+                    .unwrap();
+                let want = s.download(&want).unwrap();
+                assert_bits(
+                    &got[h * t..(h + 1) * t],
+                    &want,
+                    &format!("d {dk}: product {h}"),
+                );
+            }
+            for x in [x, b, xb, kk, clean] {
+                s.free(x).unwrap();
+            }
+        }
     });
 }

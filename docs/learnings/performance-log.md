@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [A stacked product's tail rows left unread](#a-stacked-products-tail-rows-left-unread-2026-10-17-cards-0-and-1) | 2026-10-17 | a batched product's padded left blocks no longer read their tail rows as zeros under a stacked output: a 1.7B decode step -> **36.89 / 37.30 / 38.36 ms**, 135M -> **16.05 / 16.48 / 17.29** |
 | [A transposed `B` transposed by the unpacker](#a-transposed-b-transposed-by-the-unpacker-2026-10-17-cards-0-and-1) | 2026-10-17 | a matmul's transposed `B` read as it lies and transposed by unpacker 0 (`Haloize_mode`, faces swapped), not by the mover at ~10 us a tile: bit for bit; a 1.7B decode step -> **37.24 / 38.66 / 40.50 ms**, 135M -> **17.10 / 17.52 / 18.25** |
 | [Element-wise ops on a decode row's row groups](#element-wise-ops-on-a-decode-rows-row-groups-2026-10-17-cards-0-and-1) | 2026-10-17 | lanewise SFPU kinds on a `[1, W]` row run 1 of 8 row groups: a 1.7B decode step 38.93 / 41.38 / 44.58 -> **37.69 / 40.20 / 43.41 ms**, 135M -> **17.51 / 17.97 / 18.76** |
 | [Captured barriers on the units an op ran on](#captured-barriers-on-the-units-an-op-ran-on-2026-10-17-cards-0-and-1) | 2026-10-17 | a captured op's barrier counts the units it ran on (waits for a unit that sat ops out, in its stream): no step time change (1.7B 38.93 / 41.38 / 44.58 ms); the condition for a cross-op prefetch |
@@ -329,6 +330,26 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## A stacked product's tail rows left unread (2026-10-17, cards 0 and 1)
+
+[decode-attention.md](../plans/decode-attention.md) A2a.
+- **The cost:** the batched product gathers each head's left block into a tile row of its own, and read its 31
+  tail rows as zeros, 64 bytes at a time. At `Step(512)` a 1.7B step's `pv` gather was 32,768 read entries (3.06 ms,
+  profile `1792278468`).
+- **The change:** under a stacked output those `M` rows reach nothing, and they are no longer read
+  (`tensor::GATHER_HOLE`).
+- **Gate:** `step184`, with NaN-primed staging.
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792272596`, `1792273005`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 37.24 / 38.66 / 40.50 | **36.89 / 37.30 / 38.36** (`1792279829`) | — |
+| SmolLM2-135M | 17.10 / 17.52 / 18.25 | **16.05 / 16.48 / 17.29** (`1792280238`) | 28.0 / 29.2 / 31.2 |
+
+**Then the batched product's padding off `K`, used as it is** ([A1](../plans/decode-attention.md)): no fill of
+`Q`'s padding rows before `q k^T`.
+- 1.7B: **36.39 / 37.02 / 37.98 ms** (`1792280991`).
+- 135M: **15.33 / 15.79 / 16.47** (`1792281384`, burn-flex 26.9 / 29.3 / 31.5).
 
 ## A transposed `B` transposed by the unpacker (2026-10-17, cards 0 and 1)
 

@@ -1238,6 +1238,21 @@ pub fn matmul_dram(
     )
 }
 
+/// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 4, the bound on reading `A` once a
+/// product): every GDDR matmul block is gathered [`record::GATHER_A_RESIDENT`], reading only `B`.
+/// **The products are wrong** (`A`'s slots hold whatever they held); only their time means anything.
+static PROBE_SKIP_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_A`] on or off, process-wide. Dev-facing: a timing bound, never a result.
+#[doc(hidden)]
+pub fn probe_skip_a_reads(on: bool) {
+    PROBE_SKIP_A.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn probing_skip_a() -> bool {
+    PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How a GDDR matmul reads `A` ([`matmul_dram_limited`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Reads {
@@ -1454,8 +1469,10 @@ impl BlockPlan {
                 } = layout;
                 let thin = if i0 + rows == mt { self.thin } else { 0 };
                 let unit = jobs.len() % units.max(1);
-                let resident =
-                    self.resident_a && half.is_none() && last_a[unit] == Some((i0, rows, a_at));
+                let resident = probing_skip_a()
+                    || (self.resident_a
+                        && half.is_none()
+                        && last_a[unit] == Some((i0, rows, a_at)));
                 last_a[unit] = Some((i0, rows, a_at));
                 let flags = u32::from(a_transposed)
                     | u32::from(b_transposed) << 1
@@ -1607,6 +1624,11 @@ impl BlockPlan {
                         | u32::from(transposed[1]) << 1
                         | record::gather_rows(thin)
                         | (count as u32) << 8
+                        | if probing_skip_a() {
+                            record::GATHER_A_RESIDENT
+                        } else {
+                            0
+                        }
                         | if unpack_b {
                             record::GATHER_B_UNPACK_TRANSPOSE
                         } else {
@@ -3945,6 +3967,9 @@ pub fn repack_many(
     Ok(Work { out, jobs })
 }
 
+/// [`gather_rows`]'s source for a row it leaves as its slot held it (nothing read).
+pub const GATHER_HOLE: usize = usize::MAX;
+
 /// A new `[rows.len(), cols]` tensor whose row `i` is row `rows[i].1` of
 /// `sources[rows[i].0]`, bit for bit: an embedding's lookup, and the rows a
 /// gradient scatters, gathered on the card.
@@ -3957,7 +3982,8 @@ pub fn repack_many(
 /// are built in staging slots (64-aligned) by B, then written out by NC, a few
 /// tiles to a batch ([`Step::Transfer`]). Two read entries a row a tile
 /// column, ~316 cycles each on the mover. Rows past the last in the last tile row are left as the
-/// slot held them: the output's padding is undefined there.
+/// slot held them: the output's padding is undefined there. So is a row whose source is
+/// [`GATHER_HOLE`]: nothing is read for it.
 pub fn gather_rows(
     alloc: &mut DramAlloc,
     sources: &[&DramTensor],
@@ -3985,7 +4011,7 @@ pub fn gather_rows(
     if let Some((i, &(k, r))) = rows
         .iter()
         .enumerate()
-        .find(|(_, &(k, r))| k >= sources.len() || r >= sources[k].rows)
+        .find(|(_, &(k, r))| k != GATHER_HOLE && (k >= sources.len() || r >= sources[k].rows))
     {
         return Err(TensorError::Shape(format!(
             "a row gather's row {i} names row {r} of source {k}, which has none"
@@ -4022,6 +4048,9 @@ pub fn gather_rows(
                     let slot = first_slot + k as u64 * TILE_SLOT;
                     for r in 0..32.min(rows.len() - oi * 32) {
                         let (src, sr) = rows[oi * 32 + r];
+                        if src == GATHER_HOLE {
+                            continue;
+                        }
                         let from = sources[src].tile(sr / 32, oj);
                         for h in 0..2 {
                             read.push([

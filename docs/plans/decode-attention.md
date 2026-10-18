@@ -89,11 +89,39 @@ Every phase is bit for bit with today's attention, and each head's positions kee
       tokens fell from 5.7 to 3.3 ms;
     - 135M 17.51 / 17.97 / 18.76 -> **17.10 / 17.52 / 18.25** (`1792273005`);
     - 1.7B prefill's first token 101.7 / 172.5 / 297.3 -> 98.7 / 169.7 / 293.4 ms.
-- [ ] **A1. The batched path's padding:** `matmul_dram_batched` gets `matmul_padding_off_k`.
-  - `q` and `P` have padding past `M` only.
-  - **Worth:** −0.38 ms.
-  - **Gate:** `step24_padding`'s pattern on the batched path, with dirty padding past `M` and past `N`. Watched
-    failing with the rule applied along `K`.
+- [x] **A2a. The stacked product's tail rows left unread** (2026-10-17). After A0b, profile `1792278468`:
+  - **The cost:** `pv`'s row gather was 1.12 ms a 1.7B step at `Step(64)` and **3.06 ms at `Step(512)`**. That is
+    32,768 read entries a step, ~97% of them each head's 31 zero tail rows, read from the kept zero row 64 bytes at
+    a time.
+  - **Why they need not be zero:** an untransposed left block's tail rows are `M` rows, and they make only output
+    rows past each product's `m`, which a stacked output leaves out.
+  - **The change:** `rows_padded` leaves them as the staging slot held them (`tensor::GATHER_HOLE`, nothing read)
+    in exactly that case. A `K` row (a transposed left block, any right block) and an output kept padded still read
+    zero.
+  - **Gate:** `step184` now fills the row gather's staging with NaN before every check; every product stays bit for
+    bit its block computed alone. Watched failing with the stacking reading one row late (a NaN tail row).
+  - **Regression:**
+    - ttsim: `step183`, `step187`, `step193`;
+    - card 0 (`1792279773`): those, `step199`, `step201`, ViT-Tiny's `step166`;
+    - Burn conformance: 2,973 passed, 52 as expected;
+    - `step12_mnist`.
+  - **Measured** (card 1):
+    - 1.7B 37.24 / 38.66 / 40.50 -> **36.89 / 37.30 / 38.36 ms** (`1792279829`). The 32-to-256-token slope is
+      1.5 ms (5.6 when this plan began);
+    - 135M 17.10 / 17.52 / 18.25 -> **16.05 / 16.48 / 17.29** (`1792280238`, burn-flex 28.0 / 29.2 / 31.2).
+- [x] **A1. The batched path's padding** (2026-10-17). `matmul_dram_batched_with` filled both operands' padding
+  every time.
+  - **The rule now** (`matmul_padding_off_k`'s): an operand needs zero padding only when its stored `K` dimension is
+    ragged, and otherwise it is used as it is. Its padding past `M` or `N` reaches only the output's padding,
+    declared `Undefined`, or rows a stacked output leaves out.
+  - **Gate:** `step184::padding_off_k_is_used_as_it_is`. A `Q` whose padding rows hold a bias queues the clean `Q`'s
+    ops and stays bit for bit each product alone. With `K` ragged, the padding is filled and the products still
+    match. Watched failing with the rule off (the extra fill).
+  - **Regression:** card 0 `1792280747` (`step183`, `step184`, `step187`, `step193`, `step166`, `step188`);
+    Burn conformance 2,973 passed, 52 as expected; `step12_mnist`; `--smoke` 1,116 of 1,116 (`1792281614`).
+  - **Measured** (card 1):
+    - 1.7B 36.89 / 37.30 / 38.36 -> **36.39 / 37.02 / 37.98 ms** (`1792280991`);
+    - 135M 16.05 / 16.48 / 17.29 -> **15.33 / 15.79 / 16.47** (`1792281384`, burn-flex 26.9 / 29.3 / 31.5).
 - [ ] **A2. No regathering of `q`, `P` or the output.** Either:
   - `padded_attention` takes the caller's mask and a small `m`;
   - or the batched product reads thin `A` rows in place, as the decode projections already do (`thin`), and writes

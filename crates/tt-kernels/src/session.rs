@@ -5210,7 +5210,9 @@ impl<T: Transport> Session<T> {
         let units = self.spread_for(rows.len().div_ceil(32) * cols.div_ceil(32));
         let work = tensor::gather_rows(&mut self.dram_state()?.alloc, sources, rows, cols, units)?;
         let out = self.execute_on(work, units, RESET_BUDGET)?;
-        let zero = rows.len() % 32 == 0 && sources.iter().all(|t| t.pad() == tensor::Pad::Zero);
+        let zero = rows.len() % 32 == 0
+            && sources.iter().all(|t| t.pad() == tensor::Pad::Zero)
+            && rows.iter().all(|&(k, _)| k != tensor::GATHER_HOLE);
         out.set_pad(if zero {
             tensor::Pad::Zero
         } else {
@@ -5647,12 +5649,33 @@ impl<T: Transport> Session<T> {
         use tensor::OpPadding;
         a.expect("a matmul", tensor::Elem::F32)?;
         b.expect("a matmul", tensor::Elem::F32)?;
-        // A block that reaches its tensor's ragged edge reads the tensor's
-        // padding as `K`'s: the same fill `matmul_dram` asks for.
+        // A block that reaches its tensor's ragged edge reads the tensor's padding: as `K`'s
+        // when the edge is along `K`, which must then be zero, the fill `matmul_dram` asks
+        // for. Along `M` or `N` it reaches only the output's padding (or rows a stacked output
+        // leaves out), so an operand whose stored `K` dimension is whole tiles is used as it is
+        // (`tensor::matmul_padding_off_k`), and the output's padding is then undefined.
         let need = tensor::MatmulPadding;
+        let k_ragged = |t: &DramTensor, side: usize| {
+            items.iter().any(|(ba, bb)| {
+                let transposed = if side == 0 {
+                    ba.transposed
+                } else {
+                    bb.transposed
+                };
+                // `K` is `op(A)`'s columns and `op(B)`'s rows.
+                let k_is_cols = (side == 0) != transposed;
+                (if k_is_cols { t.cols } else { t.rows }) % 32 != 0
+            })
+        };
+        let needs = |t: &DramTensor, side: usize| match k_ragged(t, side) {
+            true => need.requires(side),
+            false => tensor::PadNeed::Any,
+        };
+        let dirty = (!k_ragged(a, 0) && a.pad() != tensor::Pad::Zero)
+            || (!k_ragged(b, 1) && b.pad() != tensor::Pad::Zero);
         let mut temporary = Vec::new();
         let result = (|| {
-            let ca = self.meet(a, need.requires(0))?;
+            let ca = self.meet(a, needs(a, 0))?;
             let a = match ca {
                 Some(c) => {
                     temporary.push(c);
@@ -5660,7 +5683,7 @@ impl<T: Transport> Session<T> {
                 }
                 None => a.clone(),
             };
-            let cb = self.meet(b, need.requires(1))?;
+            let cb = self.meet(b, needs(b, 1))?;
             let b = match cb {
                 Some(c) => {
                     temporary.push(c);
@@ -5701,8 +5724,17 @@ impl<T: Transport> Session<T> {
                 {
                     continue;
                 }
-                let Some((p, blocks)) =
-                    self.rows_padded(t, &items.iter().map(pick).collect::<Vec<_>>(), extent)?
+                // An untransposed left block's tail rows are `M` rows: they make only output rows
+                // past each product's `m`, which a stacked output leaves out. Anything else
+                // (a `K` row, an output kept padded) is read: zero.
+                let zero_tails =
+                    !(side == 0 && layout.stacked && items.iter().all(|i| !i.0.transposed));
+                let Some((p, blocks)) = self.rows_padded(
+                    t,
+                    &items.iter().map(pick).collect::<Vec<_>>(),
+                    extent,
+                    zero_tails,
+                )?
                 else {
                     // Not whole rows: the product refuses the block by name.
                     continue;
@@ -5740,7 +5772,10 @@ impl<T: Transport> Session<T> {
                     )
                 })
                 .and_then(|work| self.execute_on(work, units, budget))?;
-            out.set_pad(need.produces(&[&a, &b]));
+            out.set_pad(match dirty {
+                true => tensor::Pad::Undefined,
+                false => need.produces(&[&a, &b]),
+            });
             if !layout.stacked || items.len() == 1 || m % 32 == 0 {
                 return Ok(out);
             }
@@ -5768,6 +5803,7 @@ impl<T: Transport> Session<T> {
         t: &DramTensor,
         blocks: &[tensor::Block],
         extent: impl Fn(&tensor::Block) -> [usize; 2],
+        zero_tails: bool,
     ) -> Result<Option<(DramTensor, Vec<tensor::Block>)>, TensorError> {
         let whole_rows = blocks.iter().all(|b| {
             let [r, c] = extent(b);
@@ -5788,7 +5824,12 @@ impl<T: Transport> Session<T> {
                     let first = rows.len();
                     places.push((b.at[0], r, first));
                     let padded = r.div_ceil(32) * 32;
-                    rows.extend((0..padded).map(|i| if i < r { (0, b.at[0] + i) } else { (1, 0) }));
+                    let tail = if zero_tails {
+                        (1, 0)
+                    } else {
+                        (tensor::GATHER_HOLE, 0)
+                    };
+                    rows.extend((0..padded).map(|i| if i < r { (0, b.at[0] + i) } else { tail }));
                     first
                 }
             };
@@ -5797,8 +5838,12 @@ impl<T: Transport> Session<T> {
                 transposed: b.transposed,
             });
         }
-        let zero = self.zero_row(t.cols, t.elem)?;
-        let gathered = self.gather_rows(&[t, &zero], &rows, t.cols)?;
+        let gathered = if zero_tails {
+            let zero = self.zero_row(t.cols, t.elem)?;
+            self.gather_rows(&[t, &zero], &rows, t.cols)?
+        } else {
+            self.gather_rows(&[t], &rows, t.cols)?
+        };
         Ok(Some((gathered, at)))
     }
 

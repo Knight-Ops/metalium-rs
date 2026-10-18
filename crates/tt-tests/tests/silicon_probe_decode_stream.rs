@@ -162,6 +162,22 @@ fn decode_products_against_their_weight_stream() {
                      B {:.0} GB/s",
                     bytes / us / 1e3
                 );
+                // The bound on reading `A` once a product: every block reads only `B` (the
+                // product is wrong; its time is the point).
+                if units == 64 || units == all {
+                    tt_kernels::tensor::probe_skip_a_reads(true);
+                    let mut skipped = Vec::new();
+                    let us_b = op_us(&mut s, |s| skipped.push(product(s, &x, &w)));
+                    tt_kernels::tensor::probe_skip_a_reads(false);
+                    for t in skipped {
+                        s.free(t).unwrap();
+                    }
+                    println!(
+                        "MEASURE decode-stream {name} [{k}, {n}] product without A's reads, spread \
+                         {units}: {us_b:.1} us, B {:.0} GB/s",
+                        bytes / us_b / 1e3
+                    );
+                }
             }
             for units in [64usize, all] {
                 if name.contains("head") {
