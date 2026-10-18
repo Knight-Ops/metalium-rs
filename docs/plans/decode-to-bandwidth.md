@@ -160,7 +160,35 @@ Burn model gains.
 Reordered by Phase 0. A layer's products take ~907 us, against ~600 us for their weights' column-dealt stream and
 ~550 at 488 GB/s. The gap is the product's own structure, not channels.
 
-- [ ] **`A` once a product, multicast** (G7, decode-step-bandwidth B2 point 6).
+- [x] **The bound on `A`'s reads** (2026-10-18, `silicon_probe_decode_stream` with `tensor::probe_skip_a_reads`,
+  card 0 `1792283215`). Every block reads only `B`, so the products are wrong and only their time counts:
+
+  | Product (1.7B), today's deal | With `A` | Without | Saved |
+  |---|--:|--:|--:|
+  | `qkv`, 120 units | 181 us | 157 | 24 |
+  | `o`, 64 | 73 | 56 | 17 |
+  | `gate\|up`, 120 | 383 | 353 | 31 |
+  | `down`, 64, `K` = 8192 | 270 | 198 | **72** |
+  | head, 120 | 1,051 | 1,034 | 17 |
+
+  - **The total:** ~143 us a layer, **~3.4 ms a 1.7B step at most**.
+  - **What is left without `A`:** each product is still above its weights' own stream (`o` 56 against 38 us,
+    `down` 198 against 150). That is the kernel tail and the barrier, the next items.
+- [ ] **`A` once a product** (G7, decode-step-bandwidth B2 point 6). Two designs, neither built:
+  - **(a) Multicast.** One unit reads `A`'s `K` tiles and multicasts its `A` slots to the product's other units.
+    Multicast writes are probed on silicon (`step115`; rectangles only, as ttsim takes them), but the mover issues
+    none today. It needs:
+    - two mover entries: multicast an L1 range to a `noc::multicast::Rect` and wait for its acknowledgements; and
+      wait for a local word, then clear it;
+    - a flag the receivers wait on before their kernel;
+    - the product's units as rectangles of surviving tiles;
+    - a hazard rule: nothing outside the product may be written.
+  - **(b) A vector layout for decode activations.** A `[1, K]` activation stored as its `K` values, contiguous.
+    `A` is then one read, and the matmul's unpacker reads a tile's faces at 128-byte strides: only row 0 is used,
+    and the other rows reach only the output's padding.
+    - **Benefit:** no NoC multicast and no leader.
+    - **Cost:** a new tensor layout that the producers (`SILU_MUL`, the norms, the residual adds) write and the
+      thin product reads, plus new unpacker addressing in the matmul kernel.
   - **How:** one unit reads `A`'s `K` tiles and multicasts them to the product's units' `A` slots; a semaphore the
     mover waits on releases each unit's compute. Every other unit reads only `B`.
   - **Worth:** `A`'s entries are ~17 us on `qkv`, `o` and `gate|up`, ~70-80 on `down`: ~120 us a layer, ~2.9 ms a

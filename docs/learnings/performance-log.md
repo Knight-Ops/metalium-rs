@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The bound on a decode product's `A` reads](#the-bound-on-a-decode-products-a-reads-2026-10-18-card-0) | 2026-10-18 | every block reading only `B` (a timing probe): a 1.7B layer's products ~143 us faster (`down` 270 -> 198 us), ~3.4 ms a step at most for reading `A` once a product |
 | [A stacked product's tail rows left unread](#a-stacked-products-tail-rows-left-unread-2026-10-17-cards-0-and-1) | 2026-10-17 | a batched product's padded left blocks no longer read their tail rows as zeros under a stacked output: a 1.7B decode step -> **36.89 / 37.30 / 38.36 ms**, 135M -> **16.05 / 16.48 / 17.29** |
 | [A transposed `B` transposed by the unpacker](#a-transposed-b-transposed-by-the-unpacker-2026-10-17-cards-0-and-1) | 2026-10-17 | a matmul's transposed `B` read as it lies and transposed by unpacker 0 (`Haloize_mode`, faces swapped), not by the mover at ~10 us a tile: bit for bit; a 1.7B decode step -> **37.24 / 38.66 / 40.50 ms**, 135M -> **17.10 / 17.52 / 18.25** |
 | [Element-wise ops on a decode row's row groups](#element-wise-ops-on-a-decode-rows-row-groups-2026-10-17-cards-0-and-1) | 2026-10-17 | lanewise SFPU kinds on a `[1, W]` row run 1 of 8 row groups: a 1.7B decode step 38.93 / 41.38 / 44.58 -> **37.69 / 40.20 / 43.41 ms**, 135M -> **17.51 / 17.97 / 18.76** |
@@ -330,6 +331,21 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The bound on a decode product's `A` reads (2026-10-18, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 4.
+- **The probe:** `silicon_probe_decode_stream`, with `tensor::probe_skip_a_reads` making every product block
+  `A`-resident, so blocks read only `B`. The products are wrong; only the time counts. Run `1792283215`.
+- **The bound:** without `A`'s reads a 1.7B layer's products are ~143 us faster, ~3.4 ms a step:
+  - `qkv` 181 -> 157 us;
+  - `o` 73 -> 56;
+  - `gate|up` 383 -> 353;
+  - `down` 270 -> 198;
+  - the head 1,051 -> 1,034;
+  - the 135M head 307 -> 285.
+- **What is left:** even without `A` each product is above its weights' stream on the same units. That is the
+  kernel tail and the barrier.
 
 ## A stacked product's tail rows left unread (2026-10-17, cards 0 and 1)
 
