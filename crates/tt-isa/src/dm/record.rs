@@ -170,7 +170,12 @@ pub const POKE_RUN_MAX: usize = 13;
 /// credit pop waits for its writes (`Action::Pop`), so a later batch's row
 /// lands after an earlier batch's.
 ///
-/// `flags`: [`SCATTER_ROWS_COLUMN`]; bit 0 (16-bit datums) is reserved and,
+/// `flags`: [`SCATTER_ROWS_COLUMN`], and a range of the indices to write
+/// ([`scatter_rows_range`]): only the rows `r` in it are written, while a
+/// repeated row is still written only from the last of all `count` indices,
+/// so records that split one batch's indices between them write each address
+/// once, from the same index one record would (a row's writer is the record
+/// whose range holds its last index). Bit 0 (16-bit datums) is reserved and,
 /// as any other bit, [`super::error::RANGE`]. As with [`SELECT_ROWS`], the
 /// slots are not checked against the data arena here
 /// (`tt_kernels::index::scatter_rows_jobs` places them from its plan); each
@@ -180,6 +185,15 @@ pub const SCATTER_ROWS: u32 = 0x1A;
 /// [`SCATTER_ROWS`]'s indices are a column, `(r, 0)` of the slot: an `[n, 1]`
 /// index tensor, read where it is with no repack.
 pub const SCATTER_ROWS_COLUMN: u32 = 1 << 1;
+/// The bits of a [`SCATTER_ROWS`] index range ([`scatter_rows_range`]).
+const SCATTER_ROWS_RANGE: u32 = 0x3f << 8 | 0x3f << 16;
+
+/// [`SCATTER_ROWS`]'s flags for writing only indices `rows` (within `0..32`,
+/// not empty) of its `count`: the first at bits 8..14, the end at bits 16..22.
+/// No range (both zero) is every index.
+pub const fn scatter_rows_range(rows: core::ops::Range<u32>) -> u32 {
+    rows.start << 8 | rows.end << 16
+}
 
 /// A [`POKE_RUN`] of `values` into the words from `address`, which the caller
 /// has checked is a role mailbox's (`Entry::decode` refuses what is not, of
@@ -735,10 +749,19 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         }
         SCATTER_ROWS if WRITES => {
             let [_, idx_at, count, bound, j0, cols, stage_at, flags] = h;
-            if flags & !SCATTER_ROWS_COLUMN != 0 {
+            if flags & !(SCATTER_ROWS_COLUMN | SCATTER_ROWS_RANGE) != 0 {
                 // 16-bit datums (bit 0) are not implemented.
                 return Err(super::error::RANGE);
             }
+            // The indices written: a range of them, or (none given) all.
+            let (first, end) = (flags >> 8 & 0x3f, flags >> 16 & 0x3f);
+            let (first, end) = if (first, end) == (0, 0) {
+                (0, 32)
+            } else if first < end && end <= 32 {
+                (first, end)
+            } else {
+                return Err(super::error::RANGE);
+            };
             let (x, cols) = indexed_rows(rec, count, bound, j0, cols)?;
             // As `SELECT_ROWS`: every index checked before any write, each
             // read again where it is used, 32-bit arithmetic throughout.
@@ -759,7 +782,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             }
             let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * 64;
             let mut port = 0;
-            for r in 0..count {
+            for r in first..end.min(count) {
                 let v = index(word(r));
                 // A later index naming the same row is the one written.
                 let mut later = r + 1;
@@ -1631,6 +1654,50 @@ mod tests {
         }
         let got: Vec<_> = got.iter().map(|e| (e[1], e[3], e[4])).collect();
         assert_eq!(got, want);
+    }
+
+    /// Records that split one batch's indices into ranges make, between them,
+    /// exactly the writes of one record over them all, each once: a repeated
+    /// row only from its last index, whichever range that is in. A range that
+    /// is empty, reversed or past 32 is refused.
+    #[test]
+    fn scatter_rows_ranges_split_one_records_writes() {
+        let x = t(2, 3);
+        let values = [5u32, 7, 5, 9, 7, 7, 40, 3, 9, 12, 5];
+        let n = values.len() as u32;
+        let writes = |flags: u32| {
+            let rec = scatter(x, 64, n, 1, 2, flags);
+            let mut got = Vec::new();
+            expand_writes(&rec, l1_of(&values), |e| {
+                got.push(e);
+                Ok(())
+            })
+            .map(|()| got)
+        };
+        let whole = writes(0).unwrap();
+        for cuts in [&[0u32, 11][..], &[0, 3, 11], &[0, 1, 6, 9, 11], &[0, 4, 32]] {
+            let mut split = Vec::new();
+            for w in cuts.windows(2) {
+                split.extend(writes(scatter_rows_range(w[0]..w[1])).unwrap());
+            }
+            let addresses = |v: &[[u32; 8]]| {
+                let mut a: Vec<_> = v.iter().map(|e| (e[1], e[3], e[4])).collect();
+                a.sort_unstable();
+                a
+            };
+            assert_eq!(addresses(&split), addresses(&whole), "{cuts:?}");
+            let mut to: Vec<_> = split.iter().map(|e| (e[1], e[3])).collect();
+            to.sort_unstable();
+            to.dedup();
+            assert_eq!(to.len(), split.len(), "{cuts:?}: an address written twice");
+        }
+        for bad in [(3, 3), (5, 2), (0, 33), (40, 41)] {
+            assert_eq!(
+                writes(bad.0 << 8 | bad.1 << 16),
+                Err(crate::dm::error::RANGE),
+                "{bad:?}"
+            );
+        }
     }
 
     /// An index at or past `bound`, or a negative one, is `DOMAIN` before a

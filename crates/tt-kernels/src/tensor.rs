@@ -3899,6 +3899,10 @@ pub fn repack(
     repack_many(alloc, &[t], &mapping, [rows, cols])
 }
 
+/// The source tiles a [`repack_many`] batch reads before it copies: their reads are in flight
+/// together.
+const REPACK_SLOTS: usize = 32;
+
 /// Assemble raw datums from multiple resident tensors using static geometry.
 pub fn repack_many(
     alloc: &mut DramAlloc,
@@ -3921,7 +3925,12 @@ pub fn repack_many(
         return Err(TensorError::Shape("invalid native repack mapping".into()));
     }
     let mut req = crate::l1::Requirements::new(1);
-    let input = req.scratch("repack source tile", TILE_SLOT, 64, 0..1);
+    let input = req.scratch(
+        "repack source tiles",
+        REPACK_SLOTS as u64 * TILE_SLOT,
+        64,
+        0..1,
+    );
     let output = req.scratch("repack destination tile", TILE_SLOT, 64, 0..1);
     let layout = req
         .plan(tt_isa::l1::DATA)
@@ -3954,76 +3963,104 @@ pub fn repack_many(
                 0,
                 0,
             ];
+            let write = vec![
+                [
+                    record::WRITE_RUN,
+                    (i * ct + j) as u32,
+                    1,
+                    output as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                out.tensor_ref().encode()[0],
+                out.tensor_ref().encode()[1],
+            ];
+            // A batch reads its source tiles into slots of their own, all of them before any copy
+            // (B waits for the preceding reads before a `COPY_WORDS`, so the reads are in flight
+            // together), then copies their words in the order one slot would have.
             let mut batches = Vec::new();
-            let mut read = Vec::new();
-            let flush = |read: &mut Vec<[u32; 8]>, batches: &mut Vec<TransferBatch>| {
-                if read.is_empty() {
+            let (mut reads, mut copies) = (Vec::new(), Vec::<[u32; 8]>::new());
+            let flush = |reads: &mut Vec<[u32; 8]>,
+                         copies: &mut Vec<[u32; 8]>,
+                         batches: &mut Vec<TransferBatch>| {
+                if reads.is_empty() {
                     return;
                 }
+                let mut read = std::mem::take(reads);
+                read.append(copies);
                 batches.push(TransferBatch {
-                    read: std::mem::take(read),
-                    write: vec![
-                        [
-                            record::WRITE_RUN,
-                            (i * ct + j) as u32,
-                            1,
-                            output as u32,
-                            0,
-                            0,
-                            0,
-                            0,
-                        ],
-                        out.tensor_ref().encode()[0],
-                        out.tensor_ref().encode()[1],
-                    ],
+                    read,
+                    write: write.clone(),
                 });
             };
             for ((source, tile), mut words) in tiles {
                 let t = inputs[source];
                 words.sort_unstable();
                 let src = t.tile(tile / t.grid()[1], tile % t.grid()[1]);
-                let read_src = [
-                    op::READ,
-                    src.channel().index() as u32,
-                    0,
-                    src.offset() as u32,
-                    input as u32,
-                    TILE_SLOT as u32,
-                    0,
-                    0,
-                ];
+                // Consecutive words commonly cover a face-row. Merge
+                // them without assuming a tile-coherent logical view.
+                let mut merged = Vec::new();
                 let mut n = 0;
                 while n < words.len() {
-                    if read.len() >= 240 {
-                        flush(&mut read, &mut batches);
-                        read.push(read_prior);
+                    let (sr, dst) = words[n];
+                    let mut count = 1;
+                    while n + count < words.len() && words[n + count] == (sr + count, dst + count) {
+                        count += 1;
                     }
-                    read.push(read_src);
-                    // Consecutive words commonly cover a face-row. Merge
-                    // them without assuming a tile-coherent logical view.
-                    while n < words.len() && read.len() < 240 {
-                        let (sr, dst) = words[n];
-                        let mut count = 1;
-                        while n + count < words.len()
-                            && words[n + count] == (sr + count, dst + count)
-                        {
-                            count += 1;
-                        }
-                        read.push([
+                    merged.push((sr, dst, count));
+                    n += count;
+                }
+                // A tile whose copies do not fit one batch is read again for each part.
+                for part in merged.chunks(TRANSFER_SIDE_MAX - 2) {
+                    if reads.len() == REPACK_SLOTS
+                        || 1 + reads.len() + 1 + copies.len() + part.len() > TRANSFER_SIDE_MAX
+                    {
+                        flush(&mut reads, &mut copies, &mut batches);
+                    }
+                    if reads.is_empty() && !batches.is_empty() {
+                        reads.push(read_prior);
+                    }
+                    let slot = input + (reads.len() as u64) * TILE_SLOT;
+                    // Only the 64-byte span of the slot that holds the part's words (a decode row's
+                    // two face rows are 1,152 bytes of 4,160): a unit's reads are bound by its own
+                    // stream (~7 GB/s), not by their count. Slot offsets on both sides, so the read
+                    // keeps the C64 congruence.
+                    let (lo, hi) = part
+                        .iter()
+                        .fold((u64::MAX, 0), |(lo, hi), &(sr, _, count)| {
+                            (
+                                lo.min(TILE_DATA + 4 * sr as u64),
+                                hi.max(TILE_DATA + 4 * (sr + count) as u64),
+                            )
+                        });
+                    let (lo, hi) = (lo / 64 * 64, hi.next_multiple_of(64).min(TILE_SLOT));
+                    reads.push([
+                        op::READ,
+                        src.channel().index() as u32,
+                        0,
+                        (src.offset() + lo) as u32,
+                        (slot + lo) as u32,
+                        (hi - lo) as u32,
+                        0,
+                        0,
+                    ]);
+                    copies.extend(part.iter().map(|&(sr, dst, count)| {
+                        [
                             op::COPY_WORDS,
-                            (input + TILE_DATA + sr as u64 * 4) as u32,
+                            (slot + TILE_DATA + sr as u64 * 4) as u32,
                             (output + TILE_DATA + dst as u64 * 4) as u32,
                             count as u32,
                             4,
                             4,
                             0,
                             0,
-                        ]);
-                        n += count;
-                    }
+                        ]
+                    }));
                 }
             }
-            flush(&mut read, &mut batches);
+            flush(&mut reads, &mut copies, &mut batches);
             jobs.push(vec![Step::Transfer {
                 what: "native repack",
                 depth: 1,

@@ -1079,6 +1079,19 @@ From [decode-attention.md](../plans/decode-attention.md) A0b; gate `step201_unpa
   clear: `unpack_src_config` by construction, `unpack_config` explicitly. So no other kernel unpacks transposed, and
   none unpacks to `Dst` with it set (undefined behaviour).
 
+## The movers' per-entry costs in small moves (2026-10-18, card 1, profiles `1792293993`, `1792296384`)
+
+Small moves are bound by the movers' entries, not by GDDR. What a decode step's moves measured:
+- **A `FILL` of a staged tile's other 31 rows: ~10 us a tile.** B stores word by word. A one-row
+  `resident row select` of 64 tiles in groups of 24 took 253 us on 3 units, and 67 us dealt one tile a unit over 64
+  (`index::select_taps_jobs`). Spread a ragged fill across units, or avoid it.
+- **A `SCATTER_ROWS` write entry: ~0.37 us to issue on NC.** 64 face-row writes on a unit took ~24 us; split over 16
+  units (`record::scatter_rows_range`), the op took 8.8 us.
+- **A repack of 32 one-row reads a unit:** ~38 us with each read into one slot before its copy. It was 31-33 us with
+  the reads in flight together, and no faster with each read cut from 4,160 to 1,152 bytes (31.0 us on 74 KB,
+  `1792298755`). Neither the reads' latency nor their bytes bounds it: it is ~96 entries a unit (32 reads, 64
+  `COPY_WORDS`), ~0.3 us an entry.
+
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 
 - **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of

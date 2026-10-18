@@ -206,9 +206,15 @@ pub(crate) fn select_taps_jobs(
         ));
     }
     let ort = output.grid()[0];
-    // One batch a tile row of the output and a group of its tap-major tiles.
+    // One batch a tile row of the output and a group of its tap-major tiles: groups narrow
+    // enough for every unit to have one (a decode step's one row of 64 tiles is 64 groups, not
+    // 3), since a ragged batch fills its staged tiles' other rows one word at a time (~10 us a
+    // tile).
     let tiles = taps * ct;
-    let groups = tiles.div_ceil(SELECT_TILES);
+    let width = tiles
+        .div_ceil((units.max(1) / ort.max(1)).max(1))
+        .clamp(1, SELECT_TILES);
+    let groups = tiles.div_ceil(width);
     let table_ref = table.tensor_ref().encode();
     let mut jobs = Vec::new();
     for run in runs(ort * groups, units, SELECT_BATCHES) {
@@ -216,7 +222,7 @@ pub(crate) fn select_taps_jobs(
             .enumerate()
             .map(|(b, item)| {
                 let (oi, g) = (item / groups, item % groups);
-                let (k0, k1) = (g * SELECT_TILES, ((g + 1) * SELECT_TILES).min(tiles));
+                let (k0, k1) = (g * width, ((g + 1) * width).min(tiles));
                 let count = 32.min(n - oi * 32);
                 let first = stage + (b % 2 * SELECT_TILES) as u64 * TILE_SLOT;
                 // The index tile rows this group's taps are in: at most two,
@@ -306,6 +312,20 @@ pub(crate) fn select_taps_jobs(
 /// Tile columns a [`scatter_rows_jobs`] batch stages, as [`SELECT_TILES`].
 const SCATTER_TILES: usize = 24;
 
+/// The fewest indices a [`scatter_rows_jobs`] job writes when it splits one batch's indices
+/// between jobs.
+pub(crate) const SCATTER_SPLIT_ROWS: usize = 4;
+
+/// The work [`scatter_rows_jobs`] can share between units, for a session to choose them by:
+/// each job's tile columns, and for one batch of indices (32 or fewer) its index ranges too.
+pub(crate) fn scatter_rows_work(dst: &DramTensor, n: usize, values_tiles: usize) -> usize {
+    if n <= 32 {
+        dst.grid()[1] * n.div_ceil(SCATTER_SPLIT_ROWS)
+    } else {
+        values_tiles
+    }
+}
+
 /// `values`' rows written over rows of `dst` in place, `dst` row `indices[i]`
 /// becoming `values` row `i` -- Burn's `scatter_nd` with `Assign` over whole
 /// rows, a cache write at a position the card holds -- with no host address:
@@ -321,7 +341,12 @@ const SCATTER_TILES: usize = 24;
 /// each job owns a group of tile columns for every index (no two units write
 /// one address), its batches in index order, a batch's writes acknowledged
 /// before the next batch's are issued (the writer's credit pop), and within a
-/// batch the record writes a repeated row once, from its last index.
+/// batch the record writes a repeated row once, from its last index. With one
+/// batch of indices (32 or fewer: a decode step's row a head), units left
+/// over after the column groups split the indices into ranges, at least
+/// [`SCATTER_SPLIT_ROWS`] each: every job reads the whole index tile, and a
+/// repeated row is written only by the job whose range holds its last index
+/// (`record::scatter_rows_range`), so still once.
 pub(crate) fn scatter_rows_jobs(
     dst: &DramTensor,
     indices: &DramTensor,
@@ -385,6 +410,15 @@ pub(crate) fn scatter_rows_jobs(
     // a job holds every index batch of its columns, in order.
     let width = ct.div_ceil(units.max(1)).clamp(1, SCATTER_TILES);
     let groups = ct.div_ceil(width);
+    // One batch: the units past the groups split its indices.
+    let parts = if n <= 32 {
+        (units.max(1) / groups).clamp(1, n.div_ceil(SCATTER_SPLIT_ROWS))
+    } else {
+        1
+    };
+    let ranges: Vec<std::ops::Range<usize>> = (0..parts)
+        .map(|p| p * n / parts..(p + 1) * n / parts)
+        .collect();
     let dst_ref = dst.tensor_ref().encode();
     let flags = if column {
         record::SCATTER_ROWS_COLUMN
@@ -404,8 +438,14 @@ pub(crate) fn scatter_rows_jobs(
         ]
     };
     let jobs = (0..groups)
-        .map(|g| {
+        .flat_map(|g| ranges.iter().map(move |r| (g, r.clone())))
+        .map(|(g, rows)| {
             let (j0, j1) = (g * width, ((g + 1) * width).min(ct));
+            let flags = if parts > 1 {
+                flags | record::scatter_rows_range(rows.start as u32..rows.end as u32)
+            } else {
+                flags
+            };
             let batches = (0..n.div_ceil(32))
                 .map(|b| {
                     let at = idx + (b % 2) as u64 * TILE_SLOT;

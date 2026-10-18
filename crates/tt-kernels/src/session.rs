@@ -5284,7 +5284,8 @@ impl<T: Transport> Session<T> {
         values: &DramTensor,
         column: bool,
     ) -> Result<(), TensorError> {
-        let units = self.spread_for(tiles_of(values));
+        let n = if column { indices.rows } else { indices.cols };
+        let units = self.spread_for(crate::index::scatter_rows_work(dst, n, tiles_of(values)));
         let jobs = crate::index::scatter_rows_jobs(dst, indices, values, column, units)?;
         self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
         if values.pad() != tensor::Pad::Zero {

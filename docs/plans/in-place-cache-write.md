@@ -217,6 +217,9 @@ Phases, each on ttsim then card 0, each gate watched failing:
   - **Ruled out:** values read in place by face-row reads, ~128 entries a write, about the repack's cost.
   - **The fix is a layout:** a position-major cache, `[L, kv * d]`, makes the write the projection's row as it is.
     It changes what attention reads, so it is decided in [decode-attention.md](decode-attention.md).
+  - **Since (2026-10-18, decode-to-bandwidth Phase 1):** the repack reads its source tiles in flight together, each
+    only the span it uses (38 -> 31-33 us, profile `1792296384`), and the row scatter splits one batch over 16 units
+    (25 -> 8.8 us). The repack is still the layout's cost.
 
 Documentation on completion: the roadmap (Track 2 item 6, step 6), the performance log and scoreboard,
 `docs/README.md`, and this file moved to `completed-plans/`.

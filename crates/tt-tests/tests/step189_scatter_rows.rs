@@ -70,6 +70,44 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
     }
 }
 
+/// A session on `units` Tensix units (the scatter splits one batch of indices between them).
+#[cfg(not(feature = "silicon"))]
+fn with_units(units: usize, f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
+    if let Err(e) = fork_scope(|| {
+        let mut sim = tt_ttsim::Simulator::open().unwrap();
+        let dev = tt_device::Device::open(sim.transport()).unwrap();
+        let mut s = Session::open(
+            dev,
+            tt_firmware_images::ROLES,
+            TileChoice::Count(units),
+            |_, _| Ok(None),
+        )
+        .unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        f(&mut s);
+    }) {
+        panic!("{e}");
+    }
+}
+
+#[cfg(feature = "silicon")]
+fn with_units(units: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
+    if let Err(e) = fork_scope(|| {
+        let mut s = Session::open_card(
+            tt_tests::backend::device_index(),
+            tt_firmware_images::ROLES,
+            TileChoice::Count(units),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        f(&mut s);
+    }) {
+        panic!("{e}");
+    }
+}
+
 /// `n` datums of raw bits: every fifth one of a pattern a copy must not touch,
 /// the rest anything at all.
 fn raw_bits(seed: u64, n: usize) -> Vec<u32> {
@@ -217,6 +255,57 @@ fn scattering_in_place_writes_only_the_named_rows() {
             &want,
             "two scatters in place",
         );
+    });
+}
+
+/// One batch of indices (32 or fewer, a decode step's row a head) split between units
+/// (`record::scatter_rows_range`), in place: each named row is written once, from its last index,
+/// whichever unit's range holds it, and no other row changes. Repeats inside and across the
+/// ranges; 32, 9 and 3 indices; two and three tile columns; row and column indices; and 33
+/// indices (two batches, not split) beside them. Watched failing with each range deduplicated
+/// only within itself (the record unit gate `scatter_rows_ranges_split_one_records_writes`
+/// fails the same way).
+#[test]
+fn one_batch_split_between_units_writes_each_row_once_from_its_last_index() {
+    with_units(16, |s| {
+        for cols in [64usize, 96] {
+            let rows = 32 * 40;
+            let bits = raw_bits(cols as u64, rows * cols);
+            let t = s.upload_bits(&bits, rows, cols, Elem::F32).unwrap();
+            let mut want = bits.clone();
+            let mut idx32: Vec<u32> = (0..32).map(|h| h * 40 + 7).collect();
+            // Repeats: across the ranges (1 and 30), and three of one row (5, 6, 20).
+            idx32[30] = idx32[1];
+            idx32[6] = idx32[5];
+            idx32[20] = idx32[5];
+            let cases: [(&str, Vec<u32>); 4] = [
+                ("32 heads", idx32),
+                ("9 heads", (0..9).map(|h| h * 40 + 39).collect()),
+                ("3 heads", vec![1, 41, 1]),
+                ("33 rows", (0..33).map(|i| (i * 37) % 1280).collect()),
+            ];
+            for (k, (what, idx)) in cases.into_iter().enumerate() {
+                let n = idx.len();
+                let values = raw_bits(100 + k as u64, n * cols);
+                let column = k % 2 == 0;
+                let di = if column {
+                    s.upload_bits(&idx, n, 1, Elem::I32).unwrap()
+                } else {
+                    s.upload_bits(&idx, 1, n, Elem::I32).unwrap()
+                };
+                let dv = s.upload_bits(&values, n, cols, Elem::F32).unwrap();
+                s.scatter_rows_into(&t, &di, &dv, column).unwrap();
+                want = expected(&want, cols, &idx, &values);
+                assert_bits(
+                    &s.download_bits(&t).unwrap(),
+                    &want,
+                    &format!("{what}, {cols} columns"),
+                );
+                s.free(di).unwrap();
+                s.free(dv).unwrap();
+            }
+            s.free(t).unwrap();
+        }
     });
 }
 

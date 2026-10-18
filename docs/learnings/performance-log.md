@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The cache write's and the embedding's moves spread](#the-cache-writes-and-the-embeddings-moves-spread-2026-10-18-cards-0-and-1) | 2026-10-18 | a repack's reads in flight together, one batch's row scatter split between units, and a ragged row select over every unit, bit for bit: a 1.7B decode step -> **33.05 / 33.59 / 34.51 ms**, 135M -> **14.04 / 14.45 / 15.04** |
 | [Thin products on 64 units; attention's scale and mask as one op](#thin-products-on-64-units-attentions-scale-and-mask-as-one-op-2026-10-18-cards-0-and-1) | 2026-10-18 | a one-tile-row product over a long `K` on at most 64 units (~1.2 ms), and `mask ? -inf : s x` in one pass (~0.1-0.2 ms), bit for bit: a 1.7B decode step -> **34.35 / 34.87 / 35.76 ms**, 135M -> **14.28 / 14.68 / 15.25** |
 | [RoPE's sum as one op](#ropes-sum-as-one-op-2026-10-18-cards-0-and-1) | 2026-10-18 | `x cos + rotate(x) sin`'s second product and sum in one pass (`MUL_ADD`, a chain fuser), bit for bit: a 1.7B decode step -> **35.64 / 36.22 / 37.20 ms**, 135M -> **14.43 / 14.92 / 15.46** |
 | [Attention's softmax in four ops](#attentions-softmax-in-four-ops-2026-10-18-cards-0-and-1) | 2026-10-18 | `exp(x - max)` in one pass and each clamp on its reduction, bit for bit: a 1.7B decode step -> **36.12 / 36.52 / 37.54 ms**, 135M -> **14.80 / 15.29 / 15.86** |
@@ -334,6 +335,28 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The cache write's and the embedding's moves spread (2026-10-18, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 1. Profile `1792293993`, `Step(64)`, showed the
+cache write's 96 ops at 3.06 ms, each on 2 units, and the embedding's row select at 253 us on 3. Three changes, each
+bit for bit:
+- **`repack_many`:** up to 32 source tiles are read into slots of their own before any copy. The reads used to run one
+  after another, 38 us for a key's or value's row a head.
+- **`SCATTER_ROWS` with an index range:** one batch is split between units. A repeated row is still written once,
+  from its last index.
+- **The row select:** its tile groups are narrowed to the units, because a ragged batch's fill costs ~10 us a tile.
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792292588`, `1792293687`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 34.35 / 34.87 / 35.76 | **33.05 / 33.59 / 34.51** (`1792295836`) | 298.9 / 305.6 / 329.4 |
+| SmolLM2-135M | 14.28 / 14.68 / 15.25 | **14.04 / 14.45 / 15.04** (`1792296202`) | 26.7 / 29.0 / 31.6 |
+
+- **Profile `1792296384`** (`Step(64)`): the replay 33.68 -> 32.34 ms. The cache write 3.06 -> 1.94 ms: the row
+  scatter 25 -> 8.8 us, the repack only 38 -> 31-33 us. The embedding's select 253 -> 67 us.
+- **The repack's reads cut to the span they use** (a row's two face rows, 1,152 of 4,160 bytes), after it: 1.7B
+  33.02 / 33.52 / 34.42 ms (`1792298195`), 135M 14.04 / 14.45 / 15.02 (`1792298556`). Neither the reads' latency nor
+  their bytes bound the repack.
 
 ## Thin products on 64 units; attention's scale and mask as one op (2026-10-18, cards 0 and 1)
 

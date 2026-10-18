@@ -262,6 +262,8 @@ pub const SMOKE: &[&str] = &[
     "step200_row_limited_eltwise::",
     // A matmul's transposed `B` transposed by the unpacker, bit for bit the mover's (decode-attention.md).
     "step201_unpacker_transposed_b::",
+    // A native repack's reads in flight together (decode-to-bandwidth.md Phase 1).
+    "step202_repack_reads::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

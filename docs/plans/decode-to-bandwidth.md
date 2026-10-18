@@ -1,16 +1,28 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-18): **a 1.7B step 41.83 / 44.25 / 47.40 -> 34.35 / 34.87 / 35.76 ms (`1792292588`), 135M
-20.03 / 20.55 / 21.19 -> 14.28 / 14.68 / 15.25 (`1792293687`).**
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-18): **a 1.7B step 41.83 / 44.25 / 47.40 -> 33.02 / 33.52 / 34.42 ms (`1792298195`), 135M
+20.03 / 20.55 / 21.19 -> 14.04 / 14.45 / 15.02 (`1792298556`).**
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
-- **Phase 1:** the copies are done; the k/v repack moved to Phase 2.
+- **Phase 1:** the copies are done; the repack's reads run in flight together, the row scatter and the embedding's
+  select on every unit; the k/v repack itself moved to Phase 2.
 - **Phase 3:** the capture barriers, the row-limited element-wise ops and RoPE's sum fuser are done.
 - **Phase 2:** A0 found the transposed reads of the key cache; `B` is now transposed by the unpacker (A0b), and a
   stacked product's tail rows are no longer read (A2a), nor its padding off `K` filled (A1); the softmax is four
   ops (A4a), and the scale and the mask are one (A4b).
 - **Phase 4:** a thin product over a long `K` runs on 64 units (the deal).
-- **Next:** Phase 2's A1-A2 (the batched path's padding, no regathering), then Phase 3's fusers. This is the umbrella plan.
+- **Where the step goes now** (profile `1792298755`, 1.7B `Step(64)`, 32.32 ms):
+  - products 21.65 ms at 361 GB/s;
+  - RMSNorm's two ops 2.42;
+  - the cache write 1.94 (the repack 1.5 of it);
+  - the softmax 1.53, `pv` 0.93, `qk` 0.81;
+  - `gamma`'s product 0.85, RoPE's sum 0.47, the residual adds 0.42, `silu * up` 0.37.
+- **Next, the larger changes (documented, not built):**
+  - `A` once a product (G7, ~2.9 ms);
+  - compute under the reads (~1.4 ms);
+  - the position-major cache (A-layout: the repack, and `qk`/`pv`'s regathering, A2);
+  - the weight stream under the small ops (Phase 5).
+  This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
 - [in-place-cache-write.md](in-place-cache-write.md) (D1-D5);
 - [decode-small-ops.md](decode-small-ops.md) (S1d, S4, S5);
@@ -100,10 +112,60 @@ row gathers.
   - **Measured (card 1):**
     - 1.7B **41.83 / 44.25 / 47.40 -> 38.97 / 41.41 / 44.58 ms** (`1792263398`);
     - 135M **20.03 / 20.55 / 21.19 -> 18.59 / 19.07 / 19.79** (`1792263801`).
-- [ ] **k and v without the repack** (1.83 ms; in-place-cache-write D5, decode-small-ops S1d). It is the cache's
-  head-major layout, so it moves to Phase 2: a position-major cache (`[L, kv * d]`) makes the write the
-  projection's row as it is.
-- [ ] **The row scatter on more units** (1.29 ms on 2 units). Probe it first.
+- [x] **The repack's reads in flight together** (2026-10-18). Profile `1792293993` (1.7B, `Step(64)`): the cache
+  write's 96 ops took 3.06 ms. Per layer that is a `native repack` (38 us) and a `resident row scatter` (25 us) for
+  each of k and v, every one of them on 2 units.
+  - **Why the repack was slow:** `tensor::repack_many` read each source tile into one slot and copied it before it
+    read the next, so the 32 reads of an output tile ran one after another (~1.1 us each). The data does not explain
+    it: the reads were whole tiles for one row each.
+  - **The change:** a batch reads up to `REPACK_SLOTS` (32) source tiles into slots of their own, all before any copy
+    (B waits for the preceding reads before a `COPY_WORDS`), then copies the same words in the same order. A tile's
+    copies that do not fit a batch read it again, and a later batch reads the output tile back first, as before.
+    Every `repack_many` gains (convolutions' relayouts, cats, views), not only decode.
+  - **Then only the span read:** each read is the 64-byte span of the slot that holds the words copied from it
+    (a row's two face rows, 1,152 bytes of 4,160).
+  - **Gate `step202_repack_reads`** (ttsim; in `--smoke`), bit for bit against the host's mapping over NaN-primed
+    slots: the decode rows (32 and 9 heads), a transpose (a tile's copies over several batches), an output tile from
+    48 source tiles (two batches), and two sources. Watched failing with every copy reading slot 0, and with the span
+    64 bytes short.
+  - **What it bought: little.** Profile `1792296384` has the repack at 31-33 us, against 38. The span read then took
+    the 1.7B step only 33.05 / 33.59 / 34.51 -> 33.02 / 33.52 / 34.42 ms (`1792298195`; 135M unchanged,
+    `1792298556`). The repack is bound by neither its reads' latency nor their bytes: 31.0 us on 74 KB (profile
+    `1792298755`), ~96 entries a unit at ~0.3 us each. The position-major cache below removes it.
+- [x] **The row scatter on more units** (2026-10-18). Each NC write entry costs ~0.37 us to issue, and a unit wrote
+  32 rows x 2 face rows.
+  - **The record:** `record::SCATTER_ROWS` takes a range of its indices (`scatter_rows_range`). It writes only the rows
+    in it, but drops a repeated row unless its index is the last of all `count`. Records splitting one batch therefore
+    write each address once, from the same index one record would.
+  - **The deal:** `scatter_rows_jobs` splits a batch of 32 or fewer indices (a decode step's row a head) over the units
+    left after the column groups, at least `SCATTER_SPLIT_ROWS` (4) a job. Every job reads the whole index tile. More
+    batches are not split, since nothing would order one unit's batch after another's.
+  - **Gates:**
+    - record unit `scatter_rows_ranges_split_one_records_writes`: repeats across ranges, each address once, bad ranges
+      refused. Watched failing with each range deduplicated only within itself;
+    - `step189::one_batch_split_between_units_writes_each_row_once_from_its_last_index` (16 units). Watched failing
+      the same way on ttsim;
+    - firmware clippy plain, `encoded-guard` and `profile`; card 0 `1792294692` (54 gates, with `step172`/`step173`).
+- [x] **The embedding's row select on every unit** (2026-10-18). Each step began with a 253 us `resident row select`
+  on 3 units: a ragged batch fills its staged tiles' other 31 rows one word at a time (~10 us a tile), and the 64 tiles
+  went in groups of 24. `select_taps_jobs` now narrows its groups until every unit has one (64 groups of one tile).
+  The bits and the `Pad::Zero` claim are unchanged.
+  - **Gate:** `step171::a_select_over_many_units_is_the_host_s_indexing_with_zero_padding` (16 units, padding rows
+    downloaded). Watched failing with only the first group filled.
+- **Regression** for the three: ttsim `step179`, `step180`, `step187`, `step192`, `step193`, `step199`,
+  `step12_mnist`; Burn conformance 2,973 passed, 52 as expected; card 0 `1792294692`, `1792295061`, `1792297325`;
+  `--smoke` 1,123 of 1,123 (`1792299469`).
+- **Measured** (card 1):
+  - 1.7B 34.35 / 34.87 / 35.76 -> **33.05 / 33.59 / 34.51 ms** (`1792295836`), with the span read **33.02 / 33.52 /
+    34.42** (`1792298195`);
+  - 135M 14.28 / 14.68 / 15.25 -> **14.04 / 14.45 / 15.04** (`1792296202`, burn-flex 26.7 / 29.0 / 31.6), with the
+    span read 14.04 / 14.45 / 15.02 (`1792298556`).
+  - **Profile `1792296384`** (`Step(64)`, before the span read): the replay 33.68 -> 32.34 ms. The cache write's 96
+    ops 3.06 -> 1.94 ms (the row scatter 25 -> 8.8 us on 16 units). The embedding's select 253 -> 67 us on 64 units,
+    52 of it the barrier; the RoPE tables' selects 24 -> 14 us.
+- [ ] **k and v without the repack** (in-place-cache-write D5, decode-small-ops S1d). It is the cache's head-major
+  layout, so it moves to Phase 2: a position-major cache (`[L, kv * d]`) makes the write the projection's row as it
+  is. What is left of the repack after the change above is in the profile.
 
 ### Phase 2. Decode attention, ~5.2 / 10.9 -> ≲1 ms
 

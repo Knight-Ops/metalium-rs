@@ -64,6 +64,44 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
     }
 }
 
+/// A session on `units` Tensix units (the select deals its tile groups between them).
+#[cfg(not(feature = "silicon"))]
+fn with_units(units: usize, f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
+    if let Err(e) = fork_scope(|| {
+        let mut sim = tt_ttsim::Simulator::open().unwrap();
+        let dev = tt_device::Device::open(sim.transport()).unwrap();
+        let mut s = Session::open(
+            dev,
+            tt_firmware_images::ROLES,
+            TileChoice::Count(units),
+            |_, _| Ok(None),
+        )
+        .unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        f(&mut s);
+    }) {
+        panic!("{e}");
+    }
+}
+
+#[cfg(feature = "silicon")]
+fn with_units(units: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
+    if let Err(e) = fork_scope(|| {
+        let mut s = Session::open_card(
+            tt_tests::backend::device_index(),
+            tt_firmware_images::ROLES,
+            TileChoice::Count(units),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        f(&mut s);
+    }) {
+        panic!("{e}");
+    }
+}
+
 /// `n` datums of raw bits: every fifth one of a pattern a copy must not touch,
 /// the rest anything at all.
 fn raw_bits(seed: u64, n: usize) -> Vec<u32> {
@@ -151,6 +189,43 @@ fn selected_rows_are_the_host_s_indexing_bit_for_bit() {
             }
             // The table is unchanged.
             assert_bits(&s.download_bits(&table).unwrap(), &bits, "the table");
+            s.free(table).unwrap();
+        }
+    });
+}
+
+/// On 16 units, a select's tile groups are narrowed so every unit has one (a decode step's
+/// embedding row of 64 tiles: 64 groups of one tile, not 3 of 24): the rows are the host's
+/// indexing, and the output's padding rows are still zero (`Pad::Zero`), each unit filling its
+/// own tiles'. One row of 2048 columns (the 1.7B embedding), of 576 (the 135M's), 9 rows, and
+/// 33 (two output tile rows).
+#[test]
+fn a_select_over_many_units_is_the_host_s_indexing_with_zero_padding() {
+    with_units(16, |s| {
+        for (rows, cols) in [(300usize, 2048usize), (100, 576), (97, 70)] {
+            let bits = raw_bits(rows as u64 * 7 + cols as u64, rows * cols);
+            let table = s.upload_bits(&bits, rows, cols, Elem::F32).unwrap();
+            for n in [1usize, 9, 33] {
+                let idx = indices(rows, n);
+                let di = s.upload_bits(&idx, 1, n, Elem::I32).unwrap();
+                let out = s.select_rows(&table, &di).unwrap();
+                let what = format!("{n} of the rows of [{rows}, {cols}]");
+                assert_eq!(out.pad(), tt_kernels::tensor::Pad::Zero, "{what}");
+                assert_bits(
+                    &s.download_bits(&out).unwrap(),
+                    &expected(&bits, cols, &idx),
+                    &what,
+                );
+                let padded = s.download_padded(&out).unwrap();
+                let pc = 32 * cols.div_ceil(32);
+                for (k, v) in padded.iter().enumerate() {
+                    if k / pc >= n || k % pc >= cols {
+                        assert_eq!(v.to_bits(), 0, "{what}: padding datum {k}");
+                    }
+                }
+                s.free(out).unwrap();
+                s.free(di).unwrap();
+            }
             s.free(table).unwrap();
         }
     });
