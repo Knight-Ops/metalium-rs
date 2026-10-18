@@ -3441,6 +3441,26 @@ pub mod float {
         )
     }
 
+    /// `mask ? value : tensor * scale` in one SFPU pass (`kind_sfpu::SCALE_MASK_FILL`), bit for
+    /// bit `float_mask_fill(float_mul_scalar(tensor, scale), mask, value)`: an attention's scaled,
+    /// masked scores. That composition where the pass does not apply.
+    pub fn float_scale_mask_fill(
+        tensor: FloatTensor<TtBackend>,
+        scale: Scalar,
+        mask: BoolTensor<TtBackend>,
+        value: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        let op = op2(
+            kind_sfpu::SCALE_MASK_FILL,
+            scalar_f32(scale),
+            scalar_f32(value),
+        );
+        if let Some(t) = device_op(op, &tensor, Some(&mask), None) {
+            return t;
+        }
+        float_mask_fill(float_mul_scalar(tensor, scale), mask, value)
+    }
+
     /// `mask ? value : x`, all three one shape, on the device where the data is;
     /// unsupported inputs fail.
     pub fn float_mask_where(
@@ -3826,28 +3846,39 @@ pub mod module {
             let _part = part("attention/qk");
             float::float_matmul(query, float::float_transpose(key))
         };
-        let mut scores = {
-            let _part = part("attention/scale");
-            let mut scores = float::float_mul_scalar(scores, scale.into());
-            if let Some(cap) = options.softcap {
-                scores = float::float_mul_scalar(
-                    float::float_tanh(float::float_div_scalar(scores, cap.into())),
-                    cap.into(),
+        if let Some(mask) = &mask {
+            assert_eq!(device, mask.device, "attention mask device differs");
+        }
+        // The caller's mask, then the causal one: with no softcap between them, the scale and the
+        // first are one pass.
+        let mut causal = options.is_causal.then(|| causal_mask(device, &qs, &ks));
+        let mask = mask.or_else(|| causal.take());
+        let (mut scores, mask) = match (mask, options.softcap) {
+            (Some(mask), None) => {
+                let _part = part("attention/scale");
+                let scores = float::float_scale_mask_fill(
+                    scores,
+                    scale.into(),
+                    mask,
+                    f32::NEG_INFINITY.into(),
                 );
+                (scores, None)
             }
-            scores
+            (mask, softcap) => {
+                let _part = part("attention/scale");
+                let mut scores = float::float_mul_scalar(scores, scale.into());
+                if let Some(cap) = softcap {
+                    scores = float::float_mul_scalar(
+                        float::float_tanh(float::float_div_scalar(scores, cap.into())),
+                        cap.into(),
+                    );
+                }
+                (scores, mask)
+            }
         };
         let _part = part("attention/mask");
-        if let Some(mask) = mask {
-            assert_eq!(device, mask.device, "attention mask device differs");
+        for mask in [mask, causal].into_iter().flatten() {
             scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
-        }
-        if options.is_causal {
-            scores = float::float_mask_fill(
-                scores,
-                causal_mask(device, &qs, &ks),
-                f32::NEG_INFINITY.into(),
-            );
         }
         if let Some(bias) = attn_bias {
             assert_eq!(device, bias.device, "attention bias device differs");
@@ -3993,22 +4024,33 @@ pub mod module {
             );
             device_result_shaped(device, id, dims, Shape::new([rows, sk]), DType::F32)
         };
-        let mut scores = {
-            let _part = part("attention/scale");
-            let mut scores = float::float_mul_scalar(scores, scale.into());
-            if let Some(cap) = options.softcap {
-                scores = float::float_mul_scalar(
-                    float::float_tanh(float::float_div_scalar(scores, cap.into())),
-                    cap.into(),
-                );
+        let causal = options
+            .is_causal
+            .then(|| causal_blocks(device, count, [m, sk], stride, Shape::new([rows, sk])));
+        // With no softcap between them, the scale and the causal mask are one pass.
+        let scores = match (causal, options.softcap) {
+            (Some(mask), None) => {
+                let _part = part("attention/scale");
+                float::float_scale_mask_fill(scores, scale.into(), mask, f32::NEG_INFINITY.into())
             }
-            scores
+            (causal, softcap) => {
+                let _part = part("attention/scale");
+                let mut scores = float::float_mul_scalar(scores, scale.into());
+                if let Some(cap) = softcap {
+                    scores = float::float_mul_scalar(
+                        float::float_tanh(float::float_div_scalar(scores, cap.into())),
+                        cap.into(),
+                    );
+                }
+                match causal {
+                    Some(mask) => {
+                        let _part = part("attention/mask");
+                        float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into())
+                    }
+                    None => scores,
+                }
+            }
         };
-        if options.is_causal {
-            let _part = part("attention/mask");
-            let mask = causal_blocks(device, count, [m, sk], stride, Shape::new([rows, sk]));
-            scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
-        }
         let probabilities = {
             let _part = part("attention/softmax");
             let max = float::reduce_clamp_min(

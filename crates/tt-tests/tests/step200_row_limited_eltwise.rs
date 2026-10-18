@@ -19,6 +19,10 @@
 //! NaN), here and in the unit gate (`row_limited_programs_keep_the_computed_rows`). A false
 //! `Pad::Zero` claim did not show in the sum or the product on ttsim (the sum masks padding,
 //! and the product's `K` padding met zeros), so the claim itself is asserted.
+//!
+//! The fused kinds a decode step's attention runs are held to their compositions on the card here
+//! too: `SUB_EXP`, a reduction with its clamp, and `SCALE_MASK_FILL` (watched failing with its
+//! select dropped).
 
 use tt_kernels::kind;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
@@ -253,6 +257,62 @@ fn sub_exp_is_sub_then_exp_on_the_card() {
                 "[{rows}, {cols}]"
             );
             for t in [a, b, nan, nan_b, primed, fused, d, composed] {
+                s.free(t).unwrap();
+            }
+        }
+    });
+}
+
+/// An attention's scale and mask as one pass (`kind_sfpu::SCALE_MASK_FILL`) are `MUL_SCALAR` then
+/// `MASK_FILL`, bit for bit: the mask a row (a decode step's `[1, attended]`) over 1, 9 and 32
+/// rows (the row-limited programs below 32), and the same shape, at a scale whose products
+/// overflow, flush and are ordinary, and a fill of `-inf`. Before the fused op, the same op over
+/// NaN primes L1 and `Dst` on the unit, so a row its programs skip shows.
+#[test]
+fn scale_mask_fill_is_scale_then_mask_on_the_card() {
+    use tt_kernels::tensor::Elem;
+    with_session(|s| {
+        for (rows, cols, row_mask) in [
+            (1usize, 2048usize, true),
+            (9, 70, true),
+            (32, 512, true),
+            (9, 70, false),
+        ] {
+            let mut x = floats((rows * 13 + cols) as u64, rows * cols);
+            x[0] = 3.0e38;
+            x[1] = 1.0e-37;
+            let mn = if row_mask { cols } else { rows * cols };
+            let m: Vec<u32> = (0..mn)
+                .map(|i| u32::from(i % 5 == 2 || i + 1 == mn))
+                .collect();
+            let a = s.upload(&x, rows, cols).unwrap();
+            let mask = s.upload_bits(&m, mn / cols, cols, Elem::Bool).unwrap();
+            let nan = s.upload(&vec![f32::NAN; rows * cols], rows, cols).unwrap();
+            for scale in [0.125f32, 4.0] {
+                let mut scaled = op(kind_sfpu::SCALE_MASK_FILL, scale);
+                scaled.scalar2 = f32::NEG_INFINITY;
+                let primed = s.eltwise(scaled, &nan, Some(&mask)).unwrap();
+                let fused = s.eltwise(scaled, &a, Some(&mask)).unwrap();
+                let t = s.eltwise(op(kind::MUL_SCALAR, scale), &a, None).unwrap();
+                let composed = s
+                    .eltwise(op(kind_sfpu::MASK_FILL, f32::NEG_INFINITY), &t, Some(&mask))
+                    .unwrap();
+                let (f, c) = (s.download(&fused).unwrap(), s.download(&composed).unwrap());
+                assert_eq!(
+                    f.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "[{rows}, {cols}], row mask {row_mask}, scale {scale}"
+                );
+                let masked = |k: usize| m[if row_mask { k % cols } else { k }] != 0;
+                assert!(
+                    (0..rows * cols).all(|k| masked(k) == (f[k] == f32::NEG_INFINITY)),
+                    "the masked positions, and only they, are filled"
+                );
+                for t in [primed, fused, t, composed] {
+                    s.free(t).unwrap();
+                }
+            }
+            for t in [a, mask, nan] {
                 s.free(t).unwrap();
             }
         }

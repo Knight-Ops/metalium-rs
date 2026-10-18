@@ -244,6 +244,11 @@ pub mod kind_sfpu {
     /// two ops (the product is an `SFPMAD` result, flushed, so its FP32 store would keep no
     /// denormal). RoPE's `x cos + rotate(x) sin`, `c` the first product.
     pub const MUL_ADD: u32 = 0x1f4;
+    /// `mask ? fill : a * scale`, the scalars `[scale, fill]`: `MUL_SCALAR` then `MASK_FILL`, in one
+    /// pass -- bit for bit the two ops (the product is stored as `MUL_SCALAR` stores it, and the
+    /// fill as an FP32 store keeps it: a zero, a normal number or an infinity; [`code_for`]
+    /// refuses any other). An attention's scaled, masked scores, `mask` (as `MASK_FILL`'s) a row.
+    pub const SCALE_MASK_FILL: u32 = 0x1f5;
     /// End of the original contiguous activation range. Additional kinds
     /// occupy the documented integer, rounding and index ranges below.
     pub const LAST: u32 = BOOL_TO_I32;
@@ -317,7 +322,7 @@ pub fn elems(kind: u32) -> Sig {
         kind_sfpu::BOOL_AND | kind_sfpu::BOOL_OR | kind_sfpu::BOOL_XOR => sig(&[Bool, Bool], Bool),
         kind_sfpu::EQ..=kind_sfpu::LE => sig(&[F32, F32], Bool),
         kind_sfpu::EQ_S..=kind_sfpu::IS_INF => sig(&[F32], Bool),
-        kind_sfpu::MASK_FILL => sig(&[F32, Bool], F32),
+        kind_sfpu::MASK_FILL | kind_sfpu::SCALE_MASK_FILL => sig(&[F32, Bool], F32),
         kind_sfpu::MASK_WHERE => sig(&[F32, Bool, F32], F32),
         kind_sfpu::MUL_ADD => sig(&[F32, F32, F32], F32),
         kind_sfpu::INT_MASK_FILL => sig(&[Elem::I32, Bool], Elem::I32),
@@ -2376,6 +2381,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::BOOL_XOR
         | kind_sfpu::EQ..=kind_sfpu::LE
         | kind_sfpu::MASK_FILL
+        | kind_sfpu::SCALE_MASK_FILL
         | kind_sfpu::INT_MASK_FILL
         | kind_sfpu::BOOL_MASK_FILL
         | kind_sfpu::PRELU
@@ -2488,6 +2494,7 @@ pub fn broadcasts(kind: u32) -> bool {
             | kind_sfpu::EQ
             ..=kind_sfpu::LE
                 | kind_sfpu::MASK_FILL
+                | kind_sfpu::SCALE_MASK_FILL
                 | kind_sfpu::INT_MASK_FILL
                 | kind_sfpu::BOOL_MASK_FILL
                 | kind_sfpu::PRELU
@@ -2511,6 +2518,15 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
         | kind_sfpu::DIV => Format::Fp32,
         _ => Format::Int32,
     };
+    if kind == kind_sfpu::SCALE_MASK_FILL {
+        // `MUL_SCALAR`'s load and product, then `MASK_FILL`'s select on the raw mask.
+        p.load(LReg::L0, Format::Fp32, a_at);
+        p.load(LReg::L1, Format::Int32, b_at);
+        p.mul(LReg::L0, LReg::L4, LReg::L2);
+        p.if_(Cond::Ne0(LReg::L1), |p| p.mov(LReg::L3, LReg::L2));
+        p.store(LReg::L2, Format::Fp32, out_at);
+        return;
+    }
     p.load(LReg::L0, fmt, a_at);
     p.load(LReg::L1, fmt, b_at);
     if let Some((op, _)) = super::integer::operation(kind) {
@@ -2619,6 +2635,11 @@ fn binary_constants(p: &mut Program, kind: u32, scalars: [f32; 2]) {
         kind_sfpu::MASK_FILL | kind_sfpu::INT_MASK_FILL | kind_sfpu::BOOL_MASK_FILL
     ) {
         p.loadi_bits(LReg::L3, scalars[0].to_bits());
+    }
+    // The scale as `MUL_SCALAR` loads its scalar.
+    if kind == kind_sfpu::SCALE_MASK_FILL {
+        p.loadi(LReg::L4, scalars[0]);
+        p.loadi_bits(LReg::L3, scalars[1].to_bits());
     }
 }
 
@@ -2932,6 +2953,7 @@ pub fn row_limited(kind: u32) -> bool {
             | kind_sfpu::SIGMOID
             | kind_sfpu::SILU_MUL
             | kind_sfpu::MUL_ADD
+            | kind_sfpu::SCALE_MASK_FILL
     )
 }
 
@@ -2971,6 +2993,9 @@ pub fn code_for(
     scalars: [f32; 2],
     bcast: Broadcast,
 ) -> Option<(Operands, crate::code::Code)> {
+    if !fill_kept(kind, scalars) {
+        return None;
+    }
     match bcast {
         Broadcast::None => code2(kind, scalars),
         _ if !broadcasts(kind) => None,
@@ -2984,6 +3009,13 @@ pub fn code_for(
             Some((Operands::RowBroadcast, p.finish_code()))
         }
     }
+}
+
+/// Whether `kind`'s fill is one its program stores as `MASK_FILL` does: `SCALE_MASK_FILL` stores
+/// its result in FP32, which would change a denormal or a NaN's payload that `MASK_FILL` moves as
+/// raw bits.
+fn fill_kept(kind: u32, [_, fill]: [f32; 2]) -> bool {
+    kind != kind_sfpu::SCALE_MASK_FILL || fill == 0.0 || fill.is_normal() || fill.is_infinite()
 }
 
 /// The program for `kind` (with its scalar), and what operands it takes, or
@@ -3001,6 +3033,9 @@ pub fn program2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, Vec<Instructi
 
 /// [`program2`] as a role's slot holds it ([`code_for`]).
 pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Code)> {
+    if !fill_kept(kind, scalars) {
+        return None;
+    }
     // The Approx twin of a transcendental (`approx.rs`).
     if let Some(code) = super::approx::code(kind) {
         return Some((Operands::Unary, code));
@@ -3113,6 +3148,7 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
         | kind_sfpu::BOOL_XOR
         | kind_sfpu::EQ..=kind_sfpu::LE
         | kind_sfpu::MASK_FILL
+        | kind_sfpu::SCALE_MASK_FILL
         | kind_sfpu::INT_MASK_FILL
         | kind_sfpu::BOOL_MASK_FILL
         | kind_sfpu::PRELU => {
@@ -5595,6 +5631,7 @@ mod row_limited_tests {
             kind_sfpu::SIGMOID,
             kind_sfpu::SILU_MUL,
             kind_sfpu::MUL_ADD,
+            kind_sfpu::SCALE_MASK_FILL,
         ];
         for kind in kinds {
             assert!(row_limited(kind), "{kind:#x}");
@@ -5724,6 +5761,66 @@ mod sub_exp_tests {
                 cols,
             );
             assert_eq!(bits(&got), bits(&want), "[{rows}, {cols}]");
+        }
+    }
+
+    /// `SCALE_MASK_FILL` is `MUL_SCALAR` then `MASK_FILL`, bit for bit, plain and with the mask a
+    /// row or a column broadcast, for scales whose products flush, overflow or are exact, and
+    /// every fill it takes; a fill it would store changed is refused.
+    #[test]
+    fn scale_mask_fill_is_mul_scalar_then_mask_fill_bit_for_bit() {
+        let flag = |i: usize| f32::from_bits(u32::from(i % 3 == 1 || i % 7 == 0));
+        for (rows, cols) in [(32, 64), (33, 70), (9, 512), (1, 40)] {
+            let x = values((rows * 100 + cols) as u32, rows * cols);
+            for (bcast, n) in [
+                (Broadcast::None, rows * cols),
+                (Broadcast::Col, rows),
+                (Broadcast::Row, cols),
+            ] {
+                if bcast != Broadcast::None && (rows == 1 || cols == 1) {
+                    continue;
+                }
+                let mask: Vec<f32> = (0..n).map(flag).collect();
+                for scale in [0.125f32, 1.0 / 8f32.sqrt(), -3.0, 1.0e30, 1.0e-30] {
+                    for fill in [f32::NEG_INFINITY, f32::INFINITY, -0.0, 0.0, -1.5, f32::MAX] {
+                        let t = reference_for(
+                            kind::MUL_SCALAR,
+                            scale,
+                            Broadcast::None,
+                            &x,
+                            None,
+                            rows,
+                            cols,
+                        );
+                        let want = reference_op(
+                            kind_sfpu::MASK_FILL,
+                            [fill, 0.0],
+                            bcast,
+                            &[&t, &mask],
+                            rows,
+                            cols,
+                        );
+                        let got = reference_op(
+                            kind_sfpu::SCALE_MASK_FILL,
+                            [scale, fill],
+                            bcast,
+                            &[&x, &mask],
+                            rows,
+                            cols,
+                        );
+                        assert_eq!(
+                            bits(&got),
+                            bits(&want),
+                            "[{rows}, {cols}] {bcast:?} scale {scale} fill {fill}"
+                        );
+                    }
+                }
+            }
+        }
+        for fill in [f32::NAN, f32::from_bits(1), -f32::from_bits(0x007f_ffff)] {
+            for bcast in [Broadcast::None, Broadcast::Row, Broadcast::Col] {
+                assert!(code_for(kind_sfpu::SCALE_MASK_FILL, [0.5, fill], bcast).is_none());
+            }
         }
     }
 

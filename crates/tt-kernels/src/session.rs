@@ -87,6 +87,18 @@ pub enum Spread {
     Work { share: usize, min: usize },
 }
 
+/// The units a one-tile-row product's weight stream saturates GDDR with: each streams ~7 GB/s,
+/// and 64 reach ~450 GB/s dealt a column a unit (Blackhole, card 0,
+/// `docs/learnings/silicon-operating-notes.md`, "A decode product's weights"). Past it, SmolLM2-1.7B's
+/// `q|k|v`, `gate|up` and head ran slower on 120 units than on 64 (180 / 383 / 1,051 against 160 /
+/// 352 / 1,024 us).
+pub const THIN_STREAM_UNITS: usize = 64;
+
+/// The `K` (tiles) from which a one-tile-row product is a weight stream ([`THIN_STREAM_UNITS`]):
+/// with a short `K` each unit's `A` reads and kernel are a larger share, and more units help (the
+/// 135M head, `K` = 18 tiles: 308 us on 120 units, 318 on 64).
+pub const THIN_STREAM_K_TILES: usize = 32;
+
 /// How [`Session::probe_stream`] deals a tensor's tiles over its units.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,6 +460,8 @@ pub struct Session<T: Transport> {
     resident_matmul_a: bool,
     /// [`Session::set_unpack_transposed_b`].
     unpack_transposed_b: bool,
+    /// [`Session::set_thin_stream_units`].
+    thin_stream_units: bool,
     /// [`Session::host_times`].
     host: HostTimes,
     /// Host memory the card moves tensors through ([`Session::host_dma`]),
@@ -1885,6 +1899,7 @@ impl<T: Transport> Session<T> {
             thin_matmul_reads: true,
             resident_matmul_a: true,
             unpack_transposed_b: true,
+            thin_stream_units: true,
             host: HostTimes::new(),
             staging: None,
             host_dma: true,
@@ -5559,6 +5574,14 @@ impl<T: Transport> Session<T> {
         let (mt, kt) = if a_transposed { (ac, ar) } else { (ar, ac) };
         let nt = if b_transposed { br } else { bc };
         let units = self.spread_for(mt * nt * kt);
+        // A one-tile-row product over a long `K` streams its weights: GDDR is saturated by
+        // `THIN_STREAM_UNITS` units, and more only share it while each pays its own `A` reads and
+        // the deal's last round (`silicon_probe_decode_stream`).
+        let units = if self.thin_stream_units && mt == 1 && kt >= THIN_STREAM_K_TILES {
+            units.min(THIN_STREAM_UNITS)
+        } else {
+            units
+        };
         // No `MOP` in the matmul: with its loops replayed it is backend-bound,
         // and the math role's `MOP` measured no faster end to end on silicon
         // (row AE) -- while ttsim's FIFO overflows under one (row 68), so the
@@ -6093,6 +6116,13 @@ impl<T: Transport> Session<T> {
     /// each tile as it reads it (`READ_TRANSPOSED`, ~10 us a tile on silicon), the same bits.
     pub fn set_unpack_transposed_b(&mut self, on: bool) {
         self.unpack_transposed_b = on;
+    }
+
+    /// Whether a one-tile-row GDDR product over a long `K` (at least [`THIN_STREAM_K_TILES`]
+    /// tiles: a decode step's weight stream) runs on at most [`THIN_STREAM_UNITS`] units (on by
+    /// default). The bits are the same on any number of units.
+    pub fn set_thin_stream_units(&mut self, on: bool) {
+        self.thin_stream_units = on;
     }
 
     /// How the transcendentals run from the next element-wise op on

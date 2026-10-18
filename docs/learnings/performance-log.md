@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Thin products on 64 units; attention's scale and mask as one op](#thin-products-on-64-units-attentions-scale-and-mask-as-one-op-2026-10-18-cards-0-and-1) | 2026-10-18 | a one-tile-row product over a long `K` on at most 64 units (~1.2 ms), and `mask ? -inf : s x` in one pass (~0.1-0.2 ms), bit for bit: a 1.7B decode step -> **34.35 / 34.87 / 35.76 ms**, 135M -> **14.28 / 14.68 / 15.25** |
 | [RoPE's sum as one op](#ropes-sum-as-one-op-2026-10-18-cards-0-and-1) | 2026-10-18 | `x cos + rotate(x) sin`'s second product and sum in one pass (`MUL_ADD`, a chain fuser), bit for bit: a 1.7B decode step -> **35.64 / 36.22 / 37.20 ms**, 135M -> **14.43 / 14.92 / 15.46** |
 | [Attention's softmax in four ops](#attentions-softmax-in-four-ops-2026-10-18-cards-0-and-1) | 2026-10-18 | `exp(x - max)` in one pass and each clamp on its reduction, bit for bit: a 1.7B decode step -> **36.12 / 36.52 / 37.54 ms**, 135M -> **14.80 / 15.29 / 15.86** |
 | [The bound on a decode product's `A` reads](#the-bound-on-a-decode-products-a-reads-2026-10-18-card-0) | 2026-10-18 | every block reading only `B` (a timing probe): a 1.7B layer's products ~143 us faster (`down` 270 -> 198 us), ~3.4 ms a step at most for reading `A` once a product |
@@ -333,6 +334,23 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Thin products on 64 units; attention's scale and mask as one op (2026-10-18, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 4 ("The deal") and
+[decode-attention.md](../plans/decode-attention.md) A4b.
+- **The deal:** a one-tile-row product with `K` of at least 32 tiles runs on at most 64 units
+  (`session::THIN_STREAM_UNITS`): 64 units saturate the weight stream, and more only add their own `A` reads and an
+  uneven last round. Each output column keeps its `K` chain, so the bits are unchanged. It touches every 1.7B product
+  (`K` = 64 or 256 tiles) and the 135M's `down` (`K` = 48); the 135M head (`K` = 18) keeps every unit.
+- **The scale and mask:** `kind_sfpu::SCALE_MASK_FILL` is `MUL_SCALAR` then `MASK_FILL` in one pass, bit for bit;
+  burn-tt's attention applies its first mask (the caller's, else the causal one) with the scale when there is no
+  softcap.
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792290295`, `1792290681`) | Scale and mask only | Both | burn-flex |
+|---|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 35.64 / 36.22 / 37.20 | 35.56 / 36.10 / 37.00 (`1792293194`) | **34.35 / 34.87 / 35.76** (`1792292588`) | 295.0 / 313.2 / 327.2 |
+| SmolLM2-135M | 14.43 / 14.92 / 15.46 | — | **14.28 / 14.68 / 15.25** (`1792293687`) | 26.6 / 29.0 / 31.3 |
 
 ## RoPE's sum as one op (2026-10-18, cards 0 and 1)
 

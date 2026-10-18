@@ -117,6 +117,8 @@ fn decode_products_against_their_weight_stream() {
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
         let all = s.tiles().len();
+        // The sweep sets the units itself.
+        s.set_thin_stream_units(false);
         println!(
             "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"tiles\":{all},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"reps\":{REPS},\"window\":{WINDOW},\"route\":\"Tf32FromFp32\",\"fidelity\":\"HiFi4\",\"timing\":\"replay of {REPS} ops less replay of 1, over {}\"}}",
             tt_tests::bench::git_sha(),

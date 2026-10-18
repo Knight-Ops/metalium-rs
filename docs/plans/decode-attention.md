@@ -152,9 +152,25 @@ Every phase is bit for bit with today's attention, and each head's positions kee
   - **Measured** (card 1):
     - 1.7B 36.39 / 37.02 / 37.98 -> **36.12 / 36.52 / 37.54 ms** (`1792287482`);
     - 135M 15.33 / 15.79 / 16.47 -> **14.80 / 15.29 / 15.86** (`1792287884`, burn-flex 26.6 / 29.0 / 31.4).
-- [ ] **A4b. Scale and mask into the softmax** (two ops a layer, ~0.3 ms a 1.7B step). Scale is a multiply,
-  `SFPMAD`, flushed; the mask fill is a select. Both could ride in `SUB_EXP`'s pass only if the maximum were taken
-  after them, so they need a kernel that scales and masks before the reduction.
+- [x] **A4b. The scale and the mask as one op** (2026-10-18). Both could ride in `SUB_EXP`'s pass only if the
+  maximum were taken after them, so the scale and the mask became one op of their own, and the reduction reads it.
+  - **The kernel:** `kind_sfpu::SCALE_MASK_FILL`, `mask ? fill : x * scale`: `MUL_SCALAR`'s load, product and FP32
+    store, with `MASK_FILL`'s select on the raw mask between them, so bit for bit the two ops. A fill that an FP32 store
+    would change (a denormal, a NaN's payload) is refused (`code_for`), since `MASK_FILL` moves it as raw bits. It is
+    row-limited, and it takes a row or a column mask.
+  - **Where:** burn-tt's attention, when there is no softcap between them, applies its first mask (the caller's, else
+    the causal one) with the scale. `padded_attention`'s causal mask does the same. A second mask runs as `MASK_FILL`.
+  - **Gates:**
+    - unit `scale_mask_fill_is_mul_scalar_then_mask_fill_bit_for_bit`: every broadcast, scales whose products flush or
+      overflow, fills of `±inf`, `±0`, `MAX`. Watched failing with the select taken before the scale.
+    - the row-limit unit gate, now with this kind.
+    - `step200::scale_mask_fill_is_scale_then_mask_on_the_card`: a `[1, attended]` mask over 1, 9 and 32 rows,
+      over NaN-primed L1. Watched failing with the select dropped.
+    - `step183`: the scale holds the mask's job, and every case is bit for bit one head at a time. Card 0
+      `1792292589`, `1792293081`.
+  - **Regression:** ttsim `step187`, `step191`, `step193`; Burn conformance 2,973 passed, 52 as expected.
+  - **Measured** (card 1, alone): 1.7B 35.64 / 36.22 / 37.20 -> 35.56 / 36.10 / 37.00 ms (`1792293194`).
+    With the thin-product deal (decode-to-bandwidth Phase 4), see there.
 - [ ] **A5. Decision (ask the user):** split-position (flash-decode) attention, if A0-A4 leave attention exposed. It
   changes the softmax's and `pv`'s accumulation order, so it needs a derived bound.
 

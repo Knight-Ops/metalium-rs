@@ -1,14 +1,15 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-18): **a 1.7B step 41.83 / 44.25 / 47.40 -> 35.64 / 36.22 / 37.20 ms (`1792290295`), 135M
-20.03 / 20.55 / 21.19 -> 14.43 / 14.92 / 15.46 (`1792290681`).**
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-18): **a 1.7B step 41.83 / 44.25 / 47.40 -> 34.35 / 34.87 / 35.76 ms (`1792292588`), 135M
+20.03 / 20.55 / 21.19 -> 14.28 / 14.68 / 15.25 (`1792293687`).**
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
 - **Phase 1:** the copies are done; the k/v repack moved to Phase 2.
 - **Phase 3:** the capture barriers, the row-limited element-wise ops and RoPE's sum fuser are done.
 - **Phase 2:** A0 found the transposed reads of the key cache; `B` is now transposed by the unpacker (A0b), and a
   stacked product's tail rows are no longer read (A2a), nor its padding off `K` filled (A1); the softmax is four
-  ops (A4a).
+  ops (A4a), and the scale and the mask are one (A4b).
+- **Phase 4:** a thin product over a long `K` runs on 64 units (the deal).
 - **Next:** Phase 2's A1-A2 (the batched path's padding, no regathering), then Phase 3's fusers. This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
 - [in-place-cache-write.md](in-place-cache-write.md) (D1-D5);
@@ -216,18 +217,32 @@ Reordered by Phase 0. A layer's products take ~907 us, against ~600 us for their
     step.
   - **Constraints:** rectangles only (ttsim refuses non-rectangular multicast), and the reading unit gets fewer
     columns.
-- [ ] **Compute under the reads.** The ~15 us kernel tail of each product (~1.4 ms a step) is the compute after the
-  last read: under `Staging::Slots` a job's kernel starts when all its `K` tiles are in.
+- [ ] **Compute under the reads** (a larger change: documented, not built). The ~15 us kernel tail of each product
+  (~1.4 ms a step) is the compute after the last read: under `Staging::Slots` a job's kernel starts when all its `K`
+  tiles are in.
+  - **Why it is larger:** B runs a job's gathers and then its `KERNEL` in order. Starting the kernel first needs:
+    - a mover entry that launches T0-T2 and goes on reading;
+    - the matmul kernel's unpacker waiting on a credit for each `K` chunk (`matmul_requirements`' `A` and `B` rings
+      already run from the mover to the unpacker);
+    - the mover posting those credits as each chunk's reads land;
+    - the `step172`/`step173` gates in both read modes, and the firmware lints.
+  - **Single-job units benefit most:** on the 1.7B, `o` and `down` each run one job a unit, so between-job double
+    buffering (`SlotsHalf`) has nothing to overlap there.
   - **The fix:** start the `K` chain on the tiles that have landed, by credits per `K` chunk, in the same order, so
     bit for bit.
   - Or, for a unit with several jobs, `SlotsHalf`'s double buffering.
-- [ ] **The deal.** A product's units should be chosen from its bytes, not "every unit":
+- [x] **The deal** (2026-10-18). A product's units are chosen from its bytes, not "every unit":
   - 64 units saturate;
   - an uneven last round costs its barrier.
-
-  The rule is measured, not guessed (the 135M head wants more units): `qkv`, `gate|up` and the head on 64 units save
-  ~1.25 ms a 1.7B step. It goes in `Session::matmul_dram`'s unit choice (`thin_runs`, `blocks`), checked against the
-  probe's sweep.
+  - **The rule:** a one-tile-row product with `K` of at least 32 tiles runs on at most 64 units
+    (`session::THIN_STREAM_UNITS`, `THIN_STREAM_K_TILES`; `Session::set_thin_stream_units`, which the probe's sweep
+    turns off). The rule comes from the probe's sweep. A short `K` keeps every unit: the 135M head (`K` = 18) was
+    faster on 120.
+  - **Bits:** unchanged. Each output column keeps its `K` chain; only which unit holds it moves.
+  - **Measured** (card 1), with the attention's scale and mask as one op (decode-attention A4b):
+    - 1.7B 35.64 / 36.22 / 37.20 -> **34.35 / 34.87 / 35.76 ms** (`1792292588`); without the deal 35.56 / 36.10 /
+      37.00 (`1792293194`), so the deal is ~1.2 ms;
+    - 135M 14.43 / 14.92 / 15.46 -> **14.28 / 14.68 / 15.25** (`1792293687`, burn-flex 26.6 / 29.0 / 31.3).
 - [ ] **Consecutive tiles.** A column-dealt stream is ~7% under the consecutive-tile ceiling (~45 us a layer).
   - **Options:** a skewed placement (decode-matmul-bandwidth P5.1), or a deal of `K`-contiguous runs that walk the
     channels.
