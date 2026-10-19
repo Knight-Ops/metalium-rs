@@ -294,6 +294,20 @@ fn accumulate_with(
 /// `first` tile, which also zeroes the accumulator's other rows (as the
 /// result's padding). Flex's `sum` over `dim = 0`, bit for bit.
 pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
+    in_order(first, valid, false)
+}
+
+/// The column sums of squares of one input tile's first `valid` rows, in order, into row 0 of
+/// the accumulator tile: what [`accumulate_squares`] adds a lane at a time over a row's tiles,
+/// for that row laid out one of its tiles' data rows per row (`tensor::pack_row`: row `kk` is
+/// the row's tile `kk`). Column `c` then takes the same squares in the same order as lane `c`
+/// of the row's sum -- the first as it is (not added to `+0.0`), each later one added as
+/// `square + sum` -- and [`finish_rows`]`(.., 1)` folds row 0 as it folds the row's.
+pub fn accumulate_squares_in_order(first: bool, valid: u32) -> Vec<Instruction> {
+    in_order(first, valid, true)
+}
+
+fn in_order(first: bool, valid: u32, square: bool) -> Vec<Instruction> {
     let mut p = Program::with_policy(LoopPolicy::Unrolled);
     let acc = |r: u32| OUT_ROW + r;
     if first {
@@ -309,6 +323,8 @@ pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
             } else {
                 p.load(LReg::L4, Format::Fp32, acc(top + half));
             }
+            // The first square is the sum, as `accumulate_squares` stores the first tile's.
+            let mut fresh = first && square;
             for g in 0..8u32 {
                 let rows = valid.saturating_sub(4 * g).min(4);
                 if rows == 0 {
@@ -320,15 +336,23 @@ pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
                     bottom + 4 * (g - 4)
                 };
                 p.load(LReg::L0, Format::Fp32, A_ROW + r + half);
+                if square {
+                    p.mul(LReg::L0, LReg::L0, LReg::L0);
+                }
                 // Row `i` of the four into row 0 of `L[i]`; row 0 of `L4`
                 // stays where it is.
                 p.transpose4();
                 for i in 0..rows {
-                    p.add(
-                        LReg::L4,
-                        [LReg::L0, LReg::L1, LReg::L2, LReg::L3][i as usize],
-                        LReg::L4,
-                    );
+                    let row = [LReg::L0, LReg::L1, LReg::L2, LReg::L3][i as usize];
+                    if fresh {
+                        p.mov(row, LReg::L4);
+                        fresh = false;
+                    } else if square {
+                        // `combine`'s order: the new value, then the sum.
+                        p.add(row, LReg::L4, LReg::L4);
+                    } else {
+                        p.add(LReg::L4, row, LReg::L4);
+                    }
                 }
             }
             // Row 0 the sums, rows 1..4 zero: `L5..L8` cleared and transposed

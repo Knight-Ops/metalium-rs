@@ -3546,6 +3546,69 @@ pub fn sfpu_rms(alloc: &mut DramAlloc, a: &DramTensor, eps: f32) -> Result<Work>
     Ok(Work { out, jobs })
 }
 
+/// [`sfpu_rms`] of one row of `cols` columns (whole tiles) from its packed layout (`packed`,
+/// `[cols / 32, 32]`, [`pack_row`]): one job, `cols / 1024` tiles read where the row is
+/// `cols / 32` entries. The same sums in the same order (`sfpu::norm::math_packed`), so bit for
+/// bit [`sfpu_rms`]'s `[1, 1]`.
+pub fn sfpu_rms_packed(
+    alloc: &mut DramAlloc,
+    packed: &DramTensor,
+    cols: usize,
+    eps: f32,
+) -> Result<Work> {
+    use crate::sfpu::{norm, reduce};
+    packed.expect("a packed RMS statistic", Elem::F32)?;
+    if cols % 32 != 0 || (packed.rows, packed.cols) != (cols / 32, 32) {
+        return Err(TensorError::Shape(format!(
+            "[{}, {}] is not a packed row of {cols} columns",
+            packed.rows, packed.cols
+        )));
+    }
+    let [pt, _] = packed.grid();
+    let layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (squares, fin) = norm::math_packed(cols, eps);
+    let roles = Arc::new(reduce::roles(&layout, &squares, &fin));
+    let out = DramTensor::alloc_elem(alloc, 1, 1, Elem::F32)?;
+    let (rp, ro) = (packed.tensor_ref(), out.tensor_ref());
+    let gather = [
+        [
+            record::READ_RUN,
+            0,
+            pt as u32,
+            layout.in_at as u32,
+            0,
+            1,
+            0,
+            0,
+        ],
+        rp.encode()[0],
+        rp.encode()[1],
+    ];
+    let scatter = [
+        [record::WRITE_RUN, 0, 1, layout.out_at as u32, 0, 0, 0, 0],
+        ro.encode()[0],
+        ro.encode()[1],
+    ];
+    let jobs = vec![vec![
+        Step::List {
+            what: "rms gather",
+            entries: gather.to_vec(),
+        },
+        Step::Kernel {
+            roles,
+            init: layout.init.clone(),
+            mop: Box::new([None; 3]),
+            loops: Default::default(),
+            half: None,
+        },
+        Step::List {
+            what: "rms scatter",
+            entries: scatter.to_vec(),
+        },
+    ]];
+    Ok(Work { out, jobs })
+}
+
 /// Inclusive scan down matrix rows. Each column tile is a job, so its
 /// continuations stay on one unit. A WAIT protects every prior-output reload.
 pub fn sfpu_scan(

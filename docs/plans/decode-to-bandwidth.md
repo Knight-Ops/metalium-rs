@@ -238,7 +238,7 @@ Burn model gains.
 - **The small ops, 2026-10-19.** From profile `1792363365`: ~424 us a layer of small ops in four windows between
   products, which the prefetch (~43 us of stream a product) cannot hide. In order of worth and risk, each bit for bit
   and re-profiled before the next:
-  - [x] **A column broadcast in the SFPU** (~1.0 ms). A `[rows, 1]` operand was broadcast by the mover a datum at a
+  - [x] **A column broadcast in the SFPU** (~1.0 ms, measured 1.0). A `[rows, 1]` operand was broadcast by the mover a datum at a
     time (`READ_BROADCAST_COL`, ~10 us a tile). The mover now reads its tile as it lies
     (`record::READ_RUN_COL_AS_IT_LIES`), and the program copies column 0 across in `Dst` first
     (`sfpu::Program::broadcast_col0`), bit for bit the mover's tile.
@@ -251,9 +251,26 @@ Burn model gains.
     - **Measured:** RMSNorm's `DIV` 24.1 -> 14.7 us, the softmax's 2-unit ops 24.7 -> 15.0 us, the replay 25.61 ->
       24.71 ms (profile `1792372923`). 1.7B 26.47 / 27.14 / 27.97 -> **25.48 / 26.18 / 27.01 ms** (`1792372396`);
       135M 12.62 / 13.06 / 13.59 -> **11.37 / 11.76 / 12.29** (`1792372749`).
-  - [ ] **RMSNorm's statistic from the packed row** (~0.9 ms): `pack_row`'s `[K / 32, 32]` row `kk` is tile `kk`'s
-    data row, so a sum down its rows takes each lane's squares in the same order; 2 tiles read on the statistic's
-    unit, not 64 entries.
+  - [x] **RMSNorm's statistic from the packed row** (estimated ~0.9 ms; **measured ~0.15**). `pack_row`'s
+    `[K / 32, 32]` row `kk` is tile `kk`'s data row, so a sum down its rows takes each lane's squares in the same
+    order (`sfpu::reduce::accumulate_squares_in_order`, `sfpu::norm::math_packed`, `tensor::sfpu_rms_packed`;
+    `Session::set_packed_rms`, on, for one row of at least `PACKED_A_K_TILES` tiles). It also lifts the one-job limit
+    (4,096 columns) for such a row.
+    - **Gates:** unit `a_packed_row_s_statistic_is_the_row_s` (576-8192 columns, specials, two NaN payloads; control:
+      the packed rows summed bottom to top differ, on a row whose sum the order changes); `step196`
+      `a_decode_row_s_statistic_reads_it_packed` (ttsim; card 0 `1792374366`): packed, unpacked and the model bit for
+      bit at 1024-8192 columns, the packing seen to run and not to run; watched failing with the statistic reading one
+      packed tile too few. Not observable on the model: the first square taken as it is and the add's operand order
+      (kept as `accumulate_squares` has them).
+    - **Regression:** ttsim `step187`, `step193`, `step195`, `step197`, `step199`, the tt-kernels unit tests; Burn
+      conformance `--fusion` 2,970 passed, 55 as expected; card 0 30 of 30 (`1792374366`, `step188` among them).
+    - **Measured** (profile `1792375116`): the statistic 30.1 -> 10.9 us, but the packing is an op of its own on 64
+      units, 12.2 us (barrier 4.7), and the `DIV` after it 14.7 -> 18.0. A norm 44.7 -> 41.1 us; the replay 24.71 ->
+      24.58 ms. 1.7B **25.38 / 26.03 / 26.91 ms** (`1792374654`).
+    - **What would make it pay:** no packing op. The residual `Add` before each norm runs on the row's 64 units and
+      could write its row packed too (two face-row writes a tile in its own job), as could `x gamma` for the
+      product's packed `A` (97 packing ops a step, ~6-7 us each). Both are a packed twin carried with a one-row
+      result.
   - [ ] **Row-dealt stacking gathers** in attention (~0.8 ms): `gather_rows` deals by output tile, so a `[32, 64]`
     output's 64 row reads land on 2 units.
   - [ ] **The prefetch keeps its units at long context** (~0.4 ms at `Step(512)`): in a capture, non-product ops capped

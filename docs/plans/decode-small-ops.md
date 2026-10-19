@@ -237,6 +237,10 @@ projection), or `FixedWrite` taking the rows before the head split.
     each of 64 units, `SILU_MUL`, `sigmoid`, the residual adds), whose decode row is one of the eight row groups their
     kernels run (what that saves there is unmeasured).
 
+- [x] **Since (2026-10-19, decode-to-bandwidth Phase 3):** the `DIV`'s column operand is broadcast by the SFPU, not
+  the mover (24.1 -> 14.7 us), and a decode row of at least 32 tiles is packed before its statistic, which then reads
+  2 tiles where it read 64 (30.1 -> 10.9 us, plus a 12.2 us packing op).
+
 ### S4. Attention's non-product ops (~4.5 ms)
 
 Superseded by [decode-attention.md](decode-attention.md) (2026-10-17), which takes both items below.

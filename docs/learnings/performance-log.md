@@ -338,6 +338,28 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## RMSNorm's statistic from the packed row (2026-10-19, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3, "The small ops". A decode row's statistic read its
+64 tiles on one unit, ~0.33 us an entry (30.1 us a norm). Packed (`pack_row`, `[K / 32, 32]`), the same squares sum in
+the same order down two tiles' rows, bit for bit.
+
+| Per norm, 1.7B `Step(64)` | Before (`1792372923`) | After (`1792375116`) |
+|---|--:|--:|
+| the packing, 64 units | — | 12.2 us (barrier 4.7, data 4.8) |
+| the statistic, 1 unit | 30.1 | **10.9** |
+| the `DIV`, 64 units | 14.7 | 18.0 |
+| a norm | 44.7 | 41.1 |
+| the replay | 24.71 ms | 24.58 |
+
+- **Timed** (card 1): 1.7B 25.48 / 26.18 / 27.01 -> **25.38 / 26.03 / 26.91 ms** (`1792374654`, burn-flex 306.3 / 318.9 /
+  327.3; 269.7 GB/s of weights at 32 tokens).
+- **Short of the ~0.9 ms estimated:** the packing is an op of its own, with a 64-unit barrier. The saving needs the
+  row written packed by the op that makes it (the residual `Add`).
+- **Gates:** unit `a_packed_row_s_statistic_is_the_row_s`; `step196` `a_decode_row_s_statistic_reads_it_packed`
+  (watched failing with one packed tile too few read); conformance `--fusion` 2,970 passed, 55 as expected; card 0
+  `1792374366` (30 of 30).
+
 ## Where decode's bandwidth stands, and a column broadcast in the SFPU (2026-10-19, cards 0 and 1)
 
 **The assessment** (1.7B, card 1, before this change: timed `1792364210`, profile `1792363365`):

@@ -467,6 +467,8 @@ pub struct Session<T: Transport> {
     thin_matmul_reads: bool,
     /// [`Session::set_packed_thin_a`].
     packed_thin_a: bool,
+    /// [`Session::set_packed_rms`].
+    packed_rms: bool,
     /// [`Session::set_streamed_k`].
     streamed_k: bool,
     /// [`Session::set_weight_prefetch`].
@@ -1916,6 +1918,7 @@ impl<T: Transport> Session<T> {
             matmul_k_block_limit: None,
             thin_matmul_reads: true,
             packed_thin_a: true,
+            packed_rms: true,
             streamed_k: true,
             weight_prefetch: true,
             prefetch_anchor: None,
@@ -5488,6 +5491,27 @@ impl<T: Transport> Session<T> {
     /// Each row's `sqrt(mean(a a) + eps)` over its columns, `[rows, 1]`: RMSNorm's statistic,
     /// one job a tile row (`tensor::sfpu_rms`), bit for bit the ops it replaces.
     pub fn rms(&mut self, a: &DramTensor, eps: f32) -> Result<DramTensor, TensorError> {
+        let kt = a.cols / 32;
+        if self.packed_rms
+            && a.rows == 1
+            && a.cols % 32 == 0
+            && kt >= PACKED_A_K_TILES
+            && a.elem == tensor::Elem::F32
+        {
+            // One unit reading the row's `K / 32` tiles is bound by its entries (~0.33 us
+            // each): the packing spreads them over the units, the statistic reads `K / 1024`.
+            let units = self.spread_for(kt);
+            let work = tensor::pack_row(&mut self.dram_state()?.alloc, a, units)?;
+            let packed = self.execute_on(work, units, RESET_BUDGET)?;
+            let stat = self
+                .dram_state()
+                .and_then(|d| tensor::sfpu_rms_packed(&mut d.alloc, &packed, a.cols, eps))
+                .and_then(|work| self.execute_on(work, 1, RESET_BUDGET));
+            self.free(packed)?;
+            let out = stat?;
+            out.set_pad(tensor::Pad::Undefined);
+            return Ok(out);
+        }
         let units = self.spread_for(a.grid()[0]);
         let work = tensor::sfpu_rms(&mut self.dram_state()?.alloc, a, eps)?;
         let out = self.execute_on(work, units, RESET_BUDGET)?;
@@ -6221,6 +6245,14 @@ impl<T: Transport> Session<T> {
     /// two.
     pub fn set_packed_thin_a(&mut self, on: bool) {
         self.packed_thin_a = on;
+    }
+
+    /// Whether RMSNorm's statistic of one row over a long `K` reads the row packed
+    /// ([`tensor::pack_row`], [`PACKED_A_K_TILES`]; on by default): the packing spread over the
+    /// units, then `K / 1024` tile reads on the statistic's one unit, where the row takes `K / 32`
+    /// entries there. Bit for bit either way (`sfpu::norm::math_packed`); off, the gates compare.
+    pub fn set_packed_rms(&mut self, on: bool) {
+        self.packed_rms = on;
     }
 
     /// Whether a one-row product with a packed `A` streams each output column's `K` in chunks,

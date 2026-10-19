@@ -28,7 +28,7 @@ use tt_isa::isa::Instruction;
 
 use super::kernel::OUT_ROW;
 use super::ops::sqrt_program;
-use super::reduce::{accumulate_squares, finish_rows, Axis, ReduceOp};
+use super::reduce::{accumulate_squares, accumulate_squares_in_order, finish_rows, Axis, ReduceOp};
 use super::{Format, LReg, LoopPolicy, Program};
 
 /// Most tiles a row may have: its slots fit the data arena and its role programs a program
@@ -93,6 +93,26 @@ pub fn math(
     (squares, fin)
 }
 
+/// [`math`] for one row of `cols` (whole tiles) laid out `[cols / 32, 32]`
+/// (`tensor::pack_row`): its `cols / 1024` tiles' squares summed down their rows in order
+/// ([`accumulate_squares_in_order`]), then row 0 folded and the statistic. The same sums in the
+/// same order as [`math`]'s over the row's `cols / 32` tiles, so the same bits, from an
+/// entry a packed tile where the row takes one a tile.
+pub fn math_packed(cols: usize, eps: f32) -> (Vec<Vec<Instruction>>, Vec<Instruction>) {
+    assert!(
+        cols % 32 == 0 && cols > 0,
+        "a packed row is whole tiles, not {cols} columns"
+    );
+    let rows = cols / 32;
+    let tiles = rows.div_ceil(32);
+    let squares = (0..tiles)
+        .map(|n| accumulate_squares_in_order(n == 0, (rows - 32 * n).min(32) as u32))
+        .collect();
+    let mut fin = finish_rows(ReduceOp::Sum, Axis::Cols, 1);
+    fin.extend(statistic(cols, eps, 1));
+    (squares, fin)
+}
+
 /// What the device computes for `x` (`[rows, cols]`, row-major): `[rows]`, each row's
 /// statistic as column 0 holds it, the same programs run by the interpreter over each tile row.
 /// Padding is a NaN, which no row's statistic may see.
@@ -143,6 +163,34 @@ fn reference_with(
         }
     }
     out
+}
+
+/// What the device computes for one row `x` of whole tiles from its packed layout
+/// ([`math_packed`]): the statistic as column 0 holds it, the packed tiles built as
+/// `tensor::pack_row` lays them (row `kk` the row's columns `32 kk..32 kk + 32`), their unused
+/// rows NaN.
+pub fn reference_packed(x: &[f32], eps: f32) -> f32 {
+    use super::interp::Vector;
+    use tt_isa::dm::face_index;
+    let cols = x.len();
+    let (squares, fin) = math_packed(cols, eps);
+    let mut v = Vector::new();
+    for (n, program) in squares.iter().enumerate() {
+        let mut t = vec![0x7fc0_dead_u32; 1024];
+        for r in 0..32 {
+            let kk = 32 * n + r;
+            for c in 0..32 {
+                if kk * 32 + c < cols {
+                    t[face_index(r, c)] = x[kk * 32 + c].to_bits();
+                }
+            }
+        }
+        v.put_tile(super::kernel::A_ROW as usize, &t);
+        v.run(program)
+            .unwrap_or_else(|e| panic!("packed sum of squares: {e}"));
+    }
+    v.run(&fin).unwrap_or_else(|e| panic!("statistic: {e}"));
+    f32::from_bits(v.tile(OUT_ROW as usize)[face_index(0, 0)])
 }
 
 #[cfg(test)]
@@ -285,5 +333,53 @@ mod tests {
             );
         }
         assert!(fits(32 * MAX_TILES) && !fits(32 * MAX_TILES + 1));
+    }
+
+    /// A row's statistic from its packed layout is the row's, bit for bit, at widths of 18 to
+    /// 256 tiles (one packed tile, several, a ragged last one) over ordinary values, signed
+    /// zeros, every special value, and two NaNs of different payloads in one row. Control: the
+    /// packed rows summed bottom to top differ, on a row whose sum the order changes.
+    #[test]
+    fn a_packed_row_s_statistic_is_the_row_s() {
+        let mut differ = 0;
+        for cols in [576usize, 1024, 1056, 2048, 4096, 8192] {
+            let rows = values(5, cols, cols as u32);
+            let mut cases: Vec<Vec<f32>> = rows.chunks(cols).map(<[f32]>::to_vec).collect();
+            let mut two_nans = cases[0].clone();
+            two_nans[3] = f32::from_bits(0x7fc1_2345);
+            two_nans[cols - 5] = f32::from_bits(0xffa0_0001);
+            cases.push(two_nans);
+            for (i, x) in cases.iter().enumerate() {
+                for eps in [1e-5f32, 1e-6] {
+                    let want = reference(x, 1, cols, eps)[0];
+                    let got = reference_packed(x, eps);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{cols} columns, row {i}, eps {eps}"
+                    );
+                    if i == 0 {
+                        // The first tile's squares `2^24`, the rest `1`: each `1` is lost
+                        // added to `2^24`, and not when the ones come first.
+                        let x: Vec<f32> = (0..cols)
+                            .map(|k| if k < 32 { 4096.0 } else { 1.0 })
+                            .collect();
+                        let want = reference(&x, 1, cols, eps)[0];
+                        assert_eq!(reference_packed(&x, eps).to_bits(), want.to_bits());
+                        let reversed: Vec<f32> =
+                            x.chunks(32).rev().flat_map(|c| c.iter().copied()).collect();
+                        differ += usize::from(
+                            reference_packed(&reversed, eps).to_bits() != want.to_bits(),
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            differ,
+            12,
+            "control: reversed rows matched in {} of 12",
+            12 - differ
+        );
     }
 }

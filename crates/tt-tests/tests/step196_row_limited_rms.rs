@@ -95,3 +95,73 @@ fn row_limited_statistic_is_the_models_bit_for_bit_over_primed_l1() {
         }
     });
 }
+
+/// A decode row's statistic over a long `K` reads the row packed (`Session::set_packed_rms`,
+/// `sfpu::norm::math_packed`): `pack_row` spreads the row's tiles over the units, and the
+/// statistic's one unit reads `K / 1024` tiles. Bit for bit the model and the unpacked path, at
+/// `K` of 1024, 1056 (a packed tile of one row), 2048, 4096 and 8192 (past the unpacked path's one
+/// job, which refuses it by name), with signed zeros,
+/// denormals, `f32::MAX`, infinities and NaNs of two payloads among ordinary values; the packing
+/// is seen to run (a transfer packet) and not to run with the switch off.
+#[test]
+fn a_decode_row_s_statistic_reads_it_packed() {
+    const SPECIAL: [u32; 8] = [
+        0x8000_0000,
+        0x0000_0001,
+        0x807f_ffff,
+        0x7f7f_ffff,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7fc1_2345,
+        0xffa0_0001,
+    ];
+    with_session(|s| {
+        let eps = 1e-5f32;
+        for cols in [1024usize, 1056, 2048, 4096, 8192] {
+            let plain = floats(cols as u64, cols);
+            let mut cases = vec![plain.clone()];
+            for k in 0..SPECIAL.len() {
+                // One special value a case, the last two NaNs of different payloads together.
+                let mut x = plain.clone();
+                x[(k * 977 + 31) % cols] = f32::from_bits(SPECIAL[k]);
+                if k + 1 == SPECIAL.len() {
+                    x[cols / 2] = f32::from_bits(SPECIAL[k - 1]);
+                }
+                cases.push(x);
+            }
+            for (i, x) in cases.iter().enumerate() {
+                let label = format!("[1, {cols}] case {i}");
+                let want = norm::reference(x, 1, cols, eps)[0];
+                assert_eq!(
+                    norm::reference_packed(x, eps).to_bits(),
+                    want.to_bits(),
+                    "{label}"
+                );
+                let a = s.upload(x, 1, cols).unwrap();
+                let mut got = [want.to_bits(); 2];
+                for (n, packed) in [true, false].into_iter().enumerate() {
+                    s.set_packed_rms(packed);
+                    if !packed && !norm::fits(cols) {
+                        // Past one job's tiles the row is refused by name; packed it is not.
+                        let e = s.rms(&a, eps).unwrap_err().to_string();
+                        assert!(e.contains("does not fit"), "{label}: {e}");
+                        continue;
+                    }
+                    let before = s.dataflow_stats().transfer_packets;
+                    let t = s.rms(&a, eps).unwrap();
+                    let packets = s.dataflow_stats().transfer_packets - before;
+                    assert_eq!(
+                        packets > 0,
+                        packed,
+                        "{label}: packed {packed}, {packets} packets"
+                    );
+                    got[n] = s.download(&t).unwrap()[0].to_bits();
+                    s.free(t).unwrap();
+                }
+                s.set_packed_rms(true);
+                assert_eq!(got, [want.to_bits(); 2], "{label}: packed, unpacked, model");
+                s.free(a).unwrap();
+            }
+        }
+    });
+}
