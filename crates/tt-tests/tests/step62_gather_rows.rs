@@ -147,3 +147,91 @@ fn rows_added_by_index_are_the_host_s_sequential_sums() {
         assert!(e.to_string().contains("twice"), "{e}");
     });
 }
+
+#[cfg(not(feature = "silicon"))]
+fn with_units(units: usize, f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
+    if let Err(e) = fork_scope(|| {
+        let mut sim = tt_ttsim::Simulator::open().unwrap();
+        let dev = tt_device::Device::open(sim.transport()).unwrap();
+        let mut s = Session::open(
+            dev,
+            tt_firmware_images::ROLES,
+            TileChoice::Count(units),
+            |_, _| Ok(None),
+        )
+        .unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        f(&mut s);
+    }) {
+        panic!("{e}");
+    }
+}
+
+#[cfg(feature = "silicon")]
+fn with_units(units: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
+    if let Err(e) = fork_scope(|| {
+        let mut s = Session::open_card(
+            tt_tests::backend::device_index(),
+            tt_firmware_images::ROLES,
+            TileChoice::Count(units),
+        )
+        .unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        f(&mut s);
+    }) {
+        panic!("{e}");
+    }
+}
+
+/// On 16 units, a gather of fewer output tiles than units is dealt by rows (a stacked product's
+/// `[heads, n]` output, `tensor::GATHER_DEAL_ROWS` a unit at least): each row one read of its two
+/// face rows and two writes into place. Bit for bit the host's selection, over an output first
+/// filled with NaN where it is allocated (a gather writes only its rows): one row from each of 32
+/// tiles (the stacking), 9 rows and 37 rows (ragged), two sources, repeats, a ragged width, rows
+/// on both faces of their tiles; and a gather of more tiles than units, dealt by tiles as before.
+/// Watched failing with the read landing at the source row's place, not the output row's.
+#[test]
+fn rows_dealt_over_units_are_the_host_s_selection() {
+    with_units(16, |s| {
+        for (vocab, cols, n, stacked) in [
+            (1024usize, 64usize, 32usize, true),
+            (1024, 70, 9, true),
+            (100, 70, 37, false),
+            (64, 2048, 33, false),
+        ] {
+            let w = floats(vocab as u64 + cols as u64, vocab * cols);
+            let z = floats(2, 3 * cols);
+            let dw = s.upload(&w, vocab, cols).unwrap();
+            let dz = s.upload(&z, 3, cols).unwrap();
+            let rows: Vec<(usize, usize)> = (0..n)
+                .map(|i| match (stacked, i % 7) {
+                    (true, _) => (0, i * 32 + i % 32),
+                    (false, 6) => (1, i % 3),
+                    _ => (0, (i * 37 + 11) % vocab),
+                })
+                .collect();
+            // Where the output will be allocated, NaN first: freed, the next allocation of the
+            // same size reuses it.
+            let nan = s.upload(&vec![f32::NAN; n * cols], n, cols).unwrap();
+            s.free(nan).unwrap();
+            let got = s.gather_rows(&[&dw, &dz], &rows, cols).unwrap();
+            let want: Vec<f32> = rows
+                .iter()
+                .flat_map(|&(k, r)| {
+                    let src = if k == 0 { &w } else { &z };
+                    src[r * cols..(r + 1) * cols].to_vec()
+                })
+                .collect();
+            assert_bits(
+                &s.download(&got).unwrap(),
+                &want,
+                &format!("{n} rows of [{vocab}, {cols}] on 16 units"),
+            );
+            for t in [got, dw, dz] {
+                s.free(t).unwrap();
+            }
+        }
+    });
+}

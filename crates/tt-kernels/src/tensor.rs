@@ -4678,6 +4678,10 @@ pub fn repack_many(
 /// [`gather_rows`]'s source for a row it leaves as its slot held it (nothing read).
 pub const GATHER_HOLE: usize = usize::MAX;
 
+/// The fewest rows a unit takes when [`gather_rows`] deals rows, not tiles: each unit in an op
+/// costs it a barrier arrival.
+pub const GATHER_DEAL_ROWS: usize = 4;
+
 /// A new `[rows.len(), cols]` tensor whose row `i` is row `rows[i].1` of
 /// `sources[rows[i].0]`, bit for bit: an embedding's lookup, and the rows a
 /// gradient scatters, gathered on the card.
@@ -4691,7 +4695,9 @@ pub const GATHER_HOLE: usize = usize::MAX;
 /// tiles to a batch ([`Step::Transfer`]). Two read entries a row a tile
 /// column, ~316 cycles each on the mover. Rows past the last in the last tile row are left as the
 /// slot held them: the output's padding is undefined there. So is a row whose source is
-/// [`GATHER_HOLE`]: nothing is read for it.
+/// [`GATHER_HOLE`]: nothing is read for it. With fewer output tiles than `units`, rows are dealt
+/// instead (at least [`GATHER_DEAL_ROWS`] a unit), and only the rows gathered are written: the
+/// others keep what GDDR held, as undefined.
 pub fn gather_rows(
     alloc: &mut DramAlloc,
     sources: &[&DramTensor],
@@ -4735,6 +4741,60 @@ pub fn gather_rows(
     let [ort, oct] = out.grid();
     let face_row =
         |r: usize, h: usize| TILE_DATA + (((r / 16) * 2 + h) * 1024 + (r % 16) * 64) as u64;
+    if ort * oct < units {
+        // Fewer output tiles than units (a stacked product's `[heads, n]`): a tile's 32 rows on
+        // one unit would cost it 64 entries. Dealt by rows instead, each a read of its two face
+        // rows (1,024 bytes apart in any tile, so one 1,088-byte read lands both where the
+        // output row's go) into a slot of its own, and two 64-byte writes into place.
+        let items: Vec<(usize, usize, usize, usize)> = (0..oct)
+            .flat_map(|oj| {
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, &(k, _))| k != GATHER_HOLE)
+                    .map(move |(i, &(k, sr))| (i, oj, k, sr))
+            })
+            .collect();
+        let per = items.len().div_ceil(units).clamp(GATHER_DEAL_ROWS, GROUP);
+        let jobs = items
+            .chunks(per)
+            .map(|chunk| {
+                let (mut read, mut write) = (Vec::new(), Vec::new());
+                for (q, &(i, oj, k, sr)) in chunk.iter().enumerate() {
+                    let (from, slot) = (sources[k].tile(sr / 32, oj), stage + q as u64 * TILE_SLOT);
+                    let r = i % 32;
+                    read.push([
+                        op::READ,
+                        from.channel().index() as u32,
+                        (q % tt_isa::dram::PORTS as usize) as u32,
+                        (from.offset() + face_row(sr % 32, 0)) as u32,
+                        (slot + face_row(r, 0)) as u32,
+                        1024 + 64,
+                        0,
+                        0,
+                    ]);
+                    let to = out.tile(i / 32, oj);
+                    for h in 0..2 {
+                        write.push([
+                            op::WRITE,
+                            to.channel().index() as u32,
+                            0,
+                            (to.offset() + face_row(r, h)) as u32,
+                            (slot + face_row(r, h)) as u32,
+                            64,
+                            0,
+                            0,
+                        ]);
+                    }
+                }
+                vec![Step::Transfer {
+                    what: "row gather list",
+                    depth: 1,
+                    batches: vec![TransferBatch { read, write }],
+                }]
+            })
+            .collect();
+        return Ok(Work { out, jobs });
+    }
     // Output tiles go in batches of `PER_BATCH`: its 64 face-row reads a tile
     // must fit a packet's side, and two batches alternate halves of the
     // staging so NC writes one out while B reads the next.

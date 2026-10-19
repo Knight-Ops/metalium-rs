@@ -5271,7 +5271,15 @@ impl<T: Transport> Session<T> {
         rows: &[(usize, usize)],
         cols: usize,
     ) -> Result<DramTensor, TensorError> {
-        let units = self.spread_for(rows.len().div_ceil(32) * cols.div_ceil(32));
+        // Fewer output tiles than rows to deal: rows dealt, at least `GATHER_DEAL_ROWS` a unit.
+        let tiles = rows.len().div_ceil(32) * cols.div_ceil(32);
+        let dealt = rows
+            .iter()
+            .filter(|&&(k, _)| k != tensor::GATHER_HOLE)
+            .count()
+            * cols.div_ceil(32)
+            / tensor::GATHER_DEAL_ROWS;
+        let units = self.spread_for(tiles.max(dealt));
         let work = tensor::gather_rows(&mut self.dram_state()?.alloc, sources, rows, cols, units)?;
         let out = self.execute_on(work, units, RESET_BUDGET)?;
         let zero = rows.len() % 32 == 0

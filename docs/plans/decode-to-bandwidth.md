@@ -1,7 +1,7 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 25.48 / 26.18 / 27.01 ms (`1792372396`), 135M
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 24.72 / 25.38 / 26.17 ms (`1792377589`), 135M
 20.03 / 20.55 / 21.19 -> 11.37 / 11.76 / 12.29 (`1792372749`).** The four larger changes are built (below), and the
 small ops' phase has begun (Phase 3, "The small ops, 2026-10-19").
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
@@ -271,8 +271,20 @@ Burn model gains.
       could write its row packed too (two face-row writes a tile in its own job), as could `x gamma` for the
       product's packed `A` (97 packing ops a step, ~6-7 us each). Both are a packed twin carried with a one-row
       result.
-  - [ ] **Row-dealt stacking gathers** in attention (~0.8 ms): `gather_rows` deals by output tile, so a `[32, 64]`
-    output's 64 row reads land on 2 units.
+  - [x] **Row-dealt gathers** in attention (estimated ~0.8 ms, measured ~0.7). `gather_rows` dealt by output tile,
+    so a stacked `[32, 64]` output's 64 face-row reads landed on 2 units (22.3 us). With fewer output tiles than
+    units it now deals rows (`tensor::GATHER_DEAL_ROWS`, at least 4 a unit): each row one 1,088-byte read of its
+    two face rows into a slot of its own and two 64-byte writes into place, only the rows gathered written. `P`'s
+    gather (32 rows and their holes over 64 tiles) is dealt the same way.
+    - **Gate:** `step62::rows_dealt_over_units_are_the_host_s_selection` (16 units, the output's place primed with
+      NaN; stacked, ragged, two sources, a ragged width, and a gather of more tiles than units; watched failing with
+      the read landing at the source row's place).
+    - **Regression:** ttsim `step61`, `step180`, `step181`, `step183`, `step184`, `step187`, `step190`, `step192`,
+      `step193`, `step199`; Burn conformance 2,973 passed, 52 as expected; card 0 44 of 44 (`1792376471`, `step166`
+      and `step188` among them).
+    - **Measured:** the three gathers a layer 22.3 / 5.3 / 22.3 -> 8.0 us each on 16 units; the replay 24.58 -> 23.88
+      ms (profile `1792376868`). 1.7B 25.38 / 26.03 / 26.91 -> **24.72 / 25.38 / 26.17 ms** (`1792377589`, 276.9 GB/s
+      of weights at 32 tokens, 54%).
   - [ ] **The prefetch keeps its units at long context** (~0.4 ms at `Step(512)`): in a capture, non-product ops capped
     at `THIN_STREAM_UNITS`.
   - [ ] **Decision (ask the user):** RoPE over `q|k` in one pass (a model-code change), a cheaper barrier (firmware), or

@@ -338,6 +338,23 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## Row gathers dealt by rows (2026-10-19, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3. A decode attention's stacked outputs (`[32, 64]`, 2
+tiles) were gathered a tile a unit: 64 face-row reads on each of 2 units, 22.3 us. With fewer output tiles than units,
+`gather_rows` now deals rows (at least 4 a unit), each one 1,088-byte read and two 64-byte writes.
+
+| 1.7B `Step(64)` | Before (`1792375116`) | After (`1792376868`) |
+|---|--:|--:|
+| `qk`'s and `pv`'s stacking gathers, 2 units -> 16 | 22.3 us each | 8.0 |
+| `P`'s gather, 64 units -> 16 | 5.3 us | 8.0 |
+| the replay | 24.58 ms | **23.88** |
+
+- **Timed** (card 1): 1.7B 25.38 / 26.03 / 26.91 -> **24.72 / 25.38 / 26.17 ms** (`1792377589`, burn-flex 301.1 / 314.2 /
+  333.3; 276.9 GB/s of weights at 32 tokens, 54% of 512).
+- **Gates:** `step62::rows_dealt_over_units_are_the_host_s_selection` (16 units; watched failing); conformance 2,973
+  passed, 52 as expected; card 0 `1792376471` (44 of 44).
+
 ## RMSNorm's statistic from the packed row (2026-10-19, cards 0 and 1)
 
 [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3, "The small ops". A decode row's statistic read its

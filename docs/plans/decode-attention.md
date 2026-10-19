@@ -152,7 +152,9 @@ Every phase is bit for bit with today's attention, and each head's positions kee
   - or the batched product reads thin `A` rows in place, as the decode projections already do (`thin`), and writes
     thin output rows.
 
-  **Worth:** −1.36 ms at `Step(64)`, −1.56 at `Step(512)`. That is re-measured after A2a (profile `1792298755`):
+  **Worth:** −1.36 ms at `Step(64)`, −1.56 at `Step(512)`. **Partly taken (2026-10-19):** the stacking gathers and
+  `P`'s are dealt by rows over 16 units (22.3 / 5.3 / 22.3 -> 8.0 us each, decode-to-bandwidth Phase 3, ~0.7 ms); the
+  regathering itself remains. That is re-measured after A2a (profile `1792298755`):
   the two stacking gathers on 2 units (22 us each a layer), `P`'s gather (5 us) and the context's repack (6-8 us).
 - [ ] **A3. K and V read in place at the read ceiling.**
   - The cache keeps tile-aligned per-head blocks at every attended length.
