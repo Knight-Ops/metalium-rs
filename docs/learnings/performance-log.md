@@ -338,6 +338,29 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## The prefetch keeps its units (2026-10-19, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3. In a capture, once a one-row product has streamed,
+every op but a product runs on at most that product's units, so the units past them stay idle for the next product's
+prefetch. At 512 positions attention had spread to 120 units and taken `o`'s.
+
+| 1.7B, profile | Before | After (`1792379163`) |
+|---|--:|--:|
+| `Step(512)`: the products' time over their floor | 812 us (`1792363365`) | 392 |
+| `Step(512)`: `o` a layer | 52.6 us (`1792363365`) | ~37 |
+| `Step(512)`: `qk`, 120 units -> 64 | 27.2 us (`1792363365`) | 27.5 |
+| `silu_mul`, 120 units -> 64 | 15.5 us (`1792376868`) | 18.3 |
+| the `Step(64)` replay | 23.88 ms (`1792376868`) | **23.62** |
+
+- **Timed** (card 1): 1.7B 24.72 / 25.38 / 26.17 -> **24.41 / 25.01 / 25.93 ms** (`1792378639`, burn-flex 296.1 / 312.7 /
+  328.3; 280.5 GB/s of weights at 32 tokens, 55% of 512). 135M 11.40 / 11.80 / 12.26 (`1792378993`, burn-flex 27.0 /
+  29.2 / 31.7), unchanged: none of its products prefetch.
+- **Where the small-ops phase leaves the step** (four changes, this day): `Step(64)` 25.61 -> 23.62 ms; products 15.60
+  ms at 462 GB/s (at the read ceiling); everything else 10.01 -> 8.02 ms; every byte 297 -> 322 GB/s (58 -> 63% of
+  512); the timed step's weights 258.6 -> 280.5 GB/s (50 -> 55%).
+- **Gates:** `step205::ops_after_a_streaming_product_keep_off_the_prefetch_s_units` (watched failing with the cap off);
+  card 0 `1792378401` (28 of 28); `--smoke` on card 0 after the four changes, 1,134 of 1,134 (`1792378998`).
+
 ## Row gathers dealt by rows (2026-10-19, cards 0 and 1)
 
 [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3. A decode attention's stacked outputs (`[32, 64]`, 2

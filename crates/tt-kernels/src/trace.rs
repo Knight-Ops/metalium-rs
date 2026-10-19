@@ -298,6 +298,8 @@ pub(crate) struct Capture {
     /// nothing after it, so a list appended to it runs as soon as the product is done
     /// (`Session::matmul_dram`'s weight prefetch).
     pub(crate) weight_anchor: Option<(u32, Vec<usize>)>,
+    /// The units that product ran on: the rest are where the next one's weights stream.
+    pub(crate) weight_units: usize,
 }
 
 /// One unit's share of a finished trace.

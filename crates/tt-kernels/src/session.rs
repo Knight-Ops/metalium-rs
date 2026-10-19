@@ -469,6 +469,8 @@ pub struct Session<T: Transport> {
     packed_thin_a: bool,
     /// [`Session::set_packed_rms`].
     packed_rms: bool,
+    /// [`Session::set_prefetch_keeps_units`].
+    prefetch_keeps_units: bool,
     /// [`Session::set_streamed_k`].
     streamed_k: bool,
     /// [`Session::set_weight_prefetch`].
@@ -1919,6 +1921,7 @@ impl<T: Transport> Session<T> {
             thin_matmul_reads: true,
             packed_thin_a: true,
             packed_rms: true,
+            prefetch_keeps_units: true,
             streamed_k: true,
             weight_prefetch: true,
             prefetch_anchor: None,
@@ -2736,7 +2739,7 @@ impl<T: Transport> Session<T> {
             a.cols.div_ceil(32),
             b.cols.div_ceil(32),
         );
-        let units = self.spread_for(mt * nt * kt);
+        let units = self.spread_for_product(mt * nt * kt);
         let k_limit = self.matmul_k_block_limit.map(std::num::NonZeroUsize::get);
         let work = crate::bf16::matmul(
             &mut self.dram_state()?.alloc,
@@ -4145,6 +4148,7 @@ impl<T: Transport> Session<T> {
             ops: Vec::new(),
             failed: false,
             weight_anchor: None,
+            weight_units: 0,
         });
         Ok(())
     }
@@ -5652,7 +5656,7 @@ impl<T: Transport> Session<T> {
         let [br, bc] = b.grid();
         let (mt, kt) = if a_transposed { (ac, ar) } else { (ar, ac) };
         let nt = if b_transposed { br } else { bc };
-        let units = self.spread_for(mt * nt * kt);
+        let units = self.spread_for_product(mt * nt * kt);
         // A one-tile-row product over a long `K` streams its weights: GDDR is saturated by
         // `THIN_STREAM_UNITS` units, and more only share it while each pays its own `A` reads and
         // the deal's last round (`silicon_probe_decode_stream`).
@@ -5757,6 +5761,7 @@ impl<T: Transport> Session<T> {
             if let Some(c) = self.capture.as_mut() {
                 let rel = rel.wrapping_sub(c.barriers_base);
                 c.weight_anchor = Some((rel, c.units.iter().map(|u| u.stream.len()).collect()));
+                c.weight_units = units;
             }
         }
         for c in [ca, cb, packed].into_iter().flatten() {
@@ -6263,6 +6268,14 @@ impl<T: Transport> Session<T> {
         self.packed_rms = on;
     }
 
+    /// Whether, in a capture whose one-row products prefetch their weights, the ops after one
+    /// such product run on at most the units it ran on (on by default), leaving the rest idle
+    /// for the next one's prefetch ([`Session::set_weight_prefetch`]). Placement only: the bits
+    /// are the same either way.
+    pub fn set_prefetch_keeps_units(&mut self, on: bool) {
+        self.prefetch_keeps_units = on;
+    }
+
     /// Whether a one-row product with a packed `A` streams each output column's `K` in chunks,
     /// the mover reading one while the kernel computes the one before (on by default; see
     /// `tensor::BlockPlan::push_stream_jobs`). Off, a column's whole `K` is read before its
@@ -6338,8 +6351,29 @@ impl<T: Transport> Session<T> {
         self.spread
     }
 
-    /// The units an op with `work` runs on, by [`Session::set_spread`].
+    /// The units an op with `work` runs on, by [`Session::set_spread`]. In a capture whose
+    /// one-row products prefetch their weights ([`Session::set_weight_prefetch`]), once one has,
+    /// at most the units it ran on ([`Session::set_prefetch_keeps_units`]): the units past them are
+    /// where the next one's weights stream while the ops between run, and an op on them takes
+    /// them from it (a decode step's attention at long context did,
+    /// `docs/plans/decode-to-bandwidth.md` Phase 3). Products take
+    /// [`Session::spread_for_product`].
     fn spread_for(&self, work: usize) -> usize {
+        let units = self.spread_for_product(work);
+        match &self.capture {
+            Some(c)
+                if self.weight_prefetch
+                    && self.prefetch_keeps_units
+                    && c.weight_anchor.is_some() =>
+            {
+                units.min(c.weight_units.max(1))
+            }
+            _ => units,
+        }
+    }
+
+    /// [`Session::spread_for`] for a product, which chooses its own units.
+    fn spread_for_product(&self, work: usize) -> usize {
         self.spread.units_for(work, self.units.len())
     }
 

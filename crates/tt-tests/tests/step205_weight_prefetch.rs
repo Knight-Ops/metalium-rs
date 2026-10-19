@@ -17,6 +17,12 @@
 //!   product's own wait after it. Taking only idle units is a policy: a busy unit's reads would
 //!   start no earlier than its last op ends, and its columns could finish after the others'.)
 //!
+//! - **The prefetch keeps its units** (`Session::set_prefetch_keeps_units`, on by default): once a
+//!   product has streamed, ops that would spread over all eight units in the capture run on the
+//!   four it ran on, so units 4-7 stay idle and the next products prefetch there; the bits are the
+//!   same. Claim three turns it off. (A decode step's attention at long context took the units
+//!   `o`'s weights stream on.)
+//!
 //! Watched failing: the prefetched columns not left out of the other units' deal (the rest
 //! dealt from column 0), which leaves the last columns uncomputed.
 
@@ -227,8 +233,11 @@ fn a_unit_that_ran_an_op_since_the_last_product_does_not_prefetch() {
         let warm = chain.forward(s, &x, Spread::Fixed(4));
         let want = s.download(&warm).unwrap();
         s.free(warm).unwrap();
+        // The ops may take every unit (claim four keeps them off the prefetch's).
+        s.set_prefetch_keeps_units(false);
         s.begin_trace().unwrap();
         let y = chain.forward(s, &x, Spread::All);
+        s.set_prefetch_keeps_units(true);
         let id = s.end_trace().unwrap();
         assert_bits("the capture's own run", &s.download(&y).unwrap(), &want);
         s.replay(id).unwrap();
@@ -238,6 +247,45 @@ fn a_unit_that_ran_an_op_since_the_last_product_does_not_prefetch() {
             on_idle_units(s, id),
             [false, false, false],
             "units 4-7 ran the ops between the products"
+        );
+        s.release_trace(id).unwrap();
+        for t in chain.w.into_iter().chain([x, y]) {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// Claim four: with the prefetch keeping its units, element-wise ops asked to spread over all
+/// eight units in the capture run on the product's four, and the next products prefetch on 4-7.
+/// Watched failing with the cap left out of `Session::spread_for`.
+#[test]
+fn ops_after_a_streaming_product_keep_off_the_prefetch_s_units() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        let chain = Chain::upload(s);
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let warm = chain.forward(s, &x, Spread::Fixed(4));
+        let want = s.download(&warm).unwrap();
+        s.free(warm).unwrap();
+        s.begin_trace().unwrap();
+        let y = chain.forward(s, &x, Spread::All);
+        let id = s.end_trace().unwrap();
+        assert_bits("the capture's own run", &s.download(&y).unwrap(), &want);
+        s.replay(id).unwrap();
+        s.sync().unwrap();
+        assert_bits("the replay", &s.download(&y).unwrap(), &want);
+        let ops = s.trace_ops(id).unwrap();
+        for op in ops.iter().filter(|op| op.what.contains("sfpu")) {
+            assert!(
+                op.entries[4..8].iter().all(|r| r.is_empty()),
+                "{}: on units 4-7",
+                op.what
+            );
+        }
+        assert_eq!(
+            on_idle_units(s, id),
+            [false, true, true],
+            "the second and third products prefetch on units 4-7"
         );
         s.release_trace(id).unwrap();
         for t in chain.w.into_iter().chain([x, y]) {

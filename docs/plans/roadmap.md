@@ -380,13 +380,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
       - **Result:** a 1.7B step **33.02 / 33.52 / 34.42 -> 26.47 / 27.14 / 27.97 ms** (`1792364210`), 135M 14.04 /
         14.45 / 15.02 -> **12.62 / 13.06 / 13.59** (`1792364661`).
       - **Bandwidth (2026-10-19):** the products run at the read ceiling (462 GB/s over their spans); the step's
-        weights stream at 52% of 512 GB/s because ~9-10 ms of small ops sit between the products
+        weights stream at 55% of 512 GB/s (280.5 GB/s, `1792378639`) because ~8 ms of small ops sit between the products
         ([log](../learnings/performance-log.md#where-decodes-bandwidth-stands-and-a-column-broadcast-in-the-sfpu-2026-10-19-cards-0-and-1)).
       - **The small ops, under way** (decode-to-bandwidth Phase 3, "The small ops, 2026-10-19"): a column operand
-        broadcast by the SFPU, RMSNorm's statistic from the packed row, row gathers dealt by rows: 1.7B **24.72 / 25.38
-        / 26.17 ms** (`1792377589`), 135M **11.37 / 11.76 / 12.29** (`1792372749`). Next there: the prefetch's units at
-        long context, a packed twin written by the op that makes a one-row result; then prefetch for
-        the K-blocked `down`.
+        broadcast by the SFPU, RMSNorm's statistic from the packed row, row gathers dealt by rows, the prefetch keeping
+        its units: 1.7B **24.41 / 25.01 / 25.93 ms** (`1792378639`), 135M **11.40 / 11.80 / 12.26** (`1792378993`).
+        Next there: a decision (RoPE over `q|k` in one pass, a cheaper barrier, `x / stat * gamma` as one op), a
+        packed twin written by the op that makes a one-row result; then prefetch for the K-blocked `down`.
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.

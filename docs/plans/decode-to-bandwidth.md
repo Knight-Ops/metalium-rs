@@ -1,8 +1,8 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 24.72 / 25.38 / 26.17 ms (`1792377589`), 135M
-20.03 / 20.55 / 21.19 -> 11.37 / 11.76 / 12.29 (`1792372749`).** The four larger changes are built (below), and the
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 24.41 / 25.01 / 25.93 ms (`1792378639`), 135M
+20.03 / 20.55 / 21.19 -> 11.40 / 11.80 / 12.26 (`1792378993`).** The four larger changes are built (below), and the
 small ops' phase has begun (Phase 3, "The small ops, 2026-10-19").
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
 - **Phase 1:** done. The copies are gone. The repack's reads run in flight together, and the row scatter and the
@@ -17,15 +17,16 @@ small ops' phase has begun (Phase 3, "The small ops, 2026-10-19").
   streamed).
 - **Phase 5:** the weight stream under the small ops, on idle units.
 - **Bandwidth now** (2026-10-19, [log](../learnings/performance-log.md#where-decodes-bandwidth-stands-and-a-column-broadcast-in-the-sfpu-2026-10-19-cards-0-and-1)):
-  the weights stream at **268.6 GB/s over a timed step, 52% of 512** (`1792372396`; 258.6 before the column
-  broadcast); every byte of a `Step(64)` replay at 308 GB/s, 60% (profile `1792372923`).
-- **Where the step goes now** (profile `1792372923`, 1.7B `Step(64)`, 24.71 ms; products partly overlap the small
+  the weights stream at **280.5 GB/s over a timed step, 55% of 512** (`1792378639`; 258.6 before the small ops'
+  phase); every byte of a `Step(64)` replay at 322 GB/s, 63% (profile `1792379163`).
+- **Where the step goes now** (profile `1792379163`, 1.7B `Step(64)`, 23.62 ms; products partly overlap the small
   ops now):
-  - the products (and their packing ops) 15.61 ms, 462 GB/s over their own time: at the read ceiling. Their `B`
+  - the products (and their packing ops) 15.60 ms, 462 GB/s over their own time: at the read ceiling. Their `B`
     alone would take 14.88 at 469 GB/s; only `down` (172 us a layer against ~143, not prefetched) is clearly over;
-  - everything else 9.10 ms in four windows between a layer's products, ~3.5 ms of it on 1-2 units: RMSNorm's
-    one-unit statistic, the stacking gathers, the 2-unit softmax ops.
-- **Next:** the rest of Phase 3's small-ops sequence (below); then prefetch for the K-blocked `down`.
+  - everything else 8.02 ms in four windows between a layer's products, ~1.9 ms of it on 1-2 units: the softmax's
+    SFPU ops and reductions, attention's scale.
+- **Next:** Phase 3's decision (RoPE over `q|k` in one pass, a cheaper barrier, `x / stat * gamma` as one op) and a
+  packed twin written by the op that makes a one-row result; then prefetch for the K-blocked `down`.
 
 This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
@@ -285,8 +286,24 @@ Burn model gains.
     - **Measured:** the three gathers a layer 22.3 / 5.3 / 22.3 -> 8.0 us each on 16 units; the replay 24.58 -> 23.88
       ms (profile `1792376868`). 1.7B 25.38 / 26.03 / 26.91 -> **24.72 / 25.38 / 26.17 ms** (`1792377589`, 276.9 GB/s
       of weights at 32 tokens, 54%).
-  - [ ] **The prefetch keeps its units at long context** (~0.4 ms at `Step(512)`): in a capture, non-product ops capped
-    at `THIN_STREAM_UNITS`.
+  - [x] **The prefetch keeps its units** (estimated ~0.4 ms at `Step(512)`; measured 0.3 at every length). At 512
+    positions attention's `qk` and a `pv` gather spread to 120 units and took `o`'s prefetch units (`o` 35.6 -> 52.6 us
+    a layer). In a capture, once a one-row product has streamed, every op but a product runs on at most the units
+    that product ran on (`Session::spread_for`, the capture's `weight_units`; `Session::set_prefetch_keeps_units`, on).
+    Placement only.
+    - **Gate:** `step205::ops_after_a_streaming_product_keep_off_the_prefetch_s_units` (ttsim, 8 units: ops asked to
+      spread over all eight stay on the product's four, and the next products prefetch on 4-7, bit for bit; watched
+      failing with the cap off). Claim three now turns the cap off to show busy units are not taken.
+    - **Regression:** ttsim `step176`, `step186`, `step187`, `step193`, `step197`, `step199`, `step204`; card 0 28 of
+      28 (`1792378401`, `step188` among them); `--smoke` on card 0 after the four, 1,134 of 1,134 (`1792378998`).
+    - **Measured** (profile `1792379163`): at `Step(512)` `o` ~37 us a layer again and `qk` on 64 units as fast as on
+      120 (27.5 us); the products' time over their floor 812 -> 392 us; `silu_mul` on 64 units, 15.5 -> 18.3 us. The
+      `Step(64)` replay 23.88 -> 23.62 ms. 1.7B 24.72 / 25.38 / 26.17 -> **24.41 / 25.01 / 25.93 ms** (`1792378639`,
+      280.5 GB/s of weights at 32 tokens, 55%); 135M unchanged, 11.40 / 11.80 / 12.26 (`1792378993`, burn-flex 27.0 /
+      29.2 / 31.7: none of its products prefetch).
+  - **Where the four leave the step** (profile `1792379163`, `Step(64)`, 23.62 ms): products 15.60 ms at 462 GB/s;
+    everything else 8.02 ms (10.01 at the start); every byte at 322 GB/s, 63% of 512. 1.7B 26.47 / 27.14 / 27.97 ->
+    24.41 / 25.01 / 25.93 ms (-8%).
   - [ ] **Decision (ask the user):** RoPE over `q|k` in one pass (a model-code change), a cheaper barrier (firmware), or
     `x / stat * gamma` as one op (burn-fusion's `Reshape` block).
 - [ ] **The other chain fusers** (`burn-tt` `fusion/chain.rs`):
