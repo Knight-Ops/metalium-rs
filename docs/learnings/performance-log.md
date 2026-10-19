@@ -338,6 +338,27 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## Packed twins, a released barrier, and weights stored transposed (2026-10-19, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3.
+
+- **Packed twins** (`Session::set_packed_twins`): a one-row element-wise result over a long `K` also writes its
+  row packed, in its own scatter, so products and RMSNorm's statistic run no packing op. 121 fewer ops a step; each
+  element-wise op ~1 us more; RMSNorm's `DIV` 18.0 -> 25.6 us (its units now wait there on the one-unit statistic).
+  1.7B 24.41 / 25.01 / 25.93 -> **23.95 / 24.55 / 25.52 ms** (`1792382455`, burn-flex 311.4 / 317.7 / 335.9).
+- **A barrier released by unit 0** (tt-metal's pattern: each unit spins on its own L1, unit 0 multicasts the
+  release). Same build, card 1: release **24.04 / 24.48 / 25.39 ms** (`1792383988`) against polling 24.09 / 24.65 /
+  25.64 (`1792384336`, `TT_BARRIER_RELEASE=0`). The barrier's ~3.8 ms a step (profile, unit 0) is mostly waiting for
+  the slowest unit, not the mechanism.
+- **Profile `1792382914`** (twins and release): `Step(64)` 23.22 ms (23.62, `1792379163`), 835 ops (956); products
+  15.58 ms at 463 GB/s; everything else 7.64 ms.
+- **Weights stored transposed** (`[n, k]`, through the unpacker's transpose, so a column of `B` is consecutive tiles;
+  `silicon_probe_decode_stream::decode_products_with_their_weights_stored_transposed`, card 1, isolated products on
+  the decode deal): qkv 147.9 -> 157.0 us, o 67.3 -> 68.8, gate|up 341.9 -> 357.1, down 174.9 -> 179.9, head 993.0 ->
+  1,021.7. Slower everywhere; not built. Isolated, the products read at 346-412 GB/s: the ~462 in the step is the
+  prefetch reading part of their weights earlier.
+- **Gates:** `step207_packed_twin`, `step208_barrier_release` (ttsim, card 0 `1792382182`, `1792383833`).
+
 ## The prefetch keeps its units (2026-10-19, cards 0 and 1)
 
 [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 3. In a capture, once a one-row product has streamed,

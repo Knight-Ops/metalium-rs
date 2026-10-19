@@ -138,6 +138,25 @@ pub const BARRIER_RET: u64 = MAILBOX_BASE + 0x80;
 /// profile mode's window counts it as that many arrivals.
 pub const BARRIER_STANDS_FOR: usize = 5;
 const _: () = assert!(BARRIER_COUNTER % 16 == BARRIER_POLL % 16);
+/// The word of an `op::BARRIER` that asks for the coordinator's release (1) rather than polling
+/// its counter (0).
+pub const BARRIER_RELEASE_MODE: usize = 6;
+/// The last barrier target the coordinator released to this tile (`op::BARRIER` word 6): written
+/// by the coordinator's NoC multicast, read by this tile's B in its own L1. Zeroed by the host
+/// with the counter.
+pub const BARRIER_RELEASE: u64 = MAILBOX_BASE + 0x100;
+/// The coordinator's copy of the target it multicasts, the same offset modulo 16 as
+/// [`BARRIER_RELEASE`], as a NoC write between L1s requires.
+pub const BARRIER_RELEASE_STAGE: u64 = MAILBOX_BASE + 0x110;
+const _: () = assert!(BARRIER_RELEASE % 16 == BARRIER_RELEASE_STAGE % 16);
+/// Host -> the coordinator: the rectangles its release reaches, `[count, (hi, acks) x count]`,
+/// `hi` a rectangle's `NOC_RET_ADDR_HI` on NoC #0 (`noc::multicast::Rect::hi`) and `acks` its
+/// tile count. Every tile of every rectangle is a surviving Tensix tile (`Rect::new`), and none
+/// is the coordinator's.
+pub const BARRIER_RECTS: u64 = MAILBOX_BASE + 0x120;
+/// Most rectangles at [`BARRIER_RECTS`]: `noc::multicast::full_grid_except`'s.
+pub const BARRIER_RECTS_MAX: u32 = 8;
+const _: () = assert!(BARRIER_RECTS + 4 + BARRIER_RECTS_MAX as u64 * 8 <= encoded::ENDPOINTS);
 
 /// The mover's list queue (`hardware-coverage.md` X4a): the host writes a
 /// list into the ring of entries at [`LIST`] (never across its end), a slot
@@ -342,6 +361,13 @@ pub mod op {
     /// trace, the captured ops' barriers the unit sat out -- which the profile mode's window
     /// (`TRACE_WINDOW`) counts as an arrival counts one, so every unit's count is the op's index.
     /// Zero for an arrival, at most `0xffff`.
+    ///
+    /// Word 6 ([`super::BARRIER_RELEASE_MODE`]), 0 or 1: 1 waits for the coordinator's release,
+    /// not by polling its counter. The coordinator (the mover whose tile is `(x, y)`) waits on
+    /// its own counter, then writes `target` into [`super::BARRIER_RELEASE`] of every tile of the
+    /// rectangles at [`super::BARRIER_RECTS`] by NoC multicast; every other mover waits on its own
+    /// [`super::BARRIER_RELEASE`], in its own L1, with no NoC traffic. The host sets it only where
+    /// the coordinator reaches the target too (it arrives at that barrier, or at a later one).
     pub const BARRIER: u32 = 9;
     /// Run a list held in GDDR -- a trace (`tt_kernels::trace`):
     /// `[CALL, channel, offset, count, generation_base, barrier_base, 0, 0]`.
@@ -685,12 +711,13 @@ pub enum Entry {
     },
     /// [`op::WAIT`].
     Wait,
-    /// [`op::BARRIER`]: `arrive` false is its wait-only form.
+    /// [`op::BARRIER`]: `arrive` false is its wait-only form; `release`, word 6.
     Barrier {
         target: u32,
         x: u8,
         y: u8,
         arrive: bool,
+        release: bool,
     },
     /// [`op::CALL`]: run `count` entries from GDDR.
     Call {
@@ -940,7 +967,8 @@ impl Entry {
                 || w[4] > 1
                 || (w[4] == 0 && w[5] != 0)
                 || w[5] > 0xffff
-                || w[6..].iter().any(|&v| v != 0)
+                || w[6] > 1
+                || w[7] != 0
             {
                 return Err(error::OP);
             }
@@ -949,6 +977,7 @@ impl Entry {
                 x: w[2] as u8,
                 y: w[3] as u8,
                 arrive: w[4] == 0,
+                release: w[6] == 1,
             });
         }
         if w[0] == op::CALL {
@@ -1165,7 +1194,8 @@ mod tests {
                 target: 7,
                 x: 1,
                 y: 2,
-                arrive: true
+                arrive: true,
+                release: false,
             })
         );
         assert_eq!(
@@ -1174,7 +1204,8 @@ mod tests {
                 target: 7,
                 x: 1,
                 y: 2,
-                arrive: false
+                arrive: false,
+                release: false,
             })
         );
         assert_eq!(decode(2, 0), Err(error::OP));
@@ -1182,6 +1213,20 @@ mod tests {
         assert!(decode(1, 3).is_ok());
         assert_eq!(decode(1, 0x1_0000), Err(error::OP));
         assert_eq!(decode(0, 1), Err(error::OP));
+        // Word 6: 1 waits for the coordinator's release; nothing else, and word 7 zero.
+        let word = |w6: u32, w7: u32| Entry::decode(0xFF, [op::BARRIER, 7, 1, 2, 0, 0, w6, w7]);
+        assert_eq!(
+            word(1, 0),
+            Ok(Entry::Barrier {
+                target: 7,
+                x: 1,
+                y: 2,
+                arrive: true,
+                release: true,
+            })
+        );
+        assert_eq!(word(2, 0), Err(error::OP));
+        assert_eq!(word(0, 1), Err(error::OP));
     }
 
     #[test]

@@ -1150,6 +1150,20 @@ Small moves are bound by the movers' entries, not by GDDR. What a decode step's 
   `1792298755`). Neither the reads' latency nor their bytes bounds it: it is ~96 entries a unit (32 reads, 64
   `COPY_WORDS`), ~0.3 us an entry.
 
+## A barrier released by multicast from a mover (2026-10-19, cards 0 and 1)
+
+The B mover now issues NoC multicast writes in normal operation (it was only the probe image before): unit 0's B, after
+its barrier counter reaches a target, writes it to every other unit's `dm::BARRIER_RELEASE` with one response-marked,
+path-reserved multicast per rectangle on static VC 4 (`noc::multicast::registers_to`), rectangles of session tiles only.
+On card 0 (`step208`, 8 units) and on card 1 in every decode bench since (120 units, ~1,000 barriers a step, 835 ops), no
+hang. What was learned:
+- **Completion:** counted on `NIU_MST_WR_ACK_RECEIVED`, never on the transaction ID's outstanding counter (a broadcast
+  adds one and takes one per recipient), which is never cleared: ttsim refuses that write, and nothing waits on the ID.
+- **L1 keeps the release words across sessions:** they are zeroed with the counter when unit 0's mover starts, before
+  any barrier is queued.
+- **The release changes little:** 0.05-0.25 ms of a 24-25 ms step against every unit polling unit 0 over NoC0. The
+  barrier's time is the slowest unit's arrival.
+
 ## A column broadcast costs the mover ~10 us a tile (2026-10-19, card 1, profiles `1792363365`, `1792372923`)
 
 `READ_BROADCAST_COL` reads a `[rows, 1]` operand's tile into the scratch slot and then copies column 0 into every

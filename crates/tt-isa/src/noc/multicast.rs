@@ -205,37 +205,59 @@ impl MulticastWrite {
         txn: TxnId,
         niu: Niu,
     ) -> Result<[(u64, u32); 11], MulticastError> {
-        check_copy(self.from_local, self.to_addr, self.len).map_err(MulticastError::Request)?;
         if self.rect.contains(me.0, me.1) {
             return Err(MulticastError::ContainsInitiator);
         }
-        let local = Endpoint {
-            x: me.0,
-            y: me.1,
-            addr: self.from_local,
-        };
-        Ok([
-            (TARG_ADDR_LO, self.from_local),
-            (TARG_ADDR_MID, 0),
-            (TARG_ADDR_HI, local.hi()),
-            (RET_ADDR_LO, self.to_addr),
-            (RET_ADDR_MID, 0),
-            (RET_ADDR_HI, self.rect.hi(niu)),
-            (PACKET_TAG, (txn.index() as u32) << 10),
-            (
-                CTRL,
-                CMD_WR | RESP_MARKED | BRCST_PACKET | PATH_RESERVE | STATIC_VC_MULTICAST,
-            ),
-            (AT_LEN_BE, self.len),
-            (AT_DATA, 0),
-            (BRCST_EXCLUDE, 0),
-        ])
+        registers_to(
+            self.from_local,
+            self.to_addr,
+            self.len,
+            self.rect.hi(niu),
+            me,
+            txn,
+        )
+        .map_err(MulticastError::Request)
     }
 
     /// The acknowledgements to count: one per recipient.
     pub const fn acks(&self) -> u32 {
         self.rect.tile_count()
     }
+}
+
+/// [`MulticastWrite::registers`] for a rectangle given as its `NOC_RET_ADDR_HI` on NoC #0, `hi`
+/// ([`Rect::hi`]): what a mover reads from a table the host built of [`Rect`]s it validated
+/// (`dm::BARRIER_RECTS`), so firmware holds no grid. The host also left the initiator out.
+pub fn registers_to(
+    from_local: u32,
+    to_addr: u32,
+    len: u32,
+    hi: u32,
+    me: (u8, u8),
+    txn: TxnId,
+) -> Result<[(u64, u32); 11], RequestError> {
+    check_copy(from_local, to_addr, len)?;
+    let local = Endpoint {
+        x: me.0,
+        y: me.1,
+        addr: from_local,
+    };
+    Ok([
+        (TARG_ADDR_LO, from_local),
+        (TARG_ADDR_MID, 0),
+        (TARG_ADDR_HI, local.hi()),
+        (RET_ADDR_LO, to_addr),
+        (RET_ADDR_MID, 0),
+        (RET_ADDR_HI, hi),
+        (PACKET_TAG, (txn.index() as u32) << 10),
+        (
+            CTRL,
+            CMD_WR | RESP_MARKED | BRCST_PACKET | PATH_RESERVE | STATIC_VC_MULTICAST,
+        ),
+        (AT_LEN_BE, len),
+        (AT_DATA, 0),
+        (BRCST_EXCLUDE, 0),
+    ])
 }
 
 /// Where a multicast is, by the initiator's acknowledgement counter.

@@ -272,6 +272,10 @@ pub const SMOKE: &[&str] = &[
     "step205_weight_prefetch::",
     // A column operand broadcast by the SFPU, read as it lies (decode-to-bandwidth.md Phase 3).
     "step206_sfpu_col_broadcast::",
+    // A one-row result written packed by the op that makes it (decode-to-bandwidth.md Phase 3).
+    "step207_packed_twin::",
+    // Barriers released by unit 0's multicast, each unit waiting on its own L1 (decode-to-bandwidth.md Phase 3).
+    "step208_barrier_release::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

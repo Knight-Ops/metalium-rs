@@ -209,3 +209,62 @@ fn decode_products_against_their_weight_stream() {
     })
     .unwrap_or_else(|e| panic!("{e}"));
 }
+
+/// Each decode product with its weights stored transposed (`[n, k]`, read through the unpacker's
+/// transpose, `Session::set_unpack_transposed_b`): a unit's column of `B` is then a row of the
+/// stored tensor, consecutive tiles, where today it is `K` tiles a grid row apart. On the decode
+/// path's own deal (`THIN_STREAM_UNITS`), against today's layout; each replayed product equals
+/// the eager plain-layout product bit for bit.
+#[test]
+#[ignore = "benchmark"]
+fn decode_products_with_their_weights_stored_transposed() {
+    let card = device_index();
+    fork_scope(|| {
+        let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::All)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        println!(
+            "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"tiles\":{},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"reps\":{REPS}}}",
+            tt_tests::bench::git_sha(),
+            !cfg!(debug_assertions),
+            s.tiles().len()
+        );
+        let product = |s: &mut Card, x: &DramTensor, w: &DramTensor, t: bool| {
+            s.matmul_dram(x, false, w, t, SrcRoute::Tf32FromFp32, Fidelity::HiFi4, BUDGET)
+                .unwrap()
+        };
+        for (name, k, n) in [
+            ("qkv", 2048usize, 6144usize),
+            ("o", 2048, 2048),
+            ("gate|up", 2048, 16384),
+            ("down", 8192, 2048),
+            ("head", 2048, 49152),
+        ] {
+            let values = floats(2, k * n);
+            let transposed: Vec<f32> = (0..n * k).map(|i| values[(i % k) * n + i / k]).collect();
+            let x = s.upload(&floats(1, k), 1, k).unwrap();
+            let w = s.upload(&values, k, n).unwrap();
+            let wt = s.upload(&transposed, n, k).unwrap();
+            let bytes = (k / 32 * n / 32) as f64 * TILE_SLOT as f64;
+            let reference = product(&mut s, &x, &w, false);
+            let want = s.download(&reference).unwrap();
+            s.free(reference).unwrap();
+            for (layout, b, t) in [("[k, n]", &w, false), ("[n, k] transposed", &wt, true)] {
+                let mut last = None;
+                let us = op_us(&mut s, |s| last = Some(product(s, &x, b, t)));
+                let got = s.download(last.as_ref().unwrap()).unwrap();
+                assert_eq!(bits(&got), bits(&want), "{name} {layout}: a replay");
+                println!(
+                    "MEASURE decode-stream {name} [{k}, {n}] product, weights {layout}: {us:.1} us, \
+                     B {:.0} GB/s",
+                    bytes / us / 1e3
+                );
+            }
+            for t in [w, wt, x] {
+                s.free(t).unwrap();
+            }
+        }
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+}

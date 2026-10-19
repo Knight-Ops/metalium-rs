@@ -1,7 +1,7 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 24.41 / 25.01 / 25.93 ms (`1792378639`), 135M
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 24.04 / 24.48 / 25.39 ms (`1792383988`), 135M
 20.03 / 20.55 / 21.19 -> 11.40 / 11.80 / 12.26 (`1792378993`).** The four larger changes are built (below), and the
 small ops' phase has begun (Phase 3, "The small ops, 2026-10-19").
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
@@ -17,16 +17,16 @@ small ops' phase has begun (Phase 3, "The small ops, 2026-10-19").
   streamed).
 - **Phase 5:** the weight stream under the small ops, on idle units.
 - **Bandwidth now** (2026-10-19, [log](../learnings/performance-log.md#where-decodes-bandwidth-stands-and-a-column-broadcast-in-the-sfpu-2026-10-19-cards-0-and-1)):
-  the weights stream at **280.5 GB/s over a timed step, 55% of 512** (`1792378639`; 258.6 before the small ops'
-  phase); every byte of a `Step(64)` replay at 322 GB/s, 63% (profile `1792379163`).
-- **Where the step goes now** (profile `1792379163`, 1.7B `Step(64)`, 23.62 ms; products partly overlap the small
+  the weights stream at **284.8 GB/s over a timed step, 56% of 512** (`1792383988`; 258.6 before the small ops'
+  phase); every byte of a `Step(64)` replay at 327 GB/s, 64% (profile `1792382914`).
+- **Where the step goes now** (profile `1792382914`, 1.7B `Step(64)`, 23.22 ms; products partly overlap the small
   ops now):
-  - the products (and their packing ops) 15.60 ms, 462 GB/s over their own time: at the read ceiling. Their `B`
-    alone would take 14.88 at 469 GB/s; only `down` (172 us a layer against ~143, not prefetched) is clearly over;
-  - everything else 8.02 ms in four windows between a layer's products, ~1.9 ms of it on 1-2 units: the softmax's
-    SFPU ops and reductions, attention's scale.
-- **Next:** Phase 3's decision (RoPE over `q|k` in one pass, a cheaper barrier, `x / stat * gamma` as one op) and a
-  packed twin written by the op that makes a one-row result; then prefetch for the K-blocked `down`.
+  - the products 15.58 ms, 463 GB/s over their own time: at the read ceiling. Their `B` alone would take 14.88 at
+    469 GB/s; only `down` (172 us a layer against ~143, not prefetched) is clearly over;
+  - everything else 7.64 ms in 690 ops, in four windows between a layer's products, ~1.9 ms of it on 1-2 units: the
+    softmax's SFPU ops and reductions, attention's scale, RMSNorm's statistic.
+- **Next:** a deeper weight prefetch (more than one job a unit, more than one product ahead) and prefetch for the
+  K-blocked `down`, which put more of the weight stream under the small ops.
 
 This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
@@ -304,8 +304,64 @@ Burn model gains.
   - **Where the four leave the step** (profile `1792379163`, `Step(64)`, 23.62 ms): products 15.60 ms at 462 GB/s;
     everything else 8.02 ms (10.01 at the start); every byte at 322 GB/s, 63% of 512. 1.7B 26.47 / 27.14 / 27.97 ->
     24.41 / 25.01 / 25.93 ms (-8%).
-  - [ ] **Decision (ask the user):** RoPE over `q|k` in one pass (a model-code change), a cheaper barrier (firmware), or
-    `x / stat * gamma` as one op (burn-fusion's `Reshape` block).
+  - [x] **Decided (2026-10-19):** build the packed twin and the barrier; document RoPE over `q|k` in one pass
+    (~0.6 ms, a model-code change) and `x / stat * gamma` as one op (~0.4 ms, burn-fusion's `Reshape` block) and skip
+    them for now.
+  - [x] **A one-row result written packed by the op that makes it** (`Session::set_packed_twins`, on;
+    `tensor::packed_twin_writes`). A `[1, K]` F32 element-wise result over at least `PACKED_A_K_TILES` tiles also
+    writes each output tile's data row into a `[K / 32, 32]` twin, from the slots its own scatter writes out (two
+    64-byte writes a tile). A product's packed `A` and RMSNorm's statistic read the twin: no packing op. The twin is
+    the session's (`Session::packed_twin`), freed with its result and dropped by any write in place (`write`,
+    `write_bits`, `copy_into`, `write_rows`, `scatter_rows_into`).
+    - **Gate:** `step207_packed_twin` (ttsim and card 0, 8 units): the twin is `pack_row` of the result bit for bit
+      (`K` 1024, 1056, 2048; plain and block operands); its readers equal the packing paths' bits and pack nothing; after
+      each kind of write in place the readers are the new row's and the twin is gone; GDDR returns to where it was;
+      a capture and its replays equal the ops run fresh. Watched failing with the twin's rows a face row off, and with
+      `drop_twin` doing nothing (the statistic after a write read the old row).
+    - **Regression:** ttsim `step187`, `step190`, `step192`-`step200`, `step204`, `step205`, the tt-kernels unit tests,
+      `step12_mnist`; Burn conformance plain 2,973 passed, 52 as expected, `--fusion` 2,970 passed, 55 as expected;
+      card 0 34 of 34 (`1792382182`, `step188` among them).
+    - **Measured:** 121 fewer ops a step (97 product packings and 49 statistic packings, less the `o` input's, which
+      a repack makes); each element-wise op ~1 us more (the two writes), RMSNorm's `DIV` 18 -> 25.6 us (the 63 units
+      that sat out the statistic now wait on its barrier there, where the packing op absorbed it). 1.7B 24.41 / 25.01 /
+      25.93 -> **23.95 / 24.55 / 25.52 ms** (`1792382455`, 285.8 GB/s of weights).
+  - [x] **A barrier released by unit 0** (tt-metal's coordinator-broadcast barrier; `dm::op::BARRIER` word 6,
+    `Session::set_barrier_release`, on; `TT_BARRIER_RELEASE=0` turns it off). Every unit polled unit 0's counter with
+    NoC0 reads, which queue behind the GDDR reads; tt-metal never polls remotely (`dataflow_api.h`:
+    `noc_semaphore_wait` spins on local L1; `barrier_sync.hpp`, "avoids the NOC congestion of polling-read barriers").
+    The per-tile RISC-V mailboxes are tile-local and cannot be reached over the NoC, so they are not a barrier.
+    - **Now:** arrival is the same NoC atomic increment. Unit 0 waits on the counter in its own L1, then writes the
+      target into every other unit's `dm::BARRIER_RELEASE` with one non-posted multicast per rectangle
+      (`dm::BARRIER_RECTS`, at most 8: the session's units but unit 0, a row's runs merged down rows, each checked by
+      `Rect::new`, so no other tile is written; path-reserved, VC 4, as `noc::multicast::registers_to`). Every other
+      unit waits on its own word, with no NoC traffic. Unit 0 arrives at every barrier (a list of its own where the op
+      did not run on it), so every target is released; it releases only what it arrives at, so the words only grow. The
+      next release waits for the last one's acknowledgements (`NIU_MST_WR_ACK_RECEIVED`), so one is in flight at most;
+      the transaction ID's counter is never waited on or cleared (ttsim refuses the clear).
+    - **Gates:** `step208_barrier_release` (ttsim, card 0 `1792383833`, 8 units): the slow-op-then-readers case
+      exact every round, eager and replayed; every unit's word equals the arrivals after each sync; with release off
+      the words stay put; turned on again, every word starts at the count. Negative control (ttsim only): with unit 0
+      releasing nothing and every word far ahead, the readers overtake the slow op. On card 0 they did not even at `K`
+      8192 and 32768 (the host queues the readers more slowly than unit 0 finishes). Unit `release_rect_tests` (every
+      unit but the leader once and nothing else, full and harvested grids, skipped tiles; a checkerboard refused). Record
+      unit test for word 6.
+    - **Regression:** ttsim `step34`, `step39`, `step62`, `step171`, `step176`, `step183`, `step184`, `step189`,
+      `step205`, `step207`; `step172`/`step173`/`step208` in the safe, `fast-reads` and `fast-reads` + `encoded-guard`
+      images; firmware clippy x4; card 0: `step172`/`step173`/`step208` in the guarded fast-read image (`1792385599`),
+      `--smoke` 1,140 of 1,140 with twins and release on (`1792383989`).
+    - **Measured (card 1, release against polling, same build):** 1.7B **24.04 / 24.48 / 25.39** against 24.09 / 24.65 /
+      25.64 ms (`1792383988`, `1792384336`): 0.05-0.25 ms. The barrier's ~3.8 ms a step is mostly waiting for the
+      slowest unit to arrive, not the release.
+  - [x] **Weights stored transposed: tried, slower.** A decode product's column of `B` is `K` tiles a grid row apart;
+    stored `[n, k]` (read through the unpacker's transpose, bit for bit) it is consecutive tiles. Probe
+    `silicon_probe_decode_stream::decode_products_with_their_weights_stored_transposed` (card 1): every product 2-6%
+    slower (`gate|up` 342 -> 357 us, `down` 175 -> 180, the head 993 -> 1022). Not built.
+  - **Where the step stands** (1.7B, card 1, `1792383988`): 24.04 / 24.48 / 25.39 ms, 284.8 GB/s of weights at 32
+    tokens (56% of 512); profile `1792382914` (twins and release): `Step(64)` 23.22 ms, products 15.58 ms at 463 GB/s,
+    everything else 7.64 ms in 690 ops. Alone, the products read at 346-412 GB/s (the probe above): in the step they
+    reach ~462 because the prefetch reads part of their weights during the small ops before them. More of the weight
+    stream under the small ops is the lever left for the step's bandwidth: a prefetch deeper than one job a unit and
+    one product ahead.
 - [ ] **The other chain fusers** (`burn-tt` `fusion/chain.rs`):
   - RMSNorm's `x / stat * gamma` as one body. Today `gamma`'s `Reshape` puts the product in a block of its own, so
     the fuser cannot see it (decode-small-ops S3, R0).

@@ -471,6 +471,16 @@ pub struct Session<T: Transport> {
     packed_rms: bool,
     /// [`Session::set_prefetch_keeps_units`].
     prefetch_keeps_units: bool,
+    /// [`Session::set_packed_twins`].
+    packed_twins_on: bool,
+    /// [`Session::set_barrier_release`].
+    barrier_release: bool,
+    /// The leader's release rectangles (`dm::BARRIER_RECTS`, [`release_rects`]): `None` where
+    /// the units need more than `BARRIER_RECTS_MAX`, and barriers poll.
+    release_rects: Option<Vec<(u32, u32)>>,
+    /// One-row element-wise results and their packed twins ([`Session::set_packed_twins`]), by
+    /// the result's placement: dropped when the result is freed or written in place.
+    twins: Vec<(tensor::Placement, DramTensor)>,
     /// [`Session::set_streamed_k`].
     streamed_k: bool,
     /// [`Session::set_weight_prefetch`].
@@ -1374,6 +1384,72 @@ fn admitted(words: usize, cache: u64) -> bool {
 /// reader section (NC's writes wait on credits only the reader and the roles release, so
 /// they follow it too), or first in a plain list. `false`, and `seg` unchanged, if the
 /// list is already as long as a list may be.
+/// Unit 0's barrier counter and every unit's release word zeroed, through window `w`, and unit
+/// 0's release rectangles written (`dm::BARRIER_RECTS`; none where `rects` is `None`).
+fn write_barrier_words<T: Transport>(
+    dev: &mut Device<T>,
+    w: &tt_device::Window,
+    tiles: &[NocCoord<Noc0>],
+    rects: Option<&[(u32, u32)]>,
+) -> Result<(), TensorError> {
+    let Some(&leader) = tiles.first() else {
+        return Ok(());
+    };
+    dev.write32(w, leader, tt_isa::dm::BARRIER_COUNTER, 0)?;
+    let rects = rects.unwrap_or(&[]);
+    dev.write32(w, leader, tt_isa::dm::BARRIER_RECTS, rects.len() as u32)?;
+    for (i, &(hi, acks)) in rects.iter().enumerate() {
+        let at = tt_isa::dm::BARRIER_RECTS + 4 + 8 * i as u64;
+        dev.write32(w, leader, at, hi)?;
+        dev.write32(w, leader, at + 4, acks)?;
+    }
+    for &tile in tiles {
+        dev.write32(w, tile, tt_isa::dm::BARRIER_RELEASE, 0)?;
+    }
+    Ok(())
+}
+
+/// The rectangles a barrier release reaches (`dm::BARRIER_RECTS`): every tile of `tiles` but the
+/// first (the leader's), each once, and no other tile -- a row's contiguous runs, merged down
+/// rows where they match -- as `(NOC_RET_ADDR_HI on NoC #0, tile count)`, each checked against
+/// the grid ([`multicast::Rect::new`]). `None` past `dm::BARRIER_RECTS_MAX`.
+fn release_rects(grid: &Tensix, tiles: &[(u8, u8)]) -> Option<Vec<(u32, u32)>> {
+    use tt_isa::noc::multicast::Rect;
+    let mut rest: Vec<(u8, u8)> = tiles.iter().skip(1).copied().collect();
+    rest.sort_unstable_by_key(|&(x, y)| (y, x));
+    rest.dedup();
+    // Each row's runs of adjacent columns, `(y, x0, x1)`.
+    let mut runs: Vec<(u8, u8, u8)> = Vec::new();
+    for &(x, y) in &rest {
+        match runs.last_mut() {
+            Some(r) if r.0 == y && r.2 + 1 == x => r.2 = x,
+            _ => runs.push((y, x, x)),
+        }
+    }
+    // Merged down the rows: `(x0, x1, y0, y1)`.
+    let mut rects: Vec<(u8, u8, u8, u8)> = Vec::new();
+    for (y, x0, x1) in runs {
+        match rects
+            .iter_mut()
+            .find(|r| (r.0, r.1) == (x0, x1) && r.3 + 1 == y)
+        {
+            Some(r) => r.3 = y,
+            None => rects.push((x0, x1, y, y)),
+        }
+    }
+    if rects.len() > tt_isa::dm::BARRIER_RECTS_MAX as usize {
+        return None;
+    }
+    rects
+        .into_iter()
+        .map(|(x0, x1, y0, y1)| {
+            Rect::new(grid, x0, y0, x1, y1)
+                .ok()
+                .map(|r| (r.hi(tt_isa::noc::niu::Niu::Noc0), r.tile_count()))
+        })
+        .collect()
+}
+
 /// A captured stream's top-level `BARRIER` entries: `[arrivals, wait-only, the barriers both
 /// stand for]` (`dm::op::BARRIER` words 4 and 5).
 fn barrier_entries(stream: &[[u32; 8]]) -> [u32; 3] {
@@ -1922,6 +1998,11 @@ impl<T: Transport> Session<T> {
             packed_thin_a: true,
             packed_rms: true,
             prefetch_keeps_units: true,
+            packed_twins_on: true,
+            twins: Vec::new(),
+            // `TT_BARRIER_RELEASE=0`: every unit polls unit 0's counter, as before.
+            barrier_release: std::env::var("TT_BARRIER_RELEASE").map_or(true, |v| v != "0"),
+            release_rects: None,
             streamed_k: true,
             weight_prefetch: true,
             prefetch_anchor: None,
@@ -1984,6 +2065,12 @@ impl<T: Transport> Session<T> {
                 Err(e) => Err(SessionError::Reset(e)),
             }
         })?;
+        let tiles: Vec<(u8, u8)> = session
+            .units
+            .iter()
+            .map(|u| (u.tile.x(), u.tile.y()))
+            .collect();
+        session.release_rects = release_rects(&session.grid, &tiles);
         let asked = if want == usize::MAX { 1 } else { want };
         if session.units.len() < asked {
             return Err(SessionError::TooFewHealthy {
@@ -3220,6 +3307,10 @@ impl<T: Transport> Session<T> {
         if !p.owned() {
             return Ok(());
         }
+        if let Some(i) = self.twins.iter().position(|(q, _)| *q == p) {
+            let (_, twin) = self.twins.swap_remove(i);
+            self.free_placement(twin.placement)?;
+        }
         // A trace's: its replays read or write it (`crate::trace`).
         if let Some(c) = self.capture.as_mut() {
             c.freed.push(p);
@@ -3268,10 +3359,7 @@ impl<T: Transport> Session<T> {
                 self.recover(&[(u, had_kernels)]);
             }
             self.restart_barriers();
-            if let Some(m) = self.units.first().and_then(|u| u.resident.as_ref()) {
-                let (w, t) = (m.window(), self.units[0].tile);
-                let _ = self.dev.write32(w, t, tt_isa::dm::BARRIER_COUNTER, 0);
-            }
+            let _ = self.reset_barrier_words();
             self.apply_pending_frees();
             self.staging_at = 0;
             self.staging_busy = false;
@@ -3300,13 +3388,113 @@ impl<T: Transport> Session<T> {
             c.y() as u32,
             1,
             0,
-            0,
+            self.releasing() as u32,
             0,
         ]
     }
 
+    /// Each unit's `dm::BARRIER_RELEASE` (the last target unit 0 released to it) and the
+    /// arrivals counted so far, after a sync: for gates ([`Session::set_barrier_release`]).
+    #[doc(hidden)]
+    pub fn barrier_release_words(&mut self) -> Result<(Vec<u32>, u32), TensorError> {
+        self.sync()?;
+        let Session { dev, units, .. } = self;
+        let Some(w) = units
+            .first()
+            .and_then(|u| u.resident.as_ref())
+            .map(|r| r.window())
+        else {
+            return Ok((Vec::new(), self.barriers));
+        };
+        let words = units
+            .iter()
+            .map(|u| dev.read32(w, u.tile, tt_isa::dm::BARRIER_RELEASE))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((words, self.barriers))
+    }
+
+    /// A gate's negative control: unit 0 releases nothing from here on (no rectangles) and
+    /// every other unit's release word is far past any target, so released barriers no longer
+    /// order anything. After a sync; the session is not fit for anything else after.
+    #[doc(hidden)]
+    pub fn break_barrier_release(&mut self) -> Result<(), TensorError> {
+        self.sync()?;
+        let Session { dev, units, .. } = self;
+        let Some(w) = units
+            .first()
+            .and_then(|u| u.resident.as_ref())
+            .map(|r| r.window())
+        else {
+            return Ok(());
+        };
+        dev.write32(w, units[0].tile, tt_isa::dm::BARRIER_RECTS, 0)?;
+        for u in &units[1..] {
+            dev.write32(w, u.tile, tt_isa::dm::BARRIER_RELEASE, 0x4000_0000)?;
+        }
+        Ok(())
+    }
+
+    /// Whether barriers wait for unit 0's release ([`Session::set_barrier_release`]).
+    fn releasing(&self) -> bool {
+        self.barrier_release && self.release_rects.is_some()
+    }
+
+    /// Wait at a barrier for unit 0's release rather than by polling its counter (on by
+    /// default; `dm::op::BARRIER` word 6): unit 0 waits on the counter in its own L1, then
+    /// multicasts each target it arrives at to every other unit's `dm::BARRIER_RELEASE`, and each
+    /// waits on its own, with no NoC traffic while it waits. Unit 0 then arrives at every barrier.
+    /// Off, every unit polls unit 0's counter over the NoC, as tt-metal never does (it was 2.4 us
+    /// a barrier idle, 6-10 under the weight stream). Syncs first; traces captured before are
+    /// stale, as after a mover restart. Turned on, every unit's release word starts at the count
+    /// every unit has passed.
+    pub fn set_barrier_release(&mut self, on: bool) -> Result<(), TensorError> {
+        if on == self.barrier_release {
+            return Ok(());
+        }
+        if self.capture.is_some() {
+            return Err(TraceError::Capturing.into());
+        }
+        self.sync()?;
+        self.barrier_release = on;
+        self.epoch += 1;
+        if self.releasing() {
+            let count = self.barriers;
+            let Session { dev, units, .. } = self;
+            if let Some(w) = units
+                .first()
+                .and_then(|u| u.resident.as_ref())
+                .map(|r| r.window())
+            {
+                for unit in units.iter() {
+                    dev.write32(w, unit.tile, tt_isa::dm::BARRIER_RELEASE, count)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The barrier counter and the session's count start again at zero, and no
     /// tile has a target to wait for: on a recovery, with nothing queued.
+    /// Unit 0's barrier counter and every unit's release word to zero, and unit 0's release
+    /// rectangles written (`dm::BARRIER_RECTS`): with nothing queued anywhere.
+    fn reset_barrier_words(&mut self) -> Result<(), TensorError> {
+        let Session {
+            dev,
+            units,
+            release_rects,
+            ..
+        } = self;
+        let tiles: Vec<_> = units.iter().map(|u| u.tile).collect();
+        let Some(w) = units
+            .first()
+            .and_then(|u| u.resident.as_ref())
+            .map(|r| r.window())
+        else {
+            return Ok(());
+        };
+        write_barrier_words(dev, w, &tiles, release_rects.as_deref())
+    }
+
     fn restart_barriers(&mut self) {
         self.barriers = 0;
         for unit in &mut self.units {
@@ -3424,9 +3612,15 @@ impl<T: Transport> Session<T> {
             profiling,
             barriers,
             epoch,
+            release_rects,
             ..
         } = self;
         let idle = units.iter().all(|u| u.queued.is_empty());
+        // The units' tiles, for unit 0's barrier words below: only when its mover starts.
+        let tiles: Vec<_> = match u == 0 && units[0].mover.is_none() {
+            true => units.iter().map(|u| u.tile).collect(),
+            false => Vec::new(),
+        };
         let unit = &mut units[u];
         let r = unit.resident.as_ref().expect("prepared above");
         let d = dram
@@ -3472,7 +3666,8 @@ impl<T: Transport> Session<T> {
             // nothing queued anywhere that still waits on the old count.
             if u == 0 {
                 debug_assert!(idle, "the coordinator restarted under queued barriers");
-                dev.write32(r.window(), unit.tile, tt_isa::dm::BARRIER_COUNTER, 0)?;
+                let w = r.window();
+                write_barrier_words(dev, w, &tiles, release_rects.as_deref())?;
                 *barriers = 0;
                 // Every tile's last target was on the old count; with nothing
                 // queued, none of them has anything to wait for.
@@ -3544,7 +3739,16 @@ impl<T: Transport> Session<T> {
         // replay to count. Nothing below loops over the session's other units: on many
         // tiles that was a host cost every op paid.
         let capturing = self.capture.is_some();
-        let arriving: Vec<usize> = (0..spread).filter(|&u| !queues[u].is_empty()).collect();
+        let mut arriving: Vec<usize> = (0..spread).filter(|&u| !queues[u].is_empty()).collect();
+        // A released barrier is released by unit 0 once it arrives: it arrives at every one,
+        // with a list of its own where the op did not run on it.
+        if self.releasing()
+            && n > 1
+            && !self.unbarriered
+            && arriving.first().is_some_and(|&u| u != 0)
+        {
+            arriving.insert(0, 0);
+        }
         // What each unit the op runs on must wait for first: the latest barrier
         // before this op, if it sat out the ops up to it. Taken before this op's
         // barrier is counted, since that target includes the unit's own arrival,
@@ -3612,7 +3816,7 @@ impl<T: Transport> Session<T> {
                 c.y() as u32,
                 0,
                 0,
-                0,
+                self.releasing() as u32,
                 0,
             ]
         });
@@ -3694,7 +3898,7 @@ impl<T: Transport> Session<T> {
                     c.units[u].barriers_accounted = c.barrier_ops;
                     c.units[u]
                         .stream
-                        .push([entry[0], rel, entry[2], entry[3], 0, 0, 0, 0]);
+                        .push([entry[0], rel, entry[2], entry[3], 0, 0, entry[6], 0]);
                 }
             }
             for &u in arriving
@@ -4614,6 +4818,7 @@ impl<T: Transport> Session<T> {
     /// (`Session::dma_upload`); through the BAR, it waits for that instead.
     pub fn write(&mut self, t: &DramTensor, values: &[f32]) -> Result<(), TensorError> {
         self.refuse_while_capturing("write")?;
+        self.drop_twin(t)?;
         t.expect("a write of FP32 values", tensor::Elem::F32)?;
         self.write_src(t, Src::F32(values), false)
     }
@@ -4622,6 +4827,7 @@ impl<T: Transport> Session<T> {
     /// or bit-encoded input between replays.
     pub fn write_bits(&mut self, t: &DramTensor, values: &[u32]) -> Result<(), TensorError> {
         self.refuse_while_capturing("write")?;
+        self.drop_twin(t)?;
         self.write_src(t, Src::Bits(values), false)
     }
 
@@ -4767,15 +4973,25 @@ impl<T: Transport> Session<T> {
         let op = op.in_mode(self.math);
         let units = self.spread_for(tiles_of(a).max(b.map_or(0, tiles_of)));
         let overlap = self.overlap();
-        let alloc = &mut self.dram_state()?.alloc;
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
+        let twin = self.new_twin(a.rows, a.cols, tensor::output_elem(kind))?;
+        let alloc = &mut self.dram_state()?.alloc;
         // The SFPU's, or refused: the mover only moves data.
-        let Some(work) = tensor::sfpu_eltwise(alloc, op, a, b, c, units, overlap)? else {
-            return Err(TensorError::Shape(format!(
-                "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
-            )));
+        let work = match tensor::sfpu_eltwise(alloc, op, a, b, c, units, overlap, twin.as_ref()) {
+            Ok(Some(work)) => work,
+            other => {
+                if let Some(twin) = twin {
+                    self.free(twin)?;
+                }
+                other?;
+                return Err(TensorError::Shape(format!(
+                    "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
+                )));
+            }
         };
-        let out = self.execute_on(work, units, RESET_BUDGET)?;
+        let out = self.execute_on(work, units, RESET_BUDGET);
+        self.keep_twin(&out, twin)?;
+        let out = out?;
         out.set_pad(match tensor::eltwise_rows(kind, a.rows) {
             // Rows past `a`'s are left as `Dst` held them.
             32 => op.produces(&[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>()),
@@ -4799,14 +5015,25 @@ impl<T: Transport> Session<T> {
         let tiles = |x: &tensor::BlockOperand<'_>| x.dims[0].div_ceil(32) * x.dims[1].div_ceil(32);
         let units = self.spread_for(tiles(&a).max(b.as_ref().map_or(0, tiles)));
         let overlap = self.overlap();
+        let twin = self.new_twin(a.dims[0], a.dims[1], tensor::output_elem(op.kind))?;
         let alloc = &mut self.dram_state()?.alloc;
-        let Some(work) = tensor::sfpu_eltwise_blocks(alloc, op, a, b, c, units, overlap)? else {
-            return Err(TensorError::Shape(format!(
-                "element-wise {:#x} on blocks: no SFPU program computes it",
-                op.kind
-            )));
-        };
-        let out = self.execute_on(work, units, RESET_BUDGET)?;
+        let work =
+            match tensor::sfpu_eltwise_blocks(alloc, op, a, b, c, units, overlap, twin.as_ref()) {
+                Ok(Some(work)) => work,
+                other => {
+                    if let Some(twin) = twin {
+                        self.free(twin)?;
+                    }
+                    other?;
+                    return Err(TensorError::Shape(format!(
+                        "element-wise {:#x} on blocks: no SFPU program computes it",
+                        op.kind
+                    )));
+                }
+            };
+        let out = self.execute_on(work, units, RESET_BUDGET);
+        self.keep_twin(&out, twin)?;
+        let out = out?;
         let shapes: Vec<DramTensor> = [Some(a), b, c]
             .into_iter()
             .flatten()
@@ -4985,6 +5212,7 @@ impl<T: Transport> Session<T> {
 
     /// Copy `src`, bit for bit, into an existing allocated tensor `dst`.
     pub fn copy_into(&mut self, src: &DramTensor, dst: &DramTensor) -> Result<(), TensorError> {
+        self.drop_twin(dst)?;
         let units = self.spread_for(tiles_of(src));
         let work = tensor::copy_into(src, dst, units)?;
         self.submit_jobs_on(work.jobs, units, RESET_BUDGET)?;
@@ -5304,6 +5532,7 @@ impl<T: Transport> Session<T> {
         src: &DramTensor,
         rows: &[(usize, usize)],
     ) -> Result<(), TensorError> {
+        self.drop_twin(dst)?;
         let units = self.spread_for(tiles_of(src));
         let jobs = tensor::write_rows(dst, src, rows, units)?;
         self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
@@ -5345,6 +5574,7 @@ impl<T: Transport> Session<T> {
         values: &DramTensor,
         column: bool,
     ) -> Result<(), TensorError> {
+        self.drop_twin(dst)?;
         let n = if column { indices.rows } else { indices.cols };
         let units = self.spread_for(crate::index::scatter_rows_work(dst, n, tiles_of(values)));
         let jobs = crate::index::scatter_rows_jobs(dst, indices, values, column, units)?;
@@ -5512,14 +5742,22 @@ impl<T: Transport> Session<T> {
         {
             // One unit reading the row's `K / 32` tiles is bound by its entries (~0.33 us
             // each): the packing spreads them over the units, the statistic reads `K / 1024`.
-            let units = self.spread_for(kt);
-            let work = tensor::pack_row(&mut self.dram_state()?.alloc, a, units)?;
-            let packed = self.execute_on(work, units, RESET_BUDGET)?;
+            // The op that made the row may have packed it already.
+            let (packed, made) = match self.packed_twin(a).cloned() {
+                Some(twin) => (twin, false),
+                None => {
+                    let units = self.spread_for(kt);
+                    let work = tensor::pack_row(&mut self.dram_state()?.alloc, a, units)?;
+                    (self.execute_on(work, units, RESET_BUDGET)?, true)
+                }
+            };
             let stat = self
                 .dram_state()
                 .and_then(|d| tensor::sfpu_rms_packed(&mut d.alloc, &packed, a.cols, eps))
                 .and_then(|work| self.execute_on(work, 1, RESET_BUDGET));
-            self.free(packed)?;
+            if made {
+                self.free(packed)?;
+            }
             let out = stat?;
             out.set_pad(tensor::Pad::Undefined);
             return Ok(out);
@@ -5680,13 +5918,15 @@ impl<T: Transport> Session<T> {
         // One row over a long `K`: every unit would read `A`'s `K / 32` tiles, an entry each,
         // so it is packed `[K / 32, 32]` once, spread over the product's units, and each unit
         // reads `K / 1024`.
-        let packed = if self.packed_thin_a
+        let packs = self.packed_thin_a
             && m == 1
             && !a_transposed
             && a.cols % 32 == 0
             && kt >= PACKED_A_K_TILES
-            && route == SrcRoute::Tf32FromFp32
-        {
+            && route == SrcRoute::Tf32FromFp32;
+        // The op that made `A` may have packed it already (`Session::set_packed_twins`).
+        let twin = packs.then(|| self.packed_twin(a).cloned()).flatten();
+        let packed = if packs && twin.is_none() {
             // On the product's own units: the rest stay out of the op (a unit that sits out ops
             // is free for other work, `decode-to-bandwidth.md` Phase 5).
             let packing = self
@@ -5705,7 +5945,7 @@ impl<T: Transport> Session<T> {
         } else {
             None
         };
-        let packed_a = packed.as_ref().map(|p| p.tensor_ref());
+        let packed_a = packed.as_ref().or(twin.as_ref()).map(|p| p.tensor_ref());
         let stream_k = self.streamed_k;
         // In a capture, the units past the product's own that ran nothing since the last
         // weight-streaming product: each can read a job's `B` while the ops between run.
@@ -6146,14 +6386,7 @@ impl<T: Transport> Session<T> {
             Err(_) => {
                 let _ = self.sync();
                 self.restart_barriers();
-                if let Some(resident) = self.units[0].resident.as_ref() {
-                    let _ = self.dev.write32(
-                        resident.window(),
-                        self.units[0].tile,
-                        tt_isa::dm::BARRIER_COUNTER,
-                        0,
-                    );
-                }
+                let _ = self.reset_barrier_words();
                 Ok(())
             }
         };
@@ -6274,6 +6507,69 @@ impl<T: Transport> Session<T> {
     /// are the same either way.
     pub fn set_prefetch_keeps_units(&mut self, on: bool) {
         self.prefetch_keeps_units = on;
+    }
+
+    /// Whether a one-row F32 element-wise result over a long `K` ([`PACKED_A_K_TILES`]) also
+    /// writes its row packed (`[K / 32, 32]`, [`tensor::pack_row`]'s layout) from the slots its
+    /// own scatter writes out (on by default): a product's packed `A` and RMSNorm's statistic
+    /// then read it with no packing op ([`tensor::packed_twin_writes`]). The twin lives as long
+    /// as the result and is dropped when the result is written in place.
+    pub fn set_packed_twins(&mut self, on: bool) {
+        self.packed_twins_on = on;
+    }
+
+    /// `t`'s packed twin, if it has one and twins are on ([`Session::set_packed_twins`]).
+    pub fn packed_twin(&self, t: &DramTensor) -> Option<&DramTensor> {
+        if !self.packed_twins_on {
+            return None;
+        }
+        self.twins
+            .iter()
+            .find(|(p, _)| *p == t.placement && t.rows == 1)
+            .map(|(_, twin)| twin)
+    }
+
+    /// A twin for a `[rows, cols]` element-wise result of `elem`, when one is made.
+    fn new_twin(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        elem: tensor::Elem,
+    ) -> Result<Option<DramTensor>, TensorError> {
+        if !(self.packed_twins_on
+            && rows == 1
+            && cols % 32 == 0
+            && cols / 32 >= PACKED_A_K_TILES
+            && elem == tensor::Elem::F32)
+        {
+            return Ok(None);
+        }
+        let twin = DramTensor::alloc(&mut self.dram_state()?.alloc, cols / 32, 32)?;
+        twin.set_pad(tensor::Pad::Undefined);
+        Ok(Some(twin))
+    }
+
+    /// Keep `twin` as `out`'s, or give it back when the op made no `out`.
+    fn keep_twin(
+        &mut self,
+        out: &Result<DramTensor, TensorError>,
+        twin: Option<DramTensor>,
+    ) -> Result<(), TensorError> {
+        match (out, twin) {
+            (Ok(out), Some(twin)) => self.twins.push((out.placement.clone(), twin)),
+            (Err(_), Some(twin)) => self.free(twin)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `t` is about to be written in place: its twin no longer holds its row.
+    fn drop_twin(&mut self, t: &DramTensor) -> Result<(), TensorError> {
+        if let Some(i) = self.twins.iter().position(|(p, _)| *p == t.placement) {
+            let (_, twin) = self.twins.swap_remove(i);
+            self.free(twin)?;
+        }
+        Ok(())
     }
 
     /// Whether a one-row product with a packed `A` streams each output column's `K` in chunks,
@@ -7164,4 +7460,68 @@ pub enum PowExponent<'a> {
     Scalar(f32),
     /// An `I32` tensor of the base's shape, `as f32` first.
     Int(&'a DramTensor),
+}
+
+#[cfg(test)]
+mod release_rect_tests {
+    use super::release_rects;
+    use tt_isa::noc::grid::Tensix;
+    use tt_isa::noc::Noc0;
+
+    /// The tiles of a NoC #0 `RET_ADDR_HI` broadcast word, `start <= end`.
+    fn tiles_of(hi: u32) -> Vec<(u8, u8)> {
+        let f = |s: u32| (hi >> s & 0x3f) as u8;
+        let (ex, ey, sx, sy) = (f(0), f(6), f(12), f(18));
+        (sy..=ey)
+            .flat_map(|y| (sx..=ex).map(move |x| (x, y)))
+            .collect()
+    }
+
+    /// A release reaches every unit but the leader exactly once and no other tile, within
+    /// `BARRIER_RECTS_MAX`, for every unit count from 2 to the whole of a full and of a harvested
+    /// grid, and with tiles missing (skipped as wedged). Too scattered a set gives `None`.
+    #[test]
+    fn a_release_reaches_every_unit_but_the_leader_once_and_nothing_else() {
+        for grid in [Tensix::FULL, Tensix::from_enabled_column_count(12).unwrap()] {
+            let all: Vec<(u8, u8)> = grid.tiles::<Noc0>().map(|t| (t.x(), t.y())).collect();
+            let mut sets: Vec<Vec<(u8, u8)>> = (2..=all.len()).map(|n| all[..n].to_vec()).collect();
+            // A few wedged tiles skipped from the whole grid.
+            sets.push(
+                all.iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(i, _)| i % 37 != 5)
+                    .map(|(_, t)| t)
+                    .collect(),
+            );
+            for tiles in sets {
+                let Some(rects) = release_rects(&grid, &tiles) else {
+                    continue;
+                };
+                assert!(rects.len() <= tt_isa::dm::BARRIER_RECTS_MAX as usize);
+                let mut got: Vec<(u8, u8)> = Vec::new();
+                for &(hi, acks) in &rects {
+                    let t = tiles_of(hi);
+                    assert_eq!(t.len() as u32, acks, "{} tiles", tiles.len());
+                    got.extend(t);
+                }
+                got.sort_unstable();
+                let mut want = tiles[1..].to_vec();
+                want.sort_unstable();
+                assert_eq!(got, want, "{} tiles", tiles.len());
+            }
+        }
+        let grid = Tensix::FULL;
+        let all: Vec<(u8, u8)> = grid.tiles::<Noc0>().map(|t| (t.x(), t.y())).collect();
+        let checker: Vec<(u8, u8)> = all
+            .iter()
+            .copied()
+            .filter(|&(x, y)| (x + y) % 2 == 0)
+            .collect();
+        assert_eq!(
+            release_rects(&grid, &checker),
+            None,
+            "a checkerboard needs many rectangles"
+        );
+    }
 }

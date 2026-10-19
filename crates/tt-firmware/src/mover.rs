@@ -18,6 +18,23 @@ const BARRIER_TXN: TxnId = match TxnId::new(3) {
     Some(t) => t,
     None => panic!(),
 };
+/// A barrier release's multicasts: never waited on by ID (`noc::issue_multicast`).
+const RELEASE_TXN: TxnId = match TxnId::new(5) {
+    Some(t) => t,
+    None => panic!(),
+};
+
+/// The coordinator's last release: `NIU_MST_WR_ACK_RECEIVED` before it, and the
+/// acknowledgements it expects. The next release waits for them first, so at most one
+/// release's multicasts are in flight. In local data RAM, which `firmware_main` zeroes since
+/// ttsim does not.
+#[link_section = ".local"]
+static mut LAST_RELEASE: (u32, u32) = (0, 0);
+
+fn last_release() -> &'static mut (u32, u32) {
+    // SAFETY: one core runs this firmware, with no interrupts; no reference outlives its use.
+    unsafe { &mut *core::ptr::addr_of_mut!(LAST_RELEASE) }
+}
 
 fn rd(addr: u64) -> u32 {
     // SAFETY: every address used is an aligned word of the mover's mailbox, its
@@ -351,12 +368,21 @@ fn trace(on: bool, event: u32, detail: u32) {
 }
 
 /// `dm::op::BARRIER`: one NoC atomic increment of the coordinator's counter
-/// (unless `arrive` is false, the wait-only form), then NoC reads of it until
-/// it reaches `target`. The reads land in this tile's L1, which the NoC writes
-/// without invalidating the L0 cache: every check goes through a fence
-/// (`publish`).
+/// (unless `arrive` is false, the wait-only form), then a wait until it reaches
+/// `target`. Polling (`release` false): NoC reads of the counter. Released: the
+/// coordinator reads its own counter and then multicasts `target` to every other
+/// tile's `dm::BARRIER_RELEASE` ([`release`]); the others read their own. The NoC
+/// writes L1 without invalidating the L0 cache: every check goes through a fence
+/// (`publish`). Signed modulo 2^32, so the counter may wrap.
 #[inline(never)]
-fn barrier(me: (u8, u8), target: u32, x: u8, y: u8, arrive: bool) -> Result<(), u32> {
+fn barrier(
+    me: (u8, u8),
+    target: u32,
+    x: u8,
+    y: u8,
+    arrive: bool,
+    release: bool,
+) -> Result<(), u32> {
     use tt_isa::noc::niu::Endpoint;
     let counter = Endpoint {
         x,
@@ -377,6 +403,26 @@ fn barrier(me: (u8, u8), target: u32, x: u8, y: u8, arrive: bool) -> Result<(), 
         .map_err(|_| dm::error::ALIGNMENT)?;
         noc::wait(BARRIER_TXN);
     }
+    let reached = |v: u32| (v.wrapping_sub(target) as i32) >= 0;
+    if release && me == (x, y) {
+        // The coordinator: its counter is in its own L1. It releases only what it arrives at,
+        // which the host makes every barrier, so each release is a later target.
+        loop {
+            publish();
+            if reached(rd(dm::BARRIER_COUNTER)) {
+                break;
+            }
+        }
+        return if arrive { self::release(me, target) } else { Ok(()) };
+    }
+    if release {
+        loop {
+            publish();
+            if reached(rd(M.at(dm::BARRIER_RELEASE))) {
+                return Ok(());
+            }
+        }
+    }
     loop {
         noc::issue(
             Niu::Noc0,
@@ -395,6 +441,43 @@ fn barrier(me: (u8, u8), target: u32, x: u8, y: u8, arrive: bool) -> Result<(), 
             return Ok(());
         }
     }
+}
+
+/// The coordinator's release of `target`: once the last release's acknowledgements are in, one
+/// multicast write of it a rectangle of `dm::BARRIER_RECTS`, response-marked (non-posted, as
+/// Blackhole needs a multicast), path-reserved, on static virtual channel 4. It does not wait for
+/// these: a later release writes a later target, so a recipient that sees this one late waits no
+/// longer than its target needs.
+#[cold]
+#[inline(never)]
+fn release(me: (u8, u8), target: u32) -> Result<(), u32> {
+    let (before, expected) = *last_release();
+    while noc::wr_acks().wrapping_sub(before) < expected {}
+    let n = rd(dm::BARRIER_RECTS).min(dm::BARRIER_RECTS_MAX);
+    if n == 0 {
+        return Ok(());
+    }
+    wr(dm::BARRIER_RELEASE_STAGE, target);
+    // The store lands before the NIU reads it.
+    publish();
+    let start = noc::wr_acks();
+    let mut acks = 0u32;
+    for i in 0..n as u64 {
+        let hi = rd(dm::BARRIER_RECTS + 4 + 8 * i);
+        acks = acks.wrapping_add(rd(dm::BARRIER_RECTS + 8 + 8 * i));
+        let regs = tt_isa::noc::multicast::registers_to(
+            dm::BARRIER_RELEASE_STAGE as u32,
+            dm::BARRIER_RELEASE as u32,
+            4,
+            hi,
+            me,
+            RELEASE_TXN,
+        )
+        .map_err(|_| dm::error::ALIGNMENT)?;
+        noc::issue_multicast(&regs);
+    }
+    *last_release() = (start, acks);
+    Ok(())
 }
 
 /// Run one descriptor to completion.
@@ -628,12 +711,13 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             x,
             y,
             arrive,
+            release,
         } => {
             reader_only()?;
             // Everything this unit moved before it has landed.
             noc::wait(TXN);
             publish();
-            barrier(me, target, x, y, arrive)?;
+            barrier(me, target, x, y, arrive, release)?;
         }
         Entry::Poke { address, value } => {
             reader_only()?;
@@ -1324,6 +1408,7 @@ pub extern "Rust" fn firmware_main() -> ! {
     let me = (rd(M.at(dm::MY_X)) as u8, rd(M.at(dm::MY_Y)) as u8);
     // Local data RAM is not zeroed on the simulator (divergence row 25).
     *launched() = 0;
+    *last_release() = (0, 0);
     if IS_NC {
         *writes() = Writes {
             niu: Niu::Noc0,

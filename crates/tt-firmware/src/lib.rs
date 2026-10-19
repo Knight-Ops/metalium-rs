@@ -976,6 +976,30 @@ pub mod noc {
         in_flight(niu, txn).after_issue();
     }
 
+    /// Issue a multicast write already encoded (`tt_isa::noc::multicast::registers_to`) through
+    /// NoC #0, outside the in-flight caps: a response-marked broadcast leaves its ID's
+    /// outstanding counter meaningless (one up, one down per recipient), so its completion is
+    /// counted on [`wr_acks`] instead, and nothing waits on its ID. Waits for the initiator to be
+    /// free first and reads `CMD_CTRL` back after, as [`issue_on`].
+    #[inline(never)]
+    pub fn issue_multicast(regs: &[(u64, u32); 11]) {
+        // SAFETY: as `issue_on`.
+        unsafe {
+            while read_volatile(reg(Niu::Noc0, initiator::CMD_CTRL)) & 1 != 0 {}
+            for &(off, value) in regs {
+                write_volatile(reg(Niu::Noc0, off), value);
+            }
+            write_volatile(reg(Niu::Noc0, initiator::CMD_CTRL), 1);
+            let _ = read_volatile(reg(Niu::Noc0, initiator::CMD_CTRL));
+        }
+    }
+
+    /// NoC #0's `NIU_MST_WR_ACK_RECEIVED`: write acknowledgements this tile's NIU has received.
+    pub fn wr_acks() -> u32 {
+        // SAFETY: a read-only NIU counter.
+        unsafe { read_volatile(reg(Niu::Noc0, niu::WR_ACK_RECEIVED)) }
+    }
+
     /// Wait until every response-marked request issued under `txn` has
     /// completed, on NoC #0 and, once anything has gone out on it, NoC #1.
     /// Exact, because `issue` never lets more than the cap be in flight on

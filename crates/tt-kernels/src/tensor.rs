@@ -2651,7 +2651,7 @@ pub fn broadcast_of(
 }
 
 /// The element type `kind`'s output has.
-fn output_elem(kind: u32) -> Elem {
+pub(crate) fn output_elem(kind: u32) -> Elem {
     crate::sfpu::ops::elems(kind).out
 }
 
@@ -2664,6 +2664,7 @@ fn output_elem(kind: u32) -> Elem {
 ///
 /// The roles' programs are memoised by op, scalar and run length, so a
 /// model's repeated ops reuse them, and so does the program cache.
+#[allow(clippy::too_many_arguments)]
 pub fn sfpu_eltwise(
     alloc: &mut DramAlloc,
     op: Eltwise,
@@ -2672,6 +2673,7 @@ pub fn sfpu_eltwise(
     c: Option<&DramTensor>,
     units: usize,
     overlap: Overlap,
+    twin: Option<&DramTensor>,
 ) -> Result<Option<Work>> {
     let (kind, bcast) = broadcast_of(op, a, b)?;
     if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
@@ -2685,7 +2687,35 @@ pub fn sfpu_eltwise(
         c.map(BlockOperand::whole),
         units,
         overlap,
+        twin,
     )
+}
+
+/// The writes that put one-row tiles' data rows, packed, into `twin` (`[K / 32, 32]`, as
+/// [`pack_row`] lays them out): output tiles `first..first + count`, each in the slot after the
+/// last from `at` with its data in row 0, two 64-byte face-row writes a tile on the writer.
+pub fn packed_twin_writes(twin: &DramTensor, first: usize, count: usize, at: u64) -> Vec<[u32; 8]> {
+    use tt_isa::dm::op;
+    const FACE: u64 = 1024;
+    (0..count)
+        .flat_map(|n| {
+            let (kk, slot) = (first + n, at + n as u64 * TILE_SLOT);
+            let (dst, r) = (twin.tile(kk / 32, 0), (kk % 32) as u64);
+            (0..2u64).map(move |half| {
+                [
+                    op::WRITE,
+                    dst.channel().index() as u32,
+                    0,
+                    (dst.offset() + TILE_DATA + (2 * (r / 16) + half) * FACE + (r % 16) * 64)
+                        as u32,
+                    (slot + TILE_DATA + half * FACE) as u32,
+                    64,
+                    0,
+                    0,
+                ]
+            })
+        })
+        .collect()
 }
 
 /// One operand of [`sfpu_eltwise_blocks`]: the `dims` block of `tensor` whose
@@ -2739,6 +2769,7 @@ impl<'a> BlockOperand<'a> {
 /// they lie at its parent's row stride (`record::READ_RUN` counts over the
 /// output's grid), so a view that is a block of its buffer needs no copy
 /// first. Integer division is refused here (it reads whole tensors).
+#[allow(clippy::too_many_arguments)]
 pub fn sfpu_eltwise_blocks(
     alloc: &mut DramAlloc,
     op: Eltwise,
@@ -2747,6 +2778,7 @@ pub fn sfpu_eltwise_blocks(
     c: Option<BlockOperand<'_>>,
     units: usize,
     overlap: Overlap,
+    twin: Option<&DramTensor>,
 ) -> Result<Option<Work>> {
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::Broadcast;
@@ -2869,6 +2901,19 @@ pub fn sfpu_eltwise_blocks(
             ro.encode()[0],
             ro.encode()[1],
         ];
+        let mut scatter = scatter.to_vec();
+        if let Some(twin) = twin {
+            // A one-row result's data rows, packed as a product's `A` and RMSNorm's statistic
+            // read them, from the slots the scatter writes out: no packing op.
+            if (a.rows, twin.rows, twin.cols) != (1, ct, 32) {
+                alloc.free(&out.placement);
+                return Err(TensorError::Shape(format!(
+                    "a packed twin [{}, {}] for a [{}, {}] result",
+                    twin.rows, twin.cols, a.rows, a.cols
+                )));
+            }
+            scatter.extend(packed_twin_writes(twin, run.start, len, layout.out_at));
+        }
         jobs.push(vec![
             Step::List {
                 what: "sfpu gather",
@@ -2883,7 +2928,7 @@ pub fn sfpu_eltwise_blocks(
             },
             Step::List {
                 what: "sfpu scatter",
-                entries: scatter.to_vec(),
+                entries: scatter,
             },
         ]);
     }
