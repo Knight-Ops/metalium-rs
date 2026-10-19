@@ -338,6 +338,57 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## Where decode's bandwidth stands, and a column broadcast in the SFPU (2026-10-19, cards 0 and 1)
+
+**The assessment** (1.7B, card 1, before this change: timed `1792364210`, profile `1792363365`):
+
+| Measure | Value | Of 512 GB/s |
+|---|--:|--:|
+| Weights a step, as the bench counts them | 6.85 GB | |
+| Decode step, 32 / 128 / 256-token prompt | 26.47 / 27.14 / 27.97 ms | |
+| Weight bandwidth, timed (the bench's "decode weight bandwidth") | 258.6 / ~252 / ~245 GB/s | 50 / 49 / 48% |
+| Every GDDR byte over the `Step(64)` replay (7.60 GB in 25.61 ms) | 297 GB/s | 58% |
+| The products over their own spans | 462 GB/s | 90% |
+| Everything else: 762 ops, 391 MB in 10.01 ms | 39 GB/s | 8% |
+
+- **The products are at the read ceiling.** A layer's four take 591 us against ~584 us for their weights at 469 GB/s;
+  the prefetch already reads part of `qkv`'s and `o`'s before them. Only `down` (172 us against ~143, not
+  prefetched) is clearly over.
+- **The gap to 90-95% is the small ops:** ~424 us a layer in the four windows between products (`gate|up` -> `down`
+  ~25, `down` -> `qkv` ~80, `qkv` -> `o` ~237, `o` -> `gate|up` ~82). 4.37 ms a step of it runs on 1-2 units;
+  barriers are 4.2 ms of the step.
+- **At 512 positions** attention's `qk` and a `pv` gather spread to 120 units and take `o`'s prefetch units (`o`
+  35.6 -> 52.6 us a layer).
+
+**The change: a column operand broadcast by the SFPU.** A `[rows, 1]` operand (RMSNorm's division, the softmax's
+`SUB_EXP` and division) was read with `READ_BROADCAST_COL`: the mover copied column 0 into every column a datum at a
+time, ~10 us of each such op's ~15 us data phase. The mover now reads the tile as it lies
+(`record::READ_RUN_COL_AS_IT_LIES`), and the program first copies column 0 across in `Dst`
+(`sfpu::Program::broadcast_col0`: seven lane-row rotations, the first lane held, then four stores a row group), bit
+for bit the mover's tile.
+
+| Per op, 1.7B `Step(64)` | Before (`1792363365`) | After (`1792372923`) |
+|---|--:|--:|
+| RMSNorm's `DIV`, 64 units | 24.1 us | 14.7 |
+| softmax `SUB_EXP` and `DIV`, 2 units | 24.7 | 15.0 |
+| the replay | 25.61 ms | **24.71** |
+| everything but the products | 10.01 ms | 9.10 |
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792364210`, `1792364661`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 26.47 / 27.14 / 27.97 | **25.48 / 26.18 / 27.01** (`1792372396`; 268.6 GB/s of weights at 32) | 294.4 / 305.2 / 329.2 |
+| SmolLM2-135M | 12.62 / 13.06 / 13.59 | **11.37 / 11.76 / 12.29** (`1792372749`) | 39.7 / 30.5 / 33.1 |
+
+- **Gates:** unit `col_broadcast_tests` (the broadcast is the mover's tile in every computed row group; every kind
+  that takes a column is its plain program over the mover's tile; watched failing with six rotations and with a row
+  group skipped); `step206_sfpu_col_broadcast` (ttsim, NaN in the column's padding in GDDR; watched failing with the
+  broadcast dropped); record unit `records_walk_rows_to_the_same_tiles_as_dividing_per_tile`.
+- **Regression:** ttsim `step30`, `step43`, `step121`, `step183`, `step184`, `step187`, `step193`, `step195`, `step196`,
+  `step199`, `step200`, `step12_mnist`; `step172`/`step173` in the safe, `fast-reads` and `fast-reads` + `encoded-guard`
+  images; firmware clippy plain, `encoded-guard`, `profile`, `fast-reads`; Burn conformance 2,973 passed, 52 as
+  expected; card 0 `1792371974` (45 of 45, `step188` among them) and `1792372371` (mover gates and `step206`, guarded
+  fast-read image).
+
 ## Decode products: their rows, a packed `A`, a streamed `K`, prefetched weights (2026-10-18, cards 0 and 1)
 
 [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phases 4 and 5: three of the four larger changes compared

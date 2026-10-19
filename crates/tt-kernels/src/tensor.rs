@@ -2843,10 +2843,12 @@ pub fn sfpu_eltwise_blocks(
         };
         let mut gather = read(&ra, layout.a_at, 0).to_vec();
         if let (Some(rb), Some(b_at)) = (&rb, layout.b_at) {
+            // A column's broadcast is the program's (`Program::broadcast_col0`): the
+            // mover's datum-at-a-time copy cost ~10 us a tile.
             let flags = match bcast {
                 Broadcast::None => 0,
                 Broadcast::Row => 1,
-                Broadcast::Col => 2,
+                Broadcast::Col => record::READ_RUN_COL_AS_IT_LIES,
             };
             gather.extend(read(rb, b_at, flags));
         }

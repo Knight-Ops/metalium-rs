@@ -270,6 +270,8 @@ pub const SMOKE: &[&str] = &[
     "step204_packed_thin_a::",
     // A captured product's weights prefetched on idle units (decode-to-bandwidth.md Phase 5).
     "step205_weight_prefetch::",
+    // A column operand broadcast by the SFPU, read as it lies (decode-to-bandwidth.md Phase 3).
+    "step206_sfpu_col_broadcast::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

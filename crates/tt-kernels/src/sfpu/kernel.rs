@@ -58,8 +58,9 @@ pub enum Operands {
     /// (`Program`s read them with [`bias_row`]).
     RowBroadcast,
     /// `A`, and `B`'s first column broadcast across every column: the mover
-    /// makes `B`'s tile so (`tt_isa::dm::op::READ_BROADCAST_COL`), and the
-    /// kernel unpacks it as [`Operands::Binary`] does.
+    /// reads `B`'s tile as it lies (`record::READ_RUN_COL_AS_IT_LIES`), the
+    /// kernel unpacks it as [`Operands::Binary`] does, and the program copies
+    /// column 0 into every column first ([`crate::sfpu::Program::broadcast_col0`]).
     ColBroadcast,
     /// `A`, `B` and `C`, the same shape: `C` to rows `C_ROW..C_ROW + 64`.
     Ternary,

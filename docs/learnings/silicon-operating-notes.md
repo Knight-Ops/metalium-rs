@@ -1150,6 +1150,16 @@ Small moves are bound by the movers' entries, not by GDDR. What a decode step's 
   `1792298755`). Neither the reads' latency nor their bytes bounds it: it is ~96 entries a unit (32 reads, 64
   `COPY_WORDS`), ~0.3 us an entry.
 
+## A column broadcast costs the mover ~10 us a tile (2026-10-19, card 1, profiles `1792363365`, `1792372923`)
+
+`READ_BROADCAST_COL` reads a `[rows, 1]` operand's tile into the scratch slot and then copies column 0 into every
+column with 1,024 single-word stores (`broadcast_col0_from_scratch`). On silicon that is ~10 us a tile: an op with one
+such operand took ~15 us of data phase where the same reads without it take ~4.5 (RMSNorm's `DIV` on 64 units 24.1 us,
+the softmax's 2-unit ops 24.7). Broadcasting in the SFPU instead (`sfpu::Program::broadcast_col0`, seven lane-row
+rotations with the first lane held, ~100 instructions a tile) took them to 14.7 and 15.0 us. Element-wise programs now
+read the column as it lies (`record::READ_RUN_COL_AS_IT_LIES`); `READ_BROADCAST_COL` is left to the integer division's
+programs.
+
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 
 - **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of

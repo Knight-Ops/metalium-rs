@@ -379,8 +379,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
       - the next product's weights prefetched on idle units.
       - **Result:** a 1.7B step **33.02 / 33.52 / 34.42 -> 26.47 / 27.14 / 27.97 ms** (`1792364210`), 135M 14.04 /
         14.45 / 15.02 -> **12.62 / 13.06 / 13.59** (`1792364661`).
-      - **Next:** the small ops (~10 ms, 4.4 of it on 1-2 units, which the prefetch's traffic also slows), then
-        prefetch for the K-blocked `down`.
+      - **Bandwidth (2026-10-19):** the products run at the read ceiling (462 GB/s over their spans); the step's
+        weights stream at 52% of 512 GB/s because ~9-10 ms of small ops sit between the products
+        ([log](../learnings/performance-log.md#where-decodes-bandwidth-stands-and-a-column-broadcast-in-the-sfpu-2026-10-19-cards-0-and-1)).
+      - **The small ops, under way** (decode-to-bandwidth Phase 3, "The small ops, 2026-10-19"): a column operand
+        broadcast by the SFPU, 1.7B **25.48 / 26.18 / 27.01 ms** (`1792372396`), 135M **11.37 / 11.76 / 12.29**
+        (`1792372749`). Next there: the packed RMS statistic, row-dealt stacking gathers, the prefetch's units at long
+        context; then prefetch for the K-blocked `down`.
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.

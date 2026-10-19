@@ -468,6 +468,42 @@ impl Program {
         self.push(encode::sfpshft2(0, s.index(), Self::dst(d), 3).unwrap());
     }
 
+    /// `Dst`'s tile at `at` with its column 0 in every column, as raw bits: datum `(r, c)`
+    /// from `(r, 0)`, the tile the mover's `READ_BROADCAST_COL` makes -- in the row groups
+    /// this program computes ([`with_rows`]). Column 0 is the first lane of each lane row of
+    /// face 0's and face 2's even-column loads; seven rotations within each lane row, its
+    /// first lane held, carry it to the other seven, which are then stored to the group's
+    /// four places (even and odd columns, both faces of its rows). Uses `L0..L4` and `L7`.
+    pub fn broadcast_col0(&mut self, at: u32) {
+        assert!(!self.in_loop, "a broadcast inside a row loop");
+        let bases: Vec<u32> = reduce::row_offsets(self.rows)
+            .into_iter()
+            .filter(|o| o % 4 == 0 && o % 32 < 16)
+            .collect();
+        // `L7` = `2 * (lane & 7)`: zero only in a lane row's first lane.
+        self.loadi_bits(LReg::L7, 14);
+        self.and(LReg::LANE_X2, LReg::L7, LReg::L7);
+        let regs = [LReg::L0, LReg::L1, LReg::L2, LReg::L3];
+        for batch in bases.chunks(regs.len()) {
+            let regs = &regs[..batch.len()];
+            for (&o, &r) in batch.iter().zip(regs) {
+                self.load(r, Format::Int32, at + o);
+            }
+            self.if_(Cond::Ne0(LReg::L7), |p| {
+                for _ in 0..7 {
+                    for &r in regs {
+                        p.rotate_row(r, r);
+                    }
+                }
+            });
+            for (&o, &r) in batch.iter().zip(regs) {
+                for d in [0, 2, 16, 18] {
+                    self.store(r, Format::Int32, at + o + d);
+                }
+            }
+        }
+    }
+
     /// Transpose each lane column's 4x4 block of `L0..L4` (and of `L4..L8`):
     /// lane row `j` of `L[i]` swaps with lane row `i` of `L[j]` (`SFPTRANSP`).
     /// So row `i` of a four-row group held in `L0` ends in row 0 of `L[i]`.

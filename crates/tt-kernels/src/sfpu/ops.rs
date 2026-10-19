@@ -2975,9 +2975,10 @@ pub fn code_for_rows(
 /// The program for `kind` with its second operand broadcast as `bcast`, and
 /// what operands it takes; `None` where there is none. A row broadcast reads
 /// the row's two faces from where the kernel lays them, which depends on the
-/// row group, so its loop is unrolled; a column broadcast reads a whole tile
-/// the mover has made of the column (`READ_BROADCAST_COL`), so its program is
-/// the plain binary one.
+/// row group, so its loop is unrolled; a column broadcast first copies column 0
+/// of `B`'s tile, as it was read, into every column ([`Program::broadcast_col0`],
+/// the tile `READ_BROADCAST_COL` would have made), then runs the plain binary
+/// program.
 pub fn program_for(
     kind: u32,
     scalars: [f32; 2],
@@ -2999,7 +3000,12 @@ pub fn code_for(
     match bcast {
         Broadcast::None => code2(kind, scalars),
         _ if !broadcasts(kind) => None,
-        Broadcast::Col => code2(kind, scalars).map(|(_, p)| (Operands::ColBroadcast, p)),
+        Broadcast::Col => {
+            let (_, math) = code2(kind, scalars)?;
+            let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
+            p.broadcast_col0(B_ROW);
+            Some((Operands::ColBroadcast, p.finish_code().then(math)))
+        }
         Broadcast::Row => {
             let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
             binary_constants(&mut p, kind, scalars);
@@ -3621,15 +3627,12 @@ pub fn reference_op(
                     }
                 }
                 (Operands::ColBroadcast, Some(b)) => {
-                    // As `READ_BROADCAST_COL` makes it: row `r`'s value in
-                    // every column.
-                    let mut t = vec![0u32; 1024];
+                    // As the mover reads it: row `r`'s value in column 0, the
+                    // other columns whatever the slot held (NaN here).
+                    let mut t = vec![0x7fc0_beefu32; 1024];
                     for r in 0..32 {
                         let gr = 32 * i + r;
-                        let v = if gr < rows { b[gr].to_bits() } else { 0 };
-                        for c in 0..32 {
-                            t[face_index(r, c)] = v;
-                        }
+                        t[face_index(r, 0)] = if gr < rows { b[gr].to_bits() } else { 0 };
                     }
                     v.put_tile(B_ROW as usize, &t);
                 }
@@ -5703,6 +5706,134 @@ mod row_limited_tests {
             add1.len(),
             whole.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod col_broadcast_tests {
+    use super::super::interp::Vector;
+    use super::*;
+    use tt_isa::dm::face_index;
+
+    /// Ordinary values and every special value, from `seed`.
+    fn tile(seed: u32) -> Vec<u32> {
+        const SPECIAL: [u32; 9] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x807f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc1_2345,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+        ];
+        let mut s = seed | 1;
+        (0..1024)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if i % 7 == 3 {
+                    return SPECIAL[(s >> 8) as usize % SPECIAL.len()];
+                }
+                (((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 9.0).to_bits()
+            })
+            .collect()
+    }
+
+    /// `math` over `A` and the tile `b` at `B_ROW`, the output primed with NaN.
+    fn run(math: &[Instruction], a: &[u32], b: &[u32]) -> Vec<u32> {
+        let mut v = Vector::new();
+        v.put_tile(OUT_ROW as usize, &vec![0x7fc0_dead; 1024]);
+        v.put_tile(A_ROW as usize, a);
+        v.put_tile(B_ROW as usize, b);
+        v.run(math).unwrap();
+        v.tile(OUT_ROW as usize)
+    }
+
+    /// The tile `READ_BROADCAST_COL` makes of `b`: `(r, c)` from `(r, 0)`.
+    fn mover_broadcast(b: &[u32]) -> Vec<u32> {
+        let mut t = vec![0u32; 1024];
+        for r in 0..32 {
+            for c in 0..32 {
+                t[face_index(r, c)] = b[face_index(r, 0)];
+            }
+        }
+        t
+    }
+
+    /// `b`'s column 0 as the mover reads it plainly, the other columns NaN (whatever the
+    /// slot held).
+    fn as_read(b: &[u32]) -> Vec<u32> {
+        let mut t = vec![0x7fc0_beef; 1024];
+        for r in 0..32 {
+            t[face_index(r, 0)] = b[face_index(r, 0)];
+        }
+        t
+    }
+
+    /// The broadcast alone makes the mover's tile, bit for bit (signed zeros, denormals,
+    /// NaN payloads), in the row groups a program for `rows` rows computes, and leaves the
+    /// rest of `Dst` as it was.
+    #[test]
+    fn the_broadcast_is_the_mover_s_tile() {
+        for seed in 1..4 {
+            let b = tile(seed);
+            for rows in [1u32, 3, 4, 5, 15, 16, 17, 31, 32] {
+                let prologue = super::super::with_rows(rows, || {
+                    let mut p = Program::with_policy(super::super::LoopPolicy::Unrolled);
+                    p.broadcast_col0(B_ROW);
+                    p.finish()
+                });
+                let mut v = Vector::new();
+                v.put_tile(A_ROW as usize, &vec![0x7fc0_aaaa; 1024]);
+                v.put_tile(B_ROW as usize, &as_read(&b));
+                v.run(&prologue).unwrap();
+                assert_eq!(v.tile(A_ROW as usize), vec![0x7fc0_aaaa; 1024]);
+                let (got, want, read) = (v.tile(B_ROW as usize), mover_broadcast(&b), as_read(&b));
+                for r in 0..32 {
+                    for c in 0..32 {
+                        let i = face_index(r, c);
+                        let computed = ((r - r % 4) as u32) < rows;
+                        let want = if computed { want[i] } else { read[i] };
+                        assert_eq!(got[i], want, "seed {seed}, {rows} rows: ({r}, {c})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every kind that takes a column: its program over `B` as read is the plain program
+    /// over the mover's broadcast tile, bit for bit, whole and row-limited. Control: the
+    /// plain program over `B` as read differs (it reads the NaN columns).
+    #[test]
+    fn a_column_program_is_the_plain_one_over_the_mover_s_tile() {
+        let kinds: Vec<u32> = (0..=crate::kind::LAST)
+            .chain(0x100..=kind_sfpu::LAST)
+            .filter(|&k| broadcasts(k))
+            .collect();
+        let mut checked = 0;
+        for &kind in &kinds {
+            for scalars in [[0.75f32, 0.0], [0.5, -2.5]] {
+                let Some((operands, _)) = code_for(kind, scalars, Broadcast::Col) else {
+                    continue;
+                };
+                assert_eq!(operands, Operands::ColBroadcast, "{kind:#x}");
+                for (seed, rows) in [(5u32, 32u32), (6, 1), (7, 17)] {
+                    let (a, b) = (tile(seed), tile(seed + 100));
+                    let (_, col) = code_for_rows(kind, scalars, Broadcast::Col, rows).unwrap();
+                    let (_, plain) = code_for_rows(kind, scalars, Broadcast::None, rows).unwrap();
+                    let got = run(&col.expand(), &a, &as_read(&b));
+                    let want = run(&plain.expand(), &a, &mover_broadcast(&b));
+                    assert_eq!(got, want, "{kind:#x} {scalars:?}, {rows} rows");
+                    if rows == 32 {
+                        let unbroadcast = run(&plain.expand(), &a, &as_read(&b));
+                        assert_ne!(unbroadcast, want, "control, {kind:#x}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 3 * 20, "{checked} programs checked");
     }
 }
 

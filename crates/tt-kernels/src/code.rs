@@ -71,6 +71,17 @@ impl Code {
         }
     }
 
+    /// `self`, then `next`: `next`'s loops moved past `self`'s instructions.
+    pub fn then(mut self, next: Code) -> Code {
+        let shift = self.ins.len() as u32;
+        self.ins.extend(next.ins);
+        self.loops.extend(next.loops.into_iter().map(|l| Loop {
+            start: l.start + shift,
+            ..l
+        }));
+        self
+    }
+
     /// The stream the runner pushes: each loop's range `count` times, as
     /// `tt_firmware::corpus::Pusher::span` walks it.
     pub fn expand(&self) -> Vec<Instruction> {

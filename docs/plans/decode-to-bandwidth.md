@@ -1,8 +1,9 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-18): **a 1.7B step 41.83 / 44.25 / 47.40 -> 26.47 / 27.14 / 27.97 ms (`1792364210`), 135M
-20.03 / 20.55 / 21.19 -> 12.62 / 13.06 / 13.59 (`1792364661`).** The four larger changes are built (below).
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 25.48 / 26.18 / 27.01 ms (`1792372396`), 135M
+20.03 / 20.55 / 21.19 -> 11.37 / 11.76 / 12.29 (`1792372749`).** The four larger changes are built (below), and the
+small ops' phase has begun (Phase 3, "The small ops, 2026-10-19").
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
 - **Phase 1:** done. The copies are gone. The repack's reads run in flight together, and the row scatter and the
   embedding's select run on every unit. The k/v repack is gone with the position-major cache (Phase 2's A-layout).
@@ -15,14 +16,16 @@ Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1
 - **Phase 4:** `A` once a product (a packed `A`), compute under the reads (the m = 1 kernel's rows, a blocked `K`
   streamed).
 - **Phase 5:** the weight stream under the small ops, on idle units.
-- **Where the step goes now** (profile `1792363365`, 1.7B `Step(64)`, 25.61 ms; products partly overlap the small
+- **Bandwidth now** (2026-10-19, [log](../learnings/performance-log.md#where-decodes-bandwidth-stands-and-a-column-broadcast-in-the-sfpu-2026-10-19-cards-0-and-1)):
+  the weights stream at **268.6 GB/s over a timed step, 52% of 512** (`1792372396`; 258.6 before the column
+  broadcast); every byte of a `Step(64)` replay at 308 GB/s, 60% (profile `1792372923`).
+- **Where the step goes now** (profile `1792372923`, 1.7B `Step(64)`, 24.71 ms; products partly overlap the small
   ops now):
-  - the products (and their packing ops) 15.60 ms, 462 GB/s over their own time; their `B` alone would take 14.88
-    at 469 GB/s;
-  - everything else 10.01 ms, 4.37 of it on 1-2 units: RMSNorm's one-unit statistic, the 2-unit softmax ops and
-    the stacking gathers.
-- **Next:** the small ops, especially those on 1-2 units, which the prefetch's GDDR traffic also slows; then
-  prefetch for the K-blocked `down`.
+  - the products (and their packing ops) 15.61 ms, 462 GB/s over their own time: at the read ceiling. Their `B`
+    alone would take 14.88 at 469 GB/s; only `down` (172 us a layer against ~143, not prefetched) is clearly over;
+  - everything else 9.10 ms in four windows between a layer's products, ~3.5 ms of it on 1-2 units: RMSNorm's
+    one-unit statistic, the stacking gathers, the 2-unit softmax ops.
+- **Next:** the rest of Phase 3's small-ops sequence (below); then prefetch for the K-blocked `down`.
 
 This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
@@ -232,6 +235,31 @@ Burn model gains.
   - **Measured** (card 1):
     - 1.7B 36.12 / 36.52 / 37.54 -> **35.64 / 36.22 / 37.20 ms** (`1792290295`);
     - 135M 14.80 / 15.29 / 15.86 -> **14.43 / 14.92 / 15.46** (`1792290681`, burn-flex 26.9 / 29.1 / 31.1).
+- **The small ops, 2026-10-19.** From profile `1792363365`: ~424 us a layer of small ops in four windows between
+  products, which the prefetch (~43 us of stream a product) cannot hide. In order of worth and risk, each bit for bit
+  and re-profiled before the next:
+  - [x] **A column broadcast in the SFPU** (~1.0 ms). A `[rows, 1]` operand was broadcast by the mover a datum at a
+    time (`READ_BROADCAST_COL`, ~10 us a tile). The mover now reads its tile as it lies
+    (`record::READ_RUN_COL_AS_IT_LIES`), and the program copies column 0 across in `Dst` first
+    (`sfpu::Program::broadcast_col0`), bit for bit the mover's tile.
+    - **Gates:** unit `col_broadcast_tests` (watched failing with six rotations, and with a row group skipped);
+      `step206_sfpu_col_broadcast` (ttsim, the column's padding NaN in GDDR; watched failing with the broadcast
+      dropped; card 0 `1792371974`, and `1792372371` in the guarded fast-read image); record unit test.
+    - **Regression:** ttsim `step30`, `step43`, `step121`, `step183`, `step184`, `step187`, `step193`, `step195`,
+      `step196`, `step199`, `step200`, `step12_mnist`; `step172`/`step173` in three images; firmware clippy x4;
+      Burn conformance 2,973 passed, 52 as expected; card 0 45 of 45 (`1792371974`).
+    - **Measured:** RMSNorm's `DIV` 24.1 -> 14.7 us, the softmax's 2-unit ops 24.7 -> 15.0 us, the replay 25.61 ->
+      24.71 ms (profile `1792372923`). 1.7B 26.47 / 27.14 / 27.97 -> **25.48 / 26.18 / 27.01 ms** (`1792372396`);
+      135M 12.62 / 13.06 / 13.59 -> **11.37 / 11.76 / 12.29** (`1792372749`).
+  - [ ] **RMSNorm's statistic from the packed row** (~0.9 ms): `pack_row`'s `[K / 32, 32]` row `kk` is tile `kk`'s
+    data row, so a sum down its rows takes each lane's squares in the same order; 2 tiles read on the statistic's
+    unit, not 64 entries.
+  - [ ] **Row-dealt stacking gathers** in attention (~0.8 ms): `gather_rows` deals by output tile, so a `[32, 64]`
+    output's 64 row reads land on 2 units.
+  - [ ] **The prefetch keeps its units at long context** (~0.4 ms at `Step(512)`): in a capture, non-product ops capped
+    at `THIN_STREAM_UNITS`.
+  - [ ] **Decision (ask the user):** RoPE over `q|k` in one pass (a model-code change), a cheaper barrier (firmware), or
+    `x / stat * gamma` as one op (burn-fusion's `Reshape` block).
 - [ ] **The other chain fusers** (`burn-tt` `fusion/chain.rs`):
   - RMSNorm's `x / stat * gamma` as one body. Today `gamma`'s `Reshape` puts the product in a block of its own, so
     the fuser cannot see it (decode-small-ops S3, R0).

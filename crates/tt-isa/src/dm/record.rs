@@ -92,8 +92,12 @@ pub const FILL_PAD: u32 = 0x14;
 /// reduction over rows reads a column of tiles in; bit 3: each tile `(i, j)`
 /// of the run is `X`'s tile `(j, i)` transposed ([`op::READ_TRANSPOSED`]) --
 /// a block of `X` read as its transpose, for a block copy (not with bits
-/// 0-2).
+/// 0-2); bit 4, with bit 1: tile `(i, 0)` read as it lies ([`op::READ`]), its
+/// column 0 left for the kernel to broadcast ([`READ_RUN_COL_AS_IT_LIES`]).
 pub const READ_RUN: u32 = 0x15;
+/// [`READ_RUN`]'s flags for a `[m, 1]` tensor met by a `[m, n]` one whose kernel
+/// broadcasts column 0 itself: tile `(i, 0)` for every `(i, j)`, read plainly.
+pub const READ_RUN_COL_AS_IT_LIES: u32 = 2 | 16;
 /// A run of whole tiles' datums, L1 -> GDDR: `[WRITE_RUN, first, count, at,
 /// 0, 0, 0, 0]` + `X`. Slot `n` from `at` (its datums, past the header) to
 /// tile `first + n` of `X`, row-major. What a kernel's packer wrote goes back.
@@ -671,7 +675,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     None if transposed => x.tile(j, i)?,
                     None => x.tile(if row { 0 } else { i }, if col { 0 } else { j })?,
                 };
-                let op = if col {
+                let op = if col && flags & 16 == 0 {
                     op::READ_BROADCAST_COL
                 } else if transposed {
                     op::READ_TRANSPOSED
@@ -1197,6 +1201,23 @@ mod tests {
         .unwrap();
         let want: Vec<_> = (1..6).map(|n| a.tile(n % 3, n / 3).unwrap()).collect();
         assert_eq!(got, want, "transposed run");
+        // A column broadcast over a 3-wide grid: tile `(i, 0)` for every
+        // `(i, j)`, through `READ_BROADCAST_COL`, or read as it lies.
+        for (flags, want_op) in [
+            (2, op::READ_BROADCAST_COL),
+            (READ_RUN_COL_AS_IT_LIES, op::READ),
+        ] {
+            let head = [READ_RUN, 1, 5, 0x2_0000, flags, 3, 0, 0];
+            let mut got = Vec::new();
+            expand(&[head, a0, a1], |e| {
+                assert_eq!(e[0], want_op, "flags {flags}");
+                got.push((e[1], e[3]));
+                Ok(())
+            })
+            .unwrap();
+            let want: Vec<_> = (1..6).map(|n| a.tile(n / 3, 0).unwrap()).collect();
+            assert_eq!(got, want, "column run, flags {flags}");
+        }
         // Not with a broadcast or column-major order.
         for flags in [9, 10, 12] {
             let head = [READ_RUN, 0, 1, 0x2_0000, flags, 3, 2, 0];
