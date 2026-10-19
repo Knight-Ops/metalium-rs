@@ -354,6 +354,33 @@ fn even_strides(pairs: &[(u64, u64)]) -> Option<(u64, u64)> {
         .then_some(first)
 }
 
+/// Fewest pairs a run of [`even_runs`] may hold for a kernel to step by runs rather than
+/// retarget every pair.
+const MIN_EVEN_RUN: usize = 4;
+
+/// `pairs` cut into maximal runs each evenly spaced as [`even_strides`] needs: `(first, length,
+/// (da, db))`, a run of one taking a zero step.
+fn even_runs(pairs: &[(u64, u64)]) -> Vec<(usize, usize, (u64, u64))> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < pairs.len() {
+        let mut end = start + 1;
+        let mut stride = (0, 0);
+        if end < pairs.len() {
+            if let Some(s) = even_strides(&pairs[start..=end]) {
+                stride = s;
+                while end + 1 < pairs.len() && even_strides(&pairs[end..=end + 1]) == Some(s) {
+                    end += 1;
+                }
+                end += 1;
+            }
+        }
+        runs.push((start, end - start, stride));
+        start = end;
+    }
+    runs
+}
+
 /// [`retarget`] to the pair `(a_tile, b_tile)`, with each base and its stride
 /// left in the GPRs [`gpr_step`] adds: `SETDMAREG`s, then the bases written
 /// to the unpackers.
@@ -535,6 +562,7 @@ pub fn matmul_roles(
 /// `allow_mop` false lowers with `REPLAY` alone: on ttsim, whose frontend
 /// FIFO takes a `MOP`'s whole expansion without backpressure and overflows
 /// where silicon would stall the expander (divergence row 68).
+#[allow(clippy::too_many_arguments)]
 pub fn matmul_kernel(
     outputs: &[OutputTile],
     sems: MatmulSemaphores,
@@ -543,9 +571,18 @@ pub fn matmul_kernel(
     fidelity: Fidelity,
     allow_mop: bool,
     b_transposed: bool,
+    live: LiveRows,
 ) -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]) {
-    let [unpack, math, pack] =
-        matmul_items_reloading(outputs, sems, in_fmt, out_fmt, fidelity, None, b_transposed);
+    let [unpack, math, pack] = matmul_items_reloading(
+        outputs,
+        sems,
+        in_fmt,
+        out_fmt,
+        fidelity,
+        None,
+        b_transposed,
+        live,
+    );
     // With `allow_mop`, a `MOP` on the math role only: on silicon (row AE) one
     // on the unpack or pack role made MNIST inference slower (0.487 -> 0.500,
     // 0.528 ms a batch), and the math role's is no faster end to end on the
@@ -563,6 +600,111 @@ pub fn matmul_kernel(
 /// spaced.
 const UNPACK_FACES: u32 = 1;
 
+/// Whether a product's last tile row computes only its own rows ([`LiveRows::for_job`]): on by
+/// default.
+static TRIM_ROWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn [`LiveRows::for_job`]'s trim on or off (a gate's control, a benchmark's comparison).
+/// Process-wide; the program caches key on the rows computed.
+pub fn set_trim_rows(on: bool) {
+    TRIM_ROWS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The rows of each output tile a kernel computes: the rest are left as `ZEROACC` (or a K
+/// block's reload) left them. A product whose output rows past `m` are padding (a decode
+/// product's one row) needs only the `MVMUL`s that write its rows: `A`'s faces `(0, k)` and the
+/// first eight rows of `SrcB`. Each computed row takes the same products in the same order as
+/// [`LiveRows::All`]'s, so its bits are the same; the rows left out are zero, which every padding
+/// claim ([`crate::tensor::Pad`]) allows.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LiveRows {
+    /// All 32.
+    All,
+    /// Rows 0-15: `A`'s faces `(0, k)` only.
+    Sixteen,
+    /// Rows 0-7: `A`'s faces `(0, k)` and the first half of `SrcB`.
+    Eight,
+}
+
+impl LiveRows {
+    /// The fewest rows that compute the first `rows` of a tile (`1..=32`).
+    pub fn for_rows(rows: usize) -> Self {
+        match rows {
+            1..=8 => LiveRows::Eight,
+            9..=16 => LiveRows::Sixteen,
+            _ => LiveRows::All,
+        }
+    }
+
+    /// What a job of `rows` output tile rows from tile row `i0` computes, of a product of `m`
+    /// rows: its rows' worth when it is the product's last tile row alone, else every row.
+    /// Every row while [`set_trim_rows`] has it off.
+    pub fn for_job(m: usize, i0: usize, rows: usize) -> Self {
+        let mt = m.div_ceil(32);
+        if rows == 1 && i0 + 1 == mt && TRIM_ROWS.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::for_rows(m - 32 * (mt - 1))
+        } else {
+            LiveRows::All
+        }
+    }
+
+    /// `A`'s face rows (`fi`) unpacked: 1 or 2.
+    fn face_rows(self) -> u32 {
+        match self {
+            LiveRows::All => 2,
+            LiveRows::Sixteen | LiveRows::Eight => 1,
+        }
+    }
+
+    /// `SrcB`'s eight-row halves multiplied: 1 or 2.
+    fn halves(self) -> u32 {
+        match self {
+            LiveRows::Eight => 1,
+            LiveRows::All | LiveRows::Sixteen => 2,
+        }
+    }
+}
+
+/// `outputs` with each pair's `A` tile where a packed `A` ([`crate::tensor::pack_row`]) holds
+/// it: its packed tiles read into the slots from `a_at`, the first holding `K` tile `k0 / 32 *
+/// 32`, and pair `q` this block's `K` tile `k0 + q`. The unpacker reads a face as 16 rows of 64
+/// bytes from its base (past a 16-byte header): `K` tile `kk`'s faces `(0, 0)` and `(0, 1)`
+/// start at row `kk % 16` of the packed faces `((kk % 32) / 16, 0)` and `((kk % 32) / 16, 1)`,
+/// which are 1024 bytes apart as a tile's faces `(0, 0)` and `(0, 1)` are. So `SrcB`'s row 0 is
+/// `K` tile `kk`'s row 0, and its other rows hold later packed rows, which only reach output
+/// rows past the one a packed product has.
+pub fn packed_a_pairs(outputs: &[OutputTile], a_at: u64, k0: usize) -> Vec<OutputTile> {
+    packed_a_pairs_from(outputs, a_at, k0 / 32, k0)
+}
+
+/// [`packed_a_pairs`] with the slots from `a_at` holding the packed tiles from `first` on (a
+/// K-streamed product's whole packed `A`, `first` 0).
+pub fn packed_a_pairs_from(
+    outputs: &[OutputTile],
+    a_at: u64,
+    first: usize,
+    k0: usize,
+) -> Vec<OutputTile> {
+    outputs
+        .iter()
+        .map(|o| OutputTile {
+            pairs: o
+                .pairs
+                .iter()
+                .enumerate()
+                .map(|(q, &(_, b))| {
+                    let kk = k0 + q;
+                    let tile = (kk / 32 - first) as u64;
+                    let r = (kk % 32) as u64;
+                    let a = a_at + tile * tt_isa::dm::TILE_SLOT + (r / 16) * 2048 + (r % 16) * 64;
+                    (a, b)
+                })
+                .collect(),
+            out: o.out,
+        })
+        .collect()
+}
+
 /// Continuation state: the prior FP32 tile and the two-way reset/load handshake.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Reload {
@@ -573,7 +715,16 @@ pub(crate) struct Reload {
 
 /// One-output K block, with a separate prior tile and declared handshakes.
 pub(crate) fn k_block_layout(kt: usize) -> Result<(Layout, Reload), crate::runtime::RunError> {
-    let mut m = matmul_requirements([1, kt, 1]);
+    k_block_layout_with(kt, kt)
+}
+
+/// [`k_block_layout`] with `a_slots` slots for `A`: a packed `A`'s, `ceil(kt / 32) + 1` (a block's
+/// `K` range may start inside a packed tile).
+pub(crate) fn k_block_layout_with(
+    kt: usize,
+    a_slots: usize,
+) -> Result<(Layout, Reload), crate::runtime::RunError> {
+    let mut m = matmul_requirements_with([1, kt, 1], a_slots);
     let prior = m
         .req
         .scratch("matmul prior", tt_isa::dm::TILE_SLOT, 64, 0..1);
@@ -615,6 +766,100 @@ pub(crate) fn k_block_layout(kt: usize) -> Result<(Layout, Reload), crate::runti
     ))
 }
 
+/// The L1 of a one-row product streamed over `K` in chunks of `kq` tiles ([`k_stream_layout`]):
+/// a packed `A` read once, and two halves, each a chunk's `B` and an output slot. Chunk `c` runs
+/// in half `c % 2`; it reloads the partial chunk `c - 1` packed in the other half's output slot
+/// ([`Reload`], the K block's FP32 reload, from L1 rather than GDDR), and packs its own into its
+/// half's. So the mover reads chunk `c + 1` while chunk `c` computes, and only a column's last
+/// chunk is written out.
+#[derive(Clone, Debug)]
+pub(crate) struct StreamLayout {
+    pub a_at: u64,
+    pub b_at: [u64; 2],
+    /// Each half's output slot (its first byte: the packer writes past the header).
+    pub out: [u64; 2],
+    pub sems: MatmulSemaphores,
+    pub cleared: Semaphore,
+    pub loaded: Semaphore,
+    pub init: Vec<crate::runtime::SemaphoreInit>,
+}
+
+impl StreamLayout {
+    /// Chunk `c` (its `K` tiles from `k0`, `kq` of them) as a K block: its layout, `A`'s pairs
+    /// in the packed `A`, and its reload of the partial before it.
+    pub fn chunk(&self, c: usize, k0: usize, kq: usize) -> (Layout, Option<Reload>) {
+        let h = c % 2;
+        let outputs = vec![OutputTile {
+            pairs: (0..kq)
+                .map(|q| (self.a_at, self.b_at[h] + q as u64 * tt_isa::dm::TILE_SLOT))
+                .collect(),
+            out: self.out[h] + tt_isa::dm::TILE_DATA,
+        }];
+        let layout = Layout {
+            a_at: self.a_at,
+            b_at: self.b_at[h],
+            outputs: packed_a_pairs_from(&outputs, self.a_at, 0, k0),
+            sems: self.sems,
+            init: self.init.clone(),
+        };
+        let reload = (c > 0).then_some(Reload {
+            prior: self.out[1 - h],
+            cleared: self.cleared,
+            loaded: self.loaded,
+        });
+        (layout, reload)
+    }
+}
+
+/// [`StreamLayout`] for chunks of `kq` `K` tiles and a packed `A` of `a_slots` tiles.
+pub(crate) fn k_stream_layout(
+    kq: usize,
+    a_slots: usize,
+) -> Result<StreamLayout, crate::runtime::RunError> {
+    use crate::l1::{Endpoint, Requirements};
+    use tt_isa::dm::TILE_SLOT;
+    let mut req = Requirements::new(1);
+    let mut ring = |name, pages: usize, from, to| {
+        req.cb(
+            name,
+            TILE_SLOT,
+            pages as u32,
+            tt_isa::dram::ALIGN,
+            from,
+            to,
+            0..1,
+        )
+    };
+    let a = ring("matmul A", a_slots, Endpoint::Mover, Endpoint::Unpack);
+    let b = [
+        ring("matmul B, half 0", kq, Endpoint::Mover, Endpoint::Unpack),
+        ring("matmul B, half 1", kq, Endpoint::Mover, Endpoint::Unpack),
+    ];
+    let out = [
+        ring("matmul out, half 0", 1, Endpoint::Pack, Endpoint::Mover),
+        ring("matmul out, half 1", 1, Endpoint::Pack, Endpoint::Mover),
+    ];
+    let sems = MatmulSemaphores::declare(&mut req, 0..1);
+    let cleared = req.semaphore("matmul cleared", 0, 0..1);
+    let loaded = req.semaphore("matmul loaded", 0, 0..1);
+    let plan = req
+        .plan(tt_isa::l1::DATA)
+        .map_err(|_| crate::runtime::RunError::DoesNotFit {
+            what: "a K-streamed matmul",
+            bytes: (a_slots + 2 * kq + 2) as u64 * TILE_SLOT,
+            limit: tt_isa::l1::DATA.len(),
+        })?;
+    Ok(StreamLayout {
+        a_at: plan.addr(a),
+        b_at: b.map(|b| plan.addr(b)),
+        out: out.map(|o| plan.addr(o)),
+        sems: MatmulSemaphores::planned(&plan, sems),
+        cleared: plan.semaphore(cleared),
+        loaded: plan.semaphore(loaded),
+        init: plan.semaphore_init(),
+    })
+}
+
 /// First/continuation programs share the Matrix Unit's original product order.
 pub(crate) fn k_block_kernel(
     layout: &Layout,
@@ -622,6 +867,7 @@ pub(crate) fn k_block_kernel(
     route: SrcRoute,
     fidelity: Fidelity,
     b_transposed: bool,
+    live: LiveRows,
 ) -> [Vec<Instruction>; 3] {
     let (in_fmt, out_fmt) = route.formats();
     let items = matmul_items_reloading(
@@ -632,6 +878,7 @@ pub(crate) fn k_block_kernel(
         fidelity,
         reload,
         b_transposed,
+        live,
     );
     items.map(|items| crate::loops::lower_with(&items, false).words)
 }
@@ -660,7 +907,16 @@ pub fn matmul_items(
     out_fmt: u32,
     fidelity: Fidelity,
 ) -> [Vec<Item>; 3] {
-    matmul_items_reloading(outputs, sems, in_fmt, out_fmt, fidelity, None, false)
+    matmul_items_reloading(
+        outputs,
+        sems,
+        in_fmt,
+        out_fmt,
+        fidelity,
+        None,
+        false,
+        LiveRows::All,
+    )
 }
 
 /// [`matmul_items`], continuing a K block's accumulator from `reload`'s prior tile when given,
@@ -668,7 +924,9 @@ pub fn matmul_items(
 /// transposes within each face (`Haloize_mode`, [`tt_isa::unpacker::stage_transpose`]) and `B`'s
 /// face `(k, fj)` is unpacked from the slot's face `(fj, k)`, so the mover reads the stored tile
 /// as it lies (`record::GATHER_B_UNPACK_TRANSPOSE`). The unpack converts each datum as it does
-/// untransposed, so `SrcA` holds the same values the mover's own transpose would give it.
+/// untransposed, so `SrcA` holds the same values the mover's own transpose would give it. Only
+/// `live`'s rows of each output tile are computed ([`LiveRows`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_items_reloading(
     outputs: &[OutputTile],
     sems: MatmulSemaphores,
@@ -677,6 +935,7 @@ pub(crate) fn matmul_items_reloading(
     fidelity: Fidelity,
     reload: Option<Reload>,
     b_transposed: bool,
+    live: LiveRows,
 ) -> [Vec<Item>; 3] {
     assert!(
         outputs.iter().all(|o| !o.pairs.is_empty()),
@@ -707,18 +966,24 @@ pub(crate) fn matmul_items_reloading(
     let mut pack: Vec<Item> = Vec::new();
     let base = encode::UnpacrRegular::ZERO.multi_context_mode(1);
     let phases = fidelity.phases();
+    let (face_rows, halves) = (live.face_rows(), live.halves());
     // Each `MVMUL` names its `Dst` row within its `fi` -- the same for both --
     // and the RWCs' `Dst` holds the `fi`'s base, which only the last `MVMUL`
     // of an `fi` moves ([`math_prelude`], `MATH_AM_*`).
     let mv = |row: u32, am: u32| encode::Mvmul::ZERO.dst_row(row).addr_mod(am);
-    // One `MVMUL` group into rows `dst..dst + 16` of the `fi` -- both `SrcB`
-    // halves, every phase -- all but its last `MVMUL`, which the caller issues
-    // with the group's flips and its end.
+    // One `MVMUL` group into rows `dst..dst + 8 halves` of the `fi` -- each
+    // `SrcB` half it computes, every phase -- all but its last `MVMUL`, which
+    // the caller issues at `dst + 8 (halves - 1)` with the group's flips and
+    // its end.
     let group = |out: &mut Vec<Instruction>, dst: u32, mut loaded: Banks<Loaded, Loaded>| {
-        for half in 0..2u32 {
-            let last = if half == 0 { phases } else { phases - 1 };
+        for half in 0..halves {
+            let last = if half + 1 < halves {
+                phases
+            } else {
+                phases - 1
+            };
             for phase in 0..last {
-                let am = if half == 0 && phase + 1 == phases {
+                let am = if half + 1 < halves && phase + 1 == phases {
                     MATH_AM_HALF
                 } else {
                     MATH_AM_PHASE
@@ -748,7 +1013,8 @@ pub(crate) fn matmul_items_reloading(
     let mut ub = Vec::new();
     let mut unit: Option<Vec<Instruction>> = None;
     let mut banks = Banks::after_reset();
-    for fi in 0..2u32 {
+    let last_row = 8 * (halves - 1);
+    for fi in 0..face_rows {
         let mut mb = Vec::new();
         for k in 0..2u32 {
             // `A` is in0 and goes to `SrcB`: its face `(fi, k)`.
@@ -760,14 +1026,14 @@ pub(crate) fn matmul_items_reloading(
             let (u, both) = with_b.unpack_a(base).unwrap();
             ub.push(u);
             let loaded = group(&mut mb, 0, both);
-            let (m, only_b) = loaded.mvmul_release_a(mv(8, MATH_AM_GROUP)).unwrap();
+            let (m, only_b) = loaded.mvmul_release_a(mv(last_row, MATH_AM_GROUP)).unwrap();
             mb.push(m);
             ub.push(zw(Unpacker::SrcA, b_face(k, 1)));
             let (u, both) = only_b.unpack_a(base).unwrap();
             ub.push(u);
             let loaded = group(&mut mb, 16, both);
             let end = if k == 0 { MATH_AM_GROUP } else { MATH_AM_FI };
-            let (m, empty) = loaded.mvmul_release_both(mv(24, end)).unwrap();
+            let (m, empty) = loaded.mvmul_release_both(mv(16 + last_row, end)).unwrap();
             mb.push(m);
             banks = empty;
         }
@@ -792,7 +1058,7 @@ pub(crate) fn matmul_items_reloading(
         vec![
             Item::I(reset),
             Item::Repeat {
-                times: 2,
+                times: face_rows,
                 body: i(unit.iter().copied()).collect(),
             },
         ]
@@ -828,6 +1094,7 @@ pub(crate) fn matmul_items_reloading(
         } else {
             math.push(Item::I(encode::zeroacc(3, 0, 0, 0).unwrap()));
         }
+        let runs = even_runs(&output.pairs);
         match even_strides(&output.pairs) {
             // Pairs evenly spaced in L1 (how the gather stages them): the
             // tiles are stepped by GPR arithmetic, so every pair is the same
@@ -843,6 +1110,24 @@ pub(crate) fn matmul_items_reloading(
                     body: pair_math.clone(),
                 });
                 // Where the last step left the bases: one stride past the last pair.
+                current = (u64::MAX, u64::MAX);
+            }
+            // Runs of evenly spaced pairs (a packed `A`'s 16 rows a face, [`packed_a_pairs`]):
+            // each run a loop of its own, from bases set once a run.
+            None if runs.iter().all(|r| r.1 >= MIN_EVEN_RUN) => {
+                for &(start, n, (da, db)) in &runs {
+                    let (a, b) = output.pairs[start];
+                    unpack.extend(i(gpr_retarget(a, b, da, db)));
+                    let body: Vec<Item> = i(ub.iter().copied()).chain(i(gpr_step())).collect();
+                    unpack.push(Item::Repeat {
+                        times: n as u32,
+                        body,
+                    });
+                }
+                math.push(Item::Repeat {
+                    times: output.pairs.len() as u32,
+                    body: pair_math.clone(),
+                });
                 current = (u64::MAX, u64::MAX);
             }
             None => {
@@ -1308,6 +1593,12 @@ pub fn plan_layout_in(
 /// the unpacker, and the output tiles, a ring from the packer back to the
 /// mover -- planned in the data arena. One stage, so all three live at once.
 pub fn matmul_requirements([mt, kt, nt]: [usize; 3]) -> MatmulBuffers {
+    matmul_requirements_with([mt, kt, nt], mt * kt)
+}
+
+/// [`matmul_requirements`] with `a_slots` slots for `A` (a packed `A`'s few,
+/// [`packed_a_pairs`]).
+pub fn matmul_requirements_with([mt, kt, nt]: [usize; 3], a_slots: usize) -> MatmulBuffers {
     use crate::l1::{Endpoint, Requirements};
     use tt_isa::dm::TILE_SLOT;
     let mut req = Requirements::new(1);
@@ -1327,7 +1618,7 @@ pub fn matmul_requirements([mt, kt, nt]: [usize; 3]) -> MatmulBuffers {
     let a = ring(
         &mut req,
         "matmul A",
-        mt * kt,
+        a_slots,
         Endpoint::Mover,
         Endpoint::Unpack,
     );
@@ -1563,9 +1854,14 @@ pub fn matmul_with(
     let (in_fmt, out_fmt) = route.formats();
     let staged = stage_matmul(a, b, m, k, n, in_fmt)?;
     let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
-    let roles = programs((tiles, Staging::Host), route, fidelity, staged.sems, || {
-        matmul_roles(&staged.outputs, staged.sems, in_fmt, out_fmt, fidelity)
-    });
+    let roles = programs(
+        (tiles, Staging::Host),
+        route,
+        fidelity,
+        staged.sems,
+        LiveRows::All,
+        || matmul_roles(&staged.outputs, staged.sems, in_fmt, out_fmt, fidelity),
+    );
     let [unpack, math, pack] = &*roles;
     let stage = [
         (MATMUL_STAGE, staged.a.as_slice()),
@@ -1613,9 +1909,14 @@ pub fn chunk_fits_in(
     let Ok(layout) = plan_layout_in(tiles, in_fmt, staging) else {
         return false;
     };
-    let roles = programs((tiles, staging), route, fidelity, layout.sems, || {
-        matmul_roles(&layout.outputs, layout.sems, in_fmt, out_fmt, fidelity)
-    });
+    let roles = programs(
+        (tiles, staging),
+        route,
+        fidelity,
+        layout.sems,
+        LiveRows::All,
+        || matmul_roles(&layout.outputs, layout.sems, in_fmt, out_fmt, fidelity),
+    );
     roles
         .iter()
         .all(|p| p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize)
@@ -1632,17 +1933,24 @@ pub(crate) fn programs(
     route: SrcRoute,
     fidelity: Fidelity,
     sems: MatmulSemaphores,
+    live: LiveRows,
     build: impl FnOnce() -> [Vec<Instruction>; 3],
 ) -> std::sync::Arc<[Vec<Instruction>; 3]> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     // The semaphores are part of the programs: the same shape planned beside
     // another kernel may be given different ones.
-    type Key = (([usize; 3], Staging), SrcRoute, Fidelity, MatmulSemaphores);
+    type Key = (
+        ([usize; 3], Staging),
+        SrcRoute,
+        Fidelity,
+        MatmulSemaphores,
+        LiveRows,
+    );
     type Roles = Arc<[Vec<Instruction>; 3]>;
     static CACHE: OnceLock<Mutex<HashMap<Key, Roles>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, route, fidelity, sems);
+    let key = (tiles, route, fidelity, sems, live);
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
     }
@@ -1656,12 +1964,13 @@ pub(crate) fn programs(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn kernel_programs(
     tiles: [usize; 3],
-    half: u8,
+    half: u32,
     route: SrcRoute,
     fidelity: Fidelity,
     sems: MatmulSemaphores,
     allow_mop: bool,
     b_transposed: bool,
+    live: LiveRows,
     build: impl FnOnce() -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]),
 ) -> (
     std::sync::Arc<[Vec<Instruction>; 3]>,
@@ -1670,20 +1979,31 @@ pub(crate) fn kernel_programs(
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     // `half`: the half of a double-buffered pair (`Staging::SlotsHalf`), whose
-    // programs name addresses `HALF` apart under the same semaphores.
+    // programs name addresses `HALF` apart under the same semaphores -- or any
+    // other layout a caller tells apart (a K-streamed chunk's).
     type Key = (
         [usize; 3],
-        u8,
+        u32,
         SrcRoute,
         Fidelity,
         MatmulSemaphores,
         bool,
         bool,
+        LiveRows,
     );
     type Value = (Arc<[Vec<Instruction>; 3]>, [Option<MopConfig>; 3]);
     static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, half, route, fidelity, sems, allow_mop, b_transposed);
+    let key = (
+        tiles,
+        half,
+        route,
+        fidelity,
+        sems,
+        allow_mop,
+        b_transposed,
+        live,
+    );
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
     }
@@ -2036,6 +2356,7 @@ mod loop_tests {
                     f,
                     true,
                     false,
+                    LiveRows::All,
                 );
                 for r in 0..3 {
                     let got = crate::loops::frontend_stream(&words[r], mop[r].as_ref()).unwrap();

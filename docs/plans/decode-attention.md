@@ -1,7 +1,7 @@
 # Decode attention
 
 Phase 2 of [decode-to-bandwidth.md](decode-to-bandwidth.md). Written 2026-10-17 against `c69b9c1`. Status:
-**planned; A0 next.** It follows S4 of [decode-small-ops.md](decode-small-ops.md) (the row gathers and the softmax),
+**A0, A0b, A1, A2a, A4a, A4b and the A-layout done (2026-10-18); A2, A3 and A5 open.** It follows S4 of [decode-small-ops.md](decode-small-ops.md) (the row gathers and the softmax),
 which it replaces.
 
 ## Why this item
@@ -46,16 +46,41 @@ A 1.7B decode step spends **~5.2 ms on attention at `Step(64)`** and **~10.9 ms 
 
 Every phase is bit for bit with today's attention, and each head's positions keep their order.
 
-- [ ] **A-layout. The cache's layout, decided first.** Today it is head-major, `[1, kv, L, d]`.
-  - **The cost:** a step's key and value repack into it at every write (38 us each, 1.83 ms a 1.7B step;
+- [x] **A-layout. The cache is position-major** (2026-10-18). It was head-major, `[1, kv, L, d]`.
+  - **The cost was:** a step's key and value repacked into it at every write (31 us each, 1.5 ms a 1.7B step;
     in-place-cache-write D5). Each head's new row is a column block of the projection's one row.
-  - **The alternative:** a position-major cache, `[L, kv * d]`. The write is then the projection's row as it is (a
-    one-index row scatter), and each head's keys are a tile-aligned column block over all positions.
-  - **What attention would read:**
-    - `qk` as `K_h q_h^T`: `A` is the head's block, untransposed;
-    - `pv` with `V_h` as an untransposed block `B`.
-
-  Decide it with A0's numbers: it changes `FixedCache`, the prefill chunks' write and attention's operand forms.
+  - **Now:** `FixedCache` stores `[1, 1, L, kv * d]` when `head_dim` is a multiple of 32
+    (`tt_models::kv_cache::CacheLayout::for_heads`). Otherwise it stays head-major, since a head's block would not
+    be whole tiles.
+    - **The write:** the projection's row as it is, `new.swap_dims(1, 2).reshape([1, kv * d])`, a one-index row
+      scatter.
+    - **A chunk:** writes its `[c, kv * d]` rows by position.
+  - **What attention reads:** `FixedWrite::attended` gives the same head-major view, `[1, kv, len, d]`.
+    - Head `h` is the column block `h d` of the positions' rows, read in place.
+    - `qk` stays `q K^T` (`K` through the unpacker's transpose, A0b) and `pv` reads `V`'s block. The tiles are the
+      same in the same order.
+    - Not `K_h q_h^T`: swapping the operands between `SrcA` and `SrcB` is not known to keep the bits.
+  - **Unchanged:** `Llama`, the GPT decoder and Burn's API.
+  - **The fallbacks:**
+    - A ragged attended length makes its operands plain (a repack). Traced steps attend multiples of 32.
+    - The fused `v` sits at a column offset in `qkv`, so its row is copied once (6 us a layer). A row scatter that
+      reads values at a column offset would remove it.
+  - **Gate:** `step199::a_position_major_cache_writes_the_projection_s_row_as_it_is` (ttsim; card 0
+    `1792336651`):
+    - **No repack:** a synthetic GQA Llama's decode steps have no `native repack`.
+    - **The negative control:** the same model over a head-major cache (`Llama::fixed_cache_in`) repacks (6 in
+      its 3 step traces: the value's row in each layer).
+    - **Bits:** its generation is the head-major one's, token for token and bit for bit, at step lengths 32, a
+      ragged 48 and 128, after a two-chunk prefill.
+  - **Regression:**
+    - ttsim: `step185`, `step187`, `step193` (with the weights), `step197`, `step199`, the `tt-models` tests;
+    - card 0 `1792336651`: `step187`, `step188` (the 1.7B, traced against eager), `step193`, `step199`.
+    - `--smoke` on card 0: 1,124 of 1,124 (`1792338013`).
+  - **Measured** (card 1):
+    - 1.7B 33.02 / 33.52 / 34.42 -> **31.72 / 32.31 / 33.21 ms** (`1792337485`, burn-flex 295.8 / 312.8 / 331.8);
+    - 135M 14.04 / 14.45 / 15.02 -> **13.71 / 14.16 / 14.66** (`1792337842`);
+    - profile `1792336760` (`Step(64)`): the replay 32.32 -> 30.91 ms, and the cache write's ops 96 -> 72 at 1.94
+      -> 0.64 ms.
 - [x] **A0. Profile by sub-op** (profile `1792264052`). **Why `qk` reads K at ~30 GB/s:**
   - **Not the deal or `block_fits`:** at `Step(512)` the product is ~11 read entries a unit on 120 units, and
     still 138 us of data.
@@ -127,7 +152,8 @@ Every phase is bit for bit with today's attention, and each head's positions kee
   - or the batched product reads thin `A` rows in place, as the decode projections already do (`thin`), and writes
     thin output rows.
 
-  **Worth:** −1.7 ms at `Step(64)`, −3.7 at `Step(512)`.
+  **Worth:** −1.36 ms at `Step(64)`, −1.56 at `Step(512)`. That is re-measured after A2a (profile `1792298755`):
+  the two stacking gathers on 2 units (22 us each a layer), `P`'s gather (5 us) and the context's repack (6-8 us).
 - [ ] **A3. K and V read in place at the read ceiling.**
   - The cache keeps tile-aligned per-head blocks at every attended length.
   - `qk` and `pv` are dealt over 120 units by head, with each head's positions on one unit.

@@ -99,6 +99,15 @@ pub const THIN_STREAM_UNITS: usize = 64;
 /// 135M head, `K` = 18 tiles: 308 us on 120 units, 318 on 64).
 pub const THIN_STREAM_K_TILES: usize = 32;
 
+/// Most units a product's weight prefetch takes ([`Session::set_weight_prefetch`]): each streams
+/// ~7 GB/s, and the ops the prefetch runs under read GDDR too.
+pub const PREFETCH_UNITS: usize = 40;
+
+/// The `K` (tiles) from which a one-row product packs its `A` ([`Session::set_packed_thin_a`]):
+/// every unit's thin `A` reads cost ~0.27 us an entry (64 at `K` = 2048, 256 at 8192), the packing
+/// op one read and two writes a tile spread over every unit.
+pub const PACKED_A_K_TILES: usize = 32;
+
 /// How [`Session::probe_stream`] deals a tensor's tiles over its units.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -456,6 +465,15 @@ pub struct Session<T: Transport> {
     matmul_k_block_limit: Option<std::num::NonZeroUsize>,
     /// [`Session::set_thin_matmul_reads`].
     thin_matmul_reads: bool,
+    /// [`Session::set_packed_thin_a`].
+    packed_thin_a: bool,
+    /// [`Session::set_streamed_k`].
+    streamed_k: bool,
+    /// [`Session::set_weight_prefetch`].
+    weight_prefetch: bool,
+    /// While a prefetching product is queued in a capture: the barrier its `PREFETCH` lists wait
+    /// for (`enqueue_work_inner`).
+    prefetch_anchor: Option<u32>,
     /// [`Session::set_resident_matmul_a`].
     resident_matmul_a: bool,
     /// [`Session::set_unpack_transposed_b`].
@@ -1897,6 +1915,10 @@ impl<T: Transport> Session<T> {
             spread: Spread::All,
             matmul_k_block_limit: None,
             thin_matmul_reads: true,
+            packed_thin_a: true,
+            streamed_k: true,
+            weight_prefetch: true,
+            prefetch_anchor: None,
             resident_matmul_a: true,
             unpack_transposed_b: true,
             thin_stream_units: true,
@@ -3590,6 +3612,21 @@ impl<T: Transport> Session<T> {
         });
         let fold = barrier.filter(|_| self.capture.is_none());
         let mut folded = vec![false; spread];
+        // A prefetching product's `PREFETCH` lists (`tensor::BlockPlan::push_prefetched_jobs`): in
+        // a capture each goes into its unit's stream ahead of the unit's catch-up wait, behind a
+        // wait for the anchor -- the last weight-streaming product -- alone, so the unit reads
+        // its `B` while the ops since that product run. The unit ran nothing since it (the
+        // session took only such units), so nothing between touches the slots it reads into.
+        if let (Some(anchor), true) = (self.prefetch_anchor, capturing) {
+            for (u, q) in per_unit.iter_mut().enumerate() {
+                if q.front().is_some_and(|seg| seg.what == tensor::PREFETCH) {
+                    let seg = q.pop_front().expect("a front segment");
+                    let wait = self.barrier_wait(anchor);
+                    self.capture.as_mut().unwrap().units[u].stream.push(wait);
+                    self.enqueue_segment(u, &seg, budget)?;
+                }
+            }
+        }
         while per_unit.iter().any(|q| !q.is_empty()) {
             for (u, q) in per_unit.iter_mut().enumerate() {
                 if let Some(mut seg) = q.pop_front() {
@@ -4104,6 +4141,7 @@ impl<T: Transport> Session<T> {
             freed: Vec::new(),
             ops: Vec::new(),
             failed: false,
+            weight_anchor: None,
         });
         Ok(())
     }
@@ -4805,6 +4843,14 @@ impl<T: Transport> Session<T> {
 
     /// `t`, bit for bit, as a tensor of its own ([`tensor::copy`]): data
     /// movement only, any element type.
+    /// `t` (`[1, K]`, `K` whole tiles) laid out `[K / 32, 32]` ([`tensor::pack_row`]), on every
+    /// unit: what a one-row product reads as its packed `A` ([`Session::set_packed_thin_a`]).
+    pub fn pack_row(&mut self, t: &DramTensor) -> Result<DramTensor, TensorError> {
+        let units = self.units.len();
+        let work = tensor::pack_row(&mut self.dram_state()?.alloc, t, units)?;
+        self.execute_on(work, units, RESET_BUDGET)
+    }
+
     pub fn copy(&mut self, t: &DramTensor) -> Result<DramTensor, TensorError> {
         let units = self.spread_for(tiles_of(t));
         let work = tensor::copy(&mut self.dram_state()?.alloc, t, units)?;
@@ -5595,10 +5641,56 @@ impl<T: Transport> Session<T> {
         let thin = self.thin_matmul_reads && tensor::thin_rows(m, a_transposed) != 0;
         let resident_a = self.resident_matmul_a;
         let unpack_b = self.unpack_transposed_b;
+        // One row over a long `K`: every unit would read `A`'s `K / 32` tiles, an entry each,
+        // so it is packed `[K / 32, 32]` once, spread over the product's units, and each unit
+        // reads `K / 1024`.
+        let packed = if self.packed_thin_a
+            && m == 1
+            && !a_transposed
+            && a.cols % 32 == 0
+            && kt >= PACKED_A_K_TILES
+            && route == SrcRoute::Tf32FromFp32
+        {
+            // On the product's own units: the rest stay out of the op (a unit that sits out ops
+            // is free for other work, `decode-to-bandwidth.md` Phase 5).
+            let packing = self
+                .dram_state()
+                .and_then(|d| tensor::pack_row(&mut d.alloc, ca.as_ref().unwrap_or(a), units))
+                .and_then(|work| self.execute_on(work, units, budget));
+            match packing {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    for c in [ca, cb].into_iter().flatten() {
+                        let _ = self.free(c);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        let packed_a = packed.as_ref().map(|p| p.tensor_ref());
+        let stream_k = self.streamed_k;
+        // In a capture, the units past the product's own that ran nothing since the last
+        // weight-streaming product: each can read a job's `B` while the ops between run.
+        let spread = self.units.len();
+        let (prefetch, anchor): (Vec<usize>, Option<u32>) = match &self.capture {
+            Some(c) if self.weight_prefetch && packed_a.is_some() => match &c.weight_anchor {
+                Some((rel, lens)) => (
+                    (units..spread)
+                        .filter(|&u| c.units[u].stream.len() == lens[u])
+                        .take(PREFETCH_UNITS)
+                        .collect(),
+                    Some(*rel),
+                ),
+                None => (Vec::new(), None),
+            },
+            _ => (Vec::new(), None),
+        };
         let out = self
             .dram_state()
             .and_then(|d| {
-                tensor::matmul_dram_limited(
+                tensor::matmul_dram_prefetching(
                     &mut d.alloc,
                     ca.as_ref().unwrap_or(a),
                     a_transposed,
@@ -5614,11 +5706,28 @@ impl<T: Transport> Session<T> {
                         thin,
                         resident_a,
                         unpack_b,
+                        packed_a,
+                        stream_k,
                     },
+                    &prefetch,
+                    spread,
                 )
             })
-            .and_then(|work| self.execute_on(work, units, budget));
-        for c in [ca, cb].into_iter().flatten() {
+            .and_then(|(work, dealt)| {
+                self.prefetch_anchor = dealt.and(anchor);
+                let r = self.execute_on(work, dealt.unwrap_or(units), budget);
+                self.prefetch_anchor = None;
+                r
+            });
+        // This product is the next one's anchor: a unit idle after it can prefetch for that one.
+        if out.is_ok() && packed_a.is_some() {
+            let rel = self.barriers;
+            if let Some(c) = self.capture.as_mut() {
+                let rel = rel.wrapping_sub(c.barriers_base);
+                c.weight_anchor = Some((rel, c.units.iter().map(|u| u.stream.len()).collect()));
+            }
+        }
+        for c in [ca, cb, packed].into_iter().flatten() {
             self.free(c)?;
         }
         let out = out?;
@@ -5627,7 +5736,8 @@ impl<T: Transport> Session<T> {
         // held past the rows it read.
         let dirty = (off_k[0] && a.pad() != tensor::Pad::Zero)
             || (off_k[1] && b.pad() != tensor::Pad::Zero)
-            || thin;
+            || thin
+            || packed_a.is_some();
         out.set_pad(match dirty {
             true => tensor::Pad::Undefined,
             false => need.produces(&[a, b]),
@@ -6103,6 +6213,32 @@ impl<T: Transport> Session<T> {
     /// Off, it reads whole tiles, as before: the gates compare the two.
     pub fn set_thin_matmul_reads(&mut self, on: bool) {
         self.thin_matmul_reads = on;
+    }
+
+    /// Whether a one-row product over a long `K` packs its `A` first ([`tensor::pack_row`],
+    /// [`PACKED_A_K_TILES`]; on by default): each unit then reads `A` in `K / 1024` tiles, not
+    /// a thin read a `K` tile. Off, every unit reads `A`'s `K / 32` tiles: the gates compare the
+    /// two.
+    pub fn set_packed_thin_a(&mut self, on: bool) {
+        self.packed_thin_a = on;
+    }
+
+    /// Whether a one-row product with a packed `A` streams each output column's `K` in chunks,
+    /// the mover reading one while the kernel computes the one before (on by default; see
+    /// `tensor::BlockPlan::push_stream_jobs`). Off, a column's whole `K` is read before its
+    /// kernel starts: the gates compare the two.
+    pub fn set_streamed_k(&mut self, on: bool) {
+        self.streamed_k = on;
+    }
+
+    /// Whether a captured one-row product with a packed `A` and its `K` whole puts its first
+    /// columns on units idle since the last such product, each reading its columns' `B` as soon
+    /// as that product is done -- under the ops between the two -- and the product then reading
+    /// only `A` there (on by default; `tensor::BlockPlan::push_prefetched_jobs`). Only in a
+    /// capture, whose streams show which units ran nothing in between. Off, every column is read
+    /// by the product: the gates compare the two.
+    pub fn set_weight_prefetch(&mut self, on: bool) {
+        self.weight_prefetch = on;
     }
 
     /// Whether a GDDR matmul's later blocks on a unit skip reading the `A` rows its previous block

@@ -30,7 +30,7 @@ use burn::tensor::{DType, Int, Tensor, TensorData};
 
 pub use crate::generate::Generation;
 use crate::generate::{argmax, FixedShapeCache, FixedShapeDecoder};
-use crate::kv_cache::{FixedCache, FixedWrite};
+use crate::kv_cache::{CacheLayout, FixedCache, FixedWrite};
 use crate::load::{load_safetensors, weights_path, Layout, LoadError, Loaded};
 use crate::rope::Rope;
 
@@ -282,8 +282,9 @@ impl<B: Backend> Layer<B> {
         }
     }
 
-    /// The layer's output, and its cache's keys and values `[1, kv_heads, max_len, head_dim]`
-    /// (`cache_k`, `cache_v`) with this step's written as `write` says.
+    /// The layer's output, and its cache's keys and values (`cache_k`, `cache_v`: `[1, kv_heads,
+    /// max_len, head_dim]` for a growing cache, as a [`FixedCache`] stores them for a fixed one)
+    /// with this step's written as `write` says.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -668,18 +669,31 @@ impl<B: Backend> Llama<B> {
         self.head(x, t)
     }
 
-    /// An empty [`LlamaCache`] for `max_len` positions.
+    /// An empty [`LlamaCache`] for `max_len` positions, in the layout the heads take
+    /// ([`CacheLayout::for_heads`]).
     pub fn fixed_cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> LlamaCache<B> {
         let cfg = &self.config;
+        let layout = CacheLayout::for_heads(cfg.kv_heads, cfg.head_dim);
+        self.fixed_cache_in(max_len, layout, dtype, device)
+    }
+
+    /// An empty [`LlamaCache`] for `max_len` positions, laid out as `layout` says (of the model's
+    /// key/value heads).
+    pub fn fixed_cache_in(
+        &self,
+        max_len: usize,
+        layout: CacheLayout,
+        dtype: DType,
+        device: &B::Device,
+    ) -> LlamaCache<B> {
+        let cfg = &self.config;
+        assert_eq!(
+            layout.heads(),
+            (cfg.kv_heads, cfg.head_dim),
+            "a layout of the model's key/value heads"
+        );
         LlamaCache {
-            kv: FixedCache::zeros(
-                cfg.layers,
-                cfg.kv_heads,
-                cfg.head_dim,
-                max_len,
-                dtype,
-                device,
-            ),
+            kv: FixedCache::zeros_in(cfg.layers, layout, max_len, dtype, device),
             rope: Rope::table(max_len, cfg.head_dim, cfg.rope_theta, dtype, device),
         }
     }

@@ -1,8 +1,8 @@
 # Writing a traced cache in place
 
 Status: **D1-D4 done (2026-10-17): a 1.7B decode step 41.83 / 44.25 / 47.40 -> 38.97 / 41.41 / 44.58 ms
-(`1792263398`), 135M 20.03-21.19 -> 18.59-19.79 (`1792263801`); D5 moved to
-[decode-attention.md](decode-attention.md).** Scheduled 2026-10-16; was `docs/proposals/in-place-cache-write.md`). It follows
+(`1792263398`), 135M 20.03-21.19 -> 18.59-19.79 (`1792263801`); D5 done there as the position-major cache
+(2026-10-18, [decode-attention.md](decode-attention.md) A-layout).** Scheduled 2026-10-16; was `docs/proposals/in-place-cache-write.md`). It follows
 the cache write of one row a head (roadmap Track 2 item 6, step 6;
 [performance log](../learnings/performance-log.md#a-cache-write-of-one-row-a-head-2026-10-16-cards-0-and-1)). The
 phases and checklist are at the end ("Plan"); the design above them is the proposal's, unchanged. Read the current
@@ -212,7 +212,9 @@ Phases, each on ttsim then card 0, each gate watched failing:
   - **Profile `1792264052`:** the replay 41.16 -> 38.28 ms, its ops 1,152 -> 1,008, the cache write 5.94 -> 3.03 ms
     (the repack and the row scatter).
   - **135M:** 20.03 / 20.55 / 21.19 -> **18.59 / 19.07 / 19.79** (`1792263801`; burn-flex 26.11 / 28.53 / 31.02).
-- [ ] **D5. The key's and value's repack** (38 us each, 1.83 ms a 1.7B step). It is the cache's head-major layout:
+- [x] **D5. The key's and value's repack** (38 us each, 1.83 ms a 1.7B step). **Done 2026-10-18 by the
+  position-major cache** ([decode-attention.md](decode-attention.md) A-layout): a 1.7B step 33.02 / 33.52 / 34.42
+  -> 31.72 / 32.31 / 33.21 ms (`1792337485`). It is the cache's head-major layout:
   a head's row is a column block of the projection's one row, and no tile copy moves it into a row of its own.
   - **Ruled out:** values read in place by face-row reads, ~128 entries a write, about the repack's cost.
   - **The fix is a layout:** a position-major cache, `[L, kv * d]`, makes the write the projection's row as it is.

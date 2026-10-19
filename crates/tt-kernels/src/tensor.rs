@@ -1234,6 +1234,8 @@ pub fn matmul_dram(
             thin: true,
             resident_a: false,
             unpack_b: false,
+            packed_a: None,
+            stream_k: false,
         },
     )
 }
@@ -1265,6 +1267,12 @@ pub(crate) struct Reads {
     pub resident_a: bool,
     /// A transposed `B` is transposed by the kernel's unpacker (`BlockPlan::unpack_b`).
     pub unpack_b: bool,
+    /// `A` (one row) as [`pack_row`] laid it out, `[K / 32, 32]`: each block reads its
+    /// `K / 1024` tiles instead of a thin read a `K` tile ([`BlockPlan::packed_a`]).
+    pub packed_a: Option<TensorRef>,
+    /// With `packed_a`, each output column's `K` in chunks the mover reads while the kernel
+    /// computes the chunk before ([`BlockPlan::push_stream_jobs`]).
+    pub stream_k: bool,
 }
 
 /// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
@@ -1276,6 +1284,91 @@ pub fn thin_rows(m: usize, a_transposed: bool) -> u32 {
         r @ 1..=16 if !a_transposed => r as u32,
         _ => 0,
     }
+}
+
+/// The packed tiles of a [`pack_row`]'d `A` holding `K` tiles `k0..k0 + count`, read into the
+/// slots from `at`: a `READ_RUN` of whole tiles down its one tile column.
+fn packed_a_reads(packed: TensorRef, k0: usize, count: usize, at: u64) -> Vec<[u32; 8]> {
+    let (first, last) = (k0 / 32, (k0 + count - 1) / 32);
+    vec![
+        [
+            record::READ_RUN,
+            first as u32,
+            (last - first + 1) as u32,
+            at as u32,
+            0,
+            1,
+            0,
+            0,
+        ],
+        packed.encode()[0],
+        packed.encode()[1],
+    ]
+}
+
+/// One row of `K` values (`t`, `[1, K]`, `K` a multiple of 32) laid out `[K / 32, 32]`: row
+/// `kk` is `t`'s columns `32 kk..32 kk + 32`, the row of `t`'s tile `kk` that holds data. A
+/// product's packed `A` ([`Reads::packed_a`]): it reads `K / 1024` tiles, where a thin read
+/// reads `K / 32`, an entry each. Spread over `units`: each reads its tiles' rows (one entry a
+/// tile) and writes each row's two face rows into place (two `WRITE`s), B reading and NC
+/// writing ([`Step::Transfer`]), no kernel. Data movement only, so bit for bit; the last tile's
+/// rows past `K / 32` are not written (padding, `Undefined`).
+pub fn pack_row(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work> {
+    use tt_isa::dm::op;
+    t.expect("a packed row", Elem::F32)?;
+    if t.rows != 1 || t.cols % 32 != 0 {
+        return Err(TensorError::Shape(format!(
+            "a packed row is [1, K] with K whole tiles, not [{}, {}]",
+            t.rows, t.cols
+        )));
+    }
+    // Two writes a tile: a batch's side stays within `TRANSFER_SIDE_MAX`.
+    const GROUP: usize = 64;
+    const FACE: u64 = 1024;
+    let kt = t.cols / 32;
+    let stage = staging("packed row slots", GROUP.min(kt))?;
+    let out = DramTensor::alloc(alloc, kt, 32)?;
+    let jobs = runs(kt, units, GROUP)
+        .into_iter()
+        .map(|run| {
+            let (mut read, mut write) = (Vec::new(), Vec::new());
+            for (q, kk) in run.enumerate() {
+                let (src, slot) = (t.tile(0, kk), stage + q as u64 * TILE_SLOT);
+                // Row 0 of faces 0 and 1: face 0 whole, then face 1's first row.
+                read.push([
+                    op::READ,
+                    src.channel().index() as u32,
+                    (kk % tt_isa::dram::PORTS as usize) as u32,
+                    (src.offset() + TILE_DATA) as u32,
+                    (slot + TILE_DATA) as u32,
+                    (FACE + 64) as u32,
+                    0,
+                    0,
+                ]);
+                let (dst, r) = (out.tile(kk / 32, 0), (kk % 32) as u64);
+                for half in 0..2u64 {
+                    let face = 2 * (r / 16) + half;
+                    write.push([
+                        op::WRITE,
+                        dst.channel().index() as u32,
+                        0,
+                        (dst.offset() + TILE_DATA + face * FACE + (r % 16) * 64) as u32,
+                        (slot + TILE_DATA + half * FACE) as u32,
+                        64,
+                        0,
+                        0,
+                    ]);
+                }
+            }
+            vec![Step::Transfer {
+                what: "packed row",
+                depth: 1,
+                batches: vec![TransferBatch { read, write }],
+            }]
+        })
+        .collect();
+    out.set_pad(Pad::Undefined);
+    Ok(Work { out, jobs })
 }
 
 /// [`matmul_dram`] with `K` blocked to at most `max_k_tiles`, reading `A` as `reads` says.
@@ -1294,6 +1387,52 @@ pub(crate) fn matmul_dram_limited(
     max_k_tiles: Option<std::num::NonZeroUsize>,
     reads: Reads,
 ) -> Result<Work> {
+    matmul_dram_prefetching(
+        alloc,
+        a,
+        a_transposed,
+        b,
+        b_transposed,
+        route,
+        fidelity,
+        units,
+        allow_mop,
+        pipeline,
+        max_k_tiles,
+        reads,
+        &[],
+        units,
+    )
+    .map(|(work, _)| work)
+}
+
+/// What a list that reads a product's `B` ahead of it is called: the session puts it in a unit's
+/// trace stream ahead of the wait that orders the unit after the ops before the product
+/// ([`BlockPlan::push_prefetched_jobs`]).
+pub const PREFETCH: &str = "weight prefetch";
+
+/// [`matmul_dram_limited`], with `prefetch` (units at or past `units`, below `spread`) each
+/// taking one job of the product whose `B` its own list reads ahead ([`PREFETCH`],
+/// [`BlockPlan::push_prefetched_jobs`]) -- where the product is one row with a packed `A` and
+/// its `K` whole (a prefetching unit's one job is in the first half when pipelined). Returns the work, and `Some(spread)` when its jobs are dealt over
+/// `spread` units (job `j` to unit `j % spread`), else `None` (over `units`, `prefetch` unused).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_dram_prefetching(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    a_transposed: bool,
+    b: &DramTensor,
+    b_transposed: bool,
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    allow_mop: bool,
+    pipeline: bool,
+    max_k_tiles: Option<std::num::NonZeroUsize>,
+    reads: Reads,
+    prefetch: &[usize],
+    spread: usize,
+) -> Result<(Work, Option<usize>)> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
     let (m, ka) = if a_transposed {
@@ -1331,14 +1470,25 @@ pub(crate) fn matmul_dram_limited(
     } else {
         kc
     };
+    // A packed `A` takes a few slots, not `K`'s: its K blocks are as few as fit.
+    let kc = match reads.packed_a {
+        Some(_) if kc < kt => packed_k_block(kt, max_k_tiles, route, fidelity)?,
+        _ => kc,
+    };
     let col_runs = thin_runs([mt, kt, nt], [kc, nc], staging, units);
     let [mc, nc] = blocks([mt, nt], [mc, nc], units);
     let (ra, rb) = (a.tensor_ref(), b.tensor_ref());
     let c = DramTensor::alloc(alloc, m, n)?;
     let rc = c.tensor_ref();
     let mut jobs = Vec::new();
+    if reads.packed_a.is_some() && (m != 1 || a_transposed) {
+        return Err(TensorError::Shape(format!(
+            "a packed `A` is one row read as it is, not [{m}, {k}] transposed {a_transposed}"
+        )));
+    }
     let plan = BlockPlan {
         tiles: [mt, kt, nt],
+        m,
         block: [mc, nc],
         k_block: kc,
         staging,
@@ -1354,18 +1504,48 @@ pub(crate) fn matmul_dram_limited(
         resident_a: reads.resident_a && staging == Staging::Slots,
         col_runs,
         unpack_b: reads.unpack_b && route == SrcRoute::Tf32FromFp32,
+        packed_a: reads.packed_a,
+        // Only where `K` would be blocked: a whole `K` is one batch a column, and each chunk
+        // batch's own reload, pack and retire (~3 us a chunk, profile `1792358552`) cost a unit
+        // of several columns more than the compute they hide.
+        stream_k: reads.stream_k
+            && reads.packed_a.is_some()
+            && mt == 1
+            && staging == Staging::Slots
+            && kc < kt,
     };
-    if let Err(e) = plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed]) {
+    let prefetching = !prefetch.is_empty()
+        && plan.packed_a.is_some()
+        && !plan.stream_k
+        && mt == 1
+        && kc >= kt
+        && prefetch.iter().all(|&u| (units..spread).contains(&u));
+    let pushed = if prefetching {
+        plan.push_prefetched_jobs(
+            &mut jobs,
+            [ra, rb, rc],
+            [a_transposed, b_transposed],
+            prefetch,
+            spread,
+        )
+    } else {
+        plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed])
+    };
+    if let Err(e) = pushed {
         alloc.free(&c.placement);
         return Err(e);
     }
-    Ok(Work { out: c, jobs })
+    Ok((Work { out: c, jobs }, prefetching.then_some(spread)))
 }
 
 /// How one `[m, k, n]` product is cut into jobs: what [`matmul_dram`] and
 /// [`matmul_dram_batched`] share.
+#[derive(Clone)]
 struct BlockPlan {
     tiles: [usize; 3],
+    /// The product's rows: a job of its last tile row alone computes only those it holds
+    /// ([`matmul::LiveRows`]).
+    m: usize,
     block: [usize; 2],
     k_block: usize,
     staging: Staging,
@@ -1387,6 +1567,17 @@ struct BlockPlan {
     /// (`READ_TRANSPOSED`, ~10 us a tile). Only on the TF32 route, where `B`'s unpack to `SrcA`
     /// converts it anyway.
     unpack_b: bool,
+    /// A one-row `A` packed `[K / 32, 32]` ([`pack_row`]): a block reads the packed tiles
+    /// holding its `K` range ([`record::READ_RUN`]) and its gather reads only `B`
+    /// ([`record::GATHER_A_RESIDENT`]). The kernel unpacks `K` tile `kk`'s faces `(0, k)` from
+    /// row `kk % 16` of the packed faces `((kk % 32) / 16, k)` ([`matmul::packed_a_pairs`]):
+    /// row 0 of `SrcB` holds the same values, and the other rows only reach output rows past
+    /// the product's one.
+    packed_a: Option<TensorRef>,
+    /// One job a column, its `K` in chunks ([`BlockPlan::push_stream_jobs`]): with `packed_a`,
+    /// one tile row, [`Staging::Slots`], and a `K` too long for one block (its chunks no longer
+    /// than `k_block`) only.
+    stream_k: bool,
 }
 
 /// A one-tile-row product's output columns, one run a job, in the order a
@@ -1419,6 +1610,11 @@ pub fn thin_runs(
 }
 
 impl BlockPlan {
+    /// The rows of each output tile a job of `rows` tile rows from `i0` computes.
+    fn live_rows(&self, i0: usize, rows: usize) -> matmul::LiveRows {
+        matmul::LiveRows::for_job(self.m, i0, rows)
+    }
+
     /// One job per `[mc, nc]` output block of `op(A) @ op(B)`, the operands
     /// and the output named by `refs` (`[A, B, C]`, each a tensor or a
     /// tile-aligned block of one: the records read `K` and the output from
@@ -1430,6 +1626,9 @@ impl BlockPlan {
         [a_transposed, b_transposed]: [bool; 2],
     ) -> Result<()> {
         let [mt, kt, nt] = self.tiles;
+        if self.stream_k {
+            return self.push_stream_jobs(jobs, [ra, rb, rc], [a_transposed, b_transposed]);
+        }
         if self.k_block < kt {
             return self.push_k_jobs(jobs, [ra, rb, rc], [a_transposed, b_transposed]);
         }
@@ -1467,7 +1666,11 @@ impl BlockPlan {
                     sems,
                     init,
                 } = layout;
-                let thin = if i0 + rows == mt { self.thin } else { 0 };
+                let thin = if i0 + rows == mt && self.packed_a.is_none() {
+                    self.thin
+                } else {
+                    0
+                };
                 let unit = jobs.len() % units.max(1);
                 let resident = probing_skip_a()
                     || (self.resident_a
@@ -1478,7 +1681,7 @@ impl BlockPlan {
                     | u32::from(b_transposed) << 1
                     | record::gather_rows(thin)
                     | (kt as u32) << 8
-                    | if resident {
+                    | if resident || self.packed_a.is_some() {
                         record::GATHER_A_RESIDENT
                     } else {
                         0
@@ -1488,7 +1691,11 @@ impl BlockPlan {
                     } else {
                         0
                     };
-                let gather = [
+                let mut gather = Vec::new();
+                if let (Some(pa), false) = (self.packed_a, resident) {
+                    gather.extend(packed_a_reads(pa, 0, kt, a_at));
+                }
+                gather.extend([
                     [
                         record::GATHER,
                         flags,
@@ -1503,11 +1710,17 @@ impl BlockPlan {
                     ra.encode()[1],
                     rb.encode()[0],
                     rb.encode()[1],
-                ];
+                ]);
+                let outputs = match self.packed_a {
+                    Some(_) => matmul::packed_a_pairs(&outputs, a_at, 0),
+                    None => outputs,
+                };
                 // The cache tells the stagings and halves apart: their programs
                 // name different addresses.
-                let variant = half.map_or(0, |h| 1 + h);
+                let variant = half.map_or(0, |h| 1 + u32::from(h))
+                    | if self.packed_a.is_some() { 0x40 } else { 0 };
                 let (fidelity, allow_mop) = (self.fidelity, self.allow_mop);
+                let live = self.live_rows(i0, rows);
                 let (roles, mop) = matmul::kernel_programs(
                     tiles,
                     variant,
@@ -1516,9 +1729,10 @@ impl BlockPlan {
                     sems,
                     allow_mop,
                     unpack_b,
+                    live,
                     || {
                         matmul::matmul_kernel(
-                            &outputs, sems, in_fmt, out_fmt, fidelity, allow_mop, unpack_b,
+                            &outputs, sems, in_fmt, out_fmt, fidelity, allow_mop, unpack_b, live,
                         )
                     },
                 );
@@ -1547,7 +1761,7 @@ impl BlockPlan {
                 jobs.push(vec![
                     Step::List {
                         what: "matmul gather",
-                        entries: gather.to_vec(),
+                        entries: gather,
                     },
                     Step::Kernel {
                         roles,
@@ -1567,12 +1781,312 @@ impl BlockPlan {
     }
 }
 
+/// `A` slots a K block of `count` tiles takes with `A` packed: the packed tiles its `K` range
+/// may span.
+fn packed_a_slots(count: usize) -> usize {
+    count.div_ceil(32) + 1
+}
+
+/// The K block of a product with a packed `A` ([`Reads::packed_a`]): `kt` cut into the fewest
+/// blocks of equal size (at most `limit`) whose layout ([`matmul::k_block_layout_with`]) and
+/// programs fit. `down` (`K` = 8192) takes two of 128 where a thin `A`'s 64 slots a block left
+/// four of 64: half the blocks' compute between reads, and half the partials through GDDR.
+fn packed_k_block(
+    kt: usize,
+    limit: Option<std::num::NonZeroUsize>,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> Result<usize> {
+    let limit = limit.map_or(kt, |l| l.get());
+    for blocks in 2..=kt {
+        let kc = kt.div_ceil(blocks);
+        if kc > limit {
+            continue;
+        }
+        let Ok((layout, reload)) = matmul::k_block_layout_with(kc, packed_a_slots(kc)) else {
+            continue;
+        };
+        let layout = matmul::Layout {
+            outputs: matmul::packed_a_pairs(&layout.outputs, layout.a_at, 0),
+            ..layout
+        };
+        let fits = [None, Some(reload)].into_iter().all(|r| {
+            matmul::k_block_kernel(&layout, r, route, fidelity, false, matmul::LiveRows::All)
+                .iter()
+                .all(|p| {
+                    p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                        && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+                })
+        });
+        if fits {
+            return Ok(kc);
+        }
+    }
+    Err(TensorError::Shape(
+        "no K-block matmul of a packed A fits".into(),
+    ))
+}
+
+impl BlockPlan {
+    /// The jobs of a one-row product with a packed `A` and its `K` whole, its first columns on
+    /// the `prefetch` units -- each a job of the plan's width, its gather's `B` reads moved into
+    /// a list of their own ahead of the job ([`PREFETCH`]), its gather left reading the packed
+    /// `A` -- and the rest dealt over the plan's units as [`thin_runs`] deals them. Laid out for
+    /// a deal over `spread` units: a regular unit `u`'s `k`th job at `k spread + u`, a
+    /// prefetching unit's at its own index. A prefetching unit's `B` slots are the job's own,
+    /// written by its `PREFETCH` list and read by its kernel, with nothing on the unit between
+    /// the two (the session takes as prefetching only units idle since the last product), so
+    /// each output column is its unprefetched self, bit for bit.
+    fn push_prefetched_jobs(
+        &self,
+        jobs: &mut Vec<Job>,
+        refs: [TensorRef; 3],
+        transposed: [bool; 2],
+        prefetch: &[usize],
+        spread: usize,
+    ) -> Result<()> {
+        let [_, kt, nt] = self.tiles;
+        let nc = self.block[1];
+        let moved = (prefetch.len() * nc).min(nt);
+        let mut regular = Vec::new();
+        if moved < nt {
+            let rest = nt - moved;
+            let runs = thin_runs([1, kt, rest], [kt, nc], Staging::Slots, self.units)
+                .unwrap_or_else(|| {
+                    (0..rest)
+                        .step_by(nc)
+                        .map(|j| j..(j + nc).min(rest))
+                        .collect()
+                });
+            let plan = BlockPlan {
+                col_runs: Some(
+                    runs.into_iter()
+                        .map(|r| r.start + moved..r.end + moved)
+                        .collect(),
+                ),
+                ..self.clone()
+            };
+            plan.push_jobs(&mut regular, refs, transposed)?;
+        }
+        let mut early = Vec::new();
+        for j0 in (0..moved).step_by(nc) {
+            let plan = BlockPlan {
+                units: 1,
+                col_runs: Some(std::iter::once(j0..(j0 + nc).min(moved)).collect()),
+                resident_a: false,
+                ..self.clone()
+            };
+            let mut one = Vec::new();
+            plan.push_jobs(&mut one, refs, transposed)?;
+            let mut job = one.pop().expect("a job a block");
+            let Some(Step::List { entries, .. }) = job.first_mut() else {
+                unreachable!("a block's job starts with its gather")
+            };
+            let at = entries
+                .iter()
+                .position(|e| e[0] == record::GATHER)
+                .expect("a block's gather record");
+            let b_reads = entries.split_off(at);
+            job.insert(
+                0,
+                Step::List {
+                    what: PREFETCH,
+                    entries: b_reads,
+                },
+            );
+            early.push(job);
+        }
+        let units = self.units.max(1);
+        let rounds = regular.len().div_ceil(units).max(1);
+        let mut laid: Vec<Job> = vec![Vec::new(); rounds * spread];
+        for (k, job) in regular.into_iter().enumerate() {
+            laid[k / units * spread + k % units] = job;
+        }
+        for (job, &u) in early.into_iter().zip(prefetch) {
+            laid[u] = job;
+        }
+        jobs.extend(laid);
+        Ok(())
+    }
+}
+
+/// Fewest chunks a streamed column's `K` is cut into ([`BlockPlan::push_stream_jobs`]): the
+/// mover reads one while the kernel computes the one before, so the last's compute is what is
+/// left after the reads.
+const MIN_STREAM_CHUNKS: usize = 4;
+
+/// The chunk size of a `kt`-tile `K` streamed with a packed `A` ([`BlockPlan::push_stream_jobs`]),
+/// and its layout: an even number of chunks (a column's first in half 0, so a unit's columns
+/// alternate halves throughout), at least [`MIN_STREAM_CHUNKS`], each at most `limit` tiles (the
+/// K block the product would otherwise take), the fewest whose layout and programs fit.
+fn stream_chunks(
+    kt: usize,
+    limit: usize,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> Result<(usize, matmul::StreamLayout)> {
+    let a_slots = packed_a_slots(kt);
+    for chunks in (MIN_STREAM_CHUNKS..=kt.max(MIN_STREAM_CHUNKS)).step_by(2) {
+        let kq = kt.div_ceil(chunks);
+        if kt.div_ceil(kq) % 2 != 0 || kq > limit {
+            continue;
+        }
+        let Ok(layout) = matmul::k_stream_layout(kq, a_slots) else {
+            continue;
+        };
+        let fits = (0..2).all(|c| {
+            let (l, r) = layout.chunk(c, c * kq, kq);
+            matmul::k_block_kernel(&l, r, route, fidelity, false, matmul::LiveRows::All)
+                .iter()
+                .all(|p| {
+                    p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                        && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+                })
+        });
+        if fits {
+            return Ok((kq, layout));
+        }
+    }
+    Err(TensorError::Shape(format!(
+        "no K-streamed matmul of {kt} K tiles fits"
+    )))
+}
+
+impl BlockPlan {
+    /// One job an output column of a one-row product with a packed `A`, its `K` in chunks
+    /// ([`stream_chunks`], [`matmul::StreamLayout`]): chunk `c` gathers its `B` tiles into half `c
+    /// % 2`, its kernel reloads the partial the chunk before packed in the other half (none for
+    /// the first) and packs its own, and only the last chunk's is written out. Consecutive
+    /// chunks alternate halves, so the session double-buffers them (`Step::Kernel::half`): the
+    /// mover reads chunk `c + 1` while the kernel computes chunk `c`. Each output tile's `K`
+    /// chain is the same in the same order, through FP32 partials as a K block's are, so bit
+    /// for bit. The packed `A` is read once a unit, by its first chunk.
+    fn push_stream_jobs(
+        &self,
+        jobs: &mut Vec<Job>,
+        [ra, rb, rc]: [TensorRef; 3],
+        [a_transposed, b_transposed]: [bool; 2],
+    ) -> Result<()> {
+        let [mt, kt, nt] = self.tiles;
+        let packed = self.packed_a.expect("a streamed product's packed A");
+        debug_assert_eq!(mt, 1);
+        let unpack_b = self.unpack_b && b_transposed;
+        let (kq, layout) = stream_chunks(kt, self.k_block, self.route, self.fidelity)?;
+        let chunks = kt.div_ceil(kq);
+        let units = self.units.max(1);
+        let mut a_read = vec![false; units];
+        let live = self.live_rows(0, 1);
+        for j in 0..nt {
+            let unit = jobs.len() % units;
+            let mut steps = Vec::new();
+            for c in 0..chunks {
+                let (k0, h) = (c * kq, c % 2);
+                let count = kq.min(kt - k0);
+                let (chunk, reload) = layout.chunk(c, k0, count);
+                let mut gather = Vec::new();
+                if !a_read[unit] {
+                    gather.extend(packed_a_reads(packed, 0, kt, layout.a_at));
+                    a_read[unit] = true;
+                }
+                let mut br = rb;
+                br.first += if b_transposed {
+                    k0 as u32
+                } else {
+                    (k0 * br.ct as usize) as u32
+                };
+                let flags = u32::from(a_transposed)
+                    | u32::from(b_transposed) << 1
+                    | (count as u32) << 8
+                    | record::GATHER_A_RESIDENT
+                    | if unpack_b {
+                        record::GATHER_B_UNPACK_TRANSPOSE
+                    } else {
+                        0
+                    };
+                gather.extend([
+                    [
+                        record::GATHER,
+                        flags,
+                        chunk.a_at as u32,
+                        chunk.b_at as u32,
+                        0,
+                        1,
+                        j as u32,
+                        1,
+                    ],
+                    ra.encode()[0],
+                    ra.encode()[1],
+                    br.encode()[0],
+                    br.encode()[1],
+                ]);
+                // The programs name this chunk's `K` range in the packed `A`, its half and the
+                // layout `A`'s slots fix.
+                let variant = 0x1_0000 | (packed_a_slots(kt) as u32) << 8 | c as u32;
+                let (route, fidelity) = (self.route, self.fidelity);
+                let (roles, _) = matmul::kernel_programs(
+                    [1, count, 1],
+                    variant,
+                    route,
+                    fidelity,
+                    chunk.sems,
+                    false,
+                    unpack_b,
+                    live,
+                    || {
+                        (
+                            matmul::k_block_kernel(&chunk, reload, route, fidelity, unpack_b, live),
+                            [None; 3],
+                        )
+                    },
+                );
+                let scatter = if c + 1 == chunks {
+                    vec![
+                        [
+                            record::SCATTER,
+                            chunk.outputs[0].out as u32,
+                            TILE_SLOT as u32,
+                            0,
+                            1,
+                            j as u32,
+                            1,
+                            0,
+                        ],
+                        rc.encode()[0],
+                        rc.encode()[1],
+                    ]
+                } else {
+                    Vec::new()
+                };
+                steps.extend([
+                    Step::List {
+                        what: "streamed matmul gather",
+                        entries: gather,
+                    },
+                    Step::Kernel {
+                        roles,
+                        init: chunk.init.clone(),
+                        mop: Box::new([None; 3]),
+                        loops: Default::default(),
+                        half: Some(h as u8),
+                    },
+                    Step::List {
+                        what: "streamed matmul scatter",
+                        entries: scatter,
+                    },
+                ]);
+            }
+            jobs.push(steps);
+        }
+        Ok(())
+    }
+}
+
 /// Size both first and continuation programs against the resident-cache limit.
 pub(crate) fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -> Result<usize> {
     loop {
         if let Ok((layout, reload)) = matmul::k_block_layout(kc) {
             let fits = [None, Some(reload)].into_iter().all(|r| {
-                matmul::k_block_kernel(&layout, r, route, fidelity, false)
+                matmul::k_block_kernel(&layout, r, route, fidelity, false, matmul::LiveRows::All)
                     .iter()
                     .all(|p| {
                         p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
@@ -1606,7 +2120,10 @@ impl BlockPlan {
                 let mut steps = Vec::new();
                 for k0 in (0..kt).step_by(self.k_block) {
                     let count = self.k_block.min(kt - k0);
-                    let (layout, reload) = matmul::k_block_layout(count)?;
+                    let (layout, reload) = match self.packed_a {
+                        Some(_) => matmul::k_block_layout_with(count, packed_a_slots(count))?,
+                        None => matmul::k_block_layout(count)?,
+                    };
                     let mut ar = ra;
                     let mut br = rb;
                     ar.first += if transposed[0] {
@@ -1619,12 +2136,16 @@ impl BlockPlan {
                     } else {
                         (k0 * br.ct as usize) as u32
                     };
-                    let thin = if i + 1 == mt { self.thin } else { 0 };
+                    let thin = if i + 1 == mt && self.packed_a.is_none() {
+                        self.thin
+                    } else {
+                        0
+                    };
                     let flags = u32::from(transposed[0])
                         | u32::from(transposed[1]) << 1
                         | record::gather_rows(thin)
                         | (count as u32) << 8
-                        | if probing_skip_a() {
+                        | if probing_skip_a() || self.packed_a.is_some() {
                             record::GATHER_A_RESIDENT
                         } else {
                             0
@@ -1634,7 +2155,11 @@ impl BlockPlan {
                         } else {
                             0
                         };
-                    let mut gather = vec![
+                    let mut gather = match self.packed_a {
+                        Some(pa) => packed_a_reads(pa, k0, count, layout.a_at),
+                        None => Vec::new(),
+                    };
+                    gather.extend([
                         [
                             record::GATHER,
                             flags,
@@ -1649,7 +2174,14 @@ impl BlockPlan {
                         ar.encode()[1],
                         br.encode()[0],
                         br.encode()[1],
-                    ];
+                    ]);
+                    let layout = match self.packed_a {
+                        Some(_) => matmul::Layout {
+                            outputs: matmul::packed_a_pairs(&layout.outputs, layout.a_at, k0),
+                            ..layout
+                        },
+                        None => layout,
+                    };
                     if k0 > 0 {
                         // A WAIT marks this dependent gather's footprint as
                         // conservative: the scheduler waits for NC release,
@@ -1670,7 +2202,9 @@ impl BlockPlan {
                             rc.encode()[1],
                         ]);
                     }
-                    let variant = if k0 > 0 { 0x81 } else { 0x80 };
+                    let variant = if k0 > 0 { 0x81 } else { 0x80 }
+                        | if self.packed_a.is_some() { 0x40 } else { 0 };
+                    let live = self.live_rows(i, 1);
                     let (roles, _) = matmul::kernel_programs(
                         [1, count, 1],
                         variant,
@@ -1679,6 +2213,7 @@ impl BlockPlan {
                         layout.sems,
                         false,
                         unpack_b,
+                        live,
                         || {
                             (
                                 matmul::k_block_kernel(
@@ -1687,6 +2222,7 @@ impl BlockPlan {
                                     self.route,
                                     self.fidelity,
                                     unpack_b,
+                                    live,
                                 ),
                                 [None; 3],
                             )
@@ -1902,6 +2438,7 @@ pub(crate) fn matmul_dram_batched_limited(
     }
     let plan = BlockPlan {
         tiles: [mt, kt, nt],
+        m,
         block: blocks([mt, nt], [mc, nc], per_item),
         k_block: kc,
         staging,
@@ -1915,6 +2452,8 @@ pub(crate) fn matmul_dram_batched_limited(
         resident_a: false,
         col_runs: None,
         unpack_b: unpack_b && route == SrcRoute::Tf32FromFp32,
+        packed_a: None,
+        stream_k: false,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -4842,6 +5381,8 @@ mod tests {
                 thin: true,
                 resident_a,
                 unpack_b: false,
+                packed_a: None,
+                stream_k: false,
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,
@@ -4885,6 +5426,160 @@ mod tests {
                     assert_eq!(off.reads - on.reads, (off.a - a_once) / 1088, "unit {u}");
                 }
             }
+        }
+    }
+
+    /// A packed `A` ([`super::pack_row`]) is read as its `K / 1024` packed tiles on a unit's first
+    /// block, and not at all on its later ones; `B` is read as before. Without it, each block
+    /// reads `K / 32` thin `A` tiles (once a unit with `resident_a`).
+    #[test]
+    fn a_packed_a_is_read_in_k_over_1024_tiles() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let units = 64;
+        for (k, n, limit) in [
+            (2048, 6144, None),
+            (2048, 16384, None),
+            (8192, 2048, Some(64)),
+            (8192, 2048, None),
+        ] {
+            let reads_per_unit = |packed: bool| {
+                let mut alloc = DramAlloc::new(&Dram::FULL);
+                let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+                let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+                let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+                let work = super::matmul_dram_limited(
+                    &mut alloc,
+                    &a,
+                    false,
+                    &b,
+                    false,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    units,
+                    false,
+                    false,
+                    limit.and_then(std::num::NonZeroUsize::new),
+                    super::Reads {
+                        thin: true,
+                        resident_a: true,
+                        unpack_b: false,
+                        packed_a: packed.then(|| p.tensor_ref()),
+                        stream_k: false,
+                    },
+                )
+                .unwrap();
+                let mut per_unit = vec![crate::profile_mode::OpBytes::default(); units];
+                for (j, job) in work.jobs.iter().enumerate() {
+                    for step in job {
+                        if let Step::List { entries, .. } = step {
+                            per_unit[j % units].count(entries);
+                        }
+                    }
+                }
+                per_unit
+            };
+            let (off, on) = (reads_per_unit(false), reads_per_unit(true));
+            if k == 8192 && limit.is_none() {
+                // Packed, `down` fits two K blocks of 128, not four of 64: its partial written
+                // once and read back once, not three times.
+                let kc = super::packed_k_block(256, None, SrcRoute::Tf32FromFp32, Fidelity::HiFi4);
+                assert_eq!(kc.unwrap(), 128);
+            }
+            let kt = k as u64 / 32;
+            for u in 0..units {
+                let (off, on) = (off[u], on[u]);
+                assert_eq!(on.b, off.b, "[{k}, {n}] unit {u}: B unchanged");
+                // Thin `A`, `K` tiles (once a unit with `K` whole), against the packed tiles; and
+                // each K block after the first reads its partial back (`down` unlimited: four
+                // thin blocks of 64, two packed of 128).
+                let (thin_blocks, packed_blocks) = match (k, limit) {
+                    (8192, Some(_)) => (4, 4),
+                    (8192, None) => (4, 2),
+                    _ => (1, 1),
+                };
+                let packed_tiles = if k == 8192 { kt / 32 } else { kt.div_ceil(32) };
+                assert_eq!(
+                    off.reads - on.reads,
+                    kt - packed_tiles + (thin_blocks - packed_blocks),
+                    "[{k}, {n}] unit {u}"
+                );
+            }
+        }
+    }
+
+    /// A streamed one-row product: a job a column, each its `K` in an even number of chunks
+    /// (at least [`super::MIN_STREAM_CHUNKS`]) in alternating halves, every chunk's gather reading
+    /// only `B` (its `K` range: each `B` tile once) but a unit's first, which reads the packed
+    /// `A`; and only each column's last chunk writes.
+    #[test]
+    fn a_streamed_column_reads_its_k_in_chunks() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let units = 64;
+        // `down`'s `K` (blocked anyway), and shorter ones under a block limit.
+        for (k, n, limit) in [
+            (8192, 2048, None),
+            (2048, 6144, Some(16)),
+            (1056, 200, Some(9)),
+        ] {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+            let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+            let work = super::matmul_dram_limited(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                limit.and_then(std::num::NonZeroUsize::new),
+                super::Reads {
+                    thin: true,
+                    resident_a: true,
+                    unpack_b: false,
+                    packed_a: Some(p.tensor_ref()),
+                    stream_k: true,
+                },
+            )
+            .unwrap();
+            let (kt, nt) = (k / 32, n.div_ceil(32));
+            assert_eq!(work.jobs.len(), nt, "[{k}, {n}]: a job a column");
+            let mut first_on_unit = vec![true; units];
+            let mut b_tiles = 0;
+            for (j, job) in work.jobs.iter().enumerate() {
+                let chunks = job.len() / 3;
+                assert!(
+                    chunks >= super::MIN_STREAM_CHUNKS && chunks % 2 == 0,
+                    "{chunks} chunks"
+                );
+                for (c, step) in job.chunks(3).enumerate() {
+                    let [Step::List {
+                        entries: gather, ..
+                    }, Step::Kernel { half, .. }, Step::List {
+                        entries: scatter, ..
+                    }] = step
+                    else {
+                        panic!("a chunk is a gather, a kernel and a scatter");
+                    };
+                    assert_eq!(
+                        *half,
+                        Some((c % 2) as u8),
+                        "[{k}, {n}] column {j} chunk {c}"
+                    );
+                    assert_eq!(scatter.is_empty(), c + 1 < chunks, "only the last writes");
+                    let reads_a = gather[0][0] == record::READ_RUN;
+                    assert_eq!(reads_a, std::mem::take(&mut first_on_unit[j % units]));
+                    let mut counted = crate::profile_mode::OpBytes::default();
+                    counted.count(gather);
+                    assert_eq!(counted.a, 0);
+                    b_tiles += counted.b / tt_isa::dm::TILE_SLOT;
+                }
+            }
+            assert_eq!(b_tiles, (kt * nt) as u64, "[{k}, {n}]: every B tile once");
         }
     }
 
@@ -5088,9 +5783,14 @@ mod reference {
                         list.push(fetch(b, b_transposed, kk, j0 + j, to));
                     }
                 }
+                // A job of the last tile row alone computes only its rows.
+                let live = matmul::LiveRows::for_job(m, i0, rows);
                 let roles =
-                    matmul::programs((tiles, Staging::Slots), route, fidelity, sems, || {
-                        matmul::matmul_roles(&outputs, sems, in_fmt, out_fmt, fidelity)
+                    matmul::programs((tiles, Staging::Slots), route, fidelity, sems, live, || {
+                        let (words, _) = matmul::matmul_kernel(
+                            &outputs, sems, in_fmt, out_fmt, fidelity, false, false, live,
+                        );
+                        words
                     });
 
                 // Only the datums go back: the packer writes nothing else, and the

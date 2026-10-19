@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Decode products: their rows, a packed `A`, a streamed `K`, prefetched weights](#decode-products-their-rows-a-packed-a-a-streamed-k-prefetched-weights-2026-10-18-cards-0-and-1) | 2026-10-18 | the m = 1 kernel computes only its rows, a one-row `A` read packed, a blocked `K` streamed, the next product's weights read on idle units under the small ops, bit for bit: a 1.7B decode step -> **26.47 / 27.14 / 27.97 ms**, 135M -> **12.62 / 13.06 / 13.59** |
+| [A position-major key/value cache](#a-position-major-keyvalue-cache-2026-10-18-cards-0-and-1) | 2026-10-18 | the cache stored `[1, 1, L, kv d]`, so a step writes its projection's row as it is (no repack), bit for bit: a 1.7B decode step -> **31.72 / 32.31 / 33.21 ms**, 135M -> **13.71 / 14.16 / 14.66** |
 | [The cache write's and the embedding's moves spread](#the-cache-writes-and-the-embeddings-moves-spread-2026-10-18-cards-0-and-1) | 2026-10-18 | a repack's reads in flight together, one batch's row scatter split between units, and a ragged row select over every unit, bit for bit: a 1.7B decode step -> **33.05 / 33.59 / 34.51 ms**, 135M -> **14.04 / 14.45 / 15.04** |
 | [Thin products on 64 units; attention's scale and mask as one op](#thin-products-on-64-units-attentions-scale-and-mask-as-one-op-2026-10-18-cards-0-and-1) | 2026-10-18 | a one-tile-row product over a long `K` on at most 64 units (~1.2 ms), and `mask ? -inf : s x` in one pass (~0.1-0.2 ms), bit for bit: a 1.7B decode step -> **34.35 / 34.87 / 35.76 ms**, 135M -> **14.28 / 14.68 / 15.25** |
 | [RoPE's sum as one op](#ropes-sum-as-one-op-2026-10-18-cards-0-and-1) | 2026-10-18 | `x cos + rotate(x) sin`'s second product and sum in one pass (`MUL_ADD`, a chain fuser), bit for bit: a 1.7B decode step -> **35.64 / 36.22 / 37.20 ms**, 135M -> **14.43 / 14.92 / 15.46** |
@@ -335,6 +337,64 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Decode products: their rows, a packed `A`, a streamed `K`, prefetched weights (2026-10-18, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phases 4 and 5: three of the four larger changes compared
+there (the fourth, the position-major cache, is the section below). Each is bit for bit, in the backend, for any
+one-row product.
+
+| 1.7B `Step(64)` replay (card 1 profile) | ms | Run |
+|---|--:|---|
+| after the position-major cache | 30.91 | `1792336760` |
+| the m = 1 kernel computes only its rows (`LiveRows`, `step203`) | 29.55 | `1792341444` |
+| a packed `A` (`pack_row`, `step204`) | 27.90 | `1792342758` |
+| a deal rotated over the channels (reverted) | 27.84 | `1792343591` |
+| a packed `A`'s K blocks of 128, not 64 | 27.77 | `1792344448` |
+| every one-row product's `K` streamed (replaced) | 27.88 | `1792358552` |
+| only a blocked `K` streamed | 27.51 | `1792359572` |
+| weights prefetched on idle units, 56 / 32 / 20 / **40** | 25.96 / 25.60 / 26.74 / **25.61** | `1792360408`, `1792361675`, `1792362531`, `1792363365` |
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792337485`, `1792337842`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 31.72 / 32.31 / 33.21 | **26.47 / 27.14 / 27.97** (`1792364210`) | 301.1 / 311.6 / 327.3 |
+| SmolLM2-135M | 13.71 / 14.16 / 14.66 | **12.62 / 13.06 / 13.59** (`1792364661`) | 27.0 / 29.3 / 31.5 |
+
+- **The 1.7B's first token:** 94.8 / 158.8 / 278.3 ms, unchanged.
+- **What the prefetch costs:** the latency-bound small ops it runs under slow by ~60 us a layer at 56 units (silicon
+  operating notes), hence the cap.
+- **Gates:**
+  - ttsim: `step203`, `step204`, `step205`, `step121`, `step190`, `step198`, `step187`, `step191`, `step193`, `step197`,
+    `step199`, `step39`, `step176`;
+  - Burn conformance: 2,973 passed, 52 as expected; `step12_mnist`;
+  - card 0 `1792361154`: 58 of 58, `step188` (the 1.7B traced against eager) among them.
+
+## A position-major key/value cache (2026-10-18, cards 0 and 1)
+
+[decode-attention.md](../plans/decode-attention.md) A-layout (in-place-cache-write D5, decode-small-ops S1d). It is the
+first of the four larger changes compared in
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md#the-larger-changes-compared-2026-10-18).
+
+**What changed:**
+- **The layout:** `FixedCache` stores each layer's keys and values as `[1, 1, L, kv d]` when `head_dim` is a
+  multiple of 32.
+- **The write:** a step's row is its projection's row as it is, one index for every head. Head-major, each step paid
+  two 31 us repacks a layer on 2 units.
+- **What attention reads:** the same head-major view of the same tiles, so the bits are unchanged.
+
+| Decode step, ms (32 / 128 / 256-token prompt) | Before (`1792298195`, `1792298556`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 33.02 / 33.52 / 34.42 | **31.72 / 32.31 / 33.21** (`1792337485`) | 295.8 / 312.8 / 331.8 |
+| SmolLM2-135M | 14.04 / 14.45 / 15.02 | **13.71 / 14.16 / 14.66** (`1792337842`) | 27.9 / 35.0 / 31.3 |
+
+- **Profile `1792336760`** (`Step(64)`, 1.7B): the replay 32.32 -> 30.91 ms, and the ops 840 -> 810. The cache
+  write is 1.94 -> 0.64 ms a step, and per layer it is now:
+  - two row scatters of one index, on 64 units, 10.3 us each;
+  - the fused `v`'s row copied out of `qkv`, 6 us.
+- **The 1.7B's first token:** 94.8 / 158.9 / 278.3 ms.
+- **Gates:**
+  - `step199::a_position_major_cache_writes_the_projection_s_row_as_it_is` (ttsim);
+  - card 0 `1792336651`: `step187`, `step188`, `step193`, `step199`, 21 of 21.
 
 ## The cache write's and the embedding's moves spread (2026-10-18, cards 0 and 1)
 

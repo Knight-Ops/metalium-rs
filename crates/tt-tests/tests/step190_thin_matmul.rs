@@ -262,10 +262,16 @@ fn thin_reads_equal_whole_tiles_and_skip_the_padding_rows() {
             let whole = product(s, &a, false);
             let want = s.download(&whole).unwrap();
             if k % 32 == 0 && m % 32 != 0 {
+                // Every row computed (`step203_live_rows` covers the rows left out), so the
+                // read's padding rows reach the output's.
+                tt_kernels::matmul::set_trim_rows(false);
+                let control = product(s, &a, false);
+                tt_kernels::matmul::set_trim_rows(true);
                 assert!(
-                    padding_rows(s, &w, &whole).iter().any(|x| !x.is_finite()),
+                    padding_rows(s, &w, &control).iter().any(|x| !x.is_finite()),
                     "{label}: control: whole tiles carry A's padding rows"
                 );
+                s.free(control).unwrap();
             }
             // Claim 1: L1 primed with another matrix and NaN rows, then thin.
             let primed = product(s, &other, false);

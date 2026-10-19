@@ -272,8 +272,11 @@ building only if B2.0's replay probe shows the stream hiding under the small ops
 - [x] **Probe on the eager path** (above): tiles land, results unchanged, no overlap visible.
 - [x] **B2.0** (replay-fixed-cost P1, done 2026-10-17): a captured barrier counts the units its op ran on. No step
   time change (`1792266392`).
-- [ ] The probe in a replay (Phase 5 of [decode-to-bandwidth.md](decode-to-bandwidth.md)).
-- [ ] **Decision on B2.1-B2.4 and G7,** from that probe.
+- [x] **Superseded (2026-10-18):** B2.1-B2.4 and G7 were not built as designed. In
+  [decode-to-bandwidth.md](decode-to-bandwidth.md):
+  - G7 is a packed `A`, read as `K / 1024` tiles (Phase 4);
+  - the prefetch is the next product's own gather on units idle since the last product, appended to their streams
+    at capture (Phase 5). It needs no record change, no L1 reservation and no store-time pass.
 
 ## Out of scope
 

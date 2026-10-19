@@ -371,6 +371,16 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
     - Phase 3: barriers, row-limited element-wise ops, fusers;
     - Phase 4: the products at the ceiling;
     - Phase 5: the weight prefetch under the small ops.
+    - **2026-10-18:** the four larger changes compared
+      ([there](decode-to-bandwidth.md#the-larger-changes-compared-2026-10-18)), and all four built, bit for bit:
+      - the position-major cache;
+      - the m = 1 kernel's rows and a blocked `K` streamed (compute under the reads);
+      - a packed `A` (`A` once a product);
+      - the next product's weights prefetched on idle units.
+      - **Result:** a 1.7B step **33.02 / 33.52 / 34.42 -> 26.47 / 27.14 / 27.97 ms** (`1792364210`), 135M 14.04 /
+        14.45 / 15.02 -> **12.62 / 13.06 / 13.59** (`1792364661`).
+      - **Next:** the small ops (~10 ms, 4.4 of it on 1-2 units, which the prefetch's traffic also slows), then
+        prefetch for the K-blocked `down`.
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.
@@ -454,7 +464,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         same mechanism as G7 in [decode-step-bandwidth.md](decode-step-bandwidth.md). ttsim refuses
         non-rectangular multicast.
       - **Target:** the products compute-bound, ~40x from today.
-    - [ ] **Batched decode.**
+    - [ ] **Batched decode** (design: [batched-decode.md](../proposals/batched-decode.md), 2026-10-18; unscheduled:
+      batch-1 prefill and decode come first, and are built with it in mind).
+      - **The largest knob for total throughput:** a step reads every weight once whatever the batch, and up to 32
+        rows (one tile row) stay bound by the weight stream at HiFi4.
+      - **The design:** sequences are the rows of one tile row; the batch sizes are 8, 16 and 32 (`MVMUL`'s row
+        halves, `LiveRows`); the cache is a pool of position-major 32-position pages with a page table a sequence;
+        attention is batched items, one per (sequence, head); sampling happens on the card.
       - **Now:** `TracedGenerator` is batch 1, so the roofline's batch 4-32 rows (132-863 tokens/s "realistic") are
         unreachable.
       - **Why it pays:** a step is mostly per-op fixed cost, and an `m <= 16` product's thin reads cost the same

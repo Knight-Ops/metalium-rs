@@ -1065,6 +1065,18 @@ The probe is `silicon_probe_decode_stream`, traced, so the times are the card's.
   - **`A`'s reads:** one entry a `K` tile on every unit. That is 64 at `K` = 2048 and 256 for `down`'s 8192;
   - **the compute after the last read:** ~15 us an op, not overlapped;
   - **a deal's last round:** uneven on 120 units.
+- **The "kernel tail" is compute, and it scales with the job** (profile `1792298755`, read 2026-10-18). The profile's
+  `kernels` phase is unit 0's `KERNEL_WAIT`: the last block's compute, ~0.23 us a `K`-tile pair (~305 cycles) plus
+  ~0.5 us. Attention's `qk`/`pv` (2 pairs) 1.0 us, `o` and `qkv`'s last job (64 pairs) 15.0, `down`'s last K-block
+  (64) 15.3, `gate|up`'s last 2-column job (128) 29.6.
+  - **The kernel is already launched before the reads** (`streaming_segments`: `LAUNCH` first). Its start-up is
+    hidden; the block's compute waits for the whole gather (`CB Push` drains the reads).
+  - **Earlier blocks' compute is serialized too.** Under `Staging::Slots` the ring holds one block, so a unit's next
+    gather waits for the block before it to be computed. That time is counted as `data`. `down` (4 K-blocks a unit)
+    also round-trips each partial through GDDR.
+  - **An m = 1 pair may do ~4x the work it needs** (from the code, not yet measured): `matmul_items_reloading`
+    unpacks and multiplies all four faces (64 `MVMUL`s a pair at HiFi4), where row 0 needs 16. Whether a pair is
+    bound by its `MVMUL`s or its unpacks is unmeasured.
 
 ## A matmul's transposed `B` through unpacker 0 (2026-10-17, card 0)
 
@@ -1078,6 +1090,52 @@ From [decode-attention.md](../plans/decode-attention.md) A0b; gate `step201_unpa
 - **State:** `Haloize_mode` is persistent. Every later unpack configuration writes the whole `SEC0_REG2` word with it
   clear: `unpack_src_config` by construction, `unpack_config` explicitly. So no other kernel unpacks transposed, and
   none unpacks to `Dst` with it set (undefined behaviour).
+
+## A one-row product's compute, `A` reads and weight stream (2026-10-18, cards 0 and 1)
+
+From [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 4 and 5, SmolLM2-1.7B `Step(64)` profiles on
+card 1; gates on card 0.
+
+- **A tile pair is bound by its `MVMUL`s.**
+  - **The change:** computing only the rows an output tile holds (`matmul::LiveRows`, `step203`) cut 64 `MVMUL`s a
+    pair at HiFi4 to 16 for one row.
+  - **The effect:** the last block's compute fell 15.0 -> 4.8 us (64 pairs), ~0.07 us a pair. The unpacks were not
+    the bound.
+  - **Measured:** profile `1792341444`; 1.7B `Step(64)` 30.91 -> 29.55 ms.
+- **Unpacker 1 takes a base anywhere on 16 bytes.**
+  - **The setup:** a packed `A` (`[1, K]` laid out `[K / 32, 32]`) is unpacked from a base 64 bytes times the row
+    into a packed tile.
+  - **What it reads:** face `(0, k)`'s 16 rows of 64 bytes from there, the face 1,024 bytes on.
+  - **Result:** bit for bit on every unit of card 0 (`step204`, `1792342641`). The reads past a slot's end land in the
+    next slot and only reach output rows past the product's one.
+- **Thin `A` reads are entry-bound, and packing pays.**
+  - **The rate:** ~0.27 us an entry.
+  - **Packed:** `A` is `K / 1024` whole tiles a unit (2 at `K` = 2048, 8 at 8192), plus one packing op of ~5-7 us,
+    one read and two face-row writes a tile spread over the product's units.
+  - **Measured** (profile `1792342758`, products before -> after, plus the pack): `qkv` 148 -> 135, `o` 64 -> 53,
+    `gate|up` 349 -> 337, `down` 246 -> 190 us. The step went 29.55 -> 27.90 ms.
+- **The barrier skew is not channel locality.**
+  - **The experiment:** dealing `gate|up`'s rounds rotated, so each unit walked every channel pair rather than
+    staying on one.
+  - **Result:** its barrier went 40 -> 30 us, but its data phase went 269 -> 283 us. The step was 27.90 -> 27.84 ms
+    (`1792343591`), so it was reverted.
+- **A K chunk as its own batch costs ~3 us of role work.**
+  - **What it is:** the FP32 reload, the pack, and the three roles' lockstep retire.
+  - **Measured:** streaming every product's `K` in 4 chunks raised `qkv`'s control phase to 36 us and `gate|up`'s to
+    89 (`1792358552`). It pays only where `K` would be K-blocked anyway: `down` 184 -> 173 us, the step 27.77 ->
+    27.51 ms (`1792359572`).
+- **Prefetching weights under small ops slows those ops.**
+  - **The cost:** units 64-119 reading the next product's `B` while the small ops run made the latency-bound ones
+    slower.
+  - **Where it showed:** the residual adds +12 us, RMSNorm's one-unit statistic +11, `gamma`'s product +4, each a
+    layer. One unit reading 64 tiles queues behind ~56 units' streams in the GDDR controllers.
+  - **Measured, at 56 units:** the products gained ~3.1 ms and the small ops lost ~1.6. The step went 27.51 ->
+    25.96 ms (`1792360408`).
+  - **The cap, by units:**
+    - 32: 25.60 ms (`1792361675`);
+    - 20: 26.74 (`1792362531`);
+    - 40: 25.61 / 26.03 / 26.40 / 27.23 at `Step(64)` to `Step(512)` (`1792363365`), the setting
+      (`session::PREFETCH_UNITS`).
 
 ## The movers' per-entry costs in small moves (2026-10-18, card 1, profiles `1792293993`, `1792296384`)
 

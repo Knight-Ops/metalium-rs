@@ -17,15 +17,19 @@
 //! - **an error ends the donation:** after a refused capture, an eager scatter into the same
 //!   tensor copies it and leaves it as it was;
 //! - **a decoder's generation:** a synthetic Llama's traced decode steps write their caches in
-//!   place, and its traced generation equals the copying one's token for token and bit for bit.
+//!   place, and its traced generation equals the copying one's token for token and bit for bit;
+//! - **the position-major cache** (`decode-to-bandwidth.md`, the A-layout): a step writes its
+//!   projection's row as it is, with no repack (the head-major cache's repacks are the negative
+//!   control), and generates the head-major cache's tokens and logits bit for bit.
 //!
 //! Watched failing: with `DramRef::current`'s check removed (the stale reads return the new
 //! rows), and with the donation's `written_in_place` removed (the kept transpose is read).
 
 use burn::tensor::{IndexingUpdateOp, Int, Tensor, TensorData, TensorPrimitive};
 use burn_tt::{InputPayload, OutputPayload, SharedStateTraces, TtBackend, TtDevice, TtTensor};
-use tt_models::generate::{Shapes, TracedGenerator};
-use tt_models::llama::{Llama, LlamaConfig};
+use tt_models::generate::{FixedShapeDecoder, Shapes, TracedGenerator};
+use tt_models::kv_cache::CacheLayout;
+use tt_models::llama::{Llama, LlamaCache, LlamaConfig};
 use tt_tests::burn_device::{with_device, Config};
 
 const HEADS: usize = 4;
@@ -403,5 +407,108 @@ fn a_decoder_s_steps_write_their_caches_in_place() {
         assert_eq!(in_place.0, 0, "copies left in the decode steps");
         assert_eq!(copying.1, in_place.1, "every step's logits");
         assert_eq!(copying.2, in_place.2, "the generated tokens");
+    });
+}
+
+/// A [`Llama`] whose cache is laid out as `layout` says: the same model and steps.
+struct InLayout<'a> {
+    model: &'a Llama<TtBackend>,
+    layout: CacheLayout,
+}
+
+impl FixedShapeDecoder<TtBackend> for InLayout<'_> {
+    type Cache = LlamaCache<TtBackend>;
+
+    fn new_cache(&self, max_len: usize, device: &TtDevice) -> LlamaCache<TtBackend> {
+        self.model
+            .fixed_cache_in(max_len, self.layout, burn::tensor::DType::F32, device)
+    }
+
+    fn chunk(
+        &self,
+        tokens: Tensor<TtBackend, 2, Int>,
+        start: Tensor<TtBackend, 1, Int>,
+        last: Tensor<TtBackend, 1, Int>,
+        cache: &LlamaCache<TtBackend>,
+    ) -> (Tensor<TtBackend, 2>, Vec<Tensor<TtBackend, 4>>) {
+        self.model.chunk(tokens, start, last, cache)
+    }
+
+    fn step(
+        &self,
+        token: Tensor<TtBackend, 2, Int>,
+        position: Tensor<TtBackend, 1, Int>,
+        len: usize,
+        cache: &LlamaCache<TtBackend>,
+    ) -> (Tensor<TtBackend, 2>, Vec<Tensor<TtBackend, 4>>) {
+        self.model.step(token, position, len, cache)
+    }
+}
+
+/// A position-major cache (`[1, 1, max_len, kv_heads head_dim]`) takes a step's keys and values
+/// as the projection's row they are: its decode steps relay nothing for the write (no `native
+/// repack`), where the head-major cache's relay each head's row (the negative control), and its
+/// generation is the head-major one's, token for token and bit for bit. The steps attend to 32
+/// positions, a ragged 48 (whose operands are not whole tiles of the cache's rows) and the whole
+/// 128-position cache, and a prefill of two chunks writes through the layout too.
+#[test]
+fn a_position_major_cache_writes_the_projection_s_row_as_it_is() {
+    with_device(Config::default(), |d| {
+        let config = LlamaConfig {
+            hidden: 64,
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 32,
+            ff: 96,
+            vocab: 100,
+            layers: 2,
+            rope_theta: 10_000.0,
+            eps: 1e-5,
+            tied_head: true,
+        };
+        let model = Llama::<TtBackend>::new(&config, &d);
+        let shapes = Shapes::new(128, &[8, 16]).with_steps(&[32, 48]);
+        let prompt: Vec<i32> = (0..28).map(|i| (i * 37 + 11) % 100).collect();
+        let (kv_heads, head_dim) = (config.kv_heads, config.head_dim);
+        assert_eq!(
+            CacheLayout::for_heads(kv_heads, head_dim),
+            CacheLayout::PositionMajor { kv_heads, head_dim },
+            "the layout a Llama takes"
+        );
+        burn_tt::set_state_in_place(true);
+        let mut runs = Vec::new();
+        for layout in [
+            CacheLayout::HeadMajor { kv_heads, head_dim },
+            CacheLayout::PositionMajor { kv_heads, head_dim },
+        ] {
+            let decoder = InLayout {
+                model: &model,
+                layout,
+            };
+            let g = TracedGenerator::<_, TtBackend>::new(&decoder, &shapes, &d).unwrap();
+            let mut repacks = 0;
+            for (key, ops) in g.trace_ops().unwrap() {
+                if key.starts_with("Step") {
+                    repacks += ops
+                        .iter()
+                        .filter(|op| op.label == "float_scatter_nd" && op.what == "native repack")
+                        .count();
+                }
+            }
+            let generation = g.generate(&prompt, 26).unwrap();
+            let logits: Vec<Vec<u32>> = generation.logits.iter().map(|l| bits(l)).collect();
+            runs.push((repacks, logits, generation.tokens));
+        }
+        let (head_major, position_major) = (&runs[0], &runs[1]);
+        // At least the value's row (a view of its projection's row) relaid into each layer's
+        // heads' rows, at every step length.
+        assert!(
+            head_major.0 >= config.layers * shapes.steps.len(),
+            "the negative control: {} repacks",
+            head_major.0
+        );
+        assert_eq!(position_major.0, 0, "the write relaid");
+        assert_eq!(head_major.1, position_major.1, "every step's logits");
+        assert_eq!(head_major.2, position_major.2, "the generated tokens");
     });
 }

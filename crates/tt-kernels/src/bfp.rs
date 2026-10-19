@@ -330,6 +330,7 @@ pub(crate) fn matmul(
         let mut jobs = Vec::new();
         let rc = out.tensor_ref().encode();
         for i in 0..a.rows.div_ceil(32) {
+            let live = crate::matmul::LiveRows::for_job(a.rows, i, 1);
             for j in 0..b.cols.div_ceil(32) {
                 let mut job = Vec::new();
                 for k0 in (0..kt).step_by(kc) {
@@ -377,6 +378,7 @@ pub(crate) fn matmul(
                         layout.sems,
                         false,
                         false,
+                        live,
                         || {
                             (
                                 matmul::k_block_kernel(
@@ -385,6 +387,7 @@ pub(crate) fn matmul(
                                     route,
                                     fidelity,
                                     false,
+                                    live,
                                 ),
                                 [None; 3],
                             )

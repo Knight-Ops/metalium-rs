@@ -2,7 +2,7 @@
 
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile". Written 2026-10-16 against `7e9def9`. Status: **S1, S2a, F0, S2b and S3
 done (2026-10-16; a 1.7B step 42.97 / 45.41 / 48.59 ms on `Tt` with S3's row-limited statistic, run `1792189445`);
-S1d, S4, S5 open.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
+S1d done 2026-10-18 (the position-major cache); S4, S5 open.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
 [in-place-cache-write.md](in-place-cache-write.md) (the cache write's copies). The whole step's byte budget, and the
 weight prefetch that would overlap these ops, are [decode-step-bandwidth.md](decode-step-bandwidth.md).
 
@@ -107,7 +107,10 @@ the bits are unchanged.
   - Two mutations watched failing: a block read without its column offset, and a `cat` reading every piece from the
     first.
 
-### S1d. The cache write reads its rows in place (open; ~1.8 ms a 1.7B step)
+### S1d. The cache write reads its rows in place (done 2026-10-18; ~1.2-1.3 ms a 1.7B step)
+
+**Done** by the position-major cache ([decode-attention.md](decode-attention.md) A-layout): the write takes the
+projection's row as it is. The plan as written:
 
 The key now reaches `FixedWrite::write` in the projection's layout and repacks there (38 us a layer, 0.9 ms a step),
 as the value already did (0.9 ms). This is [in-place-cache-write.md](in-place-cache-write.md) D5's fix, for both: a

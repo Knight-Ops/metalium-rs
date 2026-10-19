@@ -23,7 +23,7 @@ use tt_isa::isa::Instruction;
 use tt_isa::tile::L1Format;
 use tt_kernels::code::Code;
 use tt_kernels::loops::frontend_stream;
-use tt_kernels::matmul::{self, Fidelity, MatmulSemaphores, OutputTile, SrcRoute};
+use tt_kernels::matmul::{self, Fidelity, LiveRows, MatmulSemaphores, OutputTile, SrcRoute};
 use tt_kernels::sfpu::kernel::{self, Operands};
 use tt_kernels::sfpu::ops::{self, kind_sfpu, Broadcast};
 use tt_kernels::sfpu::reduce::{self, Axis, ReduceOp};
@@ -127,17 +127,25 @@ fn corpus() -> Vec<Checked> {
                     }],
                 ),
             ] {
-                for (allow_mop, b_t) in [(false, false), (true, false), (false, true)] {
+                for (allow_mop, b_t, live) in [
+                    (false, false, LiveRows::All),
+                    (true, false, LiveRows::All),
+                    (false, true, LiveRows::All),
+                    (false, false, LiveRows::Sixteen),
+                    (true, false, LiveRows::Eight),
+                    (false, true, LiveRows::Eight),
+                ] {
                     let (sems, _) = MatmulSemaphores::alone();
                     let (words, mop) = matmul::matmul_kernel(
-                        &outputs, sems, in_fmt, out_fmt, fidelity, allow_mop, b_t,
+                        &outputs, sems, in_fmt, out_fmt, fidelity, allow_mop, b_t, live,
                     );
                     for t in 0..3 {
                         let stream = frontend_stream(&words[t], mop[t].as_ref())
                             .expect("frontend model accepts the matmul");
                         out.push(check(
                             format!(
-                                "matmul {route:?} {fidelity:?} {tag} mop={allow_mop} b_t={b_t} {}",
+                                "matmul {route:?} {fidelity:?} {tag} mop={allow_mop} b_t={b_t} \
+                                 {live:?} {}",
                                 role[t]
                             ),
                             &stream,

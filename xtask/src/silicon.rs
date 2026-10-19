@@ -264,6 +264,12 @@ pub const SMOKE: &[&str] = &[
     "step201_unpacker_transposed_b::",
     // A native repack's reads in flight together (decode-to-bandwidth.md Phase 1).
     "step202_repack_reads::",
+    // A product's last tile row computes only its rows (decode-to-bandwidth.md Phase 4).
+    "step203_live_rows::",
+    // A one-row product reads a packed `A`, and a blocked `K` streams (decode-to-bandwidth.md Phase 4).
+    "step204_packed_thin_a::",
+    // A captured product's weights prefetched on idle units (decode-to-bandwidth.md Phase 5).
+    "step205_weight_prefetch::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

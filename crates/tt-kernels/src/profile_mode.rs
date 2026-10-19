@@ -145,13 +145,18 @@ impl OpBytes {
                 let Some(rec) = entries.get(i..i + n) else {
                     return;
                 };
-                // A gather's `A` slots, from its header: `rows x kt` slots from `a_at`.
+                // A gather's `A` slots, from its header: `rows x kt` slots from `a_at`. One with
+                // `A` resident reads only `B` (a packed `A`'s tiles are a `READ_RUN` of their
+                // own, counted as reads, not as `A`).
                 let a_slots = (head[0] == record::GATHER).then(|| {
                     let (a_at, rows, kt) = (
                         head[2] as u64,
                         head[5] as u64,
                         record::gather_kt(head[1]) as u64,
                     );
+                    if head[1] & record::GATHER_A_RESIDENT != 0 {
+                        return 0..0;
+                    }
                     a_at..a_at + rows * kt * TILE_SLOT
                 });
                 let _ = record::expand(rec, |e| {

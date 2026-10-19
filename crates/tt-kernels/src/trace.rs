@@ -293,6 +293,11 @@ pub(crate) struct Capture {
     pub(crate) ops: Vec<OpRecord>,
     /// An op failed part-way through being captured.
     pub(crate) failed: bool,
+    /// The last weight-streaming product's barrier target (relative, as every captured target
+    /// is) and each unit's stream length after it: a unit whose stream has not grown since ran
+    /// nothing after it, so a list appended to it runs as soon as the product is done
+    /// (`Session::matmul_dram`'s weight prefetch).
+    pub(crate) weight_anchor: Option<(u32, Vec<usize>)>,
 }
 
 /// One unit's share of a finished trace.

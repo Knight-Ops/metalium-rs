@@ -556,6 +556,7 @@ pub(crate) fn matmul(
         for j0 in (0..nt).step_by(nc) {
             let (rows, cols) = (mc.min(mt - i0), nc.min(nt - j0));
             let tiles = [rows, kt, cols];
+            let live = matmul::LiveRows::for_job(a.rows, i0, rows);
             let layout = match matmul::plan_layout_in(tiles, L1Format::Bf16, Staging::Slots) {
                 Ok(layout) => layout,
                 Err(error) => {
@@ -579,6 +580,7 @@ pub(crate) fn matmul(
                 layout.sems,
                 false,
                 false,
+                live,
                 || {
                     matmul::matmul_kernel(
                         &layout.outputs,
@@ -588,6 +590,7 @@ pub(crate) fn matmul(
                         fidelity,
                         false,
                         false,
+                        live,
                     )
                 },
             );
@@ -644,6 +647,7 @@ fn matmul_continuing(
         let mut jobs = Vec::new();
         let rc = out.tensor_ref().encode();
         for i in 0..a.rows.div_ceil(32) {
+            let live = matmul::LiveRows::for_job(a.rows, i, 1);
             for j in 0..b.cols.div_ceil(32) {
                 let mut steps = Vec::new();
                 for k0 in (0..a.cols.div_ceil(32)).step_by(kc) {
@@ -678,6 +682,7 @@ fn matmul_continuing(
                         layout.sems,
                         false,
                         false,
+                        live,
                         || {
                             (
                                 matmul::k_block_kernel(
@@ -686,6 +691,7 @@ fn matmul_continuing(
                                     route,
                                     fidelity,
                                     false,
+                                    live,
                                 ),
                                 [None; 3],
                             )

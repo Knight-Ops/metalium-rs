@@ -156,6 +156,8 @@ fn a_is_read_once_a_unit() {
     let (m, k, n) = (1, 2048, 192);
     with_tiles(TileChoice::Count(2), |s| {
         s.set_count_trace_bytes(true);
+        // The thin reads' count: a packed `A` (`step204`) is its own op and reads `K / 1024`.
+        s.set_packed_thin_a(false);
         let a = s.upload(&floats(1, m * k), m, k).unwrap();
         let b = s.upload(&floats(2, k * n), k, n).unwrap();
         let mut counted = Vec::new();

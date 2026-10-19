@@ -1,28 +1,30 @@
 # Decode at GDDR's bandwidth
 
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
-[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-18): **a 1.7B step 41.83 / 44.25 / 47.40 -> 33.02 / 33.52 / 34.42 ms (`1792298195`), 135M
-20.03 / 20.55 / 21.19 -> 14.04 / 14.45 / 15.02 (`1792298556`).**
+[decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-18): **a 1.7B step 41.83 / 44.25 / 47.40 -> 26.47 / 27.14 / 27.97 ms (`1792364210`), 135M
+20.03 / 20.55 / 21.19 -> 12.62 / 13.06 / 13.59 (`1792364661`).** The four larger changes are built (below).
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
-- **Phase 1:** the copies are done; the repack's reads run in flight together, the row scatter and the embedding's
-  select on every unit; the k/v repack itself moved to Phase 2.
+- **Phase 1:** done. The copies are gone. The repack's reads run in flight together, and the row scatter and the
+  embedding's select run on every unit. The k/v repack is gone with the position-major cache (Phase 2's A-layout).
 - **Phase 3:** the capture barriers, the row-limited element-wise ops and RoPE's sum fuser are done.
 - **Phase 2:** A0 found the transposed reads of the key cache; `B` is now transposed by the unpacker (A0b), and a
   stacked product's tail rows are no longer read (A2a), nor its padding off `K` filled (A1); the softmax is four
-  ops (A4a), and the scale and the mask are one (A4b).
+  ops (A4a), and the scale and the mask are one (A4b). The cache is position-major (A-layout), so a step writes its
+  projection's row as it is.
 - **Phase 4:** a thin product over a long `K` runs on 64 units (the deal).
-- **Where the step goes now** (profile `1792298755`, 1.7B `Step(64)`, 32.32 ms):
-  - products 21.65 ms at 361 GB/s;
-  - RMSNorm's two ops 2.42;
-  - the cache write 1.94 (the repack 1.5 of it);
-  - the softmax 1.53, `pv` 0.93, `qk` 0.81;
-  - `gamma`'s product 0.85, RoPE's sum 0.47, the residual adds 0.42, `silu * up` 0.37.
-- **Next, the larger changes (documented, not built):**
-  - `A` once a product (G7, ~2.9 ms);
-  - compute under the reads (~1.4 ms);
-  - the position-major cache (A-layout: the repack, and `qk`/`pv`'s regathering, A2);
-  - the weight stream under the small ops (Phase 5).
-  This is the umbrella plan.
+- **Phase 4:** `A` once a product (a packed `A`), compute under the reads (the m = 1 kernel's rows, a blocked `K`
+  streamed).
+- **Phase 5:** the weight stream under the small ops, on idle units.
+- **Where the step goes now** (profile `1792363365`, 1.7B `Step(64)`, 25.61 ms; products partly overlap the small
+  ops now):
+  - the products (and their packing ops) 15.60 ms, 462 GB/s over their own time; their `B` alone would take 14.88
+    at 469 GB/s;
+  - everything else 10.01 ms, 4.37 of it on 1-2 units: RMSNorm's one-unit statistic, the 2-unit softmax ops and
+    the stacking gathers.
+- **Next:** the small ops, especially those on 1-2 units, which the prefetch's GDDR traffic also slows; then
+  prefetch for the K-blocked `down`.
+
+This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
 - [in-place-cache-write.md](in-place-cache-write.md) (D1-D5);
 - [decode-small-ops.md](decode-small-ops.md) (S1d, S4, S5);
@@ -163,9 +165,9 @@ row gathers.
   - **Profile `1792296384`** (`Step(64)`, before the span read): the replay 33.68 -> 32.34 ms. The cache write's 96
     ops 3.06 -> 1.94 ms (the row scatter 25 -> 8.8 us on 16 units). The embedding's select 253 -> 67 us on 64 units,
     52 of it the barrier; the RoPE tables' selects 24 -> 14 us.
-- [ ] **k and v without the repack** (in-place-cache-write D5, decode-small-ops S1d). It is the cache's head-major
-  layout, so it moves to Phase 2: a position-major cache (`[L, kv * d]`) makes the write the projection's row as it
-  is. What is left of the repack after the change above is in the profile.
+- [x] **k and v without the repack** (in-place-cache-write D5, decode-small-ops S1d; 2026-10-18). It was the cache's
+  head-major layout. The cache is now position-major (decode-attention A-layout), and the write is the projection's
+  row as it is.
 
 ### Phase 2. Decode attention, ~5.2 / 10.9 -> ≲1 ms
 
@@ -258,41 +260,53 @@ Reordered by Phase 0. A layer's products take ~907 us, against ~600 us for their
   - **The total:** ~143 us a layer, **~3.4 ms a 1.7B step at most**.
   - **What is left without `A`:** each product is still above its weights' own stream (`o` 56 against 38 us,
     `down` 198 against 150). That is the kernel tail and the barrier, the next items.
-- [ ] **`A` once a product** (G7, decode-step-bandwidth B2 point 6). Two designs, neither built:
-  - **(a) Multicast.** One unit reads `A`'s `K` tiles and multicasts its `A` slots to the product's other units.
-    Multicast writes are probed on silicon (`step115`; rectangles only, as ttsim takes them), but the mover issues
-    none today. It needs:
-    - two mover entries: multicast an L1 range to a `noc::multicast::Rect` and wait for its acknowledgements; and
-      wait for a local word, then clear it;
-    - a flag the receivers wait on before their kernel;
-    - the product's units as rectangles of surviving tiles;
-    - a hazard rule: nothing outside the product may be written.
-  - **(b) A vector layout for decode activations.** A `[1, K]` activation stored as its `K` values, contiguous.
-    `A` is then one read, and the matmul's unpacker reads a tile's faces at 128-byte strides: only row 0 is used,
-    and the other rows reach only the output's padding.
-    - **Benefit:** no NoC multicast and no leader.
-    - **Cost:** a new tensor layout that the producers (`SILU_MUL`, the norms, the residual adds) write and the
-      thin product reads, plus new unpacker addressing in the matmul kernel.
-  - **How:** one unit reads `A`'s `K` tiles and multicasts them to the product's units' `A` slots; a semaphore the
-    mover waits on releases each unit's compute. Every other unit reads only `B`.
-  - **Worth:** `A`'s entries are ~17 us on `qkv`, `o` and `gate|up`, ~70-80 on `down`: ~120 us a layer, ~2.9 ms a
-    step.
-  - **Constraints:** rectangles only (ttsim refuses non-rectangular multicast), and the reading unit gets fewer
-    columns.
-- [ ] **Compute under the reads** (a larger change: documented, not built). The ~15 us kernel tail of each product
-  (~1.4 ms a step) is the compute after the last read: under `Staging::Slots` a job's kernel starts when all its `K`
-  tiles are in.
-  - **Why it is larger:** B runs a job's gathers and then its `KERNEL` in order. Starting the kernel first needs:
-    - a mover entry that launches T0-T2 and goes on reading;
-    - the matmul kernel's unpacker waiting on a credit for each `K` chunk (`matmul_requirements`' `A` and `B` rings
-      already run from the mover to the unpacker);
-    - the mover posting those credits as each chunk's reads land;
-    - the `step172`/`step173` gates in both read modes, and the firmware lints.
-  - **Single-job units benefit most:** on the 1.7B, `o` and `down` each run one job a unit, so between-job double
-    buffering (`SlotsHalf`) has nothing to overlap there.
-  - **The fix:** start the `K` chain on the tiles that have landed, by credits per `K` chunk, in the same order, so
-    bit for bit.
-  - Or, for a unit with several jobs, `SlotsHalf`'s double buffering.
+- [x] **`A` once a product: a packed `A`** (2026-10-18; G7, decode-step-bandwidth B2 point 6). Neither designed
+  form was built: multicast risks the NoC, and a vector layout needs every producer to write it. A third, built on
+  tiles, does the job.
+  - **`tensor::pack_row`:** lays a `[1, K]` row out as `[K / 32, 32]`, so row `kk` is `K` tile `kk`'s data row. It is
+    one op on the product's units: a read and two face-row writes a tile, ~5-7 us.
+  - **Each unit reads `A` as `K / 1024` whole tiles** (a `READ_RUN`, 2 at `K` = 2048, 8 at 8192), not `K / 32` thin
+    reads at ~0.27 us an entry. Its gather reads only `B` (`GATHER_A_RESIDENT`).
+  - **The kernel:** it unpacks `K` tile `kk`'s faces from row `kk % 16` of the packed faces `((kk % 32) / 16, ·)`
+    (`matmul::packed_a_pairs`), whose `(·, 0)` and `(·, 1)` are 1,024 bytes apart as a tile's are. `SrcB`'s row 0 holds
+    the same values, so it is bit for bit, and the other rows only reach output rows past the product's one. The
+    pairs are stepped in runs of 16 (`even_runs`).
+  - **K blocks:** a packed `A` takes `ceil(kc / 32) + 1` slots, so `down` fits two K blocks of 128, not four of 64
+    (`packed_k_block`).
+  - **When:** `Session::set_packed_thin_a` (on): `m = 1`, `A` untransposed, `K` whole tiles and at least
+    `PACKED_A_K_TILES` (32), TF32.
+  - **Gates:**
+    - `step204_packed_thin_a` (ttsim; card 0 `1792342641`, every unit): the packing is the host's reshape at `K` =
+      1024, 1056 and 8192, and the products are bit for bit the thin ones, whole, K-blocked and streamed, with `B`
+      transposed and NaN-primed L1. Watched failing with the face-row offset dropped;
+    - unit `a_packed_a_is_read_in_k_over_1024_tiles`.
+  - **Measured** (profile `1792342758`): `qkv` 148 -> 135, `o` 64 -> 53, `gate|up` 349 -> 337, `down` 246 -> 190 us,
+    each plus its pack. The step went 29.55 -> 27.90 ms; the larger K blocks took it to 27.77 (`1792344448`).
+- [x] **Compute under the reads** (2026-10-18). Reading the code showed the ~15 us "tail" was the last block's
+  compute, ~0.23 us a pair, and every earlier block's was serialized with the unit's next reads. Two changes:
+  - **The m = 1 kernel computes only its rows** (`matmul::LiveRows`, on every product path and BF16/BFP, by the
+    product's own `m`):
+    - an output tile whose last tile row holds 1-8 rows skips `A`'s faces `(1, k)` and `SrcB`'s second half: 16
+      `MVMUL`s a pair, not 64;
+    - with 9-16 rows, it skips the faces `(1, k)` only;
+    - the rows left out stay `ZEROACC`'s zeros, which every padding claim allows, and the computed rows take the same
+      products in the same order.
+    - **Gates:** `step203_live_rows` (ttsim; card 0 `1792341332`): bit for bit against the trim off, `m` 1-33, K whole,
+      ragged and blocked, HiFi4 and LoFi, BF16. Watched failing with the last `MVMUL` on the wrong row. `step121`
+      checks the trimmed programs' waits.
+    - **Measured** (`1792341444`): the tail went 15.0 -> 4.8 us, and the step 30.91 -> 29.55 ms.
+  - **A blocked `K` streamed in chunks** (`BlockPlan::push_stream_jobs`, `matmul::StreamLayout`; `Session::set_streamed_k`,
+    on):
+    - a one-row product with a packed `A` whose `K` would be K-blocked runs each column's `K` as an even number of
+      chunk batches, in alternating halves;
+    - each chunk reloads the partial the one before packed into its half's output slot (the K block's FP32 reload,
+      from L1, not GDDR), so the mover reads chunk `c + 1` while chunk `c` computes, and only the last chunk writes;
+    - **why only where `K` is blocked:** each chunk batch costs ~3 us of role work (the reload, the pack, the
+      lockstep retire). Streaming every product's `K` lost on units of several columns (`1792358552`: `gate|up` 337 ->
+      346 us).
+    - **Gates:** `step204` (streamed and not), unit `a_streamed_column_reads_its_k_in_chunks`; watched failing with
+      the reload dropped.
+    - **Measured** (`1792359572`): `down` 184 -> 173 us, the step 27.77 -> 27.51 ms.
 - [x] **The deal** (2026-10-18). A product's units are chosen from its bytes, not "every unit":
   - 64 units saturate;
   - an uneven last round costs its barrier.
@@ -308,25 +322,127 @@ Reordered by Phase 0. A layer's products take ~907 us, against ~600 us for their
 - [ ] **Consecutive tiles.** A column-dealt stream is ~7% under the consecutive-tile ceiling (~45 us a layer).
   - **Options:** a skewed placement (decode-matmul-bandwidth P5.1), or a deal of `K`-contiguous runs that walk the
     channels.
-  - Worth doing only after the items above.
+  - **Tried, 2026-10-18:** `gate|up`'s rounds dealt rotated, so each unit walked the channel pairs. No gain:
+    27.90 -> 27.84 ms (`1792343591`); the barrier fell, the data phase rose. Reverted. The barrier skew is not
+    channel locality.
 - [ ] **Decision point (ask the user):** split-K, if `o` and `down` remain short of the ceiling. Phase 0 shows 64
   units can saturate, so this is now less likely to be needed.
 
-### Phase 5. The weight stream under the small ops, ~3 -> ~0.5 ms exposed
+### Phase 5. The weight stream under the small ops (done 2026-10-18)
 
-These are decode-step-bandwidth B2.1-B2.4, now sized to fit.
-- [ ] **B2.1, `GATHER_B_RESIDENT`** (B1's twin): a matmul layout with `B`'s slots in a range at the top of `DATA`.
-- [ ] **B2.2, a trace-level L1 reservation** that `l1::Requirements` refuses to plan into.
-- [ ] **B2.3, a deal with an offset:** the prefetched columns go to the units that hold them.
-- [ ] **B2.4, the insertion pass at `store_trace`:**
-  - `READ_RUN`s into idle units' streams at each window's start;
-  - the hazard check;
-  - eager runs unchanged, and each trace bit for bit its eager step.
-- [ ] **Each window checked at store time,** from the counted bytes: the next product's bytes in L1 must be at least
-  the window's length times 469 GB/s.
-- **Gates:**
-  - a trace with the prefetch is bit for bit the same trace without it;
-  - a prefetch into a planned range is refused at store time.
+decode-step-bandwidth B2.1-B2.4 were not built. A simpler design does the job with no record change, no L1
+reservation and no store-time pass.
+- [x] **Prefetch on idle units** (`Session::set_weight_prefetch`, on; `tensor::BlockPlan::push_prefetched_jobs`).
+  - **Which units:** in a capture, a one-row product with a packed `A` and its `K` whole puts its first columns on up
+    to `PREFETCH_UNITS` units past its own, ones whose stream has not grown since the last such product (the
+    capture's `weight_anchor`). Each takes one job of the plan's width.
+  - **What each such unit's stream gets:**
+    1. a wait for the last product's barrier;
+    2. its job's `B` reads, the job's own `GATHER` with `A` resident (`tensor::PREFETCH`);
+    3. the usual catch-up wait;
+    4. the job, whose gather reads only the packed `A`.
+    So the weights stream while the ops between the two products run.
+  - **Why it is safe on any unit:** the list is appended when the product is captured, after everything the unit
+    did before, with only the product's own wait after it. Taking only idle units is a policy: a busy unit would
+    start late. Eager runs never prefetch.
+  - **Gates:**
+    - `step205_weight_prefetch` (ttsim with 8 units, ops on 4; card 0 `1792361154`): the capture's run and its
+      replays are the ops run fresh, bit for bit, and the second and third products run on units 4-7, but not when
+      those units ran the ops between. Watched failing with the rest of the columns not shifted past the
+      prefetched ones;
+    - card 0: `step188` (the 1.7B traced against eager), 58 of 58 gates.
+  - **Measured:**
+    - at 56 units (`1792360408`): `o` 53 -> 31, `gate|up` 337 -> 280, the next layer's `qkv` 134 -> 81 us, and the
+      step 27.51 -> 25.96 ms;
+    - **what it costs the small ops:** the latency-bound ones slow under the prefetch's GDDR traffic (the residual
+      adds, RMSNorm's one-unit statistic, `gamma`'s product: ~+60 us a layer);
+    - **the cap, by experiment** (`PREFETCH_UNITS`): 20 units 26.74 ms (`1792362531`), 32 25.60 (`1792361675`),
+      **40 25.61 / 26.03 / 26.40 / 27.23 at `Step(64)` to `Step(512)` (`1792363365`, the setting)**, 56 25.96
+      (`1792360408`).
+- [ ] **Left:**
+  - prefetch for a K-blocked product (`down`'s column is 1 MB);
+  - the small ops made latency-tolerant of the stream (the one-unit statistic spread over units, decode-small-ops).
+
+## The larger changes compared (2026-10-18)
+
+Four larger changes were left after Phases 1-4's bit-for-bit items. Each was checked against profile `1792298755`
+(1.7B `Step(64)`, 32.32 ms) and the code. The profile, per layer, against `B`'s floor at 469 GB/s:
+
+| Product | us | `B` floor | over | barrier | last block's compute | data over the floor |
+|---|--:|--:|--:|--:|--:|--:|
+| `qkv` (64 units) | 160 | 109 | 51 | 10 | 15.0 | 23 |
+| `o` (64) | 74 | 36 | 38 | 3 | 15.0 | 18 |
+| `gate\|up` (64, four 2-column jobs a unit) | 356 | 291 | 65 | 32 | 29.6 | ~0 |
+| `down` (64, four K-blocks a unit) | 271 | 145 | 126 | 19 | 15.3 | 87 |
+| **layer** | **861** | **581** | **280** | 64 | 75 | 128 |
+
+**What the code showed** (corrections to the estimates above):
+- **The "kernel tail" is compute,** not a fixed cost: the last block's compute at ~0.23 us a `K`-tile pair
+  ([operating notes](../learnings/silicon-operating-notes.md#a-decode-products-weights-what-the-card-reads-at-2026-10-17-card-0)).
+  - The kernel is already launched before the reads.
+  - Under `Staging::Slots` (one block in the ring), every earlier block's compute is serialized with that unit's
+    next reads too.
+  - `down` round-trips each K-block's partial through GDDR.
+- **The m = 1 kernel may do ~4x the work it needs.** `matmul_items_reloading` runs all four faces, where row 0 needs
+  `fi = 0` and half of `SrcB`; row 0's accumulation order would be unchanged without the rest.
+- **The position-major cache removes the two repacks a layer and no attention op.** A2's worth is now -1.36 ms at
+  `Step(64)` and -1.56 at `Step(512)`, not -1.7 / -3.7.
+- **About 232 us of a layer's ~448 us of small ops run on 1-2 units** (~5.6 ms a step):
+  - the stacking row gathers;
+  - the softmax's two SFPU ops;
+  - RMSNorm's 1-unit statistic;
+  - the repacks, gone since.
+
+**The four, compared:**
+
+| Change | Worth | Size | Risk | Verdict |
+|---|---|---|---|---|
+| Position-major cache (A-layout) | ~1.5 ms | ~100 lines (`kv_cache.rs`) | low: the same tiles in the same order | **done**: 1.2-1.3 ms measured |
+| Compute under the reads | ~2-3 ms: the tails (1.8 ms) and `down`'s serialized K-blocks (~1-1.5) | medium, mostly host | medium | **done** as the m = 1 kernel's rows (1.4 ms) and a blocked `K` streamed (0.3 ms) |
+| `A` once a product (G7) | <= 3.4 ms (the skip-`A` probe) | large | (a) multicast high (a NoC hang reboots the host); (b) vector layout medium | **done** as a packed `A` on tiles (1.8 ms with its larger K blocks), neither (a) nor (b) |
+| The weight stream under the small ops (Phase 5) | ~2-3 ms realistic | ~1,100-1,400 lines | the speed: GDDR contention, and slack that shrinks as the others land | **done** with a simpler design: idle units, no store pass (1.9 ms) |
+
+**Each change in detail:**
+- **Compute under the reads, next.**
+  - **First, the trimmed m = 1 kernel** (skip `fi = 1` and `SrcB`'s second half). It is small and bit for bit. It
+    cuts every block's compute and shows whether a pair is bound by its `MVMUL`s or its unpacks.
+  - **Then each job's `K` chain as streamed batches with a ring of two:**
+    - each batch gathers `A` and `B` for its `K` chunk;
+    - the first clears `Dst`, the last packs;
+    - the order is the same.
+    The batch format (`[VERSION, batches, capacity, role]`) already allows it. `down` then needs no K-blocking and
+    no partial's round trip.
+- **`A` once a product.**
+  - **The cost:** `A`'s cost is the mover's ~360 cycles an entry (a `READ_RUN` tile costs the same). A thin read
+    fetches 1,088 bytes and uses 128.
+  - **First, a probe:** `A`'s read order rotated by unit. It tells the entries' cost from 64 units reading one
+    channel at once.
+  - **Then the vector layout:** the producers write a K-contiguous copy, and unpacker 1 reads it at a 128-byte row
+    stride. The stride looks expressible; it is unproven on unpacker 1.
+  - **Not multicast:** the leader still pays K entries, and a mistake risks the host.
+- **The weight stream.**
+  - **A simpler design:** units 64-119 run no op from one layer's `silu_mul` to the next's. So a store-time check
+    that a prefetching unit runs nothing before its product can replace B2.2's L1 reservation.
+  - **The prefetch is the product's own `GATHER`,** with `GATHER_A_RESIDENT`, so it lands in the slots the product
+    reads.
+  - **Limits:** `down`'s 1.06 MB column cannot be prefetched, and L1 holds ~30 MB a product.
+  - **First:** the replay probe (`probe_prefetch` allowed in a capture, and `OpRecord.barrier` false for unbarriered
+    ops).
+- **Landing:** the four together reach ~24-26 ms, not 15-16. The rest is the small ops on 1-2 units, a parallel
+  track spread the way Phase 1 spread the scatter and the select.
+
+**Landed** (1.7B `Step(64)` replay, card 1 profiles):
+
+| After | ms |
+|---|--:|
+| start of the comparison (`1792298755`) | 32.32 |
+| position-major cache (`1792336760`) | 30.91 |
+| the m = 1 kernel's rows (`1792341444`) | 29.55 |
+| packed `A`, then its larger K blocks (`1792342758`, `1792344448`) | 27.90, 27.77 |
+| a blocked `K` streamed (`1792359572`) | 27.51 |
+| weight prefetch, 40 units (`1792363365`) | 25.61 |
+
+Timed (`traced_generation`, card 1): **26.47 / 27.14 / 27.97 ms** (`1792364210`), from 33.02 / 33.52 / 34.42.
 
 ## Expected landing
 

@@ -9,6 +9,7 @@ flowchart TD
     subgraph Tier3["Tier 3: docs/proposals/ (RFCs & Design Notes)"]
         P1["x280-on-card-dispatch.md<br/><i>(Proposed, unscheduled)</i>"]
         P2["future-fusion-features.md<br/><i>(FlashAttention, Sharded L1, NoC stream)</i>"]
+        P3["batched-decode.md<br/><i>(tile-row batches, paged position-major cache)</i>"]
     end
 
     subgraph Tier2["Tier 2: docs/plans/ (Active Specs)"]
@@ -95,6 +96,7 @@ Unscheduled design proposals and exploratory RFCs evaluating trade-offs before i
 - **Contents**:
   - [`x280-on-card-dispatch.md`](proposals/x280-on-card-dispatch.md): RFC proposing use of on-card SiFive X280 RISC-V cores for on-card host orchestration.
   - [`future-fusion-features.md`](proposals/future-fusion-features.md): RFCs for advanced fusion: Tiled Online Softmax FlashAttention, sharded multi-core L1 mesh tensor residency, and inter-core NoC streaming.
+  - [`batched-decode.md`](proposals/batched-decode.md): batched decode laid out on Blackhole's tiles (sequences as the rows of a tile row, batches of 8/16/32, a paged position-major cache, per-sequence attention items, on-card sampling); unscheduled behind batch-1 speed.
 
 ### Completed plans: `docs/completed-plans/`
 Plans whose checklists are closed move here as a record, with their evidence. They are not updated; current behaviour lives in `docs/learnings/` and the active plans, and any item still open is carried in [`roadmap.md`](plans/roadmap.md).
