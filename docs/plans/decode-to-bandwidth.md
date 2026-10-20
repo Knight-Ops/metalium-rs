@@ -3,7 +3,8 @@
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
 [decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 24.04 / 24.48 / 25.39 ms (`1792383988`), 135M
 20.03 / 20.55 / 21.19 -> 11.40 / 11.80 / 12.26 (`1792378993`).** The four larger changes are built (below), and the
-small ops' phase has begun (Phase 3, "The small ops, 2026-10-19").
+small ops' phase has begun (Phase 3, "The small ops, 2026-10-19"). Then decode attention as one op (Phase 6): 1.7B
+**22.78 / 23.26 / 23.98 ms** (`1792425331`), 135M **9.58 / 10.11 / 10.96** (`1792425715`).
 - **Phase 0, done:** the read ceiling is ~488 GB/s, and the products' gap is not the read stream.
 - **Phase 1:** done. The copies are gone. The repack's reads run in flight together, and the row scatter and the
   embedding's select run on every unit. The k/v repack is gone with the position-major cache (Phase 2's A-layout).
@@ -25,8 +26,16 @@ small ops' phase has begun (Phase 3, "The small ops, 2026-10-19").
     469 GB/s; only `down` (172 us a layer against ~143, not prefetched) is clearly over;
   - everything else 7.64 ms in 690 ops, in four windows between a layer's products, ~1.9 ms of it on 1-2 units: the
     softmax's SFPU ops and reductions, attention's scale, RMSNorm's statistic.
-- **Next:** a deeper weight prefetch (more than one job a unit, more than one product ahead) and prefetch for the
-  K-blocked `down`, which put more of the weight stream under the small ops.
+- **2026-10-19, the review** ([below](#the-2026-10-19-review-what-caps-decode-in-f32)): the deeper prefetch alone is
+  worth ≤ ~2 ms (L1 and a unit's read rate cap it); the order is now Phase 6 (attention as one op), Phase 7 (the other
+  small ops), Phase 8 (a continuous weight stream). **F32's floor is ~14.3 ms** (6.957 GB of weight slots at 488 GB/s;
+  13.6 at 512): ~13 ms needs BF16 storage, a later item.
+- **Phase 6, done:** decode attention as one op: 1.7B **22.78 / 23.26 / 23.98 ms** (`1792425331`), 135M **9.58 /
+  10.11 / 10.96** (`1792425715`).
+- **Then (Phase 7):** RMSNorm as one op, the token on the card, RoPE as one op, three copies gone: 1.7B **20.95 / 21.41 /
+  22.18 ms** (`1792444936`), 135M **8.00 / 8.59 / 9.38** (`1792445319`).
+- **Phase 8's probe (2026-10-20):** weights free, a step is 7.85 ms; under a ~300 GB/s stream its ops cost 1.6x; go,
+  but L1 binds (~2-3 ms realistic). Next: the packed-`A` ring reclaim, then busy units streaming (below).
 
 This is the umbrella plan.
 It orders the open items of the companion plans and adds two new ones:
@@ -492,6 +501,189 @@ reservation and no store-time pass.
 - [ ] **Left:**
   - prefetch for a K-blocked product (`down`'s column is 1 MB);
   - the small ops made latency-tolerant of the stream (the one-unit statistic spread over units, decode-small-ops).
+
+## The 2026-10-19 review: what caps decode in F32
+
+Asked: the deeper prefetch, or a review for assumptions that limit us, toward ~13 ms. Three reviews (scheduler,
+formats and bandwidth, the op graph; profile `1792382914`, `Step(64)` 23.22 ms: products 15.58, 690 other ops 7.64,
+the host ~0.8).
+
+- **The floor.** F32 weight slots are 6.957 GB: **14.3 ms at the 488 GB/s read ceiling**, 14.7 with a 512-position
+  cache, 13.6 at the 512 GB/s peak. ~13 ms is not reachable in F32 on one card. The checkpoint is BF16 widened at load
+  (`llama.rs` `Precision::F32`), and `SrcA` multiplies at TF32 (9 mantissa bits used), so BF16 storage would be
+  bit for bit at half the bytes (~7.2 ms floor): decided (2026-10-19) to come after the F32 levers, then lower formats
+  and mixed precision.
+- **The deeper prefetch alone: ≤ ~2 ms, likely ~1.** The arena is 896 KiB, so a unit holds one 2-column job at
+  `K` = 2048; ~56 idle units hold ≤ ~50 MB against a ~88 MB window; a unit reads at ~7 GB/s; contention slows the
+  latency-bound small ops (the cap of 40). Its longest window was attention's.
+- **Limiting assumptions, ranked:**
+
+  | # | Assumption | Cost | Phase |
+  |---|---|--:|---|
+  | 1 | Attention, RoPE and the cache write are 21 ops a layer, 5 of them on 1-2 units (32 heads in one tile row) | ~4.5 ms | 6 |
+  | 2 | Weights stream only on idle units, one product ahead: B drains every read before a `LAUNCH` or `BARRIER`, ops are total-ordered behind one cumulative barrier, nothing in L1 survives an op | products ~150 us a layer over their floor (~3.6 ms); isolated they read at 346-412 GB/s | 8 |
+  | 3 | ~3.5 us of control an op (`PAIR_CALL`, credits, `LAUNCH`) over ~690 ops, and barrier skew | ~2.4 ms + ~3.8 of waiting | 7 |
+  | 4 | RMSNorm is three ops, the residual add a fourth | ~2.3 ms | 7 |
+  | 5 | The `[1, 49152]` logits downloaded a step; argmax on the host | ~0.47 ms | 7 |
+  | 6 | `down` never prefetched (a 1 MB column) | ~0.7 ms | 8 |
+  | — | Not limiting: the in-flight cap (8), `fast-reads` (no effect on `READ_RUN`), NoC1 reads (SYS-1419), slot headers (1.6%), the head (~0.1 ms over) | — | — |
+
+- **Why shrinking is not enough:** once the small ops are small, the step tends to the products' isolated ~17.6 ms
+  (732 us a layer against 581); their start, tail and barrier hide only under a stream already running. Hence Phase 8.
+- **Expected:** Phase 6 ~20-21 ms, Phase 7 ~18-19, Phase 8 ~15.5-16.5 (32-token prompt).
+
+### Phase 6. Decode attention as one op (done 2026-10-19)
+
+- [x] **6a. In `ModuleOps::attention`** (`Session::attention_rows`, `tt_kernels::attention`; burn-tt
+  `module::attention_rows`, `burn_tt::set_attention_rows`). For a few query rows a key/value head under one mask row,
+  each head runs on one unit as seven kernels in one job, the intermediates in L1: `Q K^T` (a head's query rows read into
+  row 0 of `A`'s slots, the keys through the unpacker's transpose), `SCALE_MASK_FILL`, the row maximum with its clamp,
+  `SUB_EXP`, the row sum with its clamp, `DIV`, `P V`; its rows written into the stacked output, two 64-byte face rows a
+  row and tile. Every kernel computes only the head's rows (`code_for_rows`, `reduce::math_programs_rows`; `SUB_EXP` now
+  a row-limited kind). It replaces ten ops a layer.
+  - **Bits:** a product's output row is its `A` row's alone; a reduction over columns and the lanewise kinds never move
+    a value between rows; the row-limited programs keep the computed rows' bits. So it is the composition bit for bit.
+  - **Gate:** `step209_attention_rows` (ttsim, card 0 `1792425779`); probe `silicon_probe_attention_rows`
+    ([log](../learnings/performance-log.md#decode-attention-as-one-op-2026-10-19-cards-0-and-1)).
+  - **Measured:** 35 us a layer at 64 positions (was ~102 in ten ops), 89 at 512 (card 0, alone). 1.7B 24.04 / 24.48 /
+    25.39 -> **22.78 / 23.26 / 23.98 ms** (`1792425331`); 135M 11.40 / 11.80 / 12.26 -> **9.58 / 10.11 / 10.96**
+    (`1792425715`).
+  - **Found:** a stacked `q` puts head `h` at row `h`; built for rows `0..h + 1`, the head at row 31 ran the whole-tile
+    `SUB_EXP` and `DIV`, ~8 us a score tile (the first build was slower than the ten ops at 512 positions).
+- [x] **6b. One region a job** (2026-10-19, `tensor::share_semaphore_init`). The seven blocks were up to seven regions:
+  blocks join one only with equal semaphore initialisations, and the matmul's, SFPU's and reduction's differ only by the
+  semaphores the others lack. With their union: 35.2 -> **25.0 us** a layer at 64 positions, 89.4 -> 79.4 at 512 (card 0,
+  `1792430708`). Fewer kernels (the scale and mask into the maximum's pre-map, `SUB_EXP` into the sum's) are left.
+- [ ] **6c. RoPE and the cache's row write in the op** (now ~55 us a layer at `Step(64)`, 5 ops, after RoPE as one op and
+  the value's copy gone): a burn-fusion chain fuser
+  matching `cat` / `mul` / `MulAdd` / `ScatterNd` / `Attention` (burn-fusion keeps `Attention` one stream op), the
+  `v` row's copy out of `qkv` with them.
+- [ ] **6d. The context written as `o`'s packed row** (its repack and packing, ~10 us a layer).
+
+### Phase 7. The other small ops
+
+- [x] **RMSNorm's statistic and `DIV` as one op** (2026-10-19, `Session::rms_norm`, gate `step210`): every unit computes
+  the statistic from the packed twin and divides its tiles, at least 2 tiles a job (64 readers of one 2-tile row cost
+  more than they save). Isolated 19.8 -> 14.4 us a norm; in the step ~36 -> ~30. With 6b: 1.7B 22.78 / 23.26 / 23.98 ->
+  **22.24 / 22.70 / 23.43 ms** (`1792432143`). Less than the ~1 ms estimated: inside the step a small op costs about
+  twice its isolated time (the prefetch reading beside it).
+- [ ] `x / stat * gamma`: burn-fusion puts `gamma`'s `Reshape` in a block of its own, so the product by it is a separate op
+  no fuser of the norm's block sees. Needs a decision: a deferred result in burn-tt (risky: much of it tells a device
+  tensor by its materialised buffer), a change to burn-fusion's blocks, or model code.
+- [ ] The residual `Add` with the next norm (the statistic needs the whole sum on each unit: products write no twin).
+- [x] **The token on the card** (2026-10-19): a row's argmax as one native op (`Session::argmax_row`, gate `step211`), the
+  greedy token every trace's second output, read back alone (`TracedGenerator::generate_tokens`; gate `step212`). The
+  greedy rule is now `torch.argmax`'s (the first maximum) on the host and the card. ~0.34 ms a 1.7B step.
+- [x] **Sampling on the card** (2026-10-19, `generate::Sampler::Sample`: temperature, top-k, top-p, a host-seeded draw;
+  gate `step212` against burn-flex), eagerly over the trace's logits: the device sort cannot be captured beside a model's
+  traces (program cache). 112 ms a token: correct, slow.
+- [ ] **A native top-k** (`k` ≤ ~64, two phases like the argmax), so that sampling's softmax, top-p and draw are small
+  ops inside the trace. Needed before sampled decoding is fast.
+- [x] **RoPE as one op** (2026-10-19, `burn_tt::rope`, a burn-fusion custom operation on `Tt`; gate `step213`): ~0.6 ms.
+- [x] **Three copies gone** (2026-10-19): the same-shape reshape, the value's copy before its cache write
+  (`Session::scatter_rows_into_block`), the context's repack and `o`'s packing (attention writes the row and its twin).
+  ~0.36 ms. 1.7B **20.95 / 21.41 / 22.18 ms** (`1792444936`), 135M **8.00 / 8.59 / 9.38** (`1792445319`).
+- [ ] S5: measure the ~3.5 us of control an op, then back-to-back small ops sharing one `PAIR_CALL` and its credits,
+  and the next reader section fetched ahead.
+- [ ] The step's mask from the position in one op (8 int ops, ~80 us).
+
+### Phase 8. A continuous weight stream
+
+- [x] **The feasibility probe** (2026-10-20; [log](../learnings/performance-log.md#the-phase-8-feasibility-probe-the-step-without-its-weight-stream-and-under-one-2026-10-20-cards-0-and-1)).
+  Two `#[doc(hidden)]` process-wide switches in `tt-kernels`, set by
+  `silicon_bench_models::traced_generation_stream_ceiling` (`TT_PROBE_STREAM=off|skip|skip-bg:<units>`, `TT_TILES=all`):
+  `tensor::probe_skip_weight_reads` (a packed-`A` product gathers no `B`, nothing prefetches) and
+  `session::probe_background_stream` (unbarriered `READ_RUN`s of a scratch tensor on idle units, after each unit's last
+  op, at the top of `DATA`). Gate `step214_stream_ceiling_probe` (ttsim; card 0 `1792465030`): no `GATHER` under the
+  switch and the products differ from the ops run fresh (watched failing with the switch ignored); the background
+  moved after a first op on every unit, bit for bit; nothing left behind. 1.7B, 32 / 256-token prompts:
+
+  | Mode | Timed, card 0 | `Step(64)` replay, card 1 profile |
+  |---|--:|--:|
+  | today (`off`, `1792463041`, `1792463722`) | 20.92 / 22.15 ms | 20.42 ms: products 15.79 (455 GB/s), 283 other ops 4.63 |
+  | weights free (`skip`, `1792463279`, `1792464102`) | **7.85 / 9.10** | **7.46**: products' fixed cost 3.45 (35.5 us each), other ops 4.02 |
+  | weights free, 40 idle units streaming (`1792465141`, `1792465817`) | 10.43 / 11.80 (the stream's own end) | 10.02 |
+  | weights free, 56 idle units streaming (`1792465032`, `1792465464`) | 12.56 / 13.95 (the stream's own end) | 12.00 |
+
+  - **The ops' tax under a stream.** With ~260 GB/s read on idle units, the step's own work costs 1.34x; with ~300 GB/s,
+    1.61x. Almost all of it is latency: `control` (the `LAUNCH`, `KERNEL`, `CB`, `POKE` entries, each of which drains the
+    mover's reads) goes from ~0.9 to ~3.5 ms, and the rest is barrier and data wait. Today's prefetch already costs the
+    small ops ~1.3 ms (5.28 against 4.02).
+  - **The bound and the go/no-go.** With the stream fully overlapped, `max(14.3 ms of weights, the ops under a ~470 GB/s
+    stream: ~14-15 by extrapolation)` is ~15 ms, ~6 ms under today. **Go**, by the rule set beforehand (≥ 2 ms).
+  - **What binds is L1, not the bound.** A busy unit can stream ahead only as far as its arena holds: ~72 MB over 120
+    units against ~290 MB of weights a layer, in windows of ~200-300 us. Realistic: **~2-3 ms**, and **~0.6 ms a step
+    for every 100 KB a unit** freed for prefetched `B` (12 MB more a window, 24 layers). So the space audit decides
+    how far Phase 8 goes.
+- [x] **The space audit** (2026-10-20, `session::probe_space_report`, the same runs: per op kind, the highest `DATA`
+  address planned, stream entries and program-cache bytes, and how many ops are alike). `Step(64)`, every tile:
+  - **`DATA`:** the small ops reach 12-50 KB (attention 33, RMSNorm 29, RoPE 25, element-wise 12-50); the row scatter
+    and select 208 KB; the mask's and RoPE table's block copies 532 KB (four ops at the step's start). **The products
+    reach 807 KB**: a packed `A` is read into `kt / 32 + 1` slots, but its ring is planned with `kt` (64 slots, 266 KB,
+    at `K` = 2048). `down` (streamed) reaches 578 KB.
+  - **Stream:** 404 ops are 32 distinct (label, list, entries a unit): the 24 layers are one layer's ops 24 times, so
+    a layer sub-trace with base-relative addresses would hold ~1/12 of the entries.
+  - **Programs:** 39-70 KB a trace on its fullest unit (one-tile sessions: argmax 78 KB alone).
+  - **Ranked candidates** (space freed, cost):
+    1. the packed-`A` ring planned with the slots it fills: ~254 KB a product unit, bit for bit, small;
+    2. the block copies' batch sized under a reservation: 532 -> ~266 KB on the units at the step's start, small;
+    3. one layer sub-trace called 24 times: ~16x fewer stream entries and GDDR, and fewer stream fetches under load
+       (the ops' tax is latency); large (argument refs in the mover). Proposal:
+       [layer-sub-traces.md](../proposals/layer-sub-traces.md) (17.8% of a layer's words differ from the next's, 86%
+       of them tensor references);
+    4. `PROGRAMS` (4 x 32 KiB) and `MAILBOXES` (128 KiB) audited for what they still need: unmeasured;
+    5. the timestamper's 16 KiB only under `profile`: small, little.
+- [x] **The packed-`A` ring planned with the slots it fills** (2026-10-20, `matmul::plan_layout_packed_a`, candidate 1
+  above): a one-row product with a packed `A` plans `A`'s ring with `kt / 32 + 1` slots, not `kt`, so `B` and the outputs
+  sit lower. The products' highest `DATA` address 807 -> **553 KB** (254 KB a unit free for prefetched `B`), bit for bit:
+  ttsim `step187`, `step190`, `step191`, `step193`, `step203`-`step205`, `step207`, `step209`, `step210`, `step214`; card 0
+  `step204`, `step205`, `step207`, `step214` (`1792466471`) and `step188` (`1792466602`, traced against eager). The step is
+  unchanged until something uses the room (20.90 / 22.15 ms, `1792466481`).
+- [x] **A prefetch transaction ID** (2026-10-20, Step 3 of the plan; `dm::TXN_PREFETCH` = 6, `record::GATHER_PREFETCH`,
+  `op::WAIT` word 1 `dm::WAIT_PREFETCH`). B issues a flagged `GATHER`'s reads on ID 6, so the entries that drain its own ID
+  (launches, barriers, `WAIT`s, chunk ends, `COPY_WORDS`) leave them in flight; a prefetch `WAIT` drains them, and so does a
+  list's end. ID 6's cap is `TILE_IN_FLIGHT_CAP`, set once at the mover's start; the fast read path is told to write the
+  tag (which holds the ID) again whenever the ID changes. The record refuses the flag on anything but plain reads (packed
+  BF16, a transposing read). Gate `step215_prefetch_txn` (ttsim; card 0 `1792468449`): the flag changes no read; every slot
+  holds the oracle's bytes (the host's expansion and a DRAM mirror) after a prefetch `WAIT` and after a list's end; with
+  the mover's own cap at one, **a plain gather stalled 127 times, a prefetch 0** (its reads are not on that ID). Whether a
+  snapshot after a plain `WAIT` catches a read still in flight is printed, not asserted: 0 of 4 rounds, a read lands ~1 us
+  after its issue. Card 0: the safe image 22 of 22 (`step49`, `step118`, `step172`, `step173`, `step188`, `step204`,
+  `step205`, `step214`, `step215`; `1792468459`), `fast-reads` 18 of 18 (`1792468676`), `fast-reads` + `encoded-guard` 13 of
+  13 (`1792468695`); firmware clippy plain, `encoded-guard`, `profile`, `fast-reads`.
+- [x] **`B`'s ring at the top of `DATA`** (2026-10-20, Step 4; `matmul::matmul_requirements_top_b`): a packed-`A` product
+  under `Staging::Slots` plans `A` and the outputs at the arena's start and `B` against its end (a gap buffer between), so
+  the ops between two products, which plan low (12-208 KB), leave the next product's `B` ring alone. No cost: 20.94 /
+  22.21 ms (`1792469766`) against 20.90 / 22.15.
+- [x] **Busy units read their first job's `B` ahead: built, correct, slower; opt-in** (2026-10-20, Step 5;
+  `Session::set_busy_prefetch`, `TT_BUSY_PREFETCH=1`, `tensor::BUSY_PREFETCH`, `trace::Capture::move_block`). In a capture,
+  each of a product's units whose ops since the last product all planned below its `B` ring (`OpRecord::l1_top`, each
+  known) splits its first job's `GATHER` into a prefetch list; the capture's own run reads it with the job, and the
+  stream moves it back to just after the last product; the job's gather list ends with the prefetch `WAIT`.
+  - **Gates:** unit `a_units_first_job_reads_its_b_ahead_where_the_ops_before_plan_below_it` (which jobs, the flag, the
+    wait, `B` at the arena's end; not where an op planned higher, is unknown, or `B` is read transposed); unit
+    `a_moved_block_leaves_every_op_its_own_entries`; `step216_busy_prefetch` (ttsim, card 0 `1792469431`): bit for bit
+    the ops run fresh, on and off; the op before each later product starts ≥ 5 entries later on each unit with its own
+    entries, the product 4 fewer; watched failing with the move left out. Card 0 15 of 15 with it on (`step188`
+    bit for bit); ttsim `step187`, `step191`, `step193`, `step209`, `step210`.
+  - **Measured (it on):** 1.7B **21.93 / 23.78 ms** against 20.94 / 22.21 off (card 0, `1792469641`, `1792469766`). The
+    profile (card 1, `Step(64)`, on `1792470019` against off `1792470407`): **the products 15.24 -> 11.66 ms** (1.7 GB of
+    `B` read ahead), but **the residual add 0.67 -> 5.15 ms** (14 -> 107 us each) and RoPE 0.81 -> 1.55; RMSNorm and `mul`
+    1.92 -> 1.21. **Why:** a `GATHER` is expanded synchronously and B issues in order, so on a busy unit the prefetch's
+    ~128 reads (~75 us at a unit's rate) are issued before the next op's entries: the op after the last product (the add)
+    waits for all of it to be issued. The reads overlap only the waits that follow.
+  - **What would make it pay** (the products' 3.6 ms is there to take): the prefetch's reads issued while the mover would
+    otherwise wait, not ahead of the next op. Either (a) **sliced at capture**, no firmware: the `GATHER` cut along `K`
+    into chunks of ~8-16 tiles (`b_at` and `B`'s first tile moved by `k0`, as `push_stream_jobs` does), one put before
+    each barrier the unit waits at between the two products, so ~2-4 us of issue rides each barrier's wait; or (b) **a
+    prefetch pump in the mover**: a flagged `GATHER` queued and expanded a tile at a time from the mover's wait loops
+    (barrier, kernel, credits) under ID 6's cap, the prefetch `WAIT` issuing what is left first. (b) hides more and is
+    a firmware change of the hot loops; (a) is host only.
+- [ ] `down` prefetched: the first chunk batches' `B` gathers of `push_stream_jobs` on idle units. ~0.7 ms.
+- [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
+  reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small
+  ops' entries (decode-step-bandwidth B2.1-B2.4).
+- [ ] Depth and the caps (`PREFETCH_UNITS`, `THIN_STREAM_UNITS`) re-tuned from a profile after Phases 6-7.
 
 ## The larger changes compared (2026-10-18)
 

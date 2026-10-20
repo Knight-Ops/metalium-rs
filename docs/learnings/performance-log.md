@@ -12,6 +12,10 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The Phase 8 feasibility probe](#the-phase-8-feasibility-probe-the-step-without-its-weight-stream-and-under-one-2026-10-20-cards-0-and-1) | 2026-10-20 | a 1.7B decode step with its weights free is **7.85 ms** (today 20.92); under a ~300 GB/s stream on idle units its ops cost 1.6x, mostly drains waiting on reads; L1, not bandwidth, bounds a continuous stream; the packed-`A` ring wastes ~254 KB a product unit |
+| [The token on the card, RoPE as one op, and three copies gone](#the-token-on-the-card-rope-as-one-op-and-three-copies-gone-2026-10-19-cards-0-and-1) | 2026-10-19 | a row's argmax as one native op and the greedy token read back alone; RoPE as one op; a no-op reshape, the value's copy and the context's repack gone: a 1.7B decode step -> **20.95 / 21.41 / 22.18 ms**, 135M -> **8.00 / 8.59 / 9.38**; sampling on the card works (112 ms a token) |
+| [RMSNorm as one op, and one region a job](#rmsnorm-as-one-op-and-one-region-a-job-2026-10-19-cards-0-and-1) | 2026-10-19 | a job's kernels share one semaphore initialisation, so they run as one region (attention 35 -> 25 us a layer); RMSNorm's statistic and `DIV` as one op on 32 units: a 1.7B decode step -> **22.24 / 22.70 / 23.43 ms** |
+| [Decode attention as one op](#decode-attention-as-one-op-2026-10-19-cards-0-and-1) | 2026-10-19 | a decode step's attention a key/value head on one unit, seven kernels in L1, bit for bit: a 1.7B decode step -> **22.78 / 23.26 / 23.98 ms**, 135M -> **9.58 / 10.11 / 10.96**; a head's rows at row 0 of its tile, or `SUB_EXP` and `DIV` cost ~8 us a score tile |
 | [Decode products: their rows, a packed `A`, a streamed `K`, prefetched weights](#decode-products-their-rows-a-packed-a-a-streamed-k-prefetched-weights-2026-10-18-cards-0-and-1) | 2026-10-18 | the m = 1 kernel computes only its rows, a one-row `A` read packed, a blocked `K` streamed, the next product's weights read on idle units under the small ops, bit for bit: a 1.7B decode step -> **26.47 / 27.14 / 27.97 ms**, 135M -> **12.62 / 13.06 / 13.59** |
 | [A position-major key/value cache](#a-position-major-keyvalue-cache-2026-10-18-cards-0-and-1) | 2026-10-18 | the cache stored `[1, 1, L, kv d]`, so a step writes its projection's row as it is (no repack), bit for bit: a 1.7B decode step -> **31.72 / 32.31 / 33.21 ms**, 135M -> **13.71 / 14.16 / 14.66** |
 | [The cache write's and the embedding's moves spread](#the-cache-writes-and-the-embeddings-moves-spread-2026-10-18-cards-0-and-1) | 2026-10-18 | a repack's reads in flight together, one batch's row scatter split between units, and a ragged row select over every unit, bit for bit: a 1.7B decode step -> **33.05 / 33.59 / 34.51 ms**, 135M -> **14.04 / 14.45 / 15.04** |
@@ -337,6 +341,163 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The Phase 8 feasibility probe: the step without its weight stream, and under one (2026-10-20, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8. SmolLM2-1.7B-Instruct, F32, every tile (`TT_TILES=all`),
+a 512-position cache, one 64-token chunk; `silicon_bench_models::traced_generation_stream_ceiling` with
+`TT_PROBE_STREAM` (timing only: under the probe the products read no weights). Timed on card 0, profiled (`--profile`)
+on card 1.
+
+| Mode | Decode step, 32 / 256-token prompt (card 0) | `Step(64)` replay, profile (card 1) |
+|---|--:|--:|
+| `off`: today | 20.92 / 22.15 ms (`1792463041`) | 20.42 ms (`1792463722`): products 15.79, other ops 4.63 |
+| `skip`: no `B` read, no prefetch | **7.85 / 9.10** (`1792463279`) | **7.46** (`1792464102`): products 3.45, other ops 4.02 |
+| `skip-bg:24`: and 24 idle units reading 68 MB each | 8.62 / 10.01 (`1792465246`) | |
+| `skip-bg:40` | 10.43 / 11.80 (`1792465141`) | 10.02 (`1792465817`) |
+| `skip-bg:56` | 12.56 / 13.95 (`1792465032`) | 12.00 (`1792465464`) |
+
+- **Timed `skip-bg` rows are the background's own length** (it outlasts the step): 68 MB a unit in 8.6 / 10.4 / 12.6
+  ms is ~190 / ~260 / ~300 GB/s from 24 / 40 / 56 units while the step runs. Per unit that falls from ~7.9 to ~5.4
+  GB/s as units are added.
+- **The ops under a stream** (profile, `Step(64)`, `skip` against `skip-bg:56`): products' fixed part 3.45 -> 4.72 ms,
+  RMSNorm 0.76 -> 1.24, RoPE 0.53 -> 1.06, attention 0.65 -> 1.02, the row scatter 0.46 -> 0.99, `silu_mul` 0.48 -> 0.86,
+  `mul` and `add` 0.43 -> 0.84 and 0.80. `control` (the draining `LAUNCH`, `KERNEL`, `CB`, `POKE` entries) ~0.9 -> ~3.5
+  ms: latency of the op's own reads, not bandwidth. The stream runs only on units that run no op, so this is GDDR
+  queueing alone.
+- **Today's prefetch already pays it:** the other ops take 5.28 ms with it (`off`, 20.42 - 15.14) against 4.02 without.
+- **First run, for the record:** the background at the front of the streams held up the step's mask (`int_expand`, a
+  row gather list on 103 units) behind 68 MB a unit (8.7 ms of barrier); the capture now moves it after each unit's
+  last op (`1792462457`-`1792462904` were also one-tile sessions without `TT_TILES=all`, whose traces do not fit the
+  program cache).
+- **The space audit** (`session::probe_space_report`, the `off` run): the products plan up to 807 KB of `DATA` (the
+  packed `A`'s ring planned with `kt` slots: 64 at `K` = 2048, of which `kt / 32 + 1` = 3 are used), the small ops
+  12-50 KB, the row scatter and select 208 KB, block copies 532 KB; 404 ops are 32 distinct.
+
+## The token on the card, RoPE as one op, and three copies gone (2026-10-19, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 7.
+
+- **A row's argmax as one native op** (`Session::argmax_row`, `tt_kernels::sfpu::select`; burn-tt's `float_argmax` and
+  `float_argmin` on one row). Two ops: each unit's run of tiles to a partial (canonical keys compared as sign-magnitude
+  integers, an exact float index a lane), then one unit's choice. One looped body a tile, so a unit's program does not
+  grow with its tiles (the first build, a program a tile, took ~11 KB a unit and the 1.7B's traces no longer fit the
+  program cache together). `torch.argmax`'s rule (the first maximum, NaN first, `-0 == +0`), which is now the host's
+  greedy rule too (`generate::argmax`; it was the last maximum under `total_cmp`).
+  - **Cost** (`silicon_probe_sampling`, card 0, a `[1, 49152]` row, traced): the composition 8.95 ms a replay; the op
+    about one element-wise op's time, and 10.5 us to read the token against 448 to read the logits.
+- **The token on the card** (`TracedGenerator::generate_tokens`, `decode_token`, `prefill_token`): every step and chunk
+  trace carries its greedy token as a second output (`TracedInference::run_outputs` reads only what is asked).
+  **Sampling** (`generate::Sampler::Sample`: temperature, top-k, top-p, a host-seeded draw) runs on the card over the
+  logits where the trace left them (`TracedInference::output_tensor`), eagerly: the device sort's programs, all held by a
+  capture, do not fit the program cache beside a model's traces (a 256-wide sort alone nearly fills it; 512 does not
+  capture). Top-k beyond one sort is found in rounds of 1,024-wide rows. **112 ms a token** for top-k 50 and top-p 0.9 on
+  card 0: correct (`step212` against burn-flex), not yet fast; a native top-k is the follow-up.
+- **RoPE as one op** (`burn_tt::rope`, `Session::rope`, `tensor::rope_blocks`; a burn-fusion custom operation on `Tt`):
+  `x cos + rotate_half(x) sin` in one job a run of tiles, `MUL` then `MUL_ADD`, `rotate_half` read as `x`'s own tiles
+  across each head's halves. Bit for bit the composition. It replaces a `cat` copy and two ops for each of `q` and `k`.
+  The first build was 1 ms slower a step: its report bookkeeping asked the result view for its buffer, which copied it
+  (35 us a call on 2 units).
+- **Three copies gone:** a reshape to the same shape returns its input (`Llama`'s multi-head `q` fold copied a view);
+  the cache's row scatter reads the value head's columns of the projection's row where they lie
+  (`Session::scatter_rows_into_block`); attention writes its context as the `[1, heads dv]` row the `o` projection reads,
+  with its packed twin (no repack, no packing op).
+
+| Decode step, ms (32 / 128 / 256-token prompt), card 1 | 1.7B | 135M |
+|---|---|---|
+| before (RMSNorm as one op, `1792432143`) | 22.24 / 22.70 / 23.43 | 9.58 / 10.11 / 10.96 (`1792425715`) |
+| the token on the card (`1792439035`) | 21.90 / 22.37 / 23.10 | |
+| RoPE as one op (`1792443823`) | 21.31 / 21.78 / 22.53 | |
+| the three copies (`1792444936`, `1792445319`) | **20.95 / 21.41 / 22.18** | **8.00 / 8.59 / 9.38** |
+
+burn-flex in the last runs: 1.7B 296.5 / 307.7 / 326.4 ms, 135M 27.3 / 29.5 / 32.0. The 1.7B's traces hold 231.5 of
+245.8 KB of program cache on the fullest unit.
+
+- **Gates:** `step211_argmax_row` (the native op against the composition and the host rule: ties, NaN beside infinity,
+  two NaNs, signed zeros, subnormal maxima, ragged widths, argmin, ranks one and two; unit gates on the specification
+  model, watched failing with a later equal key winning); `step212_device_sampling` (greedy tokens equal the logits
+  path's on three synthetic Llamas; 144 sampled draws equal burn-flex's, vocabularies 100 to 3,000; a traced sampled
+  generation equals the same choices run eagerly); `step213_rope` (bit for bit on `TtBackend` and `Tt`, `head_dim` 64 and
+  128 native, 32 composed, one position and four, the tables swapped differ); `step209` now checks the context's twin
+  through a product (watched failing with the twin a row off); `step193` checks RoPE as one op on `Tt`. Card 0
+  `1792444687` (39 of 39, `step188` among them); `--smoke` 1,152 of 1,152 (`1792447224`). Burn conformance plain 2,973
+  passed, 52 as expected, `--fusion` 2,970 passed, 55 as expected; `step12_mnist`.
+
+## RMSNorm as one op, and one region a job (2026-10-19, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phases 6b and 7.
+
+- **One region a job** (`tensor::share_semaphore_init`). Consecutive blocks join one ownership region only when their
+  semaphore initialisations are equal (`execution_groups`). The matmul's, SFPU's and reduction's plans number their
+  semaphores from zero in the same order with the same starting values (`[0, 1]`, `[0, 1, 0]`, `[0, 1, 0, 1]`), so a job
+  of several kinds of kernel now carries their union: one region a job, not one a kernel. The attention op
+  (`silicon_probe_attention_rows`, card 0, `1792430708`): **35.2 -> 25.0 us** a layer at 64 positions, 89.4 -> 79.4 at
+  512.
+- **RMSNorm up to its scale as one op** (`Session::rms_norm`, `tensor::rms_divide`; burn-tt's `float_rms_norm`): every
+  unit computes the statistic from the row's packed twin and divides its own tiles, where the statistic ran on one unit
+  and the `DIV`'s 63 other units waited on its barrier. Bit for bit the two ops (`step210_rms_divide`).
+  - **Isolated** (traced, `K` 2048, card 0, `1792431978`): the two ops 31.7 / 24.9 / 21.5 / 19.8 us on 8 / 16 / 32 / 64
+    units; one op 22.8 / 16.4 / **14.4** / 17.5. Every job reads the whole 2-tile packed row, so 64 readers of one channel
+    cost more than they save: at least 2 tiles a job (`session::RMS_DIVIDE_TILES`).
+  - **In the step** the op took ~34 us at 64 units (profile `1792431191`), against ~36 for the two (`1792428728`): a
+    small op costs about twice its isolated time inside the step, the next product's prefetch reading beside it.
+- **Measured** (card 1): 1.7B 22.78 / 23.26 / 23.98 -> 22.43 / 22.91 / 23.64 ms with both (`1792430730`), -> **22.24 /
+  22.70 / 23.43** with the norm on 32 units (`1792432143`; burn-flex 298.3 / 313.7 / 330.8).
+- **Not fused, and why:** `x / stat * gamma`. burn-fusion puts `gamma`'s `Reshape` in a block of its own, so the product
+  by it reaches the backend as a separate op that no fuser of the norm's block sees.
+- **Gates:** `step210_rms_divide` (ttsim; card 0 `1792430716`, `1792432591`): bit for bit the two ops at `K` 1024, 2048
+  and 4096 over signed zeros, subnormals, values near `f32::MAX`, rows holding NaN and infinities; its twin the packed
+  result; one region fewer; a captured add-and-norm replayed over new rows equals the two run fresh. Negative control: a
+  row with one datum moved gives every other output other bits (one ulp of one square was under the sum's ulp and moved
+  nothing). `step209` again bit for bit with the shared initialisation.
+
+## Decode attention as one op (2026-10-19, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 6 (the 2026-10-19 review's first lever). A decode
+step's attention for a few query rows a key/value head (`Session::attention_rows`, `tt_kernels::attention`; burn-tt's
+`module::attention_rows`) is one op: each head's `Q K^T`, scale and mask, maximum, `SUB_EXP`, sum, `DIV` and `P V`
+on one unit, seven kernels in one job, the intermediates in L1. It replaces ten ops a layer (the products, their
+stacking gathers, `P`'s gather, the softmax's four) and their barriers. Bit for bit the composition.
+
+**What the kernels cost** (`silicon_probe_attention_rows`, card 0, 32 heads of 64, traced, a kernel left out at a
+time; runs `1792424226`-`1792425322`):
+
+| Per layer | 64 positions | 512 positions |
+|---|--:|--:|
+| first build | 70.9 us | 373.2 us |
+| of which `SUB_EXP`, `DIV` | 21.3, 18.3 | 139.8, 144.7 |
+| `DIV` swapped for `MUL`, `SUB_EXP` for `SUB` (timing only) | 40.7 | 116.7 |
+| **a head's rows read into row 0; `SUB_EXP` row-limited** | **35.2** | **89.4** |
+| reads, `Q K^T` and writes alone | 13.4 | 39.0 |
+
+- **The cause was the layout, not the kinds.** `q` stacked by rows puts head `h` at row `h` of its tile; the first
+  build computed rows `0..h + 1`, so the head at row 31 ran the whole-tile `SUB_EXP` and `DIV`, ~8 us a score tile.
+  On one unit, alone, `DIV` of a `[1, 512]` row costs 29.6 us against `MUL`'s 21.7 (row-limited, ~0.5 us a tile more),
+  whatever the divisor (zero, a denormal, NaN, infinity: the same); `SUB_EXP`, not then row-limited, 153.3 us (~8.5
+  us a tile). Now each head's query rows are read into rows `0..m` of `A`'s slots (64-byte face rows), and `SUB_EXP` is
+  a row-limited kind (`sfpu::ops::row_limited`, unit gate `row_limited_programs_keep_the_computed_rows`).
+- **Row-limited reductions** (`reduce::math_programs_rows`) bought ~5 us at 512 positions: the reductions were not
+  the cost.
+- **Each kernel's block costs ~3.5-4 us** (its launch, credits and the roles' retirement): ~25 us of the 35.
+- **Profile** (`1792423305`, before the last fix): `Step(64)` 53-55 us a layer against ~102 us for the ten ops
+  (`1792382914`); `Step(512)` 217-224 us.
+
+| Decode step, ms (32 / 128 / 256-token prompt), card 1 | Before (`1792383988`, `1792378993`) | After | burn-flex |
+|---|---|---|---|
+| SmolLM2-1.7B-Instruct | 24.04 / 24.48 / 25.39 | **22.78 / 23.26 / 23.98** (`1792425331`; 300.6 GB/s of weights at 32) | 296.0 / 310.2 / 328.3 |
+| SmolLM2-135M | 11.40 / 11.80 / 12.26 | **9.58 / 10.11 / 10.96** (`1792425715`) | 27.2 / 29.8 / 32.4 |
+
+- **First build, for the record** (`1792421939`): 1.7B 23.17 / 24.85 / ~27.1 ms, faster at 32 tokens and slower at
+  256, from the row offset above.
+- **Gates:** `step209_attention_rows` (ttsim, card 0 `1792425779`): bit for bit the composition
+  (`burn_tt::set_attention_rows(false)`) at `head_dim` 32 / 64 / 128, MHA, GQA folded and `q` stacked by rows, 32 to
+  512 positions, masked keys and values holding NaN and infinities; the report charges each call one job. Negative
+  control: the positions permuted (not reversed: a two-tile chain and the lanes' butterfly fold sum a reversal to the
+  same bits) give other bits for every output. Watched failing with `P V` reading the undivided exponentials.
+- **Regression:** ttsim `step183`, `step184`, `step185`, `step187`, `step193`, `step199`, `step200`, `step12_mnist`, the
+  tt-kernels unit tests; Burn conformance plain 2,973 passed, 52 as expected, `--fusion` 2,970 passed, 55 as expected;
+  card 0 33 of 33 (`1792425779`: `step183`, `step184`, `step187`, `step188`, `step193`, `step199`, `step200`,
+  `step209`); `--smoke` 1,142 of 1,142 (`1792426484`, `step209` added).
 
 ## Packed twins, a released barrier, and weights stored transposed (2026-10-19, cards 0 and 1)
 

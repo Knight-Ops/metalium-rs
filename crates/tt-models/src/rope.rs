@@ -69,8 +69,17 @@ impl<B: Backend> Rope<B> {
         }
     }
 
-    /// `x` (`[n, heads, t, head_dim]`) rotated: `x cos + rotate_half(x) sin`.
+    /// The tables, `cos` and `sin` (`sin`'s first half negated).
+    pub fn tables(&self) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        (self.cos.clone(), self.sin.clone())
+    }
+
+    /// `x` (`[n, heads, t, head_dim]`) rotated: `x cos + rotate_half(x) sin`. On the card one op
+    /// where it can be (`burn_tt::rope`, bit for bit this composition), else the composition.
     pub fn apply(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        if let Some(y) = burn_tt::rope(&x, &self.cos, &self.sin) {
+            return y;
+        }
         let [n, h, t, d] = x.dims();
         let half = d / 2;
         let x1 = x.clone().slice([0..n, 0..h, 0..t, 0..half]);

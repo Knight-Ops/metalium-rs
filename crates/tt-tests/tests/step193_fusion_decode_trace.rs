@@ -131,6 +131,8 @@ struct Run {
     generations: Vec<(usize, Generation)>,
     /// The Burn ops the warm-up and captures ran, by calls.
     ops: HashMap<&'static str, u64>,
+    /// RoPEs the warm-up and captures ran as one native op (`burn_tt::rope_count`).
+    ropes: u64,
 }
 
 /// A traced generation of every prompt length on `B`, with its timings printed. The captures and
@@ -138,7 +140,9 @@ struct Run {
 /// transfers outside an op), and the generations run no Burn op and stage nothing.
 fn traced_run<B: TracedBackend>(model: &Llama<B>, what: &str, d: &TtDevice) -> Run {
     let t0 = Instant::now();
+    let ropes = burn_tt::rope_count();
     let (g, report) = reported(|| TracedGenerator::<_, B>::new(model, &shapes(), d));
+    let ropes = burn_tt::rope_count() - ropes;
     let capture = t0.elapsed();
     let g = g.unwrap();
     let ops = report.0.iter().map(|s| (s.op, s.calls)).collect();
@@ -175,7 +179,11 @@ fn traced_run<B: TracedBackend>(model: &Llama<B>, what: &str, d: &TtDevice) -> R
          {mean:.2?} over {}",
         steps.len()
     );
-    Run { generations, ops }
+    Run {
+        generations,
+        ops,
+        ropes,
+    }
 }
 
 #[test]
@@ -238,20 +246,12 @@ fn tt_and_tt_backend_compared() {
                 (calls(&native, "float_mean_dim"), 0),
                 "{what}: every RMSNorm fused"
             );
-            // Each RoPE application's `x cos + rotate(x) sin` is one `MUL_ADD` on `Tt` where its
-            // halves are whole tiles (`head_dim` 64): an `add` fewer for each. At 32 the table does
-            // not lie over the heads by tile copies, and the sum runs as itself. The generations
-            // are `TtBackend`'s bit for bit either way (below).
-            // (A single key head's table needs no relaying: its sums fuse at 32 too.)
-            let mul_adds = calls(&on_tt, "tt_mul_add");
-            assert!(mul_adds > 0, "{what}: RoPE's sums matched");
-            let saved = calls(&native, "float_add") - calls(&on_tt, "float_add");
-            assert!(
-                saved <= mul_adds,
-                "{what}: {saved} adds saved by {mul_adds} sums"
-            );
+            // Each RoPE application is one native op on both backends where its halves are whole
+            // tiles (`head_dim` 64; `burn_tt::rope`, a custom operation in `Tt`'s stream), else
+            // its composition inside that operation: the generations are `TtBackend`'s bit for bit
+            // either way (below).
             if config.head_dim % 64 == 0 {
-                assert_eq!(saved, mul_adds, "{what}: every sum fused");
+                assert!(on_tt.ropes > 0, "{what}: RoPE as one op on Tt");
             }
             for ((len, a), (_, b)) in native.generations.iter().zip(&on_tt.generations) {
                 assert_same(b, a, &format!("{what}, prompt {len}, Tt against TtBackend"));

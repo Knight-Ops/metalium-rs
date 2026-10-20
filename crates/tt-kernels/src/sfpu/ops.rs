@@ -2954,6 +2954,7 @@ pub fn row_limited(kind: u32) -> bool {
             | kind_sfpu::SILU_MUL
             | kind_sfpu::MUL_ADD
             | kind_sfpu::SCALE_MASK_FILL
+            | kind_sfpu::SUB_EXP
     )
 }
 
@@ -5635,6 +5636,7 @@ mod row_limited_tests {
             kind_sfpu::SILU_MUL,
             kind_sfpu::MUL_ADD,
             kind_sfpu::SCALE_MASK_FILL,
+            kind_sfpu::SUB_EXP,
         ];
         for kind in kinds {
             assert!(row_limited(kind), "{kind:#x}");

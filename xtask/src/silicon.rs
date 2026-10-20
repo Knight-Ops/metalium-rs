@@ -276,6 +276,20 @@ pub const SMOKE: &[&str] = &[
     "step207_packed_twin::",
     // Barriers released by unit 0's multicast, each unit waiting on its own L1 (decode-to-bandwidth.md Phase 3).
     "step208_barrier_release::",
+    // A decode step's attention a key/value head on one unit, bit for bit (decode-to-bandwidth.md Phase 6).
+    "step209_attention_rows::",
+    // A decode row's RMSNorm statistic and `DIV` as one op (decode-to-bandwidth.md Phase 7).
+    "step210_rms_divide::",
+    // A row's argmax as one native op; the token chosen on the card; RoPE as one op (decode-to-bandwidth.md Phase 7).
+    "step211_argmax_row::",
+    "step212_device_sampling::",
+    "step213_rope::",
+    // The Phase 8 probe's switches: weights skipped, a background stream (decode-to-bandwidth.md Phase 8).
+    "step214_stream_ceiling_probe::",
+    // B's prefetch reads on a transaction ID of their own (decode-to-bandwidth.md Phase 8).
+    "step215_prefetch_txn::",
+    // A product's own units reading their first job's `B` ahead, in a capture (opt-in).
+    "step216_busy_prefetch::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

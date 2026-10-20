@@ -1881,6 +1881,27 @@ pub mod float {
                 format_args!("{}, dim={dim}, out_dtype={out_dtype:?}", context(&tensor)),
             );
         }
+        // One row along its last dimension (a decode step's logits): one native op
+        // (`Session::argmax_row`), the same choice as the composition below. An argmin is
+        // the argmax of the negation, which keeps both the ties and the NaNs where they were.
+        let row =
+            (shape.len() == 1 || (shape.len() == 2 && shape[0] == 1)) && dim + 1 == shape.len();
+        if row && ARGMAX_ROW.load(std::sync::atomic::Ordering::Relaxed) {
+            let device = tensor.device;
+            let tensor = if minimum { float_neg(tensor) } else { tensor };
+            let _part = crate::report::part("argmax/row");
+            let d = plain_dram(&tensor);
+            let (id, dims) = crate::server::argmax_row(device, d.buffer.id);
+            let mut output = shape;
+            output[dim] = 1;
+            return device_result_shaped(
+                device,
+                id,
+                dims,
+                burn_backend::Shape::from(output),
+                DType::I32,
+            );
+        }
         if shape.len() > 2 {
             let packed = pack_axis(&tensor, dim).unwrap_or_else(|| fail(op, context(&tensor)));
             let selected = argextreme(packed, 1, out_dtype, minimum);
@@ -2161,18 +2182,17 @@ pub mod float {
         {
             return None;
         }
+        // The statistic and the division as one op where the session can
+        // (`Session::rms_norm`), else the two: bit for bit either way.
         let d = plain_dram(x);
-        let (id, dims) = crate::server::rms(x.device, d.buffer.id, eps);
-        let mut shape = shape;
-        *shape.last_mut()? = 1;
-        let rms = device_result_shaped(
+        let (id, dims) = crate::server::rms_norm(x.device, d.buffer.id, eps);
+        Some(device_result_shaped(
             x.device,
             id,
             dims,
             burn_backend::Shape::from(shape),
             DType::F32,
-        );
-        Some(float_div(x.clone(), rms))
+        ))
     }
 
     /// `atan2(lhs, rhs)` on the device where the data is, within
@@ -2647,6 +2667,11 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
         shape: burn_backend::Shape,
     ) -> FloatTensor<TtBackend> {
+        // The same shape: the tensor itself, view or not (a view's reshape would otherwise copy
+        // it out: `Llama`'s multi-head `q` folded to `[n, kv, groups t, d]` is its own shape).
+        if tensor.shape() == shape {
+            return tensor;
+        }
         let tensor = if tensor.storage_format() != crate::storage::StorageFormat::F32
             && (tensor.is_transposed()
                 || tensor.stored() != crate::tensor::stored_dims(&shape.to_vec()))
@@ -3767,12 +3792,35 @@ mod ctc;
 mod deform_conv;
 mod exact_matmul;
 pub use accurate_matmul::set_slicing as set_accurate_matmul_slicing;
+
+/// Whether a row's argmax runs as one native op (`Session::argmax_row`); on unless turned off.
+static ARGMAX_ROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn off (or back on) a row's argmax as one native op, process-wide: off, it is the
+/// composition of predicates, masks and reductions. For gates' comparisons. Dev-facing.
+#[doc(hidden)]
+pub fn set_argmax_row(on: bool) {
+    ARGMAX_ROW.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether attention for a few query rows a key/value head runs as one op
+/// (`module::attention_rows`, `Session::attention_rows`); on unless turned off.
+static ATTENTION_ROWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn off (or back on) attention as one op for a decode step's rows, process-wide: off,
+/// attention runs as its composition of products, scale, mask and softmax. For gates' and
+/// benches' comparisons. Dev-facing.
+#[doc(hidden)]
+pub fn set_attention_rows(on: bool) {
+    ATTENTION_ROWS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
 pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
 mod interpolate;
 mod nhwc;
 mod pool;
 mod region;
+pub(crate) mod rope;
 mod scan;
 mod sort;
 
@@ -3838,6 +3886,17 @@ pub mod module {
         };
         if mask.is_none() && attn_bias.is_none() {
             if let Some(out) = padded_attention(&query, &key, &value, &options, scale) {
+                let _part = part("attention/narrow");
+                return cast_native(out, dtype);
+            }
+        }
+        if let (Some(m), None, None, false) =
+            (&mask, &attn_bias, options.softcap, options.is_causal)
+        {
+            if let Some(out) = {
+                let _part = part("attention/rows");
+                attention_rows(&query, &key, &value, m, scale)
+            } {
                 let _part = part("attention/narrow");
                 return cast_native(out, dtype);
             }
@@ -3975,6 +4034,85 @@ pub mod module {
     /// other than `Fast`, a mask or bias (the caller's), a causal mask past a
     /// million elements, or where padding would grow the scores by more than a
     /// quarter (one query a head: 32 rows for 1).
+    /// Attention for a few query rows a key/value head under one mask row -- a decode step's --
+    /// as one op (`Session::attention_rows`): bit for bit the composition below, a head's
+    /// scores, softmax and `P V` on one unit with nothing in GDDR between them. `None` where
+    /// it does not apply: the composition runs.
+    fn attention_rows(
+        query: &TtTensor,
+        key: &TtTensor,
+        value: &TtTensor,
+        mask: &TtTensor,
+        scale: f64,
+    ) -> Option<TtTensor> {
+        use tt_kernels::attention::{fits, Item};
+        let device = query.device;
+        if !ATTENTION_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::matmul_mode::effective(device) != crate::MatmulMode::Fast
+            || crate::matmul_mode::fidelity_override().is_some()
+            || !crate::server::supports_batched_layout(device)
+        {
+            return None;
+        }
+        let (qs, ks, vs, ms) = (
+            query.shape().to_vec(),
+            key.shape().to_vec(),
+            value.shape().to_vec(),
+            mask.shape().to_vec(),
+        );
+        let dims = [qs[2], qs[3], ks[2], vs[3]];
+        let [m, d, l, dv] = dims;
+        // One mask row for every query row of every head.
+        if ms.len() != 4 || ms[..3].iter().any(|&x| x != 1) || ms[3] != l || !fits(dims, 0) {
+            return None;
+        }
+        let key_t = float::float_transpose(key.clone());
+        let qk = float::batched_plan(query, &key_t)?;
+        let (vb, value_blocks) = float::operand_blocks(value, &qk.batch)?;
+        if qk.mkn != [m, d, l] || value_blocks.len() != qk.items.len() {
+            return None;
+        }
+        let items: Vec<Item> = qk
+            .items
+            .iter()
+            .zip(&value_blocks)
+            .map(|((bq, bk), bv)| {
+                (!bq.transposed && bk.transposed && !bv.transposed && fits(dims, bq.at[0] % 32))
+                    .then_some(Item {
+                        q: bq.at,
+                        k: bk.at,
+                        v: bv.at,
+                    })
+            })
+            .collect::<Option<_>>()?;
+        let mask_dram = plain_dram(mask);
+        if [mask_dram.buffer.rows, mask_dram.buffer.cols] != [1, l] {
+            return None;
+        }
+        let (id, out_dims) = crate::server::attention_rows(
+            device,
+            [qk.a, qk.b, vb, mask_dram.buffer.id],
+            items,
+            dims,
+            scale as f32,
+        );
+        // The heads' rows in row-major order along one row: `[b, heads, m, dv]` viewed over it,
+        // so the context's `swap_dims(1, 2).reshape([b, t, heads dv])` is the row itself.
+        let out = device_view(device, id, out_dims, None, DType::F32)
+            .to_dram()
+            .clone();
+        Some(TtTensor::view(
+            crate::views::Strided {
+                src: out,
+                base: [0, 0],
+                strides: vec![[0, qs[1] * m * dv], [0, m * dv], [0, dv], [0, 1]],
+            },
+            Shape::new([qs[0], qs[1], m, dv]),
+            DType::F32,
+            device,
+        ))
+    }
+
     fn padded_attention(
         query: &TtTensor,
         key: &TtTensor,

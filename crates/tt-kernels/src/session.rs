@@ -87,6 +87,15 @@ pub enum Spread {
     Work { share: usize, min: usize },
 }
 
+/// Tiles of a decode row each job of [`Session::rms_norm`]'s one op divides, at least: every job
+/// also reads the row's packed twin, so fewer, wider jobs read it fewer times
+/// (`silicon_probe_attention_rows::rms_norm_one_op_against_two`).
+pub const RMS_DIVIDE_TILES: usize = 2;
+
+/// The most units [`Session::argmax_row`]'s partials run on: the choice reads one partial a unit,
+/// in order, on one unit.
+pub const ARGMAX_UNITS: usize = 64;
+
 /// The units a one-tile-row product's weight stream saturates GDDR with: each streams ~7 GB/s,
 /// and 64 reach ~450 GB/s dealt a column a unit (Blackhole, card 0,
 /// `docs/learnings/silicon-operating-notes.md`, "A decode product's weights"). Past it, SmolLM2-1.7B's
@@ -107,6 +116,74 @@ pub const PREFETCH_UNITS: usize = 40;
 /// every unit's thin `A` reads cost ~0.27 us an entry (64 at `K` = 2048, 256 at 8192), the packing
 /// op one read and two writes a tile spread over every unit.
 pub const PACKED_A_K_TILES: usize = 32;
+
+/// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the small ops' cost under a
+/// stream): every capture's stream on units `first..first + units` begins with `tiles_per_unit`
+/// tiles of a scratch tensor read into a window at the top of `DATA` ([`Session::probe_stream`]'s
+/// `READ_RUN`s), queued without a barrier and before anything else, so a replay reads GDDR on those
+/// units while its ops run. Meant for units the trace leaves idle (with
+/// [`tensor::probe_skip_weight_reads`] nothing prefetches, and a decode step's ops keep to
+/// [`THIN_STREAM_UNITS`]); [`Session::end_trace`] reports a unit that also ran an op.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeBackground {
+    pub first: usize,
+    pub units: usize,
+    pub tiles_per_unit: usize,
+}
+
+static PROBE_BACKGROUND: std::sync::Mutex<Option<ProbeBackground>> = std::sync::Mutex::new(None);
+
+/// Set [`ProbeBackground`] (or none), process-wide. Dev-facing: a timing probe, never a result.
+#[doc(hidden)]
+pub fn probe_background_stream(background: Option<ProbeBackground>) {
+    *PROBE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = background;
+}
+
+fn probing_background() -> Option<ProbeBackground> {
+    *PROBE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static PROBE_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the space audit): every
+/// capture prints, as it ends, what its ops take of the three things that bound a trace -- a
+/// unit's `DATA` arena, its program cache and the stream in GDDR -- by op, and how many of its ops
+/// are alike ([`Session::space_report`]). Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_space_report(on: bool) {
+    PROBE_SPACE.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn probing_space() -> bool {
+    PROBE_SPACE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Move unit `u`'s [`ProbeBackground`] reads, put at the front of its stream, to just after the
+/// last op it ran in `capture` (a step's first ops may reach every unit), so they run under the
+/// ops after it rather than hold that op up; the op records and `PAIR_CALL` positions follow.
+fn relocate_probe_background(capture: &mut trace::Capture, u: usize) {
+    let n = capture.units[u].probe_entries;
+    let last = capture
+        .ops
+        .iter()
+        .map(|op| &op.entries[u])
+        .filter(|r| !r.is_empty())
+        .map(|r| r.end)
+        .max()
+        .unwrap_or(0);
+    if n == 0 || last <= n {
+        return;
+    }
+    eprintln!(
+        "probe background: unit {u} also ran {} entries of ops; its reads follow them",
+        last - n
+    );
+    capture.move_block(u, 0..n, last);
+}
+
+/// The tiles a [`ProbeBackground`] unit reads a `READ_RUN`: 532 KB of `DATA`'s top.
+const PROBE_BACKGROUND_WINDOW: usize = 128;
 
 /// How [`Session::probe_stream`] deals a tensor's tiles over its units.
 #[doc(hidden)]
@@ -469,6 +546,8 @@ pub struct Session<T: Transport> {
     packed_thin_a: bool,
     /// [`Session::set_packed_rms`].
     packed_rms: bool,
+    /// [`Session::set_rms_divide`].
+    rms_divide: bool,
     /// [`Session::set_prefetch_keeps_units`].
     prefetch_keeps_units: bool,
     /// [`Session::set_packed_twins`].
@@ -488,6 +567,13 @@ pub struct Session<T: Transport> {
     /// While a prefetching product is queued in a capture: the barrier its `PREFETCH` lists wait
     /// for (`enqueue_work_inner`).
     prefetch_anchor: Option<u32>,
+    /// [`Session::set_busy_prefetch`].
+    busy_prefetch: bool,
+    /// While a product with `BUSY_PREFETCH` lists is queued in a capture: each unit's stream
+    /// length after the last weight-streaming product, where its list moves to
+    /// (`enqueue_work`), and the lists queued so far (unit, entries).
+    busy_anchor: Option<Vec<usize>>,
+    busy_moves: Vec<(usize, std::ops::Range<usize>)>,
     /// [`Session::set_resident_matmul_a`].
     resident_matmul_a: bool,
     /// [`Session::set_unpack_transposed_b`].
@@ -504,6 +590,8 @@ pub struct Session<T: Transport> {
     /// While set, queued work takes no barrier: a host DMA transfer, which
     /// the session syncs on at once, so nothing can run past it.
     unbarriered: bool,
+    /// What a [`ProbeBackground`] reads, kept for the session's life once made.
+    probe_scratch: Option<DramTensor>,
     /// The caller's name for the ops it queues now ([`Session::set_op_label`]),
     /// kept in a capture's [`trace::OpRecord`]s.
     op_label: &'static str,
@@ -1997,6 +2085,7 @@ impl<T: Transport> Session<T> {
             thin_matmul_reads: true,
             packed_thin_a: true,
             packed_rms: true,
+            rms_divide: true,
             prefetch_keeps_units: true,
             packed_twins_on: true,
             twins: Vec::new(),
@@ -2006,6 +2095,12 @@ impl<T: Transport> Session<T> {
             streamed_k: true,
             weight_prefetch: true,
             prefetch_anchor: None,
+            // `TT_BUSY_PREFETCH=1`: the product's own units read their first job's `B` ahead too.
+            // Off by default: B issues a prefetch's reads before the next op's entries, so the
+            // op after the last product waits for them (decode-to-bandwidth.md Phase 8).
+            busy_prefetch: std::env::var("TT_BUSY_PREFETCH").is_ok_and(|v| v == "1"),
+            busy_anchor: None,
+            busy_moves: Vec::new(),
             resident_matmul_a: true,
             unpack_transposed_b: true,
             thin_stream_units: true,
@@ -2013,6 +2108,7 @@ impl<T: Transport> Session<T> {
             staging: None,
             host_dma: true,
             unbarriered: false,
+            probe_scratch: None,
             op_label: "",
             staging_at: 0,
             staging_busy: false,
@@ -3712,7 +3808,16 @@ impl<T: Transport> Session<T> {
                 barrier: self.units.len() > 1,
                 stamps: [0; 2],
                 bytes: Default::default(),
+                l1_top: crate::l1::take_planned_top(),
             });
+            // A unit's `BUSY_PREFETCH` list, queued with the product, moves back in its stream
+            // to just after the last weight-streaming product: a replay reads that `B` under
+            // the ops between.
+            if let Some(lens) = &self.busy_anchor {
+                for (u, block) in std::mem::take(&mut self.busy_moves) {
+                    c.move_block(u, block, lens[u]);
+                }
+            }
         }
         result
     }
@@ -3840,7 +3945,7 @@ impl<T: Transport> Session<T> {
         while per_unit.iter().any(|q| !q.is_empty()) {
             for (u, q) in per_unit.iter_mut().enumerate() {
                 if let Some(mut seg) = q.pop_front() {
-                    if what.is_empty() {
+                    if what.is_empty() && seg.what != tensor::BUSY_PREFETCH {
                         *what = seg.what;
                     }
                     if let Some(rel) = trace_behind[u].take() {
@@ -3881,7 +3986,15 @@ impl<T: Transport> Session<T> {
                             folded[u] = true;
                         }
                     }
+                    let busy = capturing
+                        && self.busy_anchor.is_some()
+                        && seg.what == tensor::BUSY_PREFETCH;
+                    let at = self.capture.as_ref().map_or(0, |c| c.units[u].stream.len());
                     self.enqueue_segment(u, &seg, budget)?;
+                    if busy {
+                        let end = self.capture.as_ref().map_or(0, |c| c.units[u].stream.len());
+                        self.busy_moves.push((u, at..end));
+                    }
                 }
             }
         }
@@ -4265,6 +4378,11 @@ impl<T: Transport> Session<T> {
             }
             Ok(())
         })();
+        if probing_space() {
+            let (label, what) = (self.op_label, seg.what);
+            out.program_owners
+                .extend(held.iter().map(|&(_, at)| (at, label, what)));
+        }
         out.held_programs.extend(held);
         self.capture.as_mut().unwrap().units[u] = out;
         result
@@ -4342,6 +4460,8 @@ impl<T: Transport> Session<T> {
                 }
             })
             .collect();
+        // What was planned before the capture is no captured op's.
+        crate::l1::take_planned_top();
         self.capture = Some(trace::Capture {
             epoch: self.epoch,
             barriers_base: self.barriers,
@@ -4354,6 +4474,247 @@ impl<T: Transport> Session<T> {
             weight_anchor: None,
             weight_units: 0,
         });
+        if let Some(background) = probing_background() {
+            if let Err(e) = self.push_probe_background(background) {
+                self.capture = None;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`probe_space_report`]'s lines for `c`, as it ends: per op kind (its label and first
+    /// list's name), how many ops, the highest `DATA` address their plans reached
+    /// ([`trace::OpRecord::l1_top`]; "unplanned" counts ops whose layout was not planned while
+    /// captured), their stream entries on all units (sections included), and the program-cache
+    /// bytes they hold on the unit where they hold most (each program charged to the op that took
+    /// it first); then how many ops are alike, by kind and entries a unit, which bounds what one
+    /// repeated sub-trace (a layer) could share.
+    fn space_report(&self, c: &trace::Capture) {
+        use std::collections::{BTreeMap, BTreeSet};
+        #[derive(Default)]
+        struct Kind {
+            ops: usize,
+            unplanned: usize,
+            top: u64,
+            entries: u64,
+            program_bytes: u64,
+        }
+        let data = tt_isa::l1::DATA;
+        let entries = |u: usize, r: &std::ops::Range<usize>| -> u64 {
+            let uc = &c.units[u];
+            let sections: u64 = uc
+                .pair_calls
+                .iter()
+                .enumerate()
+                .filter(|&(_, at)| r.contains(at))
+                .map(|(i, _)| u64::from(uc.sections[2 * i] + uc.sections[2 * i + 1]))
+                .sum();
+            r.len() as u64 + sections
+        };
+        let mut kinds: BTreeMap<(&str, &str), Kind> = BTreeMap::new();
+        let mut alike: BTreeSet<String> = BTreeSet::new();
+        let mut signatures: Vec<String> = Vec::with_capacity(c.ops.len());
+        for op in &c.ops {
+            let k = kinds.entry((op.label, op.what)).or_default();
+            k.ops += 1;
+            if op.l1_top == 0 {
+                k.unplanned += 1;
+            }
+            k.top = k.top.max(op.l1_top);
+            let per_unit: Vec<u64> = (0..c.units.len())
+                .map(|u| entries(u, &op.entries[u]))
+                .collect();
+            k.entries += per_unit.iter().sum::<u64>();
+            let signature = format!("{}|{}|{per_unit:?}", op.label, op.what);
+            alike.insert(signature.clone());
+            signatures.push(signature);
+        }
+        // Each unit's programs, charged to the op that held each first.
+        let mut fullest = (0u64, 0usize, 0usize);
+        for (u, uc) in c.units.iter().enumerate() {
+            let mut first: BTreeMap<u64, (&str, &str)> = BTreeMap::new();
+            for &(at, label, what) in &uc.program_owners {
+                first.entry(at).or_insert((label, what));
+            }
+            let mut by_kind: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+            let mut total = 0;
+            for (&at, &kind) in &first {
+                let bytes = self.units[u].programs.program_bytes(at).unwrap_or(0);
+                *by_kind.entry(kind).or_default() += bytes;
+                total += bytes;
+            }
+            if total > fullest.0 {
+                fullest = (total, u, first.len());
+            }
+            for (kind, bytes) in by_kind {
+                let k = kinds.entry(kind).or_default();
+                k.program_bytes = k.program_bytes.max(bytes);
+            }
+        }
+        let region = self.units[0].programs.region();
+        eprintln!(
+            "SPACE trace: {} ops, {} alike-distinct; programs {} of {} bytes on unit {} ({} programs)",
+            c.ops.len(),
+            alike.len(),
+            fullest.0,
+            region.end - region.base,
+            fullest.1,
+            fullest.2,
+        );
+        Self::space_report_layers(c, &signatures);
+        let mut rows: Vec<_> = kinds.into_iter().collect();
+        rows.sort_by_key(|(_, k)| std::cmp::Reverse((k.program_bytes, k.entries)));
+        for ((label, what), k) in rows {
+            eprintln!(
+                "SPACE   {label:>18} {what:<28} ops {:>4}  DATA top {:>7} B ({} unplanned)  entries {:>8}  programs {:>6} B",
+                k.ops,
+                k.top.saturating_sub(data.base),
+                k.unplanned,
+                k.entries,
+                k.program_bytes,
+            );
+        }
+    }
+
+    /// [`probe_space_report`]'s comparison of repeated layers: the period `p` at which the ops'
+    /// signatures repeat most, then, for every op whose signature equals the one `p` later, its
+    /// stream and sections word by word against that one's, the differing words counted by what
+    /// holds them (an entry whose first word is an op is counted by that op and word; the rest,
+    /// the tensor references a record carries, as "ref"). What differs is what a sub-trace called
+    /// once a layer would take as its arguments.
+    fn space_report_layers(c: &trace::Capture, signatures: &[String]) {
+        use std::collections::BTreeMap;
+        let n = signatures.len();
+        let matches = |p: usize| {
+            (0..n - p)
+                .filter(|&k| signatures[k] == signatures[k + p])
+                .count()
+        };
+        let Some(p) = (1..n / 2).max_by_key(|&p| (matches(p), std::cmp::Reverse(p))) else {
+            return;
+        };
+        let words = |u: usize, r: &std::ops::Range<usize>| -> Vec<[u32; 8]> {
+            let uc = &c.units[u];
+            let mut out = Vec::new();
+            for (k, e) in uc.stream[r.clone()].iter().enumerate() {
+                out.push(*e);
+                if e[0] == tt_isa::dm::op::PAIR_CALL {
+                    if let Some(i) = uc.pair_calls.iter().position(|&at| at == r.start + k) {
+                        for part in &uc.pending_sections[2 * i..2 * i + 2] {
+                            out.extend_from_slice(part);
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let (mut compared, mut total, mut differing) = (0usize, 0u64, 0u64);
+        let mut by_kind: BTreeMap<String, u64> = BTreeMap::new();
+        for k in 0..n - p {
+            if signatures[k] != signatures[k + p] {
+                continue;
+            }
+            compared += 1;
+            for u in 0..c.units.len() {
+                let (a, b) = (
+                    words(u, &c.ops[k].entries[u]),
+                    words(u, &c.ops[k + p].entries[u]),
+                );
+                if a.len() != b.len() {
+                    *by_kind.entry("(lengths differ)".into()).or_default() += 1;
+                    continue;
+                }
+                let mut head = 0u32;
+                let mut left = 0usize;
+                for (x, y) in a.iter().zip(&b) {
+                    // An op word opens a record or entry; the record's other entries are its
+                    // tensor references.
+                    let kind = if left == 0 {
+                        head = x[0];
+                        left = tt_isa::dm::record::len(x[0]).max(1);
+                        None
+                    } else {
+                        Some("ref")
+                    };
+                    left -= 1;
+                    total += 8;
+                    for w in 0..8 {
+                        if x[w] != y[w] {
+                            differing += 1;
+                            let key = match kind {
+                                Some(r) => format!("{r} of op {head:#x}, word {w}"),
+                                None => format!("op {head:#x}, word {w}"),
+                            };
+                            *by_kind.entry(key).or_default() += 1;
+                            let op_key = match kind {
+                                Some(r) => format!("~ {r} of op {head:#x}"),
+                                None => format!("~ op {head:#x}"),
+                            };
+                            *by_kind.entry(op_key).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "SPACE layers: period {p} ops ({} of {} ops repeat at it); {compared} op pairs compared: \
+             {differing} of {total} words differ",
+            matches(p),
+            n - p,
+        );
+        let mut rows: Vec<_> = by_kind.into_iter().collect();
+        rows.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        for (key, count) in rows.iter().filter(|(k, _)| k.starts_with('~')) {
+            eprintln!("SPACE   differs by op {key}: {count}");
+        }
+        for (key, count) in rows
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with('~'))
+            .take(24)
+        {
+            eprintln!("SPACE   differs: {key}: {count}");
+        }
+    }
+
+    /// [`ProbeBackground`]'s reads, at the front of the capture's streams on its units: each unit
+    /// reads its tiles from its own start in the scratch tensor, `PROBE_BACKGROUND_WINDOW` at a time.
+    fn push_probe_background(&mut self, b: ProbeBackground) -> Result<(), TensorError> {
+        use tt_isa::dm::{record, TILE_SLOT};
+        let n = self.units.len();
+        let units = b.first.min(n)..(b.first + b.units).min(n);
+        if self.probe_scratch.is_none() {
+            // 64 MiB of slots, spread over every channel.
+            self.probe_scratch = Some(self.empty(4096, 4096, tensor::Elem::F32)?);
+        }
+        let t = self.probe_scratch.as_ref().expect("made above");
+        let [rt, ct] = t.grid();
+        let total = rt * ct;
+        let x = t.tensor_ref();
+        let at = (tt_isa::l1::DATA.end - PROBE_BACKGROUND_WINDOW as u64 * TILE_SLOT) as u32;
+        let c = self.capture.as_mut().expect("capturing");
+        for (k, u) in units.enumerate() {
+            let stream = &mut c.units[u].stream;
+            let (mut first, mut left) =
+                ((k * 61 * PROBE_BACKGROUND_WINDOW) % total, b.tiles_per_unit);
+            while left > 0 {
+                let count = PROBE_BACKGROUND_WINDOW.min(left).min(total - first);
+                stream.push([
+                    record::READ_RUN,
+                    first as u32,
+                    count as u32,
+                    at,
+                    0,
+                    ct as u32,
+                    0,
+                    0,
+                ]);
+                stream.extend(x.encode());
+                left -= count;
+                first = (first + count) % total;
+            }
+            c.units[u].probe_entries = stream.len();
+        }
         Ok(())
     }
 
@@ -4368,6 +4729,9 @@ impl<T: Transport> Session<T> {
         // its stream, so a replay leaves every unit it ran on past all of its barriers.
         let last = self.barriers.wrapping_sub(capture.barriers_base);
         let ops = capture.barrier_ops;
+        for u in 0..capture.units.len() {
+            relocate_probe_background(&mut capture, u);
+        }
         for uc in capture.units.iter_mut() {
             if !uc.stream.is_empty() && uc.barriers_accounted != ops {
                 let mut wait = self.barrier_wait(last);
@@ -4381,6 +4745,9 @@ impl<T: Transport> Session<T> {
             .iter()
             .map(|u| u.held_programs.clone())
             .collect();
+        if probing_space() {
+            self.space_report(&capture);
+        }
         let result = self.store_trace(capture);
         if result.is_err() {
             for (u, held) in held.iter().enumerate() {
@@ -5574,12 +5941,25 @@ impl<T: Transport> Session<T> {
         values: &DramTensor,
         column: bool,
     ) -> Result<(), TensorError> {
+        self.scatter_rows_into_block(dst, indices, tensor::BlockOperand::whole(values), column)
+    }
+
+    /// [`Session::scatter_rows_into`] with the values a block of a resident tensor, read where it
+    /// lies (a value head's columns of a projection's row): no copy of them first.
+    pub fn scatter_rows_into_block(
+        &mut self,
+        dst: &DramTensor,
+        indices: &DramTensor,
+        values: tensor::BlockOperand<'_>,
+        column: bool,
+    ) -> Result<(), TensorError> {
         self.drop_twin(dst)?;
         let n = if column { indices.rows } else { indices.cols };
-        let units = self.spread_for(crate::index::scatter_rows_work(dst, n, tiles_of(values)));
+        let tiles = values.dims[0].div_ceil(32) * values.dims[1].div_ceil(32);
+        let units = self.spread_for(crate::index::scatter_rows_work(dst, n, tiles));
         let jobs = crate::index::scatter_rows_jobs(dst, indices, values, column, units)?;
         self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
-        if values.pad() != tensor::Pad::Zero {
+        if values.tensor.pad() != tensor::Pad::Zero {
             dst.set_pad(tensor::Pad::Undefined);
         }
         Ok(())
@@ -5769,6 +6149,107 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// `a / sqrt(mean(a a) + eps)` over each row, RMSNorm up to its scale: bit for bit
+    /// [`Session::rms`] then `kind_sfpu::DIV` by its column. A decode row with a packed row
+    /// ([`Session::set_packed_rms`]) runs as one op ([`tensor::rms_divide`]): every unit computes
+    /// the statistic from the packed row and divides its own tiles, so no unit waits on one that
+    /// computed the statistic alone ([`Session::set_rms_divide`] turns it off).
+    pub fn rms_norm(&mut self, a: &DramTensor, eps: f32) -> Result<DramTensor, TensorError> {
+        let div = tensor::Eltwise {
+            kind: crate::sfpu::ops::kind_sfpu::DIV,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let kt = a.cols / 32;
+        let fused = self.rms_divide
+            && self.packed_rms
+            && a.rows == 1
+            && a.cols % 32 == 0
+            && kt >= PACKED_A_K_TILES
+            && a.elem == tensor::Elem::F32
+            && div.in_mode(self.math).kind == div.kind;
+        if !fused {
+            let stat = self.rms(a, eps)?;
+            let out = self.eltwise(div, a, Some(&stat));
+            self.free(stat)?;
+            return out;
+        }
+        let (packed, made) = match self.packed_twin(a).cloned() {
+            Some(twin) => (twin, false),
+            None => {
+                let units = self.spread_for(kt);
+                let work = tensor::pack_row(&mut self.dram_state()?.alloc, a, units)?;
+                (self.execute_on(work, units, RESET_BUDGET)?, true)
+            }
+        };
+        // Every job reads the whole packed row (`K / 1024` tiles, on a channel or two): at a
+        // tile of `a` a job, 64 of them reading it at once cost more than they save (card 0,
+        // `K` 2048: 17.5 us on 64 units, 14.4 on 32, 16.4 on 16; the two ops 19.8).
+        let units = self
+            .spread_for(tiles_of(a))
+            .min(kt.div_ceil(RMS_DIVIDE_TILES))
+            .max(1);
+        let twin = self.new_twin(a.rows, a.cols, tensor::Elem::F32)?;
+        let work = self
+            .dram_state()
+            .and_then(|d| tensor::rms_divide(&mut d.alloc, a, &packed, eps, units, twin.as_ref()));
+        let out = match work {
+            Ok(work) => self.execute_on(work, units, RESET_BUDGET),
+            Err(e) => Err(e),
+        };
+        self.keep_twin(&out, twin)?;
+        if made {
+            self.free(packed)?;
+        }
+        let out = out?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
+    /// Rotary position embedding as one op ([`tensor::rope_blocks`]): `x cos + rotate(x) sin` over
+    /// blocks of resident tensors whose columns are heads of `head` columns, bit for bit the two
+    /// products and the sum.
+    pub fn rope(
+        &mut self,
+        x: tensor::BlockOperand<'_>,
+        cos: tensor::BlockOperand<'_>,
+        sin: tensor::BlockOperand<'_>,
+        head: usize,
+    ) -> Result<DramTensor, TensorError> {
+        let tiles = x.dims[0].div_ceil(32) * x.dims[1].div_ceil(32);
+        let units = self.spread_for(tiles);
+        let work = tensor::rope_blocks(&mut self.dram_state()?.alloc, x, cos, sin, head, units)?;
+        let out = self.execute_on(work, units, RESET_BUDGET)?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
+    /// The index of the `[1, cols]` F32 row `a`'s largest element as a `[1, 1]` I32
+    /// (`crate::sfpu::select`): the first maximum, any NaN above every number (the first NaN),
+    /// `-0` and `+0` equal, as `torch.argmax` and burn-tt's argmax choose. Two ops: each unit's
+    /// run of tiles to a partial, then one unit's choice among them. A decode step's next token,
+    /// with no download of its logits.
+    pub fn argmax_row(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
+        let ct = a.grid()[1];
+        let units = self.spread_for(ct).clamp(1, ARGMAX_UNITS);
+        let (work, starts) = tensor::argmax_partials(&mut self.dram_state()?.alloc, a, units)?;
+        let partials = self.execute_on(work, units, RESET_BUDGET)?;
+        let chosen = self
+            .dram_state()
+            .and_then(|d| tensor::argmax_choose(&mut d.alloc, &partials, &starts))
+            .and_then(|work| self.execute_on(work, 1, RESET_BUDGET));
+        self.free(partials)?;
+        let out = chosen?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
+    }
+
+    /// Run a decode row's RMSNorm as one op ([`Session::rms_norm`]); on by default. Off, it is
+    /// the statistic op then `DIV`, for gates' and benches' comparisons.
+    pub fn set_rms_divide(&mut self, on: bool) {
+        self.rms_divide = on;
+    }
+
     /// Inclusive scan down rows, carrying each prefix between tiles: FP32
     /// sum/product, raw-total-order or Flex-order (NaN-propagating, IEEE)
     /// min/max -- these preserve the selected datum's bits -- or the wrapping
@@ -5951,16 +6432,50 @@ impl<T: Transport> Session<T> {
         // weight-streaming product: each can read a job's `B` while the ops between run.
         let spread = self.units.len();
         let (prefetch, anchor): (Vec<usize>, Option<u32>) = match &self.capture {
-            Some(c) if self.weight_prefetch && packed_a.is_some() => match &c.weight_anchor {
-                Some((rel, lens)) => (
-                    (units..spread)
-                        .filter(|&u| c.units[u].stream.len() == lens[u])
-                        .take(PREFETCH_UNITS)
-                        .collect(),
-                    Some(*rel),
-                ),
-                None => (Vec::new(), None),
-            },
+            Some(c)
+                if self.weight_prefetch
+                    && packed_a.is_some()
+                    && !tensor::probing_skip_weights() =>
+            {
+                match &c.weight_anchor {
+                    Some((rel, lens)) => (
+                        (units..spread)
+                            .filter(|&u| c.units[u].stream.len() == lens[u])
+                            .take(PREFETCH_UNITS)
+                            .collect(),
+                        Some(*rel),
+                    ),
+                    None => (Vec::new(), None),
+                }
+            }
+            _ => (Vec::new(), None),
+        };
+        // In a capture, each of the product's units' bound for reading its first job's `B` ahead:
+        // the highest `DATA` address the ops it ran since the last weight-streaming product
+        // planned, if every one of them is known.
+        let (busy, busy_anchor): (Vec<Option<u64>>, Option<Vec<usize>>) = match &self.capture {
+            Some(c)
+                if self.busy_prefetch && packed_a.is_some() && !tensor::probing_skip_weights() =>
+            {
+                match &c.weight_anchor {
+                    Some((_, lens)) => (
+                        (0..units)
+                            .map(|u| {
+                                c.ops
+                                    .iter()
+                                    .map(|op| &op.entries[u])
+                                    .zip(&c.ops)
+                                    .filter(|(r, _)| r.start < r.end && r.start >= lens[u])
+                                    .try_fold(tt_isa::l1::DATA.base, |top, (_, op)| {
+                                        (op.l1_top != 0).then(|| top.max(op.l1_top))
+                                    })
+                            })
+                            .collect(),
+                        Some(lens.clone()),
+                    ),
+                    None => (Vec::new(), None),
+                }
+            }
             _ => (Vec::new(), None),
         };
         let out = self
@@ -5987,12 +6502,16 @@ impl<T: Transport> Session<T> {
                     },
                     &prefetch,
                     spread,
+                    &busy,
                 )
             })
             .and_then(|(work, dealt)| {
                 self.prefetch_anchor = dealt.and(anchor);
+                self.busy_anchor = busy_anchor;
                 let r = self.execute_on(work, dealt.unwrap_or(units), budget);
                 self.prefetch_anchor = None;
+                self.busy_anchor = None;
+                self.busy_moves.clear();
                 r
             });
         // This product is the next one's anchor: a unit idle after it can prefetch for that one.
@@ -6057,6 +6576,58 @@ impl<T: Transport> Session<T> {
             budget,
             BatchedLayout::STACKED,
         )
+    }
+
+    /// Attention for a few query rows a key/value head, as one op on a unit a head
+    /// ([`crate::attention::attention_rows`]): bit for bit the batched `Q K^T`, scale and
+    /// mask, softmax and `P V` burn-tt composes, with no tensor between them. The result is
+    /// the `[1, items.len() m dv]` row of the heads' rows in order, with its packed twin where
+    /// twins are made ([`Session::set_packed_twins`]): the projection after attention reads it
+    /// with no repack and no packing op. Its padding is undefined.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_rows(
+        &mut self,
+        q: &DramTensor,
+        k: &DramTensor,
+        v: &DramTensor,
+        mask: &DramTensor,
+        items: &[crate::attention::Item],
+        dims: [usize; 4],
+        scale: f32,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<DramTensor, TensorError> {
+        let [m, d, l, dv] = dims;
+        let work = items.len() * (d / 32 + dv / 32) * l.div_ceil(32);
+        let units = self.spread_for(work).min(items.len()).max(1);
+        let unpack_b = self.unpack_transposed_b;
+        let cols = items.len() * m * dv;
+        let twin = self.new_twin(1, cols, tensor::Elem::F32)?;
+        let work = self.dram_state().and_then(|s| {
+            crate::attention::attention_rows(
+                &mut s.alloc,
+                q,
+                k,
+                v,
+                mask,
+                items,
+                dims,
+                scale,
+                route,
+                fidelity,
+                unpack_b,
+                twin.as_ref(),
+            )
+        });
+        let out = match work {
+            Ok(work) => self.execute_on(work, units, budget),
+            Err(e) => Err(e),
+        };
+        self.keep_twin(&out, twin)?;
+        let out = out?;
+        out.set_pad(tensor::Pad::Undefined);
+        Ok(out)
     }
 
     /// [`Session::matmul_dram_batched`] with the left operand, the output, or
@@ -6588,6 +7159,17 @@ impl<T: Transport> Session<T> {
     /// by the product: the gates compare the two.
     pub fn set_weight_prefetch(&mut self, on: bool) {
         self.weight_prefetch = on;
+    }
+
+    /// Whether, in a capture, the units a one-row product with a packed `A` runs on read their
+    /// first job's `B` ahead too, as soon as the last such product is done and under the ops
+    /// between (off by default; `TT_BUSY_PREFETCH=1` turns it on; `docs/plans/decode-to-bandwidth.md`
+    /// Phase 8: the mover issues the reads before the next op's entries, so that op waits). A unit does where every op it ran since planned `DATA` below that `B`'s ring (at
+    /// the arena's end, `matmul::plan_layout_packed_a`): its reads are a prefetch
+    /// (`record::GATHER_PREFETCH`), which those ops' drains leave in flight, and the job waits for
+    /// them before its kernel (`tensor::BUSY_PREFETCH`). Off, those units read `B` in the job.
+    pub fn set_busy_prefetch(&mut self, on: bool) {
+        self.busy_prefetch = on;
     }
 
     /// Whether a GDDR matmul's later blocks on a unit skip reading the `A` rows its previous block

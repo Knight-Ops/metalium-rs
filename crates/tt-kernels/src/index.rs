@@ -350,10 +350,19 @@ pub(crate) fn scatter_rows_work(dst: &DramTensor, n: usize, values_tiles: usize)
 pub(crate) fn scatter_rows_jobs(
     dst: &DramTensor,
     indices: &DramTensor,
-    values: &DramTensor,
+    values: crate::tensor::BlockOperand<'_>,
     column: bool,
     units: usize,
 ) -> Result<Vec<Job>> {
+    // The values' block: whole tiles of its tensor, each tile read where it lies.
+    if !crate::tensor::block_fits(values.tensor, values.at, values.dims) {
+        return Err(TensorError::Shape(format!(
+            "a row scatter's values: a [{}, {}] block at {:?} of a [{}, {}] tensor is not whole \
+             tiles",
+            values.dims[0], values.dims[1], values.at, values.tensor.rows, values.tensor.cols
+        )));
+    }
+    let (v0, vt) = ([values.at[0] / 32, values.at[1] / 32], values.tensor);
     indices.expect("resident row scatter indices", Elem::I32)?;
     let n = if column { indices.rows } else { indices.cols };
     let one = if column { indices.cols } else { indices.rows };
@@ -367,8 +376,8 @@ pub(crate) fn scatter_rows_jobs(
         || dst.rows == 0
         || dst.cols == 0
         || dst.rows > i32::MAX as usize
-        || [values.rows, values.cols] != [n, dst.cols]
-        || values.elem != dst.elem
+        || values.dims != [n, dst.cols]
+        || vt.elem != dst.elem
     {
         return Err(TensorError::Shape(format!(
             "a resident row scatter needs [1, n] or [n, 1] indices and [n, {}] values of {:?}: \
@@ -378,9 +387,9 @@ pub(crate) fn scatter_rows_jobs(
             [indices.rows, indices.cols],
             indices.rows,
             indices.cols,
-            values.rows,
-            values.cols,
-            values.elem,
+            values.dims[0],
+            values.dims[1],
+            vt.elem,
         )));
     }
     let mut req = crate::l1::Requirements::new(1);
@@ -458,7 +467,7 @@ pub(crate) fn scatter_rows_jobs(
                     let mut read_side = vec![read(index_tile, at, 0)];
                     for j in j0..j1 {
                         let slot = first + (j - j0) as u64 * TILE_SLOT;
-                        read_side.push(read(values.tile(b, j), slot, j - j0 + 1));
+                        read_side.push(read(vt.tile(v0[0] + b, v0[1] + j), slot, j - j0 + 1));
                     }
                     let mut write = vec![[
                         record::SCATTER_ROWS,

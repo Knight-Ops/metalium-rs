@@ -319,18 +319,47 @@ fn scatter_rows_native(
         ),
         _ => (plain_dram(&index), column),
     };
-    let (t, v) = (plain_dram(table), plain_dram(rows));
+    let t = plain_dram(table);
     let words = |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
     let index_dims = if column { [nd.n, 1] } else { [1, nd.n] };
     if !words(&t)
         || !words(&i)
-        || !words(&v)
         || [t.buffer.rows, t.buffer.cols] != [nd.rows, nd.rest]
         || [i.buffer.rows, i.buffer.cols] != index_dims
-        || [v.buffer.rows, v.buffer.cols] != [nd.n, nd.rest]
     {
         return None;
     }
+    // The rows written in place may be read where they lie, a block of their buffer (a value
+    // head's columns of a projection's row): no copy of them first. Elsewhere, made plain.
+    let in_place = !t.transposed
+        && t.buffer.parent.is_none()
+        && crate::server::donated_since(t.buffer.id).is_some();
+    let block = in_place
+        .then(|| super::block_view(rows))
+        .flatten()
+        .filter(|(w, dims)| *dims == [nd.n, nd.rest] && w.base[0] % 32 == 0 && w.base[1] % 32 == 0);
+    let (v, values) = match block {
+        Some((w, dims)) => {
+            let arg = crate::server::BlockArg {
+                id: w.src.buffer.id,
+                at: w.base,
+                dims,
+            };
+            (w.src, arg)
+        }
+        None => {
+            let v = plain_dram(rows);
+            if !words(&v) || [v.buffer.rows, v.buffer.cols] != [nd.n, nd.rest] {
+                return None;
+            }
+            let arg = crate::server::BlockArg {
+                id: v.buffer.id,
+                at: [0, 0],
+                dims: [nd.n, nd.rest],
+            };
+            (v, arg)
+        }
+    };
     // A table the open capture owns as its state (a traced decode step's cache) is written in
     // place: the step's result is the state's own buffer, at the generation the write made, so
     // the trace needs neither the copy nor a write-back. Everything else, and every eager
@@ -340,7 +369,7 @@ fn scatter_rows_native(
         && crate::server::donated_since(t.buffer.id).is_some()
     {
         let generation =
-            crate::server::scatter_rows_into(device, t.buffer.id, i.buffer.id, v.buffer.id, column)
+            crate::server::scatter_rows_into(device, t.buffer.id, i.buffer.id, values, column)
                 .unwrap_or_else(|e| crate::unsupported::fail("scatter_nd", e));
         return Some(TtTensor::on_device(
             crate::tensor::DramRef::of(t.buffer.clone(), false, generation),

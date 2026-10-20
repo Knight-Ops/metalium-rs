@@ -537,6 +537,25 @@ pub fn math_programs(
     (inputs, finish(op, axis))
 }
 
+/// [`math_programs`] of a reduction over columns computing only the row groups of each tile's
+/// first `rows` rows ([`row_offsets`]): a decode head's score row is 4 of the 32. A reduction
+/// over columns never moves a value between rows, so those rows keep their bits; the others
+/// are left as they were, padding.
+pub fn math_programs_rows(
+    op: ReduceOp,
+    per: usize,
+    last_valid: u32,
+    rows: u32,
+) -> (Vec<Vec<Instruction>>, Vec<Instruction>) {
+    let inputs = (0..per)
+        .map(|n| {
+            let valid = (n + 1 == per && last_valid < 32).then_some(last_valid);
+            accumulate_with(op, Axis::Cols, n == 0, valid, false, rows)
+        })
+        .collect();
+    (inputs, finish_rows(op, Axis::Cols, rows))
+}
+
 /// The three role programs of a run over `layout`.
 pub fn roles(
     layout: &Layout,

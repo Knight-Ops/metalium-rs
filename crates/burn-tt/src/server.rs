@@ -235,6 +235,17 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// Attention for a few query rows a key/value head, as one op
+    /// (`Session::attention_rows`): `[q, k, v, mask]`, each head's blocks in `items`.
+    fn attention_rows(
+        &mut self,
+        _buffers: [BufferId; 4],
+        _items: &[tt_kernels::attention::Item],
+        _dims: [usize; 4],
+        _scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// A new `dims` buffer assembled from blocks of `a`
     /// (`Session::copy_blocks`).
     /// Bit-preserving native repack from source coordinates in output order.
@@ -343,7 +354,7 @@ pub trait Engine {
         &mut self,
         _table: BufferId,
         _indices: BufferId,
-        _values: BufferId,
+        _values: BlockArg,
         _column: bool,
     ) -> Result<(), TtError> {
         Err(unsupported())
@@ -374,6 +385,16 @@ pub trait Engine {
     /// Each row's `sqrt(mean(a a) + eps)`, `[rows, 1]`, left on the device
     /// (`tt_kernels::session::Session::rms`).
     fn rms(&mut self, _a: BufferId, _eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// `a / sqrt(mean(a a) + eps)` over each row, left on the device
+    /// (`tt_kernels::session::Session::rms_norm`).
+    fn rms_norm(&mut self, _a: BufferId, _eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// The index of a `[1, cols]` row's largest element, `[1, 1]` I32, left on the device
+    /// (`tt_kernels::session::Session::argmax_row`).
+    fn argmax_row(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Rows `[first, first + rows)` of `a` as a view: no copy. The caller
@@ -421,6 +442,17 @@ pub trait Engine {
         _a: BlockArg,
         _b: Option<BlockArg>,
         _c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// Rotary position embedding as one op (`tt_kernels::session::Session::rope`): `x cos +
+    /// rotate(x) sin` over blocks whose columns are heads of `head` columns.
+    fn rope_blocks(
+        &mut self,
+        _x: BlockArg,
+        _cos: BlockArg,
+        _sin: BlockArg,
+        _head: usize,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -1264,6 +1296,28 @@ impl DramBuffers {
         Ok(self.insert(c))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        [q, k, v, mask]: [BufferId; 4],
+        items: &[tt_kernels::attention::Item],
+        dims: [usize; 4],
+        scale: f32,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let [tq, tk, tv, tm] = [q, k, v, mask].map(|id| self.get(id).cloned());
+        let (tq, tk, tv, tm) = (tq?, tk?, tv?, tm?);
+        let c = s
+            .attention_rows(
+                &tq, &tk, &tv, &tm, items, dims, scale, route, fidelity, budget,
+            )
+            .map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
     pub fn gather_rows<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1336,18 +1390,23 @@ impl DramBuffers {
         s: &mut Session<T>,
         table: BufferId,
         indices: BufferId,
-        values: BufferId,
+        values: BlockArg,
         column: bool,
     ) -> Result<(), TtError> {
-        for b in [table, values] {
+        for b in [table, values.id] {
             if self.bf16.contains_key(&b) || self.bfp.contains_key(&b) {
                 return Err(TtError::Device(
                     "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
                 ));
             }
         }
-        let (tt, ti, tv) = (self.get(table)?, self.get(indices)?, self.get(values)?);
-        s.scatter_rows_into(tt, ti, tv, column)
+        let (tt, ti, tv) = (self.get(table)?, self.get(indices)?, self.get(values.id)?);
+        let block = tt_kernels::tensor::BlockOperand {
+            tensor: tv,
+            at: values.at,
+            dims: values.dims,
+        };
+        s.scatter_rows_into_block(tt, ti, block, column)
             .map_err(TtError::from)
     }
 
@@ -1592,6 +1651,27 @@ impl DramBuffers {
         Ok(self.insert(out))
     }
 
+    pub fn rope_blocks<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        x: BlockArg,
+        cos: BlockArg,
+        sin: BlockArg,
+        head: usize,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let block = |b: BlockArg| -> Result<tt_kernels::tensor::BlockOperand<'_>, TtError> {
+            Ok(tt_kernels::tensor::BlockOperand {
+                tensor: self.get(b.id)?,
+                at: b.at,
+                dims: b.dims,
+            })
+        };
+        let out = s
+            .rope(block(x)?, block(cos)?, block(sin)?, head)
+            .map_err(TtError::from)?;
+        Ok(self.insert(out))
+    }
+
     pub fn sum_rows<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1623,6 +1703,27 @@ impl DramBuffers {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
         let c = s.rms(&ta, eps).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn rms_norm<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let ta = self.get(a)?.clone();
+        let c = s.rms_norm(&ta, eps).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn argmax_row<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let ta = self.get(a)?.clone();
+        let c = s.argmax_row(&ta).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -2862,6 +2963,31 @@ pub(crate) fn eltwise_blocks(
     )
 }
 
+/// Rotary position embedding as one op on the device, without waiting: `x`'s block's dims.
+pub(crate) fn rope_blocks(
+    device: TtDevice,
+    x: BlockArg,
+    cos: BlockArg,
+    sin: BlockArg,
+    head: usize,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "rope",
+        device,
+        x.dims,
+        move || format!("rope, heads of {head}"),
+        move |engine, ids| {
+            let get = |b: BlockArg| -> Result<BlockArg, TtError> {
+                Ok(BlockArg {
+                    id: ids.get(b.id)?,
+                    ..b
+                })
+            };
+            engine.rope_blocks(get(x)?, get(cos)?, get(sin)?, head)
+        },
+    )
+}
+
 /// `x^y` on the device, without waiting: `x`'s shape.
 pub(crate) fn pow(device: TtDevice, x: BufferId, y: PowArg) -> (BufferId, [usize; 2]) {
     submit(
@@ -2917,14 +3043,25 @@ pub(crate) fn reduce_then(
 
 /// RMSNorm's statistic on the device, without waiting: each row's `sqrt(mean(a a) + eps)`,
 /// `[rows, 1]`. The caller has checked the row fits one job (`tt_kernels::sfpu::norm::fits`).
-pub(crate) fn rms(device: TtDevice, a: BufferId, eps: f32) -> (BufferId, [usize; 2]) {
-    let [r, _] = dims_of(a);
+/// The index of a row's largest element on the device, without waiting.
+pub(crate) fn argmax_row(device: TtDevice, a: BufferId) -> (BufferId, [usize; 2]) {
     submit(
-        "rms",
+        "argmax_row",
         device,
-        [r, 1],
+        [1, 1],
+        || "argmax row".into(),
+        move |engine, ids| engine.argmax_row(ids.get(a)?),
+    )
+}
+
+/// `a / sqrt(mean(a a) + eps)` over each row on the device, without waiting.
+pub(crate) fn rms_norm(device: TtDevice, a: BufferId, eps: f32) -> (BufferId, [usize; 2]) {
+    submit(
+        "rms_norm",
+        device,
+        dims_of(a),
         move || format!("eps {eps:e}"),
-        move |engine, ids| engine.rms(ids.get(a)?, eps),
+        move |engine, ids| engine.rms_norm(ids.get(a)?, eps),
     )
 }
 
@@ -3030,6 +3167,33 @@ pub(crate) fn matmul_dram_batched(
                 None => engine.matmul_dram_batched(ids.get(a)?, ids.get(b)?, &items, mkn),
                 Some(f) => engine.matmul_dram_batched_at(ids.get(a)?, ids.get(b)?, &items, mkn, f),
             }
+        },
+    )
+}
+
+/// Attention for a few query rows a key/value head as one op on the device
+/// (`Session::attention_rows`), without waiting: `[q, k, v, mask]`.
+pub(crate) fn attention_rows(
+    device: TtDevice,
+    buffers: [BufferId; 4],
+    items: Vec<tt_kernels::attention::Item>,
+    dims: [usize; 4],
+    scale: f32,
+) -> (BufferId, [usize; 2]) {
+    let [m, _, _, dv] = dims;
+    submit(
+        "attention_rows",
+        device,
+        [1, items.len() * m * dv],
+        || "attention rows".into(),
+        move |engine, ids| {
+            let buffers = [
+                ids.get(buffers[0])?,
+                ids.get(buffers[1])?,
+                ids.get(buffers[2])?,
+                ids.get(buffers[3])?,
+            ];
+            engine.attention_rows(buffers, &items, dims, scale)
         },
     )
 }
@@ -3471,6 +3635,16 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise_blocks(&mut self.session, op, a, b, c)
     }
+    fn rope_blocks(
+        &mut self,
+        x: BlockArg,
+        cos: BlockArg,
+        sin: BlockArg,
+        head: usize,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.rope_blocks(&mut self.session, x, cos, sin, head)
+    }
     fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.pow(&mut self.session, x, y)
@@ -3492,6 +3666,14 @@ impl Engine for KmdEngine {
     fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.rms(&mut self.session, a, eps)
+    }
+    fn rms_norm(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.rms_norm(&mut self.session, a, eps)
+    }
+    fn argmax_row(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.argmax_row(&mut self.session, a)
     }
     fn scan(
         &mut self,
@@ -3554,6 +3736,25 @@ impl Engine for KmdEngine {
             self.fidelity,
             self.budget,
             layout,
+        )
+    }
+    fn attention_rows(
+        &mut self,
+        buffers: [BufferId; 4],
+        items: &[tt_kernels::attention::Item],
+        dims: [usize; 4],
+        scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.attention_rows(
+            &mut self.session,
+            buffers,
+            items,
+            dims,
+            scale,
+            self.route,
+            self.fidelity,
+            self.budget,
         )
     }
     fn copy_blocks(
@@ -3669,7 +3870,7 @@ impl Engine for KmdEngine {
         &mut self,
         table: BufferId,
         indices: BufferId,
-        values: BufferId,
+        values: BlockArg,
         column: bool,
     ) -> Result<(), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
@@ -3864,7 +4065,7 @@ pub(crate) fn scatter_rows_into(
     device: TtDevice,
     table: BufferId,
     indices: BufferId,
-    values: BufferId,
+    values: BlockArg,
     column: bool,
 ) -> Result<u64, TtError> {
     if donated_since(table).is_none() {
@@ -3874,7 +4075,11 @@ pub(crate) fn scatter_rows_into(
     }
     run(device, move |engine, ids| {
         ids.healthy()?;
-        engine.scatter_rows_into(ids.get(table)?, ids.get(indices)?, ids.get(values)?, column)
+        let values = BlockArg {
+            id: ids.get(values.id)?,
+            ..values
+        };
+        engine.scatter_rows_into(ids.get(table)?, ids.get(indices)?, values, column)
     })?;
     let mut g = locked(&GENERATIONS);
     let n = g
@@ -4386,6 +4591,16 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         let bufs = &mut self.buffers;
         bufs.eltwise_blocks(self.fabric.chips[0].session(), op, a, b, c)
     }
+    fn rope_blocks(
+        &mut self,
+        x: BlockArg,
+        cos: BlockArg,
+        sin: BlockArg,
+        head: usize,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.rope_blocks(self.fabric.chips[0].session(), x, cos, sin, head)
+    }
     fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.pow(self.fabric.chips[0].session(), x, y)
@@ -4407,6 +4622,14 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.rms(self.fabric.chips[0].session(), a, eps)
+    }
+    fn rms_norm(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.rms_norm(self.fabric.chips[0].session(), a, eps)
+    }
+    fn argmax_row(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.argmax_row(self.fabric.chips[0].session(), a)
     }
     fn scan(
         &mut self,
@@ -4613,7 +4836,7 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         &mut self,
         table: BufferId,
         indices: BufferId,
-        values: BufferId,
+        values: BlockArg,
         column: bool,
     ) -> Result<(), TtError> {
         let bufs = &mut self.buffers;

@@ -18,6 +18,7 @@
 
 pub mod adc_copy;
 pub mod atomics;
+pub mod attention;
 pub mod bf16;
 pub mod bfp;
 pub mod code;

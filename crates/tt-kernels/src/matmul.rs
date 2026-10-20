@@ -1528,6 +1528,23 @@ pub(crate) fn half_arena() -> tt_isa::l1::Region {
     }
 }
 
+/// [`plan_layout_in`] in slots ([`Staging::Slots`] or [`Staging::SlotsHalf`]) for a product
+/// whose `A` is read packed (`crate::tensor`'s packed `A`): its ring holds the `a_slots` slots
+/// the packed rows span, not `mt * kt` (at `K` = 2048, 3 slots against 64: 254 KB of a unit's
+/// arena freed). Under [`Staging::Slots`], `B`'s ring sits at the arena's end, `A` and the
+/// outputs at its start ([`matmul_requirements_top_b`]), so a prefetch of `B` lands above what the
+/// ops before the product plan. The pairs name `A`'s unpacked slots as [`plan_layout_in`]'s do;
+/// the caller relays them onto the packed rows.
+pub fn plan_layout_packed_a(
+    tiles: [usize; 3],
+    in_fmt: L1Format,
+    staging: Staging,
+    a_slots: usize,
+) -> Result<Layout, crate::runtime::RunError> {
+    assert!(staging != Staging::Host, "a packed A is read into slots");
+    planned_slots(tiles, in_fmt, staging, a_slots, staging == Staging::Slots)
+}
+
 /// [`plan_layout`] for either [`Staging`].
 pub fn plan_layout_in(
     [mt, kt, nt]: [usize; 3],
@@ -1536,7 +1553,9 @@ pub fn plan_layout_in(
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::runtime::RunError;
     match staging {
-        Staging::Slots | Staging::SlotsHalf => return planned_slots([mt, kt, nt], in_fmt, staging),
+        Staging::Slots | Staging::SlotsHalf => {
+            return planned_slots([mt, kt, nt], in_fmt, staging, mt * kt, false)
+        }
         Staging::Host => {}
     }
     let (img, align, out_stride, out_skip) = match staging {
@@ -1598,7 +1617,31 @@ pub fn matmul_requirements([mt, kt, nt]: [usize; 3]) -> MatmulBuffers {
 
 /// [`matmul_requirements`] with `a_slots` slots for `A` (a packed `A`'s few,
 /// [`packed_a_pairs`]).
-pub fn matmul_requirements_with([mt, kt, nt]: [usize; 3], a_slots: usize) -> MatmulBuffers {
+pub fn matmul_requirements_with(tiles: [usize; 3], a_slots: usize) -> MatmulBuffers {
+    matmul_requirements_placed(tiles, a_slots, None)
+}
+
+/// [`matmul_requirements_with`] with `B`'s ring at the end of `arena_bytes` of arena: `A` and the
+/// outputs first, then a gap that fills the rest, then `B`, so first fit puts `B` against the
+/// arena's end (`docs/plans/decode-to-bandwidth.md` Phase 8: the ops between two products plan
+/// low, and a prefetch of the next product's `B` lands above them). `None` if the three do not
+/// fit, as the plain order would not.
+pub fn matmul_requirements_top_b(
+    [mt, kt, nt]: [usize; 3],
+    a_slots: usize,
+    arena_bytes: u64,
+) -> Option<MatmulBuffers> {
+    use tt_isa::dm::TILE_SLOT;
+    let used = (a_slots + mt * nt + kt * nt) as u64 * TILE_SLOT;
+    let gap = arena_bytes.checked_sub(used)?;
+    Some(matmul_requirements_placed([mt, kt, nt], a_slots, Some(gap)))
+}
+
+fn matmul_requirements_placed(
+    [mt, kt, nt]: [usize; 3],
+    a_slots: usize,
+    gap: Option<u64>,
+) -> MatmulBuffers {
     use crate::l1::{Endpoint, Requirements};
     use tt_isa::dm::TILE_SLOT;
     let mut req = Requirements::new(1);
@@ -1622,20 +1665,45 @@ pub fn matmul_requirements_with([mt, kt, nt]: [usize; 3], a_slots: usize) -> Mat
         Endpoint::Mover,
         Endpoint::Unpack,
     );
-    let b = ring(
-        &mut req,
-        "matmul B",
-        kt * nt,
-        Endpoint::Mover,
-        Endpoint::Unpack,
-    );
-    let out = ring(
-        &mut req,
-        "matmul out",
-        mt * nt,
-        Endpoint::Pack,
-        Endpoint::Mover,
-    );
+    let (b, out) = match gap {
+        None => {
+            let b = ring(
+                &mut req,
+                "matmul B",
+                kt * nt,
+                Endpoint::Mover,
+                Endpoint::Unpack,
+            );
+            let out = ring(
+                &mut req,
+                "matmul out",
+                mt * nt,
+                Endpoint::Pack,
+                Endpoint::Mover,
+            );
+            (b, out)
+        }
+        Some(gap) => {
+            let out = ring(
+                &mut req,
+                "matmul out",
+                mt * nt,
+                Endpoint::Pack,
+                Endpoint::Mover,
+            );
+            if gap > 0 {
+                req.scratch("matmul gap", gap, tt_isa::dram::ALIGN, 0..1);
+            }
+            let b = ring(
+                &mut req,
+                "matmul B",
+                kt * nt,
+                Endpoint::Mover,
+                Endpoint::Unpack,
+            );
+            (b, out)
+        }
+    };
     let sems = MatmulSemaphores::declare(&mut req, 0..1);
     MatmulBuffers {
         req,
@@ -1664,22 +1732,31 @@ fn planned_slots(
     tiles: [usize; 3],
     in_fmt: L1Format,
     staging: Staging,
+    a_slots: usize,
+    top_b: bool,
 ) -> Result<Layout, crate::runtime::RunError> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = ([usize; 3], L1Format, Staging);
-    static CACHE: OnceLock<Mutex<HashMap<Key, Layout>>> = OnceLock::new();
+    type Key = ([usize; 3], L1Format, Staging, usize, bool);
+    // Each layout with the highest `DATA` address its plan reached, noted again on every hit
+    // (`crate::l1::note_planned_top`).
+    static CACHE: OnceLock<Mutex<HashMap<Key, (Layout, u64)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, in_fmt, staging);
-    if let Some(l) = cache.lock().unwrap().get(&key) {
+    let key = (tiles, in_fmt, staging, a_slots, top_b);
+    if let Some((l, top)) = cache.lock().unwrap().get(&key) {
+        crate::l1::note_planned_top(*top);
         return Ok(l.clone());
     }
     let arena = match staging {
         Staging::SlotsHalf => half_arena(),
         _ => tt_isa::l1::DATA,
     };
-    let l = plan_slots(tiles, in_fmt, arena)?;
-    cache.lock().unwrap().insert(key, l.clone());
+    let before = crate::l1::take_planned_top();
+    let planned = plan_slots(tiles, in_fmt, arena, a_slots, top_b);
+    let top = crate::l1::take_planned_top();
+    crate::l1::note_planned_top(before.max(top));
+    let l = planned?;
+    cache.lock().unwrap().insert(key, (l.clone(), top));
     Ok(l)
 }
 
@@ -1687,6 +1764,8 @@ fn plan_slots(
     [mt, kt, nt]: [usize; 3],
     in_fmt: L1Format,
     arena: tt_isa::l1::Region,
+    a_slots: usize,
+    top_b: bool,
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::l1::PlanError;
     use crate::runtime::RunError;
@@ -1695,7 +1774,16 @@ fn plan_slots(
         tile_image_bytes(in_fmt) <= TILE_DATA + 4096,
         "slot staging must fit the operand image"
     );
-    let m = matmul_requirements([mt, kt, nt]);
+    let m = match top_b {
+        true => matmul_requirements_top_b([mt, kt, nt], a_slots, arena.len()).ok_or(
+            RunError::DoesNotFit {
+                what: "the operand tiles",
+                bytes: (a_slots + mt * nt + kt * nt) as u64 * TILE_SLOT,
+                limit: arena.len(),
+            },
+        )?,
+        false => matmul_requirements_with([mt, kt, nt], a_slots),
+    };
     let plan = m.req.plan(arena).map_err(|e| match e {
         PlanError::DoesNotFit { name, bytes, arena } => RunError::DoesNotFit {
             what: name,

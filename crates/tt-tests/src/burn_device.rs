@@ -425,6 +425,16 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.eltwise_blocks(&mut self.session, op, a, b, c)
         }
+        fn rope_blocks(
+            &mut self,
+            x: burn_tt::BlockArg,
+            cos: burn_tt::BlockArg,
+            sin: burn_tt::BlockArg,
+            head: usize,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers
+                .rope_blocks(&mut self.session, x, cos, sin, head)
+        }
         fn pow(
             &mut self,
             x: burn_tt::BufferId,
@@ -453,6 +463,19 @@ fn sim_factory(
             eps: f32,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.rms(&mut self.session, a, eps)
+        }
+        fn rms_norm(
+            &mut self,
+            a: burn_tt::BufferId,
+            eps: f32,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.rms_norm(&mut self.session, a, eps)
+        }
+        fn argmax_row(
+            &mut self,
+            a: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.argmax_row(&mut self.session, a)
         }
         fn scan(
             &mut self,
@@ -518,6 +541,25 @@ fn sim_factory(
                 c.fidelity,
                 c.budget,
                 layout,
+            )
+        }
+        fn attention_rows(
+            &mut self,
+            buffers: [burn_tt::BufferId; 4],
+            items: &[tt_kernels::attention::Item],
+            dims: [usize; 4],
+            scale: f32,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            let c = &self.config;
+            self.buffers.attention_rows(
+                &mut self.session,
+                buffers,
+                items,
+                dims,
+                scale,
+                c.route,
+                c.fidelity,
+                c.budget,
             )
         }
         fn repack(
@@ -624,7 +666,7 @@ fn sim_factory(
             &mut self,
             table: burn_tt::BufferId,
             indices: burn_tt::BufferId,
-            values: burn_tt::BufferId,
+            values: burn_tt::BlockArg,
             column: bool,
         ) -> Result<(), TtError> {
             self.buffers

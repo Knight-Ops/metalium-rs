@@ -3,7 +3,7 @@
 **Start here.** This is the single list of open work. It holds only open items, each
 linking to its evidence and to the detailed plan. Closed work lives in
 [`completed-plans/`](../completed-plans/) and the archived phase docs below; permanent facts live in
-[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-16.
+[`learnings/`](../learnings/). Last reviewed against the code on 2026-10-19.
 
 ## Where the project stands
 
@@ -385,9 +385,20 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
       - **The small ops, under way** (decode-to-bandwidth Phase 3, "The small ops, 2026-10-19"): a column operand
         broadcast by the SFPU, RMSNorm's statistic from the packed row, row gathers dealt by rows, the prefetch keeping
         its units, packed twins, a barrier released by unit 0: 1.7B **24.04 / 24.48 / 25.39 ms** (`1792383988`), 135M
-        **11.40 / 11.80 / 12.26** (`1792378993`). Weights stored transposed were slower (not built). Next there: a
-        deeper weight prefetch and prefetch for the K-blocked `down`; RoPE over `q|k` in one pass and
-        `x / stat * gamma` as one op are documented and skipped (~1 ms together).
+        **11.40 / 11.80 / 12.26** (`1792378993`). Weights stored transposed were slower (not built).
+      - **The 2026-10-19 review** ([there](decode-to-bandwidth.md#the-2026-10-19-review-what-caps-decode-in-f32)): F32's
+        floor is ~14.3 ms (~13 ms needs BF16 storage, after the F32 levers); the deeper prefetch alone is worth ≤ ~2 ms. The
+        order: attention as one op (Phase 6), the other small ops (Phase 7), a continuous weight stream (Phase 8).
+      - **Decode attention as one op** (Phase 6a, `Session::attention_rows`, gate `step209`): a head a unit, seven kernels
+        in L1, bit for bit: 1.7B **22.78 / 23.26 / 23.98 ms** (`1792425331`), 135M **9.58 / 10.11 / 10.96**
+        (`1792425715`). Then one region a job (6b) and RMSNorm's statistic and `DIV` as one op (gate `step210`): 1.7B
+        **22.24 / 22.70 / 23.43 ms** (`1792432143`). Then the token on the card (a native argmax; sampling with temperature,
+        top-k and top-p on the card, eager and slow until a native top-k), RoPE as one op, three copies gone (gates
+        `step211`-`step213`): 1.7B **20.95 / 21.41 / 22.18 ms** (`1792444936`), 135M **8.00 / 8.59 / 9.38**
+        (`1792445319`). Phase 8's probe (2026-10-20,
+        gate `step214`): with its weights free a step is **7.85 ms**; under a ~300 GB/s stream its ops cost 1.6x; L1
+        bounds a continuous stream (~2-3 ms realistic, ~0.6 ms a step per 100 KB a unit freed). Next: the packed-`A`
+        ring reclaim (~254 KB a product unit), then busy units streaming. `gamma`'s product is deferred.
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.
@@ -754,7 +765,9 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
     the mode.
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
-  ([traced-execution.md](traced-execution.md) §8).
+  ([traced-execution.md](traced-execution.md) §8). Related proposal (2026-10-20):
+  [layer-sub-traces.md](../proposals/layer-sub-traces.md), one stored layer called once a layer (a 1.7B step's
+  trace ~635 K -> ~40 K entries).
 - [x] **Trace size in GDDR** (2026-10-15, [decode-length-cost.md](../completed-plans/decode-length-cost.md) A0-A1).
   SmolLM2's step and 64/128/256 chunks held **3.75 GB** of trace streams; now **563 MB**, each trace exactly its
   entries. Every `PAIR_CALL` section had been an allocation of its own of at least one 4,160-byte slot, holding ~810

@@ -38,6 +38,7 @@ pub mod ops;
 pub mod reduce;
 pub mod round;
 pub mod scan;
+pub mod select;
 pub mod sort;
 
 use tt_isa::frontend;

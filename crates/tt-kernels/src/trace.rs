@@ -133,6 +133,9 @@ pub struct OpRecord {
     /// What it moves through GDDR on all its units. Counted when the trace is stored, in the
     /// profile mode only; zero otherwise.
     pub bytes: crate::profile_mode::OpBytes,
+    /// The highest `DATA` address its L1 plans reached ([`crate::l1::take_planned_top`]): what it
+    /// needs of a unit's arena. Zero where its layout was not planned while it was captured.
+    pub l1_top: u64,
 }
 
 /// What a stored stream is made of: how many entries it holds, how many of those
@@ -223,6 +226,12 @@ pub(crate) struct UnitCapture {
     /// Entries in each reader and writer section stored for the stream's
     /// `PAIR_CALL`s, chunk padding included: reader, then writer, per packet.
     pub(crate) sections: Vec<u32>,
+    /// The entries a development probe put at the front of `stream`
+    /// (`Session`'s `ProbeBackground`); 0 without one.
+    pub(crate) probe_entries: usize,
+    /// Each program-cache hold's address and the op that took it (`OpRecord::label` and
+    /// `what`), for the space report (`Session`'s `probe_space_report`).
+    pub(crate) program_owners: Vec<(u64, &'static str, &'static str)>,
 }
 
 impl UnitCapture {
@@ -302,6 +311,78 @@ pub(crate) struct Capture {
     pub(crate) weight_units: usize,
 }
 
+impl Capture {
+    /// Move unit `u`'s entries `block` of its stream to start at `to`, earlier (`to <=
+    /// block.start`: the entries from `to` move up behind it) or later (`to >= block.end`, `to`
+    /// counted before the move: the block ends where `to` was, the entries between move down).
+    /// Every op's range on `u` and every `PAIR_CALL`'s position follow their entries; a range
+    /// that held the block keeps the rest of its entries, which are contiguous again. The block
+    /// is no op's own afterwards: a prefetch moved to before the ops it runs under, or the
+    /// probe's background moved after them.
+    pub(crate) fn move_block(&mut self, u: usize, block: std::ops::Range<usize>, to: usize) {
+        let len = block.len();
+        assert!(
+            to <= block.start || to >= block.end,
+            "a block moves out of its own place"
+        );
+        if len == 0 || to == block.start || to == block.end {
+            return;
+        }
+        debug_assert!(
+            self.ops
+                .iter()
+                .all(|op| !(op.entries[u].start < to && to < op.entries[u].end)),
+            "a block moves to the middle of an op"
+        );
+        let earlier = to < block.start;
+        // Where the entry at `i` goes.
+        let at = |i: usize| -> usize {
+            if block.contains(&i) {
+                i - block.start + if earlier { to } else { to - len }
+            } else if earlier && (to..block.start).contains(&i) {
+                i + len
+            } else if !earlier && (block.end..to).contains(&i) {
+                i - len
+            } else {
+                i
+            }
+        };
+        let uc = &mut self.units[u];
+        for p in uc.pair_calls.iter_mut() {
+            *p = at(*p);
+        }
+        if earlier {
+            uc.stream[to..block.end].rotate_right(len);
+        } else {
+            uc.stream[block.start..to].rotate_left(len);
+        }
+        for op in &mut self.ops {
+            let r = &mut op.entries[u];
+            if r.start >= r.end {
+                continue;
+            }
+            let holds = r.start <= block.start && r.end >= block.end;
+            debug_assert!(
+                holds || r.end <= block.start || r.start >= block.end,
+                "an op's range cuts the block"
+            );
+            // The range's own entries, the block's left out where it held them.
+            let (first, last) = match holds {
+                true if r.start == block.start && r.end == block.end => {
+                    *r = 0..0;
+                    continue;
+                }
+                true if r.start == block.start => (block.end, r.end - 1),
+                true if r.end == block.end => (r.start, block.start - 1),
+                _ => (r.start, r.end - 1),
+            };
+            let (a, b) = (at(first), at(last));
+            debug_assert!(b >= a && b - a + 1 == (r.len() - if holds { len } else { 0 }));
+            *r = a..b + 1;
+        }
+    }
+}
+
 /// One unit's share of a finished trace.
 pub(crate) struct UnitTrace {
     /// Its stream in GDDR, its sections after it in the same region, and where
@@ -369,6 +450,105 @@ pub(crate) fn chunked(entries: &[[u32; 8]]) -> Vec<[u32; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capture of one unit whose entries are numbered (word 1), with `PAIR_CALL`s at `calls`
+    /// and one op a range of `ranges`.
+    fn numbered(n: usize, calls: &[usize], ranges: &[std::ops::Range<usize>]) -> Capture {
+        let stream = (0..n)
+            .map(|i| {
+                let op = if calls.contains(&i) {
+                    op::PAIR_CALL
+                } else {
+                    op::WAIT
+                };
+                [op, i as u32, 0, 0, 0, 0, 0, 0]
+            })
+            .collect();
+        let uc = UnitCapture {
+            stream,
+            pair_calls: calls.to_vec(),
+            ..Default::default()
+        };
+        Capture {
+            epoch: 0,
+            barriers_base: 0,
+            barriers: 0,
+            barrier_ops: 0,
+            units: vec![uc],
+            freed: Vec::new(),
+            ops: ranges
+                .iter()
+                .map(|r| OpRecord {
+                    what: "",
+                    label: "",
+                    entries: vec![r.clone()],
+                    barrier: true,
+                    stamps: [0; 2],
+                    bytes: Default::default(),
+                    l1_top: 0,
+                })
+                .collect(),
+            failed: false,
+            weight_anchor: None,
+            weight_units: 0,
+        }
+    }
+
+    /// Each op's entries (by number) and the numbers at the `PAIR_CALL` positions.
+    fn contents(c: &Capture) -> (Vec<Vec<u32>>, Vec<u32>) {
+        let s = &c.units[0].stream;
+        let ops = c
+            .ops
+            .iter()
+            .map(|o| s[o.entries[0].clone()].iter().map(|e| e[1]).collect())
+            .collect();
+        let calls = c.units[0]
+            .pair_calls
+            .iter()
+            .map(|&p| {
+                assert_eq!(
+                    s[p][0],
+                    op::PAIR_CALL,
+                    "a PAIR_CALL position follows its entry"
+                );
+                s[p][1]
+            })
+            .collect();
+        (ops, calls)
+    }
+
+    #[test]
+    fn a_moved_block_leaves_every_op_its_own_entries() {
+        // Ops 0..4, 4..10 (a PAIR_CALL at 6), 10..20 (the last holds a block 12..15 with a
+        // PAIR_CALL at 13): the block moves back to 4, before the second op.
+        let mut c = numbered(20, &[6, 13], &[0..4, 4..10, 10..20]);
+        c.move_block(0, 12..15, 4);
+        let (ops, calls) = contents(&c);
+        assert_eq!(ops[0], (0..4).collect::<Vec<_>>());
+        assert_eq!(ops[1], (4..10).collect::<Vec<_>>());
+        assert_eq!(ops[2], [10, 11, 15, 16, 17, 18, 19]);
+        assert_eq!(calls, [6, 13]);
+        let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
+        assert_eq!(&order[..10], [0, 1, 2, 3, 12, 13, 14, 4, 5, 6]);
+        // A block at the front of the stream (the probe's background) moved after the ops.
+        let mut c = numbered(12, &[5], &[3..6, 6..9, 9..12]);
+        c.move_block(0, 0..3, 9);
+        let (ops, calls) = contents(&c);
+        assert_eq!(ops[0], [3, 4, 5]);
+        assert_eq!(ops[1], [6, 7, 8]);
+        assert_eq!(ops[2], [9, 10, 11]);
+        assert_eq!(calls, [5]);
+        let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
+        assert_eq!(order, [3, 4, 5, 6, 7, 8, 0, 1, 2, 9, 10, 11]);
+        // A block that starts an op's range, moved back past another op.
+        let mut c = numbered(10, &[], &[0..5, 5..10]);
+        c.move_block(0, 5..7, 0);
+        let (ops, _) = contents(&c);
+        assert_eq!(ops[0], [0, 1, 2, 3, 4]);
+        assert_eq!(ops[1], [7, 8, 9]);
+        let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
+        assert_eq!(&order[..2], [5, 6]);
+    }
 
     #[test]
     fn no_record_crosses_a_chunk() {

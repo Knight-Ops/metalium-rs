@@ -93,6 +93,9 @@ pub struct Layout {
     pub a_at: u64,
     /// The second operand's, unless unary.
     pub b_at: Option<u64>,
+    /// `B` is one slot, read for every tile: a `[rows, 1]` column that every tile of a row
+    /// broadcasts ([`Operands::ColBroadcast`]), held in L1 once (`crate::attention`).
+    pub b_once: bool,
     /// The third operand's, for a ternary op.
     pub c_at: Option<u64>,
     /// The packer's output slots: datums at `TILE_DATA` past each slot's start.
@@ -147,6 +150,7 @@ pub fn plan_layout_in(
         tiles,
         a_at: plan.addr(a),
         b_at: b.map(|b| plan.addr(b)),
+        b_once: false,
         c_at: c.map(|c| plan.addr(c)),
         out_at: plan.addr(out),
         sems: SfpuSemaphores {
@@ -209,6 +213,7 @@ pub(crate) fn roles_code_validated(
     use crate::code::Loop;
     let s = layout.sems;
     let slot = |base: u64, n: usize| base + n as u64 * TILE_SLOT;
+    let b_slot = |base: u64, n: usize| slot(base, if layout.b_once { 0 } else { n });
 
     // Everything the unpacker's address generators read, set here: a kernel
     // inherits the thread's ADCs from whatever ran before (a matmul leaves Z
@@ -227,7 +232,7 @@ pub(crate) fn roles_code_validated(
         unpack.extend(unpack_tile_to_dst(slot(layout.a_at, n), A_ROW));
         match (operands, layout.b_at) {
             (Operands::Binary | Operands::ColBroadcast, Some(b)) => {
-                unpack.extend(unpack_tile_to_dst(slot(b, n), B_ROW));
+                unpack.extend(unpack_tile_to_dst(b_slot(b, n), B_ROW));
             }
             (Operands::Ternary, Some(b)) => {
                 unpack.extend(unpack_tile_to_dst(slot(b, n), B_ROW));

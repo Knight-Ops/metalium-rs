@@ -1174,6 +1174,30 @@ rotations with the first lane held, ~100 instructions a tile) took them to 14.7 
 read the column as it lies (`record::READ_RUN_COL_AS_IT_LIES`); `READ_BROADCAST_COL` is left to the integer division's
 programs.
 
+## What an SFPU kind costs a tile, and a kernel a block (2026-10-19, card 0, `silicon_probe_attention_rows`)
+
+- **An exp-based kind over whole tiles is ~8.5 us a tile.** `SUB_EXP` of a `[1, 512]` row on one unit, all 32 rows
+  computed: 153.3 us for 16 tiles, against `MUL`'s 21.7 (runs `1792424868`, `1792424899`). Row-limited to one row,
+  in the attention job's 16 score tiles, its kernel took 15.0 us against 13.5 for a `MUL` in its place (`1792425322`,
+  `1792424459`). Build exp-, reciprocal- and divide-based kinds for the rows a tile holds
+  (`sfpu::ops::code_for_rows`, `reduce::math_programs_rows`).
+- **Row-limited `DIV` is ~0.5 us a tile over `MUL`,** and its time does not depend on the divisor: zero, a denormal,
+  NaN, infinity and 1e-38 gave 29.4-29.6 us over 16 tiles.
+- **Only the rows from 0 count as limited.** Programs built for rows `0..r0 + m` compute every row group up to the last
+  live row: a head at row 31 of a stacked tile ran the whole-tile `SUB_EXP` and `DIV`, ~8 us a score tile. Move a
+  few live rows to row 0 first (64-byte face-row reads, as `attention::attention_rows` does).
+- **A region costs ~3.5-4 us** (a `PAIR_CALL`'s start and finish, its credits, the roles' retirement), whatever it
+  computes. Consecutive blocks of a job join one region only with equal semaphore initialisations: a job mixing matmul,
+  SFPU and reduction kernels was a region a kernel (seven in the attention op, ~25 of its 35 us at 64 positions) until
+  they shared their union (`tensor::share_semaphore_init`; 25 us).
+- **A capture holds every program it places,** so an op whose kernels are many and long cannot be captured beside a model's
+  traces: the device sort of a 256-wide row nearly fills the 240 KiB cache by itself, 512 does not capture at all (card 0,
+  ttsim; the 1.7B's traces hold 231 KB). Eager runs evict between lists and are not limited so. Make a kernel's program one
+  body repeated (`code::Loop`), not one a tile: a row's argmax with a program a tile took ~11 KB a unit and broke the 1.7B's
+  captures.
+- **Many units reading the same few tiles serialise on a channel:** 64 units each reading one row's 2-tile packed twin made
+  a norm 17.5 us against 14.4 on 32 (`1792431978`).
+
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 
 - **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of

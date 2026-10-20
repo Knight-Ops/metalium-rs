@@ -34,6 +34,23 @@ use tt_isa::sync::Semaphore;
 
 use crate::runtime::SemaphoreInit;
 
+std::thread_local! {
+    /// The highest `DATA` address planned on this thread since [`take_planned_top`] last ran.
+    static PLANNED_TOP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Note that a layout reaches `top` of `DATA` (every [`Requirements::plan`] in `DATA`, and the
+/// layouts placed by hand there): a capture keeps each op's highest in its
+/// [`crate::trace::OpRecord::l1_top`], what it needs of a unit's arena.
+pub(crate) fn note_planned_top(top: u64) {
+    PLANNED_TOP.with(|t| t.set(t.get().max(top)));
+}
+
+/// The highest `DATA` address noted since the last call, and start again from none.
+pub(crate) fn take_planned_top() -> u64 {
+    PLANNED_TOP.with(|t| t.replace(0))
+}
+
 /// Who reads or writes a circular buffer.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Endpoint {
@@ -412,6 +429,20 @@ impl Requirements {
     /// same addresses -- which is what lets programs built from a plan be
     /// memoised by shape.
     pub fn plan(&self, arena: Region) -> Result<Plan, PlanError> {
+        let plan = self.plan_unnoted(arena)?;
+        if arena.base >= tt_isa::l1::DATA.base && arena.end <= tt_isa::l1::DATA.end {
+            let top = self
+                .buffers
+                .iter()
+                .zip(&plan.addr)
+                .map(|(b, &at)| at + b.bytes)
+                .max();
+            note_planned_top(top.unwrap_or(arena.base));
+        }
+        Ok(plan)
+    }
+
+    fn plan_unnoted(&self, arena: Region) -> Result<Plan, PlanError> {
         self.validate()?;
         let mut addr: Vec<u64> = Vec::with_capacity(self.buffers.len());
         for (i, b) in self.buffers.iter().enumerate() {

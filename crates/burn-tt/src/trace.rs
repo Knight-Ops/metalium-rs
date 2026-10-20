@@ -473,6 +473,58 @@ impl TracedInference {
         server::run_generic_trace(self.device, self.id, in_pairs, out_pairs)
     }
 
+    /// Output `i` as a device tensor of the buffer the trace writes, holding what the last replay
+    /// wrote there: a new tensor each call (with no host copy), so an op run on it reads the
+    /// card's current data. Kept alive by the trace; an op that writes it in place would change
+    /// what the next reader sees, so treat it as read-only. A decode step's logits sampled from on
+    /// the card, where the trace left them.
+    pub fn output_tensor(&self, i: usize) -> Result<TtTensor, TtError> {
+        let held = self
+            ._held
+            .get(self.inputs.len() + i)
+            .filter(|_| i < self.outputs.len())
+            .ok_or_else(|| TtError::Device(format!("output {i} of {}", self.outputs.len())))?;
+        let dram = held
+            .dram()
+            .ok_or_else(|| TtError::Device("a trace output must be on the device".into()))?
+            .clone();
+        Ok(TtTensor::on_device(
+            dram,
+            held.shape().clone(),
+            held.dtype(),
+            self.device,
+        ))
+    }
+
+    /// [`TracedInference::run_timed`] reading back only the outputs `which` names (indices into
+    /// the capture's outputs, in the order wanted): a decode step's chosen token without its
+    /// logits.
+    pub fn run_outputs(
+        &self,
+        inputs: Vec<server::InputPayload>,
+        which: &[usize],
+    ) -> Result<server::GenericTraceRun, TtError> {
+        if inputs.len() != self.inputs.len() {
+            return Err(TtError::Device(format!(
+                "expected {} inputs, got {}",
+                self.inputs.len(),
+                inputs.len()
+            )));
+        }
+        let in_pairs: Vec<(BufferId, server::InputPayload)> =
+            self.inputs.iter().copied().zip(inputs).collect();
+        let out_pairs = which
+            .iter()
+            .map(|&i| {
+                self.outputs
+                    .get(i)
+                    .map(|&(id, kind, _)| (id, kind))
+                    .ok_or_else(|| TtError::Device(format!("output {i} of {}", self.outputs.len())))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        server::run_generic_trace(self.device, self.id, in_pairs, out_pairs)
+    }
+
     /// [`TracedInference::run_timed`] with every unit's data mover stamping the replay's
     /// entries (`tt_kernels::profile`): where a replay's device time goes, op by op when
     /// read beside [`TracedInference::ops`]. Each unit's buffer holds 1,024 events, so

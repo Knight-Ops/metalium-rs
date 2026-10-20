@@ -1,7 +1,9 @@
 # Decode attention
 
 Phase 2 of [decode-to-bandwidth.md](decode-to-bandwidth.md). Written 2026-10-17 against `c69b9c1`. Status:
-**A0, A0b, A1, A2a, A4a, A4b and the A-layout done (2026-10-18); A2, A3 and A5 open.** It follows S4 of [decode-small-ops.md](decode-small-ops.md) (the row gathers and the softmax),
+**A0, A0b, A1, A2a, A4a, A4b and the A-layout done (2026-10-18); A2 and A3 superseded for decode by attention as one
+op (2026-10-19, [decode-to-bandwidth.md](decode-to-bandwidth.md) Phase 6, `Session::attention_rows`: a head a unit, no
+regathering, bit for bit); A5 open.** It follows S4 of [decode-small-ops.md](decode-small-ops.md) (the row gathers and the softmax),
 which it replaces.
 
 ## Why this item
@@ -147,7 +149,8 @@ Every phase is bit for bit with today's attention, and each head's positions kee
   - **Measured** (card 1):
     - 1.7B 36.89 / 37.30 / 38.36 -> **36.39 / 37.02 / 37.98 ms** (`1792280991`);
     - 135M 16.05 / 16.48 / 17.29 -> **15.33 / 15.79 / 16.47** (`1792281384`, burn-flex 26.9 / 29.3 / 31.5).
-- [ ] **A2. No regathering of `q`, `P` or the output.** Either:
+- [x] **A2. No regathering of `q`, `P` or the output** (decode: done by attention as one op, 2026-10-19; the
+  composition, which a prefill and other shapes still run, keeps its gathers). Either:
   - `padded_attention` takes the caller's mask and a small `m`;
   - or the batched product reads thin `A` rows in place, as the decode projections already do (`thin`), and writes
     thin output rows.
@@ -156,7 +159,8 @@ Every phase is bit for bit with today's attention, and each head's positions kee
   `P`'s are dealt by rows over 16 units (22.3 / 5.3 / 22.3 -> 8.0 us each, decode-to-bandwidth Phase 3, ~0.7 ms); the
   regathering itself remains. That is re-measured after A2a (profile `1792298755`):
   the two stacking gathers on 2 units (22 us each a layer), `P`'s gather (5 us) and the context's repack (6-8 us).
-- [ ] **A3. K and V read in place at the read ceiling.**
+- [x] **A3. K and V read in place at the read ceiling** (decode: attention as one op reads each head's keys and values
+  in place on its own unit, 2026-10-19; 89 us a layer at 512 positions, card 0).
   - The cache keeps tile-aligned per-head blocks at every attended length.
   - `qk` and `pv` are dealt over 120 units by head, with each head's positions on one unit.
   - **Target:** ≥300 GB/s on the cache. **Worth:** −3 ms at 512.

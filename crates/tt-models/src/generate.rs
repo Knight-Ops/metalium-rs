@@ -83,8 +83,157 @@ impl Generation {
     }
 }
 
+/// The first largest logit, as `torch.argmax` chooses (and so the reference implementation's
+/// greedy decoding): any NaN above every number (the first NaN), `-0` and `+0` equal. The card's
+/// greedy choice is the same (`burn-tt`'s argmax, `tt_kernels::sfpu::select`).
 pub(crate) fn argmax(v: &[f32]) -> usize {
-    (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap()
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate().skip(1) {
+        let b = v[best];
+        if if x.is_nan() {
+            !b.is_nan()
+        } else {
+            !b.is_nan() && x > b
+        } {
+            best = i;
+        }
+    }
+    best
+}
+
+/// How a step's next token is chosen, on the card ([`TracedGenerator::generate_tokens`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sampler {
+    /// The first largest logit ([`argmax`]'s choice).
+    Greedy,
+    /// A draw from `softmax(logits / temperature)` over what top-k and then top-p keep, in that
+    /// order (as `transformers`' warpers apply them):
+    /// - `top_k`: the `k` largest logits, exactly `k` (a logit tied with the `k`-th largest past
+    ///   them is left out, where `transformers` keeps it), at most `SORT_MAX / 2` (512); without
+    ///   it, the 512 largest (all of a vocabulary that small; past it, a token outside them has a
+    ///   probability no normal temperature leaves above ~`1 / vocab`);
+    /// - `top_p`: of those, by probability, the fewest whose total reaches `p`;
+    /// - the draw: the first kept token, largest first, whose running total of the kept
+    ///   probabilities passes a uniform `u` in `[0, 1)`, one a step from a generator seeded with
+    ///   `seed` on the host.
+    Sample {
+        temperature: f32,
+        top_k: Option<usize>,
+        top_p: Option<f32>,
+        seed: u64,
+    },
+}
+
+impl Sampler {
+    fn draws(&self) -> bool {
+        matches!(self, Sampler::Sample { .. })
+    }
+}
+
+/// `[1, 1]`: the token `sampler` chooses from `logits` (`[1, vocab]`), as Burn ops, so it runs on
+/// whichever backend `logits` lives on: on the card inside a trace, on burn-flex as its oracle.
+/// `u` (`[1, 1]`, in `[0, 1)`) is the draw, needed only by [`Sampler::Sample`].
+pub fn choose<B: Backend>(
+    logits: Tensor<B, 2>,
+    sampler: &Sampler,
+    u: Option<Tensor<B, 2>>,
+) -> Tensor<B, 2, Int> {
+    let Sampler::Sample {
+        temperature,
+        top_k,
+        top_p,
+        ..
+    } = *sampler
+    else {
+        return logits.argmax(1);
+    };
+    let vocab = logits.dims()[1];
+    let x = if temperature == 1.0 {
+        logits
+    } else {
+        logits.div_scalar(temperature)
+    };
+    let k = top_k
+        .unwrap_or(SORT_MAX / 2)
+        .clamp(1, vocab.min(SORT_MAX / 2));
+    let (sorted, order) = largest(x, k);
+    let mut probs = burn::tensor::activation::softmax(sorted, 1);
+    if let Some(p) = top_p {
+        // Keep an entry while the mass before it is under `p`: the fewest whose total reaches it,
+        // the first always.
+        let before = probs.clone().cumsum(1) - probs.clone();
+        let drop = before.greater_equal_elem(p);
+        probs = probs.mask_fill(drop, 0.0);
+        probs = probs.clone() / probs.sum_dim(1);
+    }
+    let u = u.expect("a draw for a sampled token");
+    let below = probs.cumsum(1).lower(u.expand([1, k]));
+    let at = below.int().sum_dim(1).clamp_max(k as i32 - 1);
+    order.gather(1, at)
+}
+
+/// The widest rows [`largest`] sorts, and so the most candidates a [`Sampler::Sample`] keeps: the
+/// longest axis the device sorts with indices (burn-tt's sort).
+pub const SORT_MAX: usize = 1024;
+
+/// The `k` largest of `x` (`[1, n]`, `k <= SORT_MAX / 2`), largest first, and their indices: rows
+/// of at most [`SORT_MAX`] each sorted, each row's `k` largest kept (the row's `k` largest are
+/// among them, and at most half of each row, so each round at least halves what is left), and
+/// those sorted again until one sort holds them all.
+fn largest<B: Backend>(x: Tensor<B, 2>, k: usize) -> (Tensor<B, 2>, Tensor<B, 2, Int>) {
+    let n = x.dims()[1];
+    let device = x.device();
+    if n <= SORT_MAX {
+        let (v, i) = x.sort_descending_with_indices(1);
+        return (v.slice([0..1, 0..k]), i.slice([0..1, 0..k]));
+    }
+    let rows = n.div_ceil(SORT_MAX);
+    let x = if rows * SORT_MAX > n {
+        let pad = Tensor::<B, 2>::full([1, rows * SORT_MAX - n], f32::NEG_INFINITY, &device);
+        Tensor::cat(vec![x, pad], 1)
+    } else {
+        x
+    };
+    let (v, i) = x.reshape([rows, SORT_MAX]).sort_descending_with_indices(1);
+    let (v, i) = (v.slice([0..rows, 0..k]), i.slice([0..rows, 0..k]));
+    // Each row's first index in `x`: fixed by the shape.
+    let first = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(
+            (0..rows).map(|r| (r * SORT_MAX) as i32).collect::<Vec<_>>(),
+            [rows, 1],
+        ),
+        &device,
+    );
+    let (v, i) = (v.reshape([1, rows * k]), (i + first).reshape([1, rows * k]));
+    let (v, at) = largest(v, k);
+    (v, i.gather(1, at))
+}
+
+/// The host's uniform draws in `[0, 1)` for [`Sampler::Sample`] (SplitMix64, 24 bits a draw).
+#[derive(Clone, Debug)]
+pub struct Draws(u64);
+
+impl Draws {
+    pub fn new(seed: u64) -> Self {
+        Draws(seed)
+    }
+
+    pub fn draw(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+/// The tokens a run of next-token choices on the card produced ([`TracedGenerator::generate_tokens`]).
+#[derive(Debug)]
+pub struct Tokens {
+    /// Wall time of each forward pass, the prompt's first, including reading its token back.
+    pub times: Vec<Duration>,
+    pub tokens: Vec<i32>,
 }
 
 pub(crate) fn read<B: Backend>(logits: Tensor<B, 2>) -> Vec<f32> {
@@ -402,6 +551,24 @@ fn input<B: TracedBackend, const D: usize>(t: &Tensor<B, D, Int>) -> TtTensor {
     t
 }
 
+/// A chunk's three inputs: its tokens, its first position and its last row.
+fn chunk_inputs(tokens: Vec<u32>, chunk: Chunk) -> Vec<InputPayload> {
+    vec![
+        InputPayload::Bits(tokens),
+        InputPayload::Bits(vec![chunk.start as u32]),
+        InputPayload::Bits(vec![chunk.n as u32 - 1]),
+    ]
+}
+
+fn token(out: Vec<OutputPayload>) -> Result<i32, GenerateError> {
+    match out.into_iter().next() {
+        Some(OutputPayload::Bits(v)) if !v.is_empty() => Ok(v[0] as i32),
+        other => Err(GenerateError::Refused(format!(
+            "a trace's token came back as {other:?}"
+        ))),
+    }
+}
+
 fn logits(out: Vec<OutputPayload>) -> Result<Vec<f32>, GenerateError> {
     match out.into_iter().next() {
         Some(OutputPayload::F32(v)) => Ok(v),
@@ -431,6 +598,8 @@ pub struct TracedGenerator<'m, M: FixedShapeDecoder<B>, B: TracedBackend = Tt> {
     sets: Vec<SharedStateTraces<Key>>,
     /// Which of `sets` holds the chunks.
     prefill: usize,
+    /// How each trace's second output, its next token, is chosen.
+    sampler: Sampler,
 }
 
 impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
@@ -438,7 +607,18 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
     /// cache on `device`. The cache's state must be F32: a packed one would be unpacked by each
     /// replay's write-back.
     pub fn new(model: &'m M, shapes: &Shapes, device: &TtDevice) -> Result<Self, GenerateError> {
-        Self::build(model, shapes, device, false)
+        Self::build(model, shapes, device, false, Sampler::Greedy)
+    }
+
+    /// [`Self::new`] choosing each next token on the card by `sampler`
+    /// ([`Self::generate_tokens`]); [`Self::new`] chooses greedily.
+    pub fn with_sampler(
+        model: &'m M,
+        shapes: &Shapes,
+        device: &TtDevice,
+        sampler: Sampler,
+    ) -> Result<Self, GenerateError> {
+        Self::build(model, shapes, device, false, sampler)
     }
 
     /// [`Self::new`] with the chunks capturing over a second cache that the step never reads: a
@@ -449,7 +629,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         shapes: &Shapes,
         device: &TtDevice,
     ) -> Result<Self, GenerateError> {
-        Self::build(model, shapes, device, true)
+        Self::build(model, shapes, device, true, Sampler::Greedy)
     }
 
     fn build(
@@ -457,6 +637,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         shapes: &Shapes,
         device: &TtDevice,
         private: bool,
+        sampler: Sampler,
     ) -> Result<Self, GenerateError> {
         let shapes = shapes.checked()?;
         let max_len = shapes.max_len;
@@ -497,6 +678,10 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             )?);
         }
 
+        // Each trace's outputs: its logits, then its greedy next token chosen on the card. A
+        // sampler draws on the card from the logits where the trace left them
+        // ([`Self::decode_token`]): its sort's programs, all held by a capture, would not fit the
+        // program cache beside a model's traces.
         let cache = &caches[0];
         for &len in &shapes.steps {
             let token = ids::<B>(&[0], device);
@@ -504,7 +689,11 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             let (tp, pp) = (input(&token), input(&position));
             sets[0].capture(Key::Step(len), &[&tp, &pp], || {
                 let (y, state) = model.step(token, position, len, cache);
-                (vec![float(y)], state.into_iter().map(float).collect())
+                let next = y.clone().argmax(1);
+                (
+                    vec![float(y), B::int_native(next.into_primitive())],
+                    state.into_iter().map(float).collect(),
+                )
             })?;
         }
 
@@ -517,7 +706,11 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             let (tp, sp, lp) = (input(&tokens), input(&start), input(&last));
             sets[prefill].capture(Key::Chunk(c), &[&tp, &sp, &lp], || {
                 let (y, state) = model.chunk(tokens, start, last, cache);
-                (vec![float(y)], state.into_iter().map(float).collect())
+                let next = y.clone().argmax(1);
+                (
+                    vec![float(y), B::int_native(next.into_primitive())],
+                    state.into_iter().map(float).collect(),
+                )
             })?;
         }
         Ok(Self {
@@ -526,6 +719,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             caches,
             sets,
             prefill,
+            sampler,
         })
     }
 
@@ -593,13 +787,106 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 .into_iter()
                 .map(|t| t as u32)
                 .collect();
-            out = Some(trace.run(vec![
-                InputPayload::Bits(tokens),
-                InputPayload::Bits(vec![chunk.start as u32]),
-                InputPayload::Bits(vec![chunk.n as u32 - 1]),
-            ])?);
+            out = Some(trace.run_outputs(chunk_inputs(tokens, chunk), &[0])?);
         }
-        logits(out.expect("a chunk"))
+        logits(out.expect("a chunk").outputs)
+    }
+
+    /// Replay `trace` with `inputs` and choose its next token on the card: greedy, its own
+    /// token output; a sampler, [`choose`] run on the card over its logits where it left them,
+    /// with the draw `u`. Only the token is read back.
+    fn pick(
+        &self,
+        trace: &burn_tt::TracedInference,
+        inputs: Vec<InputPayload>,
+        u: f32,
+    ) -> Result<i32, GenerateError> {
+        if !self.sampler.draws() {
+            return token(trace.run_outputs(inputs, &[1])?.outputs);
+        }
+        trace.run_outputs(inputs, &[])?;
+        let logits =
+            Tensor::<TtBackend, 2>::from_primitive(TensorPrimitive::Float(trace.output_tensor(0)?));
+        let device = logits.device();
+        let u = Tensor::<TtBackend, 2>::from_data(TensorData::new(vec![u], [1, 1]), &device);
+        let next = choose(logits, &self.sampler, Some(u));
+        Ok(next
+            .into_data()
+            .to_vec::<i32>()
+            .map_err(|e| GenerateError::Refused(format!("a sampled token came back as {e:?}")))?[0])
+    }
+
+    /// Feed `prompt` from position 0 and return the token the sampler chooses after its last,
+    /// on the card (`u` its draw): only the token is read back.
+    pub fn prefill_token(&self, prompt: &[i32], u: f32) -> Result<i32, GenerateError> {
+        check_request(prompt, 1, self.shapes.max_len)?;
+        let chunks = schedule(prompt.len(), &self.shapes.chunks);
+        let last = chunks.len() - 1;
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let trace = self.sets[self.prefill]
+                .get(Key::Chunk(chunk.c))
+                .expect("a trace for every bucket");
+            let tokens = padded(prompt, chunk)
+                .into_iter()
+                .map(|t| t as u32)
+                .collect();
+            if i == last {
+                return self.pick(trace, chunk_inputs(tokens, chunk), u);
+            }
+            trace.run_outputs(chunk_inputs(tokens, chunk), &[])?;
+        }
+        unreachable!("a prompt has a chunk")
+    }
+
+    /// One token at `position`: the next token the sampler chooses, on the card (`u` its draw),
+    /// from the step attending to the fewest positions that include it. Only the token is read
+    /// back.
+    pub fn decode_token(
+        &self,
+        token_in: i32,
+        position: usize,
+        u: f32,
+    ) -> Result<i32, GenerateError> {
+        if position >= self.shapes.max_len {
+            return Err(GenerateError::Capacity {
+                needed: position + 1,
+                max_len: self.shapes.max_len,
+            });
+        }
+        let len = self.shapes.step_len(position);
+        let trace = self.sets[0]
+            .get(Key::Step(len))
+            .ok_or_else(|| GenerateError::Refused(format!("no step attending to {len}")))?;
+        let fixed = vec![
+            InputPayload::Bits(vec![token_in as u32]),
+            InputPayload::Bits(vec![position as u32]),
+        ];
+        self.pick(trace, fixed, u)
+    }
+
+    /// `steps` tokens after `prompt`, each chosen on the card by the generator's sampler, only
+    /// the tokens read back: the greedy ones are [`Self::generate`]'s.
+    pub fn generate_tokens(&self, prompt: &[i32], steps: usize) -> Result<Tokens, GenerateError> {
+        check_request(prompt, steps, self.shapes.max_len)?;
+        let mut draws = match self.sampler {
+            Sampler::Sample { seed, .. } => Draws::new(seed),
+            Sampler::Greedy => Draws::new(0),
+        };
+        let mut out = Tokens {
+            times: Vec::with_capacity(steps),
+            tokens: Vec::with_capacity(steps),
+        };
+        let t0 = Instant::now();
+        let mut next = self.prefill_token(prompt, draws.draw())?;
+        out.times.push(t0.elapsed());
+        out.tokens.push(next);
+        for step in 1..steps {
+            let t0 = Instant::now();
+            next = self.decode_token(next, prompt.len() + step - 1, draws.draw())?;
+            out.times.push(t0.elapsed());
+            out.tokens.push(next);
+        }
+        Ok(out)
     }
 
     /// One token at `position` (every earlier position already fed): the logits after it, from
@@ -627,10 +914,11 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         let trace = self.sets[0]
             .get(Key::Step(len))
             .ok_or_else(|| GenerateError::Refused(format!("no step attending to {len}")))?;
-        logits(trace.run(vec![
+        let fixed = vec![
             InputPayload::Bits(vec![token as u32]),
             InputPayload::Bits(vec![position as u32]),
-        ])?)
+        ];
+        logits(trace.run_outputs(fixed, &[0])?.outputs)
     }
 
     /// Greedy decoding: `steps` tokens after `prompt`, as [`generate_fixed`] with the same chunk

@@ -1255,6 +1255,37 @@ fn probing_skip_a() -> bool {
     PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the stream fully ahead of the
+/// products): a product with a packed `A` gathers nothing, so it reads no `B` (its `GATHER` reads
+/// only `B`, [`record::GATHER_A_RESIDENT`]), and the session prefetches nothing. What is left of a
+/// step is its products' compute, control and barriers and the small ops: the step with its weight
+/// stream made free. **The products are wrong**; only their time means anything.
+static PROBE_SKIP_WEIGHTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_WEIGHTS`] on or off, process-wide. Dev-facing: a timing bound, never a result.
+#[doc(hidden)]
+pub fn probe_skip_weight_reads(on: bool) {
+    PROBE_SKIP_WEIGHTS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn probing_skip_weights() -> bool {
+    PROBE_SKIP_WEIGHTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A gather list with its `B`-only `GATHER` left out under [`PROBE_SKIP_WEIGHTS`] (only where `A`
+/// is packed, so the record reads nothing else); a `WAIT` stands in where nothing is left.
+fn probe_gather(mut gather: Vec<[u32; 8]>, record: [[u32; 8]; 5], packed_a: bool) -> Vec<[u32; 8]> {
+    if packed_a && probing_skip_weights() {
+        if gather.is_empty() {
+            gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+        }
+    } else {
+        gather.extend(record);
+    }
+    gather
+}
+
 /// How a GDDR matmul reads `A` ([`matmul_dram_limited`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Reads {
@@ -1402,6 +1433,7 @@ pub(crate) fn matmul_dram_limited(
         reads,
         &[],
         units,
+        &[],
     )
     .map(|(work, _)| work)
 }
@@ -1410,6 +1442,14 @@ pub(crate) fn matmul_dram_limited(
 /// trace stream ahead of the wait that orders the unit after the ops before the product
 /// ([`BlockPlan::push_prefetched_jobs`]).
 pub const PREFETCH: &str = "weight prefetch";
+
+/// What a list that reads a product's `B` ahead on a unit that runs the ops before the product
+/// is called (`docs/plans/decode-to-bandwidth.md` Phase 8): its `GATHER` carries
+/// [`record::GATHER_PREFETCH`], so the ops' own drains leave its reads in flight, and the job's
+/// gather list ends with the `WAIT` that drains them. The capture moves it back in the unit's
+/// stream to just after the last weight-streaming product; the capture's own run, and any run
+/// that is not captured, read it where the job is.
+pub const BUSY_PREFETCH: &str = "busy weight prefetch";
 
 /// [`matmul_dram_limited`], with `prefetch` (units at or past `units`, below `spread`) each
 /// taking one job of the product whose `B` its own list reads ahead ([`PREFETCH`],
@@ -1432,6 +1472,7 @@ pub(crate) fn matmul_dram_prefetching(
     reads: Reads,
     prefetch: &[usize],
     spread: usize,
+    busy: &[Option<u64>],
 ) -> Result<(Work, Option<usize>)> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -1513,6 +1554,7 @@ pub(crate) fn matmul_dram_prefetching(
             && mt == 1
             && staging == Staging::Slots
             && kc < kt,
+        busy: busy.to_vec(),
     };
     let prefetching = !prefetch.is_empty()
         && plan.packed_a.is_some()
@@ -1578,6 +1620,10 @@ struct BlockPlan {
     /// one tile row, [`Staging::Slots`], and a `K` too long for one block (its chunks no longer
     /// than `k_block`) only.
     stream_k: bool,
+    /// Per unit of a capture, the highest `DATA` address the ops it ran since the last
+    /// weight-streaming product planned, where all are known: the unit's first job reads its `B`
+    /// ahead ([`BUSY_PREFETCH`]) if `B`'s ring lies above it. Empty: none does.
+    busy: Vec<Option<u64>>,
 }
 
 /// A one-tile-row product's output columns, one run a job, in the order a
@@ -1654,7 +1700,13 @@ impl BlockPlan {
                 // are every `units`-th: they alternate halves by `j / units`.
                 let half = (staging == Staging::SlotsHalf)
                     .then(|| ((jobs.len() / units.max(1)) % 2) as u8);
-                let layout = match matmul::plan_layout_in(tiles, in_fmt, staging) {
+                let planned = match self.packed_a {
+                    Some(_) => {
+                        matmul::plan_layout_packed_a(tiles, in_fmt, staging, packed_a_slots(kt))
+                    }
+                    None => matmul::plan_layout_in(tiles, in_fmt, staging),
+                };
+                let layout = match planned {
                     Ok(l) if half == Some(1) => l.shifted(matmul::HALF),
                     Ok(l) => l,
                     Err(e) => return Err(e.into()),
@@ -1695,22 +1747,26 @@ impl BlockPlan {
                 if let (Some(pa), false) = (self.packed_a, resident) {
                     gather.extend(packed_a_reads(pa, 0, kt, a_at));
                 }
-                gather.extend([
+                let gather = probe_gather(
+                    gather,
                     [
-                        record::GATHER,
-                        flags,
-                        a_at as u32,
-                        b_at as u32,
-                        i0 as u32,
-                        rows as u32,
-                        j0 as u32,
-                        cols as u32,
+                        [
+                            record::GATHER,
+                            flags,
+                            a_at as u32,
+                            b_at as u32,
+                            i0 as u32,
+                            rows as u32,
+                            j0 as u32,
+                            cols as u32,
+                        ],
+                        ra.encode()[0],
+                        ra.encode()[1],
+                        rb.encode()[0],
+                        rb.encode()[1],
                     ],
-                    ra.encode()[0],
-                    ra.encode()[1],
-                    rb.encode()[0],
-                    rb.encode()[1],
-                ]);
+                    self.packed_a.is_some(),
+                );
                 let outputs = match self.packed_a {
                     Some(_) => matmul::packed_a_pairs(&outputs, a_at, 0),
                     None => outputs,
@@ -1758,7 +1814,39 @@ impl BlockPlan {
                     rc.encode()[0],
                     rc.encode()[1],
                 ];
-                jobs.push(vec![
+                // A unit's first job reads its `B` ahead if the ops it ran since the last
+                // weight-streaming product all planned below `B`'s ring, and the record reads
+                // plainly (a prefetch may not transpose).
+                let ahead = self.packed_a.is_some()
+                    && staging == Staging::Slots
+                    && jobs.len() < units
+                    && (!b_transposed || unpack_b)
+                    && self
+                        .busy
+                        .get(unit)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|top| b_at >= top);
+                let (mut gather, mut job) = (gather, Vec::new());
+                if ahead && gather.len() >= 5 && gather[gather.len() - 5][0] == record::GATHER {
+                    let mut early = gather.split_off(gather.len() - 5);
+                    early[0][1] |= record::GATHER_PREFETCH;
+                    gather.push([
+                        tt_isa::dm::op::WAIT,
+                        tt_isa::dm::WAIT_PREFETCH,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]);
+                    job.push(Step::List {
+                        what: BUSY_PREFETCH,
+                        entries: early,
+                    });
+                }
+                job.extend([
                     Step::List {
                         what: "matmul gather",
                         entries: gather,
@@ -1775,6 +1863,7 @@ impl BlockPlan {
                         entries: scatter.to_vec(),
                     },
                 ]);
+                jobs.push(job);
             }
         }
         Ok(())
@@ -1874,6 +1963,7 @@ impl BlockPlan {
                 units: 1,
                 col_runs: Some(std::iter::once(j0..(j0 + nc).min(moved)).collect()),
                 resident_a: false,
+                busy: Vec::new(),
                 ..self.clone()
             };
             let mut one = Vec::new();
@@ -2003,22 +2093,26 @@ impl BlockPlan {
                     } else {
                         0
                     };
-                gather.extend([
+                let gather = probe_gather(
+                    gather,
                     [
-                        record::GATHER,
-                        flags,
-                        chunk.a_at as u32,
-                        chunk.b_at as u32,
-                        0,
-                        1,
-                        j as u32,
-                        1,
+                        [
+                            record::GATHER,
+                            flags,
+                            chunk.a_at as u32,
+                            chunk.b_at as u32,
+                            0,
+                            1,
+                            j as u32,
+                            1,
+                        ],
+                        ra.encode()[0],
+                        ra.encode()[1],
+                        br.encode()[0],
+                        br.encode()[1],
                     ],
-                    ra.encode()[0],
-                    ra.encode()[1],
-                    br.encode()[0],
-                    br.encode()[1],
-                ]);
+                    true,
+                );
                 // The programs name this chunk's `K` range in the packed `A`, its half and the
                 // layout `A`'s slots fix.
                 let variant = 0x1_0000 | (packed_a_slots(kt) as u32) << 8 | c as u32;
@@ -2155,26 +2249,30 @@ impl BlockPlan {
                         } else {
                             0
                         };
-                    let mut gather = match self.packed_a {
+                    let gather = match self.packed_a {
                         Some(pa) => packed_a_reads(pa, k0, count, layout.a_at),
                         None => Vec::new(),
                     };
-                    gather.extend([
+                    let mut gather = probe_gather(
+                        gather,
                         [
-                            record::GATHER,
-                            flags,
-                            layout.a_at as u32,
-                            layout.b_at as u32,
-                            i as u32,
-                            1,
-                            j as u32,
-                            1,
+                            [
+                                record::GATHER,
+                                flags,
+                                layout.a_at as u32,
+                                layout.b_at as u32,
+                                i as u32,
+                                1,
+                                j as u32,
+                                1,
+                            ],
+                            ar.encode()[0],
+                            ar.encode()[1],
+                            br.encode()[0],
+                            br.encode()[1],
                         ],
-                        ar.encode()[0],
-                        ar.encode()[1],
-                        br.encode()[0],
-                        br.encode()[1],
-                    ]);
+                        self.packed_a.is_some(),
+                    );
                     let layout = match self.packed_a {
                         Some(_) => matmul::Layout {
                             outputs: matmul::packed_a_pairs(&layout.outputs, layout.a_at, k0),
@@ -2316,7 +2414,12 @@ fn padded_block_ref(
 /// kept. Refused unless the block starts on a tile and, where it does not end
 /// on one, ends at the tensor's own edge -- a ragged edge inside the tensor
 /// would read its neighbour's elements as padding.
-fn block_ref(t: &DramTensor, at: [usize; 2], extent: [usize; 2], what: &str) -> Result<TensorRef> {
+pub(crate) fn block_ref(
+    t: &DramTensor,
+    at: [usize; 2],
+    extent: [usize; 2],
+    what: &str,
+) -> Result<TensorRef> {
     let ([r0, c0], [r, c]) = (at, extent);
     if !block_fits(t, at, extent) {
         return Err(TensorError::Shape(format!(
@@ -2454,6 +2557,7 @@ pub(crate) fn matmul_dram_batched_limited(
         unpack_b: unpack_b && route == SrcRoute::Tf32FromFp32,
         packed_a: None,
         stream_k: false,
+        busy: Vec::new(),
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -3328,7 +3432,26 @@ fn sfpu_programs(
         rows,
     );
     let memo = MEMO.get_or_init(Default::default);
+    // The highest `DATA` address the layout reaches, noted on every hit as a plan notes it on a
+    // miss (`crate::l1::note_planned_top`): its last region's slots, `B`'s one where held once.
+    let note_top = |l: &crate::sfpu::kernel::Layout| {
+        let slots = |at: u64| at + l.tiles as u64 * TILE_SLOT;
+        let b = l
+            .b_at
+            .map(|b| if l.b_once { b + TILE_SLOT } else { slots(b) });
+        let top = [
+            Some(slots(l.a_at)),
+            b,
+            l.c_at.map(slots),
+            Some(slots(l.out_at)),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        crate::l1::note_planned_top(top.unwrap_or(0));
+    };
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        note_top(&p.0);
         return Ok(p.clone());
     }
     let layout = match half {
@@ -3340,6 +3463,7 @@ fn sfpu_programs(
     let (_, math) = crate::sfpu::ops::code_for_rows(op.kind, [op.scalar, op.scalar2], bcast, rows)
         .expect("checked by the caller");
     let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
+    note_top(&layout);
     let p = (layout, Arc::new(roles), Arc::new(loops));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -3652,6 +3776,504 @@ pub fn sfpu_rms_packed(
         },
     ]];
     Ok(Work { out, jobs })
+}
+
+/// One semaphore initialisation for every kernel of `job`, where their plans agree on each
+/// semaphore's starting value (the matmul's, SFPU's and reduction's do: theirs number from zero in
+/// the same order). A kernel leaves every semaphore as it found it, those it never takes
+/// included, so the union is each one's own. Consecutive blocks join one ownership region only
+/// with equal initialisations: one region a job, not one a kernel (~3.5 us each). Where two
+/// disagree, `job` is left as it is.
+pub(crate) fn share_semaphore_init(job: &mut Job) {
+    let mut all: Vec<crate::runtime::SemaphoreInit> = Vec::new();
+    for step in job.iter() {
+        if let Step::Kernel { init, .. } = step {
+            for &(sem, value, max) in init {
+                match all.iter().find(|(s, _, _)| *s == sem) {
+                    Some(&(_, v, m)) if (v, m) != (value, max) => return,
+                    Some(_) => {}
+                    None => all.push((sem, value, max)),
+                }
+            }
+        }
+    }
+    all.sort_by_key(|(s, _, _)| s.index());
+    for step in job.iter_mut() {
+        if let Step::Kernel { init, .. } = step {
+            *init = all.clone();
+        }
+    }
+}
+
+/// `a / sqrt(mean(a a) + eps)` for a decode row `a` (`[1, K]`) whose packed row (`[K / 32, 32]`,
+/// [`pack_row`]) is `packed`: RMSNorm up to its scale, as one op. Each job takes a run of `a`'s
+/// tiles and computes the statistic itself from `packed` ([`sfpu_rms_packed`]'s kernel), then
+/// divides its tiles by it (`kind_sfpu::DIV`, the column broadcast, one row): bit for bit the
+/// statistic op and the `DIV` after it, with no barrier between them and no unit waiting on one
+/// that computed the statistic alone. `twin`, if given, receives the result's packed row.
+pub fn rms_divide(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    packed: &DramTensor,
+    eps: f32,
+    units: usize,
+    twin: Option<&DramTensor>,
+) -> Result<Work> {
+    use crate::sfpu::kernel::{self as sk, Operands};
+    use crate::sfpu::ops::{code_for_rows, kind_sfpu, Broadcast};
+    use crate::sfpu::{norm, reduce};
+    a.expect("an RMS division", Elem::F32)?;
+    packed.expect("a packed RMS statistic", Elem::F32)?;
+    let cols = a.cols;
+    if a.rows != 1 || cols % 32 != 0 || (packed.rows, packed.cols) != (cols / 32, 32) {
+        return Err(TensorError::Shape(format!(
+            "an RMS division of [{}, {cols}] by the packed row [{}, {}]",
+            a.rows, packed.rows, packed.cols
+        )));
+    }
+    let [pt, _] = packed.grid();
+    let ct = a.grid()[1];
+    let div = Eltwise {
+        kind: kind_sfpu::DIV,
+        scalar: 0.0,
+        scalar2: 0.0,
+    };
+    // A run's slots: the packed row, the statistic, its tiles of `a` and of the result.
+    let by_slots = ((tt_isa::l1::DATA.len() / TILE_SLOT) as usize).saturating_sub(pt + 1) / 2;
+    let group = sfpu_group(div, Broadcast::Col, Operands::ColBroadcast, false).min(by_slots);
+    if group == 0 {
+        return Err(TensorError::Shape(format!(
+            "an RMS division's packed row of {pt} tiles leaves no slots"
+        )));
+    }
+    let stat_layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let stat_layout = reduce::Layout {
+        in_at: tt_isa::l1::DATA.base,
+        out_at: tt_isa::l1::DATA.base + pt as u64 * TILE_SLOT,
+        ..stat_layout
+    };
+    let a_at = stat_layout.out_at + TILE_SLOT;
+    let (squares, fin) = norm::math_packed(cols, eps);
+    let stat_roles = Arc::new(reduce::roles(&stat_layout, &squares, &fin));
+    let (_, code) = code_for_rows(
+        div.kind,
+        [0.0, 0.0],
+        Broadcast::Col,
+        eltwise_rows(div.kind, 1),
+    )
+    .ok_or_else(|| TensorError::Shape("no column-broadcast DIV program".into()))?;
+    let out = DramTensor::alloc(alloc, 1, cols)?;
+    let (rp, ra, ro) = (packed.tensor_ref(), a.tensor_ref(), out.tensor_ref());
+    let mut jobs = Vec::new();
+    for run in runs(ct, units, group) {
+        let len = run.len();
+        let planned = sk::plan_layout(len, Operands::ColBroadcast)
+            .map_err(|e| TensorError::Shape(e.to_string()))?;
+        let layout = sk::Layout {
+            tiles: len,
+            a_at,
+            b_at: Some(stat_layout.out_at),
+            b_once: true,
+            c_at: None,
+            out_at: a_at + len as u64 * TILE_SLOT,
+            sems: planned.sems,
+            init: planned.init,
+        };
+        crate::l1::note_planned_top(layout.out_at + len as u64 * TILE_SLOT);
+        let (roles, loops) = sk::roles_code(&layout, Operands::ColBroadcast, &code);
+        let read = |x: &TensorRef, start: usize, n: usize, at: u64, grid_ct: usize| {
+            [
+                [
+                    record::READ_RUN,
+                    start as u32,
+                    n as u32,
+                    at as u32,
+                    0,
+                    grid_ct as u32,
+                    0,
+                    0,
+                ],
+                x.encode()[0],
+                x.encode()[1],
+            ]
+        };
+        let mut gather = read(&rp, 0, pt, stat_layout.in_at, 1).to_vec();
+        gather.extend(read(&ra, run.start, len, a_at, ct));
+        let mut scatter = vec![
+            [
+                record::WRITE_RUN,
+                run.start as u32,
+                len as u32,
+                layout.out_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        if let Some(twin) = twin {
+            scatter.extend(packed_twin_writes(twin, run.start, len, layout.out_at));
+        }
+        jobs.push(vec![
+            Step::List {
+                what: "rms divide gather",
+                entries: gather,
+            },
+            Step::Kernel {
+                roles: stat_roles.clone(),
+                init: stat_layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Default::default(),
+                half: None,
+            },
+            Step::List {
+                what: "rms divide statistic",
+                entries: Vec::new(),
+            },
+            Step::List {
+                what: "rms divide",
+                entries: Vec::new(),
+            },
+            Step::Kernel {
+                roles: Arc::new(roles),
+                init: layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Arc::new(loops),
+                half: None,
+            },
+            Step::List {
+                what: "rms divide scatter",
+                entries: scatter,
+            },
+        ]);
+        share_semaphore_init(jobs.last_mut().expect("just pushed"));
+    }
+    Ok(Work { out, jobs })
+}
+
+/// Rotary position embedding in the rotate-half layout, as one op: `x cos + rotate(x) sin` over
+/// the `[rows, cols]` block `x`, whose columns are heads of `head` columns each, `cos` and `sin`
+/// laid out as `x` is (each head's table row), `sin` carrying `rotate_half`'s sign. `rotate(x)`
+/// is each head's halves swapped, read as `x`'s own tiles at the swapped place: no copy. Each job
+/// is two kernels on its run of tiles, `MUL` then `MUL_ADD` (`c + a b`, two roundings): bit for
+/// bit the product, the product and the sum. `head / 2` must be whole tiles.
+pub fn rope_blocks(
+    alloc: &mut DramAlloc,
+    x: BlockOperand<'_>,
+    cos: BlockOperand<'_>,
+    sin: BlockOperand<'_>,
+    head: usize,
+    units: usize,
+) -> Result<Work> {
+    use crate::sfpu::kernel::{self as sk, Operands};
+    use crate::sfpu::ops::{code_for_rows, kind_sfpu, Broadcast};
+    let [rows, cols] = x.dims;
+    if head == 0 || head % 64 != 0 || cols % head != 0 || [cos.dims, sin.dims] != [x.dims; 2] {
+        return Err(TensorError::Shape(format!(
+            "RoPE over [{rows}, {cols}] in heads of {head}: halves of whole tiles, tables of x's \
+             shape"
+        )));
+    }
+    for t in [x.tensor, cos.tensor, sin.tensor] {
+        t.expect("RoPE", Elem::F32)?;
+    }
+    let what = "a RoPE operand";
+    let (rx, rc, rs) = (
+        x.tensor_ref(what)?,
+        cos.tensor_ref(what)?,
+        sin.tensor_ref(what)?,
+    );
+    let shape = x.shape_only();
+    let [rt, ct] = shape.grid();
+    let (dt, half) = (head / 32, head / 64);
+    let live = eltwise_rows(kind_sfpu::MUL_ADD, rows);
+    let (_, mul) = code_for_rows(crate::kind::MUL, [0.0, 0.0], Broadcast::None, live)
+        .ok_or_else(|| TensorError::Shape("no MUL program".into()))?;
+    let (_, mul_add) = code_for_rows(kind_sfpu::MUL_ADD, [0.0, 0.0], Broadcast::None, live)
+        .ok_or_else(|| TensorError::Shape("no MUL_ADD program".into()))?;
+    // A run's slots: `x`, `cos`, `rotate(x)`, `sin`, the product and the result.
+    let group = (((tt_isa::l1::DATA.len() / TILE_SLOT) as usize) / 6).min(64);
+    let out = DramTensor::alloc(alloc, rows, cols)?;
+    let ro = out.tensor_ref();
+    let mut jobs = Vec::new();
+    for run in runs(rt * ct, units, group) {
+        let len = run.len();
+        let slots = len as u64 * TILE_SLOT;
+        let base = tt_isa::l1::DATA.base;
+        let [x_at, c_at, r_at, s_at, p_at, o_at] = std::array::from_fn(|k| base + k as u64 * slots);
+        crate::l1::note_planned_top(o_at + slots);
+        let planned = |operands| {
+            sk::plan_layout(len, operands).map_err(|e| TensorError::Shape(e.to_string()))
+        };
+        let (pb, pt) = (planned(Operands::Binary)?, planned(Operands::Ternary)?);
+        let product = sk::Layout {
+            tiles: len,
+            a_at: x_at,
+            b_at: Some(c_at),
+            b_once: false,
+            c_at: None,
+            out_at: p_at,
+            sems: pb.sems,
+            init: pb.init,
+        };
+        let sum = sk::Layout {
+            tiles: len,
+            a_at: r_at,
+            b_at: Some(s_at),
+            b_once: false,
+            c_at: Some(p_at),
+            out_at: o_at,
+            sems: pt.sems,
+            init: pt.init,
+        };
+        let (product_roles, product_loops) = sk::roles_code(&product, Operands::Binary, &mul);
+        let (sum_roles, sum_loops) = sk::roles_code(&sum, Operands::Ternary, &mul_add);
+        let read_run = |r: &TensorRef, at: u64| {
+            [
+                [
+                    record::READ_RUN,
+                    run.start as u32,
+                    len as u32,
+                    at as u32,
+                    0,
+                    ct as u32,
+                    0,
+                    0,
+                ],
+                r.encode()[0],
+                r.encode()[1],
+            ]
+        };
+        let mut gather = read_run(&rx, x_at).to_vec();
+        gather.extend(read_run(&rc, c_at));
+        gather.extend(read_run(&rs, s_at));
+        // `rotate(x)`'s tile `n` is `x`'s tile across the head's halves.
+        for n in 0..len {
+            let t = run.start + n;
+            let (i, j) = (t / ct, t % ct);
+            let (h, k) = (j / dt, j % dt);
+            let src = x
+                .tensor
+                .tile(x.at[0] / 32 + i, x.at[1] / 32 + h * dt + (k + half) % dt);
+            gather.push([
+                tt_isa::dm::op::READ,
+                src.channel().index() as u32,
+                (n % tt_isa::dram::PORTS as usize) as u32,
+                src.offset() as u32,
+                (r_at + n as u64 * TILE_SLOT) as u32,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ]);
+        }
+        let scatter = [
+            [
+                record::WRITE_RUN,
+                run.start as u32,
+                len as u32,
+                o_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        let kernel = |roles, loops, init| Step::Kernel {
+            roles: Arc::new(roles),
+            init,
+            mop: Box::new([None; 3]),
+            loops: Arc::new(loops),
+            half: None,
+        };
+        let mut job = vec![
+            Step::List {
+                what: "rope gather",
+                entries: gather,
+            },
+            kernel(product_roles, product_loops, product.init),
+            Step::List {
+                what: "rope product",
+                entries: Vec::new(),
+            },
+            Step::List {
+                what: "rope sum",
+                entries: Vec::new(),
+            },
+            kernel(sum_roles, sum_loops, sum.init),
+            Step::List {
+                what: "rope scatter",
+                entries: scatter.to_vec(),
+            },
+        ];
+        share_semaphore_init(&mut job);
+        jobs.push(job);
+    }
+    Ok(Work { out, jobs })
+}
+
+/// Most tiles of a row one partial of [`argmax_partials`] reads: its programs are a tile's each.
+pub const ARGMAX_RUN_MAX: usize = 32;
+
+/// Phase 1 of a row's argmax ([`crate::sfpu::select`]): the `[1, cols]` F32 row `a` dealt in runs
+/// of tiles over `units`, each run's best key and index in a tile of the `[1, 32 runs]` result.
+/// Also each run's first column, which [`argmax_choose`] adds to its index.
+pub fn argmax_partials(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    units: usize,
+) -> Result<(Work, Vec<usize>)> {
+    use crate::sfpu::{reduce, select};
+    a.expect("an argmax", Elem::F32)?;
+    if a.rows != 1 || a.cols == 0 {
+        return Err(TensorError::Shape(format!(
+            "an argmax of [{}, {}]: one row",
+            a.rows, a.cols
+        )));
+    }
+    let ct = a.grid()[1];
+    let all = runs(ct, units, ARGMAX_RUN_MAX);
+    let out = DramTensor::alloc(alloc, 1, 32 * all.len())?;
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    let mut jobs = Vec::with_capacity(all.len());
+    let mut starts = Vec::with_capacity(all.len());
+    let body = select::accumulate(a.cols - 1);
+    let fold = select::fold();
+    for (j, run) in all.into_iter().enumerate() {
+        let len = run.len();
+        let layout = match reduce::plan_layout(1, len) {
+            Ok(l) => l,
+            Err(e) => {
+                alloc.free(&out.placement);
+                return Err(TensorError::Shape(e.to_string()));
+            }
+        };
+        let (roles, loops) = select::roles(
+            &layout,
+            len,
+            &select::prologue(32 * run.start),
+            &body,
+            &fold,
+        );
+        let (roles, loops) = (Arc::new(roles), Arc::new(loops));
+        starts.push(32 * run.start);
+        let gather = [
+            [
+                record::READ_RUN,
+                run.start as u32,
+                len as u32,
+                layout.in_at as u32,
+                0,
+                ct as u32,
+                0,
+                0,
+            ],
+            ra.encode()[0],
+            ra.encode()[1],
+        ];
+        let scatter = [
+            [
+                record::WRITE_RUN,
+                j as u32,
+                1,
+                layout.out_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        jobs.push(vec![
+            Step::List {
+                what: "argmax gather",
+                entries: gather.to_vec(),
+            },
+            Step::Kernel {
+                roles,
+                init: layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops,
+                half: None,
+            },
+            Step::List {
+                what: "argmax scatter",
+                entries: scatter.to_vec(),
+            },
+        ]);
+    }
+    Ok((Work { out, jobs }, starts))
+}
+
+/// Phase 2 of a row's argmax: one job over [`argmax_partials`]' tiles, in order, each index moved
+/// by its run's first column (`starts`); the chosen index as an I32 `[1, 1]`.
+pub fn argmax_choose(
+    alloc: &mut DramAlloc,
+    partials: &DramTensor,
+    starts: &[usize],
+) -> Result<Work> {
+    use crate::sfpu::{reduce, select};
+    let pt = partials.grid()[1];
+    if pt != starts.len() || partials.rows != 1 {
+        return Err(TensorError::Shape(format!(
+            "an argmax's {pt} partials for {} runs",
+            starts.len()
+        )));
+    }
+    let layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (roles, loops) = select::roles(
+        &layout,
+        pt,
+        &select::choice_prologue(),
+        &select::combine(),
+        &select::index_out(),
+    );
+    let (roles, loops) = (Arc::new(roles), Arc::new(loops));
+    let out = DramTensor::alloc_elem(alloc, 1, 1, Elem::I32)?;
+    let (rp, ro) = (partials.tensor_ref(), out.tensor_ref());
+    let gather = [
+        [
+            record::READ_RUN,
+            0,
+            pt as u32,
+            layout.in_at as u32,
+            0,
+            pt as u32,
+            0,
+            0,
+        ],
+        rp.encode()[0],
+        rp.encode()[1],
+    ];
+    let scatter = [
+        [record::WRITE_RUN, 0, 1, layout.out_at as u32, 0, 0, 0, 0],
+        ro.encode()[0],
+        ro.encode()[1],
+    ];
+    Ok(Work {
+        out,
+        jobs: vec![vec![
+            Step::List {
+                what: "argmax choice gather",
+                entries: gather.to_vec(),
+            },
+            Step::Kernel {
+                roles,
+                init: layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops,
+                half: None,
+            },
+            Step::List {
+                what: "argmax choice scatter",
+                entries: scatter.to_vec(),
+            },
+        ]],
+    })
 }
 
 /// Inclusive scan down matrix rows. Each column tile is a job, so its
@@ -5681,6 +6303,89 @@ mod tests {
     /// (at least [`super::MIN_STREAM_CHUNKS`]) in alternating halves, every chunk's gather reading
     /// only `B` (its `K` range: each `B` tile once) but a unit's first, which reads the packed
     /// `A`; and only each column's last chunk writes.
+    #[test]
+    fn a_units_first_job_reads_its_b_ahead_where_the_ops_before_plan_below_it() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        use tt_isa::dm::{op, TILE_SLOT, WAIT_PREFETCH};
+        let units = 8;
+        let (k, n) = (2048, 1024);
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+        let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+        let bt = DramTensor::alloc(&mut alloc, n, k).unwrap();
+        let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+        let mut jobs = |busy: &[Option<u64>], b_transposed: bool| {
+            super::matmul_dram_prefetching(
+                &mut alloc,
+                &a,
+                false,
+                if b_transposed { &bt } else { &b },
+                b_transposed,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                None,
+                super::Reads {
+                    thin: true,
+                    resident_a: true,
+                    unpack_b: false,
+                    packed_a: Some(p.tensor_ref()),
+                    stream_k: false,
+                },
+                &[],
+                units,
+                busy,
+            )
+            .unwrap()
+            .0
+            .jobs
+        };
+        let ahead =
+            |job: &Job| matches!(&job[0], Step::List { what, .. } if *what == super::BUSY_PREFETCH);
+        let data = tt_isa::l1::DATA;
+        // Every unit free below the arena's top: each unit's first job, and only it, reads ahead.
+        let all = jobs(&vec![Some(data.base); units], false);
+        assert!(all.len() > units, "more than a job a unit");
+        for (j, job) in all.iter().enumerate() {
+            assert_eq!(ahead(job), j < units, "job {j}");
+            if j >= units {
+                continue;
+            }
+            let (
+                Step::List { entries: early, .. },
+                Step::List {
+                    entries: gather, ..
+                },
+            ) = (&job[0], &job[1])
+            else {
+                unreachable!("two lists first")
+            };
+            assert_eq!(early.len(), 5, "the GATHER and its operands");
+            assert_eq!(early[0][0], record::GATHER);
+            assert_ne!(early[0][1] & record::GATHER_PREFETCH, 0, "flagged");
+            assert_eq!(gather.last().unwrap()[..2], [op::WAIT, WAIT_PREFETCH]);
+            assert!(gather.iter().all(|e| e[0] != record::GATHER));
+            // `B`'s ring ends at the arena's end.
+            let [kt, cols] = [k as u64 / 32, early[0][7] as u64];
+            assert_eq!(early[0][3] as u64 + kt * cols * TILE_SLOT, data.end);
+        }
+        // Where an op before planned up into `B`'s ring, or is not known, or `B` is read
+        // transposed by the mover: no unit reads ahead.
+        let mut some = vec![Some(data.end); units];
+        some[3] = Some(data.base);
+        some[5] = None;
+        let mixed = jobs(&some, false);
+        for (j, job) in mixed.iter().enumerate() {
+            assert_eq!(ahead(job), j == 3, "job {j}");
+        }
+        assert!(jobs(&vec![Some(data.base); units], true)
+            .iter()
+            .all(|j| !ahead(j)));
+        assert!(jobs(&[], false).iter().all(|j| !ahead(j)));
+    }
+
     #[test]
     fn a_streamed_column_reads_its_k_in_chunks() {
         use crate::matmul::{Fidelity, SrcRoute};

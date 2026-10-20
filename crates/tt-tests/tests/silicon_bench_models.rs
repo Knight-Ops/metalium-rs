@@ -986,6 +986,13 @@ fn median(v: &[f64]) -> f64 {
     v[v.len() / 2]
 }
 
+/// The median of `times`, in ms.
+fn median_ms(times: &[std::time::Duration]) -> f64 {
+    let mut d: Vec<f64> = times.iter().map(|t| t.as_secs_f64() * 1e3).collect();
+    d.sort_by(f64::total_cmp);
+    d[d.len() / 2]
+}
+
 /// The median decode step of `g`, in ms.
 fn decode_ms(g: &tt_models::generate::Generation) -> f64 {
     let mut d: Vec<f64> = g.times[1..].iter().map(|t| t.as_secs_f64() * 1e3).collect();
@@ -1128,19 +1135,18 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
         }
         for len in GEN_PROMPTS {
             let p = prompt(len);
+            // Timed: each token chosen on the card, only the token read back
+            // (`TracedGenerator::generate_tokens`); the logits path's tokens are the check.
+            let want = g.generate(&p, new).unwrap().tokens;
             let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
-            let mut tokens = None;
             for i in 0..WARMUPS + SAMPLES {
                 let t0 = Instant::now();
-                let out = g.generate(&p, new).unwrap();
+                let out = g.generate_tokens(&p, new).unwrap();
                 let all = t0.elapsed();
-                match &tokens {
-                    None => tokens = Some(out.tokens.clone()),
-                    Some(t) => assert_eq!(&out.tokens, t, "a run's tokens"),
-                }
+                assert_eq!(out.tokens, want, "a run's tokens, against the logits path");
                 if i >= WARMUPS {
                     first.push(ms(out.times[0]));
-                    step.push(decode_ms(&out));
+                    step.push(median_ms(&out.times[1..]));
                     total.push(ms(all));
                 }
             }
@@ -1185,4 +1191,88 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
             );
         }
     }
+}
+
+/// The Phase 8 feasibility probe (`docs/plans/decode-to-bandwidth.md`): what a decode step costs
+/// with its weight stream made free, and what its ops cost under a stream. **Timing only**: under
+/// the probe the products read no weights, so the tokens are not checked.
+///
+/// `TT_PROBE_STREAM` picks the mode, one a run (so `--profile` attributes one set of traces):
+/// - `off`: today's step, as [`traced_generation`] times it;
+/// - `skip`: products read no `B` and nothing prefetches ([`tt_kernels::tensor::probe_skip_weight_reads`]);
+/// - `skip-bg:<units>`: as `skip`, with `<units>` units from [`tt_kernels::session::THIN_STREAM_UNITS`]
+///   reading GDDR all step ([`tt_kernels::session::probe_background_stream`]), `TT_PROBE_BG_TILES`
+///   tiles a unit a replay (default 16,384: ~68 MB, ~10 ms at ~7 GB/s a unit).
+///
+/// Every capture also prints its space report (`SPACE` lines, [`tt_kernels::session::probe_space_report`]):
+/// what its ops take of a unit's `DATA`, the program cache and the stream.
+///
+/// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
+/// cache with one 64-token chunk; prompts of 32 and 256 tokens, `TT_GEN_NEW` tokens each.
+#[test]
+#[ignore = "a probe: cargo xtask bench --filter silicon_bench_models::traced_generation_stream_ceiling"]
+fn traced_generation_stream_ceiling() {
+    use tt_kernels::session::{
+        probe_background_stream, probe_space_report, ProbeBackground, THIN_STREAM_UNITS,
+    };
+    use tt_kernels::tensor::probe_skip_weight_reads;
+    use tt_models::generate::{Shapes, TracedGenerator};
+    let env = |key: &str, default: usize| -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let mode = std::env::var("TT_PROBE_STREAM").unwrap_or_else(|_| "off".into());
+    let background = match mode.as_str() {
+        "off" | "skip" => None,
+        m => {
+            let units = m
+                .strip_prefix("skip-bg:")
+                .and_then(|u| u.parse().ok())
+                .unwrap_or_else(|| panic!("TT_PROBE_STREAM={m}: off, skip or skip-bg:<units>"));
+            Some(ProbeBackground {
+                first: THIN_STREAM_UNITS,
+                units,
+                tiles_per_unit: env("TT_PROBE_BG_TILES", 16_384),
+            })
+        }
+    };
+    let name = std::env::var("TT_GEN_MODEL").unwrap_or_else(|_| "smollm2-1.7b-instruct".into());
+    let config = match name.as_str() {
+        "smollm2-135m" => SMOLLM2_135M,
+        "smollm2-1.7b-instruct" => SMOLLM2_1_7B_INSTRUCT,
+        other => panic!("TT_GEN_MODEL={other}: smollm2-135m or smollm2-1.7b-instruct"),
+    };
+    let (max_len, new) = (env("TT_GEN_MAX_LEN", 512), env("TT_GEN_NEW", 64));
+    probe_skip_weight_reads(mode != "off");
+    probe_background_stream(background);
+    probe_space_report(true);
+    with_device(Config::default(), |d| {
+        conditions(card());
+        println!("BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\"}}");
+        let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
+        let m = m.fused();
+        let shapes = Shapes::new(max_len, &[64]);
+        let g = TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap();
+        for len in [32, 256] {
+            let p = gen_prompt(len, config.vocab);
+            let mut step = Vec::new();
+            for i in 0..WARMUPS + SAMPLES {
+                let out = g.generate_tokens(&p, new).unwrap();
+                if i >= WARMUPS {
+                    step.push(median_ms(&out.times[1..]));
+                }
+            }
+            report(
+                &format!("{name} stream ceiling ({mode}), {len}-token prompt, decode step"),
+                "ms",
+                "host",
+                Stats::of(step),
+            );
+        }
+    });
+    probe_skip_weight_reads(false);
+    probe_background_stream(None);
+    probe_space_report(false);
 }
