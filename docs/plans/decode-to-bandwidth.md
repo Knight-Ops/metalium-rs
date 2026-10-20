@@ -700,7 +700,11 @@ the host ~0.8).
   - **What would change it:** small ops that do not read GDDR between products -- their activations held in L1 from
     the op that makes them (the "nothing in L1 survives an op" assumption of the 2026-10-19 review) -- so the stream
     could take the windows' whole bandwidth. That is the L1 budget question (the space audit), and a larger design:
-    [planned-l1-residency.md](../proposals/planned-l1-residency.md).
+    [planned-l1-residency.md](planned-l1-residency.md), now a plan: its Phase 1 (the plan, reported) is done (2026-10-20,
+    `step217`): a 1.7B step keeps 401 of 548 tensors resident in 112-171 KB a unit, 294 MB of reads spared a step.
+    Phase 2's mechanism done the same day (`step218`, `step219`, bit for bit on the 1.7B): sharded tensors resident,
+    the step even and 0.1 ms better under busy prefetch; rows read whole on many units, by multicast, cost 23 ms more
+    (contended multicasts), so 2f and Phase 3 (the products' outputs) decide whether residency frees the windows.
 - [ ] `down` prefetched: the first chunk batches' `B` gathers of `push_stream_jobs` on idle units. ~0.7 ms.
 - [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
   reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small

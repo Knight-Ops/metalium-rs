@@ -121,7 +121,7 @@ impl Layout {
 /// Plan a run of `tiles` tiles in the data arena: slots for the operands and
 /// the outputs, and the three semaphores.
 pub fn plan_layout(tiles: usize, operands: Operands) -> Result<Layout, PlanError> {
-    plan_layout_in(tiles, operands, tt_isa::l1::DATA)
+    plan_layout_in(tiles, operands, crate::l1::arena())
 }
 
 /// [`plan_layout`] in `arena`: half the data arena, for a run double-buffered
@@ -165,7 +165,7 @@ pub fn plan_layout_in(
 /// Most tiles a run may have: a slot per operand and one for the output, each,
 /// in the data arena.
 pub fn max_tiles(operands: Operands) -> usize {
-    max_tiles_in(operands, tt_isa::l1::DATA.len())
+    max_tiles_in(operands, crate::l1::arena().len())
 }
 
 /// [`max_tiles`] in an arena of `bytes`.

@@ -1205,7 +1205,9 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
 ///   tiles a unit a replay (default 16,384: ~68 MB, ~10 ms at ~7 GB/s a unit).
 ///
 /// Every capture also prints its space report (`SPACE` lines, [`tt_kernels::session::probe_space_report`]):
-/// what its ops take of a unit's `DATA`, the program cache and the stream.
+/// what its ops take of a unit's `DATA`, the program cache and the stream. With `TT_PROBE_RESIDENCY=1`,
+/// its residency plan too (`RESIDENCY` lines, [`tt_kernels::residency::probe_residency_plan`]: what
+/// could stay in L1 between ops; `docs/plans/planned-l1-residency.md` Phase 1).
 ///
 /// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
 /// cache with one 64-token chunk; prompts of 32 and 256 tokens, `TT_GEN_NEW` tokens each.
@@ -1248,6 +1250,8 @@ fn traced_generation_stream_ceiling() {
     probe_skip_weight_reads(mode != "off");
     probe_background_stream(background);
     probe_space_report(true);
+    let residency = std::env::var("TT_PROBE_RESIDENCY").is_ok_and(|v| v == "1");
+    tt_kernels::residency::probe_residency_plan(residency);
     with_device(Config::default(), |d| {
         conditions(card());
         println!("BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\"}}");
@@ -1275,4 +1279,5 @@ fn traced_generation_stream_ceiling() {
     probe_skip_weight_reads(false);
     probe_background_stream(None);
     probe_space_report(false);
+    tt_kernels::residency::probe_residency_plan(false);
 }

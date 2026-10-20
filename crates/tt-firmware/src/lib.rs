@@ -505,9 +505,7 @@ pub mod cfg {
 /// NIU: NoC #0's or NoC #1's, named per request.
 pub mod noc {
     use core::ptr::{read_volatile, write_volatile};
-    use tt_isa::noc::niu::{
-        self, initiator, Batch, Command, InFlight, Niu, RequestError, TxnId,
-    };
+    use tt_isa::noc::niu::{self, initiator, Batch, Command, InFlight, Niu, RequestError, TxnId};
 
     const _: () = assert!(niu::NOC1_BASE <= u32::MAX as u64 && niu::NOC0_BASE < niu::NOC1_BASE);
 
@@ -990,21 +988,32 @@ pub mod noc {
     /// free first and reads `CMD_CTRL` back after, as [`issue_on`].
     #[inline(never)]
     pub fn issue_multicast(regs: &[(u64, u32); 11]) {
+        issue_multicast_on(Niu::Noc0, regs);
+    }
+
+    /// [`issue_multicast`] through `niu`.
+    #[inline(never)]
+    pub fn issue_multicast_on(niu: Niu, regs: &[(u64, u32); 11]) {
         // SAFETY: as `issue_on`.
         unsafe {
-            while read_volatile(reg(Niu::Noc0, initiator::CMD_CTRL)) & 1 != 0 {}
+            while read_volatile(reg(niu, initiator::CMD_CTRL)) & 1 != 0 {}
             for &(off, value) in regs {
-                write_volatile(reg(Niu::Noc0, off), value);
+                write_volatile(reg(niu, off), value);
             }
-            write_volatile(reg(Niu::Noc0, initiator::CMD_CTRL), 1);
-            let _ = read_volatile(reg(Niu::Noc0, initiator::CMD_CTRL));
+            write_volatile(reg(niu, initiator::CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, initiator::CMD_CTRL));
         }
     }
 
     /// NoC #0's `NIU_MST_WR_ACK_RECEIVED`: write acknowledgements this tile's NIU has received.
     pub fn wr_acks() -> u32 {
+        wr_acks_on(Niu::Noc0)
+    }
+
+    /// `niu`'s `NIU_MST_WR_ACK_RECEIVED`.
+    pub fn wr_acks_on(niu: Niu) -> u32 {
         // SAFETY: a read-only NIU counter.
-        unsafe { read_volatile(reg(Niu::Noc0, niu::WR_ACK_RECEIVED)) }
+        unsafe { read_volatile(reg(niu, niu::WR_ACK_RECEIVED)) }
     }
 
     /// Wait until every response-marked request issued under `txn` has

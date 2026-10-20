@@ -35,20 +35,97 @@ use tt_isa::sync::Semaphore;
 use crate::runtime::SemaphoreInit;
 
 std::thread_local! {
-    /// The highest `DATA` address planned on this thread since [`take_planned_top`] last ran.
-    static PLANNED_TOP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Where [`arena`] ends on this thread: `DATA`'s end, or a planned capture's persistent region's
+    /// base.
+    static ARENA_END: std::cell::Cell<u64> = const { std::cell::Cell::new(tt_isa::l1::DATA.end) };
 }
 
-/// Note that a layout reaches `top` of `DATA` (every [`Requirements::plan`] in `DATA`, and the
-/// layouts placed by hand there): a capture keeps each op's highest in its
-/// [`crate::trace::OpRecord::l1_top`], what it needs of a unit's arena.
+/// The part of `DATA` an op's layouts may use: all of it, except while a capture with a persistent
+/// region is planned on this thread (`crate::residency`), when the region at its top is not the
+/// op's. Every layout planned in `DATA` is planned here, and sized from it; whatever caches a
+/// layout, or programs that name its addresses, keys them by its end.
+pub fn arena() -> Region {
+    Region {
+        name: "the data arena",
+        base: tt_isa::l1::DATA.base,
+        end: ARENA_END.with(|e| e.get()),
+    }
+}
+
+/// Make [`arena`] end at `end` on this thread (`DATA`'s end, or a region's base: `DATA.base <=
+/// end <= DATA.end`), returning where it ended.
+pub(crate) fn set_arena_end(end: u64) -> u64 {
+    assert!(
+        (tt_isa::l1::DATA.base..=tt_isa::l1::DATA.end).contains(&end),
+        "an arena end {end:#x} outside DATA"
+    );
+    ARENA_END.with(|e| e.replace(end))
+}
+
+/// What the L1 plans of one op reached ([`take_planned`]): its highest `DATA` address, and the
+/// highest it needs where a plan declared room it can do without ([`Requirements::slack`]: a
+/// product's `B` ring placed against the arena's end, with a gap below it). `need <= top`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct Planned {
+    pub top: u64,
+    pub need: u64,
+}
+
+std::thread_local! {
+    /// What was planned in `DATA` on this thread since [`take_planned`] last ran.
+    static PLANNED: std::cell::Cell<Planned> = const { std::cell::Cell::new(Planned { top: 0, need: 0 }) };
+}
+
+/// Note that a layout reaches `top` of `DATA` and needs all of it (every [`Requirements::plan`] in
+/// `DATA` without slack, and the layouts placed by hand there): a capture keeps each op's highest
+/// in its [`crate::trace::OpRecord::l1_top`], what it needs of a unit's arena.
 pub(crate) fn note_planned_top(top: u64) {
-    PLANNED_TOP.with(|t| t.set(t.get().max(top)));
+    note_planned(Planned { top, need: top });
 }
 
-/// The highest `DATA` address noted since the last call, and start again from none.
+/// [`note_planned_top`] for a layout that reaches `p.top` but needs only `p.need`.
+pub(crate) fn note_planned(p: Planned) {
+    PLANNED.with(|t| {
+        let q = t.get();
+        t.set(Planned {
+            top: q.top.max(p.top),
+            need: q.need.max(p.need),
+        })
+    });
+}
+
+/// What was noted since the last call, and start again from nothing.
+pub(crate) fn take_planned() -> Planned {
+    PLANNED.with(|t| t.replace(Planned::default()))
+}
+
+/// The highest `DATA` address noted since the last call ([`take_planned`]'s `top`), and start again.
 pub(crate) fn take_planned_top() -> u64 {
-    PLANNED_TOP.with(|t| t.replace(0))
+    take_planned().top
+}
+
+/// Run `f` and forget what it plans: a measurement's layouts, which no op runs.
+pub(crate) fn unnoted<R>(f: impl FnOnce() -> R) -> R {
+    let before = take_planned();
+    let r = f();
+    take_planned();
+    note_planned(before);
+    r
+}
+
+/// Run `f`, whose plans are noted where they were planned, and note them `by` higher: a layout
+/// planned in one half of the arena and then moved to the other (`matmul::half`).
+pub(crate) fn planned_shifted<R>(by: u64, f: impl FnOnce() -> R) -> R {
+    let before = take_planned();
+    let r = f();
+    let p = take_planned();
+    let up = |v: u64| if v == 0 { 0 } else { v + by };
+    note_planned(before);
+    note_planned(Planned {
+        top: up(p.top),
+        need: up(p.need),
+    });
+    r
 }
 
 /// Who reads or writes a circular buffer.
@@ -184,6 +261,8 @@ pub struct Requirements {
     stages: u32,
     buffers: Vec<BufferSpec>,
     sems: Vec<SemSpec>,
+    /// Bytes of [`Requirements::slack`] declared.
+    slack: u64,
 }
 
 impl Requirements {
@@ -194,6 +273,7 @@ impl Requirements {
             stages,
             buffers: Vec::new(),
             sems: Vec::new(),
+            slack: 0,
         }
     }
 
@@ -227,6 +307,15 @@ impl Requirements {
             live,
             kind: Kind::Scratch,
         })
+    }
+
+    /// Declare scratch that holds nothing: room a layout leaves on purpose, so that what it
+    /// declares after lands higher (a product's `B` ring against the arena's end). It is placed as
+    /// [`Requirements::scratch`] is; a plan notes what the layout needs without it
+    /// ([`Planned::need`]), which is what a smaller arena would still have to hold.
+    pub fn slack(&mut self, name: &'static str, bytes: u64, align: u64, live: Range<u32>) -> Buf {
+        self.slack += bytes;
+        self.scratch(name, bytes, align, live)
     }
 
     /// Declare a circular buffer of `pages` pages of `page` bytes, each page
@@ -285,6 +374,7 @@ impl Requirements {
     ) -> Result<Fused, PlanError> {
         let invalid = |s: String| Err(PlanError::Invalid(s));
         let mut req = Requirements::new(first.stages + second.stages);
+        req.slack = first.slack + second.slack;
         let shift = |r: &Range<u32>| r.start + first.stages..r.end + first.stages;
         let mut map_first = Vec::with_capacity(first.buffers.len());
         for b in &first.buffers {
@@ -436,8 +526,12 @@ impl Requirements {
                 .iter()
                 .zip(&plan.addr)
                 .map(|(b, &at)| at + b.bytes)
-                .max();
-            note_planned_top(top.unwrap_or(arena.base));
+                .max()
+                .unwrap_or(arena.base);
+            note_planned(Planned {
+                top,
+                need: top - self.slack.min(top - arena.base),
+            });
         }
         Ok(plan)
     }

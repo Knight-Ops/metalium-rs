@@ -288,7 +288,7 @@ impl MatmulSemaphores {
         let mut req = crate::l1::Requirements::new(1);
         let sems = Self::declare(&mut req, 0..1);
         let plan = req
-            .plan(tt_isa::l1::DATA)
+            .plan(crate::l1::arena())
             .expect("two semaphores always fit");
         (Self::planned(&plan, sems), plan.semaphore_init())
     }
@@ -730,14 +730,14 @@ pub(crate) fn k_block_layout_with(
         .scratch("matmul prior", tt_isa::dm::TILE_SLOT, 64, 0..1);
     let cleared = m.req.semaphore("matmul cleared", 0, 0..1);
     let loaded = m.req.semaphore("matmul loaded", 0, 0..1);
-    let plan = m
-        .req
-        .plan(tt_isa::l1::DATA)
-        .map_err(|_| crate::runtime::RunError::DoesNotFit {
-            what: "a K-block matmul",
-            bytes: (2 * kt + 2) as u64 * tt_isa::dm::TILE_SLOT,
-            limit: tt_isa::l1::DATA.len(),
-        })?;
+    let plan =
+        m.req
+            .plan(crate::l1::arena())
+            .map_err(|_| crate::runtime::RunError::DoesNotFit {
+                what: "a K-block matmul",
+                bytes: (2 * kt + 2) as u64 * tt_isa::dm::TILE_SLOT,
+                limit: crate::l1::arena().len(),
+            })?;
     let (a_at, b_at) = (plan.addr(m.a), plan.addr(m.b));
     let layout = Layout {
         a_at,
@@ -843,11 +843,11 @@ pub(crate) fn k_stream_layout(
     let cleared = req.semaphore("matmul cleared", 0, 0..1);
     let loaded = req.semaphore("matmul loaded", 0, 0..1);
     let plan = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|_| crate::runtime::RunError::DoesNotFit {
             what: "a K-streamed matmul",
             bytes: (a_slots + 2 * kq + 2) as u64 * TILE_SLOT,
-            limit: tt_isa::l1::DATA.len(),
+            limit: crate::l1::arena().len(),
         })?;
     Ok(StreamLayout {
         a_at: plan.addr(a),
@@ -1464,7 +1464,7 @@ pub struct Layout {
 impl Layout {
     /// The same run with its operands and outputs `by` bytes further on and
     /// its semaphores where they were: the other half of a double-buffered
-    /// pair ([`Staging::SlotsHalf`], [`HALF`]). Two runs that share
+    /// pair ([`Staging::SlotsHalf`], [`half`]). Two runs that share
     /// semaphores never overlap -- the second starts once the first has
     /// finished, and each leaves its semaphores as it found them.
     pub fn shifted(&self, by: u64) -> Layout {
@@ -1511,20 +1511,22 @@ pub enum Staging {
     Slots,
     /// [`Staging::Slots`] in the first half of the data arena, so that a
     /// second block can be staged in the other half ([`Layout::shifted`] by
-    /// [`HALF`]) while this one computes (checklist 9.15).
+    /// [`half`]) while this one computes (checklist 9.15).
     SlotsHalf,
 }
 
-/// How far the second half of the data arena is from the first, for
+/// How far the second half of the data arena ([`crate::l1::arena`]) is from the first, for
 /// [`Staging::SlotsHalf`]: half the arena, on a slot-friendly boundary.
-pub const HALF: u64 = (tt_isa::l1::DATA.len() / 2) / 4096 * 4096;
+pub fn half() -> u64 {
+    (crate::l1::arena().len() / 2) / 4096 * 4096
+}
 
 /// The first half of the data arena ([`Staging::SlotsHalf`]).
 pub(crate) fn half_arena() -> tt_isa::l1::Region {
     tt_isa::l1::Region {
         name: "first half of the data arena",
         base: tt_isa::l1::DATA.base,
-        end: tt_isa::l1::DATA.base + HALF,
+        end: tt_isa::l1::DATA.base + half(),
     }
 }
 
@@ -1573,13 +1575,16 @@ pub fn plan_layout_in(
         });
     }
     let out_bytes = (mt * nt) as u64 * out_stride;
-    if MATMUL_OUT + out_bytes > tt_isa::mailbox::MAILBOX_BASE {
+    // The arena's end: the mailboxes, or a planned capture's persistent region (`crate::l1::arena`).
+    let end = crate::l1::arena().end;
+    if MATMUL_OUT + out_bytes > end {
         return Err(RunError::DoesNotFit {
             what: "the output tiles",
             bytes: out_bytes,
-            limit: tt_isa::mailbox::MAILBOX_BASE - MATMUL_OUT,
+            limit: end.saturating_sub(MATMUL_OUT),
         });
     }
+    crate::l1::note_planned_top(MATMUL_OUT + out_bytes);
     let mut outputs = Vec::with_capacity(mt * nt);
     for i in 0..mt {
         for j in 0..nt {
@@ -1692,7 +1697,7 @@ fn matmul_requirements_placed(
                 Endpoint::Mover,
             );
             if gap > 0 {
-                req.scratch("matmul gap", gap, tt_isa::dram::ALIGN, 0..1);
+                req.slack("matmul gap", gap, tt_isa::dram::ALIGN, 0..1);
             }
             let b = ring(
                 &mut req,
@@ -1737,26 +1742,34 @@ fn planned_slots(
 ) -> Result<Layout, crate::runtime::RunError> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = ([usize; 3], L1Format, Staging, usize, bool);
-    // Each layout with the highest `DATA` address its plan reached, noted again on every hit
-    // (`crate::l1::note_planned_top`).
-    static CACHE: OnceLock<Mutex<HashMap<Key, (Layout, u64)>>> = OnceLock::new();
+    type Key = ([usize; 3], L1Format, Staging, usize, bool, u64);
+    // Each layout with what its plan reached and needed, noted again on every hit
+    // (`crate::l1::note_planned`); by the arena's end too, which `B`'s ring may sit against.
+    static CACHE: OnceLock<Mutex<HashMap<Key, (Layout, crate::l1::Planned)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, in_fmt, staging, a_slots, top_b);
-    if let Some((l, top)) = cache.lock().unwrap().get(&key) {
-        crate::l1::note_planned_top(*top);
+    let key = (
+        tiles,
+        in_fmt,
+        staging,
+        a_slots,
+        top_b,
+        crate::l1::arena().end,
+    );
+    if let Some((l, p)) = cache.lock().unwrap().get(&key) {
+        crate::l1::note_planned(*p);
         return Ok(l.clone());
     }
     let arena = match staging {
         Staging::SlotsHalf => half_arena(),
-        _ => tt_isa::l1::DATA,
+        _ => crate::l1::arena(),
     };
-    let before = crate::l1::take_planned_top();
+    let before = crate::l1::take_planned();
     let planned = plan_slots(tiles, in_fmt, arena, a_slots, top_b);
-    let top = crate::l1::take_planned_top();
-    crate::l1::note_planned_top(before.max(top));
+    let p = crate::l1::take_planned();
+    crate::l1::note_planned(before);
+    crate::l1::note_planned(p);
     let l = planned?;
-    cache.lock().unwrap().insert(key, (l.clone(), top));
+    cache.lock().unwrap().insert(key, (l.clone(), p));
     Ok(l)
 }
 
@@ -2028,17 +2041,19 @@ pub(crate) fn programs(
     use std::sync::{Arc, Mutex, OnceLock};
     // The semaphores are part of the programs: the same shape planned beside
     // another kernel may be given different ones.
+    // The programs name the layout's addresses, planned in the arena (`crate::l1::arena`).
     type Key = (
         ([usize; 3], Staging),
         SrcRoute,
         Fidelity,
         MatmulSemaphores,
         LiveRows,
+        u64,
     );
     type Roles = Arc<[Vec<Instruction>; 3]>;
     static CACHE: OnceLock<Mutex<HashMap<Key, Roles>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, route, fidelity, sems, live);
+    let key = (tiles, route, fidelity, sems, live, crate::l1::arena().end);
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
     }
@@ -2067,7 +2082,7 @@ pub(crate) fn kernel_programs(
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     // `half`: the half of a double-buffered pair (`Staging::SlotsHalf`), whose
-    // programs name addresses `HALF` apart under the same semaphores -- or any
+    // programs name addresses `half()` apart under the same semaphores -- or any
     // other layout a caller tells apart (a K-streamed chunk's).
     type Key = (
         [usize; 3],
@@ -2078,6 +2093,7 @@ pub(crate) fn kernel_programs(
         bool,
         bool,
         LiveRows,
+        u64,
     );
     type Value = (Arc<[Vec<Instruction>; 3]>, [Option<MopConfig>; 3]);
     static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
@@ -2091,6 +2107,8 @@ pub(crate) fn kernel_programs(
         allow_mop,
         b_transposed,
         live,
+        // The layout was planned in the arena (`crate::l1::arena`).
+        crate::l1::arena().end,
     );
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
@@ -2120,10 +2138,11 @@ pub fn plan_in(
 ) -> Option<ChunkShape> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = ([usize; 3], SrcRoute, Fidelity, Staging);
+    // By the arena's end too (`crate::l1::arena`): what fits it.
+    type Key = ([usize; 3], SrcRoute, Fidelity, Staging, u64);
     static CACHE: OnceLock<Mutex<HashMap<Key, Option<ChunkShape>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (mkn, route, fidelity, staging);
+    let key = (mkn, route, fidelity, staging, crate::l1::arena().end);
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return *p;
     }

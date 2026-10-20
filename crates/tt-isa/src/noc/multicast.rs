@@ -107,12 +107,18 @@ impl Rect {
     /// NoC's raw coordinates run the other way while translation does not change
     /// the direction of data flow (`Coordinates.md:26`).
     pub const fn hi(&self, niu: Niu) -> u32 {
-        let (s, e) = match niu {
-            Niu::Noc0 => ((self.x0, self.y0), (self.x1, self.y1)),
-            Niu::Noc1 => ((self.x1, self.y1), (self.x0, self.y0)),
-        };
-        (e.0 as u32) | ((e.1 as u32) << 6) | ((s.0 as u32) << 12) | ((s.1 as u32) << 18)
+        corners_hi((self.x0, self.y0), (self.x1, self.y1), niu)
     }
+}
+
+/// [`Rect::hi`] of the rectangle from `start` to `end` (`start <= end` on both axes, as a [`Rect`]
+/// is): what firmware computes from corners it was given, holding no grid.
+pub const fn corners_hi(start: (u8, u8), end: (u8, u8), niu: Niu) -> u32 {
+    let (s, e) = match niu {
+        Niu::Noc0 => (start, end),
+        Niu::Noc1 => (end, start),
+    };
+    (e.0 as u32) | ((e.1 as u32) << 6) | ((s.0 as u32) << 12) | ((s.1 as u32) << 18)
 }
 
 /// The rectangles that together cover every Tensix tile of `grid`: columns

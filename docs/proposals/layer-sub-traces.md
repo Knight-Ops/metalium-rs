@@ -115,7 +115,7 @@ trace segmentation.
 
 ## With planned L1 residency
 
-[planned-l1-residency.md](planned-l1-residency.md) plans a captured graph's activations into L1 a layer at a time, with
+[planned-l1-residency.md](../plans/planned-l1-residency.md) plans a captured graph's activations into L1 a layer at a time, with
 the same addresses in every repeat. With it, a body's L1 words are the same in every layer, and its arguments are only
 GDDR references: the layer's weights, its cache, and what is left in GDDR. Its argument tables shrink too, since 86% of
 the words that differ between layers today are tensor references, many of them activations.

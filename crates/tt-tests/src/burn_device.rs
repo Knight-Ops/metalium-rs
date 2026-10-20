@@ -681,6 +681,13 @@ fn sim_factory(
         fn end_trace(&mut self) -> Result<u64, TtError> {
             self.buffers.end_trace(&mut self.session)
         }
+        fn begin_trace_planned(&mut self) -> Result<bool, TtError> {
+            self.buffers.begin_trace_planned(&mut self.session)
+        }
+        fn set_residency(&mut self, bytes: u64) -> Result<(), TtError> {
+            self.session.set_residency(bytes);
+            Ok(())
+        }
         fn run_trace(
             &mut self,
             trace: u64,
@@ -702,6 +709,10 @@ fn sim_factory(
         }
         fn set_count_trace_bytes(&mut self, on: bool) -> Result<(), TtError> {
             self.session.set_count_trace_bytes(on);
+            Ok(())
+        }
+        fn set_l1_region(&mut self, bytes: u64) -> Result<(), TtError> {
+            self.session.set_l1_region(bytes);
             Ok(())
         }
         fn trace_footprint(

@@ -38,6 +38,7 @@ pub mod prng;
 pub mod profile;
 pub mod profile_mode;
 pub mod program_cache;
+pub mod residency;
 pub mod runtime;
 pub mod session;
 pub mod sfpu;

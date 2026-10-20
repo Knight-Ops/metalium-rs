@@ -343,6 +343,61 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## Planned residency applied: replicated rows by multicast, then sharded only (2026-10-20, card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) Phase 2: a planned capture's lists rewritten so its resident
+tensors move between units' L1 (`TT_RESIDENCY=1`, a 96 KiB region). SmolLM2-1.7B-Instruct, F32, every tile,
+`traced_generation_stream_ceiling` (`TT_PROBE_STREAM=off`), decode step, 32 / 256-token prompts; bit for bit throughout
+(`step188` traced against eager with residency on, `1792526703`).
+
+| Configuration | ms | Run |
+|---|--:|---|
+| residency off | 20.98 / 22.24 | `1792518158` |
+| every plain use resident (204 tensors, 33 KB, 91.5 MB of reads spared a step) | **43.89 / 45.01** | `1792526939` |
+| sharded tensors only (79 resident, 25 KB) | 20.92 / 22.14 | `1792528051` |
+| busy prefetch, cap 8: residency off / sharded only | 21.66 / 23.26 vs **21.53 / 23.17** | `1792528455`, `1792528191` |
+| busy prefetch, cap 2: sharded only | 20.67 / 22.18 | `1792528324` |
+
+The profile (`Step(64)`, residency off `1792527261`, every plain use `1792527601`): the products 15.23 -> 15.57 ms;
+`gamma`'s multiply 0.69 -> 12.37, the residual add 0.66 -> 6.77, attention 0.65 -> 4.33, `silu_mul` 0.49 -> 1.27: each an
+op whose output is a row its readers take whole on many units (a product's packed `A`, RMSNorm's twin), delivered by its
+64 producing units' multicasts into one rectangle at once, which serialize (~250 us a multiply). The reads that copied a
+unit's region word by word on B (`COPY_WORDS`) showed too (RMSNorm's data time 0.53 -> 1.02 ms) and became NoC
+loopback reads (`READ_L1`). With replicated rows left in GDDR the step is even, and under busy prefetch 0.1 ms
+better: the residual add still reads the product's output (`SCATTER`) from GDDR behind the stream (Phase 3).
+
+## What an empty persistent region costs the step (2026-10-20, card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) Phase 2a: the top `TT_L1_REGION` bytes of each unit's arena
+kept from every captured op, nothing in them. SmolLM2-1.7B-Instruct, F32, every tile,
+`traced_generation_stream_ceiling` (`TT_PROBE_STREAM=off`), decode step, 32 / 256-token prompts:
+
+| Region a unit | ms | Products' gather entries a step | Run |
+|---|--:|--:|---|
+| none | 20.98 / 22.24 | 196,648 | `1792518158` |
+| 64 KB | 21.03 / 22.23 | 196,648 | `1792523682` |
+| 96 KB | 20.97 / 22.20 | 196,648 | `1792523958` |
+| 128 KB | 22.59 / 23.80 | 307,576 | `1792523804` |
+| 256 KB | 22.56 / 23.81 | 307,576 | `1792523535` |
+
+Past ~96-128 KB the products take narrower `K`-whole blocks (`matmul::plan_in`, the widest that fits the arena):
++56% gather entries, +1.6 ms. Under it, a region is free.
+
+## A decode step's L1 residency plan, reported (2026-10-20, card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) Phase 1: what a static plan could keep in L1 between ops,
+with nothing made resident. SmolLM2-1.7B-Instruct, F32, every tile, `traced_generation_stream_ceiling` with
+`TT_PROBE_RESIDENCY=1` (`1792517890`, `1792518158`). The step is unchanged: 20.98 / 22.24 ms (32 / 256-token prompt).
+
+- **`Step(64)`:** 404 ops, 548 tensors made and used up inside the step. 401 are resident in 47 addresses, sparing **294
+  MB of reads and 123 MB of writes a step** (of the 300 / 168 MB they move); the weights and the cache are 7.0 GB
+  external. The layer is the period (16 ops x 23 from op 30), and a layer needs 112 KB a unit (171 KB at 512 attended
+  positions) against a budget of 339 KB (896 KB less `down`'s 557 KB).
+- **The whole step's region is 266 KB, the logits'**: the head's row read whole by the argmax's one unit.
+- **147 tensors a step (38.7 MB) are written and never read**: rows written both as tiles and packed, only one read.
+- **`Chunk(64)`:** 97 of 691 resident, a 110 KB budget beside the prefill products; `down`'s K-blocked product
+  accumulates in GDDR.
+
 ## Busy-unit prefetch and the prefetch pump (2026-10-20, cards 0 and 1)
 
 [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, Steps 3-5 and the pump. SmolLM2-1.7B-Instruct, F32,

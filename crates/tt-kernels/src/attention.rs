@@ -83,7 +83,7 @@ fn slot_at(base: u64, n: usize) -> u64 {
 
 fn plan_slots(tiles: [usize; 3]) -> Option<Slots> {
     let [kt, nt, dvt] = tiles;
-    let arena = tt_isa::l1::DATA;
+    let arena = crate::l1::arena();
     if slots_needed(tiles) as u64 * TILE_SLOT > arena.len() {
         return None;
     }
@@ -137,25 +137,34 @@ fn kernels(
 ) -> Result<Arc<Vec<Step>>> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = ([usize; 3], usize, u32, SrcRoute, Fidelity, bool);
-    // Each job's steps with the highest `DATA` address their plans reached, noted again on every
-    // hit (`crate::l1::note_planned_top`).
-    type Built = (Arc<Vec<Step>>, u64);
+    type Key = ([usize; 3], usize, u32, SrcRoute, Fidelity, bool, u64);
+    // Each job's steps with what their plans reached and needed, noted again on every hit
+    // (`crate::l1::note_planned`); by the arena's end too, where they were planned.
+    type Built = (Arc<Vec<Step>>, crate::l1::Planned);
     static MEMO: OnceLock<Mutex<HashMap<Key, Built>>> = OnceLock::new();
-    let key = (tiles, rows, scale.to_bits(), route, fidelity, unpack_b);
+    let key = (
+        tiles,
+        rows,
+        scale.to_bits(),
+        route,
+        fidelity,
+        unpack_b,
+        crate::l1::arena().end,
+    );
     let memo = MEMO.get_or_init(Default::default);
-    if let Some((k, top)) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
-        crate::l1::note_planned_top(*top);
+    if let Some((k, p)) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        crate::l1::note_planned(*p);
         return Ok(k.clone());
     }
-    let before = crate::l1::take_planned_top();
+    let before = crate::l1::take_planned();
     let built = build_kernels(tiles, rows, scale, route, fidelity, unpack_b);
-    let top = crate::l1::take_planned_top();
-    crate::l1::note_planned_top(before.max(top));
+    let p = crate::l1::take_planned();
+    crate::l1::note_planned(before);
+    crate::l1::note_planned(p);
     let built = Arc::new(built?);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(key, (built.clone(), top));
+        .insert(key, (built.clone(), p));
     Ok(built)
 }
 

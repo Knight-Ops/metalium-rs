@@ -478,6 +478,17 @@ pub trait Engine {
     fn end_trace(&mut self) -> Result<u64, TtError> {
         Err(no_traces())
     }
+    /// Start capturing a trace that applies the residency plan the last capture made
+    /// (`Session::begin_trace_planned`): `false`, starting nothing, without one.
+    fn begin_trace_planned(&mut self) -> Result<bool, TtError> {
+        Ok(false)
+    }
+    /// Plan every capture from here on for L1 residency, in a region of `bytes` a unit (0: off;
+    /// `Session::set_residency`).
+    #[doc(hidden)]
+    fn set_residency(&mut self, _bytes: u64) -> Result<(), TtError> {
+        Err(no_traces())
+    }
     /// Overwrite `input`'s values, replay `trace`, and read `output` back:
     /// one round trip.
     fn run_trace(
@@ -537,6 +548,12 @@ pub trait Engine {
     /// (`Session::set_count_trace_bytes`), read back with [`Engine::trace_ops`].
     #[doc(hidden)]
     fn set_count_trace_bytes(&mut self, _on: bool) -> Result<(), TtError> {
+        Err(no_traces())
+    }
+    /// Keep `bytes` at the top of each unit's L1 arena for a persistent region in every trace
+    /// captured from here on (`Session::set_l1_region`).
+    #[doc(hidden)]
+    fn set_l1_region(&mut self, _bytes: u64) -> Result<(), TtError> {
         Err(no_traces())
     }
     #[doc(hidden)]
@@ -894,6 +911,13 @@ impl DramBuffers {
         s: &mut Session<T>,
     ) -> Result<(), TtError> {
         s.begin_trace().map_err(TtError::from)
+    }
+
+    pub fn begin_trace_planned<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+    ) -> Result<bool, TtError> {
+        s.begin_trace_planned().map_err(TtError::from)
     }
 
     pub fn end_trace<T: tt_device::Transport>(
@@ -3887,6 +3911,14 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.end_trace(&mut self.session)
     }
+    fn begin_trace_planned(&mut self) -> Result<bool, TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.begin_trace_planned(&mut self.session)
+    }
+    fn set_residency(&mut self, bytes: u64) -> Result<(), TtError> {
+        self.session.set_residency(bytes);
+        Ok(())
+    }
     fn run_trace(
         &mut self,
         trace: u64,
@@ -3939,6 +3971,10 @@ impl Engine for KmdEngine {
     }
     fn set_count_trace_bytes(&mut self, on: bool) -> Result<(), TtError> {
         self.session.set_count_trace_bytes(on);
+        Ok(())
+    }
+    fn set_l1_region(&mut self, bytes: u64) -> Result<(), TtError> {
+        self.session.set_l1_region(bytes);
         Ok(())
     }
     fn profile_generic_trace(

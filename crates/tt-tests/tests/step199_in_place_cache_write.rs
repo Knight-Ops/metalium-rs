@@ -337,7 +337,7 @@ fn a_transpose_kept_from_before_the_capture_is_not_read() {
                     new_rows(at, &d),
                     IndexingUpdateOp::Assign,
                 );
-                let y = xc.matmul(new.clone().transpose());
+                let y = xc.clone().matmul(new.clone().transpose());
                 (vec![float2(y)], vec![float2(new)])
             })
             .unwrap();

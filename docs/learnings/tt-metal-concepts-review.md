@@ -576,7 +576,7 @@ fusion (`Requirements::fuse` drops the GDDR legs) plus a `Residency::L1Sharded {
 range: CoreRangeSet, shard: [h, w] }` placement for a `DramTensor`'s successor type, with
 ops declaring which shard specs they accept, as ttnn's `validate` does. Defer until
 G5/G7 exist and a measured op chain is GDDR-bound. **Measured (2026-10-20):** decode's small ops are GDDR-bound under
-a weight stream (the residual add 14 -> ~100 us). Proposal: [planned-l1-residency.md](../proposals/planned-l1-residency.md),
+a weight stream (the residual add 14 -> ~100 us). Proposal: [planned-l1-residency.md](../plans/planned-l1-residency.md),
 a static plan over each captured graph rather than a runtime allocator.
 
 ### G13. Debug tooling: watcher, waypoints, device print (P1, developer experience)

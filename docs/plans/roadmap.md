@@ -402,8 +402,16 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         in the mover (gates `step215`, `step216`), and busy units reading `B` ahead: the products 15.2 -> 11.6 ms, but the
         small ops' reads queue behind the prefetch at GDDR, so the step gains at best ~0.2-0.4 ms; opt-in
         (`TT_BUSY_PREFETCH=1`, `TT_PREFETCH_CAP`). Next: small ops' activations held in L1 between ops,
-        [planned-l1-residency.md](../proposals/planned-l1-residency.md) (a static plan over each captured graph, the
-        same addresses every layer; traced inference and training included, eager ops unchanged), with
+        [planned-l1-residency.md](planned-l1-residency.md) (a static plan over each captured graph, the
+        same addresses every layer; traced inference and training included, eager ops unchanged). **Phase 1 done**
+        (2026-10-20, gate `step217`, card 0 `1792518158`): a 1.7B step's plan keeps 401 of 548 tensors in 47 addresses,
+        a layer in 112-171 KB a unit of a 339 KB budget, sparing 294 MB of reads and 123 MB of writes a step. **Phase 2's
+        mechanism done** (2026-10-20, gates `step218`, `step219`): NC writes and multicasts into other units' L1, B
+        reads its own over the NoC, and a planned capture (`TT_RESIDENCY=1`) rewrites each op's lists so its resident
+        tensors never touch GDDR, bit for bit (`step188`). Measured: rows read whole on many units cost more by
+        contended multicast (43.9 ms a step), so they stay in GDDR (2f); sharded only, even (20.92 ms), 0.1 ms better
+        under busy prefetch. Next: 2f, then Phase 3 (the products' outputs, which the residual add still reads from
+        GDDR). With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is
         deferred.

@@ -269,6 +269,44 @@ impl TracedInference {
         state: &[&TtTensor],
         f: impl FnOnce() -> (Vec<TtTensor>, Vec<(TtTensor, TtTensor)>),
     ) -> Result<(Self, Vec<server::OutputPayload>), TtError> {
+        Self::capture_pass(inputs, state, f, false)
+            .map(|c| c.expect("a plain capture always begins"))
+    }
+
+    /// [`TracedInference::capture_donating`], twice where the device plans captures for L1
+    /// residency (`crate::set_residency`, `docs/plans/planned-l1-residency.md`): the plain
+    /// capture plans, and a second run of `f` is captured applying the plan, its trace kept in
+    /// the plain one's place. The step runs twice, so it must be one whose second run leaves what
+    /// its first did: it writes its state, as a decoder's cache row, and does not accumulate
+    /// into it. A planned capture that is not its plan's is refused by the session, its reason
+    /// printed; the plain trace is kept and replayed once over the same inputs, so the state is
+    /// what the plain run left.
+    pub(crate) fn capture_donating_planned(
+        inputs: &[&TtTensor],
+        state: &[&TtTensor],
+        mut f: impl FnMut() -> (Vec<TtTensor>, Vec<(TtTensor, TtTensor)>),
+    ) -> Result<(Self, Vec<server::OutputPayload>), TtError> {
+        let (plain, first) = Self::capture_pass(inputs, state, &mut f, false)?
+            .expect("a plain capture always begins");
+        match Self::capture_pass(inputs, state, &mut f, true) {
+            Ok(None) => Ok((plain, first)),
+            Ok(Some(planned)) => Ok(planned),
+            Err(e) => {
+                eprintln!("burn-tt: the residency-planned capture was refused; keeping the plain trace: {e}");
+                server::run_generic_trace(plain.device, plain.id, Vec::new(), Vec::new())?;
+                Ok((plain, first))
+            }
+        }
+    }
+
+    /// One capture of `f`: planned (`Session::begin_trace_planned`), or plain. `None` if planned
+    /// and there is no plan to apply.
+    fn capture_pass(
+        inputs: &[&TtTensor],
+        state: &[&TtTensor],
+        f: impl FnOnce() -> (Vec<TtTensor>, Vec<(TtTensor, TtTensor)>),
+        planned: bool,
+    ) -> Result<Option<(Self, Vec<server::OutputPayload>)>, TtError> {
         let Some(first_in) = inputs.first() else {
             return Err(TtError::Device(
                 "a trace needs at least one input tensor".into(),
@@ -322,7 +360,13 @@ impl TracedInference {
             }
         }
 
-        server::run(device, |e, _| e.begin_trace())?;
+        if planned {
+            if !server::run(device, |e, _| e.begin_trace_planned())? {
+                return Ok(None);
+            }
+        } else {
+            server::run(device, |e, _| e.begin_trace())?;
+        }
         let mut guard = Capturing::new(device, false);
         let (outs, updates) = f();
         // From here nothing reads the state as the step's: the write-back below reads it as
@@ -399,7 +443,7 @@ impl TracedInference {
         held.extend(outs);
         held.extend(held_state);
 
-        Ok((
+        Ok(Some((
             TracedInference {
                 device,
                 id,
@@ -408,7 +452,7 @@ impl TracedInference {
                 _held: held,
             },
             first_outputs,
-        ))
+        )))
     }
 
     /// Name the trace in the profile mode's report (`crate::profile`); it is otherwise reported by
@@ -630,11 +674,15 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
     /// Capture the step keyed `key` over `inputs`: `f` reads [`Self::state`] and returns
     /// the outputs and the new state, one tensor for each state tensor in its order and of
     /// its shape and dtype. Returns the capture's own outputs (its first run).
+    ///
+    /// Where the device plans captures for L1 residency (`crate::set_residency`), `f` runs twice
+    /// ([`TracedInference::capture_donating_planned`]): a step that writes its state, not one
+    /// that accumulates into it.
     pub fn capture(
         &mut self,
         key: K,
         inputs: &[&TtTensor],
-        f: impl FnOnce() -> (Vec<TtTensor>, Vec<TtTensor>),
+        mut f: impl FnMut() -> (Vec<TtTensor>, Vec<TtTensor>),
     ) -> Result<Vec<server::OutputPayload>, TtError> {
         if self.traces.contains_key(&key) {
             return Err(TtError::Device(format!(
@@ -644,7 +692,7 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
         let state = self.state.clone();
         let mut mismatch = None;
         let donated: Vec<&TtTensor> = self.state.iter().collect();
-        let (trace, first) = TracedInference::capture_donating(inputs, &donated, || {
+        let (trace, first) = TracedInference::capture_donating_planned(inputs, &donated, || {
             let (outs, new) = f();
             if new.len() != state.len() {
                 mismatch = Some(format!(
@@ -744,6 +792,25 @@ pub fn set_profile_buffer(device: TtDevice, bytes: Option<u64>) -> Result<(), Tt
 #[doc(hidden)]
 pub fn set_count_trace_bytes(device: TtDevice, on: bool) -> Result<(), TtError> {
     server::run(device, move |e, _| e.set_count_trace_bytes(on))
+}
+
+/// Keep `bytes` at the top of each unit's L1 arena for a persistent region in every trace captured
+/// on `device` from here on (`Session::set_l1_region`; 0 keeps none): the captured ops plan below
+/// it, and a capture with an op that does not is refused by name.
+/// `docs/plans/planned-l1-residency.md` Phase 2. Dev-facing.
+#[doc(hidden)]
+pub fn set_l1_region(device: TtDevice, bytes: u64) -> Result<(), TtError> {
+    server::run(device, move |e, _| e.set_l1_region(bytes))
+}
+
+/// Plan every capture on `device` from here on for L1 residency, in a region of `bytes` a unit
+/// (0 turns it off; `TT_RESIDENCY=1` turns it on when the device attaches;
+/// `Session::set_residency`, `docs/plans/planned-l1-residency.md`). A capture that runs its step
+/// twice ([`SharedStateTraces::capture`]) then keeps the planned trace, whose tensors move
+/// between units' L1 where the plan says. Dev-facing.
+#[doc(hidden)]
+pub fn set_residency(device: TtDevice, bytes: u64) -> Result<(), TtError> {
+    server::run(device, move |e, _| e.set_residency(bytes))
 }
 
 /// Detailed timing breakdown of a traced training step.

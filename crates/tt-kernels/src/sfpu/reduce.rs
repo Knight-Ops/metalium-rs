@@ -481,7 +481,7 @@ impl Layout {
 }
 
 pub fn plan_layout(outputs: usize, per: usize) -> Result<Layout, PlanError> {
-    plan_layout_in(outputs, per, tt_isa::l1::DATA)
+    plan_layout_in(outputs, per, crate::l1::arena())
 }
 
 /// [`plan_layout`] in `arena`: half the data arena, for a run double-buffered
@@ -643,7 +643,7 @@ pub fn plan_chunk_layout(outputs: usize) -> Result<ChunkLayout, PlanError> {
     let consumed = req.semaphore("reduce consumed", 1, 0..1);
     let computed = req.semaphore("reduce computed", 0, 0..1);
     let packed = req.semaphore("reduce packed", 1, 0..1);
-    let plan = req.plan(tt_isa::l1::DATA)?;
+    let plan = req.plan(crate::l1::arena())?;
     Ok(ChunkLayout {
         layout: Layout {
             outputs,

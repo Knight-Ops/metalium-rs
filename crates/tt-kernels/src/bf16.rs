@@ -383,7 +383,7 @@ fn repack_many_into(
     let dst = req.scratch("BF16 repack output", TILE_SLOT, 64, 0..1);
     let constant = req.scratch("BF16 repack padding", TILE_SLOT, 64, 0..1);
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (src, dst) = (layout.addr(src), layout.addr(dst));
     let constant = layout.addr(constant);

@@ -1215,6 +1215,37 @@ programs.
   window streams, its ops wait for. Throttling the stream (ID 6's cap 1-2) traded the two at best ~0.2-0.4 ms a 1.7B
   step.
 
+## NC writes another tile's L1 (2026-10-20, ttsim and card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) Phase 2b: `op::WRITE_L1`, one unicast `noc::Command::Write`
+from NC's L1 into a peer Tensix tile's L1 (gate `step218_l1_write_records`; card 0, safe image `1792524683`,
+`fast-reads` `1792524825`, `fast-reads` + `encoded-guard` `1792524963`).
+- **The peer is named by the coordinate the session uses for it, on either NoC.** With translation on, NoC #1 takes
+  the same `(x, y)` as NoC #0 (`step50`), so the record carries one coordinate and the NIU NC's writes go out on
+  issues it. Writes of 64 B to 16 KiB into two peers, on NoC #1 and NoC #0 and at three 16-byte skews, landed byte for
+  byte; the guard below the window and a tile no entry named stayed poisoned. No hang.
+- **Completion needs nothing new.** A `Command::Write` is response-marked, so NC's drain at a list's end (`noc::wait`
+  on its ID, both NIUs once used) waits for it before NC reports done, and its unit then arrives at the barrier: the
+  reader after the barrier sees the bytes.
+- **What the card can and cannot refuse.** Its decode refuses a coordinate outside the Tensix rows and columns, a
+  length of zero or past one request, a range outside `DATA`, and addresses not congruent mod 16, before any NoC
+  access (each sent raw, refused with its code, nothing written). It cannot tell a harvested tile (translated X 15
+  and 16 here) from a present one: that refusal is the host's alone (`DataMover::set_l1_writes`: the session's own
+  tiles and its window), and no such entry is ever sent past it.
+- **Image sizes:** B 30,404 -> 30,612 bytes of 43,008 (the decode arm); NC 15,540 -> 16,704 of 24,576 (7,872 left).
+- **B reads a tile's L1 over the NoC, its own included** (`op::READ_L1`, a loopback read of the unit's region; every
+  `step219` run and the 1.7B with residency on, `1792526703`): no hang, the bytes as written.
+- **Many units multicasting into one rectangle at once serialize.** 64 units each multicasting a row's 64-byte face rows
+  into the same 104-tile rectangle took ~250 us an op where its GDDR writes took ~14 (`1792527601`): path-reserved
+  multicasts that share a rectangle wait for one another. A row many units read whole is delivered some other way
+  (`planned-l1-residency.md` 2f).
+- **NC multicasts through NoC #1 too** (`op::WRITE_L1_MCAST`, `step218` `1792525425`): the first NoC #1 multicast
+  here, a 2x2 rectangle in translated coordinates with the corners swapped (`multicast::corners_hi`), landed in all four
+  tiles and none beside them; no hang. Completion is NoC #1's `WR_ACK_RECEIVED`, read after NC's earlier writes have
+  drained and counted to the rectangle's tiles before the next entry. NoC #1's counter is NC's alone: B, on the same
+  NIUs, never writes through NoC #1, where NoC #0's counts B's barrier release too. With the multicast, B 30,996 and NC
+  17,872 bytes (6,704 left).
+
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 
 - **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of

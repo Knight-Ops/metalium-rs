@@ -233,6 +233,9 @@ pub struct DataMover<N: NocId> {
     /// What an encoded read is bound to: this chip, this tile and the key written to the
     /// mover's mailbox as it started (`encoded::Context`), plus the endpoint bitmap `validate` needs.
     context: encoded::Context,
+    /// Where this mover's [`op::WRITE_L1`] entries may write ([`DataMover::set_l1_writes`]): none
+    /// until the session says.
+    l1_writes: L1Writes,
     /// How long a descriptor may take on silicon. On ttsim the budget is
     /// simulated cycles instead, since the simulator's clock only moves when
     /// ticked.
@@ -358,12 +361,33 @@ impl<N: NocId> DataMover<N> {
             caps,
             encode_reads: caps & dm::caps::FAST_READS != 0,
             context: encoded::Context::new(dram.usable_mask() as u32, (tile.x(), tile.y()), key),
+            l1_writes: L1Writes::default(),
             deadline: Duration::from_secs(1),
         })
     }
 
     pub fn tile(&self) -> NocCoord<N> {
         self.tile
+    }
+
+    /// Let this mover's [`op::WRITE_L1`] entries write into `writes` (see [`L1Writes`]); the
+    /// default admits none. Host state only: what a list is checked against before it is queued.
+    pub fn set_l1_writes(&mut self, writes: L1Writes) -> Result<()> {
+        let data = tt_isa::l1::DATA;
+        if !writes.window.is_empty()
+            && (writes.window.start < data.base || writes.window.end > data.end)
+        {
+            return Err(DmError::Invalid(dm::error::RANGE));
+        }
+        if writes
+            .tiles
+            .iter()
+            .any(|&(x, y)| !tt_isa::noc::grid::is_tensix_geometry(x, y))
+        {
+            return Err(DmError::Invalid(dm::error::RANGE));
+        }
+        self.l1_writes = writes;
+        Ok(())
     }
 
     /// Which core's mover this is, and where its mailbox and ring are.
@@ -684,6 +708,13 @@ impl<N: NocId> DataMover<N> {
                 contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
             } else if n == 1 {
                 decode_contained(usable, entries[i]).map_err(DmError::Invalid)?;
+                if matches!(
+                    entries[i][0],
+                    op::WRITE_L1 | op::WRITE_L1_MCAST | op::READ_L1
+                ) && !self.l1_writes.admits(entries[i])
+                {
+                    return Err(DmError::Invalid(dm::error::RANGE));
+                }
             } else {
                 let rec = entries
                     .get(i..i + n)
@@ -920,11 +951,49 @@ impl<N: NocId> DataMover<N> {
     }
 }
 
+/// Where a mover's [`op::WRITE_L1`] entries may write: into `window` of the L1 of one of `tiles`.
+/// The card checks only that a destination could be a Tensix tile and lies in `DATA`; a coordinate
+/// of a tile this chip does not have is a NoC access nothing answers, which hangs the NoC and can
+/// take the host down (`docs/learnings/ttsim-divergence.md` row 35). So the host refuses every
+/// `WRITE_L1` but those into the tiles its session runs on (each read off the chip's grid) and the
+/// window it keeps for them (a capture's persistent region, `docs/plans/planned-l1-residency.md`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct L1Writes {
+    /// `(x, y)` as the session names its tiles.
+    pub tiles: Vec<(u8, u8)>,
+    /// Inside `tt_isa::l1::DATA`; empty refuses every write.
+    pub window: std::ops::Range<u64>,
+}
+
+impl L1Writes {
+    /// Whether [`op::WRITE_L1`] or [`op::WRITE_L1_MCAST`] entry `e` writes inside the window of
+    /// the tiles (one of them, or a rectangle all of whose tiles are), or [`op::READ_L1`] entry
+    /// `e` reads inside the window of one of them.
+    pub fn admits(&self, e: [u32; 8]) -> bool {
+        let (to, len) = (e[3] as u64, e[5] as u64);
+        let ours = |x: u8, y: u8| self.tiles.contains(&(x, y));
+        let tiles = match e[0] {
+            op::WRITE_L1 | op::READ_L1 => u8::try_from(e[1])
+                .ok()
+                .zip(u8::try_from(e[2]).ok())
+                .is_some_and(|(x, y)| ours(x, y)),
+            op::WRITE_L1_MCAST => {
+                let [x0, y0, x1, y1] = e[1].to_le_bytes();
+                x0 <= x1 && y0 <= y1 && (y0..=y1).all(|y| (x0..=x1).all(|x| ours(x, y)))
+            }
+            _ => false,
+        };
+        tiles && to >= self.window.start && to + len <= self.window.end
+    }
+}
+
 /// A shared packet's ownership rules, beyond what each entry's decode checks:
 /// every credit names the header's capacity (the role scripts carry it too,
-/// from the same header), and the writer section only writes to GDDR, so NC
-/// stays on NoC #1 -- an NC read would share B's NoC #0 initiator. `entries`
-/// is the header, the reader section and the writer section.
+/// from the same header), and the writer section only writes -- to GDDR, or
+/// to other tiles' L1 ([`op::WRITE_L1`], checked against the mover's
+/// [`L1Writes`]) -- so NC stays on NoC #1: an NC read would share B's NoC #0
+/// initiator. `entries` is the header, the reader section and the writer
+/// section.
 pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
     let header = entries.first().ok_or(dm::error::LENGTH)?;
     let capacity = header[3];
@@ -965,6 +1034,7 @@ pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
                             .is_some_and(|ch| ch.permits(endpoint(writer), action)) => {}
                     Entry::Buffer { .. } => return Err(dm::error::OP),
                     Entry::Move { descriptor, .. } if writer && descriptor.op == op::WRITE => {}
+                    Entry::L1Write { .. } | Entry::L1Multicast { .. } if writer => {}
                     Entry::CheckFlags { .. } if writer => {}
                     _ if writer => return Err(dm::error::OP),
                     _ => {}

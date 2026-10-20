@@ -131,6 +131,14 @@ pub const TXN_NC: u8 = 4;
 /// op that reads what they bring puts before its kernel (`docs/plans/decode-to-bandwidth.md`
 /// Phase 8). Its cap is [`TILE_IN_FLIGHT_CAP`], set once when the mover starts.
 pub const TXN_PREFETCH: u8 = 6;
+/// The NoC transaction ID of RISCV NC's multicasts ([`op::WRITE_L1_MCAST`]): apart from
+/// [`TXN_NC`], whose counter a broadcast would leave meaningless. Nothing waits on it: a multicast
+/// is counted by its acknowledgements.
+pub const TXN_NC_MCAST: u8 = 7;
+/// [`op::WRITE_L1_MCAST`]'s word 1 for the rectangle `start..=end`.
+pub const fn mcast_corners(start: (u8, u8), end: (u8, u8)) -> u32 {
+    u32::from_le_bytes([start.0, start.1, end.0, end.1])
+}
 /// [`op::WAIT`]'s word 1 for a wait that also drains the prefetch reads ([`TXN_PREFETCH`]).
 pub const WAIT_PREFETCH: u32 = 1;
 const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
@@ -323,6 +331,42 @@ pub mod op {
     pub const READ_ENCODED: u32 = 0x4A;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
+    /// L1 -> another Tensix tile's L1: `[WRITE_L1, x, y, to, from, len, 0, 0]`, [`WRITE`]'s
+    /// shape with a tile for a channel and port. RISCV NC writes `len` bytes of its own tile's L1
+    /// at `from` to `to` in the L1 of the tile at `(x, y)`, through the NIU its writes go out on
+    /// ([`super::WRITE_NOC`]). `(x, y)` is the tile's coordinate as the session names it, which
+    /// with translation on is the same on both NoCs (`step50_noc1`). Both ranges inside
+    /// `crate::l1::DATA`, congruent mod 16; `len` at most `crate::noc::niu::MAX_REQUEST_BYTES`;
+    /// `(x, y)` a coordinate a Tensix tile could have (`crate::noc::grid::is_tensix_geometry`),
+    /// which is all the card can check: the host narrows it to the tiles of its session that read
+    /// what is written, and every one of them exists (`docs/plans/planned-l1-residency.md`).
+    /// Response-marked, so the drain at a list's end waits for it: a unit's writes have landed
+    /// before it reports done and arrives at its barrier. NC's only. Only in a list entry.
+    pub const WRITE_L1: u32 = 0x24;
+    /// L1 -> the L1 of every tile of a rectangle: `[WRITE_L1_MCAST, corners, 0, to, from, len, 0,
+    /// 0]`, [`WRITE_L1`] to each of the tiles `x0..=x1` by `y0..=y1`, `corners` `x0 | y0 << 8 |
+    /// x1 << 16 | y1 << 24` ([`super::mcast_corners`]). One response-marked, path-reserved
+    /// multicast (`crate::noc::multicast::registers_to`) through NoC #1, which NC's writes must go
+    /// out on ([`super::WRITE_NOC`]; NoC #0 is [`super::error::DIRECTION`]): RISCV NC counts the
+    /// rectangle's acknowledgements on that NIU's write-ack counter before it runs the next
+    /// entry, having first waited for its earlier writes. A multicast's ID counter proves nothing
+    /// (one up, one down a recipient), nothing else NC sends is then in flight to add to the
+    /// count, and B, which shares the tile's NIUs, never writes through NoC #1 (NoC #0's counter
+    /// is B's barrier release's). So its writes too have landed before NC reports done. Every tile of the
+    /// rectangle must be one a Tensix tile could have (`crate::noc::grid::is_tensix_geometry`):
+    /// no non-memory or DRAM column inside it, which a broadcast would otherwise rely on masks to
+    /// skip; the tile running it is never one (no broadcast to itself); the ranges as
+    /// [`WRITE_L1`]'s. The host narrows the rectangle to its session's tiles. NC's only. Only in
+    /// a list entry.
+    pub const WRITE_L1_MCAST: u32 = 0x25;
+    /// Another (or this) Tensix tile's L1 -> this tile's L1: `[READ_L1, x, y, from, to, len, 0,
+    /// 0]`, [`WRITE_L1`]'s mirror on the reader. RISCV B reads `len` bytes at `from` in the L1 of
+    /// the tile at `(x, y)` -- this tile's own, a loopback -- into its own L1 at `to`, one request
+    /// through NoC #0 under its read ID, so what drains its reads (a kernel's launch, a list's
+    /// end) drains it. The checks are [`WRITE_L1`]'s; the host narrows `(x, y)` to its session's
+    /// tiles and `from` to the window it keeps (`docs/plans/planned-l1-residency.md`). B's only.
+    /// Only in a list entry.
+    pub const READ_L1: u32 = 0x26;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
     /// in order. The other descriptor words are unused.
     pub const LIST: u32 = 3;
@@ -445,7 +489,15 @@ pub mod op {
 
 // Entry ops and record ops (`record`, from 0x10) share one numbering.
 const _: () = {
-    let ops = [op::HOST_READ, op::HOST_WRITE, op::TILIZE, op::UNTILIZE];
+    let ops = [
+        op::HOST_READ,
+        op::HOST_WRITE,
+        op::TILIZE,
+        op::UNTILIZE,
+        op::WRITE_L1,
+        op::WRITE_L1_MCAST,
+        op::READ_L1,
+    ];
     let mut i = 0;
     while i < ops.len() {
         assert!(!record::is_record(ops[i]));
@@ -533,10 +585,10 @@ impl Mover {
     ///
     /// RISCV B is the reader: it never writes GDDR -- [`op::WRITE`] and the
     /// writing records ([`record::Direction::Write`]) are its
-    /// [`error::DIRECTION`] -- and it keeps everything else: the control
+    /// [`error::DIRECTION`], as is [`op::WRITE_L1`] -- and it keeps everything else: the control
     /// entries, the roles' launches, barriers, PCIe moves ([`op::HOST_WRITE`]
     /// included), and the reading records. RISCV NC is the writer: only
-    /// [`op::WRITE`], the writing records, [`op::WAIT`] and the credits
+    /// [`op::WRITE`], [`op::WRITE_L1`], the writing records, [`op::WAIT`] and the credits
     /// ([`op::CB`]). The packet entries ([`op::PAIR`], [`op::PAIR_CALL`],
     /// [`op::RELEASED`]) and [`op::CALL`] are B's; NC is started by B's
     /// packet, through its `SHARED` and `CALL` words, which are not entries.
@@ -544,11 +596,15 @@ impl Mover {
         match self.core {
             crate::tensix::Core::B => {
                 op != op::WRITE
+                    && op != op::WRITE_L1
+                    && op != op::WRITE_L1_MCAST
                     && op != op::CHECK_FLAGS
                     && !matches!(record::direction(op), Some(record::Direction::Write))
             }
             _ => {
                 op == op::WRITE
+                    || op == op::WRITE_L1
+                    || op == op::WRITE_L1_MCAST
                     || op == op::CHECK_FLAGS
                     || op == op::WAIT
                     || op == op::CB
@@ -710,6 +766,30 @@ pub enum Entry {
         descriptor: Descriptor,
         transform: Transform,
     },
+    /// [`op::WRITE_L1_MCAST`]: [`Entry::L1Write`] to every tile of `start..=end`.
+    L1Multicast {
+        start: (u8, u8),
+        end: (u8, u8),
+        to: u32,
+        from: u32,
+        len: u32,
+    },
+    /// [`op::WRITE_L1`]: `len` bytes of this tile's L1 at `from` to `to` in the L1 of `(x, y)`.
+    L1Write {
+        x: u8,
+        y: u8,
+        to: u32,
+        from: u32,
+        len: u32,
+    },
+    /// [`op::READ_L1`]: `len` bytes at `from` in the L1 of `(x, y)` to `to` in this tile's.
+    L1Read {
+        x: u8,
+        y: u8,
+        from: u32,
+        to: u32,
+        len: u32,
+    },
     /// [`op::FILL`].
     Fill {
         value: u32,
@@ -826,6 +906,77 @@ impl Entry {
                 src_stride: w[4],
                 dst_stride: w[5],
                 halfwords: width == 2,
+            });
+        }
+        if w[0] == op::WRITE_L1_MCAST {
+            let (to, from, len) = (w[3], w[4], w[5]);
+            let [x0, y0, x1, y1] = w[1].to_le_bytes();
+            if len == 0
+                || len > crate::noc::niu::MAX_REQUEST_BYTES
+                || w[2] != 0
+                || w[6] != 0
+                || w[7] != 0
+            {
+                return Err(error::LENGTH);
+            }
+            if x0 > x1 || y0 > y1 {
+                return Err(error::RANGE);
+            }
+            let mut x = x0;
+            while x <= x1 {
+                // Rows are a range, so the two corner rows bound every tile's.
+                if !crate::noc::grid::is_tensix_geometry(x, y0)
+                    || !crate::noc::grid::is_tensix_geometry(x, y1)
+                {
+                    return Err(error::RANGE);
+                }
+                x += 1;
+            }
+            if from % 16 != to % 16
+                || !crate::l1::DATA.contains(from as u64, len as u64)
+                || !crate::l1::DATA.contains(to as u64, len as u64)
+            {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::L1Multicast {
+                start: (x0, y0),
+                end: (x1, y1),
+                to,
+                from,
+                len,
+            });
+        }
+        if w[0] == op::WRITE_L1 || w[0] == op::READ_L1 {
+            // The same five words: the remote address third, the local fourth.
+            let (x, y, to, from, len) = (w[1], w[2], w[3], w[4], w[5]);
+            if len == 0 || len > crate::noc::niu::MAX_REQUEST_BYTES || w[6] != 0 || w[7] != 0 {
+                return Err(error::LENGTH);
+            }
+            if x > 0x3f || y > 0x3f || !crate::noc::grid::is_tensix_geometry(x as u8, y as u8) {
+                return Err(error::RANGE);
+            }
+            if from % 16 != to % 16
+                || !crate::l1::DATA.contains(from as u64, len as u64)
+                || !crate::l1::DATA.contains(to as u64, len as u64)
+            {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(if w[0] == op::READ_L1 {
+                Entry::L1Read {
+                    x: x as u8,
+                    y: y as u8,
+                    from: to,
+                    to: from,
+                    len,
+                }
+            } else {
+                Entry::L1Write {
+                    x: x as u8,
+                    y: y as u8,
+                    to,
+                    from,
+                    len,
+                }
             });
         }
         if w[0] == op::INDEX_PICK {
@@ -1202,6 +1353,107 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+    /// `WRITE_L1`: a Tensix coordinate, both ranges in `DATA` and congruent mod 16, at most one
+    /// request, the reserved words zero; and only NC runs it.
+    #[test]
+    fn an_l1_write_decodes_only_whole_and_only_on_nc() {
+        use super::*;
+        let to = crate::l1::DATA.end as u32 - 4096;
+        let good = [op::WRITE_L1, 4, 4, to, 0x4_0010, 4096, 0, 0];
+        assert_eq!(
+            Entry::decode(0xFF, [op::WRITE_L1, 4, 4, to + 16, 0x4_0010, 64, 0, 0]),
+            Ok(Entry::L1Write {
+                x: 4,
+                y: 4,
+                to: to + 16,
+                from: 0x4_0010,
+                len: 64
+            })
+        );
+        let with = |k: usize, v: u32| {
+            let mut e = good;
+            e[k] = v;
+            Entry::decode(0xFF, e)
+        };
+        assert!(matches!(
+            Entry::decode(0xFF, good),
+            Ok(Entry::L1Write { .. })
+        ));
+        assert_eq!(with(1, 8), Err(error::RANGE), "the non-memory column");
+        assert_eq!(with(1, 9), Err(error::RANGE), "a DRAM column");
+        assert_eq!(with(2, 1), Err(error::RANGE), "above the Tensix rows");
+        assert_eq!(with(1, 64), Err(error::RANGE), "past six bits");
+        assert_eq!(with(5, 0), Err(error::LENGTH));
+        assert_eq!(with(5, 16384 + 16), Err(error::LENGTH));
+        assert_eq!(with(6, 1), Err(error::LENGTH), "a reserved word");
+        assert_eq!(
+            with(3, to + 8),
+            Err(error::ALIGNMENT),
+            "not congruent mod 16"
+        );
+        assert_eq!(with(3, 0x1_0000), Err(error::ALIGNMENT), "below DATA");
+        assert_eq!(
+            with(3, crate::l1::DATA.end as u32 - 64),
+            Err(error::ALIGNMENT),
+            "past DATA"
+        );
+        assert!(Mover::NC.permits(op::WRITE_L1));
+        assert!(!Mover::B.permits(op::WRITE_L1));
+    }
+
+    /// `WRITE_L1_MCAST`: a rectangle of Tensix geometry, `start <= end`, no non-memory or DRAM
+    /// column inside it; the ranges as `WRITE_L1`'s; and only NC runs it.
+    #[test]
+    fn a_multicast_decodes_only_over_tensix_columns() {
+        use super::*;
+        let to = crate::l1::DATA.end as u32 - 4096;
+        let mc = |s: (u8, u8), e: (u8, u8), len: u32| {
+            Entry::decode(
+                0xFF,
+                [
+                    op::WRITE_L1_MCAST,
+                    mcast_corners(s, e),
+                    0,
+                    to,
+                    0x4_0000,
+                    len,
+                    0,
+                    0,
+                ],
+            )
+        };
+        assert_eq!(
+            mc((1, 2), (7, 11), 64),
+            Ok(Entry::L1Multicast {
+                start: (1, 2),
+                end: (7, 11),
+                to,
+                from: 0x4_0000,
+                len: 64
+            })
+        );
+        assert_eq!(mc((10, 2), (14, 11), 4096).map(|_| ()), Ok(()));
+        assert_eq!(
+            mc((7, 2), (10, 2), 64),
+            Err(error::RANGE),
+            "across columns 8 and 9"
+        );
+        assert_eq!(
+            mc((0, 2), (3, 2), 64),
+            Err(error::RANGE),
+            "from the DRAM column"
+        );
+        assert_eq!(
+            mc((3, 1), (3, 4), 64),
+            Err(error::RANGE),
+            "above the Tensix rows"
+        );
+        assert_eq!(mc((4, 4), (3, 4), 64), Err(error::RANGE), "reversed");
+        assert_eq!(mc((3, 4), (4, 4), 0), Err(error::LENGTH));
+        assert!(Mover::NC.permits(op::WRITE_L1_MCAST));
+        assert!(!Mover::B.permits(op::WRITE_L1_MCAST));
+    }
+
     /// Word 4 of a `BARRIER` says whether the unit arrives (0, as every barrier did before
     /// the wait-only form) or only waits (1); anything else, or a word past it, is refused.
     #[test]

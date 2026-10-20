@@ -290,6 +290,12 @@ pub const SMOKE: &[&str] = &[
     "step215_prefetch_txn::",
     // A product's own units reading their first job's `B` ahead, in a capture (opt-in).
     "step216_busy_prefetch::",
+    // A captured graph's L1 residency plan, reported only (planned-l1-residency.md Phase 1).
+    "step217_residency_plan::",
+    // NC writing another tile's L1 (planned-l1-residency.md Phase 2b).
+    "step218_l1_write_records::",
+    // A planned capture keeping its tensors in L1 (planned-l1-residency.md Phase 2).
+    "step219_residency_decode::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

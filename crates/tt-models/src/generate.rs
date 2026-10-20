@@ -687,8 +687,10 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             let token = ids::<B>(&[0], device);
             let position = index::<B>(0, device);
             let (tp, pp) = (input(&token), input(&position));
+            // The step may be captured twice (a residency plan, then the plan applied: `burn_tt::
+            // set_residency`), each run over the same inputs.
             sets[0].capture(Key::Step(len), &[&tp, &pp], || {
-                let (y, state) = model.step(token, position, len, cache);
+                let (y, state) = model.step(token.clone(), position.clone(), len, cache);
                 let next = y.clone().argmax(1);
                 (
                     vec![float(y), B::int_native(next.into_primitive())],
@@ -705,7 +707,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             let last = index::<B>(0, device);
             let (tp, sp, lp) = (input(&tokens), input(&start), input(&last));
             sets[prefill].capture(Key::Chunk(c), &[&tp, &sp, &lp], || {
-                let (y, state) = model.chunk(tokens, start, last, cache);
+                let (y, state) = model.chunk(tokens.clone(), start.clone(), last.clone(), cache);
                 let next = y.clone().argmax(1);
                 (
                     vec![float(y), B::int_native(next.into_primitive())],

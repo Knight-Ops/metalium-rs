@@ -55,7 +55,7 @@ impl Local {
         let ready = req.semaphore("XMOV output reserved", 0, 0..1);
         let done = req.semaphore("XMOV T0 complete", 0, 0..1);
         let plan = req
-            .plan(tt_isa::l1::DATA)
+            .plan(crate::l1::arena())
             .map_err(|e| invalid(&e.to_string()))?;
         let ready = plan.semaphore(ready);
         let done = plan.semaphore(done);

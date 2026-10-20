@@ -162,6 +162,27 @@ impl Placement {
         self.tiles
     }
 
+    /// Each channel's share of the slots, in the order tiles are dealt to them: `(the chip's
+    /// channel index, offset, bytes)`. A view's are its allocation's.
+    pub(crate) fn extents(&self) -> impl Iterator<Item = (u8, u64, u64)> + '_ {
+        let bytes = self.slots * self.slot_bytes;
+        self.channels
+            .iter()
+            .zip(&self.base)
+            .map(move |(c, &b)| (c.index(), b, bytes))
+    }
+
+    /// Bytes a tile's slot takes.
+    pub(crate) fn slot_bytes(&self) -> u64 {
+        self.slot_bytes
+    }
+
+    /// Do `self` and `other` name slots of one allocation (a view and what it borrows, or the
+    /// same tensor twice)?
+    pub(crate) fn same_allocation(&self, other: &Placement) -> bool {
+        self.channels == other.channels && self.base == other.base
+    }
+
     /// The whole of a one-channel placement's slots ([`DramAlloc::alloc_on`]).
     pub(crate) fn region(&self) -> Option<DramRange> {
         match self.channels[..] {
@@ -205,6 +226,9 @@ pub struct DramAlloc {
     channels: Vec<DramChannel>,
     /// Per channel: free regions as `offset -> bytes`, coalesced on free.
     free: Vec<BTreeMap<u64, u64>>,
+    /// The tensors allocated since [`DramAlloc::start_log`], in order, while one is kept: a
+    /// capture's own tensors (`crate::residency`).
+    log: Option<Vec<Placement>>,
 }
 
 impl DramAlloc {
@@ -216,7 +240,27 @@ impl DramAlloc {
             .iter()
             .map(|_| BTreeMap::from([(0, usable)]))
             .collect();
-        DramAlloc { channels, free }
+        DramAlloc {
+            channels,
+            free,
+            log: None,
+        }
+    }
+
+    /// Keep every tensor allocated from now on ([`DramAlloc::alloc`]) until
+    /// [`DramAlloc::take_log`].
+    pub(crate) fn start_log(&mut self) {
+        self.log = Some(Vec::new());
+    }
+
+    /// What was allocated since [`DramAlloc::start_log`], so far.
+    pub(crate) fn logged(&self) -> &[Placement] {
+        self.log.as_deref().unwrap_or(&[])
+    }
+
+    /// What was allocated since [`DramAlloc::start_log`], and stop keeping it.
+    pub(crate) fn take_log(&mut self) -> Vec<Placement> {
+        self.log.take().unwrap_or_default()
     }
 
     /// `bytes` contiguous on channel `channel` (an index into the chip's
@@ -277,7 +321,7 @@ impl DramAlloc {
             }
             base.push(at);
         }
-        Ok(Placement {
+        let p = Placement {
             channels: self.channels.clone(),
             base,
             slots,
@@ -285,7 +329,11 @@ impl DramAlloc {
             tiles,
             first: 0,
             owned: true,
-        })
+        };
+        if let Some(log) = &mut self.log {
+            log.push(p.clone());
+        }
+        Ok(p)
     }
 
     /// Give `p`'s slots back; nothing, for a view.
@@ -1700,14 +1748,16 @@ impl BlockPlan {
                 // are every `units`-th: they alternate halves by `j / units`.
                 let half = (staging == Staging::SlotsHalf)
                     .then(|| ((jobs.len() / units.max(1)) % 2) as u8);
-                let planned = match self.packed_a {
+                // The second half's layout is the first's moved up, and noted there.
+                let up = if half == Some(1) { matmul::half() } else { 0 };
+                let planned = crate::l1::planned_shifted(up, || match self.packed_a {
                     Some(_) => {
                         matmul::plan_layout_packed_a(tiles, in_fmt, staging, packed_a_slots(kt))
                     }
                     None => matmul::plan_layout_in(tiles, in_fmt, staging),
-                };
+                });
                 let layout = match planned {
-                    Ok(l) if half == Some(1) => l.shifted(matmul::HALF),
+                    Ok(l) if half == Some(1) => l.shifted(matmul::half()),
                     Ok(l) => l,
                     Err(e) => return Err(e.into()),
                 };
@@ -2678,11 +2728,18 @@ fn half_of(j: usize, units: usize) -> u8 {
 /// `slots` tile slots of scratch for the mover's own use, planned in the data
 /// arena (`crate::l1`): where an element-wise run or a column sum stages its
 /// tiles.
+/// `want` staging slots, or as many as the arena holds ([`crate::l1::arena`]) where fewer: an even
+/// number, at least two, so batches can alternate halves.
+fn arena_group(want: usize) -> usize {
+    let slots = (crate::l1::arena().len() / TILE_SLOT) as usize;
+    want.min(slots / 2 * 2).max(2)
+}
+
 fn staging(name: &'static str, slots: usize) -> Result<u64> {
     let mut req = crate::l1::Requirements::new(1);
     let b = req.scratch(name, slots as u64 * TILE_SLOT, tt_isa::dram::ALIGN, 0..1);
     let plan = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     Ok(plan.addr(b))
 }
@@ -3194,7 +3251,7 @@ pub(crate) fn metadata(
     let dst = req.scratch("metadata destination", TILE_SLOT, 64, 0..1);
     let constant = req.scratch("metadata immediate", TILE_SLOT, 64, 0..1);
     let plan = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (dst, constant) = (plan.addr(dst), plan.addr(constant));
     let out = DramTensor::alloc_elem(alloc, rows, cols, elem)?;
@@ -3342,7 +3399,8 @@ fn sfpu_group(
     use std::sync::{Mutex, OnceLock};
     // Measuring builds the op's role programs twice over: once per op kind,
     // scalar and broadcast, not once per op.
-    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast, bool), usize>>;
+    // By the arena's end too (`crate::l1::arena`): a group is sized from it.
+    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast, bool, u64), usize>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
     let key = (
         op.kind,
@@ -3350,6 +3408,7 @@ fn sfpu_group(
         op.scalar2.to_bits(),
         bcast,
         half,
+        crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
@@ -3369,8 +3428,13 @@ fn measure_sfpu_group(
     half: bool,
 ) -> usize {
     const GROUP: usize = 64;
+    // The programs' lengths, which do not depend on where the layout sits: measured in the whole of
+    // `DATA`, whatever the arena, and not noted as the op's.
     let lens = |n: usize| -> [usize; 3] {
-        let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
+        let layout = crate::l1::unnoted(|| {
+            crate::sfpu::kernel::plan_layout_in(n, operands, tt_isa::l1::DATA)
+        })
+        .expect("two tiles always fit DATA");
         let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
             .expect("checked by the caller");
         crate::sfpu::kernel::roles_code(&layout, operands, &math)
@@ -3388,9 +3452,9 @@ fn measure_sfpu_group(
         .min()
         .unwrap();
     let arena = if half {
-        crate::matmul::HALF
+        crate::matmul::half()
     } else {
-        tt_isa::l1::DATA.len()
+        crate::l1::arena().len()
     };
     GROUP
         .min(crate::sfpu::kernel::max_tiles_in(operands, arena))
@@ -3419,9 +3483,11 @@ fn sfpu_programs(
         usize,
         Option<u8>,
         u32,
+        u64,
     );
     type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
+    // The programs name the layout's addresses, planned in the arena (`crate::l1::arena`).
     let key = (
         op.kind,
         op.scalar.to_bits(),
@@ -3430,6 +3496,7 @@ fn sfpu_programs(
         len,
         half,
         rows,
+        crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
     // The highest `DATA` address the layout reaches, noted on every hit as a plan notes it on a
@@ -3457,7 +3524,7 @@ fn sfpu_programs(
     let layout = match half {
         None => crate::sfpu::kernel::plan_layout(len, operands),
         Some(h) => crate::sfpu::kernel::plan_layout_in(len, operands, crate::matmul::half_arena())
-            .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
+            .map(|l| l.shifted(h as u64 * crate::matmul::half())),
     }
     .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (_, math) = crate::sfpu::ops::code_for_rows(op.kind, [op.scalar, op.scalar2], bcast, rows)
@@ -3839,7 +3906,7 @@ pub fn rms_divide(
         scalar2: 0.0,
     };
     // A run's slots: the packed row, the statistic, its tiles of `a` and of the result.
-    let by_slots = ((tt_isa::l1::DATA.len() / TILE_SLOT) as usize).saturating_sub(pt + 1) / 2;
+    let by_slots = ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(pt + 1) / 2;
     let group = sfpu_group(div, Broadcast::Col, Operands::ColBroadcast, false).min(by_slots);
     if group == 0 {
         return Err(TensorError::Shape(format!(
@@ -3994,7 +4061,7 @@ pub fn rope_blocks(
     let (_, mul_add) = code_for_rows(kind_sfpu::MUL_ADD, [0.0, 0.0], Broadcast::None, live)
         .ok_or_else(|| TensorError::Shape("no MUL_ADD program".into()))?;
     // A run's slots: `x`, `cos`, `rotate(x)`, `sin`, the product and the result.
-    let group = (((tt_isa::l1::DATA.len() / TILE_SLOT) as usize) / 6).min(64);
+    let group = (((crate::l1::arena().len() / TILE_SLOT) as usize) / 6).min(64);
     let out = DramTensor::alloc(alloc, rows, cols)?;
     let ro = out.tensor_ref();
     let mut jobs = Vec::new();
@@ -4517,9 +4584,11 @@ fn reduce_group(
     use crate::sfpu::reduce::{Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32, bool, ReduceThen), Option<usize>>>;
+    // By the arena's end too (`crate::l1::arena`): a group is sized from it.
+    type Key = (ReduceOp, Axis, usize, u32, bool, ReduceThen, u64);
+    type Memo = Mutex<HashMap<Key, Option<usize>>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, per, valid, half, then);
+    let key = (op, axis, per, valid, half, then, crate::l1::arena().end);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
@@ -4542,9 +4611,9 @@ fn measure_reduce_group(
     use crate::sfpu::reduce::{math_programs, plan_layout, roles};
     const GROUP: usize = 64;
     let arena = if half {
-        crate::matmul::HALF
+        crate::matmul::half()
     } else {
-        tt_isa::l1::DATA.len()
+        crate::l1::arena().len()
     };
     let slots = (arena / TILE_SLOT) as usize;
     let by_slots = slots / (per + 1);
@@ -4589,27 +4658,54 @@ fn reduce_programs(
     use crate::sfpu::reduce::{math_programs, plan_layout, plan_layout_in, roles, Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (ReduceOp, Axis, usize, usize, u32, Option<u8>, ReduceThen);
-    type Memo = Mutex<HashMap<Key, ReducePrograms>>;
+    type Key = (
+        ReduceOp,
+        Axis,
+        usize,
+        usize,
+        u32,
+        Option<u8>,
+        ReduceThen,
+        u64,
+    );
+    // Each layout with what its plan reached, where it was moved to, noted again on every hit
+    // (`crate::l1::note_planned`); by the arena's end too, where it was planned.
+    type Memo = Mutex<HashMap<Key, (ReducePrograms, crate::l1::Planned)>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, len, per, valid, half, then);
+    let key = (
+        op,
+        axis,
+        len,
+        per,
+        valid,
+        half,
+        then,
+        crate::l1::arena().end,
+    );
     let memo = MEMO.get_or_init(Default::default);
-    if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+    if let Some((p, planned)) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        crate::l1::note_planned(*planned);
         return Ok(p.clone());
     }
+    let before = crate::l1::take_planned();
     let layout = match half {
         None => plan_layout(len, per),
-        Some(h) => plan_layout_in(len, per, crate::matmul::half_arena())
-            .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
-    }
-    .map_err(|e| TensorError::Shape(e.to_string()))?;
+        Some(h) => crate::l1::planned_shifted(h as u64 * crate::matmul::half(), || {
+            plan_layout_in(len, per, crate::matmul::half_arena())
+        })
+        .map(|l| l.shifted(h as u64 * crate::matmul::half())),
+    };
+    let planned = crate::l1::take_planned();
+    crate::l1::note_planned(before);
+    crate::l1::note_planned(planned);
+    let layout = layout.map_err(|e| TensorError::Shape(e.to_string()))?;
     let (inputs, _) = math_programs(op, axis, per, valid);
     let fin = finishing(op, axis, then)
         .ok_or_else(|| TensorError::Shape("a reduction's finishing kind is no exact one".into()))?;
     let p = (layout.clone(), Arc::new(roles(&layout, &inputs, &fin)));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(key, p.clone());
+        .insert(key, (p.clone(), planned));
     Ok(p)
 }
 
@@ -4733,9 +4829,19 @@ pub fn sum_rows(
 /// role programs' length; `None` if not even one fits.
 fn chunk_group() -> Option<usize> {
     use crate::sfpu::reduce::{chunk_roles, plan_chunk_layout, ROW_CHUNK};
-    static MEMO: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *MEMO.get_or_init(|| {
-        let slots = (tt_isa::l1::DATA.len() / TILE_SLOT) as usize;
+    // By the arena's end (`crate::l1::arena`).
+    static MEMO: std::sync::Mutex<std::collections::BTreeMap<u64, Option<usize>>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let arena = crate::l1::arena();
+    if let Some(&g) = MEMO
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&arena.end)
+    {
+        return g;
+    }
+    let g = (|| {
+        let slots = (arena.len() / TILE_SLOT) as usize;
         let by_slots = slots / (ROW_CHUNK + 2);
         let lens = |n: usize| -> Option<[usize; 3]> {
             let c = plan_chunk_layout(n).ok()?;
@@ -4755,7 +4861,11 @@ fn chunk_group() -> Option<usize> {
             .min()
             .unwrap();
         Some(64.min(by_slots).min(by_program).max(1))
-    })
+    })();
+    MEMO.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(arena.end, g);
+    g
 }
 
 /// [`sum_rows`]'s padding rules. It reads only a ragged tensor's valid rows
@@ -4947,12 +5057,12 @@ impl OpPadding for Eltwise {
 /// Its padding is the source tiles' -- the parent's data, for a view -- so
 /// undefined unless `t`'s is zero.
 pub fn copy(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work> {
-    const GROUP: usize = 128;
-    let stage = staging("copy slots", GROUP)?;
+    let group = arena_group(128);
+    let stage = staging("copy slots", group)?;
     let out = DramTensor::alloc_elem(alloc, t.rows, t.cols, t.elem)?;
     let [rt, ct] = t.grid();
     let (rs, ro) = (t.tensor_ref(), out.tensor_ref());
-    let jobs = runs(rt * ct, units, GROUP)
+    let jobs = runs(rt * ct, units, group)
         .into_iter()
         .map(|run| {
             let (first, count) = (run.start as u32, run.len() as u32);
@@ -4997,11 +5107,11 @@ pub fn copy_into(src: &DramTensor, dst: &DramTensor, units: usize) -> Result<Wor
             src.rows, src.cols, src.elem, dst.rows, dst.cols, dst.elem
         )));
     }
-    const GROUP: usize = 128;
-    let stage = staging("copy slots", GROUP)?;
+    let group = arena_group(128);
+    let stage = staging("copy slots", group)?;
     let [rt, ct] = src.grid();
     let (rs, ro) = (src.tensor_ref(), dst.tensor_ref());
-    let jobs = runs(rt * ct, units, GROUP)
+    let jobs = runs(rt * ct, units, group)
         .into_iter()
         .map(|run| {
             let (first, count) = (run.start as u32, run.len() as u32);
@@ -5066,7 +5176,7 @@ pub fn copy_blocks(
     [rows, cols]: [usize; 2],
     units: usize,
 ) -> Result<Work> {
-    const GROUP: usize = 128;
+    let group = arena_group(128);
     let out = DramTensor::alloc_elem(alloc, rows, cols, t.elem)?;
     let checked = (|| {
         let [ort, oct] = out.grid();
@@ -5108,13 +5218,13 @@ pub fn copy_blocks(
             return Err(e);
         }
     };
-    let stage = staging("copy slots", GROUP)?;
+    let stage = staging("copy slots", group)?;
     let per = units.div_ceil(moves.len().max(1)).max(1);
     let mut jobs = Vec::new();
     for (rs, ro, [r, c], transposed) in refs {
         let ct = c.div_ceil(32);
         let flags = if transposed { 8 } else { 0 };
-        for run in runs(r.div_ceil(32) * ct, per, GROUP) {
+        for run in runs(r.div_ceil(32) * ct, per, group) {
             let (first, count) = (run.start as u32, run.len() as u32);
             jobs.push(vec![Step::Transfer {
                 what: "block copy list",
@@ -5204,7 +5314,7 @@ pub fn repack_many(
     );
     let output = req.scratch("repack destination tile", TILE_SLOT, 64, 0..1);
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (input, output) = (layout.addr(input), layout.addr(output));
     let out = DramTensor::alloc_elem(alloc, rows, cols, t.elem)?;
@@ -5634,7 +5744,7 @@ pub fn write_rows(
 /// tiles only, dealt out in runs to `units` tiles. Nothing at all when `t`
 /// has no ragged edge.
 pub fn fill_pad(t: &DramTensor, value: f32, units: usize) -> Result<Vec<Job>> {
-    const GROUP: usize = 192;
+    let group = arena_group(192);
     let [rt, ct] = t.grid();
     let (rows, cols) = (t.rows % 32, t.cols % 32);
     let edges = if rows != 0 { ct } else { 0 }
@@ -5646,11 +5756,11 @@ pub fn fill_pad(t: &DramTensor, value: f32, units: usize) -> Result<Vec<Job>> {
     if edges == 0 {
         return Ok(Vec::new());
     }
-    let stage = staging("fill-pad slots", GROUP)?;
+    let stage = staging("fill-pad slots", group)?;
     let r = t.tensor_ref();
     // B reads each edge tile and fills its padding; NC writes it back. Batches
     // of half the staging alternate, so NC writes one while B fills the next.
-    const PER_BATCH: usize = GROUP / 2;
+    let per_batch = group / 2;
     let head = |op: u32, first: usize, count: usize, stage: u64| {
         [
             op,
@@ -5663,15 +5773,15 @@ pub fn fill_pad(t: &DramTensor, value: f32, units: usize) -> Result<Vec<Job>> {
             rt as u32,
         ]
     };
-    Ok(runs(edges, units, GROUP)
+    Ok(runs(edges, units, group)
         .into_iter()
         .map(|run| {
             let batches = (run.start..run.end)
-                .step_by(PER_BATCH)
+                .step_by(per_batch)
                 .enumerate()
                 .map(|(b, first)| {
-                    let count = PER_BATCH.min(run.end - first);
-                    let at = stage + (b % 2 * PER_BATCH) as u64 * TILE_SLOT;
+                    let count = per_batch.min(run.end - first);
+                    let at = stage + (b % 2 * per_batch) as u64 * TILE_SLOT;
                     let side =
                         |op: u32| vec![head(op, first, count, at), r.encode()[0], r.encode()[1]];
                     TransferBatch {

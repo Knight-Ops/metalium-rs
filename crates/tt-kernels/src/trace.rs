@@ -70,6 +70,19 @@ pub enum TraceError {
     NotResident,
     /// A capture with nothing in it.
     Empty,
+    /// A planned capture that is not its plan's (`Session::begin_trace_planned`): why. Nothing
+    /// was kept; what its run wrote to the state is the plain trace's to restore.
+    Planned(String),
+    /// Captured op `op` (`label`, `what`) planned L1 up to `top` (0: its layout was not planned
+    /// while captured, so its need is unknown), past the persistent region's base `base`
+    /// (`Session::set_l1_region`).
+    IntoRegion {
+        op: usize,
+        label: &'static str,
+        what: &'static str,
+        top: u64,
+        base: u64,
+    },
 }
 
 impl core::fmt::Display for TraceError {
@@ -98,6 +111,25 @@ impl core::fmt::Display for TraceError {
                  a replay cannot do"
             ),
             TraceError::Empty => write!(f, "the capture ran no device work"),
+            TraceError::Planned(why) => write!(f, "the planned capture is not its plan's: {why}"),
+            TraceError::IntoRegion {
+                op,
+                label,
+                what,
+                top,
+                base,
+            } => match top {
+                0 => write!(
+                    f,
+                    "captured op {op} ({label}, {what}) did not plan its L1 layout while captured, \
+                     so whether it stays below the persistent region at {base:#x} is unknown"
+                ),
+                _ => write!(
+                    f,
+                    "captured op {op} ({label}, {what}) plans L1 up to {top:#x}, into the \
+                     persistent region at {base:#x}"
+                ),
+            },
         }
     }
 }
@@ -136,6 +168,15 @@ pub struct OpRecord {
     /// The highest `DATA` address its L1 plans reached ([`crate::l1::take_planned_top`]): what it
     /// needs of a unit's arena. Zero where its layout was not planned while it was captured.
     pub l1_top: u64,
+    /// The highest address of [`OpRecord::l1_top`]'s that it could not do without
+    /// ([`crate::l1::Planned::need`]): below `l1_top` where a plan left room on purpose (a product's
+    /// `B` ring against the arena's end), what a smaller arena must still hold. Zero where
+    /// `l1_top` is.
+    pub l1_need: u64,
+    /// A hash of how its lists were laid out before a planned capture rewrote them: each unit's
+    /// steps, their kinds and entry counts. A planned capture's ops must have their plan pass's
+    /// (`crate::residency::Applied`).
+    pub shape: u64,
 }
 
 /// What a stored stream is made of: how many entries it holds, how many of those
@@ -309,6 +350,15 @@ pub(crate) struct Capture {
     pub(crate) weight_anchor: Option<(u32, Vec<usize>)>,
     /// The units that product ran on: the rest are where the next one's weights stream.
     pub(crate) weight_units: usize,
+    /// Where the persistent region begins, if the capture keeps one (`Session::set_l1_region`):
+    /// every op it holds planned below it ([`crate::l1::arena`]).
+    pub(crate) region_base: Option<u64>,
+    /// The residency plan it applies (`Session::begin_trace_planned`), while it does.
+    pub(crate) applied: Option<std::sync::Arc<crate::residency::Applied>>,
+    /// Why the plan stopped applying, if it did: the capture is then refused.
+    pub(crate) plan_mismatch: Option<String>,
+    /// Whether it began planned: it ends verified against its plan, or refused.
+    pub(crate) planned: bool,
 }
 
 impl Capture {
@@ -486,11 +536,17 @@ mod tests {
                     stamps: [0; 2],
                     bytes: Default::default(),
                     l1_top: 0,
+                    l1_need: 0,
+                    shape: 0,
                 })
                 .collect(),
             failed: false,
             weight_anchor: None,
             weight_units: 0,
+            region_base: None,
+            applied: None,
+            plan_mismatch: None,
+            planned: false,
         }
     }
 

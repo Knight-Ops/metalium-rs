@@ -253,6 +253,60 @@ fn issue_write(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
     }
 }
 
+/// [`op::WRITE_L1`]'s one request, NC's: `len` bytes of this tile's L1 at `from` to `to` in the L1
+/// of tile `at`, through the NIU NC's writes go out on (as [`issue_write`], without flipping an
+/// alternating NIU), under NC's ID, so the drains that wait for its GDDR writes wait for it too.
+#[link_section = ".text.warm"]
+#[inline(never)]
+fn issue_l1_write(me: (u8, u8), at: (u8, u8), to: u32, from: u32, len: u32) -> Result<(), u32> {
+    use tt_isa::noc::niu::Endpoint;
+    let w = *writes();
+    let (niu, me) = match w.niu {
+        Niu::Noc1 => (Niu::Noc1, w.me1),
+        Niu::Noc0 => (Niu::Noc0, me),
+    };
+    let cmd = Command::Write {
+        from_local: from,
+        to: Endpoint {
+            x: at.0,
+            y: at.1,
+            addr: to,
+        },
+        len,
+    };
+    noc::issue(niu, &cmd, me, TXN).map_err(|_| dm::error::ALIGNMENT)
+}
+
+/// [`op::WRITE_L1_MCAST`], NC's: once its earlier writes have landed, one multicast of `len` bytes
+/// at `from` to `to` in every tile of `start..=end` through NoC #1, then its acknowledgements
+/// counted on that NIU's write-ack counter, which nothing else then moves (B never writes through
+/// NoC #1). Refused through NoC #0, whose counter B's barrier release moves, and for a rectangle
+/// holding this tile.
+#[link_section = ".text.warm"]
+#[inline(never)]
+fn multicast_l1(me: (u8, u8), start: (u8, u8), end: (u8, u8), [to, from, len]: [u32; 3]) -> Result<(), u32> {
+    use tt_isa::noc::multicast::{corners_hi, registers_to};
+    const MCAST_TXN: TxnId = match TxnId::new(dm::TXN_NC_MCAST) {
+        Some(t) => t,
+        None => panic!(),
+    };
+    let w = *writes();
+    if w.niu != Niu::Noc1 {
+        return Err(dm::error::DIRECTION);
+    }
+    if (start.0..=end.0).contains(&me.0) && (start.1..=end.1).contains(&me.1) {
+        return Err(dm::error::RANGE);
+    }
+    let regs = registers_to(from, to, len, corners_hi(start, end, Niu::Noc1), w.me1, MCAST_TXN)
+        .map_err(|_| dm::error::ALIGNMENT)?;
+    let acks = (end.0 - start.0 + 1) as u32 * (end.1 - start.1 + 1) as u32;
+    noc::wait(TXN);
+    let before = noc::wr_acks_on(Niu::Noc1);
+    noc::issue_multicast_on(Niu::Noc1, &regs);
+    while noc::wr_acks_on(Niu::Noc1).wrapping_sub(before) < acks {}
+    Ok(())
+}
+
 /// One descriptor's requests through NoC #1 (`NOC1`) or NoC #0, on `port`.
 #[inline(always)]
 fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<(), u32> {
@@ -826,6 +880,45 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             publish();
         }
         Entry::Move { descriptor, .. } => issue(me, descriptor)?,
+        Entry::L1Write {
+            x,
+            y,
+            to,
+            from,
+            len,
+        } => {
+            if !IS_NC {
+                return Err(dm::error::DIRECTION);
+            }
+            issue_l1_write(me, (x, y), to, from, len)?;
+        }
+        Entry::L1Read {
+            x,
+            y,
+            from,
+            to,
+            len,
+        } => {
+            reader_only()?;
+            let cmd = Command::Read {
+                from: tt_isa::noc::niu::Endpoint { x, y, addr: from },
+                to_local: to,
+                len,
+            };
+            noc::issue(Niu::Noc0, &cmd, me, read_txn()).map_err(|_| dm::error::ALIGNMENT)?;
+        }
+        Entry::L1Multicast {
+            start,
+            end,
+            to,
+            from,
+            len,
+        } => {
+            if !IS_NC {
+                return Err(dm::error::DIRECTION);
+            }
+            multicast_l1(me, start, end, [to, from, len])?;
+        }
         Entry::Kernel {
             generation,
             programs,

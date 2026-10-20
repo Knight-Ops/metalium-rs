@@ -28,7 +28,7 @@ pub(crate) fn jobs(
     let dst = req.scratch("indexed output tile", TILE_SLOT, 64, 0..1);
     let zero = req.scratch("indexed output initialization", TILE_SLOT, 64, 0..1);
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (idx, src, dst, zero) = (
         layout.addr(idx),
@@ -192,7 +192,7 @@ pub(crate) fn select_taps_jobs(
         0..1,
     );
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (idx, stage) = (layout.addr(idx), layout.addr(slots));
     // The mover does not check that `SELECT_ROWS`'s slots are in the data
@@ -401,7 +401,7 @@ pub(crate) fn scatter_rows_jobs(
         0..1,
     );
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (idx, stage) = (layout.addr(idx), layout.addr(slots));
     // The mover does not check that `SCATTER_ROWS`'s slots are in the data
@@ -511,7 +511,7 @@ pub(crate) fn zero_tile_row_jobs(out: &DramTensor, tile_row: usize) -> Result<Ve
     let mut req = crate::l1::Requirements::new(1);
     let zero = req.scratch("zero tile", TILE_SLOT, 64, 0..1);
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let zero = layout.addr(zero);
     let batches = (0..ct)
