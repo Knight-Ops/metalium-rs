@@ -424,6 +424,21 @@ pub mod niu {
             }
         }
 
+        /// Is there room for one more request now, without waiting? Reads the counter (once)
+        /// only when `room` is 0, as [`InFlight::before_issue`] would, and refills `room` from it.
+        pub fn try_room(&mut self, outstanding: impl FnOnce() -> u8) -> bool {
+            if self.room != 0 {
+                return true;
+            }
+            let n = outstanding() as u16;
+            if n < self.cap {
+                self.room = self.cap - n;
+                true
+            } else {
+                false
+            }
+        }
+
         /// One request was issued.
         pub fn after_issue(&mut self) {
             self.room -= 1;
@@ -1155,6 +1170,21 @@ pub mod niu {
             assert!(!f.at_cap());
             f.drained();
             assert!(!f.at_cap());
+        }
+
+        #[test]
+        fn try_room_reads_only_at_the_cap_and_never_waits() {
+            let mut f = InFlight::new();
+            f.set_cap(2);
+            assert!(f.try_room(|| panic!("read with room")));
+            f.after_issue();
+            f.after_issue();
+            // At the cap: one read; still full is no room, and no wait.
+            assert!(!f.try_room(|| 2));
+            assert!(f.at_cap());
+            // One completed: room for one.
+            assert!(f.try_room(|| 1));
+            assert_eq!(f.room(), 1);
         }
 
         #[test]

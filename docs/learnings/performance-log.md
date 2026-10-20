@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Busy-unit prefetch and the prefetch pump](#busy-unit-prefetch-and-the-prefetch-pump-2026-10-20-cards-0-and-1) | 2026-10-20 | a product's own units read `B` ahead under the ops before it: the products 15.24 -> 11.66 ms, but the small ops' reads queue behind the prefetch (the residual add 14 -> ~100 us): the step 20.97 -> 21.58 ms, at best 20.74 / 21.76 with ID 6's cap at 2 / 1; opt-in |
 | [The Phase 8 feasibility probe](#the-phase-8-feasibility-probe-the-step-without-its-weight-stream-and-under-one-2026-10-20-cards-0-and-1) | 2026-10-20 | a 1.7B decode step with its weights free is **7.85 ms** (today 20.92); under a ~300 GB/s stream on idle units its ops cost 1.6x, mostly drains waiting on reads; L1, not bandwidth, bounds a continuous stream; the packed-`A` ring wastes ~254 KB a product unit |
 | [The token on the card, RoPE as one op, and three copies gone](#the-token-on-the-card-rope-as-one-op-and-three-copies-gone-2026-10-19-cards-0-and-1) | 2026-10-19 | a row's argmax as one native op and the greedy token read back alone; RoPE as one op; a no-op reshape, the value's copy and the context's repack gone: a 1.7B decode step -> **20.95 / 21.41 / 22.18 ms**, 135M -> **8.00 / 8.59 / 9.38**; sampling on the card works (112 ms a token) |
 | [RMSNorm as one op, and one region a job](#rmsnorm-as-one-op-and-one-region-a-job-2026-10-19-cards-0-and-1) | 2026-10-19 | a job's kernels share one semaphore initialisation, so they run as one region (attention 35 -> 25 us a layer); RMSNorm's statistic and `DIV` as one op on 32 units: a 1.7B decode step -> **22.24 / 22.70 / 23.43 ms** |
@@ -341,6 +342,27 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Busy-unit prefetch and the prefetch pump (2026-10-20, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, Steps 3-5 and the pump. SmolLM2-1.7B-Instruct, F32,
+every tile, `silicon_bench_models::traced_generation_stream_ceiling` with `TT_PROBE_STREAM=off`.
+
+| Decode step, ms (32 / 256-token prompt), card 0 | |
+|---|--:|
+| before: the packed-`A` reclaim (`1792466481`) | 20.90 / 22.15 |
+| `B`'s ring at the top of `DATA`, busy prefetch off (`1792469766`) | 20.94 / 22.21 |
+| busy prefetch on, issued with its record (`1792469641`) | 21.93 / 23.78 |
+| busy prefetch on, the pump, ID 6 cap 8 (`1792504143`) | 21.58 / 23.25 |
+| cap 4 (`1792505352`) | 21.23 / 23.07 |
+| cap 2 (`1792505230`) | **20.74** / 22.25 |
+| cap 1 (`1792505109`) | 21.49 / **21.76** |
+| off, the same build (`1792505474`) | 20.97 / 22.19 |
+
+`Step(64)` profiles (card 1): off (`1792470407`) products 15.24 ms, the rest 4.63; on, issued with its record
+(`1792470019`) products 11.66 (1.7 GB of `B` read ahead), the residual add 0.67 -> 5.15 ms (14 -> 107 us each), RoPE 0.81
+-> 1.55; on, the pump (`1792504522`) products 11.59, the add 4.77 (99 us each). The add waits for its own reads behind
+the prefetch at GDDR, not for the prefetch's issue: see the [operating notes](silicon-operating-notes.md#gddr-reads-are-one-queue-prefetch-traffic-is-paid-by-the-small-ops-2026-10-20-cards-0-and-1).
 
 ## The Phase 8 feasibility probe: the step without its weight stream, and under one (2026-10-20, cards 0 and 1)
 

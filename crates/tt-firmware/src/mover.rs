@@ -40,6 +40,104 @@ fn read_txn() -> TxnId {
     unsafe { READ_TXN }
 }
 
+/// The prefetch being issued from the mover's waits (`record::PrefetchCursor`), RISCV B only: a
+/// resident-`A` prefetch `GATHER` queues here instead of issuing all its reads before the next
+/// entry, and [`pump`] issues them while the mover would otherwise wait -- for a barrier, the
+/// roles, the writer -- under `PREFETCH_TXN`'s cap. In local data RAM, set before the first list.
+#[link_section = ".local"]
+static mut PUMP: Option<record::PrefetchCursor> = None;
+/// The first refusal a queued prefetch met, reported when it is drained ([`pump_finish`]).
+#[link_section = ".local"]
+static mut PUMP_ERROR: u32 = 0;
+/// The tile's coordinate and usable channels, for the pump's reads.
+#[link_section = ".local"]
+static mut PUMP_AT: ((u8, u8), u32) = ((0, 0), 0);
+
+fn pump_slot() -> &'static mut Option<record::PrefetchCursor> {
+    // SAFETY: one core runs this firmware, with no interrupts; no reference outlives its use.
+    unsafe { &mut *core::ptr::addr_of_mut!(PUMP) }
+}
+
+fn pump_fail(code: u32) {
+    // SAFETY: as `pump_slot`.
+    unsafe {
+        if PUMP_ERROR == 0 {
+            PUMP_ERROR = code;
+        }
+    }
+    *pump_slot() = None;
+}
+
+/// The most reads one wait-loop turn issues: one, so a wait that ends goes on at once; a long wait
+/// turns many times.
+const PUMP_TURN: u32 = 1;
+
+/// Issue up to `most` of the queued prefetch's reads while `PREFETCH_TXN` has room, or, with
+/// `most` `u32::MAX`, every one left (waiting for room). Bounded because a read completes faster
+/// than the mover issues the next (divergence row 72 on ttsim, and ~0.27 us an issue on silicon):
+/// room alone would issue them all before the next entry. Each is a plain read checked as any
+/// (`Descriptor::decode`), issued through initiator 0 (`noc::issue_dram_on`), so the fast path's
+/// initiator keeps what it holds.
+#[inline(never)]
+fn pump(most: u32) {
+    let all = most == u32::MAX;
+    if IS_NC {
+        return;
+    }
+    let Some(c) = pump_slot().as_mut() else {
+        return;
+    };
+    // SAFETY: as `pump_slot`.
+    let (me, usable) = unsafe { PUMP_AT };
+    for _ in 0..most {
+        if !all && !noc::has_room(PREFETCH_TXN) {
+            return;
+        }
+        let e = match c.next() {
+            None => {
+                *pump_slot() = None;
+                return;
+            }
+            Some(Ok(e)) => e,
+            Some(Err(code)) => return pump_fail(code),
+        };
+        let issued = Descriptor::decode(usable, e[0], e[1], e[2], e[3], e[4], e[5]).and_then(|d| {
+            let port = d.range.channel().port_for(Niu::Noc0, d.port);
+            let mv = DramMove::new(d.range, port, d.l1, false, me, PREFETCH_TXN, Niu::Noc0)
+                .map_err(|_| dm::error::ALIGNMENT)?;
+            for r in mv.words() {
+                noc::issue_dram_on::<false>(
+                    r.targ,
+                    r.targ_hi,
+                    r.ret,
+                    r.ret_hi,
+                    r.tag,
+                    r.ctrl,
+                    r.len,
+                    PREFETCH_TXN,
+                );
+            }
+            Ok(())
+        });
+        if let Err(code) = issued {
+            return pump_fail(code);
+        }
+    }
+}
+
+/// Issue what is left of the queued prefetch and report its first refusal: before a prefetch
+/// `WAIT`, a new prefetch, and a list's end.
+fn pump_finish() -> Result<(), u32> {
+    pump(u32::MAX);
+    // SAFETY: as `pump_slot`.
+    let code = unsafe { core::mem::replace(&mut *core::ptr::addr_of_mut!(PUMP_ERROR), 0) };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(code)
+    }
+}
+
 /// Send B's reads out on `txn` from now on. The fast read path keeps the request tag, which holds
 /// the ID, from one read to the next: it is told to write every register again.
 fn set_read_txn(txn: TxnId) {
@@ -189,6 +287,12 @@ fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<
 fn list_settings() {
     noc::set_cap(TXN, rd(M.at(dm::IN_FLIGHT_CAP)));
     if !IS_NC {
+        // Nothing is in flight on it: the last list's end drained it.
+        let cap = rd(M.at(dm::PREFETCH_CAP));
+        noc::set_cap(
+            PREFETCH_TXN,
+            if cap == 0 { dm::TILE_IN_FLIGHT_CAP } else { cap },
+        );
         noc::set_read_path(rd(M.at(dm::READ_FAST)) != 0);
         return;
     }
@@ -372,6 +476,7 @@ fn await_roles(generation: u32) -> Result<(), u32> {
             if rd(mb.status()) == status::PANICKED {
                 return Err(dm::error::ROLE);
             }
+            pump(PUMP_TURN);
         }
     }
     let traced = trace_mode() != 0 && in_window();
@@ -438,6 +543,7 @@ fn barrier(
             if reached(rd(dm::BARRIER_COUNTER)) {
                 break;
             }
+            pump(PUMP_TURN);
         }
         return if arrive { self::release(me, target) } else { Ok(()) };
     }
@@ -447,9 +553,11 @@ fn barrier(
             if reached(rd(M.at(dm::BARRIER_RELEASE))) {
                 return Ok(());
             }
+            pump(PUMP_TURN);
         }
     }
     loop {
+        pump(PUMP_TURN);
         noc::issue(
             Niu::Noc0,
             &Command::Read {
@@ -731,6 +839,7 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         Entry::Wait { prefetch } => {
             noc::wait(TXN);
             if prefetch {
+                pump_finish()?;
                 noc::wait(PREFETCH_TXN);
             }
             publish();
@@ -1046,6 +1155,7 @@ fn finish_pair(sequence: u32, result: Result<(), u32>) -> Result<(), u32> {
     let mut poll = tt_firmware::dataflow::Poll::new();
     let result = result.and_then(|()| loop {
         poll.tick()?;
+        pump(PUMP_TURN);
         if rd(dm::Mover::NC.at(dm::DONE)) == sequence {
             let error = rd(dm::Mover::NC.at(dm::ERROR));
             return if error == 0 { Ok(()) } else { Err(error) };
@@ -1268,6 +1378,15 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
         }
         let prefetch = rec[0][0] == record::GATHER && rec[0][1] & record::GATHER_PREFETCH != 0;
         if prefetch {
+            // `B` alone: queued for the waits ahead, one prefetch at a time.
+            if let Some(c) = record::PrefetchCursor::new(&rec[..n])? {
+                pump_finish()?;
+                *pump_slot() = Some(c);
+                // SAFETY: as `pump_slot`.
+                unsafe { PUMP_AT = (me, usable) };
+                pump(dm::TILE_IN_FLIGHT_CAP);
+                return Ok(());
+            }
             set_read_txn(PREFETCH_TXN);
         }
         let result =
@@ -1466,6 +1585,9 @@ pub extern "Rust" fn firmware_main() -> ! {
     // Nothing is in flight yet: the prefetch ID's cap, once (`set_cap` resets its room).
     noc::set_cap(PREFETCH_TXN, dm::TILE_IN_FLIGHT_CAP);
     set_read_txn(TXN);
+    *pump_slot() = None;
+    // SAFETY: as `pump_slot`.
+    unsafe { PUMP_ERROR = 0 };
     let mut stalls = noc::stalls();
     loop {
         beat = beat.wrapping_add(1);
@@ -1483,7 +1605,9 @@ pub extern "Rust" fn firmware_main() -> ! {
             let slot = rd(M.at(dm::QUEUE_SLOTS) + (done % dm::QUEUE_LEN) as u64 * 4);
             let result = run_list_at(me, usable, slot & 0xffff, slot >> 16);
             // A list is done when everything it read has landed, prefetches too.
+            let pumped = pump_finish();
             noc::wait(PREFETCH_TXN);
+            let result = result.and(pumped);
             publish_stalls(&mut stalls, trace_mode() != 0 && in_window());
             // Everything the list moved has landed before it is reported.
             publish();
@@ -1540,7 +1664,9 @@ pub extern "Rust" fn firmware_main() -> ! {
             )
             .and_then(|d| run(me, d))
         };
+        let pumped = pump_finish();
         noc::wait(PREFETCH_TXN);
+        let result = result.and(pumped);
         publish_stalls(&mut stalls, trace_mode() != 0 && in_window());
         if let Err(code) = result {
             if matches!(rd(M.at(dm::OP)), op::SHARED | op::CALL) {

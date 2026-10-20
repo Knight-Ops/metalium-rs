@@ -300,6 +300,13 @@ impl<N: NocId> DataMover<N> {
         }
         d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), dm::TILE_IN_FLIGHT_CAP)?;
         if mover.core == tt_isa::tensix::Core::B {
+            // `TT_PREFETCH_CAP` (a development knob, decode-to-bandwidth.md Phase 8): the prefetch
+            // reads' cap; unset or 0, `TILE_IN_FLIGHT_CAP`.
+            let cap = std::env::var("TT_PREFETCH_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            d.write32(w, tile, mover.at(dm::PREFETCH_CAP), cap)?;
             // The semantic guard of an `encoded-guard` image (`encoded::guard`): which
             // `TARG_ADDR_HI` words are a usable DRAM endpoint. Other images ignore it.
             let bits: Vec<u8> = encoded::endpoint_bitmap(dram.usable_mask() as u32)
@@ -379,6 +386,18 @@ impl<N: NocId> DataMover<N> {
     /// `1..=MAX_IN_FLIGHT`. A mover starts at `dm::TILE_IN_FLIGHT_CAP`; this is
     /// for the gates that force the throttle and the benchmarks that compare
     /// caps.
+    /// Cap this mover's prefetch reads (`dm::TXN_PREFETCH`) in flight at `cap` from its next list
+    /// (0: `dm::TILE_IN_FLIGHT_CAP`).
+    pub fn set_prefetch_cap<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        cap: u32,
+    ) -> Result<()> {
+        d.write32(w, self.tile, self.mover.at(dm::PREFETCH_CAP), cap)?;
+        Ok(())
+    }
+
     pub fn set_in_flight_cap<T: Transport>(
         &self,
         d: &mut Device<T>,

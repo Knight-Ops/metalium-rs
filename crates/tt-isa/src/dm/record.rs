@@ -59,6 +59,98 @@ pub const GATHER_PREFETCH: u32 = 1 << 27;
 const GATHER_FLAG_BITS: u32 =
     GATHER_A_RESIDENT | GATHER_B_UNPACK_TRANSPOSE | GATHER_PREFETCH | 0xff;
 
+/// A prefetch [`GATHER`]'s reads one at a time: a record with [`GATHER_PREFETCH`] and
+/// [`GATHER_A_RESIDENT`] reads only `B`, tile by tile, and a mover can issue them while it would
+/// otherwise wait (`docs/plans/decode-to-bandwidth.md` Phase 8, the prefetch pump). Its entries,
+/// in order, are exactly what [`expand_reads`] gives the record, and it refuses what that
+/// refuses, as soon as [`PrefetchCursor::new`] or the first [`PrefetchCursor::next`] would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefetchCursor {
+    b: TensorRef,
+    b_at: u32,
+    kt: u32,
+    cols: u32,
+    j0: u32,
+    /// `B` read as it lies, transposed by the kernel ([`GATHER_B_UNPACK_TRANSPOSE`]).
+    unpacked: bool,
+    next: u32,
+}
+
+impl PrefetchCursor {
+    /// The cursor of `rec`, or `None` for a record that is not a resident-`A` prefetch
+    /// [`GATHER`] (it expands as any record does). The checks are [`expand_reads`]'s, in its
+    /// order, up to its first read of `B`.
+    pub fn new(rec: &[[u32; 8]]) -> Result<Option<Self>, u32> {
+        let h = rec[0];
+        if h[0] != GATHER
+            || h[1] & GATHER_PREFETCH == 0
+            || h[1] & GATHER_A_RESIDENT == 0
+            || rec.len() != len(GATHER)
+        {
+            return Ok(None);
+        }
+        let [_, flags, _, b_at, _, rows, j0, cols] = h;
+        let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(gather_kt(flags))?);
+        let unpacked = flags & GATHER_B_UNPACK_TRANSPOSE != 0;
+        if unpacked && (!b_t || flags & GATHER_BF16 != 0) {
+            return Err(super::error::RANGE);
+        }
+        if flags & GATHER_BF16 != 0 || (b_t && !unpacked) {
+            return Err(super::error::RANGE);
+        }
+        let (_, cols) = (extent(rows)?, extent(cols)?);
+        let (_, b) = (tensor(rec, 1)?, tensor(rec, 3)?);
+        let thin = (flags >> GATHER_ROWS_SHIFT) & 0x1f;
+        if thin > 16 || (thin != 0 && a_t) {
+            return Err(super::error::RANGE);
+        }
+        Ok(Some(PrefetchCursor {
+            b,
+            b_at,
+            kt,
+            cols,
+            j0,
+            unpacked,
+            next: 0,
+        }))
+    }
+
+    /// Reads not yet given.
+    pub fn left(&self) -> u32 {
+        self.kt * self.cols - self.next
+    }
+}
+
+/// Each read in turn (a refusal where [`expand_reads`] would refuse), then `None`.
+impl Iterator for PrefetchCursor {
+    type Item = Result<[u32; 8], u32>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.kt * self.cols {
+            return None;
+        }
+        let (kk, j) = (self.next / self.cols, self.next % self.cols);
+        self.next += 1;
+        let at = if self.unpacked {
+            self.b.tile(self.j0 + j, kk)
+        } else {
+            self.b.tile(kk, self.j0 + j)
+        };
+        Some(at.map(|(ch, off)| {
+            [
+                super::op::READ,
+                ch,
+                (kk + self.j0 + j) % PORTS,
+                off,
+                self.b_at + (kk * self.cols + j) * TILE_SLOT as u32,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ]
+        }))
+    }
+}
+
 /// [`GATHER`]'s `kt`, from its flags (bits 28-31 set make it too large for
 /// [`MAX_EXTENT`], so a record with them is refused).
 pub const fn gather_kt(flags: u32) -> u32 {
@@ -1306,6 +1398,104 @@ mod tests {
         assert_eq!(gather(0).unwrap(), whole, "0 is whole tiles");
         for bad in [gather_rows(17), gather_rows(31), gather_rows(1) | 1] {
             assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
+        }
+    }
+
+    /// A prefetch cursor gives a resident-`A` prefetch `GATHER`'s reads in [`expand_reads`]'s
+    /// order, and refuses what it refuses; any other record is not its.
+    #[test]
+    fn a_prefetch_cursor_reads_what_the_expansion_does() {
+        let mut cases = 0;
+        for (n, ct, first) in [(1u8, 5u32, 0u32), (3, 7, 4), (8, 64, 9), (5, 1, 2)] {
+            let mut b = t(n, ct);
+            b.first = first;
+            let a = t(2, 3);
+            for (kt, cols, j0) in [(1u32, 1u32, 0u32), (4, 3, 2), (32, 2, 0), (7, 1, 0)] {
+                if j0 + cols > ct {
+                    continue;
+                }
+                for flags in [
+                    GATHER_A_RESIDENT,
+                    GATHER_A_RESIDENT | 1,
+                    GATHER_A_RESIDENT | gather_rows(5),
+                    GATHER_A_RESIDENT | 2 | GATHER_B_UNPACK_TRANSPOSE,
+                ] {
+                    let head = |f: u32| [GATHER, f | kt << 8, 0x2_0000, 0x6_0000, 0, 1, j0, cols];
+                    let rec = |f: u32| {
+                        let [a0, a1] = a.encode();
+                        let [b0, b1] = b.encode();
+                        [head(f), a0, a1, b0, b1]
+                    };
+                    let mut want = Vec::new();
+                    let expanded = expand_reads(
+                        &rec(flags | GATHER_PREFETCH),
+                        |_| 0,
+                        |e| {
+                            want.push(e);
+                            Ok(())
+                        },
+                    );
+                    let mut c = PrefetchCursor::new(&rec(flags | GATHER_PREFETCH))
+                        .map(|c| c.expect("a resident-A prefetch GATHER is the cursor's"));
+                    let mut got = Vec::new();
+                    let walked = match c.as_mut() {
+                        Ok(c) => loop {
+                            match c.next() {
+                                None => break Ok(()),
+                                Some(Ok(e)) => got.push(e),
+                                Some(Err(code)) => break Err(code),
+                            }
+                        },
+                        Err(&mut code) => Err(code),
+                    };
+                    assert_eq!(walked, expanded, "{flags:#x} kt {kt} cols {cols}");
+                    if expanded.is_ok() {
+                        assert_eq!(got, want, "{flags:#x} kt {kt} cols {cols}");
+                    }
+                    // Without the flag, or with `A` read, it is not the cursor's.
+                    assert_eq!(PrefetchCursor::new(&rec(flags)), Ok(None));
+                    let read_a = flags & !GATHER_A_RESIDENT & !1;
+                    assert_eq!(
+                        PrefetchCursor::new(&rec(read_a | GATHER_PREFETCH)),
+                        Ok(None)
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases > 40);
+        // What the expansion refuses: an empty `B`, a transposing read, packed BF16, `kt` 0.
+        let empty = TensorRef::default();
+        for (flags, b) in [
+            (GATHER_A_RESIDENT, empty),
+            (GATHER_A_RESIDENT | 2, t(2, 4)),
+            (GATHER_A_RESIDENT | GATHER_BF16, t(2, 4)),
+        ] {
+            let [a0, a1] = t(2, 4).encode();
+            let [b0, b1] = b.encode();
+            let rec = [
+                [
+                    GATHER,
+                    flags | GATHER_PREFETCH | 2 << 8,
+                    0x2_0000,
+                    0x6_0000,
+                    0,
+                    1,
+                    0,
+                    2,
+                ],
+                a0,
+                a1,
+                b0,
+                b1,
+            ];
+            let expanded = expand_reads(&rec, |_| 0, |_| Ok(()));
+            assert!(expanded.is_err(), "{flags:#x}");
+            let walked = PrefetchCursor::new(&rec).and_then(|c| {
+                let mut c = c.expect("its");
+                c.next().transpose().map(|_| ())
+            });
+            assert_eq!(walked, expanded, "{flags:#x}");
         }
     }
 

@@ -600,6 +600,13 @@ pub mod noc {
         unsafe { read_volatile(reg(niu, niu::reqs_outstanding(txn))) as u8 }
     }
 
+    /// Whether `txn` has room under its cap on NoC #0 for one more request now: what a caller
+    /// that would rather do something else than wait asks before [`issue_dram_on`].
+    #[inline(always)]
+    pub fn has_room(txn: TxnId) -> bool {
+        in_flight(Niu::Noc0, txn).try_room(|| outstanding(Niu::Noc0, txn))
+    }
+
     /// Use in-flight cap `cap` for `txn` on both NIUs from now on: 0 for
     /// `niu::MAX_IN_FLIGHT`, otherwise clamped to `1..=MAX_IN_FLIGHT`.
     pub fn set_cap(txn: TxnId, cap: u32) {

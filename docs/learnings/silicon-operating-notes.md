@@ -1198,6 +1198,23 @@ programs.
 - **Many units reading the same few tiles serialise on a channel:** 64 units each reading one row's 2-tile packed twin made
   a norm 17.5 us against 14.4 on 32 (`1792431978`).
 
+## GDDR reads are one queue: prefetch traffic is paid by the small ops (2026-10-20, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8.
+- **A unit's reads are issue-bound.** A whole-tile read lands ~1 us after the mover issues it, and the mover issues
+  one in ~0.27 us; with ID 6 at a cap of 8, a 128-tile prefetch stalled 0 times (`step215`, `1792468449`). A read the
+  mover issues before an entry has almost always landed by the next entry; only reads it has not issued yet are
+  still to come.
+- **Transaction IDs throttle and drain separately.** With B's own ID capped at one, a plain gather stalled 127 times
+  and the same gather on ID 6 none (`step215`).
+- **A small op's reads wait behind every unit's streaming reads.** With ~100 units reading a product's weights ahead
+  (8 requests each), the residual add after a product went from 14 to ~100 us, nearly all of it its own reads' wait.
+  That held whether the prefetch was issued at once or a read per wait-loop turn (profiles `1792470019`,
+  `1792504522`). With weights streaming on 40 / 56 idle units only (~260 / ~300 GB/s), a step's own work cost 1.34x /
+  1.61x (`1792465817`, `1792465464`). There is no idle GDDR bandwidth under the small ops to take for free: what a
+  window streams, its ops wait for. Throttling the stream (ID 6's cap 1-2) traded the two at best ~0.2-0.4 ms a 1.7B
+  step.
+
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 
 - **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of

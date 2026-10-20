@@ -230,7 +230,13 @@ const _: () = assert!(CAPS + 4 <= ENCODE_KEY);
 /// (`tt_kernels::profile`). Read at the start of each outermost list.
 pub const TRACE_WINDOW: u64 = MAILBOX_BASE + 0xF4;
 const _: () = assert!(ENCODE_KEY + 4 <= TRACE_WINDOW);
-const _: () = assert!(TRACE_WINDOW + 4 <= MAILBOX_BASE + 0x100);
+/// Host -> RISCV B: [`TXN_PREFETCH`]'s in-flight cap, applied as each list starts (nothing is then
+/// in flight on it: the last list's end drained it); 0 is [`TILE_IN_FLIGHT_CAP`]. Prefetch reads
+/// share GDDR with the ops they run under, whose latency-bound reads queue behind them
+/// (`docs/plans/decode-to-bandwidth.md` Phase 8).
+pub const PREFETCH_CAP: u64 = MAILBOX_BASE + 0xF8;
+const _: () = assert!(TRACE_WINDOW + 4 <= PREFETCH_CAP);
+const _: () = assert!(PREFETCH_CAP + 4 <= MAILBOX_BASE + 0x100);
 
 /// [`CAPS`]'s bits.
 pub mod caps {

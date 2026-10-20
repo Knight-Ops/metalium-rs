@@ -679,6 +679,27 @@ the host ~0.8).
     prefetch pump in the mover**: a flagged `GATHER` queued and expanded a tile at a time from the mover's wait loops
     (barrier, kernel, credits) under ID 6's cap, the prefetch `WAIT` issuing what is left first. (b) hides more and is
     a firmware change of the hot loops; (a) is host only.
+- [x] **A prefetch pump in the mover** (2026-10-20; `record::PrefetchCursor`, `InFlight::try_room`, `noc::has_room`,
+  `dm::PREFETCH_CAP`). A resident-`A` prefetch `GATHER` is queued, not expanded: B issues its ID's cap of reads when it
+  arrives and one a turn of its wait loops (barrier, the roles' acknowledgements, the writer's completion) while ID 6
+  has room; the prefetch `WAIT`, a new prefetch and a list's end issue the rest. Bounded a turn because a read completes
+  before the next is issued (ttsim, row 72; ~0.27 us an issue on silicon): room alone issued them all at once. The
+  cursor's reads are the expansion's (unit `a_prefetch_cursor_reads_what_the_expansion_does`); ID 6's cap is settable
+  (`TT_PREFETCH_CAP`, applied as each list starts). `step215` now asserts the deferral on both targets: the last slots
+  are unread at a plain `WAIT`, 4 of 4 rounds. Card 0: the safe image 25 of 25 (`1792503652`, `step188` among them),
+  `fast-reads` 19 of 19 (`1792503993`), `fast-reads` + `encoded-guard` 13 of 13 (`1792504131`); `--smoke` on card 0
+  with the pump and the settable cap, 1,155 of 1,155 (`1792505704`).
+  - **Measured, busy prefetch on** (card 0, 32 / 256-token prompts): cap 8 21.58 / 23.25 ms (`1792504143`); cap 4 21.23 /
+    23.07 (`1792505352`); **cap 2 20.74 / 22.25** (`1792505230`); **cap 1 21.49 / 21.76** (`1792505109`); off 20.97 /
+    22.19 (`1792505474`). Profile at cap 8 (card 1, `1792504522`): products 11.59 ms, the residual add still ~99 us
+    (was 107 without the pump, 14 off).
+  - **What it showed:** the add was never waiting mostly for the prefetch's issue, but for its own reads behind the
+    prefetch traffic at the GDDR controllers (~100 units x 8 requests queued). A window's bytes are not free: whatever
+    the prefetch reads, the small ops' latency-bound reads wait behind. At best ~0.2-0.4 ms (cap 2 or 1), against the
+    3.6 ms the products give up. **Busy prefetch stays opt-in.**
+  - **What would change it:** small ops that do not read GDDR between products -- their activations held in L1 from
+    the op that makes them (the "nothing in L1 survives an op" assumption of the 2026-10-19 review) -- so the stream
+    could take the windows' whole bandwidth. That is the L1 budget question (the space audit), and a larger design.
 - [ ] `down` prefetched: the first chunk batches' `B` gathers of `push_stream_jobs` on idle units. ~0.7 ms.
 - [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
   reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small
@@ -787,8 +808,10 @@ Estimates, re-measured after every phase.
 - `step185`, `step187`, `step188`, `step191`, `step193` stay bit for bit.
 - Each item gets its own gate, with a negative control watched failing.
 
-**Order of testing:**
-- ttsim first, then card 0: `cargo xtask silicon --release --device 0 --filter <gate>`.
+**Order of testing** (2026-10-20: ttsim only for small spikes of risky changes):
+- ttsim: the small gates of a risky change only (a record, the mover, an encoding, a negative control that could
+  hang a card). Model-level gates (`step185`, `step187`, `step188`, `step191`, `step193`, `step209`, `step210`, MNIST
+  e2e) run on card 0 directly: `cargo xtask silicon --release --device 0 --filter <gate>`.
 - A record or firmware change: `step172` and `step173` in the safe image, `fast-reads`, and `fast-reads` +
   `encoded-guard`; firmware clippy plain, with `encoded-guard`, and with `profile`.
 - An arithmetic or routing change: `step12_mnist` (e2e).

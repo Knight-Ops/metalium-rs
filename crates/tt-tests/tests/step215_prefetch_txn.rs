@@ -14,12 +14,15 @@
 //! - **Drained by its wait.** The snapshot after the prefetch `WAIT` is the slots' bytes.
 //! - **And by the list's end.** The same list without the prefetch `WAIT`: once it is done, every
 //!   slot holds its bytes.
+//! - **Pumped, not issued at once.** A resident-`A` prefetch is queued (`record::PrefetchCursor`):
+//!   the mover issues at most its ID's cap of reads when it arrives and the rest while it waits
+//!   (barriers, the roles, the writer) or at its `WAIT`. With no wait between, the snapshot after
+//!   the plain `WAIT` misses the last slots, every round, on both targets; without the flag (the
+//!   control) it is exact.
 //! - **On an ID of its own** (silicon only: ttsim completes each request before the next is issued,
 //!   divergence row 72). With the mover's own in-flight cap at one, a plain gather stalls on every
 //!   read after the first (the control, as `step49`), a prefetch on fewer than half as many: its
-//!   reads are not under that ID's cap, so not under its drains either. (Whether a snapshot after
-//!   the plain `WAIT` catches a read still in flight is printed, not asserted: a read lands ~1 us
-//!   after its issue, usually before the copy.) Without the flag that snapshot is exact.
+//!   reads are not under that ID's cap, so not under its drains either.
 
 use tt_device::tlb::WindowKind;
 use tt_device::Window;
@@ -221,9 +224,12 @@ fn a_prefetch_stays_in_flight_past_the_movers_drains_until_its_wait() {
                 in_flight += 1;
             }
         }
-        // Timing only, and not asserted: a read lands ~1 us after it is issued, and the copy
-        // usually comes later (ttsim completes each before the next, divergence row 72).
-        println!("rounds whose reads were in flight past the plain WAIT: {in_flight} of 4");
+        // Queued, not issued: a resident-`A` prefetch issues at most its ID's cap of reads when it
+        // arrives and the rest from the mover's waits or its own `WAIT` (`record::PrefetchCursor`,
+        // the pump); this list has no wait between, so the last slots are not read yet when the
+        // first snapshot copies them, on both targets.
+        println!("rounds whose last slots were not read by the plain WAIT: {in_flight} of 4");
+        assert_eq!(in_flight, 4, "the prefetch's last reads wait for its WAIT");
 
         // On another ID: the mover's own cap of one throttles a plain gather on every read after
         // the first, but not a prefetch, whose ID has a cap of its own (`TILE_IN_FLIGHT_CAP`).

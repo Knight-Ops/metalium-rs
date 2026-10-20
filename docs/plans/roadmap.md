@@ -397,8 +397,14 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         `step211`-`step213`): 1.7B **20.95 / 21.41 / 22.18 ms** (`1792444936`), 135M **8.00 / 8.59 / 9.38**
         (`1792445319`). Phase 8's probe (2026-10-20,
         gate `step214`): with its weights free a step is **7.85 ms**; under a ~300 GB/s stream its ops cost 1.6x; L1
-        bounds a continuous stream (~2-3 ms realistic, ~0.6 ms a step per 100 KB a unit freed). Next: the packed-`A`
-        ring reclaim (~254 KB a product unit), then busy units streaming. `gamma`'s product is deferred.
+        bounds a continuous stream (~2-3 ms realistic, ~0.6 ms a step per 100 KB a unit freed). Then (2026-10-20): the
+        packed-`A` ring reclaimed (807 -> 553 KB), `B` at the top of `DATA`, a prefetch transaction ID and a prefetch pump
+        in the mover (gates `step215`, `step216`), and busy units reading `B` ahead: the products 15.2 -> 11.6 ms, but the
+        small ops' reads queue behind the prefetch at GDDR, so the step gains at best ~0.2-0.4 ms; opt-in
+        (`TT_BUSY_PREFETCH=1`, `TT_PREFETCH_CAP`). Next: small ops' activations held in L1 between ops (decode-to-bandwidth
+        Phase 8, "What would change it"), with [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
+        layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is
+        deferred.
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.
@@ -501,6 +507,21 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   staged through the host, `mean_dim`, gather/scatter/select, `slice_assign`/`cat`, conv
   acceptance, attention variants, `int_div`/`remainder` on card 1, ND indexing, GMPOOL
   max-with-indices. These are closed by the ladder, not separately.
+
+## The iteration loop (asked for 2026-10-20)
+
+Development time goes to waiting more than to the card. Measured in one session (2026-10-20):
+- [x] **ttsim for small spikes only.** Model-level gates on ttsim took 50-275 s each (`step187` 105 s, `step191` 100,
+  `step209` 137, `step12_mnist` 275); on card 0 they take seconds. Rule: ttsim for the small gates of a risky change
+  (records, the mover, encodings, refusals), model gates on card 0 (decode-to-bandwidth.md, "Order of testing").
+- [ ] **One target directory a feature set.** Each switch of `cargo xtask silicon|bench` features (`--profile`,
+  `fast-reads`, `encoded-guard`) rebuilds the release tree and the firmware (~2 minutes a switch, several a session):
+  give each feature set its own `CARGO_TARGET_DIR` under `target/` in `xtask/src/silicon.rs`.
+- [ ] **Weights loaded once a session.** A 1.7B bench or probe run reloads and widens 6.8 GB of safetensors (~60-90 s)
+  before it measures anything. Options: a widened F32 cache file beside the pinned weights (checked by digest), or one
+  bench process running several configurations.
+- [ ] **One command a change.** The affected gates for a change (by crate and layer) chosen and run on card 0 in one
+  `cargo xtask` invocation, with the ttsim spikes first where the change is risky.
 
 ## Track 2: performance (host-bound first)
 
