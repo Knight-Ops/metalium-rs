@@ -23,7 +23,8 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// `kk`, goes to `a_at + (i * kt + kk) * TILE_SLOT`; `K` tile `kk` of its
 /// column `j` of `B` to `b_at + (kk * cols + j) * TILE_SLOT`. `flags`: bit 0
 /// `A` is read transposed, bit 1 `B`, bits 8..=24 `kt` ([`gather_kt`]), bit 25
-/// [`GATHER_A_RESIDENT`]; bits 26-31 zero. Bit 2 selects packed
+/// [`GATHER_A_RESIDENT`], bit 26 [`GATHER_B_UNPACK_TRANSPOSE`], bit 27 [`GATHER_PREFETCH`];
+/// bits 28-31 zero. Bit 2 selects packed
 /// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
 /// logical rows/columns and words 6/7 their tile row/column origins.
 /// GDDR slots are 2112 bytes; L1 slots remain 4160.
@@ -49,10 +50,16 @@ pub const GATHER_A_RESIDENT: u32 = 1 << 25;
 /// `op::READ_TRANSPOSED`), so the mover moves whole tiles and transposes nothing. Refused
 /// without bit 1, and with packed BF16.
 pub const GATHER_B_UNPACK_TRANSPOSE: u32 = 1 << 26;
+/// [`GATHER`]'s flag for a prefetch: RISCV B issues the record's reads on
+/// [`super::TXN_PREFETCH`], not its own ID, so nothing but an [`super::op::WAIT`] with
+/// [`super::WAIT_PREFETCH`] waits for them, and they stay in flight under the ops queued after
+/// them on the unit. The reads are the record's as without it.
+pub const GATHER_PREFETCH: u32 = 1 << 27;
 /// [`GATHER`]'s flag bits that are not `kt`.
-const GATHER_FLAG_BITS: u32 = GATHER_A_RESIDENT | GATHER_B_UNPACK_TRANSPOSE | 0xff;
+const GATHER_FLAG_BITS: u32 =
+    GATHER_A_RESIDENT | GATHER_B_UNPACK_TRANSPOSE | GATHER_PREFETCH | 0xff;
 
-/// [`GATHER`]'s `kt`, from its flags (bits 27-31 set make it too large for
+/// [`GATHER`]'s `kt`, from its flags (bits 28-31 set make it too large for
 /// [`MAX_EXTENT`], so a record with them is refused).
 pub const fn gather_kt(flags: u32) -> u32 {
     (flags & !GATHER_FLAG_BITS) >> 8
@@ -449,6 +456,14 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             let resident = flags & GATHER_A_RESIDENT != 0;
             let b_unpacked = flags & GATHER_B_UNPACK_TRANSPOSE != 0;
             if b_unpacked && (!b_t || flags & GATHER_BF16 != 0) {
+                return Err(super::error::RANGE);
+            }
+            // A prefetch's reads stay in flight under the entries after it: plain reads only,
+            // never a transposing move (through the scratch, after draining the mover's own ID)
+            // or packed BF16's fills.
+            if flags & GATHER_PREFETCH != 0
+                && (flags & GATHER_BF16 != 0 || (a_t && !resident) || (b_t && !b_unpacked))
+            {
                 return Err(super::error::RANGE);
             }
             let (rows, cols) = (extent(rows)?, extent(cols)?);
@@ -1340,7 +1355,29 @@ mod tests {
         let first_b = whole.iter().position(|e| e[4] >= 0x6_0000).unwrap();
         assert_eq!(resident, whole[first_b..]);
         assert_eq!(gather_kt(GATHER_A_RESIDENT | 7 << 8 | 0xff), 7);
-        for bad in [1 << 27, 1 << 31] {
+        // A prefetch reads what the same record reads without the flag (only the ID differs),
+        // and only as plain reads: not packed BF16, not a transposing move.
+        assert_eq!(gather_kt(GATHER_PREFETCH | 7 << 8), 7);
+        for flags in [
+            0,
+            GATHER_A_RESIDENT,
+            GATHER_A_RESIDENT | 1,
+            2 | GATHER_B_UNPACK_TRANSPOSE,
+        ] {
+            assert_eq!(
+                gather(flags | GATHER_PREFETCH, a0, b0),
+                gather(flags, a0, b0),
+                "{flags:#x}"
+            );
+        }
+        for flags in [GATHER_BF16 | GATHER_A_RESIDENT, 1, 2] {
+            assert_eq!(
+                gather(flags | GATHER_PREFETCH, a0, b0),
+                Err(super::super::error::RANGE),
+                "{flags:#x}"
+            );
+        }
+        for bad in [1 << 28, 1 << 31] {
             assert_eq!(
                 gather(bad, a0, b0),
                 Err(super::super::error::LENGTH),

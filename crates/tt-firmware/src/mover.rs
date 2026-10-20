@@ -23,6 +23,30 @@ const RELEASE_TXN: TxnId = match TxnId::new(5) {
     Some(t) => t,
     None => panic!(),
 };
+/// RISCV B's prefetch reads (`record::GATHER_PREFETCH`): drained only by a `WAIT` with
+/// `dm::WAIT_PREFETCH`, and before a list is reported done.
+const PREFETCH_TXN: TxnId = match TxnId::new(dm::TXN_PREFETCH) {
+    Some(t) => t,
+    None => panic!(),
+};
+
+/// The ID RISCV B's reads go out on: `TXN`, or `PREFETCH_TXN` while a prefetch record expands
+/// ([`run_record`]). In local data RAM, set before the first list.
+#[link_section = ".local"]
+static mut READ_TXN: TxnId = TXN;
+
+fn read_txn() -> TxnId {
+    // SAFETY: one core runs this firmware, with no interrupts.
+    unsafe { READ_TXN }
+}
+
+/// Send B's reads out on `txn` from now on. The fast read path keeps the request tag, which holds
+/// the ID, from one read to the next: it is told to write every register again.
+fn set_read_txn(txn: TxnId) {
+    // SAFETY: as `read_txn`.
+    unsafe { READ_TXN = txn };
+    noc::set_read_path(noc::read_fast());
+}
 
 /// The coordinator's last release: `NIU_MST_WR_ACK_RECEIVED` before it, and the
 /// acknowledgements it expects. The next release waits for them first, so at most one
@@ -136,7 +160,9 @@ fn issue_write(me: (u8, u8), d: Descriptor) -> Result<(), u32> {
 fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<(), u32> {
     let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
     // The whole descriptor checked once; each request then only encoded.
-    let mv = DramMove::new(d.range, port, d.l1, d.op != op::READ, me, TXN, niu)
+    let write = d.op != op::READ;
+    let txn = if IS_NC || write { TXN } else { read_txn() };
+    let mv = DramMove::new(d.range, port, d.l1, write, me, txn, niu)
         .map_err(|_| dm::error::ALIGNMENT)?;
     // B's reads on NoC #0 only, and only when the host chose the fast path
     // (`dm::READ_FAST`): each request then writes just the initiator words
@@ -145,13 +171,13 @@ fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<
     let fast = !NOC1 && !IS_NC && noc::read_fast();
     for r in mv.words() {
         if fast {
-            noc::room_for_read(TXN);
+            noc::room_for_read(txn);
             noc::issue_read(
-                r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, TXN,
+                r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, txn,
             );
         } else {
             noc::issue_dram_on::<NOC1>(
-                r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, TXN,
+                r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, txn,
             );
         }
     }
@@ -702,8 +728,11 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             publish();
             kernel(generation, programs)?;
         }
-        Entry::Wait => {
+        Entry::Wait { prefetch } => {
             noc::wait(TXN);
+            if prefetch {
+                noc::wait(PREFETCH_TXN);
+            }
             publish();
         }
         Entry::Barrier {
@@ -1237,7 +1266,16 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
             noc::wait(TXN);
             publish();
         }
-        record::expand_reads(&rec[..n], |at| rd(at.into()), |e| record_entry(me, usable, e))
+        let prefetch = rec[0][0] == record::GATHER && rec[0][1] & record::GATHER_PREFETCH != 0;
+        if prefetch {
+            set_read_txn(PREFETCH_TXN);
+        }
+        let result =
+            record::expand_reads(&rec[..n], |at| rd(at.into()), |e| record_entry(me, usable, e));
+        if prefetch {
+            set_read_txn(TXN);
+        }
+        result
     }
 }
 
@@ -1425,6 +1463,9 @@ pub extern "Rust" fn firmware_main() -> ! {
     }
     let mut beat: u32 = 0;
     noc::set_clock(wall_clock);
+    // Nothing is in flight yet: the prefetch ID's cap, once (`set_cap` resets its room).
+    noc::set_cap(PREFETCH_TXN, dm::TILE_IN_FLIGHT_CAP);
+    set_read_txn(TXN);
     let mut stalls = noc::stalls();
     loop {
         beat = beat.wrapping_add(1);
@@ -1441,6 +1482,8 @@ pub extern "Rust" fn firmware_main() -> ! {
             list_settings();
             let slot = rd(M.at(dm::QUEUE_SLOTS) + (done % dm::QUEUE_LEN) as u64 * 4);
             let result = run_list_at(me, usable, slot & 0xffff, slot >> 16);
+            // A list is done when everything it read has landed, prefetches too.
+            noc::wait(PREFETCH_TXN);
             publish_stalls(&mut stalls, trace_mode() != 0 && in_window());
             // Everything the list moved has landed before it is reported.
             publish();
@@ -1497,6 +1540,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             )
             .and_then(|d| run(me, d))
         };
+        noc::wait(PREFETCH_TXN);
         publish_stalls(&mut stalls, trace_mode() != 0 && in_window());
         if let Err(code) = result {
             if matches!(rd(M.at(dm::OP)), op::SHARED | op::CALL) {

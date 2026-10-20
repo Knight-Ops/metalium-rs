@@ -125,6 +125,14 @@ pub const TILE_IN_FLIGHT_CAP: u32 = 8;
 /// and NC's: the mover's `TXN`.
 pub const TXN_B: u8 = 2;
 pub const TXN_NC: u8 = 4;
+/// The NoC transaction ID of RISCV B's prefetch reads ([`record::GATHER_PREFETCH`]): apart from
+/// [`TXN_B`], so the entries that drain B's moves -- a kernel's launch, a barrier, a chunk's end
+/// -- leave them in flight. Only an [`op::WAIT`] with [`WAIT_PREFETCH`] drains them, which the
+/// op that reads what they bring puts before its kernel (`docs/plans/decode-to-bandwidth.md`
+/// Phase 8). Its cap is [`TILE_IN_FLIGHT_CAP`], set once when the mover starts.
+pub const TXN_PREFETCH: u8 = 6;
+/// [`op::WAIT`]'s word 1 for a wait that also drains the prefetch reads ([`TXN_PREFETCH`]).
+pub const WAIT_PREFETCH: u32 = 1;
 const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
 /// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
 /// mover mailbox; zeroed by the host before the session's first barrier.
@@ -336,6 +344,8 @@ pub mod op {
     pub const KERNEL: u32 = 6;
     /// Wait for every move before it to complete: the boundary between what
     /// were separate lists, whose entries may reuse each other's L1 slots.
+    /// `[WAIT, prefetch, 0, ...]`: `prefetch` [`super::WAIT_PREFETCH`] also waits for the
+    /// prefetch reads ([`super::TXN_PREFETCH`]), 0 does not; anything else is refused.
     /// Only in a list entry.
     pub const WAIT: u32 = 7;
     /// As [`READ_TRANSPOSED`], but the mover writes the tile with its column
@@ -709,8 +719,8 @@ pub enum Entry {
         /// Per role, `(address, words)` of a resident program, or `(0, 0)`.
         programs: [(u32, u32); 3],
     },
-    /// [`op::WAIT`].
-    Wait,
+    /// [`op::WAIT`]; `prefetch`, whether it also drains [`TXN_PREFETCH`].
+    Wait { prefetch: bool },
     /// [`op::BARRIER`]: `arrive` false is its wait-only form; `release`, word 6.
     Barrier {
         target: u32,
@@ -958,7 +968,11 @@ impl Entry {
             });
         }
         if w[0] == op::WAIT {
-            return Ok(Entry::Wait);
+            return match w[1] {
+                0 => Ok(Entry::Wait { prefetch: false }),
+                WAIT_PREFETCH => Ok(Entry::Wait { prefetch: true }),
+                _ => Err(error::RANGE),
+            };
         }
         if w[0] == op::BARRIER {
             // Word 5, a wait's barriers ([`BARRIER_STANDS_FOR`]): zero on an arrival.
@@ -1683,7 +1697,15 @@ mod tests {
         );
         assert_eq!(
             Entry::decode(ALL, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]),
-            Ok(Entry::Wait)
+            Ok(Entry::Wait { prefetch: false })
+        );
+        assert_eq!(
+            Entry::decode(ALL, [op::WAIT, WAIT_PREFETCH, 0, 0, 0, 0, 0, 0]),
+            Ok(Entry::Wait { prefetch: true })
+        );
+        assert_eq!(
+            Entry::decode(ALL, [op::WAIT, 2, 0, 0, 0, 0, 0, 0]),
+            Err(error::RANGE)
         );
     }
 
