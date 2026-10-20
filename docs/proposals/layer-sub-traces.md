@@ -113,6 +113,13 @@ trace segmentation.
 - **Measure the fetch's share first.** Use `TT_PROFILE_DETAIL=full`, with and without a background stream, so that
   what residency would save is known.
 
+## With planned L1 residency
+
+[planned-l1-residency.md](planned-l1-residency.md) plans a captured graph's activations into L1 a layer at a time, with
+the same addresses in every repeat. With it, a body's L1 words are the same in every layer, and its arguments are only
+GDDR references: the layer's weights, its cache, and what is left in GDDR. Its argument tables shrink too, since 86% of
+the words that differ between layers today are tensor references, many of them activations.
+
 ## Risks and rules
 
 - **Encoded reads.** A fast image's `READ_ENCODED` binds its checksum to a per-start key, the tile, the chip and the op

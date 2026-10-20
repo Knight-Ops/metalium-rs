@@ -401,8 +401,10 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         packed-`A` ring reclaimed (807 -> 553 KB), `B` at the top of `DATA`, a prefetch transaction ID and a prefetch pump
         in the mover (gates `step215`, `step216`), and busy units reading `B` ahead: the products 15.2 -> 11.6 ms, but the
         small ops' reads queue behind the prefetch at GDDR, so the step gains at best ~0.2-0.4 ms; opt-in
-        (`TT_BUSY_PREFETCH=1`, `TT_PREFETCH_CAP`). Next: small ops' activations held in L1 between ops (decode-to-bandwidth
-        Phase 8, "What would change it"), with [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
+        (`TT_BUSY_PREFETCH=1`, `TT_PREFETCH_CAP`). Next: small ops' activations held in L1 between ops,
+        [planned-l1-residency.md](../proposals/planned-l1-residency.md) (a static plan over each captured graph, the
+        same addresses every layer; traced inference and training included, eager ops unchanged), with
+        [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is
         deferred.
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).

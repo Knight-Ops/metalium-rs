@@ -699,7 +699,8 @@ the host ~0.8).
     3.6 ms the products give up. **Busy prefetch stays opt-in.**
   - **What would change it:** small ops that do not read GDDR between products -- their activations held in L1 from
     the op that makes them (the "nothing in L1 survives an op" assumption of the 2026-10-19 review) -- so the stream
-    could take the windows' whole bandwidth. That is the L1 budget question (the space audit), and a larger design.
+    could take the windows' whole bandwidth. That is the L1 budget question (the space audit), and a larger design:
+    [planned-l1-residency.md](../proposals/planned-l1-residency.md).
 - [ ] `down` prefetched: the first chunk batches' `B` gathers of `push_stream_jobs` on idle units. ~0.7 ms.
 - [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
   reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small
