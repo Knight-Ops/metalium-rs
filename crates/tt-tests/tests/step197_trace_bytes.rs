@@ -82,6 +82,9 @@ fn step_ops(model: &Llama<Tt>, d: &TtDevice) -> Vec<(String, Vec<burn_tt::OpReco
 fn a_decode_step_reads_each_weight_once() {
     with_device(Config::default(), |d| {
         burn_tt::set_count_trace_bytes(d, true).unwrap();
+        // The plain trace's bytes: with residency on, an op whose tensors all stay in L1 moves
+        // nothing through GDDR (step219 counts what residency spares).
+        burn_tt::set_residency(d, 0).unwrap();
         for (what, config) in configs() {
             let unfused = Llama::<Tt>::new(&config, &d);
             let mut a_reads = Vec::new();

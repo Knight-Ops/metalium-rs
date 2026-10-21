@@ -1,6 +1,9 @@
 # Planned L1 residency: activations that survive between ops
 
-Status: **scheduled; Phase 1 and Phase 2's mechanism done, 2f open** (2026-10-20; a proposal until then). Asked for after Phase 8 of
+Status: **scheduled; Phases 1 and 2 done** (2026-10-21; a proposal until 2026-10-20): rows read whole on many units
+held by two of their readers (2f), never-read writes dropped (2g), the region sized by its plan under the products' cliff,
+plans cached, and residency **on by default** (2h): a 1.7B step 21.00 / 22.25 -> 20.07 / 21.28 ms; slower builds
+accepted. Next: Phase 3. Asked for after Phase 8 of
 [decode-to-bandwidth.md](decode-to-bandwidth.md): the space audit, busy-unit prefetch and the prefetch pump.
 It is the "sharded, L1-resident tensors" gap of [tt-metal-concepts-review.md](../learnings/tt-metal-concepts-review.md)
 (G12). That gap was deferred "until a measured op chain is GDDR-bound", and that measurement now exists. It is designed
@@ -334,12 +337,221 @@ Add, RMSNorm, `gamma`'s multiply, and the next product's packed `A`. This is wha
     against 20.98 / 22.24, even; with busy prefetch at ID 6's cap 8, **21.53 / 23.17** against 21.66 / 23.26 off
     (`1792528191`, `1792528455`); at cap 2, 20.67 / 22.18 (`1792528324`). The residual add still reads the product's
     output from GDDR (a `SCATTER`, which the rewrite does not redirect) behind the stream: Phase 3.
-- [ ] **2f. Replicated rows, delivered without contended multicasts.** Candidates, to be measured on the multiply:
-  (a) a few holders: each producer unicasts its 128 B of a row to `h` holders and each reader pulls the whole row
-  from its holder with one `READ_L1` (8 KB a unit, `h` spreading the load); (b) multicasts serialized by design: one
-  producer gathers the row (unicasts in), then multicasts it whole (two 4 KB requests a rectangle) after the op's
-  barrier, as a step of the reader; (c) multicast acknowledgements counted once a run, not an entry (firmware), which
-  helps only if the NoC is not the bound.
+- [x] **2f. Replicated rows, delivered without contended multicasts** (2026-10-20). Three candidates, probed on
+  the multiply's geometry first, then the winner built into the plan and the rewrite.
+  - **A peer's L1 read** (`op::READ_L1` of another tile, which (a) needs; nothing ran one before): `tt-isa` unit
+    `an_l1_read_decodes_only_whole_and_only_on_b`; `step218` `a_read_pulls_a_peers_window`, the host's and the tile's
+    refusals (ttsim; card 0 safe `1792531966`, `fast-reads` `1792532114`, `fast-reads` + `encoded-guard`
+    `1792532259`).
+  - **(c) in firmware:** `dm::MCAST_RUN_ACKS` (word 6 of `WRITE_L1_MCAST`): a run of marked multicasts is drained
+    once before its first and its acknowledgements counted together before the next other entry and at a list's end
+    (`settle_multicasts`, NC only). Gate `step218` `a_run_of_multicasts_lands_before_the_next_entry` (one run between
+    unicasts, two runs split by a lone multicast, a run ending the list; ttsim, card 0); `step50`, `step172`,
+    `step173`, `step218`, `step220` on card 0 in the safe image 23 of 23 (`1792533202`), `fast-reads` 28 of 28
+    (`1792533364`), `fast-reads` + `encoded-guard` 29 of 29 (`1792533532`). B 31,328 -> 31,548 bytes, NC 17,908 ->
+    18,108 (6,468 left).
+  - **The probe** (`Session::probe_row_delivery`, `residency::RowScheme`; gate `step220_row_delivery`: every reader
+    ends with the twin in every scheme, eager and replayed, and a reader sent to no holder reads poison; ttsim and
+    card 0 `1792532765`). Timed by `silicon_probe_row_delivery` (card 0, 120 tiles, `--profile`, `1792533708`): per-op
+    span medians of 8 deliveries a trace, idle / under a GDDR stream on every unit the delivery leaves idle (56; 16
+    for 104 readers), in us:
+
+    | Row, producers -> readers | GDDR | multicast (Phase 2) | (c) run acks | (a) 1 / 2 / **4** / 8 holders | (b) relay |
+    |---|--:|--:|--:|--:|--:|
+    | `[1, 2048]`, 64 -> 32 | 9.0 / 47 | 140 / 140 | 130 / 140 | 8.2 / 7.5 / **8.1** / 9.9; 21 / 17 / **14** / 21 | 16 / 34 |
+    | `[1, 2048]`, 64 -> 64 | 14 / 70 | 210 / 210 | 200 / 200 | 12 / 9.2 / **8.7** / 10; 24 / 23 / **17** / 21 | 19 / 37 |
+    | `[1, 2048]`, 64 -> 104 | 17 / 23 | 240 / 240 | 240 / 240 | 16 / 11 / **9.8** / 10; 20 / 14 / **11** / 11 | 23 / 28 |
+    | `[1, 8192]`, 64 -> 64 | 16 / 80 | 780 / 780 | 760 / 760 | 33 / 23 / **20** / 28; 55 / 66 / **37** / 58 | 51 / 78 |
+
+    **(a) wins;** (c) changes nothing (the NoC is the bound, not NC's waits), (b) pays an op and a barrier. Through
+    GDDR the readers' time quadruples under the stream; from holders it at most doubles, and the writes (unicasts on
+    NoC #1) slow too.
+  - **(a) in the plan** (`residency::Rows`, `Plan::make_rows`, `Plan::held`; `Session::set_residency_rows`,
+    `TT_RESIDENCY_ROWS=gddr|mcast|held:<h>`, default `held:2`; `TT_RESIDENCY_REPLICATED` retired). A resident tensor
+    some op reads whole on more than one unit (`Tensor::replicated`) is held by `h` of its readers (`residency::holders`:
+    contiguous runs of the readers, each held by its middle one), if every reader reads it alike
+    (`Tensor::read_alike`; otherwise it stays in GDDR, so a holder's bytes are never more than a unit's were). A write
+    is a `WRITE_L1` to each holder, a read a `READ_L1` from the reader's holder, consecutive slots one request.
+    `Plan::check` refuses a reader with no holder or one sent to a unit that is not one (`Hazard::NotHeld`), and the
+    rewrite one that holds nothing. The prefetch lists cannot move a held read ahead of its writer: they take the
+    `GATHER` record only (its `A` resident), and the packed `A`'s `READ_RUN` stays in the op's own list.
+  - **Gates:** `residency.rs` units `holders_split_the_readers_evenly`,
+    `a_held_row_is_written_to_its_holders_and_read_from_them` (the first direct tests of the rewrite),
+    `rows_choose_the_delivery_and_a_misrouted_holder_is_refused`, `a_row_not_read_alike_is_not_held`; `step219`
+    `a_row_read_whole_is_held_by_two_units_bit_for_bit` (multiply -> one-row product, the twin held by 2 of 8: bit for
+    bit, 3.83 -> 3.23 MB of GDDR; the negative control refused by the check and the planned capture by name), the
+    Llama test with the default. Card 0, `TT_RESIDENCY=1`: `step219`, `step220`, `step188`, `step193`, `step209`,
+    `step210`, 20 of 20 (`1792535508`, held by 4), and with `TT_BUSY_PREFETCH=1` (`1792535737`); with the default
+    of 2, `step219`, `step220`, `step188` 11 of 11 (`1792538756`); no planned capture refused. `--smoke` on card 0,
+    residency off, 1,173 of 1,173 (`1792538973`).
+  - **Measured (1.7B, card 0, every tile, 32 / 256-token prompts, ms):** off 21.03 / 22.25 (`1792535978`); sharded
+    only 20.88 / 22.18 (`1792536101`); held by 2 **20.23 / 21.44** (`1792536365`), 4 20.40 / 21.58 (`1792536233`), 8
+    20.53 / 21.77 (`1792536496`). With 2g: held by 4 20.18 / 21.43 (`1792536628`), **held by 2 20.06 / 21.28**
+    (`1792537293`). Busy prefetch still does not pay: held by 2 with drops, cap 2, 20.13 / 21.68 (`1792537424`); held
+    by 4 with drops, cap 2 19.99 / 21.56 and cap 8 20.95 / 22.60 (`1792536759`, `1792536891`); off, cap 2 20.70 /
+    22.22 and cap 8 21.64 / 23.27 (`1792537023`, `1792537145`). The whole model prefers 2 holders where the probe
+    preferred 4: a step's other rows are read by fewer units, and two holders' writes cost each producer less.
+- [x] **2g. Never-read writes dropped** (2026-10-20). Phase 1's `NeverRead` tensors (a row written as tiles and as its
+  packed twin, where the next op reads one): `Plan::dropped` holds the internal ones whose every write is a plain
+  move; the rewrite removes their writes (a list left empty keeps a `WAIT` in its place); `Applied::verify` refuses a
+  GDDR move of one, `Plan::check` a dropped tensor that is read, resident, or the graph's output
+  (`Hazard::ReadDropped`), and the rewrite a read of one. On by default under residency
+  (`Session::set_residency_drop`, `TT_RESIDENCY_DROP=0` turns it off). Gates: unit
+  `a_never_read_tensor_s_writes_are_dropped`; `step219` `never_read_writes_are_dropped_bit_for_bit` (bit for bit,
+  548,864 -> 532,480 B written; the negative control refused by the check and the planned capture by name). Measured
+  above: -0.17 ms a step held by 2, -0.22 held by 4.
+- [x] **2h. The region sized by the plan, and residency on by default** (done 2026-10-21; asked for ahead of larger
+  models). Today every planned capture keeps a fixed region (`RESIDENCY_REGION`, 96 KiB), chosen from the 1.7B: free
+  up to 96 KiB, +1.6 ms a step past ~128 KiB, where the products take narrower blocks (2a). The 1.7B's plans use tens
+  of KB of it. Past the cliff, a region costs the products more than residency saves, and the cliff depends on the
+  products' `K`: a `K`-whole column of weights is ~266 KB at `K` = 2048 and ~532 KB at 4096. So on a larger model the
+  fixed region may cost more than it saves. Phase 1's budget (`DATA.end` less the neediest op's `l1_need`: 339 KB at
+  the 1.7B) overstated the room ~3x. Where the region does not fit, the plan leaves tensors in GDDR (the costliest
+  first) and never fails, so the risk is a loss of speed, not of correctness. In order:
+  - [x] **2h-i. The cliff, measured** (2026-10-21). `silicon_probe_region_cliff` (card 0, every tile, release,
+    `1792546337`, `1792546573`): eight one-row products (the 1.7B's and Llama-3.2-1B's `qkv`, `gate|up` and head at `K`
+    = 2048, Qwen2.5-1.5B's `gate|up` at 1536, an 8B's `qkv` at 4096, `down` at 8192, 8960 and 14,336), each under
+    regions from 0 to past its predicted limit, the limit and 64 bytes either side of it. It reports time, read and
+    stream entries a unit, the block (`matmul::probe_plan_at`) and the recorded need; every point is bit for bit
+    against the product with no region.
+    - **The cliff is exact, and the planner predicts it.** `plan_in` takes the widest block whose probe layout fits,
+      and the probe charges `A` unpacked (`kt` slots, where the kernel runs a packed `A` of `kt/32 + 1`). So a `K`-whole
+      product keeps its block while the arena ends at or above `DATA.base + 4160 * ((kt + 1)(nc + 1) - 1)`: at `K` =
+      2048, a region of at most **110,464 bytes**. At 110,464 the 1.7B's products are as with no region; 64 bytes past
+      it they narrow (`nc` 2 -> 1) and slow 8-10% (`qkv` 148 -> 161 us, `gate|up` 342 -> 376, head 991 -> 1069).
+    - **`K` blocked, `A` packed:** the jobs are a column each, so `plan_in`'s width binds nothing. The streamed chunk
+      layout binds: `down` 339,264 (8192), 285,184 (8960), 222,784 (14,336); 8B `qkv` 376,704. Past each, under 2%.
+    - **Why `l1_need` overstated the room:** it never saw the probe. `plan_in`'s probes were noted only on a cache
+      miss, and a capture after an eager run hit the cache, so the products recorded the packed layout's need. Phase
+      1's budget was then `down`'s (339 KB) where the K = 2048 products' is 110 KB.
+    - **Findings for later** ([decode-to-bandwidth.md](decode-to-bandwidth.md)): Qwen2.5-1.5B's `gate|up` is
+      *faster* narrowed (319 -> 293 us), and `K` = 4096 is never `K`-whole (257 slots of 220), so an 8B's products
+      stream with no weight prefetch. Charging the packed `A` in `plan_in`, with the width chosen by measurement rather
+      than greed, is a separate step.
+    - Recorded in the [operating notes](../learnings/silicon-operating-notes.md#a-region-at-the-top-of-l1-costs-a-product-only-past-its-plans-floor-2026-10-21-card-0).
+  - [x] **2h-ii. The region from the plan** (2026-10-21).
+    - **Every op notes its floor.** That is the lowest arena end at which its layouts are the ones it has
+      (`l1::Planned::need`, `OpRecord::l1_need`); `need` may now pass `top`.
+      - `matmul::plan_floor` gives the chosen block's probe. `plan_in` notes it on every call, without its probes,
+        fixing the warm/cold defect.
+      - `pipelining_pays` notes both stagings' floors where both decide.
+      - A packed `A` with `K` blocked notes `packed_k_block`'s and the stream's layouts, not the plan's, whose width
+        its jobs ignore.
+      - The other arena-sized layouts already noted their chosen layout. The gates below would find one that does not,
+        as a refusal, never as wrong bits.
+    - **The cap:** `residency::cap` is `DATA.end` less the graph's highest need (110,464 bytes for a 2048-wide
+      model).
+    - **The plan pass keeps no region** (`Session::begin_trace_plan_pass`), so its trace is laid out as a plain one,
+      and that is what a refusal keeps.
+    - **The plan** is made within `min(cap, RESIDENCY_REGION)`. `RESIDENCY_REGION` is now the ceiling. The planned
+      capture keeps that whole budget, not only what the plan uses: every op is laid out alike either way, and a
+      model's traces then share one arena end. Two consequences:
+      - **The programs.** The programs name addresses planned in the arena, so one set serves every trace. Kept to what
+        each plan used (the first build of this step), each trace held its own set, and the 135M on 12 tiles filled the
+        program cache (`step193`, "a list's programs do not fit an empty program cache").
+      - **Later plan passes.** For the same reason, once a planned capture has held, later plan passes keep its region
+        (`Session::planned_base`): a plan pass in the whole arena held a second set beside the kept traces'. So the
+        first trace's plan sizes a session's region, and a later graph whose ops would narrow under it plans narrower
+        rather than fail.
+    - **Only plan passes plan.** `begin_trace_plan_pass` marks them, so single-pass captures (`Trace::capture`,
+      `TracedInference::capture`, `TracedTrainingStep`) neither keep a region nor plan.
+    - **The plain trace is released before the planned capture** (burn-tt), and a refused planned capture is captured
+      plainly again.
+    - `TT_RESIDENCY_REGION=<bytes>` (`Session::set_residency_fixed`) keeps a fixed region in both passes, for
+      measurement.
+    - **Each planned op checked before it is queued.** `Applied::check_op` checks two things before the rewrite:
+      - the allocations so far are the plan's;
+      - every move of every list lands on the plan pass's tensors and tiles.
+
+      A planned capture whose plan stops queues nothing more: the next ops would read from GDDR what the plan put in
+      L1. A cached plan applied to another graph had made an op divide by zero on the card (`dm::error::DOMAIN`), and
+      that stops the queue.
+    - **Faster rewrite.** `Applied::rewrite` runs only on the lists that moved a resident or dropped tensor in the plan
+      pass (`Applied::touches`), and the capture's `Index` grows with its log instead of being rebuilt every op.
+    - **Gates:**
+      - `matmul` unit `a_plan_stands_down_to_its_floor_and_narrows_below_it` (the probe's rows: the same block at the
+        floor, narrower 64 bytes below, noted on cached calls too);
+      - `step219` `the_region_is_sized_by_its_plan_and_never_past_its_cap`: a `K` = 2048 product on 8 units; its cap
+        is 110,464; bit for bit in its own region and in exactly the cap. **Negative control:** 64 bytes past the cap
+        (`Session::probe_planned_region`), the product narrows and the planned capture is refused by name.
+
+      ttsim, then card 0 (`1792552842`).
+    - **Measured** (1.7B, card 0, every tile, 32 / 256-token prompts, ms; before the region took the whole budget):
+      off 20.97 / 22.21 (`1792546706`); sized by the plan 20.04 / 21.29 (`1792546841`); fixed 96 KiB 20.03 / 21.28
+      (`1792546985`). Even, as expected. The 1.7B's cap is 110,464 (the `K` = 2048 products), so its budget is the 96
+      KiB ceiling.
+  - [x] **2h-iii. The plan cache** (2026-10-21).
+    - **The key.** A session cannot know a graph before capturing it, so plans are kept by the caller's key.
+      - `Session::begin_trace_planned_as(key)` keeps the plan if its capture holds;
+      - `Session::begin_trace_cached(key)` applies it in one capture, refused (and forgotten) if the graph is not the
+        plan's;
+      - any residency setting change forgets every plan.
+      - burn-tt keys a step by its key, its inputs' and state's shapes and dtypes, and the set's scope
+        (`SharedStateTraces::set_plan_scope`). `TracedGenerator` scopes by its model, so two models on one device
+        keep apart.
+    - **Gates:**
+      - `step219` `a_cached_plan_is_applied_once_and_forgotten_for_another_graph`: one capture under a kept plan, bit
+        for bit. **Negative controls:** another graph under the key is refused and the key forgotten; a graph rewired
+        at its fourth op is refused before that op is queued, and the session runs on bit for bit.
+      - The Llama test: a second `TracedGenerator` build captures each trace once (`burn_tt::probe_captures`), bit
+        for bit, moving the same bytes.
+
+      ttsim, card 0 (`1792552842`).
+    - **Measured** (the 1.7B driver, card 0; first build, then a second in the same process):
+
+      | Residency | First build | Second build | Run |
+      |---|--:|--:|---|
+      | off | 45.6 s; 54.4 s | 8.76 s; 8.68 s | `1792546706`; `1792556241` |
+      | on, the rewrite rebuilding its index every op | 64.2 s | 11.3 s | `1792546841` |
+      | on, the index grown and only touched lists rewritten | 63.2 s | 10.2 s | `1792548011` |
+      | on, each op also checked before it is queued (`check_op`) | 65.0 s | 11.1 s | `1792554892` |
+
+      - **The first build** captures every trace twice: +20-40% (the off build varies by ~9 s between runs).
+      - **The second build** captures each trace once, under its cached plan. Its +2.4 s is the host's work on each
+        planned capture:
+        - the check of each op before it is queued;
+        - the rewrite of the lists it touches;
+        - `Applied::verify`'s graph of the whole capture: ~85 ms a step trace, ~570 ms the prefill chunk.
+      - **Shared bodies.** The step's attended lengths differ in their attention op, so their plans are not one, and
+        they are captured apart.
+  - [x] **2h-iv. On by default** (2026-10-21). Residency is on unless `TT_RESIDENCY=0`, for the session and so for
+    `burn-tt`'s device. Rows are held by 2 and drops are on, as before. Only captures that can run twice
+    (`SharedStateTraces`, so `TracedGenerator`) plan; the single-pass captures are unchanged.
+    - **Measured, on against off** (card 0, every tile, release; on / off):
+
+      | Workload | On | Off | Runs |
+      |---|--:|--:|---|
+      | 1.7B decode step, 32 / 256-token prompt | **20.07 / 21.28 ms** | 21.00 / 22.25 | `1792554892` / `1792556241` |
+      | 135M decode step, 32 / 128 / 256 | 8.12 / 8.76 / 9.57 ms | 8.20 / 8.84 / 9.63 | `1792555165` / `1792556373` |
+      | 135M prefill, 32 / 128 / 256 | 1521 / 4493 / 5717 tok/s | 1517 / 4480 / 5703 | same |
+      | ResNet-18, traced | 14.16 ms | 14.14 | `1792556228` / `1792557424` |
+      | ViT-Tiny, traced | 9.34 ms | 9.35 | same |
+      | MNIST MLP training, traced, 300 steps (`tt-mnist --train-trace --tiles all`) | 986 / 984 ms | 968 / 990 | two runs each |
+      | 1.7B build, first / second | 65.0 / 11.1 s | 54.4 / 8.68 s | `1792554892` / `1792556241` |
+      | 135M build (`traced_generation`) | 22.4 s | 13.0 s | `1792555165` / `1792556373` |
+
+      - **No workload runs slower**, so none keeps residency off.
+      - **The builds are slower,** which misses this item's bar of no slower than off. Accepted (2026-10-21): a
+        build's time is not an optimization target, so residency stays on by default (2h-v).
+      - **The 1.7B's `traced_generation`** hit its 900 s limit in the Flex baseline, on and off alike; its step is
+        `traced_generation_stream_ceiling`'s.
+    - **Gates with it on:** `--smoke` on card 0, 1,178 of 1,178, the model ladder included (`1792553102`); `step188`
+      (`1792552873`; no planned capture refused); `step193`, `step197`, `step209`, `step210`, `step217`, `step219`,
+      `step220`, 24 of 24 (`1792552842`); `step12_mnist` 8 of 8 and `cargo xtask conformance --release` (2,973 passed,
+      52 failed as expected, none unexpected), ttsim.
+      - `step197` (the plain trace's bytes) and `step217`'s Phase 1 report turn residency off: their claims are about
+        a plain capture.
+    - **Found on the way:**
+      - **One tile.** `tt-mnist --train-trace` on one tile fails at commit `59e78d1` too: "a list's programs do not
+        fit an empty program cache". It is not residency's; on every tile it trains.
+      - **A wrong plan can fault the card.** A plan applied to another graph made an op divide by zero on the card
+        (`step193`, before `check_op`).
+  - [x] **2h-v. The build's cost: accepted, not pursued** (2026-10-21). Residency's first build captures every trace
+    twice (+20-40%), and a second build in one process still costs +2.4 s of host checks. A build's time is not an
+    optimization target, so residency stays on by default. Should it ever matter, the options, each to be measured:
+    - plan from a trace's eager warm-up's ops instead of a plan pass;
+    - make `Applied::verify` share `check_op`'s walk;
+    - keep plans across processes, keyed as the cache is.
 
 ### Later phases
 

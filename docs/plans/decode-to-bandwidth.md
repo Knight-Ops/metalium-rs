@@ -466,6 +466,16 @@ Reordered by Phase 0. A layer's products take ~907 us, against ~600 us for their
     channel locality.
 - [ ] **Decision point (ask the user):** split-K, if `o` and `down` remain short of the ceiling. Phase 0 shows 64
   units can saturate, so this is now less likely to be needed.
+- [ ] **A product's block from what it runs, not a greedy probe** (found by planned-l1-residency 2h-i, 2026-10-21,
+  `1792546573`). `matmul::plan_in` takes the widest block whose probe fits, and the probe charges `A` unpacked (`kt`
+  slots) where the kernel runs a packed `A` (`kt/32 + 1`).
+  - **What that costs:** at `K` = 2048 the probe holds 807 KB, which is what caps a residency region at 110 KB. At `K` =
+    4096 (an 8B's `hidden`) no `K`-whole block fits (257 slots of 220), so those products stream with no weight
+    prefetch.
+  - **And the widest is not always fastest:** Qwen2.5-1.5B's `gate|up` (`K` = 1536) is 319 us at `nc` 3 and 293 at 2.
+  - **To do:** charge the packed `A` in the fit, choose the width by measurement (a bound, not greed, so the freed room
+    is not refilled), and measure the products and the step. A separate step from residency: it changes the products'
+    layouts with no region at all.
 
 ### Phase 5. The weight stream under the small ops (done 2026-10-18)
 
@@ -704,7 +714,9 @@ the host ~0.8).
     `step217`): a 1.7B step keeps 401 of 548 tensors resident in 112-171 KB a unit, 294 MB of reads spared a step.
     Phase 2's mechanism done the same day (`step218`, `step219`, bit for bit on the 1.7B): sharded tensors resident,
     the step even and 0.1 ms better under busy prefetch; rows read whole on many units, by multicast, cost 23 ms more
-    (contended multicasts), so 2f and Phase 3 (the products' outputs) decide whether residency frees the windows.
+    (contended multicasts). 2f (rows held by two of their readers) and 2g (never-read writes dropped): 21.03 -> 20.06
+    ms a step (`1792537293`), but busy prefetch still does not pay (cap 2, 20.13): Phase 3 (the products' outputs)
+    decides whether residency frees the windows.
 - [ ] `down` prefetched: the first chunk batches' `B` gathers of `push_stream_jobs` on idle units. ~0.7 ms.
 - [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
   reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small

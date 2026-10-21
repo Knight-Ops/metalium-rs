@@ -135,6 +135,9 @@ pub const TXN_PREFETCH: u8 = 6;
 /// [`TXN_NC`], whose counter a broadcast would leave meaningless. Nothing waits on it: a multicast
 /// is counted by its acknowledgements.
 pub const TXN_NC_MCAST: u8 = 7;
+/// Word 6 of an [`op::WRITE_L1_MCAST`]: counted with the run it belongs to, not on its own.
+pub const MCAST_RUN_ACKS: u32 = 1;
+
 /// [`op::WRITE_L1_MCAST`]'s word 1 for the rectangle `start..=end`.
 pub const fn mcast_corners(start: (u8, u8), end: (u8, u8)) -> u32 {
     u32::from_le_bytes([start.0, start.1, end.0, end.1])
@@ -358,6 +361,13 @@ pub mod op {
     /// skip; the tile running it is never one (no broadcast to itself); the ranges as
     /// [`WRITE_L1`]'s. The host narrows the rectangle to its session's tiles. NC's only. Only in
     /// a list entry.
+    ///
+    /// Word 6 may be [`super::MCAST_RUN_ACKS`]: a multicast so marked that follows another so
+    /// marked neither waits for earlier writes nor counts its own acknowledgements before the
+    /// next entry; the run's acknowledgements are counted together before the first entry that is
+    /// not one of it, and at the list's end (`docs/plans/planned-l1-residency.md` 2f (c)). The
+    /// run's first still waits for NC's earlier writes, so nothing else is in flight to add to the
+    /// count.
     pub const WRITE_L1_MCAST: u32 = 0x25;
     /// Another (or this) Tensix tile's L1 -> this tile's L1: `[READ_L1, x, y, from, to, len, 0,
     /// 0]`, [`WRITE_L1`]'s mirror on the reader. RISCV B reads `len` bytes at `from` in the L1 of
@@ -773,6 +783,8 @@ pub enum Entry {
         to: u32,
         from: u32,
         len: u32,
+        /// Counted with its run ([`MCAST_RUN_ACKS`]).
+        run: bool,
     },
     /// [`op::WRITE_L1`]: `len` bytes of this tile's L1 at `from` to `to` in the L1 of `(x, y)`.
     L1Write {
@@ -914,7 +926,7 @@ impl Entry {
             if len == 0
                 || len > crate::noc::niu::MAX_REQUEST_BYTES
                 || w[2] != 0
-                || w[6] != 0
+                || w[6] & !MCAST_RUN_ACKS != 0
                 || w[7] != 0
             {
                 return Err(error::LENGTH);
@@ -944,6 +956,7 @@ impl Entry {
                 to,
                 from,
                 len,
+                run: w[6] == MCAST_RUN_ACKS,
             });
         }
         if w[0] == op::WRITE_L1 || w[0] == op::READ_L1 {
@@ -1401,6 +1414,63 @@ mod tests {
         assert!(!Mover::B.permits(op::WRITE_L1));
     }
 
+    /// `READ_L1`: the remote address third and the local fourth, otherwise `WRITE_L1`'s checks;
+    /// any Tensix tile, not only the reader's own; and only B runs it.
+    #[test]
+    fn an_l1_read_decodes_only_whole_and_only_on_b() {
+        use super::*;
+        let from = crate::l1::DATA.end as u32 - 4096;
+        let good = [op::READ_L1, 5, 4, from, 0x4_0010, 4096, 0, 0];
+        assert_eq!(
+            Entry::decode(0xFF, [op::READ_L1, 5, 4, from + 16, 0x4_0010, 64, 0, 0]),
+            Ok(Entry::L1Read {
+                x: 5,
+                y: 4,
+                from: from + 16,
+                to: 0x4_0010,
+                len: 64
+            })
+        );
+        let with = |k: usize, v: u32| {
+            let mut e = good;
+            e[k] = v;
+            Entry::decode(0xFF, e)
+        };
+        assert!(matches!(
+            Entry::decode(0xFF, good),
+            Ok(Entry::L1Read { .. })
+        ));
+        assert_eq!(with(1, 8), Err(error::RANGE), "the non-memory column");
+        assert_eq!(with(1, 9), Err(error::RANGE), "a DRAM column");
+        assert_eq!(with(2, 1), Err(error::RANGE), "above the Tensix rows");
+        assert_eq!(with(1, 64), Err(error::RANGE), "past six bits");
+        assert_eq!(with(5, 0), Err(error::LENGTH));
+        assert_eq!(with(5, 16384 + 16), Err(error::LENGTH));
+        assert_eq!(with(7, 1), Err(error::LENGTH), "a reserved word");
+        assert_eq!(
+            with(3, from + 8),
+            Err(error::ALIGNMENT),
+            "not congruent mod 16"
+        );
+        assert_eq!(
+            with(3, 0x1_0000),
+            Err(error::ALIGNMENT),
+            "the remote side below DATA"
+        );
+        assert_eq!(
+            with(4, 0x1_0010),
+            Err(error::ALIGNMENT),
+            "the local side below DATA"
+        );
+        assert_eq!(
+            with(4, crate::l1::DATA.end as u32 - 48),
+            Err(error::ALIGNMENT),
+            "the local side past DATA"
+        );
+        assert!(Mover::B.permits(op::READ_L1));
+        assert!(!Mover::NC.permits(op::READ_L1));
+    }
+
     /// `WRITE_L1_MCAST`: a rectangle of Tensix geometry, `start <= end`, no non-memory or DRAM
     /// column inside it; the ranges as `WRITE_L1`'s; and only NC runs it.
     #[test]
@@ -1429,10 +1499,36 @@ mod tests {
                 end: (7, 11),
                 to,
                 from: 0x4_0000,
-                len: 64
+                len: 64,
+                run: false,
             })
         );
         assert_eq!(mc((10, 2), (14, 11), 4096).map(|_| ()), Ok(()));
+        let flagged = |w6: u32| {
+            Entry::decode(
+                0xFF,
+                [
+                    op::WRITE_L1_MCAST,
+                    mcast_corners((1, 2), (2, 2)),
+                    0,
+                    to,
+                    0x4_0000,
+                    64,
+                    w6,
+                    0,
+                ],
+            )
+        };
+        assert!(matches!(
+            flagged(MCAST_RUN_ACKS),
+            Ok(Entry::L1Multicast { run: true, .. })
+        ));
+        assert_eq!(
+            flagged(2),
+            Err(error::LENGTH),
+            "a bit word 6 does not define"
+        );
+        assert_eq!(flagged(MCAST_RUN_ACKS | 1 << 31), Err(error::LENGTH));
         assert_eq!(
             mc((7, 2), (10, 2), 64),
             Err(error::RANGE),

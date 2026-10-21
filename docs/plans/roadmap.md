@@ -409,9 +409,19 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         mechanism done** (2026-10-20, gates `step218`, `step219`): NC writes and multicasts into other units' L1, B
         reads its own over the NoC, and a planned capture (`TT_RESIDENCY=1`) rewrites each op's lists so its resident
         tensors never touch GDDR, bit for bit (`step188`). Measured: rows read whole on many units cost more by
-        contended multicast (43.9 ms a step), so they stay in GDDR (2f); sharded only, even (20.92 ms), 0.1 ms better
-        under busy prefetch. Next: 2f, then Phase 3 (the products' outputs, which the residual add still reads from
-        GDDR). With it,
+        contended multicast (43.9 ms a step); sharded only, even (20.92 ms), 0.1 ms better under busy prefetch.
+        **2f and 2g done** (2026-10-20, gates `step218`-`step220`): of three ways to deliver such a row, probed on
+        card 0 (`1792533708`), holding it on a few of its readers wins (8-10 us a `[1, 2048]` row against 9-17 through
+        GDDR, 11-17 against 23-70 under a stream); counting multicast acknowledgements once a run changed nothing.
+        Rows held by 2 readers and never-read writes dropped: a 1.7B step **21.03 / 22.25 -> 20.06 / 21.28 ms** with
+        `TT_RESIDENCY=1` (`1792535978`, `1792537293`); busy prefetch still does not pay. **2h done** (2026-10-21,
+        gates `step219`, `silicon_probe_region_cliff`): a region costs a product only past its plan's floor (110,464
+        bytes at `K` = 2048; `K` = 4096 is never `K`-whole today), each plan's region sized under its graph's cap,
+        plans cached by key, each planned op checked before it is queued, and **residency on by default**
+        (`TT_RESIDENCY=0` off): a 1.7B step 21.00 / 22.25 -> **20.07 / 21.28 ms** (`1792556241`, `1792554892`), no
+        traced workload slower; builds +20-70%, accepted (a build's time is not a target). Next: Phase 3 (the products' outputs, which the residual
+        add still reads from GDDR).
+        With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is
         deferred.

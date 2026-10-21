@@ -672,10 +672,23 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             }
         }
         let mut sets = Vec::with_capacity(caches.len());
+        // Plans kept for this model's steps are this model's: another model's steps have the same
+        // keys and shapes (`SharedStateTraces::set_plan_scope`).
+        let scope = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (
+                std::any::type_name::<M>(),
+                model as *const M as usize,
+                private,
+            )
+                .hash(&mut h);
+            h.finish()
+        };
         for cache in &caches {
-            sets.push(SharedStateTraces::new(
-                cache.state().into_iter().map(float).collect(),
-            )?);
+            let mut set = SharedStateTraces::new(cache.state().into_iter().map(float).collect())?;
+            set.set_plan_scope(scope);
+            sets.push(set);
         }
 
         // Each trace's outputs: its logits, then its greedy next token chosen on the card. A

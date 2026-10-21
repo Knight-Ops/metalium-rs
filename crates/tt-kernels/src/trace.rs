@@ -168,10 +168,11 @@ pub struct OpRecord {
     /// The highest `DATA` address its L1 plans reached ([`crate::l1::take_planned_top`]): what it
     /// needs of a unit's arena. Zero where its layout was not planned while it was captured.
     pub l1_top: u64,
-    /// The highest address of [`OpRecord::l1_top`]'s that it could not do without
-    /// ([`crate::l1::Planned::need`]): below `l1_top` where a plan left room on purpose (a product's
-    /// `B` ring against the arena's end), what a smaller arena must still hold. Zero where
-    /// `l1_top` is.
+    /// The lowest arena end at which it is laid out as it is ([`crate::l1::Planned::need`]): what
+    /// a smaller arena must still hold. Below `l1_top` where a plan left room on purpose (a
+    /// product's `B` ring against the arena's end); above it where a choice sized from the arena
+    /// tested more than it runs (a product's block width, probed with `A` unpacked). Zero where
+    /// nothing was planned.
     pub l1_need: u64,
     /// A hash of how its lists were laid out before a planned capture rewrote them: each unit's
     /// steps, their kinds and entry counts. A planned capture's ops must have their plan pass's
@@ -359,6 +360,14 @@ pub(crate) struct Capture {
     pub(crate) plan_mismatch: Option<String>,
     /// Whether it began planned: it ends verified against its plan, or refused.
     pub(crate) planned: bool,
+    /// Whether it is a residency plan pass (`Session::begin_trace_plan_pass`): it ends by planning
+    /// the next planned capture.
+    pub(crate) plan_pass: bool,
+    /// The key its plan is cached under (`Session::begin_trace_planned_as`,
+    /// `Session::begin_trace_cached`): kept there if the capture is its plan's, forgotten if not.
+    pub(crate) plan_key: Option<u64>,
+    /// While it applies a plan: its tensors' GDDR slots so far, grown as it allocates.
+    pub(crate) index: crate::residency::Index,
 }
 
 impl Capture {
@@ -547,6 +556,9 @@ mod tests {
             applied: None,
             plan_mismatch: None,
             planned: false,
+            plan_pass: false,
+            plan_key: None,
+            index: Default::default(),
         }
     }
 

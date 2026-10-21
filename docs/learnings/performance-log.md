@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Residency on by default, its region sized under the products' cliff](#residency-on-by-default-its-region-sized-under-the-products-cliff-2026-10-21-card-0) | 2026-10-21 | a region costs a product only past its plan's floor (110,464 bytes at `K` = 2048: +8-10% one 64-byte step past it); each plan's region sized under its graph's cap, plans cached, residency on by default: a 1.7B step 21.00 / 22.25 -> **20.07 / 21.28 ms**, nothing slower; builds +20-70% (open) |
+| [Rows held by a few of their readers, and never-read writes dropped](#rows-held-by-a-few-of-their-readers-and-never-read-writes-dropped-2026-10-20-card-0) | 2026-10-20 | a row many units read whole, held by 2 of them instead of multicast to all, and the writes nothing reads dropped: with `TT_RESIDENCY=1` a 1.7B step 21.03 / 22.25 -> **20.06 / 21.28 ms** (card 0); of the probe's three ways, multicast acknowledgements counted once a run changed nothing |
 | [Busy-unit prefetch and the prefetch pump](#busy-unit-prefetch-and-the-prefetch-pump-2026-10-20-cards-0-and-1) | 2026-10-20 | a product's own units read `B` ahead under the ops before it: the products 15.24 -> 11.66 ms, but the small ops' reads queue behind the prefetch (the residual add 14 -> ~100 us): the step 20.97 -> 21.58 ms, at best 20.74 / 21.76 with ID 6's cap at 2 / 1; opt-in |
 | [The Phase 8 feasibility probe](#the-phase-8-feasibility-probe-the-step-without-its-weight-stream-and-under-one-2026-10-20-cards-0-and-1) | 2026-10-20 | a 1.7B decode step with its weights free is **7.85 ms** (today 20.92); under a ~300 GB/s stream on idle units its ops cost 1.6x, mostly drains waiting on reads; L1, not bandwidth, bounds a continuous stream; the packed-`A` ring wastes ~254 KB a product unit |
 | [The token on the card, RoPE as one op, and three copies gone](#the-token-on-the-card-rope-as-one-op-and-three-copies-gone-2026-10-19-cards-0-and-1) | 2026-10-19 | a row's argmax as one native op and the greedy token read back alone; RoPE as one op; a no-op reshape, the value's copy and the context's repack gone: a 1.7B decode step -> **20.95 / 21.41 / 22.18 ms**, 135M -> **8.00 / 8.59 / 9.38**; sampling on the card works (112 ms a token) |
@@ -342,6 +344,80 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Residency on by default, its region sized under the products' cliff (2026-10-21, card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) 2h.
+
+**The cliff, probed** (`silicon_probe_region_cliff`, every tile, release, `1792546337`, `1792546573`): one-row products
+under a region swept past each one's predicted limit, every point bit for bit against no region.
+
+| Product | `K` | Limit (bytes of region) | At the limit | 64 bytes past it |
+|---|--:|--:|--:|--:|
+| 1.7B `qkv` `[2048, 6144]` | 2048 | 110,464 | 148.6 us | 162.0 us (`nc` 2 -> 1) |
+| 1.7B `gate\|up` `[2048, 16384]` | 2048 | 110,464 | 342.3 | 376.6 |
+| 1.7B head `[2048, 49152]` | 2048 | 110,464 | 991.6 | 1069.7 |
+| Qwen2.5-1.5B `gate\|up` `[1536, 17920]` | 1536 | 106,304 | 319.1 | 293.4 at 128 KiB (`nc` 3 -> 2: faster) |
+| 8B `qkv` `[4096, 6144]` (`K` blocked) | 4096 | 376,704 | 260.6 | 261.4 |
+| 1.7B `down` `[8192, 2048]` | 8192 | 339,264 | 175.7 | 178.6 |
+| Qwen2.5-1.5B `down` `[8960, 1536]` | 8960 | 285,184 | 151.1 | 148.6 |
+| 8B `down` `[14336, 4096]` | 14,336 | 222,784 | 585.9 | 590.5 |
+
+- **The `K`-whole limit** is `DATA.end` less `matmul::plan_in`'s widest block's *probe* (`A` unpacked:
+  `4160 ((kt + 1)(nc + 1) - 1)` bytes over `DATA.base`).
+- **The `K`-blocked limits** are their stream chunk layouts'. The plan's width does not bind them.
+- **Below each limit,** time and layout are those of no region.
+
+**The step** (1.7B, F32, every tile, `traced_generation_stream_ceiling`, decode step, 32 / 256-token prompts; builds
+in the same runs, first then a second in one process):
+
+| Configuration | ms | First / second build | Run |
+|---|--:|--:|---|
+| residency off | 21.00 / 22.25 | 54.4 / 8.68 s | `1792556241` |
+| on, region sized by the plan (what each plan uses) | 20.04 / 21.29 | 64.2 / 11.3 s | `1792546841` |
+| on, fixed 96 KiB in both passes | 20.03 / 21.28 | 64.0 / 11.4 s | `1792546985` |
+| **on by default** (each plan's budget, `min(cap, 96 KiB)`; plans cached; each op checked before it is queued) | **20.07 / 21.28** | 65.0 / 11.1 s | `1792554892` |
+
+- **The rest, on / off:**
+  - 135M decode step 8.12 / 8.76 / 9.57 against 8.20 / 8.84 / 9.63 ms, and prefill 1521 / 4493 / 5717 against
+    1517 / 4480 / 5703 tokens/s (`1792555165` / `1792556373`);
+  - ResNet-18 traced 14.16 / 14.14 ms, ViT-Tiny 9.34 / 9.35 (`1792556228` / `1792557424`);
+  - MNIST MLP traced training 300 steps 984-986 / 968-990 ms;
+  - the 135M's build 22.4 / 13.0 s.
+- **The builds are the cost,** accepted: a build's time is not an optimization target (2h-v).
+
+## Rows held by a few of their readers, and never-read writes dropped (2026-10-20, card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) 2f and 2g. First a probe of three ways to deliver a row
+many units read whole (`silicon_probe_row_delivery`, 120 tiles, `--profile`, `1792533708`; per-op span medians, 8
+deliveries a trace, idle / under a GDDR stream on the idle units, us): through GDDR 9.0-17 / 23-80; Phase 2's
+multicast from every producer 140-780, unchanged with a producer's acknowledgements counted once (2f (c),
+`dm::MCAST_RUN_ACKS`); one gatherer's relay op 16-51 / 28-78; **held by 4 of the readers, 8.1-20 / 11-37** (2f (a);
+1, 2 and 8 holders and every case in the plan's table). Then the winner in the plan (`Rows::Held`) and the drops
+(`Plan::dropped`).
+
+SmolLM2-1.7B-Instruct, F32, every tile (`TT_TILES=all`), `traced_generation_stream_ceiling`, decode step, 32 / 256-token
+prompts, `TT_RESIDENCY=1` unless off; bit for bit (`step188` traced against eager with residency on, `1792535508`; no
+planned capture refused in any run):
+
+| Configuration | ms | Run |
+|---|--:|---|
+| residency off | 21.03 / 22.25 | `1792535978` |
+| rows in GDDR (sharded only) | 20.88 / 22.18 | `1792536101` |
+| rows held by 2 / 4 / 8 | 20.23 / 21.44, 20.40 / 21.58, 20.53 / 21.77 | `1792536365`, `1792536233`, `1792536496` |
+| rows held by 4, drops | 20.18 / 21.43 | `1792536628` |
+| **rows held by 2, drops** (the default now) | **20.06 / 21.28** | `1792537293` |
+| held by 2, drops, busy prefetch cap 2 | 20.13 / 21.68 | `1792537424` |
+| held by 4, drops, busy prefetch cap 2 / 8 | 19.99 / 21.56, 20.95 / 22.60 | `1792536759`, `1792536891` |
+| off, busy prefetch cap 2 / 8 | 20.70 / 22.22, 21.64 / 23.27 | `1792537023`, `1792537145` |
+
+The profile (`Step(64)`, off `1792537693`, held by 2 with drops `1792538078`): the summed op spans 20.52 -> 19.58 ms;
+the products 15.22 -> 14.75 (their packed `A` from a holder, not GDDR: 7,058 -> 7,001 MB read), RMSNorm 1.24 -> 0.87,
+`silu_mul` 0.49 -> 0.45 (26.0 -> 0.8 MB written), `gamma`'s multiply 0.69 -> 0.65; the residual add unchanged (0.66),
+since it reads the product's output from GDDR (Phase 3). Busy prefetch still does not pay.
+
+Note: the bench needs `TT_TILES=all` for the 1.7B; on one tile its attention's programs do not fit the program cache
+(`1792535149`, at `59e78d1`).
 
 ## Planned residency applied: replicated rows by multicast, then sharded only (2026-10-20, card 0)
 

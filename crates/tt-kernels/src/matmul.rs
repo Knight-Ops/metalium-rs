@@ -2129,25 +2129,81 @@ pub fn plan(mkn: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> Option<Chun
     plan_in(mkn, route, fidelity, Staging::Host)
 }
 
-/// [`plan`] for either [`Staging`], cached per process.
+/// [`plan`] for either [`Staging`], cached per process. It notes, hit or miss, the arena end its
+/// answer needs ([`plan_floor`]), not the probes it made to find it.
 pub fn plan_in(
     mkn: [usize; 3],
     route: SrcRoute,
     fidelity: Fidelity,
     staging: Staging,
 ) -> Option<ChunkShape> {
+    let (p, floor) = plan_floor(mkn, route, fidelity, staging);
+    crate::l1::note_planned(crate::l1::Planned {
+        top: 0,
+        need: floor,
+    });
+    p
+}
+
+/// [`plan_in`] without noting, and the lowest arena end ([`crate::l1::arena`]) at which its
+/// answer is the same: the chunk it chose is the widest that fits, so it stands while that chunk's
+/// own probe layout fits (`A` unpacked, as [`chunk_fits_in`] lays it out), and a smaller arena
+/// narrows it (`docs/plans/planned-l1-residency.md` 2h: at `K` = 2048, `DATA.end` less 110,464
+/// bytes). [`Staging::SlotsHalf`] holds it in [`half`] the arena, which keeps it while the arena
+/// is twice the probe on [`half`]'s 4096-byte boundary. 0 for [`Staging::Host`], whose layout is
+/// not planned in the arena.
+pub fn plan_floor(
+    mkn: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    staging: Staging,
+) -> (Option<ChunkShape>, u64) {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     // By the arena's end too (`crate::l1::arena`): what fits it.
     type Key = ([usize; 3], SrcRoute, Fidelity, Staging, u64);
-    static CACHE: OnceLock<Mutex<HashMap<Key, Option<ChunkShape>>>> = OnceLock::new();
+    type Value = (Option<ChunkShape>, u64);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let key = (mkn, route, fidelity, staging, crate::l1::arena().end);
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return *p;
     }
-    let p = plan_uncached(mkn, route, fidelity, staging);
+    let p = crate::l1::unnoted(|| {
+        let p = plan_uncached(mkn, route, fidelity, staging);
+        let floor = match (p, staging) {
+            (None, _) | (_, Staging::Host) => 0,
+            (Some(s), _) => {
+                crate::l1::take_planned();
+                let laid = plan_layout_in(s.tiles, route.formats().0, staging).is_ok();
+                let need = crate::l1::take_planned().need;
+                let base = tt_isa::l1::DATA.base;
+                match staging {
+                    _ if !laid || need <= base => 0,
+                    Staging::SlotsHalf => base + 2 * (need - base).next_multiple_of(4096),
+                    _ => need,
+                }
+            }
+        };
+        (p, floor)
+    });
     cache.lock().unwrap().insert(key, p);
+    p
+}
+
+/// [`plan_floor`] in an arena ending at `arena_end`: what a capture keeping a region down to there
+/// would plan. Dev-facing: a probe reporting the block width a region leaves a product.
+#[doc(hidden)]
+pub fn probe_plan_at(
+    arena_end: u64,
+    mkn: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    staging: Staging,
+) -> (Option<ChunkShape>, u64) {
+    let was = crate::l1::set_arena_end(arena_end);
+    let p = plan_floor(mkn, route, fidelity, staging);
+    crate::l1::set_arena_end(was);
     p
 }
 
@@ -2373,6 +2429,55 @@ mod tests {
             Fidelity::HiFi4,
             Staging::Slots
         ));
+    }
+
+    /// `docs/plans/planned-l1-residency.md` 2h: a product's plan stands in any arena ending at or
+    /// above its floor, and narrows 64 bytes below it. For a one-row product with `K` whole, the
+    /// floor is the widest block's probe with `A` unpacked, `(kt + 1)(nc + 1) - 1` slots: at `K` =
+    /// 2048, 110,464 bytes of `DATA` left for a region. `plan_in` notes it, hit or miss.
+    #[test]
+    fn a_plan_stands_down_to_its_floor_and_narrows_below_it() {
+        use tt_isa::{dm::TILE_SLOT, l1::DATA};
+        let (route, fid) = (SrcRoute::Tf32FromFp32, Fidelity::HiFi4);
+        let at = |end: u64, mkn: [usize; 3], st: Staging| {
+            let was = crate::l1::set_arena_end(end);
+            let p = plan_floor(mkn, route, fid, st).0;
+            crate::l1::set_arena_end(was);
+            p
+        };
+        // 1.7B `qkv`, `gate|up`, head; Qwen2.5-1.5B's `gate|up`.
+        for (k, n, nc, left) in [
+            (2048, 6144, 2, 110_464),
+            (2048, 16_384, 2, 110_464),
+            (2048, 49_152, 2, 110_464),
+            (1536, 17_920, 3, 106_304),
+        ] {
+            let mkn = [1, k, n];
+            let kt = k / 32;
+            let (p, floor) = plan_floor(mkn, route, fid, Staging::Slots);
+            assert_eq!(p.unwrap().tiles, [1, kt, nc], "{mkn:?}");
+            assert_eq!(
+                floor,
+                DATA.base + TILE_SLOT * ((kt + 1) * (nc + 1) - 1) as u64,
+                "{mkn:?}"
+            );
+            assert_eq!(DATA.end - floor, left, "{mkn:?}");
+            assert_eq!(at(floor, mkn, Staging::Slots), p, "{mkn:?} at its floor");
+            assert_ne!(at(floor - 64, mkn, Staging::Slots), p, "{mkn:?} below it");
+            // Noted on every call, the cached ones too.
+            for _ in 0..2 {
+                crate::l1::take_planned();
+                plan_in(mkn, route, fid, Staging::Slots);
+                assert_eq!(crate::l1::take_planned().need, floor, "{mkn:?}");
+            }
+        }
+        // Half the arena: the arena twice the probe, on `half`'s 4096-byte boundary.
+        let mkn = [1024, 1024, 1024];
+        let (p, floor) = plan_floor(mkn, route, fid, Staging::SlotsHalf);
+        assert!(p.is_some() && floor > DATA.base);
+        assert_eq!((floor - DATA.base) % (2 * 4096), 0);
+        assert_eq!(at(floor, mkn, Staging::SlotsHalf), p);
+        assert_ne!(at(floor - 64, mkn, Staging::SlotsHalf), p);
     }
 
     #[test]

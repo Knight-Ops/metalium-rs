@@ -19,6 +19,15 @@
 //!   a tile not the session's; the tile refuses one holding itself, a reversed one, one across the
 //!   non-memory column, and any through NoC #0, whose acknowledgement counter B's barrier release
 //!   moves.
+//! - **A run of multicasts counted once lands as lone ones do** (`dm::MCAST_RUN_ACKS`, 2f (c)):
+//!   multicasts marked as one run, between unicasts, two runs split by an unmarked multicast, and a
+//!   run ending the list, each leave every tile of the rectangle holding the bytes when the list
+//!   ends, and the unicasts after a run land too.
+//! - **B reads a peer's L1** (`op::READ_L1`, 2f): 64 B to 16 KiB from two peers' windows and the
+//!   gate tile's own, at three skews, land byte for byte in the gate tile's L1 and nothing past them.
+//!   The host refuses a read from a tile not the session's, a harvested column's, outside the window
+//!   (the remote side), before any tile is named, and on NC; the tile refuses the decode's cases
+//!   sent raw, and writes nothing.
 //! - **The tile refuses a malformed entry by itself** (sent past the host's check,
 //!   `enqueue_raw`): a coordinate outside the Tensix rows and columns, a length of zero or past one
 //!   request, an address outside `DATA`, addresses not congruent mod 16, and the entry on B. It
@@ -422,7 +431,15 @@ fn the_tile_refuses_a_multicast_it_cannot_count_or_should_not_send() {
                 0,
             ]
         };
-        let bad: [(&str, [u32; 8], u32, Niu); 4] = [
+        let mut undefined = mc(RECT.0, RECT.1);
+        undefined[6] = 2;
+        let bad: [(&str, [u32; 8], u32, Niu); 5] = [
+            (
+                "a bit word 6 does not define",
+                undefined,
+                dm::error::LENGTH,
+                Niu::Noc1,
+            ),
             (
                 "a rectangle holding itself",
                 mc(gate, RECT.1),
@@ -466,5 +483,275 @@ fn the_tile_refuses_a_multicast_it_cannot_count_or_should_not_send() {
             }
             m.stop(d, &w).unwrap();
         }
+    });
+}
+
+/// Where B's reads land in the gate tile's own L1, and how much of it is checked.
+const DST: u32 = 0x4_0000;
+const DST_LEN: usize = 96 << 10;
+
+/// The tiles B reads from: the two peers and the gate tile itself (a loopback).
+fn sources() -> [(u8, u8); 3] {
+    [PEERS[0], PEERS[1], (GATE_TILE.0, GATE_TILE.1)]
+}
+
+fn read_dst(d: &mut Dev<'_>, w: &Window) -> Vec<u8> {
+    let t = tile(d, GATE_TILE.0, GATE_TILE.1);
+    let mut back = vec![0u8; DST_LEN];
+    d.l1_read(w, t, DST as u64, &mut back).unwrap();
+    back
+}
+
+fn poison_dst(d: &mut Dev<'_>, w: &Window) {
+    let t = tile(d, GATE_TILE.0, GATE_TILE.1);
+    d.l1_write(w, t, DST as u64, &vec![POISON; DST_LEN])
+        .unwrap();
+}
+
+#[test]
+fn a_read_pulls_a_peers_window() {
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let mut b = start(d, &w, Mover::B);
+        b.set_l1_writes(L1Writes {
+            tiles: sources().to_vec(),
+            window: window(),
+        })
+        .unwrap();
+        let span: u32 = LENS.iter().map(|l| l.next_multiple_of(64)).sum();
+        let mut read = 0;
+        for skew in [0u32, 16, 48] {
+            // Each source's window holds its own pattern.
+            let mut held = Vec::new();
+            for (k, &(x, y)) in sources().iter().enumerate() {
+                let p = pattern(WINDOW_LEN as usize, 0x2182 + k as u32 * 7 + skew);
+                let t = tile(d, x, y);
+                d.l1_write(&w, t, window().start, &p).unwrap();
+                held.push(p);
+            }
+            poison_dst(d, &w);
+            let mut want = vec![POISON; DST_LEN];
+            let mut list = Vec::new();
+            for (k, &(x, y)) in sources().iter().enumerate() {
+                let (mut from, mut to) =
+                    (window().start as u32 + skew, DST + k as u32 * span + skew);
+                for len in LENS {
+                    list.push([op::READ_L1, x as u32, y as u32, from, to, len, 0, 0]);
+                    let s = (from as u64 - window().start) as usize;
+                    let at = (to - DST) as usize;
+                    want[at..at + len as usize].copy_from_slice(&held[k][s..s + len as usize]);
+                    from += len.next_multiple_of(64);
+                    to += len.next_multiple_of(64);
+                }
+            }
+            assert!(DST as usize + DST_LEN <= window().start as usize - GUARD as usize);
+            read += list.len();
+            b.run_list(d, &w, &list).unwrap();
+            let got = read_dst(d, &w);
+            assert!(
+                first_difference(&got, &want).is_none(),
+                "skew {skew}: the gate tile's reads differ at byte {:?} past {DST:#x}",
+                first_difference(&got, &want)
+            );
+        }
+        assert_eq!(read, 3 * sources().len() * LENS.len());
+        b.stop(d, &w).unwrap();
+    });
+}
+
+#[test]
+fn the_host_refuses_a_read_its_session_does_not_own() {
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let mut b = start(d, &w, Mover::B);
+        let from = window().start as u32;
+        let e = |x: u8, y: u8, from: u32| [op::READ_L1, x as u32, y as u32, from, DST, 4160, 0, 0];
+        let refused = |r: Result<(), DmError>, what: &str| match r {
+            Err(DmError::Invalid(code)) => code,
+            other => panic!("the host took {what}: {other:?}"),
+        };
+        let r = b.run_list(d, &w, &[e(PEERS[0].0, PEERS[0].1, from)]);
+        assert_eq!(
+            refused(r, "a read before any tile was named"),
+            dm::error::RANGE
+        );
+        let end = window().end - 8192;
+        b.set_l1_writes(L1Writes {
+            tiles: PEERS.to_vec(),
+            window: window().start..end,
+        })
+        .unwrap();
+        let cases = [
+            (
+                "a tile not the session's",
+                e(BYSTANDER.0, BYSTANDER.1, from),
+            ),
+            ("a harvested column's tile", e(16, GATE_TILE.1, from)),
+            ("below the window", e(PEERS[0].0, PEERS[0].1, from - 64)),
+            (
+                "past the window",
+                e(PEERS[0].0, PEERS[0].1, end as u32 - 4096),
+            ),
+        ];
+        for (what, entry) in cases {
+            let r = b.run_list(d, &w, &[entry]);
+            assert_eq!(refused(r, what), dm::error::RANGE, "{what}");
+        }
+        b.run_list(d, &w, &[e(PEERS[1].0, PEERS[1].1, from)])
+            .unwrap();
+        b.stop(d, &w).unwrap();
+        // RISCV NC reads no L1 of another tile.
+        let mut nc = start(d, &w, Mover::NC);
+        let r = nc.run_list(d, &w, &[e(PEERS[0].0, PEERS[0].1, from)]);
+        assert_eq!(refused(r, "READ_L1 on NC"), dm::error::DIRECTION);
+        nc.stop(d, &w).unwrap();
+    });
+}
+
+#[test]
+fn the_tile_refuses_a_malformed_read_by_itself() {
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let (x, y) = (PEERS[0].0 as u32, PEERS[0].1 as u32);
+        let from = window().start as u32;
+        let bad: [(&str, [u32; 8], u32, Mover); 6] = [
+            (
+                "the non-memory column",
+                [op::READ_L1, 8, y, from, DST, 64, 0, 0],
+                dm::error::RANGE,
+                Mover::B,
+            ),
+            (
+                "a length of none",
+                [op::READ_L1, x, y, from, DST, 0, 0, 0],
+                dm::error::LENGTH,
+                Mover::B,
+            ),
+            (
+                "the remote side below DATA",
+                [op::READ_L1, x, y, 0x1_0000, DST, 64, 0, 0],
+                dm::error::ALIGNMENT,
+                Mover::B,
+            ),
+            (
+                "the local side below DATA",
+                [op::READ_L1, x, y, from, 0x1_0000, 64, 0, 0],
+                dm::error::ALIGNMENT,
+                Mover::B,
+            ),
+            (
+                "addresses not congruent mod 16",
+                [op::READ_L1, x, y, from + 8, DST, 64, 0, 0],
+                dm::error::ALIGNMENT,
+                Mover::B,
+            ),
+            (
+                "the entry on NC",
+                [op::READ_L1, x, y, from, DST, 64, 0, 0],
+                dm::error::DIRECTION,
+                Mover::NC,
+            ),
+        ];
+        for (what, entry, code, mover) in bad {
+            let mut m = start(d, &w, mover);
+            poison_dst(d, &w);
+            let n = m.enqueue_raw(d, &w, &[entry]).unwrap();
+            let got = m.wait_for(d, &w, n);
+            assert!(
+                matches!(got, Err(DmError::Queued { code: c, .. }) if c == code),
+                "the tile took {what}: {got:?}"
+            );
+            assert!(
+                read_dst(d, &w).iter().all(|&b| b == POISON),
+                "{what}: the gate tile's L1 was written"
+            );
+            m.stop(d, &w).unwrap();
+        }
+    });
+}
+
+#[test]
+fn a_run_of_multicasts_lands_before_the_next_entry() {
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let mut nc = start(d, &w, Mover::NC);
+        let mut ours = rect_tiles();
+        ours.extend(BESIDE);
+        nc.set_l1_writes(L1Writes {
+            tiles: ours,
+            window: window(),
+        })
+        .unwrap();
+        nc.set_write_noc(d, &w, Niu::Noc1).unwrap();
+        let src = pattern(64 << 10, 0x2183);
+        d.l1_write(&w, nc.tile(), SRC as u64, &src).unwrap();
+        let corners = dm::mcast_corners(RECT.0, RECT.1);
+        let base = window().start - GUARD;
+        // Which of the five multicasts are marked, and whether unicasts frame them.
+        let shapes: [(&str, [bool; 5], bool); 3] = [
+            ("one run between unicasts", [true; 5], true),
+            (
+                "two runs split by a lone multicast",
+                [true, true, false, true, true],
+                true,
+            ),
+            ("a run ending the list", [true; 5], false),
+        ];
+        for (what, marked, framed) in shapes {
+            for skew in [0u32, 48] {
+                let mut all = rect_tiles();
+                all.extend(BESIDE);
+                poison(d, &w, &all);
+                let mut list = Vec::new();
+                let mut wants_beside = [None, None];
+                if framed {
+                    let (l, mut want) = writes_to(BESIDE[0], &src, skew);
+                    list.push(l[0]);
+                    want[(window().start - base) as usize + skew as usize + 64..].fill(POISON);
+                    wants_beside[0] = Some(want);
+                }
+                let mut want_rect = vec![POISON; (WINDOW_LEN + GUARD) as usize];
+                let (mut from, mut to) = (SRC + skew, window().start as u32 + skew);
+                for (len, run) in LENS.into_iter().zip(marked) {
+                    let w6 = if run { dm::MCAST_RUN_ACKS } else { 0 };
+                    list.push([op::WRITE_L1_MCAST, corners, 0, to, from, len, w6, 0]);
+                    let at = (to as u64 - base) as usize;
+                    let s = (from - SRC) as usize;
+                    want_rect[at..at + len as usize].copy_from_slice(&src[s..s + len as usize]);
+                    from += len.next_multiple_of(64);
+                    to += len.next_multiple_of(64);
+                }
+                if framed {
+                    let (l, mut want) = writes_to(BESIDE[1], &src, skew);
+                    list.push(l[0]);
+                    want[(window().start - base) as usize + skew as usize + 64..].fill(POISON);
+                    wants_beside[1] = Some(want);
+                }
+                nc.run_list(d, &w, &list).unwrap();
+                for t in rect_tiles() {
+                    let got = read_back(d, &w, t);
+                    assert!(
+                        first_difference(&got, &want_rect).is_none(),
+                        "{what}, skew {skew}: {t:?} differs at byte {:?}",
+                        first_difference(&got, &want_rect)
+                    );
+                }
+                for (t, want) in BESIDE.iter().zip(&wants_beside) {
+                    let got = read_back(d, &w, *t);
+                    match want {
+                        Some(want) => assert!(
+                            first_difference(&got, want).is_none(),
+                            "{what}, skew {skew}: beside {t:?} differs at byte {:?}",
+                            first_difference(&got, want)
+                        ),
+                        None => assert!(
+                            got.iter().all(|&b| b == POISON),
+                            "{what}: beside {t:?} was written"
+                        ),
+                    }
+                }
+            }
+        }
+        nc.stop(d, &w).unwrap();
     });
 }

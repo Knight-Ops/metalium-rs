@@ -117,9 +117,11 @@ pub const PREFETCH_UNITS: usize = 40;
 /// op one read and two writes a tile spread over every unit.
 pub const PACKED_A_K_TILES: usize = 32;
 
-/// The persistent region a residency-planned capture keeps by default (`Session::set_residency`):
-/// 96 KiB a unit, under the ~96-128 KiB past which the products of a 2048-wide model take narrower
-/// blocks (`docs/learnings/performance-log.md`, "What an empty persistent region costs the step").
+/// The most a residency-planned capture's region takes by default (`Session::set_residency`): 96
+/// KiB a unit. Each plan takes what it uses, at most what leaves every op of its graph laid out as
+/// the plan pass laid it out (`crate::residency::cap`; at a 2048-wide model, 110,464 bytes, past
+/// which its products take narrower blocks: `docs/learnings/performance-log.md`, "What an empty
+/// persistent region costs the step").
 pub const RESIDENCY_REGION: u64 = 96 << 10;
 
 /// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the small ops' cost under a
@@ -139,14 +141,63 @@ pub struct ProbeBackground {
 
 static PROBE_BACKGROUND: std::sync::Mutex<Option<ProbeBackground>> = std::sync::Mutex::new(None);
 
+/// Where [`Session::probe_row_delivery`] keeps its row on each unit (byte addresses in `DATA`).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowLayout {
+    /// A producer's output tiles' slots, each tile's data in row 0.
+    pub src: u64,
+    /// The row where a unit holds it (the L1 schemes), at the top of `DATA`.
+    pub region: u64,
+    /// The twin's tiles, where every reader ends with them.
+    pub dst: u64,
+    /// The twin's slots' bytes.
+    pub bytes: u64,
+}
+
 /// Set [`ProbeBackground`] (or none), process-wide. Dev-facing: a timing probe, never a result.
 #[doc(hidden)]
 pub fn probe_background_stream(background: Option<ProbeBackground>) {
     *PROBE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = background;
 }
 
+/// `TT_RESIDENCY_ROWS`: `gddr`, `mcast` or `held:<h>` ([`crate::residency::Rows`]); anything else,
+/// or nothing, the default `held:2` ([`crate::residency::HOLDERS`]).
+fn residency_rows_from_env() -> crate::residency::Rows {
+    use crate::residency::{Rows, HOLDERS};
+    match std::env::var("TT_RESIDENCY_ROWS").as_deref() {
+        Ok("gddr") => Rows::Gddr,
+        Ok("mcast") => Rows::Multicast,
+        Ok(v) => v
+            .strip_prefix("held:")
+            .and_then(|h| h.parse().ok())
+            .filter(|&h| h > 0)
+            .map_or(Rows::Held(HOLDERS), Rows::Held),
+        Err(_) => Rows::Held(HOLDERS),
+    }
+}
+
+/// `TT_RESIDENCY_REGION=<bytes>`: a region both residency passes keep whole
+/// ([`Session::set_residency_fixed`]).
+fn residency_region_from_env() -> Option<u64> {
+    std::env::var("TT_RESIDENCY_REGION")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
 fn probing_background() -> Option<ProbeBackground> {
     *PROBE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static PROBE_ROW_MISROUTE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The negative control of [`Session::probe_row_delivery`]: with it on, each reader of a
+/// [`RowScheme::Held`](crate::residency::RowScheme::Held) row reads from the next reader after
+/// its holder instead, which holds nothing unless it is a holder too. Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_row_misroute(on: bool) {
+    PROBE_ROW_MISROUTE.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
 static PROBE_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -581,11 +632,28 @@ pub struct Session<T: Transport> {
     busy_moves: Vec<(usize, std::ops::Range<usize>)>,
     /// [`Session::set_l1_region`].
     l1_region: u64,
-    /// [`Session::set_residency`]: the region a residency-planned capture keeps, or 0 for none.
+    /// [`Session::set_residency`]: the most a residency-planned capture's region takes, or 0 for
+    /// no residency.
     residency_region: u64,
+    /// [`Session::set_residency_fixed`].
+    residency_fixed: bool,
+    /// [`Session::probe_planned_region`].
+    probe_planned_region: Option<u64>,
+    /// Where the region of the last planned capture that held begins: later plan passes keep it
+    /// ([`Session::begin_trace_plan_pass`]).
+    planned_base: Option<u64>,
+    /// [`Session::set_residency_rows`].
+    residency_rows: crate::residency::Rows,
+    /// [`Session::set_residency_drop`].
+    residency_drop: bool,
     /// The plan the last plain capture made, for a planned capture of the same graph to apply
     /// ([`Session::begin_trace_planned`]).
     last_plan: Option<std::sync::Arc<crate::residency::Applied>>,
+    /// Plans whose planned captures were their plans', by the key their callers gave
+    /// ([`Session::begin_trace_cached`]).
+    plans: std::collections::HashMap<u64, std::sync::Arc<crate::residency::Applied>>,
+    /// Captures begun ([`Session::probe_captures`]).
+    captures: u64,
     /// Where this session's movers may write other tiles' L1 (`dm::L1Writes`): nowhere outside a
     /// planned capture.
     l1_writes: crate::dm::L1Writes,
@@ -2151,18 +2219,25 @@ impl<T: Transport> Session<T> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
-            // `TT_RESIDENCY=1`: captures are planned (`docs/plans/planned-l1-residency.md`), with a
-            // region of `TT_RESIDENCY_REGION` bytes (default 96 KiB, which costs the products
-            // nothing: `performance-log.md`, "What an empty persistent region costs the step").
-            residency_region: if std::env::var("TT_RESIDENCY").is_ok_and(|v| v == "1") {
-                std::env::var("TT_RESIDENCY_REGION")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(RESIDENCY_REGION)
-            } else {
-                0
+            // Captures that can run twice are planned (`docs/plans/planned-l1-residency.md`), each
+            // region what its plan uses, at most 96 KiB, unless `TT_RESIDENCY=0`;
+            // `TT_RESIDENCY_REGION=<bytes>` keeps that many in both passes instead
+            // (`Session::set_residency_fixed`), for measurement.
+            residency_region: match (
+                std::env::var("TT_RESIDENCY").is_ok_and(|v| v == "0"),
+                residency_region_from_env(),
+            ) {
+                (true, _) => 0,
+                (false, fixed) => fixed.unwrap_or(RESIDENCY_REGION),
             },
+            residency_fixed: residency_region_from_env().is_some(),
+            probe_planned_region: None,
+            planned_base: None,
+            residency_rows: residency_rows_from_env(),
+            residency_drop: std::env::var("TT_RESIDENCY_DROP").map_or(true, |v| v != "0"),
             last_plan: None,
+            plans: Default::default(),
+            captures: 0,
             l1_writes: Default::default(),
             pending_shape: 0,
             resident_matmul_a: true,
@@ -3376,6 +3451,230 @@ impl<T: Transport> Session<T> {
         Ok(last)
     }
 
+    /// A development probe (`docs/plans/planned-l1-residency.md` 2f): one row delivered to units
+    /// that each read it whole, by `scheme` ([`crate::residency::RowScheme`]), as two ops with their
+    /// barriers -- three for [`RowScheme::Relay`](crate::residency::RowScheme::Relay) -- so it can be
+    /// captured and replayed and its time is the card's.
+    ///
+    /// The row is `twin`'s (`[rows, 32]` F32, `rows` a multiple of 32: a `[1, 32 rows]` row
+    /// packed, as [`tensor::pack_row`] lays it out). Units `producers` hold its output tiles,
+    /// dealt as [`tensor::runs`] deals an element-wise op's, each tile's data row in the slots from
+    /// [`RowLayout::src`] (`packed_twin_writes`' source); each writes its rows' two face rows a
+    /// tile. Units `readers` each end with the twin's tiles in the slots from [`RowLayout::dst`].
+    /// The L1 schemes keep the row in [`RowLayout::region`] at the top of `DATA` on the units that
+    /// hold it, and let every unit's movers write and read that window. Nothing else may run on
+    /// these units' `DATA` between the probe's ops.
+    #[doc(hidden)]
+    pub fn probe_row_delivery(
+        &mut self,
+        scheme: crate::residency::RowScheme,
+        producers: std::ops::Range<usize>,
+        readers: std::ops::Range<usize>,
+        twin: &DramTensor,
+    ) -> Result<RowLayout, TensorError> {
+        use crate::residency::{holders, rectangles, RowScheme};
+        use tt_isa::dm::{mcast_corners, op, record, TILE_DATA, TILE_SLOT};
+        const FACE: u64 = 1024;
+        let refuse = |why: String| Err(TensorError::Shape(format!("probe_row_delivery: {why}")));
+        let n = self.units.len();
+        let [rt, ct] = twin.grid();
+        let rows = rt * 32;
+        if ct != 1 || twin.cols != 32 || twin.rows != rows {
+            return refuse(format!("a twin of [{}, {}]", twin.rows, twin.cols));
+        }
+        if producers.is_empty() || readers.is_empty() || producers.end > n || readers.end > n {
+            return refuse(format!(
+                "producers {producers:?}, readers {readers:?} of {n}"
+            ));
+        }
+        if self.l1_region_base().is_some() {
+            return refuse(
+                "its row takes the top of `DATA`, which this session keeps as a region \
+                 (`set_residency`, `set_l1_region`): turn them off"
+                    .into(),
+            );
+        }
+        let runs = tensor::runs(rows, producers.len(), usize::MAX);
+        let most = runs.iter().map(|r| r.len()).max().unwrap_or(0) as u64;
+        let bytes = rt as u64 * TILE_SLOT;
+        let data = tt_isa::l1::DATA;
+        let region = data.end - bytes;
+        let dst = region - bytes;
+        let src = (dst - most * TILE_SLOT) & !63;
+        if src < data.base {
+            return refuse(format!("{rows} rows over {} producers", producers.len()));
+        }
+        let at = |u: usize| {
+            let t = self.units[u].tile;
+            (t.x(), t.y())
+        };
+        let all: Vec<(u8, u8)> = (0..n).map(at).collect();
+        if scheme != RowScheme::Gddr {
+            self.set_l1_writes(crate::dm::L1Writes {
+                tiles: all.clone(),
+                window: region..data.end,
+            })?;
+        }
+        let reading: Vec<usize> = readers.clone().collect();
+        let (held, holder_of) = match scheme {
+            RowScheme::Held(h) => holders(&reading, h),
+            RowScheme::Relay => holders(&reading, 1),
+            _ => (reading.clone(), reading.iter().map(|&r| (r, r)).collect()),
+        };
+        let xy = |(x, y): (u8, u8)| (x as u32, y as u32);
+        // A producer's writes, a batch a `TRANSFER_SIDE_MAX` of entries.
+        let producer = |k: usize, u: usize| -> Vec<[u32; 8]> {
+            let (first, count) = (runs[k].start, runs[k].len());
+            if scheme == RowScheme::Gddr {
+                return tensor::packed_twin_writes(twin, first, count, src);
+            }
+            let others: Vec<(u8, u8)> = reading
+                .iter()
+                .filter(|&&r| r != u)
+                .map(|&r| all[r])
+                .collect();
+            let rects = rectangles(&others);
+            let mut out = Vec::new();
+            for m in 0..count {
+                let (kk, r) = (first + m, ((first + m) % 32) as u64);
+                for half in 0..2u64 {
+                    let from = (src + m as u64 * TILE_SLOT + TILE_DATA + half * FACE) as u32;
+                    let to = (region
+                        + (kk / 32) as u64 * TILE_SLOT
+                        + TILE_DATA
+                        + (2 * (r / 16) + half) * FACE
+                        + (r % 16) * 64) as u32;
+                    let unicast = |t: (u8, u8)| {
+                        let (x, y) = xy(t);
+                        [op::WRITE_L1, x, y, to, from, 64, 0, 0]
+                    };
+                    match scheme {
+                        RowScheme::Multicast | RowScheme::MulticastRunAcks => {
+                            let run = match scheme {
+                                RowScheme::MulticastRunAcks => tt_isa::dm::MCAST_RUN_ACKS,
+                                _ => 0,
+                            };
+                            if reading.contains(&u) {
+                                out.push(unicast(all[u]));
+                            }
+                            out.extend(rects.iter().map(|&(s, e)| match s == e {
+                                true => unicast(s),
+                                false => [
+                                    op::WRITE_L1_MCAST,
+                                    mcast_corners(s, e),
+                                    0,
+                                    to,
+                                    from,
+                                    64,
+                                    run,
+                                    0,
+                                ],
+                            }));
+                        }
+                        _ => out.extend(held.iter().map(|&h| unicast(all[h]))),
+                    }
+                }
+            }
+            out
+        };
+        let transfer = |what: &'static str, writes: Vec<[u32; 8]>| -> Vec<Step> {
+            vec![Step::Transfer {
+                what,
+                depth: 1,
+                batches: writes
+                    .chunks(tensor::TRANSFER_SIDE_MAX)
+                    .map(|w| tensor::TransferBatch {
+                        read: Vec::new(),
+                        write: w.to_vec(),
+                    })
+                    .collect(),
+            }]
+        };
+        let jobs = (0..producers.end)
+            .map(|u| match u.checked_sub(producers.start) {
+                None => Vec::new(),
+                Some(k) => transfer("probe row writes", producer(k, u)),
+            })
+            .collect();
+        self.submit_jobs_on(jobs, producers.end, RESET_BUDGET)?;
+        // The relay: the gatherer multicasts the row whole, a request at a time, to the others.
+        if scheme == RowScheme::Relay {
+            let g = held[0];
+            let others: Vec<(u8, u8)> = reading
+                .iter()
+                .filter(|&&r| r != g)
+                .map(|&r| all[r])
+                .collect();
+            let mut writes = Vec::new();
+            let max = tt_isa::noc::niu::MAX_REQUEST_BYTES as u64;
+            for off in (0..bytes).step_by(max as usize) {
+                let (a, len) = ((region + off) as u32, (bytes - off).min(max) as u32);
+                for (s, e) in rectangles(&others) {
+                    writes.push(match s == e {
+                        true => [op::WRITE_L1, s.0 as u32, s.1 as u32, a, a, len, 0, 0],
+                        false => [op::WRITE_L1_MCAST, mcast_corners(s, e), 0, a, a, len, 0, 0],
+                    });
+                }
+            }
+            let jobs = (0..=g)
+                .map(|u| match u == g {
+                    true => transfer("probe row relay", writes.clone()),
+                    false => Vec::new(),
+                })
+                .collect();
+            self.submit_jobs_on(jobs, g + 1, RESET_BUDGET)?;
+        }
+        let reader = |u: usize| -> Vec<[u32; 8]> {
+            if scheme == RowScheme::Gddr {
+                let mut e = vec![[record::READ_RUN, 0, rt as u32, dst as u32, 0, 1, 0, 0]];
+                e.extend(twin.tensor_ref().encode());
+                return e;
+            }
+            let mut from = holder_of[&u];
+            if PROBE_ROW_MISROUTE.load(std::sync::atomic::Ordering::Relaxed) {
+                let k = reading
+                    .iter()
+                    .position(|&r| r == from)
+                    .expect("a holder reads");
+                from = reading[(k + 1) % reading.len()];
+            }
+            let (x, y) = xy(all[from]);
+            let max = tt_isa::noc::niu::MAX_REQUEST_BYTES as u64;
+            (0..bytes)
+                .step_by(max as usize)
+                .map(|off| {
+                    let len = (bytes - off).min(max) as u32;
+                    [
+                        op::READ_L1,
+                        x,
+                        y,
+                        (region + off) as u32,
+                        (dst + off) as u32,
+                        len,
+                        0,
+                        0,
+                    ]
+                })
+                .collect()
+        };
+        let jobs = (0..readers.end)
+            .map(|u| match readers.contains(&u) {
+                true => vec![Step::List {
+                    what: "probe row reads",
+                    entries: reader(u),
+                }],
+                false => Vec::new(),
+            })
+            .collect();
+        self.submit_jobs_on(jobs, readers.end, RESET_BUDGET)?;
+        Ok(RowLayout {
+            src,
+            region,
+            dst,
+            bytes,
+        })
+    }
+
     /// Run a transfer's jobs to their end, without a barrier (nothing is
     /// queued behind them before the sync).
     fn submit_dma(&mut self, jobs: Vec<tensor::Job>, units: usize) -> Result<(), TensorError> {
@@ -3915,6 +4214,15 @@ impl<T: Transport> Session<T> {
         if self.capture.is_some() {
             self.pending_shape = shape_of(&queues);
             self.apply_plan(&mut queues);
+            // A planned capture whose plan stopped queues nothing more: what the plan put in L1
+            // for the ops before is not in GDDR, where the next ops would read it. It is refused.
+            if self
+                .capture
+                .as_ref()
+                .is_some_and(|c| c.planned && c.plan_mismatch.is_some())
+            {
+                return Ok(());
+            }
         }
         // The units that arrive at this op's barrier: the ones it runs on, in a capture
         // too, whose trace then records how many arrived (`Capture::barriers`) for its
@@ -4514,6 +4822,32 @@ impl<T: Transport> Session<T> {
     /// queued, and forgets what the host knows of the tiles' descriptors and
     /// semaphores, so the capture records all its kernels need.
     pub fn begin_trace(&mut self) -> Result<(), TensorError> {
+        self.begin_capture(self.l1_region_base(), false)
+    }
+
+    /// [`Session::begin_trace`] as a residency plan pass: with residency on
+    /// ([`Session::set_residency`]), the capture ends by planning which of its tensors could stay
+    /// in L1, for [`Session::begin_trace_planned`] to apply to a capture of the same graph. It
+    /// keeps no region (unless [`Session::set_residency_fixed`] or [`Session::set_l1_region`]
+    /// keeps one), so it is laid out as a plain capture is, and is the trace to keep if the planned
+    /// capture is refused. Otherwise it is [`Session::begin_trace`].
+    pub fn begin_trace_plan_pass(&mut self) -> Result<(), TensorError> {
+        // Once a planned capture has held, a plan pass keeps its region: the programs of the
+        // traces kept name addresses planned below it, and a pass in the whole arena held a second
+        // set beside them (a model on 12 tiles filled the program cache).
+        let base = match (self.l1_region_base(), self.planned_base) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.begin_capture(base, self.residency_region > 0)
+    }
+
+    /// Begin a capture whose ops plan below `region_base` (none: the whole arena).
+    fn begin_capture(
+        &mut self,
+        region_base: Option<u64>,
+        plan_pass: bool,
+    ) -> Result<(), TensorError> {
         if self.capture.is_some() {
             return Err(TraceError::Capturing.into());
         }
@@ -4556,7 +4890,11 @@ impl<T: Transport> Session<T> {
             applied: None,
             plan_mismatch: None,
             planned: false,
+            plan_pass,
+            plan_key: None,
+            index: Default::default(),
         });
+        self.captures += 1;
         if let Some(background) = probing_background() {
             if let Err(e) = self.push_probe_background(background) {
                 self.capture = None;
@@ -4566,7 +4904,7 @@ impl<T: Transport> Session<T> {
         // The capture's own tensors, for its residency plan (`crate::residency`).
         self.dram_state()?.alloc.start_log();
         // Its ops plan below the persistent region, if it keeps one.
-        if let Some(base) = self.l1_region_base() {
+        if let Some(base) = region_base.filter(|&b| b < tt_isa::l1::DATA.end) {
             crate::l1::set_arena_end(base);
             if let Some(c) = self.capture.as_mut() {
                 c.region_base = Some(base);
@@ -4850,7 +5188,7 @@ impl<T: Transport> Session<T> {
                     .unwrap_or_else(|| "the plan stopped applying".into()),
             ),
             _ => {
-                if self.residency_region > 0 {
+                if capture.plan_pass {
                     self.last_plan = self.plan_of(&capture, &allocs);
                 }
                 None
@@ -4859,7 +5197,28 @@ impl<T: Transport> Session<T> {
         if capture.planned {
             self.set_l1_writes(crate::dm::L1Writes::default())?;
         }
+        let planned_base = capture
+            .planned
+            .then(|| capture.applied.as_ref().map(|a| a.region_base))
+            .flatten();
+        // A planned capture's plan, cached under its key while its captures are its own.
+        let cached = capture
+            .plan_key
+            .map(|key| (key, capture.applied.clone().filter(|_| refused.is_none())));
         let result = self.store_trace(capture);
+        if let Some((key, applied)) = cached {
+            match (applied, &result) {
+                (Some(applied), Ok(_)) => {
+                    self.plans.insert(key, applied);
+                }
+                _ => {
+                    self.plans.remove(&key);
+                }
+            }
+        }
+        if let (Some(base), Ok(_), None) = (planned_base, &result, &refused) {
+            self.planned_base = Some(base);
+        }
         if let (Some(why), Ok(id)) = (&refused, &result) {
             self.release_trace(*id)?;
             return Err(TraceError::Planned(why.clone()).into());
@@ -7315,19 +7674,71 @@ impl<T: Transport> Session<T> {
     /// arena. The region is rounded up to whole 64-byte units.
     pub fn set_l1_region(&mut self, bytes: u64) {
         self.l1_region = bytes;
+        self.plans.clear();
+        self.planned_base = None;
     }
 
-    /// Plan every capture from now on for L1 residency, with a region of `bytes` a unit (0 turns
-    /// it off; `TT_RESIDENCY=1` turns it on at open, `TT_RESIDENCY_REGION` sizing it, default
-    /// [`RESIDENCY_REGION`]; `docs/plans/planned-l1-residency.md` Phase 2). A capture then keeps
-    /// the region empty and, as it ends, plans which of its tensors could live there
-    /// (`crate::residency`), for [`Session::begin_trace_planned`] to apply to a capture of the
-    /// same graph.
+    /// How a residency plan delivers a row an op reads whole on many units
+    /// ([`crate::residency::Rows`]; `TT_RESIDENCY_ROWS=gddr|mcast|held:<h>` at open, default
+    /// `held:2`, `docs/plans/planned-l1-residency.md` 2f). For the plans made from now on.
+    pub fn set_residency_rows(&mut self, rows: crate::residency::Rows) {
+        self.residency_rows = rows;
+        self.plans.clear();
+        self.planned_base = None;
+    }
+
+    /// Whether a residency plan drops the writes of the tensors its graph makes and never reads
+    /// ([`crate::residency::Plan::dropped`]; on by default, `TT_RESIDENCY_DROP=0` at open turns it
+    /// off, `docs/plans/planned-l1-residency.md` 2g). For the plans made from now on.
+    pub fn set_residency_drop(&mut self, drop: bool) {
+        self.residency_drop = drop;
+        self.plans.clear();
+        self.planned_base = None;
+    }
+
+    /// Plan captures for L1 residency from now on, in a region of at most `bytes` a unit (0 turns
+    /// it off; on at open with [`RESIDENCY_REGION`] unless `TT_RESIDENCY=0`;
+    /// `docs/plans/planned-l1-residency.md` Phase 2). A plan pass
+    /// ([`Session::begin_trace_plan_pass`]) then ends by planning which of its tensors could live
+    /// in a region at the top of each unit's arena (`crate::residency`), for
+    /// [`Session::begin_trace_planned`] to apply to a capture of the same graph. The planned
+    /// capture keeps what its plan uses, no more than leaves every op laid out as in the plan
+    /// pass (`crate::residency::cap`), nor than `bytes`.
     pub fn set_residency(&mut self, bytes: u64) {
         self.residency_region = bytes;
+        self.plans.clear();
+        self.planned_base = None;
         if bytes == 0 {
             self.last_plan = None;
         }
+    }
+
+    /// Whether both residency passes keep the whole [`Session::set_residency`] region, as before
+    /// the region was sized by its plan (`TT_RESIDENCY_REGION=<bytes>` at open;
+    /// `docs/plans/planned-l1-residency.md` 2h). For measurement: a region past
+    /// `crate::residency::cap` narrows the ops of both passes alike.
+    pub fn set_residency_fixed(&mut self, fixed: bool) {
+        self.residency_fixed = fixed;
+        self.plans.clear();
+        self.planned_base = None;
+    }
+
+    /// Make the next planned captures keep `bytes` a unit (at least what their plan uses) instead
+    /// of what their plan uses: a gate's negative control, a region past
+    /// `crate::residency::cap` laying the planned capture's ops out unlike its plan pass's. `None`
+    /// restores the plan's own. Dev-facing.
+    #[doc(hidden)]
+    pub fn probe_planned_region(&mut self, bytes: Option<u64>) {
+        self.probe_planned_region = bytes;
+        self.plans.clear();
+        self.planned_base = None;
+    }
+
+    /// How many captures this session has begun, refused ones included. Dev-facing: a gate
+    /// counting what a build captured ([`Session::begin_trace_cached`]).
+    #[doc(hidden)]
+    pub fn probe_captures(&self) -> u64 {
+        self.captures
     }
 
     /// Begin a capture that applies the plan the last capture made (`Session::set_residency`):
@@ -7339,24 +7750,44 @@ impl<T: Transport> Session<T> {
         let Some(applied) = self.last_plan.take() else {
             return Ok(false);
         };
-        self.begin_trace()?;
-        let base = self
-            .capture
-            .as_ref()
-            .and_then(|c| c.region_base)
-            .unwrap_or(tt_isa::l1::DATA.end);
-        if base != applied.region_base {
-            self.capture = None;
-            crate::l1::set_arena_end(tt_isa::l1::DATA.end);
-            if let Some(d) = self.dram.as_mut() {
-                d.alloc.take_log();
-            }
-            return Err(TraceError::Planned(format!(
-                "the plan's region begins at {:#x}, this capture's at {base:#x}",
-                applied.region_base
-            ))
-            .into());
+        self.begin_applied(applied, None)
+    }
+
+    /// [`Session::begin_trace_planned`], and if the capture is its plan's, the plan kept under
+    /// `key` for [`Session::begin_trace_cached`]. `key` names the graph: the caller's, with
+    /// whatever shapes it depends on (`docs/plans/planned-l1-residency.md` 2h).
+    pub fn begin_trace_planned_as(&mut self, key: u64) -> Result<bool, TensorError> {
+        let Some(applied) = self.last_plan.take() else {
+            return Ok(false);
+        };
+        self.begin_applied(applied, Some(key))
+    }
+
+    /// Begin a capture that applies the plan kept under `key` ([`Session::begin_trace_planned_as`]),
+    /// with no plan pass: one capture, not two. `false`, beginning nothing, if none is kept, as
+    /// none is after the residency settings change. Its [`Session::end_trace`] refuses a capture
+    /// whose ops are not the plan's ([`TraceError::Planned`]) and forgets the plan; the caller
+    /// then captures a plan pass and a planned capture as without one.
+    pub fn begin_trace_cached(&mut self, key: u64) -> Result<bool, TensorError> {
+        if self.residency_region == 0 {
+            return Ok(false);
         }
+        let Some(applied) = self.plans.get(&key).cloned() else {
+            return Ok(false);
+        };
+        self.begin_applied(applied, Some(key))
+    }
+
+    /// Begin a capture applying `applied`, cached under `key` if it holds.
+    fn begin_applied(
+        &mut self,
+        applied: std::sync::Arc<crate::residency::Applied>,
+        key: Option<u64>,
+    ) -> Result<bool, TensorError> {
+        // The region its plan sized (`plan_of`), whatever this session would keep now: an op the
+        // region changed is laid out unlike the plan pass's, and refused by its shape.
+        let base = applied.region_base;
+        self.begin_capture(Some(base), false)?;
         let writes = crate::dm::L1Writes {
             tiles: self
                 .units
@@ -7369,6 +7800,7 @@ impl<T: Transport> Session<T> {
         let c = self.capture.as_mut().expect("begun above");
         c.applied = Some(applied);
         c.planned = true;
+        c.plan_key = key;
         Ok(true)
     }
 
@@ -7380,22 +7812,45 @@ impl<T: Transport> Session<T> {
         allocs: &[tensor::Placement],
     ) -> Option<std::sync::Arc<crate::residency::Applied>> {
         use crate::residency::{Applied, Graph, Plan};
-        let base = c.region_base?;
+        let end = tt_isa::l1::DATA.end;
+        // An op that did not plan its layout while captured cannot be shown to stay below a
+        // region (`TraceError::IntoRegion`).
+        if c.ops.iter().any(|o| o.l1_top == 0) {
+            return None;
+        }
+        // Where the plan pass's ops planned below: the whole arena, or a region it kept.
+        let kept = c.region_base.unwrap_or(end);
         let g = Graph::from_capture(c, allocs);
-        // A row its readers take whole on many units is left in GDDR unless asked for
-        // (`TT_RESIDENCY_REPLICATED=1`): its producers' multicasts into one rectangle serialize
-        // (`docs/plans/planned-l1-residency.md`, "Phase 2 measured").
-        let replicated = std::env::var("TT_RESIDENCY_REPLICATED").is_ok_and(|v| v == "1");
-        let plan = Plan::make_within(&g, tt_isa::l1::DATA.end - base, |_, u| {
-            u.plain
-                && (replicated
-                    || u.reads.len() <= 1
-                    || u.layout() != crate::residency::Layout::Replicated)
-        });
+        // The region takes at most what leaves every op laid out as here (`cap`), nor more than
+        // `residency_region` (`docs/plans/planned-l1-residency.md` 2h). A pass that kept one (an
+        // earlier plan's, a fixed one, `TT_L1_REGION`) plans in what it kept, every op already
+        // below it.
+        let budget = if c.region_base.is_some() {
+            end - kept
+        } else {
+            crate::residency::cap(&g, end).min(self.residency_region)
+        };
+        // A row its readers take whole on many units goes as `residency_rows` says: held by a few
+        // of them by default, since every producer multicasting it to all of them serializes
+        // (`docs/plans/planned-l1-residency.md` 2e, 2f).
+        let mut plan = Plan::make_rows(&g, budget, self.residency_rows, |_, u| u.plain);
+        if !self.residency_drop {
+            plan.dropped.clear();
+        }
         if crate::residency::probing() {
             crate::residency::keep(g.clone(), plan.clone());
         }
         plan.check(&g).ok()?;
+        // The planned capture keeps the whole budget, not only what the plan uses: every op is
+        // laid out as here either way, and a model's traces then share one arena end, so their
+        // programs, which name addresses planned in it, are one set in the program cache. Kept to
+        // what each plan used, each trace's were its own, and a model on 12 tiles filled the
+        // cache (`docs/plans/planned-l1-residency.md` 2h).
+        let region = self
+            .probe_planned_region
+            .map_or(budget, |r| r.max(plan.region))
+            .next_multiple_of(crate::residency::ALIGN);
+        let base = kept.min(end - region.min(end - tt_isa::l1::DATA.base));
         let shapes = c.ops.iter().map(|o| o.shape).collect();
         let coords = self
             .units
@@ -7418,7 +7873,20 @@ impl<T: Transport> Session<T> {
         };
         let a = std::sync::Arc::make_mut(applied);
         f(&a.graph, &mut a.plan);
+        a.forget_touches();
         true
+    }
+
+    /// Whether the last plan pass made a plan for [`Session::begin_trace_planned`] to apply.
+    pub fn has_pending_plan(&self) -> bool {
+        self.last_plan.is_some()
+    }
+
+    /// The plan the next [`Session::begin_trace_planned`] applies, if any: its graph, its plan and
+    /// where its region begins. Dev-facing.
+    #[doc(hidden)]
+    pub fn probe_last_plan(&self) -> Option<std::sync::Arc<crate::residency::Applied>> {
+        self.last_plan.clone()
     }
 
     /// Let every unit's movers write `writes` ([`crate::dm::L1Writes`]), and each started later.
@@ -7446,25 +7914,38 @@ impl<T: Transport> Session<T> {
             return;
         };
         let k = c.ops.len();
-        let allocs = self
-            .dram
-            .as_ref()
-            .map(|d| d.alloc.logged().to_vec())
-            .unwrap_or_default();
-        let index = crate::residency::Index::new(&allocs);
+        // The capture's tensors so far: the index grows with the log, not rebuilt an op.
+        let mut index = std::mem::take(&mut c.index);
+        if let Some(d) = self.dram.as_ref() {
+            index.extend(d.alloc.logged());
+        }
         let mut rewritten = Vec::with_capacity(queues.len());
         let result = (|| -> Result<(), String> {
             if applied.shapes.get(k) != Some(&self.pending_shape) {
                 return Err(format!("op {k} is laid out unlike the plan pass's"));
             }
+            let allocs = self.dram.as_ref().map_or(&[][..], |d| d.alloc.logged());
+            applied.check_op(&index, allocs, k, queues)?;
             for (u, steps) in queues.iter().enumerate() {
+                if !applied.touches(k, u) {
+                    rewritten.push(None);
+                    continue;
+                }
                 let mut out = Vec::with_capacity(steps.len());
                 for step in steps {
                     out.push(match step {
-                        Step::List { what, entries } => Step::List {
-                            what,
-                            entries: applied.rewrite(&index, k, u, entries)?,
-                        },
+                        Step::List { what, entries } => {
+                            let mut rewritten = applied.rewrite(&index, k, u, entries)?;
+                            // A list whose every move was a dropped write keeps its place: a
+                            // `WAIT`, which waits for nothing still in flight.
+                            if rewritten.is_empty() && !entries.is_empty() {
+                                rewritten.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                            }
+                            Step::List {
+                                what,
+                                entries: rewritten,
+                            }
+                        }
                         Step::Transfer {
                             what,
                             depth,
@@ -7490,15 +7971,18 @@ impl<T: Transport> Session<T> {
                         other => other.clone(),
                     });
                 }
-                rewritten.push(out);
+                rewritten.push(Some(out));
             }
             Ok(())
         })();
         let c = self.capture.as_mut().expect("checked above");
+        c.index = index;
         match result {
             Ok(()) => {
                 for (q, r) in queues.iter_mut().zip(rewritten) {
-                    *q = r;
+                    if let Some(r) = r {
+                        *q = r;
+                    }
                 }
             }
             Err(why) => {
@@ -7508,10 +7992,16 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// Where a capture's persistent region begins ([`Session::set_l1_region`]), if it keeps one.
+    /// Where a capture's persistent region begins ([`Session::set_l1_region`], or a fixed
+    /// residency region: [`Session::set_residency_fixed`]), if it keeps one.
     fn l1_region_base(&self) -> Option<u64> {
         let data = tt_isa::l1::DATA;
-        let bytes = self.l1_region.max(self.residency_region);
+        let fixed = if self.residency_fixed {
+            self.residency_region
+        } else {
+            0
+        };
+        let bytes = self.l1_region.max(fixed);
         let bytes = bytes.div_ceil(tt_isa::dram::ALIGN) * tt_isa::dram::ALIGN;
         (bytes > 0).then(|| data.end.saturating_sub(bytes).max(data.base))
     }

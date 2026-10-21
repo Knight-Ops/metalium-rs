@@ -211,6 +211,33 @@ fn writes() -> &'static mut Writes {
     unsafe { &mut *core::ptr::addr_of_mut!(WRITES) }
 }
 
+/// A run of [`dm::MCAST_RUN_ACKS`] multicasts under way, NC's: NoC #1's write-ack counter when
+/// it began, and the acknowledgements its multicasts so far are owed (none: no run).
+#[derive(Copy, Clone)]
+struct McastRun {
+    before: u32,
+    acks: u32,
+}
+
+#[link_section = ".local"]
+static mut MCAST_RUN: McastRun = McastRun { before: 0, acks: 0 };
+
+fn mcast_run() -> &'static mut McastRun {
+    // SAFETY: one core, no interrupts, and no reference outlives its use.
+    unsafe { &mut *core::ptr::addr_of_mut!(MCAST_RUN) }
+}
+
+/// Count a run's acknowledgements, if one is under way: before any entry not of it, and at a
+/// list's end, so its writes have landed where a lone multicast's would have.
+#[inline(always)]
+fn settle_multicasts() {
+    let r = mcast_run();
+    if IS_NC && r.acks != 0 {
+        while noc::wr_acks_on(Niu::Noc1).wrapping_sub(r.before) < r.acks {}
+        r.acks = 0;
+    }
+}
+
 /// Issue one descriptor's bytes as NIU requests of at most 16 KiB, without
 /// waiting for them. Every request's range is a sub-range of the checked
 /// descriptor, so it is inside the channel and inside L1, with the congruence
@@ -281,10 +308,19 @@ fn issue_l1_write(me: (u8, u8), at: (u8, u8), to: u32, from: u32, len: u32) -> R
 /// at `from` to `to` in every tile of `start..=end` through NoC #1, then its acknowledgements
 /// counted on that NIU's write-ack counter, which nothing else then moves (B never writes through
 /// NoC #1). Refused through NoC #0, whose counter B's barrier release moves, and for a rectangle
-/// holding this tile.
+/// holding this tile. One of a run ([`dm::MCAST_RUN_ACKS`]) adds its acknowledgements to the run's
+/// and does not wait for them; the run's first still waits for NC's earlier writes, and a later
+/// one finds only the run's multicasts in flight ([`settle_multicasts`] ends a run before any
+/// other entry).
 #[link_section = ".text.warm"]
 #[inline(never)]
-fn multicast_l1(me: (u8, u8), start: (u8, u8), end: (u8, u8), [to, from, len]: [u32; 3]) -> Result<(), u32> {
+fn multicast_l1(
+    me: (u8, u8),
+    start: (u8, u8),
+    end: (u8, u8),
+    [to, from, len]: [u32; 3],
+    run: bool,
+) -> Result<(), u32> {
     use tt_isa::noc::multicast::{corners_hi, registers_to};
     const MCAST_TXN: TxnId = match TxnId::new(dm::TXN_NC_MCAST) {
         Some(t) => t,
@@ -300,10 +336,16 @@ fn multicast_l1(me: (u8, u8), start: (u8, u8), end: (u8, u8), [to, from, len]: [
     let regs = registers_to(from, to, len, corners_hi(start, end, Niu::Noc1), w.me1, MCAST_TXN)
         .map_err(|_| dm::error::ALIGNMENT)?;
     let acks = (end.0 - start.0 + 1) as u32 * (end.1 - start.1 + 1) as u32;
-    noc::wait(TXN);
-    let before = noc::wr_acks_on(Niu::Noc1);
+    let r = mcast_run();
+    if r.acks == 0 {
+        noc::wait(TXN);
+        r.before = noc::wr_acks_on(Niu::Noc1);
+    }
     noc::issue_multicast_on(Niu::Noc1, &regs);
-    while noc::wr_acks_on(Niu::Noc1).wrapping_sub(before) < acks {}
+    r.acks += acks;
+    if !run {
+        settle_multicasts();
+    }
     Ok(())
 }
 
@@ -913,11 +955,12 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             to,
             from,
             len,
+            run,
         } => {
             if !IS_NC {
                 return Err(dm::error::DIRECTION);
             }
-            multicast_l1(me, start, end, [to, from, len])?;
+            multicast_l1(me, start, end, [to, from, len], run)?;
         }
         Entry::Kernel {
             generation,
@@ -1360,6 +1403,9 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
                 && (mode != dm::trace_mode::OPS || dm::trace_mode::ops_stamped(head[0]))
                 && in_window();
             trace(entry_traced, ev::ENTRY_BEGIN, head[0]);
+            if IS_NC && !(head[0] == op::WRITE_L1_MCAST && head[6] == dm::MCAST_RUN_ACKS) {
+                settle_multicasts();
+            }
             if n == 1 {
                 // A run of host-encoded reads is one loop (`run_encoded_reads`), untraced, on the
                 // fast read path; past it, each goes straight to its issue, past `exec`'s
@@ -1407,6 +1453,7 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
             }
             i += n;
         }
+        settle_multicasts();
         noc::wait(TXN);
         Ok(())
     })();

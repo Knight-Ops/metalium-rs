@@ -1258,7 +1258,21 @@ fn traced_generation_stream_ceiling() {
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = m.fused();
         let shapes = Shapes::new(max_len, &[64]);
-        let g = TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap();
+        // The build, and a second one (with residency on, its plans cached: one capture a trace;
+        // `docs/plans/planned-l1-residency.md` 2h).
+        let build = |what: &str| {
+            let t = std::time::Instant::now();
+            let g = TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap();
+            report(
+                &format!("{name} stream ceiling ({mode}), {what} build"),
+                "ms",
+                "host",
+                Stats::of(vec![t.elapsed().as_secs_f64() * 1e3]),
+            );
+            g
+        };
+        drop(build("first"));
+        let g = build("second");
         for len in [32, 256] {
             let p = gen_prompt(len, config.vocab);
             let mut step = Vec::new();

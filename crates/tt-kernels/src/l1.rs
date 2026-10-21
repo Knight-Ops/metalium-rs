@@ -63,8 +63,12 @@ pub(crate) fn set_arena_end(end: u64) -> u64 {
 }
 
 /// What the L1 plans of one op reached ([`take_planned`]): its highest `DATA` address, and the
-/// highest it needs where a plan declared room it can do without ([`Requirements::slack`]: a
-/// product's `B` ring placed against the arena's end, with a gap below it). `need <= top`.
+/// lowest arena end ([`arena`]) at which its layouts are the ones it has. That leaves out room a
+/// plan declared it can do without ([`Requirements::slack`]: a product's `B` ring placed against
+/// the arena's end, with a gap below it), and takes in what a choice sized from the arena tested
+/// (`matmul::plan_floor`: the widest block that fits, probed with `A` unpacked), so `need` may pass
+/// `top`. A capture's ops all have their layouts in any arena ending at or above their highest
+/// need, which is what sizes a residency plan's region (`docs/plans/planned-l1-residency.md` 2h).
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Planned {
     pub top: u64,

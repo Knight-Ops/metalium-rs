@@ -161,17 +161,38 @@ impl Tensor {
         Some((self.uses.first()?.op, self.uses.last()?.op))
     }
 
-    /// What one unit holds of it in L1 to serve every op that reads it: the most tiles any one
-    /// unit reads, over all its readers, in slots of its own size.
-    pub fn bytes_a_unit(&self) -> u64 {
+    /// The units that read it, over all its readers, and the tiles each reads.
+    pub fn read_by(&self) -> BTreeMap<usize, BTreeSet<u32>> {
         let mut per_unit: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
         for u in &self.uses {
             for (&unit, tiles) in &u.reads {
                 per_unit.entry(unit).or_default().extend(tiles);
             }
         }
-        let tiles = per_unit.values().map(|s| s.len()).max().unwrap_or(0) as u64;
+        per_unit
+    }
+
+    /// What one unit holds of it in L1 to serve every op that reads it: the most tiles any one
+    /// unit reads, over all its readers, in slots of its own size.
+    pub fn bytes_a_unit(&self) -> u64 {
+        let tiles = self.read_by().values().map(|s| s.len()).max().unwrap_or(0) as u64;
         (tiles * self.slot_bytes).div_ceil(ALIGN) * ALIGN
+    }
+
+    /// Whether an op reads it whole on more than one unit ([`Layout::Replicated`]): a row many
+    /// units need, which [`Rows`] decides how to deliver.
+    pub fn replicated(&self) -> bool {
+        self.uses
+            .iter()
+            .any(|u| u.reads.len() > 1 && u.layout() == Layout::Replicated)
+    }
+
+    /// Whether every unit that reads it reads the same tiles, over all its readers: what one
+    /// holder holds then serves any of them.
+    pub fn read_alike(&self) -> bool {
+        let by = self.read_by();
+        let mut sets = by.values();
+        sets.next().is_some_and(|first| sets.all(|s| s == first))
     }
 
     /// GDDR bytes its uses move: `[read, written]`.
@@ -294,18 +315,28 @@ struct Extent {
 }
 
 /// Which GDDR slots belong to which of a capture's tensors.
+#[derive(Default)]
 pub(crate) struct Index {
     /// Per chip channel index, by start.
     channels: BTreeMap<u8, BTreeMap<u64, Extent>>,
+    /// How many of the allocations it holds.
+    len: usize,
 }
 
 impl Index {
     pub(crate) fn new(allocs: &[Placement]) -> Self {
-        let mut channels: BTreeMap<u8, BTreeMap<u64, Extent>> = BTreeMap::new();
-        for (tensor, p) in allocs.iter().enumerate() {
+        let mut index = Index::default();
+        index.extend(allocs);
+        index
+    }
+
+    /// Add the allocations of `allocs` past those it holds (`allocs` the same log, grown): what
+    /// [`Index::new`] of the whole log would hold, a later tensor's slots over an earlier one's.
+    pub(crate) fn extend(&mut self, allocs: &[Placement]) {
+        for (tensor, p) in allocs.iter().enumerate().skip(self.len) {
             let n = p.extents().count();
             for (pos, (c, base, bytes)) in p.extents().enumerate() {
-                channels.entry(c).or_default().insert(
+                self.channels.entry(c).or_default().insert(
                     base,
                     Extent {
                         end: base + bytes,
@@ -317,7 +348,7 @@ impl Index {
                 );
             }
         }
-        Index { channels }
+        self.len = self.len.max(allocs.len());
     }
 
     /// The tensor and tile GDDR `(channel, offset)` is in.
@@ -497,6 +528,37 @@ pub enum Reason {
     Room,
 }
 
+/// How a plan delivers a resident row that an op reads whole on many units ([`Tensor::replicated`]:
+/// a product's packed `A`, RMSNorm's twin), `docs/plans/planned-l1-residency.md` 2f.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Rows {
+    /// Not at all: such a row stays in GDDR.
+    Gddr,
+    /// Phase 2's: a copy on every unit that reads it, written by each producer to itself and by
+    /// multicast to every rectangle of the others. ~250 us a multiply on the 1.7B (2e).
+    Multicast,
+    /// 2f (a): a copy on `h` of its readers ([`holders`]), each producer writing its tiles to each
+    /// by unicast, each reader pulling what it reads from its holder (`op::READ_L1`). Only for a
+    /// row every reader reads alike ([`Tensor::read_alike`]), so a holder's copy serves each.
+    Held(usize),
+}
+
+/// What 2f measured best on the 1.7B's decode step (card 0, `1792537293`: 20.06 ms, against 20.18
+/// with 4 and 21.03 without residency). Delivering one row alone, 4 were best
+/// (`silicon_probe_row_delivery`, `1792533708`: 8-10 us a `[1, 2048]` row to 32-104 readers
+/// against 9-17 through GDDR); in a step the other rows have fewer readers, and 2 holders cost
+/// each producer fewer writes.
+pub const HOLDERS: usize = 2;
+
+/// The holders of a [`Rows::Held`] tensor ([`holders`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Held {
+    /// The units that hold it, ascending.
+    pub holders: Vec<usize>,
+    /// Each unit that reads it, and the holder it reads from.
+    pub of: BTreeMap<usize, usize>,
+}
+
 /// A tensor's decision.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Place {
@@ -523,6 +585,13 @@ pub struct Plan {
     pub period: Option<Period>,
     /// Whether every repeat of the period sees the same addresses ([`Plan::make_within`]).
     pub pinned: bool,
+    /// The resident tensors held by a few of their readers ([`Rows::Held`]); every other resident
+    /// tensor is held by each unit that reads it.
+    pub held: BTreeMap<usize, Held>,
+    /// Tensors made inside the graph that nothing reads ([`Reason::NeverRead`]), every write of
+    /// them a plain move: a planned capture writes them nowhere (2g; a row written both as tiles
+    /// and as its packed twin, where the next op reads one).
+    pub dropped: BTreeSet<usize>,
 }
 
 /// A plan that breaks a rule ([`Plan::check`]).
@@ -537,6 +606,12 @@ pub enum Hazard {
     DoesNotFit { region: u64, budget: u64 },
     /// A resident tensor is placed past the region.
     OutOfRegion { tensor: usize },
+    /// A held tensor's holders do not serve its readers: one reads from no holder, or from a unit
+    /// that is not one, or the readers do not read it alike.
+    NotHeld { tensor: usize },
+    /// A tensor whose writes are dropped is read, or is not the graph's own, or is resident, or is
+    /// written other than by plain moves.
+    ReadDropped { tensor: usize },
 }
 
 impl std::fmt::Display for Hazard {
@@ -557,6 +632,12 @@ impl std::fmt::Display for Hazard {
             }
             Hazard::OutOfRegion { tensor } => {
                 write!(f, "tensor {tensor} is placed past the region")
+            }
+            Hazard::NotHeld { tensor } => {
+                write!(f, "tensor {tensor}'s holders do not serve its readers")
+            }
+            Hazard::ReadDropped { tensor } => {
+                write!(f, "tensor {tensor}'s writes are dropped, but it is needed")
             }
         }
     }
@@ -582,13 +663,22 @@ fn root(parent: &mut [usize], mut t: usize) -> usize {
     t
 }
 
+/// The most a region at the top of an arena ending at `data_end` can take with every op of `g`
+/// laid out as it was: `data_end` less the highest of the ops' needs
+/// ([`crate::trace::OpRecord::l1_need`], the lowest arena end each op's layouts stand at), in whole
+/// [`ALIGN`]s (`docs/plans/planned-l1-residency.md` 2h). At the 1.7B, the `K` = 2048 products'
+/// widest blocks set it: 110,464 bytes.
+pub fn cap(g: &Graph, data_end: u64) -> u64 {
+    let (_, need) = neediest(g);
+    data_end.saturating_sub(need) / ALIGN * ALIGN
+}
+
 impl Plan {
     /// Plan `g` for a unit arena ending at `data_end`: the tensors whose every use `capable` gives an
     /// L1 path (the op and its use), placed so each layer of `g`'s period runs at the same
-    /// addresses.
+    /// addresses, in a region of [`cap`].
     pub fn make(g: &Graph, data_end: u64, capable: impl Fn(&Op, &Use) -> bool) -> Plan {
-        let (_, need) = neediest(g);
-        Self::make_within(g, data_end.saturating_sub(need), capable)
+        Self::make_within(g, cap(g, data_end), capable)
     }
 
     /// [`Plan::make`] for a region of `budget` bytes a unit: what a capture that kept one has
@@ -600,8 +690,18 @@ impl Plan {
     /// GDDR), the graph is planned without it too, and the plan that spares more GDDR bytes is
     /// kept (the periodic one on a tie).
     pub fn make_within(g: &Graph, budget: u64, capable: impl Fn(&Op, &Use) -> bool) -> Plan {
+        Self::make_rows(g, budget, Rows::Multicast, capable)
+    }
+
+    /// [`Plan::make_within`], with the rows many units read whole delivered as `rows` says.
+    pub fn make_rows(
+        g: &Graph,
+        budget: u64,
+        rows: Rows,
+        capable: impl Fn(&Op, &Use) -> bool,
+    ) -> Plan {
         let period = period(&g.ops.iter().map(|o| &o.signature).collect::<Vec<_>>());
-        let pinned = Self::make_inner(g, budget, &capable, period);
+        let pinned = Self::make_inner(g, budget, rows, &capable, period);
         let costs = pinned.place.iter().any(|p| {
             matches!(
                 p,
@@ -611,7 +711,7 @@ impl Plan {
         if period.is_none() || !costs {
             return pinned;
         }
-        let free = Self::make_inner(g, budget, &capable, None);
+        let free = Self::make_inner(g, budget, rows, &capable, None);
         let spared = |p: &Plan| p.gddr_avoided(g).iter().sum::<u64>();
         if spared(&free) > spared(&pinned) {
             Plan { period, ..free }.unpinned()
@@ -631,6 +731,7 @@ impl Plan {
     fn make_inner(
         g: &Graph,
         budget: u64,
+        rows: Rows,
         capable: &impl Fn(&Op, &Use) -> bool,
         period: Option<Period>,
     ) -> Plan {
@@ -648,11 +749,23 @@ impl Plan {
                     Some(Reason::ReadFirst)
                 } else if t.uses.iter().any(|u| u.reads() && u.writes()) {
                     Some(Reason::ReadAndWritten)
-                } else if t.uses.iter().any(|u| !capable(&g.ops[u.op], u)) {
+                } else if t.uses.iter().any(|u| !capable(&g.ops[u.op], u))
+                    || t.replicated()
+                        && match rows {
+                            Rows::Gddr => true,
+                            Rows::Multicast => false,
+                            Rows::Held(_) => !t.read_alike(),
+                        }
+                {
                     Some(Reason::NoPath)
                 } else {
                     None
                 }
+            })
+            .collect();
+        let dropped: BTreeSet<usize> = (0..g.tensors.len())
+            .filter(|&t| {
+                reason[t] == Some(Reason::NeverRead) && g.tensors[t].uses.iter().all(|u| u.plain)
             })
             .collect();
         // Tensors at one place of two layers share an address: the `j`th tensor op `k` touches,
@@ -719,6 +832,21 @@ impl Plan {
                         };
                     }
                 }
+                let held = match rows {
+                    Rows::Held(h) => place
+                        .iter()
+                        .enumerate()
+                        .filter(|&(t, p)| {
+                            matches!(p, Place::Resident { .. }) && g.tensors[t].replicated()
+                        })
+                        .map(|(t, _)| {
+                            let readers: Vec<usize> = g.tensors[t].read_by().into_keys().collect();
+                            let (holders, of) = holders(&readers, h);
+                            (t, Held { holders, of })
+                        })
+                        .collect(),
+                    _ => BTreeMap::new(),
+                };
                 return Plan {
                     place,
                     region,
@@ -726,6 +854,8 @@ impl Plan {
                     neediest,
                     period,
                     pinned: true,
+                    held,
+                    dropped,
                 };
             }
             let cost = |m: &Vec<usize>| -> u64 {
@@ -785,6 +915,28 @@ impl Plan {
                 }
             }
         }
+        for &t in &self.dropped {
+            let tensor = &g.tensors[t];
+            let needed = !tensor.internal
+                || tensor.uses.iter().any(|u| u.reads() || !u.plain)
+                || matches!(self.place.get(t), Some(Place::Resident { .. }));
+            if needed {
+                return Err(Hazard::ReadDropped { tensor: t });
+            }
+        }
+        for (&t, h) in &self.held {
+            let tensor = &g.tensors[t];
+            let readers: BTreeSet<usize> = tensor.read_by().into_keys().collect();
+            let serves = matches!(self.place.get(t), Some(Place::Resident { .. }))
+                && tensor.read_alike()
+                && !h.holders.is_empty()
+                && h.holders.iter().all(|v| readers.contains(v))
+                && h.of.keys().copied().eq(readers.iter().copied())
+                && h.of.values().all(|v| h.holders.contains(v));
+            if !serves {
+                return Err(Hazard::NotHeld { tensor: t });
+            }
+        }
         if let Some(per) = self.period.filter(|_| self.pinned) {
             let seen = |k: usize| -> Vec<Option<u64>> {
                 g.ops[k]
@@ -826,6 +978,10 @@ impl Plan {
                     Place::Resident { offset, bytes, .. } => (1u8, offset, bytes).hash(&mut h),
                     Place::Gddr(r) => (0u8, r as u64, 0u64).hash(&mut h),
                 }
+                if let Some(held) = self.held.get(&t) {
+                    held.holders.hash(&mut h);
+                }
+                self.dropped.contains(&t).hash(&mut h);
             }
         }
         self.region.hash(&mut h);
@@ -1019,6 +1175,13 @@ impl Plan {
 ///   unit itself and one `op::WRITE_L1_MCAST` a rectangle of the others (a single tile, a
 ///   `WRITE_L1`).
 ///
+/// A dropped tensor's writes ([`Plan::dropped`]) go nowhere: removed from the list.
+///
+/// A held tensor ([`Plan::held`], [`Rows::Held`]) is held by its holders alone, each holding
+/// every tile its readers read: a read becomes an `op::READ_L1` of the reader's holder's region,
+/// and a write one `op::WRITE_L1` to each holder, no multicast. Reads of consecutive slots from
+/// one tile into consecutive slots are one `READ_L1`, up to a request.
+///
 /// A record that touches a resident tensor is rewritten whole, so all its moves must; anything
 /// else is a planned capture that is not its plan's, refused by name.
 #[derive(Clone, Debug)]
@@ -1034,6 +1197,9 @@ pub struct Applied {
     pub coords: Vec<(u8, u8)>,
     /// Per tensor, per unit that reads it: the tiles it holds, in address order.
     holds: Vec<BTreeMap<usize, Vec<u32>>>,
+    /// The (op, unit) lists that move a resident or dropped tensor in the plan pass, made when
+    /// first asked ([`Applied::touches`]; forgotten when the plan changes).
+    touched: std::sync::OnceLock<BTreeSet<(usize, usize)>>,
 }
 
 impl Applied {
@@ -1046,21 +1212,28 @@ impl Applied {
         region_base: u64,
         coords: Vec<(u8, u8)>,
     ) -> Option<Self> {
-        plan.resident().next()?;
+        if plan.resident().next().is_none() && plan.dropped.is_empty() {
+            return None;
+        }
         let holds = graph
             .tensors
             .iter()
-            .map(|t| {
-                let mut per_unit: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
-                for u in &t.uses {
-                    for (&unit, tiles) in &u.reads {
-                        per_unit.entry(unit).or_default().extend(tiles);
+            .enumerate()
+            .map(|(t, tensor)| {
+                let per_unit = tensor.read_by();
+                match plan.held.get(&t) {
+                    Some(h) => {
+                        let all: BTreeSet<u32> = per_unit.into_values().flatten().collect();
+                        h.holders
+                            .iter()
+                            .map(|&v| (v, all.iter().copied().collect()))
+                            .collect()
                     }
+                    None => per_unit
+                        .into_iter()
+                        .map(|(unit, tiles)| (unit, tiles.into_iter().collect()))
+                        .collect(),
                 }
-                per_unit
-                    .into_iter()
-                    .map(|(unit, tiles)| (unit, tiles.into_iter().collect()))
-                    .collect()
             })
             .collect();
         Some(Applied {
@@ -1070,7 +1243,110 @@ impl Applied {
             region_base,
             coords,
             holds,
+            touched: Default::default(),
         })
+    }
+
+    /// Whether op `k`'s lists on unit `u` moved a resident or dropped tensor in the plan pass: the
+    /// only lists [`Applied::rewrite`] changes. The others are kept as they are, unread: a
+    /// product's gathers expand to every weight tile it reads. A planned capture whose other lists
+    /// move one is refused all the same, by [`Applied::verify`].
+    pub(crate) fn touches(&self, k: usize, u: usize) -> bool {
+        self.touched
+            .get_or_init(|| {
+                self.plan
+                    .resident()
+                    .chain(self.plan.dropped.iter().copied())
+                    .flat_map(|t| &self.graph.tensors[t].uses)
+                    .flat_map(|w| w.reads.keys().chain(w.writes.keys()).map(|&u| (w.op, u)))
+                    .collect()
+            })
+            .contains(&(k, u))
+    }
+
+    /// Forget what [`Applied::touches`] found: the plan changed.
+    pub(crate) fn forget_touches(&mut self) {
+        self.touched = Default::default();
+    }
+
+    /// Whether op `k`, about to be queued as `queues` (each unit's steps, before
+    /// [`Applied::rewrite`]) with `allocs` the capture's tensors so far, is the plan pass's op `k`:
+    /// the same tensors allocated so far, and every move of every list on the same tensor's same
+    /// tiles, read or written alike, as [`Graph::from_capture`] attributes them. Checked before
+    /// the op runs, so a capture of another graph is stopped before any of its ops reads what the
+    /// plan put in L1 for this one (an op given other data can stop the queue: a division by
+    /// zero, `dm::error::DOMAIN`).
+    pub(crate) fn check_op(
+        &self,
+        index: &Index,
+        allocs: &[Placement],
+        k: usize,
+        queues: &[Vec<crate::tensor::Step>],
+    ) -> Result<(), String> {
+        use crate::tensor::Step;
+        if allocs.len() > self.graph.tensors.len() {
+            return Err(format!(
+                "op {k}: {} tensors allocated against the plan's {}",
+                allocs.len(),
+                self.graph.tensors.len()
+            ));
+        }
+        if let Some(t) = (0..allocs.len()).find(|&t| {
+            let want = &self.graph.tensors[t];
+            allocs[t].tiles() != want.tiles || allocs[t].slot_bytes() != want.slot_bytes
+        }) {
+            return Err(format!("op {k}: tensor {t} is not the plan's"));
+        }
+        let mut uses: BTreeMap<usize, Use> = BTreeMap::new();
+        let mut unread = 0;
+        for (u, steps) in queues.iter().enumerate() {
+            let mut access = |w: [u32; 8], whole: bool| {
+                let write = match w[0] {
+                    op::READ | op::READ_TRANSPOSED | op::READ_BROADCAST_COL => false,
+                    op::WRITE => true,
+                    _ => return,
+                };
+                if let Some((t, tile)) = index.find(w[1], w[3]) {
+                    let use_ = uses.entry(t).or_insert_with(|| Use {
+                        op: k,
+                        plain: true,
+                        ..Use::default()
+                    });
+                    use_.plain &= whole;
+                    let side = if write {
+                        &mut use_.writes
+                    } else {
+                        &mut use_.reads
+                    };
+                    side.entry(u).or_default().insert(tile);
+                    use_.bytes[usize::from(write)] += u64::from(w[5]);
+                }
+            };
+            for step in steps {
+                match step {
+                    Step::List { entries, .. } => unread += walk(entries, &mut access),
+                    Step::Transfer { batches, .. } => {
+                        for b in batches {
+                            unread += walk(&b.read, &mut access);
+                            unread += walk(&b.write, &mut access);
+                        }
+                    }
+                    Step::Kernel { .. } => {}
+                }
+            }
+        }
+        let want = self.graph.ops.get(k).map_or(&[][..], |o| &o.tensors[..]);
+        let same = unread == 0
+            && uses.len() == want.len()
+            && want.iter().all(|&t| {
+                let planned = self.graph.tensors[t].uses.iter().find(|w| w.op == k);
+                planned.is_some_and(|w| uses.get(&t).is_some_and(|got| got == w))
+            });
+        if same {
+            Ok(())
+        } else {
+            Err(format!("op {k} moves other tensors than the plan pass's"))
+        }
     }
 
     /// Whether capture `c`, ending, with `allocs` its tensors, is the plan applied: the plan pass's
@@ -1107,6 +1383,7 @@ impl Applied {
         if let Some(t) = self
             .plan
             .resident()
+            .chain(self.plan.dropped.iter().copied())
             .find(|&t| !g.tensors[t].uses.is_empty())
         {
             return Err(format!(
@@ -1120,6 +1397,11 @@ impl Applied {
     /// Whether tensor `t` is resident.
     pub fn resident(&self, t: usize) -> bool {
         matches!(self.plan.place.get(t), Some(Place::Resident { .. }))
+    }
+
+    /// Whether tensor `t`'s writes are dropped ([`Plan::dropped`]).
+    pub fn dropped(&self, t: usize) -> bool {
+        self.plan.dropped.contains(&t)
     }
 
     /// Where tile `tile` of resident tensor `t` is on unit `u`, if `u` holds it.
@@ -1181,7 +1463,11 @@ impl Applied {
             };
             let located: Vec<Option<(usize, u32, u64)>> = moves
                 .iter()
-                .map(|w| index.locate(w[1], w[3]).filter(|&(t, ..)| self.resident(t)))
+                .map(|w| {
+                    index
+                        .locate(w[1], w[3])
+                        .filter(|&(t, ..)| self.resident(t) || self.dropped(t))
+                })
                 .collect();
             if located.iter().all(Option::is_none) {
                 out.extend_from_slice(chunk);
@@ -1198,26 +1484,43 @@ impl Applied {
             for (w, at) in moves.iter().zip(located) {
                 let (t, tile, byte) = at.expect("checked");
                 let len = w[5];
+                if self.dropped(t) {
+                    if w[0] != op::WRITE {
+                        return Err(format!(
+                            "op {k} on unit {u} reads tensor {t}, whose writes are dropped"
+                        ));
+                    }
+                    continue;
+                }
                 if w[0] == op::READ {
+                    // A held tensor is read from the reader's holder; any other from its own copy.
+                    let src = match self.plan.held.get(&t) {
+                        Some(h) => *h.of.get(&u).ok_or_else(|| {
+                            format!("op {k}: unit {u} reads held tensor {t} from no holder")
+                        })?,
+                        None => u,
+                    };
                     let from = self
-                        .address(t, u, tile)
-                        .ok_or_else(|| format!("op {k}: unit {u} reads tile {tile} of tensor {t}, which the plan has it not hold"))?
+                        .address(t, src, tile)
+                        .ok_or_else(|| format!("op {k}: unit {u} reads tile {tile} of tensor {t}, which the plan has unit {src} not hold"))?
                         + byte;
-                    let (x, y) = self.coords[u];
+                    let (x, y) = self.coords[src];
                     let mut done = 0;
                     while done < len {
                         let n = (len - done).min(tt_isa::noc::niu::MAX_REQUEST_BYTES);
-                        out.push([
-                            op::READ_L1,
-                            x as u32,
-                            y as u32,
-                            from as u32 + done,
-                            w[4] + done,
-                            n,
-                            0,
-                            0,
-                        ]);
+                        push_read(
+                            &mut out,
+                            [x as u32, y as u32, from as u32 + done, w[4] + done, n],
+                        );
                         done += n;
+                    }
+                } else if let Some(h) = self.plan.held.get(&t) {
+                    let to = self.address(t, h.holders[0], tile).ok_or_else(|| {
+                        format!("op {k}: tile {tile} of held tensor {t} has no holder")
+                    })? + byte;
+                    for &v in &h.holders {
+                        let (x, y) = self.coords[v];
+                        out.push([op::WRITE_L1, x as u32, y as u32, to as u32, w[4], len, 0, 0]);
                     }
                 } else {
                     for (at, units) in self.holders(t, tile) {
@@ -1256,6 +1559,23 @@ impl Applied {
     }
 }
 
+/// Push `READ_L1` `[x, y, from, to, len]` onto `out`, or lengthen the `READ_L1` before it if this
+/// one continues it: the same tile, the next bytes on both sides, within one request.
+fn push_read(out: &mut Vec<[u32; 8]>, [x, y, from, to, len]: [u32; 5]) {
+    if let Some(last) = out.last_mut() {
+        if last[0] == op::READ_L1
+            && (last[1], last[2]) == (x, y)
+            && last[3] + last[5] == from
+            && last[4] + last[5] == to
+            && last[5] + len <= tt_isa::noc::niu::MAX_REQUEST_BYTES
+        {
+            last[5] += len;
+            return;
+        }
+    }
+    out.push([op::READ_L1, x, y, from, to, len, 0, 0]);
+}
+
 /// Rectangles covering exactly `tiles`: each row's runs of adjacent columns, runs of the same
 /// columns on adjacent rows merged. Deterministic.
 pub fn rectangles(tiles: &[(u8, u8)]) -> Vec<((u8, u8), (u8, u8))> {
@@ -1288,6 +1608,49 @@ pub fn rectangles(tiles: &[(u8, u8)]) -> Vec<((u8, u8), (u8, u8))> {
         }
     }
     out
+}
+
+/// How a row that many units read whole reaches them (`docs/plans/planned-l1-residency.md` 2f):
+/// a product's packed `A`, RMSNorm's twin. Its producers each hold a few of its face rows; every
+/// reader needs all of them. [`crate::session::Session::probe_row_delivery`] measures each.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowScheme {
+    /// Through GDDR, as without residency: each producer writes its face rows into the twin, each
+    /// reader reads the twin whole.
+    Gddr,
+    /// Phase 2's: each producer writes each face row into its own region if it reads the row, and
+    /// multicasts it to every rectangle of the other readers (2e: ~250 us a multiply, the
+    /// rectangles' multicasts serialized).
+    Multicast,
+    /// 2f (c): [`RowScheme::Multicast`], its multicasts marked as runs
+    /// ([`tt_isa::dm::MCAST_RUN_ACKS`]): a producer's acknowledgements counted once, after its last.
+    MulticastRunAcks,
+    /// 2f (a): each producer writes each face row to `h` holders among the readers ([`holders`]);
+    /// each reader pulls the row whole from its holder, one `READ_L1` a request.
+    Held(usize),
+    /// 2f (b): each producer writes each face row to one gatherer (the middle reader); an op of its
+    /// own then multicasts the row whole from there, a request at a time, to every rectangle of the
+    /// other readers, which read their own copy.
+    Relay,
+}
+
+/// The holders of a row read whole by `readers` (ascending unit indices) when `h` of them hold it
+/// ([`RowScheme::Held`]): the readers split into `h` contiguous runs ([`crate::tensor::runs`]),
+/// each held by its middle reader. Returns the holders, ascending, and each reader's holder. Pure
+/// in `readers`, so every repeat of a layer, whose readers are the same units, picks the same.
+pub fn holders(readers: &[usize], h: usize) -> (Vec<usize>, BTreeMap<usize, usize>) {
+    let h = h.clamp(1, readers.len().max(1));
+    let mut held = Vec::with_capacity(h);
+    let mut of = BTreeMap::new();
+    for run in crate::tensor::runs(readers.len(), h, usize::MAX) {
+        let holder = readers[run.start + run.len() / 2];
+        held.push(holder);
+        for &r in &readers[run] {
+            of.insert(r, holder);
+        }
+    }
+    (held, of)
 }
 
 /// A tensor's ops: who makes it and who reads it, how.
@@ -1630,6 +1993,205 @@ mod tests {
                 .map(|&(s, e)| (e.0 - s.0 + 1) as usize * (e.1 - s.1 + 1) as usize)
                 .sum()
         );
+    }
+
+    /// `h` holders split the readers into contiguous runs, each held by its middle reader; every
+    /// reader has a holder among them; `h` past the readers is every reader; the same readers
+    /// give the same holders.
+    #[test]
+    fn holders_split_the_readers_evenly() {
+        let readers: Vec<usize> = (0..104).collect();
+        let (held, of) = holders(&readers, 4);
+        assert_eq!(held, [13, 39, 65, 91]);
+        assert_eq!(of.len(), readers.len());
+        assert!(of.values().all(|h| held.contains(h)));
+        assert_eq!((of[&0], of[&25], of[&26], of[&103]), (13, 13, 39, 91));
+        let per: Vec<usize> = held
+            .iter()
+            .map(|h| of.values().filter(|&v| v == h).count())
+            .collect();
+        assert_eq!(per, [26, 26, 26, 26]);
+        // Not contiguous unit indices: the readers' own, in order.
+        let (held, of) = holders(&[3, 5, 8, 40], 2);
+        assert_eq!(held, [5, 40]);
+        assert_eq!((of[&3], of[&8]), (5, 40));
+        let (held, _) = holders(&[3, 5], 8);
+        assert_eq!(held, [3, 5], "more holders than readers: every reader");
+        assert_eq!(holders(&readers, 1).0, [52]);
+        assert_eq!(holders(&readers, 4), holders(&readers, 4));
+    }
+
+    /// A packed twin (2 tiles, tensor 0) written by units 0-3 a tile each and read whole by units
+    /// 0-7, its rewrite applied with `rows`: the `Applied`, the twin and the `Index` of its GDDR.
+    fn twin_applied(rows: Rows) -> (Applied, crate::tensor::DramTensor, Index) {
+        let mut alloc = crate::tensor::DramAlloc::new(&tt_isa::dram::Dram::FULL);
+        alloc.start_log();
+        let twin = crate::tensor::DramTensor::alloc(&mut alloc, 64, 32).unwrap();
+        let index = Index::new(alloc.logged());
+        let writes: Vec<Access> = (0..4)
+            .map(|u| (0, u, true, if u < 2 { &[0u32][..] } else { &[1u32][..] }))
+            .collect();
+        let reads: Vec<Access> = (0..8).map(|u| (0, u, false, &[0u32, 1][..])).collect();
+        let g = graph(&[2], &[("mul", &writes), ("matmul", &reads)]);
+        let plan = Plan::make_rows(&g, 96 << 10, rows, |_, _| true);
+        plan.check(&g).unwrap();
+        let coords = [1u8, 2, 3, 4, 5, 6, 7, 10].map(|x| (x, 2)).to_vec();
+        let base = tt_isa::l1::DATA.end - (96 << 10);
+        let applied = Applied::new(g, plan, vec![0, 0], base, coords).expect("the twin resident");
+        (applied, twin, index)
+    }
+
+    /// The reads of the whole twin into slots from `at`: the packed `A` read a product queues.
+    fn twin_reads(twin: &crate::tensor::DramTensor, at: u32) -> Vec<[u32; 8]> {
+        let mut e = vec![[record::READ_RUN, 0, 2, at, 0, 1, 0, 0]];
+        e.extend(twin.tensor_ref().encode());
+        e
+    }
+
+    /// `Rows::Held`: a twin read whole by eight units is held by two of them; each producer's
+    /// face-row writes become one `WRITE_L1` to each holder and no multicast; each reader's two
+    /// tile reads become one `READ_L1` of its holder's region.
+    #[test]
+    fn a_held_row_is_written_to_its_holders_and_read_from_them() {
+        let (a, twin, index) = twin_applied(Rows::Held(2));
+        let held = &a.plan.held[&0];
+        assert_eq!(held.holders, [2, 6]);
+        let at = |u: usize| a.address(0, u, 0).unwrap();
+        assert_eq!(at(2), at(6), "every holder holds the row at one address");
+        assert!(
+            a.address(0, 1, 0).is_none(),
+            "a reader that is no holder holds nothing"
+        );
+        // Unit 1 writes output tiles 16..32: twin tile 0's rows 16-31, two face rows each.
+        let writes = crate::tensor::packed_twin_writes(&twin, 16, 16, 0x4_0000);
+        let out = a.rewrite(&index, 0, 1, &writes).unwrap();
+        assert_eq!(out.len(), 2 * writes.len());
+        assert!(out.iter().all(|e| e[0] == op::WRITE_L1));
+        for (w, pair) in writes.iter().zip(out.chunks(2)) {
+            let (_, tile, byte) = index.locate(w[1], w[3]).unwrap();
+            assert_eq!(tile, 0);
+            for (e, v) in pair.iter().zip([2usize, 6]) {
+                let (x, y) = a.coords[v];
+                assert_eq!(
+                    *e,
+                    [
+                        op::WRITE_L1,
+                        x as u32,
+                        y as u32,
+                        (at(v) + byte) as u32,
+                        w[4],
+                        64,
+                        0,
+                        0
+                    ]
+                );
+            }
+        }
+        // Each reader reads both tiles from its holder, as one request.
+        for (u, holder) in [(0, 2), (3, 2), (4, 6), (7, 6), (6, 6)] {
+            let out = a
+                .rewrite(&index, 1, u, &twin_reads(&twin, 0x5_0000))
+                .unwrap();
+            let (x, y) = a.coords[holder];
+            assert_eq!(
+                out,
+                [[
+                    op::READ_L1,
+                    x as u32,
+                    y as u32,
+                    at(holder) as u32,
+                    0x5_0000,
+                    2 * SLOT as u32,
+                    0,
+                    0
+                ]],
+                "unit {u}"
+            );
+        }
+    }
+
+    /// `Rows::Multicast` keeps Phase 2's copies (a multicast a write), and `Rows::Gddr` keeps the
+    /// row in GDDR; a held plan whose reader reads from a unit that is not a holder is refused.
+    #[test]
+    fn rows_choose_the_delivery_and_a_misrouted_holder_is_refused() {
+        let (a, twin, index) = twin_applied(Rows::Multicast);
+        assert!(a.plan.held.is_empty());
+        let writes = crate::tensor::packed_twin_writes(&twin, 0, 1, 0x4_0000);
+        let out = a.rewrite(&index, 0, 0, &writes).unwrap();
+        assert!(out.iter().any(|e| e[0] == op::WRITE_L1_MCAST), "{out:x?}");
+        let held = twin_applied(Rows::Held(2)).0;
+        let reads: Vec<Access> = (0..8).map(|u| (0, u, false, &[0u32, 1][..])).collect();
+        let writes: Vec<Access> = vec![(0, 0, true, &[0u32, 1][..])];
+        let g = graph(&[2], &[("mul", &writes), ("matmul", &reads)]);
+        let p = Plan::make_rows(&g, 96 << 10, Rows::Gddr, |_, _| true);
+        assert_eq!(p.place[0], Place::Gddr(Reason::NoPath));
+        // The negative control: a reader pointed at a unit that holds nothing.
+        let mut bad = held.plan.clone();
+        bad.held.get_mut(&0).unwrap().of.insert(0, 1);
+        assert_eq!(bad.check(&held.graph), Err(Hazard::NotHeld { tensor: 0 }));
+        let mut bad = held.plan.clone();
+        bad.held.get_mut(&0).unwrap().of.remove(&5);
+        assert_eq!(bad.check(&held.graph), Err(Hazard::NotHeld { tensor: 0 }));
+        assert_eq!(held.plan.check(&held.graph), Ok(()));
+    }
+
+    /// 2g: a tensor the graph makes and never reads (tensor 1, beside a held twin) has its writes
+    /// dropped: they leave the list, the twin's are rewritten as before. A read of it is refused
+    /// by the rewrite, and a plan dropping a tensor that is read by the check.
+    #[test]
+    fn a_never_read_tensor_s_writes_are_dropped() {
+        let mut alloc = crate::tensor::DramAlloc::new(&tt_isa::dram::Dram::FULL);
+        alloc.start_log();
+        let twin = crate::tensor::DramTensor::alloc(&mut alloc, 64, 32).unwrap();
+        let tiles = crate::tensor::DramTensor::alloc(&mut alloc, 1, 64).unwrap();
+        let index = Index::new(alloc.logged());
+        let writes: Vec<Access> = vec![(0, 0, true, &[0u32, 1][..]), (1, 0, true, &[0u32, 1][..])];
+        let reads: Vec<Access> = (0..8).map(|u| (0, u, false, &[0u32, 1][..])).collect();
+        let g = graph(&[2, 2], &[("mul", &writes), ("matmul", &reads)]);
+        let plan = Plan::make_rows(&g, 96 << 10, Rows::Held(2), |_, _| true);
+        assert_eq!(plan.place[1], Place::Gddr(Reason::NeverRead));
+        assert_eq!(plan.dropped, BTreeSet::from([1]));
+        plan.check(&g).unwrap();
+        let coords = [1u8, 2, 3, 4, 5, 6, 7, 10].map(|x| (x, 2)).to_vec();
+        let base = tt_isa::l1::DATA.end - (96 << 10);
+        let a = Applied::new(g.clone(), plan.clone(), vec![0, 0], base, coords).unwrap();
+        // The tile writes of tensor 1 (a `WRITE_RUN`) vanish; the twin's face rows do not.
+        let mut list = vec![[record::WRITE_RUN, 0, 2, 0x4_0000, 0, 2, 0, 0]];
+        list.extend(tiles.tensor_ref().encode());
+        assert_eq!(
+            a.rewrite(&index, 0, 0, &list).unwrap(),
+            Vec::<[u32; 8]>::new()
+        );
+        let twin_writes = crate::tensor::packed_twin_writes(&twin, 0, 2, 0x4_0000);
+        let out = a.rewrite(&index, 0, 0, &twin_writes).unwrap();
+        assert_eq!(out.len(), 2 * twin_writes.len(), "each to two holders");
+        // A read of it: refused.
+        let mut read = vec![[record::READ_RUN, 0, 2, 0x5_0000, 0, 2, 0, 0]];
+        read.extend(tiles.tensor_ref().encode());
+        let why = a.rewrite(&index, 1, 3, &read).unwrap_err();
+        assert!(why.contains("dropped"), "{why}");
+        // The negative control: the plan drops the twin, which is read.
+        let mut bad = plan.clone();
+        bad.dropped.insert(0);
+        assert_eq!(bad.check(&g), Err(Hazard::ReadDropped { tensor: 0 }));
+    }
+
+    /// A row read whole by some units and in part by another is not read alike: no one holder's
+    /// copy is what each reads, so `Rows::Held` leaves it in GDDR.
+    #[test]
+    fn a_row_not_read_alike_is_not_held() {
+        let writes: Vec<Access> = vec![(0, 0, true, &[0u32, 1][..])];
+        let whole: Vec<Access> = (0..4).map(|u| (0, u, false, &[0u32, 1][..])).collect();
+        let part: Vec<Access> = vec![(0, 5, false, &[1u32][..])];
+        let g = graph(
+            &[2],
+            &[("mul", &writes), ("matmul", &whole), ("add", &part)],
+        );
+        assert!(g.tensors[0].replicated() && !g.tensors[0].read_alike());
+        let p = Plan::make_rows(&g, 96 << 10, Rows::Held(2), |_, _| true);
+        assert_eq!(p.place[0], Place::Gddr(Reason::NoPath));
+        let p = Plan::make_rows(&g, 96 << 10, Rows::Multicast, |_, _| true);
+        assert!(matches!(p.place[0], Place::Resident { .. }));
     }
 
     #[test]

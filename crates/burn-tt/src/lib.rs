@@ -75,7 +75,8 @@ pub use tensor::TtHandle;
 pub use tensor::{TtQTensor, TtTensor};
 #[doc(hidden)]
 pub use trace::{
-    set_count_trace_bytes, set_l1_region, set_profile_buffer, set_residency, set_state_in_place,
+    probe_captures, set_count_trace_bytes, set_l1_region, set_profile_buffer, set_residency,
+    set_state_in_place,
 };
 pub use trace::{
     SetFootprint, SharedStateTraces, StepTiming, Trace, TracedInference, TracedTrainingStep,

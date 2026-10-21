@@ -478,15 +478,36 @@ pub trait Engine {
     fn end_trace(&mut self) -> Result<u64, TtError> {
         Err(no_traces())
     }
-    /// Start capturing a trace that applies the residency plan the last capture made
-    /// (`Session::begin_trace_planned`): `false`, starting nothing, without one.
-    fn begin_trace_planned(&mut self) -> Result<bool, TtError> {
+    /// Start capturing a trace that applies the residency plan the last plan pass made, kept
+    /// under `key` if it holds (`Session::begin_trace_planned_as`): `false`, starting nothing,
+    /// without one.
+    fn begin_trace_planned(&mut self, _key: u64) -> Result<bool, TtError> {
         Ok(false)
+    }
+    /// Start capturing a trace that applies the residency plan kept under `key`
+    /// (`Session::begin_trace_cached`): `false`, starting nothing, without one.
+    fn begin_trace_cached(&mut self, _key: u64) -> Result<bool, TtError> {
+        Ok(false)
+    }
+    /// Whether the last plan pass made a plan for [`Engine::begin_trace_planned`] to apply
+    /// (`Session::has_pending_plan`).
+    fn has_pending_plan(&mut self) -> Result<bool, TtError> {
+        Ok(false)
+    }
+    /// Start capturing a trace that, with residency on, plans the next
+    /// (`Session::begin_trace_plan_pass`); otherwise [`Engine::begin_trace`].
+    fn begin_trace_plan_pass(&mut self) -> Result<(), TtError> {
+        self.begin_trace()
     }
     /// Plan every capture from here on for L1 residency, in a region of `bytes` a unit (0: off;
     /// `Session::set_residency`).
     #[doc(hidden)]
     fn set_residency(&mut self, _bytes: u64) -> Result<(), TtError> {
+        Err(no_traces())
+    }
+    /// How many captures the session has begun (`Session::probe_captures`).
+    #[doc(hidden)]
+    fn probe_captures(&mut self) -> Result<u64, TtError> {
         Err(no_traces())
     }
     /// Overwrite `input`'s values, replay `trace`, and read `output` back:
@@ -916,8 +937,24 @@ impl DramBuffers {
     pub fn begin_trace_planned<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
+        key: u64,
     ) -> Result<bool, TtError> {
-        s.begin_trace_planned().map_err(TtError::from)
+        s.begin_trace_planned_as(key).map_err(TtError::from)
+    }
+
+    pub fn begin_trace_cached<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        key: u64,
+    ) -> Result<bool, TtError> {
+        s.begin_trace_cached(key).map_err(TtError::from)
+    }
+
+    pub fn begin_trace_plan_pass<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+    ) -> Result<(), TtError> {
+        s.begin_trace_plan_pass().map_err(TtError::from)
     }
 
     pub fn end_trace<T: tt_device::Transport>(
@@ -3911,13 +3948,27 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.end_trace(&mut self.session)
     }
-    fn begin_trace_planned(&mut self) -> Result<bool, TtError> {
+    fn begin_trace_planned(&mut self, key: u64) -> Result<bool, TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
-        bufs.begin_trace_planned(&mut self.session)
+        bufs.begin_trace_planned(&mut self.session, key)
+    }
+    fn begin_trace_cached(&mut self, key: u64) -> Result<bool, TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.begin_trace_cached(&mut self.session, key)
+    }
+    fn begin_trace_plan_pass(&mut self) -> Result<(), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.begin_trace_plan_pass(&mut self.session)
     }
     fn set_residency(&mut self, bytes: u64) -> Result<(), TtError> {
         self.session.set_residency(bytes);
         Ok(())
+    }
+    fn probe_captures(&mut self) -> Result<u64, TtError> {
+        Ok(self.session.probe_captures())
+    }
+    fn has_pending_plan(&mut self) -> Result<bool, TtError> {
+        Ok(self.session.has_pending_plan())
     }
     fn run_trace(
         &mut self,

@@ -49,10 +49,13 @@ type Traced = (String, Vec<burn_tt::OpRecord>);
 
 /// Each trace's ops, and the plans its captures made, in capture order.
 fn build(model: &Llama<Tt>, d: &TtDevice) -> (Vec<Traced>, Vec<(Graph, Plan)>) {
+    // Phase 1's report: what a plain capture's plan would be, with nothing made resident.
+    burn_tt::set_residency(*d, 0).unwrap();
     residency::take_plans();
     residency::probe_residency_plan(true);
     let g = TracedGenerator::<_, Tt>::new(model, &Shapes::new(16, &[4]), d).unwrap();
     residency::probe_residency_plan(false);
+    burn_tt::set_residency(*d, tt_kernels::session::RESIDENCY_REGION).unwrap();
     (g.trace_ops().unwrap(), residency::take_plans())
 }
 

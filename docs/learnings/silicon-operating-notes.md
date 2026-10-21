@@ -1234,17 +1234,53 @@ from NC's L1 into a peer Tensix tile's L1 (gate `step218_l1_write_records`; card
   tiles and its window), and no such entry is ever sent past it.
 - **Image sizes:** B 30,404 -> 30,612 bytes of 43,008 (the decode arm); NC 15,540 -> 16,704 of 24,576 (7,872 left).
 - **B reads a tile's L1 over the NoC, its own included** (`op::READ_L1`, a loopback read of the unit's region; every
-  `step219` run and the 1.7B with residency on, `1792526703`): no hang, the bytes as written.
+  `step219` run and the 1.7B with residency on, `1792526703`): no hang, the bytes as written. **A peer's too**
+  (`step218` `a_read_pulls_a_peers_window`, 2026-10-20; card 0 safe `1792531966`, `fast-reads` `1792532114`,
+  `fast-reads` + `encoded-guard` `1792532259`): B on the gate tile read 64 B to 16 KiB from two peers' windows and its
+  own, at three 16-byte skews, byte for byte, nothing past the reads written. The host refuses a peer not the
+  session's, a harvested column's and an address outside the window (the remote side is the one checked against it);
+  the tile refuses the decode's cases sent raw and on NC, and writes nothing.
 - **Many units multicasting into one rectangle at once serialize.** 64 units each multicasting a row's 64-byte face rows
   into the same 104-tile rectangle took ~250 us an op where its GDDR writes took ~14 (`1792527601`): path-reserved
   multicasts that share a rectangle wait for one another. A row many units read whole is delivered some other way
   (`planned-l1-residency.md` 2f).
+- **The multicasts' cost is the NoC's, not NC's waits** (2f (c), `dm::MCAST_RUN_ACKS`, card 0, 120 tiles,
+  `silicon_probe_row_delivery` `1792533708`): with a producer's run of multicasts drained once and its
+  acknowledgements counted once, a `[1, 2048]` row's 64 producers into 32 / 64 / 104 readers took 130 / 200 / 240 us
+  against 140 / 210 / 240 counted an entry, and a `[1, 8192]` row 760 against 780. No hang, the bytes as written
+  (`step218`, `step220`).
+- **A row held by a few of its readers and pulled from them costs what GDDR does, and less under a stream** (2f (a),
+  same run): 64 producers unicasting each face row to `h` holders, each reader one `READ_L1` of the whole row from its
+  holder. A `[1, 2048]` row to 32-104 readers: 7.5-11 us with 2 or 4 holders against 9-17 through GDDR; under a GDDR
+  stream on the idle units, 11-23 against 23-70. One holder serializes its readers (a `[1, 8192]` row, 64 readers:
+  33 us), eight cost each producer more writes (28). The unicasts slow under the stream too (4 -> 11-16 us), but
+  less than GDDR's reads do. Delivered by one gatherer's multicast, an op and a barrier more: 16-51 us.
 - **NC multicasts through NoC #1 too** (`op::WRITE_L1_MCAST`, `step218` `1792525425`): the first NoC #1 multicast
   here, a 2x2 rectangle in translated coordinates with the corners swapped (`multicast::corners_hi`), landed in all four
   tiles and none beside them; no hang. Completion is NoC #1's `WR_ACK_RECEIVED`, read after NC's earlier writes have
   drained and counted to the rectangle's tiles before the next entry. NoC #1's counter is NC's alone: B, on the same
   NIUs, never writes through NoC #1, where NoC #0's counts B's barrier release too. With the multicast, B 30,996 and NC
   17,872 bytes (6,704 left).
+
+## A region at the top of L1 costs a product only past its plan's floor (2026-10-21, card 0)
+
+`silicon_probe_region_cliff` (`1792546573`; `planned-l1-residency.md` 2h-i). A one-row product's layout depends on
+the arena it plans in (`l1::arena`) only through the choices sized from it, and those are exact:
+- **`K` whole:** `matmul::plan_in` takes the widest block whose *probe* layout fits, and the probe charges `A`
+  unpacked (`kt` slots), where the kernel runs a packed `A` (`kt/32 + 1`). The block stands while the arena ends at or
+  above `DATA.base + 4160 * ((kt + 1)(nc + 1) - 1)`. At `K` = 2048 that leaves **110,464 bytes**, which is Phase 2a's
+  96 KiB / 128 KiB cliff. At 110,464 the layout and the time are those of no region. 64 bytes past it, `nc` 2 -> 1 and
+  `qkv` 148 -> 161 us, `gate|up` 342 -> 376, the head 991 -> 1069 (+8-10%). Qwen2.5-1.5B's `gate|up` (`K` = 1536)
+  narrows at 106,304 and is **faster** narrowed (319 -> 293 us): the widest block is not always the best.
+- **`K` blocked, `A` packed** (8B `qkv` at 4096, every `down`): the jobs are a column each, whatever `plan_in`'s
+  width, so its floor binds nothing. The streamed chunk layout's does: 1.7B `down` 339,264 bytes (Phase 1's budget), Qwen
+  `down` (8960) 285,184, 8B `down` (14,336) 222,784, 8B `qkv` 376,704. Past each, the chunks change and the time moves
+  under 2% (+1.6%, -1.6%, +0.8%, +0.3%).
+- **K = 4096 is never `K`-whole today:** the unpacked probe needs 257 slots of 220, so an 8B's `hidden`-wide products
+  stream, and no weight prefetch runs ahead of them.
+- **`l1_need` depended on a warm cache.** `plan_in`'s probes were noted only on a cache miss, so a capture after an eager
+  run recorded the packed layout's need (684,352), not the probe's (938,112). `plan_in` now notes its floor on every
+  call, without its probes (`matmul::plan_floor`).
 
 ## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
 

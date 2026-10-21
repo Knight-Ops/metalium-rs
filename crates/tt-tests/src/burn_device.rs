@@ -681,12 +681,24 @@ fn sim_factory(
         fn end_trace(&mut self) -> Result<u64, TtError> {
             self.buffers.end_trace(&mut self.session)
         }
-        fn begin_trace_planned(&mut self) -> Result<bool, TtError> {
-            self.buffers.begin_trace_planned(&mut self.session)
+        fn begin_trace_planned(&mut self, key: u64) -> Result<bool, TtError> {
+            self.buffers.begin_trace_planned(&mut self.session, key)
+        }
+        fn begin_trace_cached(&mut self, key: u64) -> Result<bool, TtError> {
+            self.buffers.begin_trace_cached(&mut self.session, key)
+        }
+        fn begin_trace_plan_pass(&mut self) -> Result<(), TtError> {
+            self.buffers.begin_trace_plan_pass(&mut self.session)
         }
         fn set_residency(&mut self, bytes: u64) -> Result<(), TtError> {
             self.session.set_residency(bytes);
             Ok(())
+        }
+        fn probe_captures(&mut self) -> Result<u64, TtError> {
+            Ok(self.session.probe_captures())
+        }
+        fn has_pending_plan(&mut self) -> Result<bool, TtError> {
+            Ok(self.session.has_pending_plan())
         }
         fn run_trace(
             &mut self,

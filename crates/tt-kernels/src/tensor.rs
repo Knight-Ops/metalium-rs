@@ -1220,12 +1220,16 @@ pub fn pipelining_pays(
     units: usize,
 ) -> bool {
     let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    // What each staging's plan needs of the arena: noted below only where both answers decide.
+    let floors = std::cell::Cell::new(0);
     // Tiles gathered over the whole op, and blocks, for a staging.
     let gathered = |st: Staging| -> Option<(usize, usize)> {
-        let s = matmul::plan_in([m, k, n], route, fidelity, st)?;
+        let (s, floor) = matmul::plan_floor([m, k, n], route, fidelity, st);
+        let s = s?;
         if s.tiles[1] < kt {
             return None;
         }
+        floors.set(floors.get().max(floor));
         let [mc, nc] = blocks([mt, nt], [s.tiles[0], s.tiles[2]], units);
         let (mut tiles, mut count) = (0, 0);
         for i0 in (0..mt).step_by(mc) {
@@ -1239,8 +1243,16 @@ pub fn pipelining_pays(
     let (Some((full, _)), Some((half, count))) =
         (gathered(Staging::Slots), gathered(Staging::SlotsHalf))
     else {
+        // A staging that cannot hold `K` whole cannot in a smaller arena either: no smaller arena
+        // changes the answer.
         return false;
     };
+    // Both plans decide; a smaller arena that narrowed either could change the answer
+    // (`docs/plans/planned-l1-residency.md` 2h).
+    crate::l1::note_planned(crate::l1::Planned {
+        top: 0,
+        need: floors.get(),
+    });
     count >= 2 * units.max(1) && half <= 2 * full
 }
 
@@ -1550,7 +1562,8 @@ pub(crate) fn matmul_dram_prefetching(
     } else {
         Staging::Slots
     };
-    let shape = matmul::plan_in([m, k, n], route, fidelity, staging)
+    let (shape, floor) = matmul::plan_floor([m, k, n], route, fidelity, staging);
+    let shape = shape
         .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
     let [mc, kc, nc] = shape.tiles;
     let kc = max_k_tiles.map_or(kc, |limit| kc.min(limit.get()));
@@ -1564,6 +1577,17 @@ pub(crate) fn matmul_dram_prefetching(
         Some(_) if kc < kt => packed_k_block(kt, max_k_tiles, route, fidelity)?,
         _ => kc,
     };
+    // The plan's block is what runs, so the arena must keep it (`matmul::plan_floor`) -- except
+    // where a packed `A`'s `K` is blocked: its blocks are `packed_k_block`'s, which notes its own
+    // layout, and its jobs a column each, whatever the plan's width; and a smaller arena keeps `K`
+    // blocked (`docs/plans/planned-l1-residency.md` 2h-i: `down` at 8192, 8960 and 14,336 laid
+    // out and timed alike past the plan's floor).
+    if !(reads.packed_a.is_some() && kc < kt) {
+        crate::l1::note_planned(crate::l1::Planned {
+            top: 0,
+            need: floor,
+        });
+    }
     let col_runs = thin_runs([mt, kt, nt], [kc, nc], staging, units);
     let [mc, nc] = blocks([mt, nt], [mc, nc], units);
     let (ra, rb) = (a.tensor_ref(), b.tensor_ref());

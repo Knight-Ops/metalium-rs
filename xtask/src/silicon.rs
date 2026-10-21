@@ -294,8 +294,11 @@ pub const SMOKE: &[&str] = &[
     "step217_residency_plan::",
     // NC writing another tile's L1 (planned-l1-residency.md Phase 2b).
     "step218_l1_write_records::",
-    // A planned capture keeping its tensors in L1 (planned-l1-residency.md Phase 2).
+    // A planned capture keeping its tensors in L1 (planned-l1-residency.md Phase 2), its region
+    // sized by its plan and its plan cached (2h).
     "step219_residency_decode::",
+    // A row read whole on many units, delivered by each scheme (planned-l1-residency.md 2f).
+    "step220_row_delivery::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",
