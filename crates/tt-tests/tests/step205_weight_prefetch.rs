@@ -33,6 +33,14 @@
 //!   same. Watched failing with three chunks read ahead (the third overwrites the first's half
 //!   before its kernel reads it).
 //!
+//! - **A streamed column is handed between two units** (`Session::set_stream_handoff`): with the
+//!   stream prefetch held to units 4-5, units 6-7 have no job in a product, and each takes the
+//!   rest of a column one of units 0-3 would read whole -- reading it ahead in the product, then
+//!   reloading the partial the column's unit wrote and computing the rest in an op of its own
+//!   after the product's barrier. Handed at chunk 1 and at half (2 of 4); the bits are the same.
+//!   Watched failing with the partial reloaded into the other half's slot, and with its reload
+//!   dropped.
+//!
 //! Watched failing: the prefetched columns not left out of the other units' deal (the rest
 //! dealt from column 0), which leaves the last columns uncomputed.
 
@@ -436,6 +444,87 @@ fn streamed_products_prefetch_their_first_chunks_and_replay_as_the_ops_run_fresh
         for (i, want) in fresh.iter().enumerate() {
             assert_bits(&format!("unprefetched, run {i}"), &off.1[i], want);
             assert_bits(&format!("prefetched, run {i}"), &on.1[i], want);
+        }
+        for t in chain.w.into_iter().chain([x]) {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// Claim seven: with the stream prefetch on units 4-5, the second and third products hand two
+/// columns each to units 6-7, whose rest runs as an op of its own on those units alone; every run
+/// is the ops run fresh, bit for bit, handed at chunk 1 and at half.
+#[test]
+fn handed_columns_replay_as_the_ops_run_fresh() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        s.set_matmul_k_block_limit(std::num::NonZeroUsize::new(8));
+        s.set_pipeline(false);
+        s.set_stream_prefetch_units(2);
+        let chain = Chain::upload(s);
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let warm = chain.forward(s, &x, Spread::Fixed(4));
+        s.free(warm).unwrap();
+        let mut runs = Vec::new();
+        for at in [None, Some(1), Some(0)] {
+            s.write(&x, &values(10, K)).unwrap();
+            s.set_stream_handoff(at);
+            s.begin_trace().unwrap();
+            let y = chain.forward(s, &x, Spread::Fixed(4));
+            let id = s.end_trace().unwrap();
+            s.set_stream_handoff(None);
+            // The handed columns' second ops: entries on units 6-7 and on none of 1-5 (unit 0
+            // coordinates every barrier), each planning the L1 its product did (a capture refuses
+            // an op whose layout it cannot place against a persistent region).
+            let ops = s.trace_ops(id).unwrap();
+            let rests: Vec<usize> = (1..ops.len())
+                .filter(|&k| {
+                    ops[k].entries[1..6].iter().all(|r| r.is_empty())
+                        && ops[k].entries[6..8].iter().all(|r| !r.is_empty())
+                })
+                .collect();
+            for &k in &rests {
+                assert!(
+                    ops[k].l1_top != 0,
+                    "handed at {at:?}: the rest's L1 planned"
+                );
+                assert_eq!(
+                    ops[k].l1_top,
+                    ops[k - 1].l1_top,
+                    "handed at {at:?}: its product's"
+                );
+            }
+            let rests = rests.len();
+            let mut replays = vec![s.download(&y).unwrap()];
+            for round in 0..2u64 {
+                s.write(&x, &values(20 + round, K)).unwrap();
+                s.replay(id).unwrap();
+                s.sync().unwrap();
+                replays.push(s.download(&y).unwrap());
+            }
+            s.release_trace(id).unwrap();
+            s.free(y).unwrap();
+            runs.push((at, rests, replays));
+        }
+        let mut fresh = Vec::new();
+        for seed in [10, 20, 21] {
+            s.write(&x, &values(seed, K)).unwrap();
+            let y = chain.forward(s, &x, Spread::Fixed(4));
+            fresh.push(s.download(&y).unwrap());
+            s.free(y).unwrap();
+        }
+        s.set_matmul_k_block_limit(None);
+        s.set_pipeline(true);
+        s.set_stream_prefetch_units(tt_kernels::session::PREFETCH_UNITS);
+        for (at, rests, replays) in &runs {
+            let want = if at.is_some() { 2 } else { 0 };
+            assert_eq!(
+                *rests, want,
+                "handed at {at:?}: the second and third products' rest"
+            );
+            for (i, w) in fresh.iter().enumerate() {
+                assert_bits(&format!("handed at {at:?}, run {i}"), &replays[i], w);
+            }
         }
         for t in chain.w.into_iter().chain([x]) {
             s.free(t).unwrap();

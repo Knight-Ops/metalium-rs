@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [A column's `K` chain handed between two units](#a-columns-k-chain-handed-between-two-units-2026-10-22-card-0) | 2026-10-22 | `down`'s whole columns handed at a chunk to spare units, as a second op, bit for bit: a 1.7B step 16.88 / 18.32 -> **17.07 / 18.51 ms** (slower; opt-in): `down` 179 -> 172 us, but the halves contend at GDDR (up to 137 us, not ~88) and `qkv` 51 -> 72 us as the spare units start its read ahead later |
 | [`down` prefetched, and the unit counts re-swept](#down-prefetched-and-the-unit-counts-re-swept-2026-10-22-card-0) | 2026-10-22 | each of 40 idle units reads a streamed column's first two chunks ahead: a 1.7B step 17.29 / 18.72 -> **16.87 / 18.30 ms**, 426 GB/s, `qkv` 90 -> 51 us a layer; the prefetch and stream unit counts kept at 40 / 64 / 40; `down`'s 24 busy units now bind it (a whole column each at one unit's rate) |
 | [The weight stream metered](#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0) | 2026-10-22 | prefetched bytes charged to their product, the prefetch `WAIT` stamped, every unit timed: a 1.7B step's weights stream at **389 GB/s**, 2.97 GB read ahead; unit 0 waits 28 / 67 us a layer for its own prefetch in `qkv` / `gate\|up`; the units read unevenly by where they sit among the readers; a weight stream's reads at 2 in flight even them out: a 1.7B step 18.44 / 19.83 -> **17.27 / 18.71 ms**, 416 GB/s, the 135M unchanged |
 | [Residency on by default, its region sized under the products' cliff](#residency-on-by-default-its-region-sized-under-the-products-cliff-2026-10-21-card-0) | 2026-10-21 | a region costs a product only past its plan's floor (110,464 bytes at `K` = 2048: +8-10% one 64-byte step past it); each plan's region sized under its graph's cap, plans cached, residency on by default: a 1.7B step 21.00 / 22.25 -> **20.07 / 21.28 ms**, nothing slower; builds +20-70% (open) |
@@ -346,6 +347,45 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## A column's `K` chain handed between two units (2026-10-22, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, "The stream's rate", the lever after `down` prefetched.
+1.7B, every tile (`TT_TILES=all`), release, the defaults otherwise, `traced_generation_stream_ceiling`, 2 warmups and 9
+samples, validated; decode step at 32 / 256-token prompts.
+
+- **What changed** (`Session::set_stream_handoff`, off by default; `TT_STREAM_HANDOFF=1`, `TT_STREAM_HANDOFF_AT=<h>`):
+  each of `down`'s columns its own units would read whole (24, on units 0-23) is handed to a unit with no job in the
+  product (units 24-47): the column's unit computes chunks `0..h` and writes the FP32 partial; the spare unit reads the
+  other chunks' `B` beside it as a prefetch, and after the product's barrier, in a second op, reloads the partial and
+  computes the rest. The same chain, bit for bit (`step205`, `step188`; card 0 `1792685194`).
+- **Timed:**
+
+  | Setting | ms | Run |
+  |---|--:|---|
+  | off | **16.88 / 18.32** | `1792685519` |
+  | handed at half (2 of 4 chunks) | 17.07 / 18.51 | `1792686180` |
+  | handed at chunk 1 | 17.22 / 18.61 | `1792686332` |
+  | handed at chunk 3 | 16.88 / 18.33 | `1792686483` |
+  | at half, spare units from the top (104-119 first) | 17.33 / 18.74 | `1792687395` |
+
+- **The profile** (`Step(64)`, handed at half, `--profile`, `1792686773`, against `1792678073`), a layer:
+
+  | Op | Span us, before -> handed | Per unit |
+  |---|--:|---|
+  | `down`, first op | 179 -> **155** | columns' units 0-23 93-137 us (was 138-177), spare units 42-86, idle 75-100 |
+  | `down`, second op | -> **17** | the spare units 15 us each; unit 0 (the coordinator) waits 17 |
+  | the next `qkv` | 51 -> **72** | its prefetch wait 8 -> 35 us |
+
+- **What it says:**
+  - **`down`'s span is bound by GDDR's aggregate rate, not one unit's.** Half a column took a columns' unit up to 137 us,
+    not the ~88 us half of 176, because the spare units read the other halves at the same time: `down`'s in-span bytes
+    are unchanged and now come from more readers at once.
+  - **The spare units cost `qkv`.** Units 24-47 had no `down` job, so their read ahead of the next `qkv` started under
+    `down`; handed, it starts after the second op. Taking spare units from the top instead (units no product takes) was
+    slower still.
+  - **An in-op firmware signal is not worth it here:** it would save the second op's ~17 us a layer, not the contention
+    or `qkv`'s later start. Left opt-in.
 
 ## `down` prefetched, and the unit counts re-swept (2026-10-22, card 0)
 

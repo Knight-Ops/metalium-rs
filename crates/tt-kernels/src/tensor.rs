@@ -1298,6 +1298,7 @@ pub fn matmul_dram(
             stream_k: false,
             stream_prefetch: false,
             prefetch_units: [usize::MAX; 2],
+            handoff: None,
         },
     )
 }
@@ -1371,6 +1372,9 @@ pub(crate) struct Reads {
     /// The most prefetching units a product takes, its `K` whole and streamed: a streamed
     /// column reads only its first chunks ahead, so the two kinds want different counts.
     pub prefetch_units: [usize; 2],
+    /// With a streamed product prefetched, each column its own units would read whole is handed
+    /// between two units at this chunk (`Some(0)`: half the chunks; [`Handoff`]).
+    pub handoff: Option<usize>,
 }
 
 /// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
@@ -1502,7 +1506,7 @@ pub(crate) fn matmul_dram_limited(
         units,
         &[],
     )
-    .map(|(work, _)| work)
+    .map(|(work, ..)| work)
 }
 
 /// What a list that reads a product's `B` ahead of it is called: the session puts it in a unit's
@@ -1518,11 +1522,34 @@ pub const PREFETCH: &str = "weight prefetch";
 /// that is not captured, read it where the job is.
 pub const BUSY_PREFETCH: &str = "busy weight prefetch";
 
+/// What the first op's list on a unit that takes the rest of a handed column is called
+/// ([`Handoff`]): the packed `A`, and its first two chunks' `B` as a prefetch
+/// ([`record::GATHER_PREFETCH`]), which the op's barrier leaves in flight.
+pub const HANDED_AHEAD: &str = "handed column read ahead";
+
+/// The second op of a streamed product whose columns are handed between two units
+/// (`docs/plans/decode-to-bandwidth.md` Phase 8, "The stream's rate"): in the first op, a unit
+/// that would read a whole column computes its first `h` chunks and writes the FP32 partial to
+/// `partials`, while a unit with no job in the product reads the rest of its `B` ahead
+/// ([`HANDED_AHEAD`]); after the first op's barrier, that unit reloads the partial into the
+/// slot chunk `h` reloads from and computes the rest, writing the column. Each output tile's
+/// `K` chain is the same in the same order, through the same FP32 partial, so bit for bit; no
+/// unit reads a whole column inside the product.
+pub(crate) struct Handoff {
+    /// The second op's jobs, laid out as the first op's: a unit's at its own index.
+    pub jobs: Vec<Job>,
+    /// The handed columns' partials, `C`'s shape: freed once the second op is queued.
+    pub partials: DramTensor,
+    /// The L1 the jobs plan (the first op's stream layout), noted again for the second op.
+    pub planned: crate::l1::Planned,
+}
+
 /// [`matmul_dram_limited`], with `prefetch` (units at or past `units`, below `spread`) each
 /// taking one job of the product whose `B` its own list reads ahead ([`PREFETCH`],
 /// [`BlockPlan::push_prefetched_jobs`]) -- where the product is one row with a packed `A` and
-/// its `K` whole or streamed (a prefetching unit's one job is in the first half when pipelined). Returns the work, and `Some(spread)` when its jobs are dealt over
-/// `spread` units (job `j` to unit `j % spread`), else `None` (over `units`, `prefetch` unused).
+/// its `K` whole or streamed (a prefetching unit's one job is in the first half when pipelined). Returns the work, `Some(spread)` when its jobs are dealt over
+/// `spread` units (job `j` to unit `j % spread`), else `None` (over `units`, `prefetch` unused),
+/// and, where `reads.handoff` hands columns, the second op (dealt as the first).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_dram_prefetching(
     alloc: &mut DramAlloc,
@@ -1540,7 +1567,7 @@ pub(crate) fn matmul_dram_prefetching(
     prefetch: &[usize],
     spread: usize,
     busy: &[Option<u64>],
-) -> Result<(Work, Option<usize>)> {
+) -> Result<(Work, Option<usize>, Option<Handoff>)> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
     let (m, ka) = if a_transposed {
@@ -1647,6 +1674,18 @@ pub(crate) fn matmul_dram_prefetching(
             kc >= kt
         }
         && prefetch.iter().all(|&u| (units..spread).contains(&u));
+    // The handed columns' partials, if any column may be handed.
+    let partials = match reads.handoff {
+        Some(_) if prefetching && plan.stream_k => match DramTensor::alloc(alloc, m, n) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                alloc.free(&c.placement);
+                return Err(e);
+            }
+        },
+        _ => None,
+    };
+    let handoff = reads.handoff.zip(partials.as_ref().map(|p| p.tensor_ref()));
     let pushed = if prefetching {
         plan.push_prefetched_jobs(
             &mut jobs,
@@ -1654,15 +1693,44 @@ pub(crate) fn matmul_dram_prefetching(
             [a_transposed, b_transposed],
             prefetch,
             spread,
+            handoff,
         )
     } else {
         plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed])
+            .map(|()| Vec::new())
     };
-    if let Err(e) = pushed {
-        alloc.free(&c.placement);
-        return Err(e);
-    }
-    Ok((Work { out: c, jobs }, prefetching.then_some(spread)))
+    let handed = match pushed {
+        Ok(handed) => handed,
+        Err(e) => {
+            alloc.free(&c.placement);
+            if let Some(p) = &partials {
+                alloc.free(&p.placement);
+            }
+            return Err(e);
+        }
+    };
+    let handoff = match partials {
+        Some(partials) if !handed.is_empty() => {
+            // What the jobs planned, left noted for the first op.
+            let planned = crate::l1::take_planned();
+            crate::l1::note_planned(planned);
+            Some(Handoff {
+                jobs: handed,
+                partials,
+                planned,
+            })
+        }
+        Some(partials) => {
+            alloc.free(&partials.placement);
+            None
+        }
+        None => None,
+    };
+    Ok((
+        Work { out: c, jobs },
+        prefetching.then_some(spread),
+        handoff,
+    ))
 }
 
 /// How one `[m, k, n]` product is cut into jobs: what [`matmul_dram`] and
@@ -2021,6 +2089,13 @@ impl BlockPlan {
     /// idle since the last product; a streamed job's third chunk refills the first half only
     /// after the first chunk's kernel, as unprefetched), so each output column is its
     /// unprefetched self, bit for bit.
+    ///
+    /// With `handoff` (`(h, partials)`, streamed only), each column dealt to the plan's units is
+    /// handed while a unit of the deal is left with no job: the column's unit computes its first
+    /// `h` chunks (`0`: half) and writes the partial to `partials`, the spare unit reads the
+    /// packed `A` and the next two chunks' `B` ahead ([`HANDED_AHEAD`]) and, in the second op
+    /// returned (laid out as the first), reloads the partial and computes the rest ([`Handoff`]).
+    /// Empty: no column is handed.
     fn push_prefetched_jobs(
         &self,
         jobs: &mut Vec<Job>,
@@ -2028,13 +2103,16 @@ impl BlockPlan {
         transposed: [bool; 2],
         prefetch: &[usize],
         spread: usize,
-    ) -> Result<()> {
+        handoff: Option<(usize, TensorRef)>,
+    ) -> Result<Vec<Job>> {
         let [_, kt, nt] = self.tiles;
         let nc = if self.stream_k { 1 } else { self.block[1] };
         // The gathers each prefetched job reads ahead: a streamed column's first two chunks.
         let ahead = if self.stream_k { 2 } else { 1 };
         let moved = (prefetch.len() * nc).min(nt);
         let mut regular = Vec::new();
+        // The regular jobs' columns, in their order (a streamed job's one).
+        let mut regular_cols = Vec::new();
         if moved < nt {
             let rest = nt - moved;
             let runs = thin_runs([1, kt, rest], [kt, nc], Staging::Slots, self.units)
@@ -2053,6 +2131,12 @@ impl BlockPlan {
                 ..self.clone()
             };
             plan.push_jobs(&mut regular, refs, transposed)?;
+            regular_cols = plan
+                .col_runs
+                .iter()
+                .flatten()
+                .flat_map(|r| r.clone())
+                .collect();
         }
         let mut early = Vec::new();
         for j0 in (0..moved).step_by(nc) {
@@ -2088,6 +2172,124 @@ impl BlockPlan {
             early.push(job);
         }
         let units = self.units.max(1);
+        let mut handed = Vec::new();
+        let mut handed_ahead = Vec::new();
+        if let Some((at, rp)) = handoff.filter(|_| self.stream_k) {
+            let (kq, layout) = stream_chunks(kt, self.k_block, self.route, self.fidelity)?;
+            let chunks = kt.div_ceil(kq);
+            let h = match at {
+                0 => chunks / 2,
+                at => at.min(chunks - 1),
+            };
+            // The units of the deal with no job: neither the plan's nor a prefetching one.
+            let taken: Vec<usize> = (0..regular.len().min(units))
+                .chain(prefetch.iter().copied().take(early.len()))
+                .collect();
+            let mut spare = (0..spread).filter(|u| !taken.contains(u));
+            for (job, &j) in regular.iter_mut().zip(&regular_cols) {
+                if h == 0 {
+                    break;
+                }
+                let Some(y) = spare.next() else {
+                    break;
+                };
+                let plan = BlockPlan {
+                    units: 1,
+                    col_runs: Some(std::iter::once(j..j + 1).collect()),
+                    resident_a: false,
+                    busy: Vec::new(),
+                    ..self.clone()
+                };
+                let mut whole = Vec::new();
+                plan.push_jobs(&mut whole, refs, transposed)?;
+                let mut rest = whole.pop().expect("a job a column");
+                let first = rest.drain(..3 * h).collect::<Vec<_>>();
+                // The column's unit: its first `h` chunks, the last one's partial to `partials`.
+                job.truncate(3 * h);
+                let Some(Step::List { entries, .. }) = job.last_mut() else {
+                    unreachable!("a chunk ends with its scatter list");
+                };
+                *entries = vec![
+                    [
+                        record::SCATTER,
+                        (layout.out[(h - 1) % 2] + tt_isa::dm::TILE_DATA) as u32,
+                        TILE_SLOT as u32,
+                        0,
+                        1,
+                        j as u32,
+                        1,
+                        0,
+                    ],
+                    rp.encode()[0],
+                    rp.encode()[1],
+                ];
+                // The spare unit, first op: the packed `A` (chunk 0's reads before its gather)
+                // and the next two chunks' gathers as a prefetch.
+                let mut ahead: Vec<[u32; 8]> = match first.first() {
+                    Some(Step::List { entries, .. }) => entries
+                        .iter()
+                        .take_while(|e| e[0] != record::GATHER)
+                        .copied()
+                        .collect(),
+                    _ => unreachable!("a chunk starts with its gather list"),
+                };
+                let gathers = rest.iter_mut().filter_map(|step| match step {
+                    Step::List { entries, .. } => entries
+                        .iter()
+                        .position(|e| e[0] == record::GATHER)
+                        .map(|at| (entries, at)),
+                    _ => None,
+                });
+                for (entries, at) in gathers.take(2) {
+                    let mut gather = entries.split_off(at);
+                    gather[0][1] = gather[0][1] & !record::GATHER_STREAM | record::GATHER_PREFETCH;
+                    ahead.extend(gather);
+                }
+                // The second op: the partial into the slot chunk `h` reloads from, after the
+                // first op's barrier, and the prefetch drained before chunk `h`'s kernel.
+                let Some(Step::List { entries, .. }) = rest.first_mut() else {
+                    unreachable!("a chunk starts with its gather list");
+                };
+                let mut lead = vec![
+                    [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0],
+                    [
+                        record::READ_RUN,
+                        j as u32,
+                        1,
+                        layout.out[(h - 1) % 2] as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    rp.encode()[0],
+                    rp.encode()[1],
+                    [
+                        tt_isa::dm::op::WAIT,
+                        tt_isa::dm::WAIT_PREFETCH,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                ];
+                lead.append(entries);
+                *entries = lead;
+                if handed.is_empty() {
+                    handed = vec![Vec::new(); spread];
+                }
+                handed[y] = rest;
+                handed_ahead.push((
+                    y,
+                    vec![Step::List {
+                        what: HANDED_AHEAD,
+                        entries: ahead,
+                    }],
+                ));
+            }
+        }
         let rounds = regular.len().div_ceil(units).max(1);
         let mut laid: Vec<Job> = vec![Vec::new(); rounds * spread];
         for (k, job) in regular.into_iter().enumerate() {
@@ -2096,8 +2298,11 @@ impl BlockPlan {
         for (job, &u) in early.into_iter().zip(prefetch) {
             laid[u] = job;
         }
+        for (u, job) in handed_ahead {
+            laid[u] = job;
+        }
         jobs.extend(laid);
-        Ok(())
+        Ok(handed)
     }
 }
 
@@ -6349,6 +6554,7 @@ mod tests {
                 stream_k: false,
                 stream_prefetch: false,
                 prefetch_units: [usize::MAX; 2],
+                handoff: None,
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,
@@ -6433,6 +6639,7 @@ mod tests {
                         stream_k: false,
                         stream_prefetch: false,
                         prefetch_units: [usize::MAX; 2],
+                        handoff: None,
                     },
                 )
                 .unwrap();
@@ -6511,6 +6718,7 @@ mod tests {
                     stream_k: false,
                     stream_prefetch: false,
                     prefetch_units: [usize::MAX; 2],
+                    handoff: None,
                 },
                 &[],
                 units,
@@ -6598,6 +6806,7 @@ mod tests {
                     stream_k: true,
                     stream_prefetch: false,
                     prefetch_units: [usize::MAX; 2],
+                    handoff: None,
                 },
             )
             .unwrap();
@@ -6656,7 +6865,7 @@ mod tests {
                 let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
                 let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
                 let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
-                let (work, dealt) = super::matmul_dram_prefetching(
+                let (work, dealt, _) = super::matmul_dram_prefetching(
                     &mut alloc,
                     &a,
                     false,
@@ -6676,6 +6885,7 @@ mod tests {
                         stream_k: true,
                         stream_prefetch: on,
                         prefetch_units: [usize::MAX, 40],
+                        handoff: None,
                     },
                     &prefetch,
                     spread,
@@ -6729,6 +6939,172 @@ mod tests {
                     assert!(ahead.is_empty());
                 }
             }
+        }
+    }
+
+    /// A streamed, prefetched product's columns its own units would read whole are handed: the
+    /// column's unit computes chunks `0..h` and writes the partial to `partials`, a spare unit
+    /// reads the packed `A` and chunks `h, h + 1` ahead in the first op, and in the second reloads
+    /// that partial into the slot its first chunk reloads from, drains the prefetch, and computes
+    /// the rest, writing the column. Every `B` tile once; nothing handed when off or with no spare
+    /// unit.
+    #[test]
+    fn a_streamed_product_s_whole_columns_are_handed_between_two_units() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let tiles = |entries: &[[u32; 8]]| {
+            let mut counted = crate::profile_mode::OpBytes::default();
+            counted.count(entries);
+            counted.b / tt_isa::dm::TILE_SLOT
+        };
+        let gathers = |entries: &[[u32; 8]]| -> Vec<u32> {
+            entries
+                .iter()
+                .filter(|e| e[0] == record::GATHER)
+                .map(|e| e[1])
+                .collect()
+        };
+        // `down` (1.7B: 4 chunks, 24 columns on the plan's units, 40 spare), handed at half and
+        // at chunk 1; then 24 units with every other unit prefetching: no spare unit.
+        for (units, spread, at) in [
+            (64, 120, Some(0)),
+            (64, 120, Some(1)),
+            (64, 120, None),
+            (24, 64, Some(0)),
+        ] {
+            let (k, n) = (8192, 2048);
+            let prefetch: Vec<usize> = (units..spread).collect();
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+            let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+            let (work, dealt, handoff) = super::matmul_dram_prefetching(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                None,
+                super::Reads {
+                    thin: true,
+                    resident_a: true,
+                    unpack_b: false,
+                    packed_a: Some(p.tensor_ref()),
+                    stream_k: true,
+                    stream_prefetch: true,
+                    prefetch_units: [usize::MAX, 40],
+                    handoff: at,
+                },
+                &prefetch,
+                spread,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(dealt, Some(spread));
+            let kt = (k / 32) as u64;
+            let (c, nt) = (work.out.tensor_ref().encode(), n / 32);
+            let regular = nt - prefetch.len().min(40);
+            let Some(handoff) = handoff else {
+                assert!(
+                    at.is_none() || units == regular,
+                    "units {units}, spread {spread}: handed with no spare unit"
+                );
+                assert!(work.jobs.iter().all(|job| !job.iter().any(
+                    |s| matches!(s, Step::List { what, .. } if *what == super::HANDED_AHEAD)
+                )));
+                continue;
+            };
+            let at = at.unwrap();
+            let pr = handoff.partials.tensor_ref().encode();
+            let (chunks, h) = (4, if at == 0 { 2 } else { at });
+            assert_eq!(handoff.jobs.len(), spread);
+            let spare: Vec<usize> = (regular..regular * 2).collect();
+            let mut columns = vec![0u64; nt];
+            for (x, &y) in spare.iter().enumerate() {
+                // The column's unit: chunks `0..h`, the last one's partial out to `partials`.
+                let job = &work.jobs[x];
+                assert_eq!(job.len(), 3 * h, "unit {x}: its first {h} chunks");
+                let Some(Step::List { entries, .. }) = job.last() else {
+                    panic!("a chunk ends with its scatter list");
+                };
+                assert_eq!(entries[0][0], record::SCATTER);
+                assert_eq!(&entries[1..], &pr[..], "unit {x}: the partial, not C");
+                let (j, from) = (entries[0][5] as usize, entries[0][1] as u64);
+                let mut read = 0;
+                for step in job {
+                    if let Step::List { entries, .. } = step {
+                        read += tiles(entries);
+                        assert!(gathers(entries)
+                            .iter()
+                            .all(|f| f & record::GATHER_PREFETCH == 0));
+                    }
+                }
+                // The spare unit, first op: the packed `A`, then two chunks' prefetched gathers.
+                let [Step::List { what, entries }] = &work.jobs[y][..] else {
+                    panic!("unit {y}: one list in the first op");
+                };
+                assert_eq!(*what, super::HANDED_AHEAD);
+                let flags = gathers(entries);
+                assert_eq!(flags.len(), 2.min(chunks - h), "unit {y}");
+                assert!(flags
+                    .iter()
+                    .all(|f| f & record::GATHER_PREFETCH != 0 && f & record::GATHER_STREAM == 0));
+                assert_eq!(
+                    entries[0][0],
+                    record::READ_RUN,
+                    "unit {y}: the packed A first"
+                );
+                read += tiles(entries);
+                // The second op: the partial reloaded where X packed it, the prefetch drained,
+                // then chunks `h..`, the last writing C.
+                let rest = &handoff.jobs[y];
+                assert_eq!(rest.len(), 3 * (chunks - h), "unit {y}: chunks {h}..");
+                let Some(Step::List { entries: lead, .. }) = rest.first() else {
+                    panic!("a chunk starts with its gather list");
+                };
+                assert_eq!(lead[0][0], op::WAIT);
+                assert_eq!(lead[1][0], record::READ_RUN);
+                assert_eq!(lead[1][1] as usize, j, "unit {y}: its column's partial");
+                assert_eq!(
+                    lead[1][3] as u64 + TILE_DATA,
+                    from,
+                    "unit {y}: into the slot X packed into"
+                );
+                assert_eq!(&lead[2..4], &pr[..]);
+                assert_eq!(lead[4][..2], [op::WAIT, tt_isa::dm::WAIT_PREFETCH]);
+                for (q, step) in rest.chunks(3).enumerate() {
+                    let [Step::List { entries: g, .. }, Step::Kernel { half, .. }, Step::List { entries: sc, .. }] =
+                        step
+                    else {
+                        panic!("a chunk is a gather, a kernel and a scatter");
+                    };
+                    assert_eq!(*half, Some(((h + q) % 2) as u8), "unit {y} chunk {}", h + q);
+                    read += tiles(g);
+                    if q + 1 == chunks - h {
+                        assert_eq!(sc[0][5] as usize, j);
+                        assert_eq!(&sc[1..], &c[..], "unit {y}: the column to C");
+                    } else {
+                        assert!(sc.is_empty());
+                    }
+                }
+                assert_eq!(read, kt, "column {j}: its B once");
+                columns[j] += 1;
+            }
+            assert!(columns.iter().filter(|&&c| c > 0).all(|&c| c == 1));
+            assert_eq!(
+                columns.iter().sum::<u64>(),
+                regular as u64,
+                "every regular column handed"
+            );
+            // Nothing else in the second op.
+            assert_eq!(
+                handoff.jobs.iter().filter(|j| !j.is_empty()).count(),
+                regular
+            );
         }
     }
 

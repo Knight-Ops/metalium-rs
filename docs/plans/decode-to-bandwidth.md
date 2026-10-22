@@ -821,8 +821,42 @@ the host ~0.8).
     span. More idle units cannot help while any unit reads a whole column (56 measured slower), nor a higher stream cap
     (3, 4 slower). **Next:** a column's `K` chain handed between two units in order (the second reads its half of `B`
     ahead while the first computes, then reloads the first's FP32 partial: the same chain, bit for bit), so no unit
-    reads a whole column in the span; and the window before `o` (~50 us a layer of GDDR idle: `o`'s 17 MB lands in
-    ~35 us of a 64 us window, and `gate|up`'s prefetch starts only at `o`'s barrier).
+    reads a whole column in the span (built and measured slower, below); and the window before `o` (~50 us a layer of
+    GDDR idle: `o`'s 17 MB lands in ~35 us of a 64 us window, and `gate|up`'s prefetch starts only at `o`'s barrier).
+- [x] **A column's `K` chain handed between two units: built, bit for bit, slower; opt-in** (2026-10-22;
+  `Session::set_stream_handoff`, off; `TT_STREAM_HANDOFF=1`, `TT_STREAM_HANDOFF_AT=<h>`). With a streamed product
+  prefetched, each column its own units would read whole is handed while a unit of the deal has no job: the column's
+  unit computes chunks `0..h` (default half) and writes the FP32 partial to a scratch tensor; the spare unit reads the
+  packed `A` and the next two chunks' `B` in the same op as a prefetch (`GATHER_PREFETCH`, which the op's barrier
+  leaves in flight; `tensor::HANDED_AHEAD`); after the barrier, a second op on the spare units alone reloads the
+  partial into the slot chunk `h` reloads from, drains the prefetch and computes the rest (`tensor::Handoff`). The
+  same chain in the same order. No firmware change (decided with the user: two ops first, an in-op signal only if the
+  profile says).
+  - **Gates:** unit `a_streamed_product_s_whole_columns_are_handed_between_two_units` (the column's unit stops at `h`
+    and writes the partial, not `C`; the spare unit's first-op list is the packed `A` and two prefetched gathers; the
+    second op reloads into the slot the partial was packed from, then `WAIT_PREFETCH`; every `B` tile once; nothing
+    handed with no spare unit; watched failing with the other half's slot); `step205`
+    `handed_columns_replay_as_the_ops_run_fresh` (ttsim and card 0: units 6-7 spare, handed at chunk 1 and at half,
+    bit for bit against the ops run fresh; the second op plans its product's L1; **watched failing** with the partial
+    reloaded into the other half's slot and with its reload dropped, element 0 782.9 against 656.6, and without the
+    second op's L1 noted). Card 0 with it on, 36 of 36 (`1792685194`: `step185`, `step187`, `step188` bit for bit,
+    `step191`, `step205`, `step216`, `step219`); `--smoke` 1,185 of 1,185 (`1792687707`, off). Found by the bench, not a gate at first: the second op did not note its
+    L1 layout, which a capture with a persistent region refuses (now asserted in `step205`).
+  - **Measured** (card 0, every tile, `traced_generation_stream_ceiling`, 32 / 256-token prompts): off **16.88 /
+    18.32 ms** (`1792685519`); handed at half 17.07 / 18.51 (`1792686180`); at chunk 1 17.22 / 18.61 (`1792686332`);
+    at chunk 3 16.88 / 18.33 (`1792686483`); at half with the spare units taken from the top (104-119 first) 17.33 /
+    18.74 (`1792687395`, not kept).
+  - **The profile** (`Step(64)`, handed at half, `1792686773`, against `1792678073`): `down`'s first op 179 -> 155 us
+    and its second 17 us (the spare units' tail and its barrier), so `down` 179 -> 172; but the columns' units 0-23
+    took 93-137 us each for half a column, not ~88, because the spare units' reads of the other halves run beside
+    them: inside `down`'s span the step is bound by GDDR's aggregate rate, not by one unit's. And `qkv` 51 -> 72 us a
+    layer (its prefetch wait 8 -> 35): the spare units 24-47 are `qkv`'s, and their read ahead of `qkv` starts only
+    after the second op.
+  - **The firmware follow-up is not built:** an in-op signal (NC writes the partial into the spare unit's reload slot
+    and increments a flag there; B waits on its own flag) would remove only the second op's ~17 us a layer, not the
+    contention or `qkv`'s later start. Revisit if `down`'s span ever runs below the aggregate stream.
+- [ ] **The GDDR idle before `o`** (~50 us a layer, profile `1792678073`): `o`'s 17 MB lands in ~35 us of a 64 us
+  window, and `gate|up`'s prefetch starts only at `o`'s barrier. The next lever of "The stream's rate".
 - [ ] **With the next record or mover change:** `record::PrefetchCursor::new` does not refuse `GATHER_STREAM |
   GATHER_PREFETCH`, though its doc says it refuses what the expansion refuses (`expand_for` does, with `RANGE`); only
   the host's check stops the pair today (found 2026-10-22). Refuse it in the cursor, cover it in the cursor-against-

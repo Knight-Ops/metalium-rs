@@ -446,9 +446,14 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         (same day): `down` prefetched, each of 40 idle units reading a column's first two chunks ahead, which also
         ends `qkv`'s wait for its prefetch (90 -> 51 us a layer): a 1.7B step **16.87 / 18.30 ms** (`1792679220`; off
         17.29 / 18.72, `1792679522`), its weights at 426 GB/s; the unit counts re-swept and kept (40 / 64 / 40); the
-        135M, ResNet-18 and ViT-Tiny unchanged. Next (decode-to-bandwidth Phase 8, "The stream's rate"): `down`'s 24
-        busy units each read a whole column at one unit's rate (~176 us a layer), so a column's `K` chain handed
-        between two units; then the GDDR idle before `o` (~50 us a layer).
+        135M, ResNet-18 and ViT-Tiny unchanged. **Then** (same day): a column's `K` chain handed between two units
+        (`down`'s 24 busy units each read a whole column at one unit's rate), as a second op, no firmware change: bit
+        for bit (`step205`, card 0 `1792685194` with `step188`), but **slower**, 16.88 / 18.32 -> 17.07 / 18.51 ms
+        (`1792685519`, `1792686180`), so opt-in (`TT_STREAM_HANDOFF=1`). Inside `down`'s span the step is bound by
+        GDDR's aggregate rate (the halves took up to 137 us beside the spare units' reads, not ~88), and the spare
+        units start `qkv`'s read ahead later (`qkv` 51 -> 72 us; profile `1792686773`). The in-op firmware signal would
+        save only the second op's ~17 us a layer: not built. Next (decode-to-bandwidth Phase 8, "The stream's rate"):
+        the GDDR idle before `o` (~50 us a layer).
         With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is

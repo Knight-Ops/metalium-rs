@@ -166,8 +166,6 @@ pub fn probe_background_stream(background: Option<ProbeBackground>) {
     *PROBE_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = background;
 }
 
-/// `TT_RESIDENCY_ROWS`: `gddr`, `mcast` or `held:<h>` ([`crate::residency::Rows`]); anything else,
-/// or nothing, the default `held:2` ([`crate::residency::HOLDERS`]).
 /// A unit count from the development knob `name` (a positive integer), else `default`.
 fn units_from_env(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -177,6 +175,8 @@ fn units_from_env(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// `TT_RESIDENCY_ROWS`: `gddr`, `mcast` or `held:<h>` ([`crate::residency::Rows`]); anything else,
+/// or nothing, the default `held:2` ([`crate::residency::HOLDERS`]).
 fn residency_rows_from_env() -> crate::residency::Rows {
     use crate::residency::{Rows, HOLDERS};
     match std::env::var("TT_RESIDENCY_ROWS").as_deref() {
@@ -640,6 +640,8 @@ pub struct Session<T: Transport> {
     stream_prefetch: bool,
     /// [`Session::set_stream_prefetch_units`].
     stream_prefetch_units: usize,
+    /// [`Session::set_stream_handoff`]: the chunk a handed column is handed at (`Some(0)`: half).
+    stream_handoff: Option<usize>,
     /// While a prefetching product is queued in a capture: the barrier its `PREFETCH` lists wait
     /// for (`enqueue_work_inner`).
     prefetch_anchor: Option<u32>,
@@ -2290,6 +2292,10 @@ impl<T: Transport> Session<T> {
             stream_prefetch: std::env::var("TT_STREAM_PREFETCH").map_or(true, |v| v != "0"),
             // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             stream_prefetch_units: units_from_env("TT_STREAM_PREFETCH_UNITS", PREFETCH_UNITS),
+            // `TT_STREAM_HANDOFF=1` turns it on; `TT_STREAM_HANDOFF_AT=<h>` hands at chunk `h`
+            // (development knobs for `docs/plans/decode-to-bandwidth.md` Phase 8).
+            stream_handoff: (std::env::var("TT_STREAM_HANDOFF").is_ok_and(|v| v == "1"))
+                .then(|| units_from_env("TT_STREAM_HANDOFF_AT", 0)),
             prefetch_anchor: None,
             // The product's own units read their first job's `B` ahead too; `TT_BUSY_PREFETCH=0`
             // turns it off. On by default since NC stopped draining B's prefetch ID at a list's end
@@ -7046,6 +7052,9 @@ impl<T: Transport> Session<T> {
         let stream_k = self.streamed_k;
         let stream_prefetch = self.stream_prefetch;
         let prefetch_units = [self.prefetch_units, self.stream_prefetch_units];
+        let handoff = self
+            .stream_handoff
+            .filter(|_| !tensor::probing_skip_weights());
         // In a capture, the units past the product's own that ran nothing since the last
         // weight-streaming product: each can read a job's `B` while the ops between run.
         let spread = self.units.len();
@@ -7119,20 +7128,44 @@ impl<T: Transport> Session<T> {
                         stream_k,
                         stream_prefetch,
                         prefetch_units,
+                        handoff,
                     },
                     &prefetch,
                     spread,
                     &busy,
                 )
             })
-            .and_then(|(work, dealt)| {
+            .and_then(|(work, dealt, handoff)| {
                 self.prefetch_anchor = dealt.and(anchor);
                 self.busy_anchor = busy_anchor;
                 let r = self.execute_on(work, dealt.unwrap_or(units), budget);
                 self.prefetch_anchor = None;
                 self.busy_anchor = None;
                 self.busy_moves.clear();
-                r
+                let Some(tensor::Handoff {
+                    jobs,
+                    partials,
+                    planned,
+                }) = handoff
+                else {
+                    return r;
+                };
+                // The handed columns' rest, after the product's barrier, in the same layout.
+                let rest = match &r {
+                    Ok(_) => {
+                        crate::l1::note_planned(planned);
+                        self.submit_jobs_on(jobs, dealt.unwrap_or(units), budget)
+                    }
+                    Err(_) => Ok(()),
+                };
+                let freed = self.free(partials);
+                match (r, rest.and(freed)) {
+                    (Ok(out), Err(e)) => {
+                        let _ = self.free(out);
+                        Err(e)
+                    }
+                    (r, _) => r,
+                }
             });
         // This product is the next one's anchor: a unit idle after it can prefetch for that one.
         if out.is_ok() && packed_a.is_some() {
@@ -7800,6 +7833,20 @@ impl<T: Transport> Session<T> {
     /// `TT_STREAM_PREFETCH_UNITS=<n>` at open.
     pub fn set_stream_prefetch_units(&mut self, units: usize) {
         self.stream_prefetch_units = units;
+    }
+
+    /// Whether a streamed product prefetched ([`Session::set_stream_prefetch`]) hands each column
+    /// its own units would read whole between two units, and at which chunk (`Some(0)`: half the
+    /// chunks; off by default, `TT_STREAM_HANDOFF=1` and `TT_STREAM_HANDOFF_AT=<h>` at open). The
+    /// column's unit computes its first chunks and writes the FP32 partial; a unit with no job in
+    /// the product reads the rest of the column's `B` meanwhile, and after the product's barrier
+    /// reloads the partial and computes the rest, as a second op (`tensor::Handoff`). The same
+    /// chain in the same order, so bit for bit; no unit reads a whole column inside the product.
+    /// Off because it measured slower on a SmolLM2-1.7B step (17.07 / 18.51 ms against 16.88 / 18.32):
+    /// the halves contend at GDDR, and the spare units start the next product's read ahead later
+    /// (`docs/learnings/performance-log.md`, "A column's `K` chain handed between two units").
+    pub fn set_stream_handoff(&mut self, at: Option<usize>) {
+        self.stream_handoff = at;
     }
 
     /// Whether, in a capture, the units a one-row product with a packed `A` runs on read their
