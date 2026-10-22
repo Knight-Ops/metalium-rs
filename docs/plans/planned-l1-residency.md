@@ -661,7 +661,9 @@ reads the product's output from GDDR").
     `step167` F32, `step185`, `step187`, 15 of 15 (`1792613099`), besides 3b's.
   - [x] **Busy prefetch on by default, at a prefetch cap of 2** (2026-10-21): `Session`'s `busy_prefetch` is on
     (`TT_BUSY_PREFETCH=0` turns it off) and a mover's prefetch ID starts at `dm::PREFETCH_CAP_DEFAULT` = 2
-    (`TT_PREFETCH_CAP` overrides; 0 is `TILE_IN_FLIGHT_CAP`). The cap is the idle units' prefetch's too; with busy
+    (`TT_PREFETCH_CAP` overrides; 0 is `TILE_IN_FLIGHT_CAP`). **Correction (2026-10-22):** the cap is not the idle
+    units' prefetch's: their `PREFETCH` lists carry no `GATHER_PREFETCH` (`tensor::push_prefetched_jobs`), so they read
+    on the mover's own ID at its own cap; only a `BUSY_PREFETCH` list is flagged. With busy
     prefetch off, cap 2 and the old default of 8 measured alike (19.51 / 20.75, 19.50 / 20.71). `step215` now sets the
     prefetch ID's full cap itself: its claim is that the ID is not the mover's own, measured at that cap. With no
     settings: the 1.7B **18.39 / 19.90 ms** (`1792615740`), 19.51 / 20.76 with `TT_BUSY_PREFETCH=0` (`1792615881`);

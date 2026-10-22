@@ -507,17 +507,21 @@ fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<
     Ok(())
 }
 
+/// The prefetch ID's cap the host set (`dm::PREFETCH_CAP`, 0 for `dm::TILE_IN_FLIGHT_CAP`).
+fn prefetch_cap() -> u32 {
+    match rd(M.at(dm::PREFETCH_CAP)) {
+        0 => dm::TILE_IN_FLIGHT_CAP,
+        cap => cap,
+    }
+}
+
 /// What the host may change between lists: the in-flight cap, on B the read
 /// path (`dm::READ_FAST`) and, on NC, the NIU the writes go out on.
 fn list_settings() {
     noc::set_cap(TXN, rd(M.at(dm::IN_FLIGHT_CAP)));
     if !IS_NC {
         // Nothing is in flight on it: the last list's end drained it.
-        let cap = rd(M.at(dm::PREFETCH_CAP));
-        noc::set_cap(
-            PREFETCH_TXN,
-            if cap == 0 { dm::TILE_IN_FLIGHT_CAP } else { cap },
-        );
+        noc::set_cap(PREFETCH_TXN, prefetch_cap());
         noc::set_read_path(rd(M.at(dm::READ_FAST)) != 0);
         return;
     }
@@ -1140,8 +1144,18 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         Entry::Wait { prefetch } => {
             noc::wait(TXN);
             if prefetch {
-                pump_finish()?;
+                use tt_isa::mailbox::trace as ev;
+                let stamped = stamps_waits();
+                trace(stamped, ev::ENTRY_BEGIN, dm::trace_mode::PREFETCH_WAIT);
+                // The job's kernel waits for these reads now, and no small op is left to make room
+                // for: what is left goes out at B's own read cap where that is higher, then at the
+                // prefetch's cap again.
+                noc::set_cap_in_flight(PREFETCH_TXN, noc::cap(TXN).max(prefetch_cap()));
+                let pumped = pump_finish();
                 noc::wait(PREFETCH_TXN);
+                noc::set_cap(PREFETCH_TXN, prefetch_cap());
+                pumped?;
+                trace(stamped, ev::ENTRY_END, dm::trace_mode::PREFETCH_WAIT);
             }
             publish();
         }
@@ -1421,8 +1435,8 @@ static mut IN_CALL: bool = false;
 /// Whether stamps now fall inside the scope's window (`dm::TRACE_WINDOW`): every stamp the mover
 /// makes inside a scope (entries, a launch's `KICK`, a wait's `ROLES_DONE`, `THROTTLE`) obeys it, or a
 /// long replay's launches alone would outrun the buffer.
-/// Whether B stamps a trace's fetches and its waits for its writer
-/// (`dm::trace_mode::FETCH`, `dm::trace_mode::WRITER_WAIT`): in `OPS` mode only, within the
+/// Whether B stamps a trace's fetches, its waits for its writer and its prefetch waits
+/// (`dm::trace_mode::FETCH`, `WRITER_WAIT`, `PREFETCH_WAIT`): in `OPS` mode only, within the
 /// window. `FULL` stamps the `PAIR` entry a wait would sit inside, and its readers take no
 /// entry inside another. NC never does: its stamps would interleave with B's in the tile's one
 /// stream.
@@ -1713,8 +1727,24 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
             }
             set_read_txn(PREFETCH_TXN);
         }
+        // A weight stream's reads at the stream cap, B's own cap again after (requests may be in
+        // flight either way: the room is counted again).
+        let stream = rec[0][0] == record::GATHER && rec[0][1] & record::GATHER_STREAM != 0;
+        let own = noc::cap(TXN);
+        if stream {
+            noc::set_cap_in_flight(
+                TXN,
+                match rd(M.at(dm::STREAM_CAP)) {
+                    0 => dm::TILE_IN_FLIGHT_CAP,
+                    cap => cap,
+                },
+            );
+        }
         let result =
             record::expand_reads(&rec[..n], |at| rd(at.into()), |e| record_entry(me, usable, e));
+        if stream {
+            noc::set_cap_in_flight(TXN, own);
+        }
         if prefetch {
             set_read_txn(TXN);
         }

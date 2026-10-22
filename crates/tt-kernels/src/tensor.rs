@@ -1812,6 +1812,11 @@ impl BlockPlan {
                     } else {
                         0
                     }
+                    | if self.packed_a.is_some() {
+                        record::GATHER_STREAM
+                    } else {
+                        0
+                    }
                     | if unpack_b {
                         record::GATHER_B_UNPACK_TRANSPOSE
                     } else {
@@ -1904,7 +1909,7 @@ impl BlockPlan {
                 let (mut gather, mut job) = (gather, Vec::new());
                 if ahead && gather.len() >= 5 && gather[gather.len() - 5][0] == record::GATHER {
                     let mut early = gather.split_off(gather.len() - 5);
-                    early[0][1] |= record::GATHER_PREFETCH;
+                    early[0][1] = early[0][1] & !record::GATHER_STREAM | record::GATHER_PREFETCH;
                     gather.push([
                         tt_isa::dm::op::WAIT,
                         tt_isa::dm::WAIT_PREFETCH,
@@ -2162,6 +2167,7 @@ impl BlockPlan {
                     | u32::from(b_transposed) << 1
                     | (count as u32) << 8
                     | record::GATHER_A_RESIDENT
+                    | record::GATHER_STREAM
                     | if unpack_b {
                         record::GATHER_B_UNPACK_TRANSPOSE
                     } else {
@@ -2315,6 +2321,11 @@ impl BlockPlan {
                         | (count as u32) << 8
                         | if probing_skip_a() || self.packed_a.is_some() {
                             record::GATHER_A_RESIDENT
+                        } else {
+                            0
+                        }
+                        | if self.packed_a.is_some() {
+                            record::GATHER_STREAM
                         } else {
                             0
                         }

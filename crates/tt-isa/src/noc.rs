@@ -395,6 +395,14 @@ pub mod niu {
             self.room = self.cap;
         }
 
+        /// Use `cap` from now on, as [`InFlight::set_cap`], with requests possibly in flight:
+        /// the room is left empty, so the next issue reads the counter and finds what the new cap
+        /// leaves (waiting, if lowered below what is in flight).
+        pub fn set_cap_in_flight(&mut self, cap: u32) {
+            self.set_cap(cap);
+            self.room = 0;
+        }
+
         pub const fn cap(&self) -> u16 {
             self.cap
         }
@@ -1184,6 +1192,25 @@ pub mod niu {
             assert!(f.at_cap());
             // One completed: room for one.
             assert!(f.try_room(|| 1));
+            assert_eq!(f.room(), 1);
+        }
+
+        #[test]
+        fn a_cap_changed_in_flight_counts_what_is_in_flight() {
+            let mut f = InFlight::new();
+            f.set_cap(2);
+            f.after_issue();
+            f.after_issue();
+            // Raised with two in flight: the next issue reads the counter, and the new cap leaves
+            // six of eight -- not a refilled eight on top of the two.
+            f.set_cap_in_flight(8);
+            assert!(f.at_cap());
+            assert_eq!(f.before_issue(|| 2), 0);
+            assert_eq!(f.room(), 6);
+            // Lowered below what is in flight: the next issue waits until it is under the cap.
+            f.set_cap_in_flight(2);
+            let mut seen = [3u8, 2, 1].into_iter();
+            assert_eq!(f.before_issue(|| seen.next().unwrap()), 2);
             assert_eq!(f.room(), 1);
         }
 

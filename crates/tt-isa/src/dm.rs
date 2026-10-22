@@ -99,6 +99,11 @@ pub mod trace_mode {
     /// NC to finish a pair's writer section (its fetch and its writes). A `PAIR_CALL` entry itself
     /// is never stamped, so the stamp is never a real entry's.
     pub const WRITER_WAIT: u32 = super::op::PAIR_CALL;
+    /// What B stamps, in `OPS` mode, as an entry headed by this op around a prefetch `WAIT`
+    /// ([`super::WAIT_PREFETCH`]): issuing the queued prefetch's last reads and waiting for them to
+    /// land. `OPS` stamps no `WAIT` as itself, so there the stamp is the prefetch's; `FULL` stamps
+    /// every `WAIT`, and the host counts those as data.
+    pub const PREFETCH_WAIT: u32 = super::op::WAIT;
 
     /// Is an entry headed by `op` stamped in `OPS` mode?
     pub const fn ops_stamped(op: u32) -> bool {
@@ -268,6 +273,16 @@ pub const PREFETCH_CAP: u64 = MAILBOX_BASE + 0xF8;
 /// `TT_PREFETCH_CAP`): two reads in flight, where busy-unit prefetch measured best on a 1.7B decode
 /// step (18.40 ms against 18.73 at 4 and 19.08 at 8, `docs/plans/planned-l1-residency.md` 3b).
 pub const PREFETCH_CAP_DEFAULT: u32 = 2;
+/// Host -> RISCV B: the in-flight cap of a weight stream's reads (`record::GATHER_STREAM`),
+/// read as each such record starts; 0 is [`TILE_IN_FLIGHT_CAP`].
+pub const STREAM_CAP: u64 = MAILBOX_BASE + 0xFC;
+const _: () = assert!(PREFETCH_CAP + 4 <= STREAM_CAP);
+const _: () = assert!(STREAM_CAP + 4 <= MAILBOX_BASE + 0x100);
+/// The [`STREAM_CAP`] a host sets unless told otherwise (`tt_kernels::dm::DataMover::start`,
+/// `TT_STREAM_CAP`): two reads in flight. With every B read at 2, a 1.7B decode step measured
+/// 17.27 / 18.91 ms against 18.28 / 19.84 at the tile cap of 8 (4: 17.80 / 19.32, 1: 18.13 /
+/// 19.99), its products' units served evenly (`docs/plans/decode-to-bandwidth.md` Phase 8).
+pub const STREAM_CAP_DEFAULT: u32 = 2;
 const _: () = assert!(TRACE_WINDOW + 4 <= PREFETCH_CAP);
 const _: () = assert!(PREFETCH_CAP + 4 <= MAILBOX_BASE + 0x100);
 

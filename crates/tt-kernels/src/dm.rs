@@ -301,7 +301,17 @@ impl<N: NocId> DataMover<N> {
         ] {
             d.write32(w, tile, word, 0)?;
         }
-        d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), dm::TILE_IN_FLIGHT_CAP)?;
+        // B's own reads' cap: `TILE_IN_FLIGHT_CAP`, or `TT_IN_FLIGHT_CAP` (a development knob,
+        // decode-to-bandwidth.md Phase 8, "The stream's rate": whether a lower cap evens the NoC's
+        // service between units). NC's writes keep the tile cap.
+        let cap = match mover.core {
+            tt_isa::tensix::Core::B => std::env::var("TT_IN_FLIGHT_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(dm::TILE_IN_FLIGHT_CAP),
+            _ => dm::TILE_IN_FLIGHT_CAP,
+        };
+        d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), cap)?;
         if mover.core == tt_isa::tensix::Core::B {
             // The prefetch reads' cap: `PREFETCH_CAP_DEFAULT`, or `TT_PREFETCH_CAP` (a development
             // knob, decode-to-bandwidth.md Phase 8; 0 is `TILE_IN_FLIGHT_CAP`).
@@ -310,6 +320,13 @@ impl<N: NocId> DataMover<N> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(dm::PREFETCH_CAP_DEFAULT);
             d.write32(w, tile, mover.at(dm::PREFETCH_CAP), cap)?;
+            // A weight stream's reads' cap: `STREAM_CAP_DEFAULT`, or `TT_STREAM_CAP` (a development
+            // knob, decode-to-bandwidth.md Phase 8; 0 is `TILE_IN_FLIGHT_CAP`).
+            let cap = std::env::var("TT_STREAM_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(dm::STREAM_CAP_DEFAULT);
+            d.write32(w, tile, mover.at(dm::STREAM_CAP), cap)?;
             // The semantic guard of an `encoded-guard` image (`encoded::guard`): which
             // `TARG_ADDR_HI` words are a usable DRAM endpoint. Other images ignore it.
             let bits: Vec<u8> = encoded::endpoint_bitmap(dram.usable_mask() as u32)

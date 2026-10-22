@@ -23,8 +23,8 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// `kk`, goes to `a_at + (i * kt + kk) * TILE_SLOT`; `K` tile `kk` of its
 /// column `j` of `B` to `b_at + (kk * cols + j) * TILE_SLOT`. `flags`: bit 0
 /// `A` is read transposed, bit 1 `B`, bits 8..=24 `kt` ([`gather_kt`]), bit 25
-/// [`GATHER_A_RESIDENT`], bit 26 [`GATHER_B_UNPACK_TRANSPOSE`], bit 27 [`GATHER_PREFETCH`];
-/// bits 28-31 zero. Bit 2 selects packed
+/// [`GATHER_A_RESIDENT`], bit 26 [`GATHER_B_UNPACK_TRANSPOSE`], bit 27 [`GATHER_PREFETCH`],
+/// bit 28 [`GATHER_STREAM`]; bits 29-31 zero. Bit 2 selects packed
 /// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
 /// logical rows/columns and words 6/7 their tile row/column origins.
 /// GDDR slots are 2112 bytes; L1 slots remain 4160.
@@ -55,9 +55,15 @@ pub const GATHER_B_UNPACK_TRANSPOSE: u32 = 1 << 26;
 /// [`super::WAIT_PREFETCH`] waits for them, and they stay in flight under the ops queued after
 /// them on the unit. The reads are the record's as without it.
 pub const GATHER_PREFETCH: u32 = 1 << 27;
+/// [`GATHER`]'s flag for a weight stream: one of the many units of a product that streams its
+/// weights reads its share. RISCV B issues the record's reads at [`super::STREAM_CAP`] in flight,
+/// not its own cap: a low cap evens out the NoC's service between the units reading together
+/// (`docs/plans/decode-to-bandwidth.md` Phase 8, "The stream's rate"). The reads are the
+/// record's as without it. Not with [`GATHER_PREFETCH`], whose reads have a cap of their own.
+pub const GATHER_STREAM: u32 = 1 << 28;
 /// [`GATHER`]'s flag bits that are not `kt`.
 const GATHER_FLAG_BITS: u32 =
-    GATHER_A_RESIDENT | GATHER_B_UNPACK_TRANSPOSE | GATHER_PREFETCH | 0xff;
+    GATHER_A_RESIDENT | GATHER_B_UNPACK_TRANSPOSE | GATHER_PREFETCH | GATHER_STREAM | 0xff;
 
 /// A prefetch [`GATHER`]'s reads one at a time: a record with [`GATHER_PREFETCH`] and
 /// [`GATHER_A_RESIDENT`] reads only `B`, tile by tile, and a mover can issue them while it would
@@ -554,7 +560,10 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             // never a transposing move (through the scratch, after draining the mover's own ID)
             // or packed BF16's fills.
             if flags & GATHER_PREFETCH != 0
-                && (flags & GATHER_BF16 != 0 || (a_t && !resident) || (b_t && !b_unpacked))
+                && (flags & GATHER_BF16 != 0
+                    || (a_t && !resident)
+                    || (b_t && !b_unpacked)
+                    || flags & GATHER_STREAM != 0)
             {
                 return Err(super::error::RANGE);
             }
@@ -1567,7 +1576,20 @@ mod tests {
                 "{flags:#x}"
             );
         }
-        for bad in [1 << 28, 1 << 31] {
+        // A weight stream reads what the record reads; it is no prefetch.
+        for flags in [0, GATHER_A_RESIDENT, 2 | GATHER_B_UNPACK_TRANSPOSE] {
+            assert_eq!(
+                gather(flags | GATHER_STREAM, a0, b0),
+                gather(flags, a0, b0),
+                "{flags:#x}"
+            );
+            assert_eq!(
+                gather(flags | GATHER_STREAM | GATHER_PREFETCH, a0, b0),
+                Err(super::super::error::RANGE),
+                "{flags:#x}"
+            );
+        }
+        for bad in [1 << 29, 1 << 31] {
             assert_eq!(
                 gather(bad, a0, b0),
                 Err(super::super::error::LENGTH),

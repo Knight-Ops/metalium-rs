@@ -1220,6 +1220,27 @@ programs.
   `1792596738` off, `1792597186` on). So a small op on a unit that is reading a product's weights ahead waits on that
   unit's own side, not at the controllers. **Cause (probed 2026-10-21):** the next entry.
 
+## Units reading GDDR together are served unevenly; two in flight evens them (2026-10-22, cards 0 and 1)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, "The stream's rate"; profiles `1792629809`,
+`1792632189` (`skew.tsv`: each unit's own time at each op).
+- **What:** in a 1.7B decode step's `down` product, 64 units each read one 1.06 MB weight column (256 tiles, all on
+  one channel, column `j` on channel `j % 8`), the same bytes a unit. Units 0-15 take 150 us, 16-31 154, 32-47 126,
+  48-63 113, the same to 0.1 us in two runs; unit 20 is the slowest in all 24 layers. Grouped by channel (unit modulo
+  8) the times are flat (132-139 us). `gate|up`, `o` and `qkv` show the same order.
+- **Where:** units are numbered row-major from the grid's top (`tt_isa::noc::grid::Tensix::tiles`), so the slow units
+  are the top rows. This is the unfair service of the [aggregate-read
+  measurement](performance-log.md#what-holds-card-reads-at-430-gbs-unfair-service-not-distance), now tied to position.
+- **What it costs:** a product dealt evenly waits for its slowest units: `down` ~38 us a layer over its median unit,
+  `gate|up` ~60-80 us.
+- **Card 1 is the same** to ~0.1 us (`1792632927`). **But it is not the rows:** with the tiles opened in reverse order,
+  so that the product's 64 units are the bottom rows, the order reverses too (`down`'s units 0-15 106.5 us, 48-63 155.0,
+  `1792633435`). A unit's service depends on where it sits among the units reading together.
+- **What evens it: fewer reads in flight a unit.** At 2 in flight `down`'s units take 145-151 us by group, where at 8
+  they took 113-154, and the product is ~20 us faster a layer; at 1 every unit is too slow. Latency-bound reads (few
+  tiles a unit, few units) lose ~3% at 2, so only a weight stream's reads use it (`record::GATHER_STREAM`,
+  `dm::STREAM_CAP`, default 2; [log](performance-log.md#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0)).
+
 ## A transaction ID's outstanding count is the tile's, not the core's (2026-10-21, card 0)
 
 `noc::wait(id)` spins on the NIU's `reqs_outstanding(id)` counter, and the NIU is the tile's: B and NC issuing under the

@@ -598,6 +598,18 @@ pub mod noc {
         unsafe { read_volatile(reg(niu, niu::reqs_outstanding(txn))) as u8 }
     }
 
+    /// Use in-flight cap `cap` for `txn` on both NIUs from now on, with requests possibly in
+    /// flight ([`InFlight::set_cap_in_flight`]).
+    pub fn set_cap_in_flight(txn: TxnId, cap: u32) {
+        in_flight(Niu::Noc0, txn).set_cap_in_flight(cap);
+        in_flight(Niu::Noc1, txn).set_cap_in_flight(cap);
+    }
+
+    /// `txn`'s in-flight cap on NoC #0.
+    pub fn cap(txn: TxnId) -> u32 {
+        in_flight(Niu::Noc0, txn).cap() as u32
+    }
+
     /// Whether `txn` has room under its cap on NoC #0 for one more request now: what a caller
     /// that would rather do something else than wait asks before [`issue_dram_on`].
     #[inline(always)]

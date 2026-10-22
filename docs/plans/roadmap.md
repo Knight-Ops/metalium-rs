@@ -436,8 +436,15 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         replay's next reader section ahead on a transaction ID of its own (`dm::TXN_FETCH`). The small ops 5.00 ->
         4.47 ms a step, fetch 0.83 -> 0.23, **but the step is unchanged** (18.44 / 19.83 ms, `1792619858`; 19.27 / 20.48
         with busy prefetch off, was 19.51 / 20.76): the products took what the small ops gave up (12.92 -> 13.46 ms,
-        profile `1792620146`). **Next: the rate the weights stream at under the small ops** (the products reach ~391
-        GB/s against 460-486), not the small ops; the stored layer (5b) is deferred on that finding.
+        profile `1792620146`). **Next: the rate the weights stream at under the small ops**, not the small ops; the stored
+        layer (5b) is deferred on that finding. **Metered** (2026-10-22, profile `1792629809`): the step's weights stream at
+        389 GB/s with 2.97 GB of 6.98 read ahead; unit 0 waits 28 / 67 us a layer for its own prefetch in `qkv` /
+        `gate|up` (drained at the prefetch cap of 2), and the low-numbered units read ~1.35x slower than the high ones,
+        so the products wait for them. **Then** (same day): the prefetch `WAIT` drained at B's read cap (18.28 / 19.84 ms),
+        and a weight stream's reads at 2 in flight (`record::GATHER_STREAM`, `dm::STREAM_CAP`), which serves the units
+        evenly: a 1.7B step **17.27 / 18.71 ms** (`1792637346`), its weights at 416 GB/s, the 135M unchanged. Next: `qkv`'s
+        prefetch (45 us a layer of waiting), the unit counts, `down` prefetched (decode-to-bandwidth Phase 8, "The
+        stream's rate").
         With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is

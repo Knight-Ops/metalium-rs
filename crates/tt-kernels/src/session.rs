@@ -630,6 +630,9 @@ pub struct Session<T: Transport> {
     /// (`enqueue_work`), and the lists queued so far (unit, entries).
     busy_anchor: Option<Vec<usize>>,
     busy_moves: Vec<(usize, std::ops::Range<usize>)>,
+    /// While a prefetching product is queued in a capture: its idle units' `PREFETCH` lists (unit,
+    /// entries), which the op's record keeps as read ahead (`trace::OpRecord::ahead`).
+    prefetch_lists: Vec<(usize, std::ops::Range<usize>)>,
     /// [`Session::set_l1_region`].
     l1_region: u64,
     /// [`Session::set_residency`]: the most a residency-planned capture's region takes, or 0 for
@@ -2045,8 +2048,9 @@ fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
 /// [`crate::profile_mode::Detail::Ops`] and in `Full`: three a stamped entry (its begin and end and a
 /// `KICK` or `ROLES_DONE` inside), and for a `PAIR_CALL`, its reader section's entries (B runs them;
 /// NC, which runs the writer's, does not stamp). B also stamps each fetch of a chunk of the stream
-/// or of a reader section, and its wait for its writer (`tt_isa::dm::trace_mode::FETCH`,
-/// `WRITER_WAIT`): two events each, and `range` may touch one chunk more than it fills.
+/// or of a reader section, its wait for its writer and each prefetch `WAIT`
+/// (`tt_isa::dm::trace_mode::FETCH`, `WRITER_WAIT`, `PREFETCH_WAIT`): two events each, and `range`
+/// may touch one chunk more than it fills.
 fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
@@ -2061,6 +2065,9 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2
             let head = entries[i][0];
             count[0] += ops.stamps(head);
             count[1] += full.stamps(head);
+            if head == tt_isa::dm::op::WAIT && entries[i][1] == tt_isa::dm::WAIT_PREFETCH {
+                count[0] += 2;
+            }
             i += (tt_isa::dm::record::len(head) as usize).max(1);
         }
     };
@@ -2084,6 +2091,47 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2
         i += (tt_isa::dm::record::len(head) as usize).max(1);
     }
     count.map(|c| c + fetches + waits)
+}
+
+/// Unit `u`'s `BARRIER` entries in its stream `uc`, in order: an arrival at the op whose entries
+/// hold it, or a wait standing for the barriers the unit sat out (`dm::BARRIER_STANDS_FOR`).
+fn unit_barriers(
+    uc: &trace::UnitCapture,
+    u: usize,
+    ops: &[trace::OpRecord],
+) -> Vec<crate::profile_mode::UnitBarrier> {
+    let mut owners: Vec<(core::ops::Range<usize>, u32)> = ops
+        .iter()
+        .enumerate()
+        .map(|(k, o)| (o.entries[u].clone(), k as u32))
+        .filter(|(r, _)| r.start < r.end)
+        .collect();
+    owners.sort_by_key(|(r, _)| r.start);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < uc.stream.len() {
+        let e = uc.stream[i];
+        if e[0] == tt_isa::dm::op::BARRIER {
+            out.push(if e[4] == 1 {
+                crate::profile_mode::UnitBarrier {
+                    arrival_of: None,
+                    counts: e[tt_isa::dm::BARRIER_STANDS_FOR],
+                }
+            } else {
+                let at = owners.partition_point(|(r, _)| r.start <= i);
+                crate::profile_mode::UnitBarrier {
+                    arrival_of: at
+                        .checked_sub(1)
+                        .map(|j| &owners[j])
+                        .filter(|(r, _)| r.contains(&i))
+                        .map(|(_, k)| *k),
+                    counts: 1,
+                }
+            });
+        }
+        i += (tt_isa::dm::record::len(e[0]) as usize).max(1);
+    }
+    out
 }
 
 /// [`trace::OpRecord::shape`] of an op laid out as `queues`: each unit's steps, their kinds and
@@ -2221,6 +2269,7 @@ impl<T: Transport> Session<T> {
             busy_prefetch: std::env::var("TT_BUSY_PREFETCH").map_or(true, |v| v != "0"),
             busy_anchor: None,
             busy_moves: Vec::new(),
+            prefetch_lists: Vec::new(),
             // `TT_L1_REGION=<bytes>`: captures keep that much of each unit's `DATA` arena, at its
             // top, for a persistent region (`docs/plans/planned-l1-residency.md` Phase 2).
             l1_region: std::env::var("TT_L1_REGION")
@@ -4186,6 +4235,7 @@ impl<T: Transport> Session<T> {
                 barrier: self.units.len() > 1,
                 stamps: [0; 2],
                 bytes: Default::default(),
+                ahead: std::mem::take(&mut self.prefetch_lists),
                 l1_top: planned.top,
                 l1_need: planned.need,
                 shape: std::mem::take(&mut self.pending_shape),
@@ -4195,7 +4245,10 @@ impl<T: Transport> Session<T> {
             // the ops between.
             if let Some(lens) = &self.busy_anchor {
                 for (u, block) in std::mem::take(&mut self.busy_moves) {
+                    let len = block.len();
                     c.move_block(u, block, lens[u]);
+                    let op = c.ops.last_mut().expect("the op just recorded");
+                    op.ahead.push((u, lens[u]..lens[u] + len));
                 }
             }
         }
@@ -4330,8 +4383,12 @@ impl<T: Transport> Session<T> {
                 if q.front().is_some_and(|seg| seg.what == tensor::PREFETCH) {
                     let seg = q.pop_front().expect("a front segment");
                     let wait = self.barrier_wait(anchor);
-                    self.capture.as_mut().unwrap().units[u].stream.push(wait);
+                    let c = self.capture.as_mut().unwrap();
+                    c.units[u].stream.push(wait);
+                    let at = c.units[u].stream.len();
                     self.enqueue_segment(u, &seg, budget)?;
+                    let end = self.capture.as_ref().unwrap().units[u].stream.len();
+                    self.prefetch_lists.push((u, at..end));
                 }
             }
         }
@@ -5263,12 +5320,33 @@ impl<T: Transport> Session<T> {
             }
             op.stamps = most;
         }
+        // In the profile mode, each unit's barriers in the order it runs them, so its stamps can be
+        // told apart op by op.
+        let unit_barriers = match self.profiler {
+            Some(_) => units
+                .iter()
+                .enumerate()
+                .map(|(u, uc)| unit_barriers(uc, u, &ops))
+                .collect(),
+            None => Vec::new(),
+        };
         // In the profile mode, what each op moves through GDDR: its records expanded on the host,
         // as the movers expand them. The streams are not kept once stored.
         if self.profiler.is_some() || self.count_trace_bytes {
             for op in &mut ops {
                 for (uc, range) in units.iter().zip(&op.entries) {
                     op_bytes(uc, range.clone(), &mut op.bytes);
+                }
+                // What its lists read ahead is its own too: counted again only where a list
+                // lies outside its entries (moved to before the ops it runs under).
+                for (u, r) in &op.ahead {
+                    let mut ahead = crate::profile_mode::OpBytes::default();
+                    op_bytes(&units[*u], r.clone(), &mut ahead);
+                    let own = &op.entries[*u];
+                    if !(own.start <= r.start && r.end <= own.end) {
+                        op.bytes.add(&ahead);
+                    }
+                    op.bytes.ahead += ahead.read;
                 }
             }
         }
@@ -5351,6 +5429,7 @@ impl<T: Transport> Session<T> {
                 free_at_end,
                 freed,
                 ops,
+                unit_barriers,
             },
         );
         Ok(TraceId(id))
@@ -5538,7 +5617,11 @@ impl<T: Transport> Session<T> {
             Some(crate::profile_mode::Detail::Full) => 1,
             _ => 0,
         };
-        let ops = self.traces.get(&id.0).map(|t| &t.ops[..]).unwrap_or(&[]);
+        let (ops, unit_barriers) = self
+            .traces
+            .get(&id.0)
+            .map(|t| (&t.ops[..], &t.unit_barriers[..]))
+            .unwrap_or((&[], &[]));
         let Some(p) = self.profiler.as_mut() else {
             return 0;
         };
@@ -5558,7 +5641,7 @@ impl<T: Transport> Session<T> {
                 .collect();
             let stamps = ops.iter().map(|o| o.stamps[detail]).collect();
             let segmented = !ops.is_empty() && ops.iter().all(|o| o.barrier);
-            (info, stamps, segmented)
+            (info, stamps, segmented, unit_barriers.to_vec())
         });
         p.next_window(id.0)
     }

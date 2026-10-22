@@ -728,6 +728,61 @@ the host ~0.8).
     (`1792615740`). **Then (2026-10-21)** [planned-l1-residency.md](planned-l1-residency.md) Phase 4 (re-scoped) and 5a, the
     reader sections read ahead: the small ops 5.00 -> 4.47 ms, the products 12.92 -> 13.46, the step unchanged (18.44 /
     19.83, `1792619858`): **under busy prefetch the step is bound by the weight stream the small ops' windows carry.**
+- **The stream's rate (2026-10-22).** The step is bound by the weight stream (Phase 5a's finding), so first the meter,
+  then the levers it ranks; every lever is bit for bit (a column's result does not depend on which unit computes it or
+  when its `B` lands).
+  - [x] **Step 1, the meter** (no behaviour change; [log](../learnings/performance-log.md#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0),
+    profile `1792629809`):
+    - what a product's units read ahead is charged to it (`trace::OpRecord::ahead`, `OpBytes::ahead`; a moved
+      `BUSY_PREFETCH` list had been no op's, ~1.7 GB a step uncounted); the summary gives the step's weight rate and
+      each label's in-span rate;
+    - B stamps its prefetch `WAIT` in `OPS` mode (`trace_mode::PREFETCH_WAIT`, the `prefetch` column; firmware
+      `profile` feature only);
+    - every unit is timed at every op from its own stamps (`profile_mode::unit_times`: the host counts each unit's
+      barriers as the mover's window does, from its stream; `skew.tsv`, and a table in `summary.md`).
+    - Gates: `step216` `what_a_product_reads_ahead_is_counted_as_its_own` (ttsim, card 0; watched failing with the
+      attribution off), `profile_mode` unit `a_units_stamps_are_told_apart_by_its_barriers`, `silicon_profile_mode`
+      (unit 0's per-unit times equal its spans sample by sample; a plain `WAIT` is no prefetch's). Card 0: safe 26 of 26
+      (`step188` among them), `fast-reads` 14 of 14, `fast-reads` + `encoded-guard` 15 of 15, profile feature 6 of 6.
+    - **Found:** the weights stream at **389 GB/s** over the step, 2.97 GB of 6.98 read ahead; unit 0 waits 28 us
+      (`qkv`) and 67 us (`gate|up`) a layer for its own prefetch, which drains at the prefetch ID's cap of 2 while the
+      kernel waits; the low-numbered units read ~1.35x slower than the high ones whatever the channel (`down`: units
+      0-31 ~150 us, 48-63 ~112; unit 20 the slowest in 24 of 24 layers); in `gate|up`, units 64-103 finish their
+      prefetched job in 13 us and wait ~235 us at the barrier.
+  - **Step 2, the levers, re-ranked by Step 1:**
+    1. [x] **The prefetch `WAIT` drains at the read cap** (2026-10-22), not the prefetch cap: once the kernel waits for
+       its `B`, no small op is left to protect. The mover raises ID 6's cap to `max(B's read cap, the prefetch cap)`
+       for the drain and sets it back after (`InFlight::set_cap_in_flight`: the room left empty, so the next issue
+       re-reads the counter; `set_cap` refills it and is only for an idle ID). Unit test
+       `a_cap_changed_in_flight_counts_what_is_in_flight`; ttsim `step172`, `step173`, `step215`, `step216` in the three
+       images; card 0 safe 26 of 26 (`1792631341`, `step188` bit for bit), `fast-reads` 14 of 14 (`1792631719`),
+       `fast-reads` + `encoded-guard` 15 of 15 (`1792631860`). **Found:** at first it took B's cap whatever it was, and
+       `step215` (B's own cap set to 1) stalled the prefetch 119 times on silicon (ttsim passed: a read lands before the
+       next issue there); hence the `max`. **Measured:** the step 18.44 / 19.83 -> **18.28 / 19.84 ms** (`1792631901`);
+       profile `1792632189`: products 13.46 -> 13.23 ms (`gate|up` 248 -> 242 us, `o` 24 -> 19), the small ops 4.47 ->
+       4.57. Small: once the product waits, GDDR is already full, so unit 0 still waits ~55 us a layer in `gate|up`.
+    2. [x] **The products' units served evenly** (2026-10-22; planned as a deal weighted by a per-card measurement of
+       each unit's rate). Card 1 matched card 0 to ~0.1 us (`1792632927`), but with the tiles opened in reverse order
+       the order reversed too (`1792633435`): a unit's service depends on where it sits among the units reading
+       together, so no measurement of units alone predicts a product's. What evens it is the in-flight cap: every B
+       read at 2 gave 17.27 / 18.91 ms (8: 18.28 / 19.84; sweep 1-12 in the
+       [log](../learnings/performance-log.md#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0)),
+       `down`'s units even, but the 135M and ResNet-18 ~3% slower. So only a weight stream's reads take it:
+       `record::GATHER_STREAM` (bit 28) on a packed-`A` product's gathers (idle units' prefetch lists included; not
+       with `GATHER_PREFETCH`), B lowering its own ID's cap to `dm::STREAM_CAP` (default 2, `TT_STREAM_CAP`) for the
+       record and restoring it after. **1.7B 17.27 / 18.71 ms** (`1792637346`), the 135M unchanged; the step's
+       weights at **416 GB/s** (profile `1792638075`; 389 before). Gates: record unit test (the flag reads what the
+       record reads; refused with `GATHER_PREFETCH`), ttsim `step172`, `step173`, `step205`, `step215`, `step216` in the
+       three images; card 0 safe 41 of 41 (`1792636757`: `step185`, `step187`, `step188` bit for bit),
+       `fast-reads` 17 of 17 (`1792637187`), `fast-reads` + `encoded-guard` 18 of 18 (`1792637329`); `--smoke` 1,182 of 1,182
+       (`1792639145`, `step12_mnist` included).
+       `TT_IN_FLIGHT_CAP` (B's own cap, a development knob) stays for further sweeps.
+    3. [ ] `PREFETCH_UNITS` / `THIN_STREAM_UNITS` re-tuned. The idle prefetch's cap is settled: its lists read at the
+       stream cap; at B's cap of 8 instead, no different (`1792638681`, `1792638827`).
+    3a. [ ] **`qkv` waits for its prefetch** (94.5 us a layer, 45 of it unit 0's prefetch `WAIT`): its window (the
+       residual add and RMSNorm) is too short for 51 MB. Candidates: more of the window (the prefetch issued before
+       `down`'s barrier, 2d), or more units on it.
+    4. [ ] `down` prefetched (below): ranked last, since its median unit is at the ceiling and its window is ~16 us.
 - [ ] `down` prefetched: the first chunk batches' `B` gathers of `push_stream_jobs` on idle units. ~0.7 ms.
 - [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
   reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small

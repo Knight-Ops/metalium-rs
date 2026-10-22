@@ -17,7 +17,8 @@
 //!
 //! Each span is split by the kind of entry it spent its time in (`OpTime`): the barrier, the kernels'
 //! wait, the control entries (launches, kernels, circular buffers, descriptor pokes), a replay's
-//! fetches of its own stream and sections, B's waits for its writer core, and data movement. In the
+//! fetches of its own stream and sections, B's waits for its writer core and for a prefetch's last
+//! reads, and data movement. In the
 //! default [`Detail::Ops`] the data entries are not stamped (they keep the mover's untraced fast
 //! paths); their time is the span less the rest.
 
@@ -99,6 +100,10 @@ pub struct OpTime {
     /// B waiting for NC to finish a pair's writer section: NC's fetch of it and its writes
     /// (`tt_isa::dm::trace_mode::WRITER_WAIT`). [`Detail::Ops`] only: in `Full` it is data.
     pub writer: u64,
+    /// B issuing what is left of a prefetch and waiting for it to land, before the kernel that
+    /// reads it (`tt_isa::dm::trace_mode::PREFETCH_WAIT`): `B` read ahead that had not arrived.
+    /// [`Detail::Ops`] only: in `Full` it is data.
+    pub prefetch: u64,
     /// Moving data: the reads, writes, gathers and scatters ([`Detail::Full`]), or, in
     /// [`Detail::Ops`], the span less everything above.
     pub data: u64,
@@ -127,6 +132,10 @@ pub struct OpBytes {
     pub a: u64,
     /// Of `read`, what `GATHER`s read into their `B` operand's slots (its weights, or a cache).
     pub b: u64,
+    /// Of `read`, what lists read ahead of the op, under the ops before it: an idle unit's
+    /// `PREFETCH` list, a busy unit's `BUSY_PREFETCH` (`trace::OpRecord::ahead`). Not moved in
+    /// the op's own span.
+    pub ahead: u64,
 }
 
 impl OpBytes {
@@ -137,6 +146,7 @@ impl OpBytes {
         self.writes += o.writes;
         self.a += o.a;
         self.b += o.b;
+        self.ahead += o.ahead;
     }
 
     /// Count `entries` (a list, a stream or a section; `PAIR` headers, credits and control entries
@@ -209,8 +219,13 @@ impl OpBytes {
 }
 
 impl OpTime {
-    fn finish(mut self, detail: Detail, data: u64) -> Self {
-        let known = self.barrier + self.kernels + self.control + self.fetch + self.writer;
+    fn finish(mut self, detail: Detail, mut data: u64) -> Self {
+        if detail == Detail::Full {
+            // `Full` stamps every `WAIT` as itself: moving data, not a prefetch's own stamp.
+            data += std::mem::take(&mut self.prefetch);
+        }
+        let known =
+            self.barrier + self.kernels + self.control + self.fetch + self.writer + self.prefetch;
         match detail {
             Detail::Ops => self.data = self.span.saturating_sub(known),
             Detail::Full => {
@@ -247,6 +262,7 @@ impl Classes {
                         op::LAUNCH | op::KERNEL | op::CB | op::POKE => self.time.control += d,
                         tt_isa::dm::trace_mode::FETCH => self.time.fetch += d,
                         tt_isa::dm::trace_mode::WRITER_WAIT => self.time.writer += d,
+                        tt_isa::dm::trace_mode::PREFETCH_WAIT => self.time.prefetch += d,
                         _ => self.data += d,
                     }
                 }
@@ -326,6 +342,66 @@ pub fn attribute_replay(events: &[TraceEvent], lo: u32, detail: Detail) -> Vec<O
     out
 }
 
+/// One replay's stamps on unit `unit`, whose barriers are `seq` in stream order, stamped within the
+/// window `lo..hi` (`hi` 0 for none): each op it arrived at whose work is wholly stamped, as `(op,
+/// time)`. The mover stamps a barrier when its count of the trace's barriers so far lies in the
+/// window, counting an arrival as one and a wait as the barriers it stands for; this counts the
+/// same way to tell which stamp is which. `None` if the stamps and `seq` do not line up.
+pub fn unit_times(
+    events: &[TraceEvent],
+    seq: &[UnitBarrier],
+    unit: u16,
+    lo: u32,
+    hi: u32,
+) -> Option<Vec<(usize, UnitTime)>> {
+    let stamps: Vec<(Event, u64)> = events.iter().filter_map(mover).collect();
+    let Some(start) = stamps
+        .iter()
+        .rposition(|(e, _)| matches!(e, Event::List { begin: true, .. }))
+    else {
+        return Some(Vec::new());
+    };
+    let mut pairs = Vec::new();
+    let mut open = None;
+    for &(event, t) in &stamps[start..] {
+        match event {
+            Event::Entry {
+                begin: true,
+                op: op::BARRIER,
+            } => open = Some(t),
+            Event::Entry {
+                begin: false,
+                op: op::BARRIER,
+            } => pairs.push((open.take()?, t)),
+            _ => {}
+        }
+    }
+    let mut pairs = pairs.into_iter();
+    let mut out = Vec::new();
+    let mut since = (lo == 0).then_some(stamps[start].1);
+    let mut count = 0u32;
+    for b in seq {
+        if hi == 0 || (lo <= count && count < hi) {
+            let (arrive, release) = pairs.next()?;
+            if let (Some(k), Some(s)) = (b.arrival_of, since) {
+                out.push((
+                    k as usize,
+                    UnitTime {
+                        unit,
+                        work: arrive.saturating_sub(s),
+                        wait: release.saturating_sub(arrive),
+                    },
+                ));
+            }
+            since = Some(release);
+        } else {
+            since = None;
+        }
+        count += b.counts;
+    }
+    pairs.next().is_none().then_some(out)
+}
+
 /// One eager op's profile.
 #[derive(Clone, Debug)]
 pub struct EagerSample {
@@ -345,11 +421,39 @@ pub struct OpInfo {
     pub bytes: OpBytes,
 }
 
+/// One of a unit's `BARRIER` entries in a trace's stream, in the order the unit runs them: what
+/// tells which of its stamped barriers is which op's ([`unit_times`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitBarrier {
+    /// The op it is the unit's arrival at; `None` for a wait-only barrier (those the unit sat
+    /// out, before its next op or at the trace's end).
+    pub arrival_of: Option<u32>,
+    /// How many of the trace's barriers the window counts it as (the mover's `TRACE_BARRIERS`):
+    /// one for an arrival, `dm::BARRIER_STANDS_FOR` for a wait.
+    pub counts: u32,
+}
+
+/// One unit's time on one op of a replay, from its own stamps, so no two tiles' clocks are
+/// compared: its work, from its previous barrier's release to its arrival at the op's, and its
+/// wait there for the slowest unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitTime {
+    pub unit: u16,
+    pub work: u64,
+    pub wait: u64,
+}
+
 /// A trace's ops and their samples, one per replay that stamped them.
 #[derive(Clone, Debug, Default)]
 pub struct TraceSamples {
     pub ops: Vec<OpInfo>,
     pub samples: Vec<Vec<OpTime>>,
+    /// Per op, each unit that arrived at its barrier, once per replay that stamped it.
+    pub units: Vec<Vec<UnitTime>>,
+    /// Units' replays whose barrier stamps did not line up with their streams: not attributed.
+    pub unit_mismatches: u32,
+    /// Per unit, its barriers in stream order (empty where unknown).
+    unit_barriers: Vec<Vec<UnitBarrier>>,
     pub replays: u32,
     /// Replays whose stamps outran a unit's buffer: none of their ops were attributed.
     pub overflowed: u32,
@@ -371,6 +475,8 @@ enum Pending {
     Replay {
         trace: u64,
         lo: u32,
+        /// The window's end, 0 for none.
+        hi: u32,
         first: usize,
     },
 }
@@ -408,19 +514,22 @@ impl Profiler {
         }
     }
 
-    /// A trace's ops, and each op's stamps on its busiest unit, when it is first replayed.
+    /// A trace's ops, each op's stamps on its busiest unit, and each unit's barriers, when it is
+    /// first replayed.
     pub(crate) fn know_trace(
         &mut self,
         trace: u64,
-        ops: impl FnOnce() -> (Vec<OpInfo>, Vec<u32>, bool),
+        ops: impl FnOnce() -> (Vec<OpInfo>, Vec<u32>, bool, Vec<Vec<UnitBarrier>>),
     ) {
         self.traces.entry(trace).or_insert_with(|| {
-            let (ops, stamps, segmented) = ops();
+            let (ops, stamps, segmented, unit_barriers) = ops();
             TraceSamples {
                 samples: vec![Vec::new(); ops.len()],
+                units: vec![Vec::new(); ops.len()],
                 ops,
                 stamps,
                 segmented,
+                unit_barriers,
                 ..Default::default()
             }
         });
@@ -439,6 +548,7 @@ impl Profiler {
             self.pending = Some(Pending::Replay {
                 trace,
                 lo: 0,
+                hi: 0,
                 first: 0,
             });
             return 0;
@@ -456,6 +566,7 @@ impl Profiler {
         self.pending = Some(Pending::Replay {
             trace,
             lo: lo as u32,
+            hi: end as u32,
             first,
         });
         (lo as u32) | ((end as u32) << 16)
@@ -504,7 +615,12 @@ impl Profiler {
                     self.eager.push(EagerSample { label, what, time });
                 }
             }
-            Some(Pending::Replay { trace, lo, first }) => {
+            Some(Pending::Replay {
+                trace,
+                lo,
+                hi,
+                first,
+            }) => {
                 let Some(t) = self.traces.get_mut(&trace) else {
                     return;
                 };
@@ -514,6 +630,21 @@ impl Profiler {
                     for (k, time) in attribute_replay(unit0, lo, detail).into_iter().enumerate() {
                         if let Some(s) = t.samples.get_mut(first + k) {
                             s.push(time);
+                        }
+                    }
+                    for (u, events) in units.iter().enumerate() {
+                        let Some(seq) = t.unit_barriers.get(u).filter(|s| !s.is_empty()) else {
+                            continue;
+                        };
+                        match unit_times(events, seq, u as u16, lo, hi) {
+                            Some(times) => {
+                                for (k, time) in times {
+                                    if let Some(s) = t.units.get_mut(k) {
+                                        s.push(time);
+                                    }
+                                }
+                            }
+                            None => t.unit_mismatches += 1,
                         }
                     }
                 } else if let (Some(time), Some(s)) =
@@ -586,10 +717,33 @@ impl TraceSamples {
                         control: m(|t| t.control),
                         fetch: m(|t| t.fetch),
                         writer: m(|t| t.writer),
+                        prefetch: m(|t| t.prefetch),
                         data: m(|t| t.data),
                         other: m(|t| t.other),
                     }
                 })
+            })
+            .collect()
+    }
+
+    /// Per op, each unit's median work and wait over the replays that stamped it, `(unit, work,
+    /// wait, samples)` by unit.
+    pub fn unit_medians(&self) -> Vec<Vec<(u16, u64, u64, usize)>> {
+        self.units
+            .iter()
+            .map(|times| {
+                let mut by: BTreeMap<u16, Vec<&UnitTime>> = BTreeMap::new();
+                for t in times {
+                    by.entry(t.unit).or_default().push(t);
+                }
+                by.into_iter()
+                    .map(|(u, ts)| {
+                        let n = ts.len();
+                        let work = median(ts.iter().map(|t| t.work).collect());
+                        let wait = median(ts.iter().map(|t| t.wait).collect());
+                        (u, work, wait, n)
+                    })
+                    .collect()
             })
             .collect()
     }
@@ -616,6 +770,7 @@ impl Total {
         self.time.control += t.control;
         self.time.fetch += t.fetch;
         self.time.writer += t.writer;
+        self.time.prefetch += t.prefetch;
         self.time.data += t.data;
         self.time.other += t.other;
     }
@@ -644,15 +799,15 @@ impl ProfileReport {
         let total: u64 = rows.iter().map(|(_, t)| t.time.span).sum();
         let _ = writeln!(
             out,
-            "| label | {count} | us | % | us each | barrier | kernels | control | fetch | writer | data | other |"
+            "| label | {count} | us | % | us each | barrier | kernels | control | fetch | writer | prefetch | data | other |"
         );
-        let _ = writeln!(out, "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
+        let _ = writeln!(out, "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
         for (label, t) in rows {
             let pct = |c: u64| 100.0 * c as f64 / t.time.span.max(1) as f64;
             let _ =
                 writeln!(
                 out,
-                "| {} | {} | {:.1} | {:.1} | {:.2} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% |",
+                "| {} | {} | {:.1} | {:.1} | {:.2} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% |",
                 if label.is_empty() { "(unlabelled)" } else { label },
                 t.count,
                 self.us(t.time.span),
@@ -663,6 +818,7 @@ impl ProfileReport {
                 pct(t.time.control),
                 pct(t.time.fetch),
                 pct(t.time.writer),
+                pct(t.time.prefetch),
                 pct(t.time.data),
                 pct(t.time.other),
             );
@@ -707,14 +863,14 @@ impl ProfileReport {
         let _ = writeln!(
             out,
             "\nGDDR traffic by label (all units; `A`/`B`: what gathers read into a product's operands):\n\n\
-             | label | ops | us | read MB | write MB | reads | writes | A MB | B MB | GB/s |\n\
-             |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|"
+             | label | ops | us | read MB | write MB | reads | writes | A MB | B MB | ahead MB | GB/s in its span |\n\
+             |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"
         );
         for (label, s) in &labels {
             let b = &s.bytes;
             let _ = writeln!(
                 out,
-                "| {} | {} | {:.1} | {:.1} | {:.1} | {} | {} | {:.1} | {:.1} | {:.0} |",
+                "| {} | {} | {:.1} | {:.1} | {:.1} | {} | {} | {:.1} | {:.1} | {:.1} | {:.0} |",
                 if label.is_empty() {
                     "(unlabelled)"
                 } else {
@@ -728,7 +884,8 @@ impl ProfileReport {
                 b.writes,
                 mb(b.a),
                 mb(b.b),
-                gbps(b.read + b.write, self.us(s.span)),
+                mb(b.ahead),
+                gbps(b.read + b.write - b.ahead, self.us(s.span)),
             );
         }
         let (mut products, mut rest, mut all) = (Sum::default(), Sum::default(), Sum::default());
@@ -745,7 +902,8 @@ impl ProfileReport {
             out,
             "\nStep budget ({} of {} ops covered): {:.1} us, {:.1} MB read and {:.1} MB written; \
              at {CARD_READ_GBPS} GB/s those bytes take {:.1} us, the products' `B` alone {:.1} us. \
-             Barriers {:.1} us.\n\n\
+             Barriers {:.1} us. The products' `B` is {:.1} MB, {:.1} of it read ahead of its \
+             product: over the covered spans the weights stream at {:.0} GB/s.\n\n\
              | part | ops | us | MB moved | entries | GB/s | us at {CARD_READ_GBPS} GB/s | us over it |\n\
              |---|--:|--:|--:|--:|--:|--:|--:|",
             covered.len(),
@@ -756,6 +914,9 @@ impl ProfileReport {
             floor(all.bytes.read + all.bytes.write),
             floor(all.bytes.b),
             self.us(all.barrier),
+            mb(products.bytes.b),
+            mb(products.bytes.ahead),
+            gbps(products.bytes.b, self.us(all.span)),
         );
         for (part, s) in [
             ("products", &products),
@@ -775,6 +936,98 @@ impl ProfileReport {
                 self.us(s.span) - floor(moved),
             );
         }
+    }
+
+    /// A trace's units against each other, by label: per op, each unit's median work (from its
+    /// previous barrier's release to its arrival at the op's), the fastest, the median and the
+    /// slowest unit's summed over the label's ops, and the units slowest most often.
+    fn skew_table(&self, out: &mut String, t: &TraceSamples) {
+        let per_op = t.unit_medians();
+        if per_op.iter().all(Vec::is_empty) {
+            return;
+        }
+        #[derive(Default)]
+        struct Skew {
+            ops: u64,
+            units: u64,
+            fastest: u64,
+            median: u64,
+            slowest: u64,
+            slowest_units: BTreeMap<u16, u32>,
+        }
+        let mut labels: BTreeMap<&str, Skew> = BTreeMap::new();
+        for (o, units) in t.ops.iter().zip(&per_op) {
+            if units.is_empty() {
+                continue;
+            }
+            let mut work: Vec<(u64, u16)> = units.iter().map(|&(u, w, ..)| (w, u)).collect();
+            work.sort_unstable();
+            let s = labels.entry(o.label).or_default();
+            s.ops += 1;
+            s.units += work.len() as u64;
+            s.fastest += work[0].0;
+            s.median += work[work.len() / 2].0;
+            let last = work[work.len() - 1];
+            s.slowest += last.0;
+            *s.slowest_units.entry(last.1).or_default() += 1;
+        }
+        let mut labels: Vec<_> = labels.into_iter().collect();
+        labels.sort_by_key(|(_, s)| std::cmp::Reverse(s.slowest - s.fastest));
+        let _ = writeln!(
+            out,
+            "\nUnits against each other (each unit's own stamps: its work from its last barrier's \
+             release to its arrival; {} unit replays did not line up and are left out):\n\n\
+             | label | ops | units an op | fastest us | median us | slowest us | slowest - median us | slowest most often |\n\
+             |---|--:|--:|--:|--:|--:|--:|---|",
+            t.unit_mismatches
+        );
+        for (label, s) in labels {
+            let mut often: Vec<_> = s.slowest_units.into_iter().collect();
+            often.sort_by_key(|&(u, n)| (std::cmp::Reverse(n), u));
+            let often: Vec<String> = often
+                .iter()
+                .take(4)
+                .map(|(u, n)| format!("{u} x{n}"))
+                .collect();
+            let _ = writeln!(
+                out,
+                "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} |",
+                if label.is_empty() {
+                    "(unlabelled)"
+                } else {
+                    label
+                },
+                s.ops,
+                s.units as f64 / s.ops as f64,
+                self.us(s.fastest),
+                self.us(s.median),
+                self.us(s.slowest),
+                self.us(s.slowest - s.median),
+                often.join(", ")
+            );
+        }
+    }
+
+    /// Every trace op's units, one line each, tab-separated: each unit's median work (from its last
+    /// barrier's release to its arrival at the op's) and wait there, in microseconds.
+    pub fn skew_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
+        let mut out = String::from("source\tindex\tlabel\twhat\tunit\tsamples\twork_us\twait_us\n");
+        for (&id, t) in &self.traces {
+            let source = name(id);
+            for (i, (o, units)) in t.ops.iter().zip(t.unit_medians()).enumerate() {
+                for (u, work, wait, n) in units {
+                    let _ = writeln!(
+                        out,
+                        "{source}\t{i}\t{}\t{}\t{u}\t{n}\t{:.3}\t{:.3}",
+                        o.label,
+                        o.what,
+                        self.us(work),
+                        self.us(wait)
+                    );
+                }
+            }
+        }
+        out
     }
 
     /// The report as markdown: eager ops by label, then each trace by label and its costliest ops.
@@ -839,6 +1092,7 @@ impl ProfileReport {
             );
             self.label_table(&mut out, &rows, "ops");
             self.bytes_tables(&mut out, t, &medians);
+            self.skew_table(&mut out, t);
             let mut top: Vec<(usize, &OpTime)> = medians
                 .iter()
                 .enumerate()
@@ -847,13 +1101,13 @@ impl ProfileReport {
             top.sort_by_key(|(_, m)| std::cmp::Reverse(m.span));
             let _ = writeln!(
                 out,
-                "\nCostliest ops:\n\n| op | label | what | units | us | barrier | kernels | control | fetch | writer | data |\n|--:|---|---|--:|--:|--:|--:|--:|--:|--:|--:|"
+                "\nCostliest ops:\n\n| op | label | what | units | us | barrier | kernels | control | fetch | writer | prefetch | data |\n|--:|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|"
             );
             for (i, m) in top.into_iter().take(25) {
                 let o = &t.ops[i];
                 let _ = writeln!(
                     out,
-                    "| {i} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
+                    "| {i} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
                     o.label,
                     o.what,
                     o.units,
@@ -863,6 +1117,7 @@ impl ProfileReport {
                     self.us(m.control),
                     self.us(m.fetch),
                     self.us(m.writer),
+                    self.us(m.prefetch),
                     self.us(m.data)
                 );
             }
@@ -875,7 +1130,7 @@ impl ProfileReport {
     /// (medians over their samples). Microseconds.
     pub fn tsv(&self, name: &dyn Fn(u64) -> String) -> String {
         let mut out = String::from(
-            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\tfetch_us\twriter_us\n",
+            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\tfetch_us\twriter_us\tahead_bytes\tprefetch_us\n",
         );
         let none = OpBytes::default();
         let mut row = |source: &str,
@@ -886,7 +1141,7 @@ impl ProfileReport {
             let b = o.3;
             let _ = writeln!(
                 out,
-                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.3}\t{:.3}",
+                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.3}\t{:.3}\t{}\t{:.3}",
                 o.0,
                 o.1,
                 o.2,
@@ -902,9 +1157,11 @@ impl ProfileReport {
                 b.writes,
                 b.a,
                 b.b,
-                gbps(b.read + b.write, self.us(t.span)),
+                gbps(b.read + b.write - b.ahead, self.us(t.span)),
                 self.us(t.fetch),
                 self.us(t.writer),
+                b.ahead,
+                self.us(t.prefetch),
             );
         };
         for (i, s) in self.eager.iter().enumerate() {
@@ -939,12 +1196,13 @@ impl ProfileReport {
             for (label, what, t) in ops {
                 let dur = self.us(t.span);
                 events.push(format!(
-                    "{{\"ph\":\"X\",\"pid\":{pid},\"tid\":0,\"name\":{label:?},\"ts\":{at:.3},\"dur\":{dur:.3},\"args\":{{\"what\":{what:?},\"barrier_us\":{:.3},\"kernels_us\":{:.3},\"control_us\":{:.3},\"fetch_us\":{:.3},\"writer_us\":{:.3},\"data_us\":{:.3}}}}}",
+                    "{{\"ph\":\"X\",\"pid\":{pid},\"tid\":0,\"name\":{label:?},\"ts\":{at:.3},\"dur\":{dur:.3},\"args\":{{\"what\":{what:?},\"barrier_us\":{:.3},\"kernels_us\":{:.3},\"control_us\":{:.3},\"fetch_us\":{:.3},\"writer_us\":{:.3},\"prefetch_us\":{:.3},\"data_us\":{:.3}}}}}",
                     self.us(t.barrier),
                     self.us(t.kernels),
                     self.us(t.control),
                     self.us(t.fetch),
                     self.us(t.writer),
+                    self.us(t.prefetch),
                     self.us(t.data)
                 ));
                 at += dur;
@@ -1028,6 +1286,62 @@ mod tests {
         assert_eq!(ops[0].span, 50);
     }
 
+    /// A unit that runs ops 0 and 3 of five: its arrivals at 0 and 3, a wait standing for 1 and 2
+    /// before 3, and one standing for 4 at the trace's end.
+    fn sat_out() -> Vec<UnitBarrier> {
+        let arrive = |k| UnitBarrier {
+            arrival_of: Some(k),
+            counts: 1,
+        };
+        let wait = |n| UnitBarrier {
+            arrival_of: None,
+            counts: n,
+        };
+        vec![arrive(0), wait(2), arrive(3), wait(1)]
+    }
+
+    #[test]
+    fn a_units_stamps_are_told_apart_by_its_barriers() {
+        // Whole: every barrier stamped, from the replay's list start at 100.
+        let mut v = vec![e(ev::LIST_BEGIN, 1, 0)];
+        v.extend(entry(op::BARRIER, 1, 3));
+        v.push(e(ev::LIST_END, 1, 4));
+        v.push(e(ev::LIST_BEGIN, 1, 100));
+        v.extend(entry(op::BARRIER, 130, 150)); // arrives at 0
+        v.extend(entry(op::BARRIER, 200, 201)); // waits for 1 and 2
+        v.extend(entry(op::KERNEL_WAIT, 210, 240));
+        v.extend(entry(op::BARRIER, 260, 300)); // arrives at 3
+        v.extend(entry(op::BARRIER, 400, 401)); // waits for 4
+        v.push(e(ev::LIST_END, 1, 402));
+        let t = |work, wait| UnitTime {
+            unit: 5,
+            work,
+            wait,
+        };
+        assert_eq!(
+            unit_times(&v, &sat_out(), 5, 0, 0),
+            Some(vec![(0, t(30, 20)), (3, t(59, 40))])
+        );
+        // A window of ops 2..4: the wait (counted 1 and 2) starts outside it, so op 3's work has
+        // no start; the trace's last wait (count 4) is stamped.
+        let mut w = vec![e(ev::LIST_BEGIN, 1, 100)];
+        w.extend(entry(op::BARRIER, 260, 300));
+        w.extend(entry(op::BARRIER, 400, 401));
+        assert_eq!(unit_times(&w, &sat_out(), 5, 2, 5), Some(Vec::new()));
+        // A window of ops 1..4: the wait is stamped, so op 3 is.
+        let mut x = vec![e(ev::LIST_BEGIN, 1, 100)];
+        x.extend(entry(op::BARRIER, 200, 201));
+        x.extend(entry(op::BARRIER, 260, 300));
+        x.extend(entry(op::BARRIER, 400, 401));
+        assert_eq!(
+            unit_times(&x, &sat_out(), 5, 1, 5),
+            Some(vec![(3, t(59, 40))])
+        );
+        // Stamps that do not line up with the stream are refused, not misattributed.
+        assert_eq!(unit_times(&w, &sat_out(), 5, 1, 5), None, "one stamp short");
+        assert_eq!(unit_times(&x, &sat_out(), 5, 2, 5), None, "one stamp over");
+    }
+
     #[test]
     fn full_detail_times_data_entries_and_keeps_the_gaps_apart() {
         let mut v = vec![e(ev::LIST_BEGIN, 3, 0)];
@@ -1056,6 +1370,7 @@ mod tests {
                     .collect(),
                 vec![9; n],
                 true,
+                Vec::new(),
             )
         });
         let mut seen = vec![false; n];

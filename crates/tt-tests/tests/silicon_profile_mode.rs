@@ -8,7 +8,11 @@
 //! * **A trace too long for one stamp buffer is covered window by window.** A chain of 600 captured
 //!   ops (whose launch stamps alone outrun a buffer), replayed, gets every op attributed after a few
 //!   replays, none twice in one replay, and no replay overflows. B's fetches of the trace and its
-//!   waits for its writer core are attributed too, within each op's span.
+//!   waits for its writer core are attributed too, within each op's span; a chain reads nothing
+//!   ahead, so no time is a prefetch's (the trace's chunk-padding `WAIT`s are not).
+//! * **Every unit's own stamps are attributed op by op.** Each unit's barriers line up with its
+//!   stream in every replay, every covered op has its units' times, and unit 0's work and wait
+//!   at each op are, sample by sample, that op's span.
 //! * **The windows stitch to the whole.** On a trace short enough to stamp whole, the per-op spans
 //!   stitched from windows sum to what whole-trace profiles measure, within the spread of those.
 //! * **Negative control:** with the window off, the long trace overflows the stamp buffer. The run
@@ -102,7 +106,7 @@ fn eager_ops_are_attributed_to_their_burn_ops() {
         // The files the environment switch writes.
         let dir = std::env::temp_dir().join(format!("tt-profile-{}", std::process::id()));
         p.write(&dir).unwrap();
-        for f in ["summary.md", "ops.tsv", "trace.json"] {
+        for f in ["summary.md", "ops.tsv", "skew.tsv", "trace.json"] {
             assert!(dir.join(f).metadata().unwrap().len() > 0, "{f}");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -114,10 +118,12 @@ fn a_long_trace_is_covered_window_by_window() {
     with_device(every_tile(), |d| {
         // 600 ops: their launches' and waits' stamps alone (two an op) outrun one buffer, so every
         // stamp the mover makes must obey the window, not only the entries'.
+        // On before the capture: a trace stored in the profile mode keeps each unit's barriers,
+        // which its units' own stamps are told apart by.
+        profile_mode(d, Some(ProfileOptions::default())).unwrap();
         let trace = traced_chain(&d, 300);
         let ops = trace.ops().unwrap().len();
         assert!(ops >= 600, "{ops}");
-        profile_mode(d, Some(ProfileOptions::default())).unwrap();
         let mut replays = 0;
         loop {
             trace.run(inputs()).unwrap();
@@ -145,9 +151,30 @@ fn a_long_trace_is_covered_window_by_window() {
                 );
                 assert!(sum(|m| m.fetch) > 0, "the replay's fetches are stamped");
                 assert!(sum(|m| m.writer) > 0, "B's waits for NC are stamped");
+                assert_eq!(sum(|m| m.prefetch), 0, "a plain `WAIT` is no prefetch's");
                 for m in &medians {
-                    assert!(m.barrier + m.kernels + m.control + m.fetch + m.writer <= m.span);
+                    assert!(
+                        m.barrier + m.kernels + m.control + m.fetch + m.writer + m.prefetch
+                            <= m.span
+                    );
                 }
+                // Each unit's own stamps, op by op.
+                assert_eq!(t.unit_mismatches, 0, "a unit's stamps did not line up");
+                for (k, (spans, units)) in t.samples.iter().zip(&t.units).enumerate() {
+                    let unit0: Vec<u64> = units
+                        .iter()
+                        .filter(|u| u.unit == 0)
+                        .map(|u| u.work + u.wait)
+                        .collect();
+                    assert!(units.len() > unit0.len(), "op {k}: only unit 0's times");
+                    assert_eq!(
+                        unit0,
+                        spans.iter().map(|s| s.span).collect::<Vec<_>>(),
+                        "op {k}: unit 0's work and wait against its span"
+                    );
+                }
+                let skew = p.device.skew_tsv(&|id| id.to_string());
+                assert!(skew.lines().count() > ops, "a line a unit an op");
                 break;
             }
             assert!(

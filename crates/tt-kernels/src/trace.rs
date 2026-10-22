@@ -165,6 +165,11 @@ pub struct OpRecord {
     /// What it moves through GDDR on all its units. Counted when the trace is stored, in the
     /// profile mode only; zero otherwise.
     pub bytes: crate::profile_mode::OpBytes,
+    /// Lists that read its operands ahead of it, (unit, range of that unit's stream): an idle
+    /// unit's `PREFETCH` list, inside `entries`, and a busy unit's `BUSY_PREFETCH` list, moved
+    /// out of them to before the ops it runs under. Their bytes are counted as the op's
+    /// (`OpBytes::ahead`).
+    pub ahead: Vec<(usize, core::ops::Range<usize>)>,
     /// The highest `DATA` address its L1 plans reached ([`crate::l1::take_planned_top`]): what it
     /// needs of a unit's arena. Zero where its layout was not planned while it was captured.
     pub l1_top: u64,
@@ -439,6 +444,18 @@ impl Capture {
             debug_assert!(b >= a && b - a + 1 == (r.len() - if holds { len } else { 0 }));
             *r = a..b + 1;
         }
+        // Lists read ahead follow their entries; none holds a block that moves.
+        for (v, r) in self.ops.iter_mut().flat_map(|op| op.ahead.iter_mut()) {
+            if *v != u || r.start >= r.end {
+                continue;
+            }
+            let (a, b) = (at(r.start), at(r.end - 1));
+            debug_assert!(
+                b >= a && b - a + 1 == r.len(),
+                "a block moves out of a list read ahead"
+            );
+            *r = a..b + 1;
+        }
     }
 }
 
@@ -476,6 +493,9 @@ pub(crate) struct Trace {
     /// Frees of what it holds, deferred to its release.
     pub(crate) freed: Vec<Placement>,
     pub(crate) ops: Vec<OpRecord>,
+    /// Per unit, its barriers in stream order, for the profile mode's per-unit times; empty
+    /// unless the trace was stored in the profile mode.
+    pub(crate) unit_barriers: Vec<Vec<crate::profile_mode::UnitBarrier>>,
 }
 
 impl Trace {
@@ -544,6 +564,7 @@ mod tests {
                     barrier: true,
                     stamps: [0; 2],
                     bytes: Default::default(),
+                    ahead: Vec::new(),
                     l1_top: 0,
                     l1_need: 0,
                     shape: 0,

@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The weight stream metered](#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0) | 2026-10-22 | prefetched bytes charged to their product, the prefetch `WAIT` stamped, every unit timed: a 1.7B step's weights stream at **389 GB/s**, 2.97 GB read ahead; unit 0 waits 28 / 67 us a layer for its own prefetch in `qkv` / `gate\|up`; the units read unevenly by where they sit among the readers; a weight stream's reads at 2 in flight even them out: a 1.7B step 18.44 / 19.83 -> **17.27 / 18.71 ms**, 416 GB/s, the 135M unchanged |
 | [Residency on by default, its region sized under the products' cliff](#residency-on-by-default-its-region-sized-under-the-products-cliff-2026-10-21-card-0) | 2026-10-21 | a region costs a product only past its plan's floor (110,464 bytes at `K` = 2048: +8-10% one 64-byte step past it); each plan's region sized under its graph's cap, plans cached, residency on by default: a 1.7B step 21.00 / 22.25 -> **20.07 / 21.28 ms**, nothing slower; builds +20-70% (open) |
 | [Rows held by a few of their readers, and never-read writes dropped](#rows-held-by-a-few-of-their-readers-and-never-read-writes-dropped-2026-10-20-card-0) | 2026-10-20 | a row many units read whole, held by 2 of them instead of multicast to all, and the writes nothing reads dropped: with `TT_RESIDENCY=1` a 1.7B step 21.03 / 22.25 -> **20.06 / 21.28 ms** (card 0); of the probe's three ways, multicast acknowledgements counted once a run changed nothing |
 | [Busy-unit prefetch and the prefetch pump](#busy-unit-prefetch-and-the-prefetch-pump-2026-10-20-cards-0-and-1) | 2026-10-20 | a product's own units read `B` ahead under the ops before it: the products 15.24 -> 11.66 ms, but the small ops' reads queue behind the prefetch (the residual add 14 -> ~100 us): the step 20.97 -> 21.58 ms, at best 20.74 / 21.76 with ID 6's cap at 2 / 1; opt-in |
@@ -344,6 +345,72 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The weight stream metered: what is read ahead, the prefetch's wait, and each unit's own time (2026-10-22, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, "The stream's rate", Step 1. The profile mode now
+charges what a product's units read ahead (an idle unit's `PREFETCH`, a busy unit's moved `BUSY_PREFETCH`) to the product
+(`OpBytes::ahead`; before, a moved list was no op's), stamps B's prefetch `WAIT` (`trace_mode::PREFETCH_WAIT`, a
+`prefetch` column), and times every unit at every op from its own stamps (`skew.tsv`: its work from its last barrier's
+release to its arrival, and its wait there). 1.7B, `Step(64)`, `traced_generation_stream_ceiling`, every tile, release,
+the defaults (residency, busy prefetch at cap 2), `--profile`, run `1792629809`.
+
+- **The step's weight stream: 389 GB/s** (6,978 MB of `B` over 17.93 ms of spans), of which **2,969 MB is read ahead**
+  of its product (the 391 GB/s of the entry below counted 5.26 GB in the products' spans only).
+- **By product, a layer** (unit 0's span and phases; work by unit group, medians over the layer's ops):
+
+  | Product | Span us | Barrier | Prefetch wait | Data | `B` MB | Ahead MB | Units 0-63 work, min / median / max us | Units 64-103 |
+  |---|--:|--:|--:|--:|--:|--:|--:|--:|
+  | `qkv` | 74.4 | 32.3 | 28.2 | 7.2 | 51.1 | 49.0 | 23.7 / 65.3 / 129.2 | 13-24 |
+  | `o` | 24.1 | 7.1 | 7.2 | 3.4 | 17.0 | 17.0 | 8.7 / 14.7 / 26.7 | 9-17 |
+  | `gate\|up` | 248.3 | 32.7 | 67.3 | 137.1 | 136.3 | 55.4 | 110.4 / 177.5 / 257.4 | 13-19 |
+  | `down` | 175.6 | 18.7 | 0 | 138.1 | 68.2 | 0 | 99.4 / 137.3 / 175.2 | (not on it) |
+
+- **What it says:**
+  - **Unit 0 waits for its own prefetch** inside `qkv` (28 us) and `gate|up` (67 us): the first job's `B`, read ahead at
+    the prefetch ID's cap of 2, has not landed when the product starts, and the prefetch `WAIT` issues the rest at that
+    same cap while the kernel waits.
+  - **The slow units are the low-numbered ones, every time.** In `down` every unit reads one 1.06 MB column, and
+    units 0-31 take ~150 us against ~112 for units 48-63 (by unit modulo 8, i.e. by channel, it is flat: 132-139);
+    unit 20 is the slowest in all 24 layers (175 us). `gate|up`: units 0-23 ~230 us, 48-63 ~115. The NoC serves tiles
+    unevenly ("What holds card reads at ~430 GB/s: unfair service"), and the deal gives every unit equal bytes.
+  - **Idle units finish and wait.** In `gate|up` units 64-103 have only their prefetched job: 13 us of work, then
+    ~235 us at the barrier while units 0-63 read the other 81 MB.
+  - **`down` is at the read ceiling on its median unit** (68.2 MB in 137 us, ~500 GB/s) and loses ~38 us a layer to
+    its slowest; nothing reads ahead for it, and the window before it (`silu_mul`, ~16 us) is short.
+- **The meter is consistent:** unit 0's work and wait at each op equal that op's span sample by sample
+  (`silicon_profile_mode`), and no unit's stamps failed to line up with its stream (0 of 352 replays x 120 units).
+- **Then: the prefetch `WAIT` drained at B's read cap** (ID 6's cap raised to `max(read cap, prefetch cap)` while the
+  kernel waits, set back after): the step **18.28 / 19.84 ms** (`1792631901`, against 18.44 / 19.83); profile
+  `1792632189`: products 13.46 -> 13.23 ms, `gate|up` 248 -> 242 us and `o` 24 -> 19 a layer, small ops 4.47 -> 4.57 ms;
+  unit 0 still waits ~55 us a layer for `gate|up`'s prefetch. The units' order is unchanged to 0.1 us (`down`: units
+  0-15 150.4, 16-31 154.1, 32-47 126.2, 48-63 113.4 us). Units are numbered row-major from the grid's top
+  (`Tensix::tiles`), so the slow units are the top rows.
+- **Card 1 is card 0** (profile `1792632927`): every product's phases and every unit group's work within ~0.1 us.
+- **Not the rows themselves.** With the tiles opened in reverse order (a probe, since removed: units 0-63, which run the
+  thin products, the bottom rows), the order reverses with them: `down`'s units 0-15 106.5 us, 48-63 155.0
+  (`1792633435`); the step 18.40 / 19.53 ms (`1792633155`). A unit's service depends on where it sits among the units
+  reading together, so a calibration of every unit alone or all together would not predict a product's.
+- **B's in-flight cap, every read** (`TT_IN_FLIGHT_CAP`, a development knob; 1.7B step, 32 / 256-token prompts, ms):
+
+  | Cap | 12 | 8 (the tile cap) | 6 | 4 | 3 | **2** | 1 |
+  |---|--:|--:|--:|--:|--:|--:|--:|
+  | Step | 18.60 / 20.04 | 18.28 / 19.84 | 18.15 / 19.61 | 17.83 / 19.26, 17.80 / 19.32 | 17.66 / 19.12 | **17.27 / 18.91** | 18.13 / 19.99 |
+  | Run | `1792634385` | `1792631901` | `1792634238` | `1792634091`, `1792634834` | `1792634542` | `1792634688` | `1792634992` |
+
+  The profile at 2 (`1792635269`): `down` 175.6 -> 156.4 us a layer with its units even (145-151 us by group, was
+  113-154), `gate|up` 242 -> 235, the small ops 4.57 -> 3.80 ms (the idle units' prefetch reads no longer crowd
+  theirs), but `qkv` 76 -> 89 and `o` 19 -> 25 (their prefetch drained at 2). **Every read at 2 is not a default:**
+  the 135M's decode step 7.57 / 8.25 / 9.05 -> 7.76 / 8.50 / 9.32 ms and prefill 2-3% slower, ResNet-18 traced 14.05 ->
+  14.51 (`1792635749` against `1792636067`); ViT-Tiny and the eager forwards even.
+- **So a weight stream's reads alone at 2** (`record::GATHER_STREAM` on a packed-`A` product's gathers, idle units'
+  prefetch lists included; `dm::STREAM_CAP`, `TT_STREAM_CAP`), every other read at 8, the prefetch drained at 8: the
+  1.7B **17.27 / 18.71 ms**, the 135M 7.61 / 8.27 / 9.07 ms and prefill 1589 / 4646 / 5848 tokens/s, unchanged
+  (`1792637346`). Stream cap 1: 18.00 / 19.41 (`1792637649`); 3: 17.59 / 19.00 (`1792637796`). The profile
+  (`1792638075`): the step's weights at **416 GB/s** over 16.76 ms of spans (389 over 17.93); products 13.01 ms, small
+  ops 3.75; `down` 156.6 us a layer, its units even; `qkv` still 94.5 (45 us waiting for its prefetch, 13.5 us of work
+  on the idle units). The idle units' prefetch lists at 8 instead: 17.21 / 18.71 against 17.27 / 18.75 in the same
+  build (`1792638681`, `1792638827`): no different, so they keep the flag.
 
 ## Phase 4 re-scoped and a trace's reader sections read ahead: the small ops shorter, the step not (2026-10-21, card 0)
 

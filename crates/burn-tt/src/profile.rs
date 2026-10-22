@@ -11,13 +11,15 @@
 //! * `summary.md`:
 //!   - every Burn op's device time (eager ops each timed alone), split into barrier, kernels,
 //!     control, a replay's fetches of its own stream (`fetch`), B's waits for its writer core
-//!     (`writer`) and data;
+//!     (`writer`), its waits for a prefetch's last reads (`prefetch`) and data;
 //!   - every trace's ops the same way, by name (`SharedStateTraces` keys, `TracedInference::set_name`),
 //!     with how many replays covered them;
 //!   - each trace's replays (input write, replay, output read);
 //!   - the host's side: server-thread time and calls per Burn op, the session's host stages,
 //!     dataflow counts and lists per tile.
 //! * `ops.tsv`: every attributed op, one per line.
+//! * `skew.tsv`: every trace op's units, one per line: each unit's work and its wait at the op's
+//!   barrier, from its own stamps.
 //! * `trace.json`: the same as a Perfetto/Chrome trace, spans named by Burn op.
 //!
 //! `TT_PROFILE_DETAIL=full` stamps every data entry too (fewer ops per replay window). A
@@ -121,12 +123,13 @@ impl Profile {
         out
     }
 
-    /// Write `summary.md`, `ops.tsv` and `trace.json` into `dir`, creating it.
+    /// Write `summary.md`, `ops.tsv`, `skew.tsv` and `trace.json` into `dir`, creating it.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         let name = |id: u64| self.name(id);
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("summary.md"), self.summary())?;
         std::fs::write(dir.join("ops.tsv"), self.device.tsv(&name))?;
+        std::fs::write(dir.join("skew.tsv"), self.device.skew_tsv(&name))?;
         std::fs::write(dir.join("trace.json"), self.device.chrome_trace(&name))
     }
 }
