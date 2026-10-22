@@ -452,8 +452,12 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         (`1792685519`, `1792686180`), so opt-in (`TT_STREAM_HANDOFF=1`). Inside `down`'s span the step is bound by
         GDDR's aggregate rate (the halves took up to 137 us beside the spare units' reads, not ~88), and the spare
         units start `qkv`'s read ahead later (`qkv` 51 -> 72 us; profile `1792686773`). The in-op firmware signal would
-        save only the second op's ~17 us a layer: not built. Next (decode-to-bandwidth Phase 8, "The stream's rate"):
-        the GDDR idle before `o` (~50 us a layer).
+        save only the second op's ~17 us a layer: not built. **Then** (same day): the GDDR idle before `o`, each unit's
+        prefetch anchored at the last product it took part in (`Session::set_prefetch_anchor`, on by default; a `B`
+        the capture writes is never read ahead): a 1.7B step **16.79 / 18.20 ms** (`1792695341`; 16.87 / 18.29 before,
+        `1792695646`), the 135M 0.01-0.03 ms slower. The same 3.48 GB is read ahead, only sooner: a unit's arena holds
+        one job's `B`, so the window is bound by L1 (profile `1792696105`). Next (decode-to-bandwidth Phase 8):
+        room for more `B` a unit (the space audit's candidates).
         With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is

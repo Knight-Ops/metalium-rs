@@ -117,6 +117,32 @@ pub const THIN_STREAM_K_TILES: usize = 32;
 /// products and 40 for streamed ones (24 and 56 slower), and 64 stream units ([`THIN_STREAM_UNITS`]).
 pub const PREFETCH_UNITS: usize = 40;
 
+/// Where, in a capture, a unit starts reading a product's weights ahead of it
+/// ([`Session::set_prefetch_anchor`]; `docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle
+/// before `o`"). [`PrefetchAnchor::Own`] by default: a SmolLM2-1.7B step 16.87 / 18.29 -> 16.79 /
+/// 18.20 ms; the 135M's 0.01-0.03 ms slower, ResNet-18 and ViT-Tiny unchanged; `OwnOldest`
+/// 17.13 / 18.67 (`docs/learnings/performance-log.md`, "Each unit's own prefetch anchor").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefetchAnchor {
+    /// After the last weight-streaming product, on every unit; idle units taken in order.
+    Last,
+    /// After the last such product the unit itself took part in: a unit that sat out the last
+    /// one reads under it and the ops before it too. Idle units taken in order.
+    Own,
+    /// As [`PrefetchAnchor::Own`], the units idle longest taken first.
+    OwnOldest,
+}
+
+/// `TT_PREFETCH_ANCHOR`: `last` or `own-oldest` ([`PrefetchAnchor`]); anything else, or nothing,
+/// [`PrefetchAnchor::Own`].
+fn prefetch_anchor_from_env() -> PrefetchAnchor {
+    match std::env::var("TT_PREFETCH_ANCHOR").as_deref() {
+        Ok("last") => PrefetchAnchor::Last,
+        Ok("own-oldest") => PrefetchAnchor::OwnOldest,
+        _ => PrefetchAnchor::Own,
+    }
+}
+
 /// The `K` (tiles) from which a one-row product packs its `A` ([`Session::set_packed_thin_a`]):
 /// every unit's thin `A` reads cost ~0.27 us an entry (64 at `K` = 2048, 256 at 8192), the packing
 /// op one read and two writes a tile spread over every unit.
@@ -214,6 +240,30 @@ pub fn probe_row_misroute(on: bool) {
     PROBE_ROW_MISROUTE.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+static PROBE_STALE_B: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A negative control (`docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`"):
+/// with it on, a captured product reads its `B` ahead even where the capture allocated or wrote
+/// that `B` in place, so a prefetch can read it before it is written. Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_stale_b(on: bool) {
+    PROBE_STALE_B.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn probing_stale_b() -> bool {
+    PROBE_STALE_B.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static PROBE_BUSY_TOPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A negative control (as [`probe_stale_b`]): with it on, a `BUSY_PREFETCH` list moves all the way
+/// to its unit's own anchor ([`PrefetchAnchor::Own`]) whatever the ops between planned, so it can
+/// read into `DATA` an op between still uses. Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_busy_ignore_tops(on: bool) {
+    PROBE_BUSY_TOPS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 static PROBE_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the space audit): every
@@ -250,6 +300,45 @@ fn relocate_probe_background(capture: &mut trace::Capture, u: usize) {
         last - n
     );
     capture.move_block(u, 0..n, last);
+}
+
+/// Where unit `u`'s `BUSY_PREFETCH` list `block` moves to in `capture`: `last`, the unit's stream
+/// length after the last weight-streaming product (the product's plan checked that every op on
+/// the unit since planned `DATA` below the ring the list reads into), or, with an older own
+/// anchor `own` ([`PrefetchAnchor::Own`]), the earliest op boundary from `own` on after which
+/// every op on the unit did too: an op whose layout is unknown or reaches the ring keeps the list
+/// after it.
+fn busy_start(
+    capture: &trace::Capture,
+    u: usize,
+    block: &std::ops::Range<usize>,
+    own: usize,
+    last: usize,
+) -> usize {
+    if own >= last {
+        return last;
+    }
+    if PROBE_BUSY_TOPS.load(std::sync::atomic::Ordering::Relaxed) {
+        return own;
+    }
+    // The ring's first slot, from the list's own `GATHER` record.
+    let Some(b_at) = capture.units[u].stream[block.clone()]
+        .iter()
+        .find(|e| e[0] == tt_isa::dm::record::GATHER)
+        .map(|e| u64::from(e[3]))
+    else {
+        return last;
+    };
+    capture
+        .ops
+        .iter()
+        .filter(|op| {
+            let r = &op.entries[u];
+            r.start < r.end && r.start >= own && r.end <= last
+        })
+        .filter(|op| op.l1_top == 0 || op.l1_top > b_at)
+        .map(|op| op.entries[u].end)
+        .fold(own, usize::max)
 }
 
 /// The tiles a [`ProbeBackground`] unit reads a `READ_RUN`: 532 KB of `DATA`'s top.
@@ -642,19 +731,24 @@ pub struct Session<T: Transport> {
     stream_prefetch_units: usize,
     /// [`Session::set_stream_handoff`]: the chunk a handed column is handed at (`Some(0)`: half).
     stream_handoff: Option<usize>,
-    /// While a prefetching product is queued in a capture: the barrier its `PREFETCH` lists wait
-    /// for (`enqueue_work_inner`).
-    prefetch_anchor: Option<u32>,
+    /// [`Session::set_prefetch_anchor`].
+    anchor_mode: PrefetchAnchor,
+    /// While a prefetching product is queued in a capture: the barrier each unit's `PREFETCH`
+    /// list waits for, by unit (`enqueue_work_inner`); empty otherwise.
+    prefetch_anchor: Vec<Option<u32>>,
     /// [`Session::set_busy_prefetch`].
     busy_prefetch: bool,
     /// While a product with `BUSY_PREFETCH` lists is queued in a capture: each unit's stream
-    /// length after the last weight-streaming product, where its list moves to
-    /// (`enqueue_work`), and the lists queued so far (unit, entries).
-    busy_anchor: Option<Vec<usize>>,
+    /// length after the last weight-streaming product, and after its own anchor
+    /// ([`PrefetchAnchor`]), between which its list moves (`enqueue_work`), and the lists queued
+    /// so far (unit, entries).
+    busy_anchor: Option<(Vec<usize>, Vec<usize>)>,
     busy_moves: Vec<(usize, std::ops::Range<usize>)>,
     /// While a prefetching product is queued in a capture: its idle units' `PREFETCH` lists (unit,
     /// entries), which the op's record keeps as read ahead (`trace::OpRecord::ahead`).
     prefetch_lists: Vec<(usize, std::ops::Range<usize>)>,
+    /// The barriers those lists wait for (unit, relative target): `trace::OpRecord::ahead_waits`.
+    prefetch_waits: Vec<(usize, u32)>,
     /// [`Session::set_l1_region`].
     l1_region: u64,
     /// [`Session::set_residency`]: the most a residency-planned capture's region takes, or 0 for
@@ -2296,7 +2390,10 @@ impl<T: Transport> Session<T> {
             // (development knobs for `docs/plans/decode-to-bandwidth.md` Phase 8).
             stream_handoff: (std::env::var("TT_STREAM_HANDOFF").is_ok_and(|v| v == "1"))
                 .then(|| units_from_env("TT_STREAM_HANDOFF_AT", 0)),
-            prefetch_anchor: None,
+            // `TT_PREFETCH_ANCHOR=last|own-oldest`: a development knob for
+            // `docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`".
+            anchor_mode: prefetch_anchor_from_env(),
+            prefetch_anchor: Vec::new(),
             // The product's own units read their first job's `B` ahead too; `TT_BUSY_PREFETCH=0`
             // turns it off. On by default since NC stopped draining B's prefetch ID at a list's end
             // (`docs/plans/planned-l1-residency.md` 3b): a 1.7B step 19.51 -> 18.40 ms at the
@@ -2305,6 +2402,7 @@ impl<T: Transport> Session<T> {
             busy_anchor: None,
             busy_moves: Vec::new(),
             prefetch_lists: Vec::new(),
+            prefetch_waits: Vec::new(),
             // `TT_L1_REGION=<bytes>`: captures keep that much of each unit's `DATA` arena, at its
             // top, for a persistent region (`docs/plans/planned-l1-residency.md` Phase 2).
             l1_region: std::env::var("TT_L1_REGION")
@@ -4273,19 +4371,22 @@ impl<T: Transport> Session<T> {
                 stamps: [0; 2],
                 bytes: Default::default(),
                 ahead: std::mem::take(&mut self.prefetch_lists),
+                ahead_waits: std::mem::take(&mut self.prefetch_waits),
                 l1_top: planned.top,
                 l1_need: planned.need,
                 shape: std::mem::take(&mut self.pending_shape),
             });
             // A unit's `BUSY_PREFETCH` list, queued with the product, moves back in its stream
-            // to just after the last weight-streaming product: a replay reads that `B` under
-            // the ops between.
-            if let Some(lens) = &self.busy_anchor {
+            // to just after the last weight-streaming product, or as far towards its own anchor
+            // as the ops between leave its ring alone ([`busy_start`]): a replay reads that `B`
+            // under the ops between.
+            if let Some((lens, own)) = &self.busy_anchor {
                 for (u, block) in std::mem::take(&mut self.busy_moves) {
                     let len = block.len();
-                    c.move_block(u, block, lens[u]);
+                    let to = busy_start(c, u, &block, own[u], lens[u]);
+                    c.move_block(u, block, to);
                     let op = c.ops.last_mut().expect("the op just recorded");
-                    op.ahead.push((u, lens[u]..lens[u] + len));
+                    op.ahead.push((u, to..to + len));
                 }
             }
         }
@@ -4412,15 +4513,19 @@ impl<T: Transport> Session<T> {
         let mut folded = vec![false; spread];
         // A prefetching product's `PREFETCH` lists (`tensor::BlockPlan::push_prefetched_jobs`): in
         // a capture each goes into its unit's stream ahead of the unit's catch-up wait, behind a
-        // wait for the anchor -- the last weight-streaming product -- alone, so the unit reads
-        // its `B` while the ops since that product run. The unit ran nothing since it (the
-        // session took only such units), so nothing between touches the slots it reads into.
-        if let (Some(anchor), true) = (self.prefetch_anchor, capturing) {
+        // wait for its anchor -- the last weight-streaming product, or the last the unit took
+        // part in ([`PrefetchAnchor`]) -- alone, so the unit reads its `B` while the ops since
+        // that product run. The unit ran nothing since it (the session took only such units),
+        // so nothing between touches the slots it reads into.
+        if capturing && !self.prefetch_anchor.is_empty() {
             for (u, q) in per_unit.iter_mut().enumerate() {
                 if q.front().is_some_and(|seg| seg.what == tensor::PREFETCH) {
                     let seg = q.pop_front().expect("a front segment");
+                    let anchor = self.prefetch_anchor[u].expect("a prefetching unit's anchor");
                     let wait = self.barrier_wait(anchor);
                     let c = self.capture.as_mut().unwrap();
+                    // Relative already, as every captured target is.
+                    self.prefetch_waits.push((u, anchor));
                     c.units[u].stream.push(wait);
                     let at = c.units[u].stream.len();
                     self.enqueue_segment(u, &seg, budget)?;
@@ -4988,6 +5093,8 @@ impl<T: Transport> Session<T> {
             failed: false,
             weight_anchor: None,
             weight_units: 0,
+            unit_anchors: Vec::new(),
+            written: Vec::new(),
             region_base: None,
             applied: None,
             plan_mismatch: None,
@@ -6929,6 +7036,7 @@ impl<T: Transport> Session<T> {
         }
         let units = self.spread_for(tiles_of(t));
         if t.placement.owned() {
+            self.note_written(t);
             let jobs = tensor::fill_pad(t, 0.0, units)?;
             self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
             t.set_pad(Pad::Zero);
@@ -7055,34 +7163,70 @@ impl<T: Transport> Session<T> {
         let handoff = self
             .stream_handoff
             .filter(|_| !tensor::probing_skip_weights());
-        // In a capture, the units past the product's own that ran nothing since the last
-        // weight-streaming product: each can read a job's `B` while the ops between run.
+        // `B` as the capture found it: a `B` it allocated or wrote in place may be written
+        // after the point a prefetch would read it from, so it is read in the product only.
+        let b_read = cb.as_ref().unwrap_or(b);
+        let b_fresh = self.capture.as_ref().is_none_or(|c| {
+            !c.written
+                .iter()
+                .chain(self.dram.as_ref().map_or(&[][..], |d| d.alloc.logged()))
+                .any(|p| p.same_allocation(&b_read.placement))
+        }) || probing_stale_b();
+        // In a capture, the units past the product's own that ran nothing since their anchor --
+        // the last weight-streaming product, or the last they took part in ([`PrefetchAnchor`])
+        // -- each with the barrier it waits for: each can read a job's `B` while the ops between
+        // run.
         let spread = self.units.len();
-        let (prefetch, anchor): (Vec<usize>, Option<u32>) = match &self.capture {
+        let mode = self.anchor_mode;
+        let (prefetch, anchors): (Vec<usize>, Vec<Option<u32>>) = match &self.capture {
             Some(c)
                 if self.weight_prefetch
                     && packed_a.is_some()
+                    && b_fresh
                     && !tensor::probing_skip_weights() =>
             {
                 match &c.weight_anchor {
-                    Some((rel, lens)) => (
-                        (units..spread)
-                            .filter(|&u| c.units[u].stream.len() == lens[u])
-                            .take(self.prefetch_units.max(self.stream_prefetch_units))
-                            .collect(),
-                        Some(*rel),
-                    ),
-                    None => (Vec::new(), None),
+                    Some((rel, lens)) => {
+                        let anchor = |u: usize| match mode {
+                            PrefetchAnchor::Last => Some((*rel, lens[u])),
+                            _ => c.unit_anchors.get(u).copied().flatten(),
+                        };
+                        let mut idle: Vec<(usize, u32)> = (units..spread)
+                            .filter(|&u| {
+                                mode == PrefetchAnchor::Last || c.units[u].probe_entries == 0
+                            })
+                            .filter_map(|u| {
+                                let (rel, len) = anchor(u)?;
+                                (c.units[u].stream.len() == len).then_some((u, rel))
+                            })
+                            .collect();
+                        if mode == PrefetchAnchor::OwnOldest {
+                            // Relative targets grow through a capture: the oldest anchor first.
+                            idle.sort_by_key(|&(u, rel)| (rel, u));
+                        }
+                        idle.truncate(self.prefetch_units.max(self.stream_prefetch_units));
+                        let mut anchors = vec![None; spread];
+                        for &(u, rel) in &idle {
+                            anchors[u] = Some(rel);
+                        }
+                        (idle.into_iter().map(|(u, _)| u).collect(), anchors)
+                    }
+                    None => (Vec::new(), Vec::new()),
                 }
             }
-            _ => (Vec::new(), None),
+            _ => (Vec::new(), Vec::new()),
         };
         // In a capture, each of the product's units' bound for reading its first job's `B` ahead:
         // the highest `DATA` address the ops it ran since the last weight-streaming product
-        // planned, if every one of them is known.
-        let (busy, busy_anchor): (Vec<Option<u64>>, Option<Vec<usize>>) = match &self.capture {
+        // planned, if every one of them is known; and each unit's stream length after that
+        // product and after its own anchor, between which its list moves ([`busy_start`]).
+        type BusyAnchor = Option<(Vec<usize>, Vec<usize>)>;
+        let (busy, busy_anchor): (Vec<Option<u64>>, BusyAnchor) = match &self.capture {
             Some(c)
-                if self.busy_prefetch && packed_a.is_some() && !tensor::probing_skip_weights() =>
+                if self.busy_prefetch
+                    && packed_a.is_some()
+                    && b_fresh
+                    && !tensor::probing_skip_weights() =>
             {
                 match &c.weight_anchor {
                     Some((_, lens)) => (
@@ -7098,13 +7242,30 @@ impl<T: Transport> Session<T> {
                                     })
                             })
                             .collect(),
-                        Some(lens.clone()),
+                        Some((
+                            lens.clone(),
+                            (0..spread)
+                                .map(|u| match mode {
+                                    PrefetchAnchor::Last => lens[u],
+                                    _ => c
+                                        .unit_anchors
+                                        .get(u)
+                                        .copied()
+                                        .flatten()
+                                        .map_or(lens[u], |(_, len)| len.min(lens[u])),
+                                })
+                                .collect(),
+                        )),
                     ),
                     None => (Vec::new(), None),
                 }
             }
             _ => (Vec::new(), None),
         };
+        // Each unit's stream length before the product, to tell the units that take part in it.
+        let before: Vec<usize> = self.capture.as_ref().map_or(Vec::new(), |c| {
+            c.units.iter().map(|u| u.stream.len()).collect()
+        });
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -7136,10 +7297,13 @@ impl<T: Transport> Session<T> {
                 )
             })
             .and_then(|(work, dealt, handoff)| {
-                self.prefetch_anchor = dealt.and(anchor);
+                self.prefetch_anchor = match dealt {
+                    Some(_) => anchors,
+                    None => Vec::new(),
+                };
                 self.busy_anchor = busy_anchor;
                 let r = self.execute_on(work, dealt.unwrap_or(units), budget);
-                self.prefetch_anchor = None;
+                self.prefetch_anchor = Vec::new();
                 self.busy_anchor = None;
                 self.busy_moves.clear();
                 let Some(tensor::Handoff {
@@ -7168,11 +7332,20 @@ impl<T: Transport> Session<T> {
                 }
             });
         // This product is the next one's anchor: a unit idle after it can prefetch for that one.
+        // It is also the own anchor of each unit whose stream grew in it (a job, a list read ahead,
+        // a handed column's), and of each unit that has none yet.
         if out.is_ok() && packed_a.is_some() {
             let rel = self.barriers;
             if let Some(c) = self.capture.as_mut() {
                 let rel = rel.wrapping_sub(c.barriers_base);
-                c.weight_anchor = Some((rel, c.units.iter().map(|u| u.stream.len()).collect()));
+                let lens: Vec<usize> = c.units.iter().map(|u| u.stream.len()).collect();
+                c.unit_anchors.resize(lens.len(), None);
+                for (u, (&len, own)) in lens.iter().zip(&mut c.unit_anchors).enumerate() {
+                    if own.is_none() || before.get(u).is_some_and(|&b| len > b) {
+                        *own = Some((rel, len));
+                    }
+                }
+                c.weight_anchor = Some((rel, lens));
                 c.weight_units = units;
             }
         }
@@ -7787,13 +7960,24 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
-    /// `t` is about to be written in place: its twin no longer holds its row.
+    /// `t` is about to be written in place: its twin no longer holds its row, and a capture
+    /// reads it ahead of no product ([`trace::Capture::written`]).
     fn drop_twin(&mut self, t: &DramTensor) -> Result<(), TensorError> {
+        self.note_written(t);
         if let Some(i) = self.twins.iter().position(|(p, _)| *p == t.placement) {
             let (_, twin) = self.twins.swap_remove(i);
             self.free(twin)?;
         }
         Ok(())
+    }
+
+    /// In a capture, `t` is written in place ([`trace::Capture::written`]).
+    fn note_written(&mut self, t: &DramTensor) {
+        if let Some(c) = self.capture.as_mut() {
+            if !c.written.iter().any(|p| p.same_allocation(&t.placement)) {
+                c.written.push(t.placement.clone());
+            }
+        }
     }
 
     /// Whether a one-row product with a packed `A` streams each output column's `K` in chunks,
@@ -7805,8 +7989,9 @@ impl<T: Transport> Session<T> {
     }
 
     /// Whether a captured one-row product with a packed `A` and its `K` whole puts its first
-    /// columns on units idle since the last such product, each reading its columns' `B` as soon
-    /// as that product is done -- under the ops between the two -- and the product then reading
+    /// columns on units idle since the last such product (or since the last they took part in,
+    /// [`Session::set_prefetch_anchor`]), each reading its columns' `B` as soon as that product
+    /// is done -- under the ops between the two -- and the product then reading
     /// only `A` there (on by default; `tensor::BlockPlan::push_prefetched_jobs`). Only in a
     /// capture, whose streams show which units ran nothing in between. Off, every column is read
     /// by the product: the gates compare the two.
@@ -7858,6 +8043,21 @@ impl<T: Transport> Session<T> {
     /// them before its kernel (`tensor::BUSY_PREFETCH`). Off, those units read `B` in the job.
     pub fn set_busy_prefetch(&mut self, on: bool) {
         self.busy_prefetch = on;
+    }
+
+    /// Where, in a capture, each unit starts reading a product's weights ahead of it
+    /// ([`Session::set_weight_prefetch`], [`Session::set_busy_prefetch`]): after the last
+    /// weight-streaming product ([`PrefetchAnchor::Last`]), or after the last one the unit itself
+    /// took part in ([`PrefetchAnchor::Own`], the default), so a unit that sat out the last one
+    /// reads under it and the ops before it too (`TT_PREFETCH_ANCHOR=last|own-oldest` at open;
+    /// `docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`"). Placement only:
+    /// a busy unit's list moves no earlier than every op after it planned `DATA` below its ring,
+    /// and no `B` the capture allocated or wrote is read ahead, so the bits are the same. Cached
+    /// residency plans are dropped: they hold each op's layout.
+    pub fn set_prefetch_anchor(&mut self, anchor: PrefetchAnchor) {
+        self.anchor_mode = anchor;
+        self.plans.clear();
+        self.planned_base = None;
     }
 
     /// Keep `bytes` at the top of each unit's `DATA` arena for a persistent region in every capture

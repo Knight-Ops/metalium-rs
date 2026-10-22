@@ -855,8 +855,49 @@ the host ~0.8).
   - **The firmware follow-up is not built:** an in-op signal (NC writes the partial into the spare unit's reload slot
     and increments a flag there; B waits on its own flag) would remove only the second op's ~17 us a layer, not the
     contention or `qkv`'s later start. Revisit if `down`'s span ever runs below the aggregate stream.
-- [ ] **The GDDR idle before `o`** (~50 us a layer, profile `1792678073`): `o`'s 17 MB lands in ~35 us of a 64 us
-  window, and `gate|up`'s prefetch starts only at `o`'s barrier. The next lever of "The stream's rate".
+- [x] **The GDDR idle before `o`: each unit's own prefetch anchor** (2026-10-22; `Session::set_prefetch_anchor`,
+  `PrefetchAnchor::Own` on by default, `TT_PREFETCH_ANCHOR=last|own-oldest`). `o`'s 17 MB landed in ~35 us of a 64 us
+  window (profile `1792678073`), and `gate|up`'s prefetch started only at `o`'s barrier: every prefetch was anchored at
+  the last weight-streaming product, though units 24-63 take no `o` job and 104-119 run nothing.
+  - **What changed:** each unit is anchored at the last such product it took part in (its stream grew in it; a unit
+    that took part in none, at the first) (`trace::Capture::unit_anchors`).
+    - An idle unit's `PREFETCH` list waits for its own anchor's barrier. Which barrier is recorded in
+      `OpRecord::ahead_waits`.
+    - A busy unit's `BUSY_PREFETCH` list moves back as far as its own anchor, but never across an op that planned into
+      its ring or did not plan at all (`session::busy_start`).
+  - **Guards:**
+    - A `B` the capture allocated or wrote in place (`trace::Capture::written`, the `drop_twin` writers and in-place
+      padding fills) is never read ahead. This hole was latent under the old anchor too.
+    - Probe-background units are never taken.
+    - Changing the anchor drops cached plans.
+  - **Gates:**
+    - `step205`:
+      - `own_anchors_start_a_prefetch_under_the_products_its_units_sat_out`: under `OwnOldest` the third product takes
+        units 6-7, and their lists wait for the first product's barrier;
+      - `a_b_the_capture_makes_is_not_read_ahead`, **watched failing** with the guard probed off
+        (`session::probe_stale_b`): `OwnOldest`'s replays read the `B` before it is made, `Last`'s do not;
+      - `a_busy_unit_reads_ahead_from_its_own_anchor_but_not_across_an_op_in_its_ring`, **watched failing** with
+        `l1_top` probed away (`session::probe_busy_ignore_tops`): the list moves across a 64-row product in its ring
+        and the bits differ;
+      - claim five is pinned to `Last`.
+    - The unit test `a_moved_block_leaves_every_op_its_own_entries` now covers a move across an op the unit sat out.
+    - ttsim: `step205`, `step214`, `step216`.
+    - Card 0 under `own-oldest`:
+      - `step185`, `step187`, `step188` (bit for bit), `step191`, `1792694043` (claim five failed there, since it
+        assumed the old anchor; it is now pinned to `Last`);
+      - `step205`, `step216`, `step219`: 22 of 22, `1792694391`.
+    - `--smoke` on card 0 with `Own` the default: 1,188 of 1,188 (`1792696786`, `step12_mnist` included).
+  - **Measured** (card 0, every tile, 32 / 256-token prompts; [log](../learnings/performance-log.md#each-units-own-prefetch-anchor-2026-10-22-card-0)):
+    - last 16.87 / 18.29 ms (`1792695646`), **own 16.79 / 18.20** (`1792695341`);
+    - own with the longest-idle units first 17.13 / 18.67 (`1792694718`);
+    - own with 48 / 56 / 32 idle units 17.15 / 18.54, 17.30 / 18.59, 16.84 / 18.24;
+    - the 135M 0.01-0.03 ms slower; ResNet-18 and ViT-Tiny unchanged.
+  - **The profile** (`1792696105`): a layer is 661.6 -> 657.3 us (`gate|up` 235 -> 232, `down` 179 -> 173); the small ops
+    in the window are 0.5-1.4 us slower each; the weights stream at 429 GB/s.
+  - **What it says:** the bytes read ahead are the same 3.48 GB. A unit's arena holds one job's `B`, so the window
+    carries the same reads sooner and cannot carry more. Adding idle units costs the small ops more than it gives.
+  - **Next:** what binds the window is L1 per unit, i.e. the space audit's candidates (the block copies' batch, layer
+    sub-traces). The next lever of "The stream's rate" is room for a second job's `B`, not an earlier start.
 - [ ] **With the next record or mover change:** `record::PrefetchCursor::new` does not refuse `GATHER_STREAM |
   GATHER_PREFETCH`, though its doc says it refuses what the expansion refuses (`expand_for` does, with `RANGE`); only
   the host's check stops the pair today (found 2026-10-22). Refuse it in the cursor, cover it in the cursor-against-

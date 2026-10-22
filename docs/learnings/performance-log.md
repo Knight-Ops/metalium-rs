@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Each unit's own prefetch anchor](#each-units-own-prefetch-anchor-2026-10-22-card-0) | 2026-10-22 | each unit's prefetch anchored at the last weight-streaming product it took part in, not the last overall: `gate\|up`'s busy units that sat out `o` read under RoPE, the cache write and attention; a 1.7B step 16.87 / 18.29 -> **16.79 / 18.20 ms**, 429 GB/s, the same 3.48 GB read ahead (L1 holds one job a unit); the 135M 0.01-0.03 ms slower; on by default |
 | [A column's `K` chain handed between two units](#a-columns-k-chain-handed-between-two-units-2026-10-22-card-0) | 2026-10-22 | `down`'s whole columns handed at a chunk to spare units, as a second op, bit for bit: a 1.7B step 16.88 / 18.32 -> **17.07 / 18.51 ms** (slower; opt-in): `down` 179 -> 172 us, but the halves contend at GDDR (up to 137 us, not ~88) and `qkv` 51 -> 72 us as the spare units start its read ahead later |
 | [`down` prefetched, and the unit counts re-swept](#down-prefetched-and-the-unit-counts-re-swept-2026-10-22-card-0) | 2026-10-22 | each of 40 idle units reads a streamed column's first two chunks ahead: a 1.7B step 17.29 / 18.72 -> **16.87 / 18.30 ms**, 426 GB/s, `qkv` 90 -> 51 us a layer; the prefetch and stream unit counts kept at 40 / 64 / 40; `down`'s 24 busy units now bind it (a whole column each at one unit's rate) |
 | [The weight stream metered](#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0) | 2026-10-22 | prefetched bytes charged to their product, the prefetch `WAIT` stamped, every unit timed: a 1.7B step's weights stream at **389 GB/s**, 2.97 GB read ahead; unit 0 waits 28 / 67 us a layer for its own prefetch in `qkv` / `gate\|up`; the units read unevenly by where they sit among the readers; a weight stream's reads at 2 in flight even them out: a 1.7B step 18.44 / 19.83 -> **17.27 / 18.71 ms**, 416 GB/s, the 135M unchanged |
@@ -347,6 +348,49 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Each unit's own prefetch anchor (2026-10-22, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, "The GDDR idle before `o`". 1.7B, every tile
+(`TT_TILES=all`), release, the defaults, `traced_generation_stream_ceiling`, 2 warmups and 9 samples, validated; decode
+step at 32 / 256-token prompts.
+
+- **What changed:** every prefetch was anchored at the last weight-streaming product, so `gate|up`'s reads waited for
+  `o`'s barrier even on units that sat `o` out (24-63 take no `o` job; 104-119 run nothing). Now each unit is anchored
+  at the last such product it took part in (`Session::set_prefetch_anchor`, `PrefetchAnchor::Own`):
+  - an idle unit's `PREFETCH` list waits for its own anchor's barrier;
+  - a busy unit's `BUSY_PREFETCH` list moves back as far as its anchor, but never across an op that planned into its
+    ring or did not plan at all (`busy_start`).
+
+  Two guards came with it. A `B` the capture allocated or wrote in place is never read ahead; that hole was latent
+  under the old anchor too. Probe units are never taken.
+- **Measured:**
+
+  | Anchor (idle prefetch units) | ms | Run |
+  |---|--:|---|
+  | last (40), before | 16.86 / 18.33; 16.87 / 18.29 | `1792694419`, `1792695646` |
+  | **own (40)** | **16.80 / 18.21; 16.79 / 18.20** | `1792694569`, `1792695341` |
+  | own, the longest-idle units first (40) | 17.13 / 18.67 | `1792694718` |
+  | own (48 / 56 / 32) | 17.15 / 18.54; 17.30 / 18.59; 16.84 / 18.24 | `1792694880`, `1792695030`, `1792695180` |
+
+  The other traced workloads, own against last (`1792695341`, `1792695646`):
+  - the 135M decode step is 7.62 / 8.31 / 9.10 against 7.61 / 8.28 / 9.07 ms (0.1-0.3% slower);
+  - prefill is unchanged;
+  - ResNet-18 is 14.12 against 14.14, and ViT-Tiny 9.18 against 9.21 (no packed products, so no anchors).
+- **The profile** (`Step(64)`, `1792696105`, against `1792678073`): a layer is 661.6 -> 657.3 us.
+  - `gate|up` 235.2 -> 231.7 and `down` 178.9 -> 172.8.
+  - RoPE, the row scatter, `o` and `silu_mul` are each 0.5-1.4 us slower: they now run under `gate|up`'s reads.
+  - The weights stream at 429 GB/s (426).
+  - **The bytes read ahead are unchanged** (3,480 MB; `gate|up`'s 55.4 MB): the anchor moves the same reads earlier
+    but cannot add reads.
+- **What it says:**
+  - A unit holds one job's `B` (one ring in its arena), so the window before `o` carries what units 24-63 already
+    read after `o`, sooner. It cannot carry more.
+  - Idle units added to fill it (48, 56, or the longest-idle first, which takes units 104-119 for `o`) cost the
+    small ops more than they give.
+  - The window is bound by L1, as the Phase 8 probe predicted ("~0.6 ms a step for every 100 KB a unit freed").
+  - **On by default** (`TT_PREFETCH_ANCHOR=last` restores the old anchor): 0.08-0.11 ms on the 1.7B, against the
+    135M's 0.01-0.03.
 
 ## A column's `K` chain handed between two units (2026-10-22, card 0)
 

@@ -1518,8 +1518,9 @@ pub const PREFETCH: &str = "weight prefetch";
 /// is called (`docs/plans/decode-to-bandwidth.md` Phase 8): its `GATHER` carries
 /// [`record::GATHER_PREFETCH`], so the ops' own drains leave its reads in flight, and the job's
 /// gather list ends with the `WAIT` that drains them. The capture moves it back in the unit's
-/// stream to just after the last weight-streaming product; the capture's own run, and any run
-/// that is not captured, read it where the job is.
+/// stream to just after the last weight-streaming product, or towards the last one the unit took
+/// part in (`Session::set_prefetch_anchor`); the capture's own run, and any run that is not
+/// captured, read it where the job is.
 pub const BUSY_PREFETCH: &str = "busy weight prefetch";
 
 /// What the first op's list on a unit that takes the rest of a handed column is called
@@ -2086,7 +2087,7 @@ impl BlockPlan {
     /// `u`'s `k`th job at `k spread + u`, a prefetching unit's at its own index. A prefetching
     /// unit's `B` slots are the job's own, written by its `PREFETCH` list and read by its kernel,
     /// with nothing on the unit between the two (the session takes as prefetching only units
-    /// idle since the last product; a streamed job's third chunk refills the first half only
+    /// idle since their anchor product; a streamed job's third chunk refills the first half only
     /// after the first chunk's kernel, as unprefetched), so each output column is its
     /// unprefetched self, bit for bit.
     ///

@@ -170,6 +170,10 @@ pub struct OpRecord {
     /// out of them to before the ops it runs under. Their bytes are counted as the op's
     /// (`OpBytes::ahead`).
     pub ahead: Vec<(usize, core::ops::Range<usize>)>,
+    /// For each idle unit's `PREFETCH` list in `ahead`, (unit, the barrier target it waits for,
+    /// relative to the capture's first): the product it is anchored at
+    /// (`Session::set_prefetch_anchor`).
+    pub ahead_waits: Vec<(usize, u32)>,
     /// The highest `DATA` address its L1 plans reached ([`crate::l1::take_planned_top`]): what it
     /// needs of a unit's arena. Zero where its layout was not planned while it was captured.
     pub l1_top: u64,
@@ -356,6 +360,14 @@ pub(crate) struct Capture {
     pub(crate) weight_anchor: Option<(u32, Vec<usize>)>,
     /// The units that product ran on: the rest are where the next one's weights stream.
     pub(crate) weight_units: usize,
+    /// Each unit's own anchor (`Session::set_prefetch_anchor`): the barrier target (relative)
+    /// of the last weight-streaming product the unit took part in -- its stream grew in it --
+    /// and its stream length after it, or after the first such product for a unit that has
+    /// taken part in none. Indexed by unit; empty before the first.
+    pub(crate) unit_anchors: Vec<Option<(u32, usize)>>,
+    /// Tensors the capture wrote in place (`Session::drop_twin`'s writers): a product whose `B`
+    /// is one of them, or was allocated in the capture, reads no `B` ahead of its own op.
+    pub(crate) written: Vec<crate::tensor::Placement>,
     /// Where the persistent region begins, if the capture keeps one (`Session::set_l1_region`):
     /// every op it holds planned below it ([`crate::l1::arena`]).
     pub(crate) region_base: Option<u64>,
@@ -565,6 +577,7 @@ mod tests {
                     stamps: [0; 2],
                     bytes: Default::default(),
                     ahead: Vec::new(),
+                    ahead_waits: Vec::new(),
                     l1_top: 0,
                     l1_need: 0,
                     shape: 0,
@@ -573,6 +586,8 @@ mod tests {
             failed: false,
             weight_anchor: None,
             weight_units: 0,
+            unit_anchors: Vec::new(),
+            written: Vec::new(),
             region_base: None,
             applied: None,
             plan_mismatch: None,
@@ -637,6 +652,24 @@ mod tests {
         assert_eq!(ops[1], [7, 8, 9]);
         let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
         assert_eq!(&order[..2], [5, 6]);
+        // Back past several ops, one of them with no entries on the unit (a product it sat out,
+        // `Session::set_prefetch_anchor`), a PAIR_CALL and an earlier op's list read ahead: the
+        // block 16..18 of the last op moves to 3, after the first op.
+        let mut c = numbered(20, &[7], &[0..3, 3..8, 8..8, 8..12, 12..20]);
+        c.ops[3].ahead.push((0, 9..11));
+        c.move_block(0, 16..18, 3);
+        let (ops, calls) = contents(&c);
+        assert_eq!(ops[0], [0, 1, 2]);
+        assert_eq!(ops[1], [3, 4, 5, 6, 7]);
+        assert!(ops[2].is_empty(), "the op it sat out holds nothing");
+        assert_eq!(ops[3], [8, 9, 10, 11]);
+        assert_eq!(ops[4], [12, 13, 14, 15, 18, 19]);
+        assert_eq!(calls, [7]);
+        let r = c.ops[3].ahead[0].1.clone();
+        let read: Vec<u32> = c.units[0].stream[r].iter().map(|e| e[1]).collect();
+        assert_eq!(read, [9, 10], "the list read ahead follows its entries");
+        let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
+        assert_eq!(&order[..6], [0, 1, 2, 16, 17, 3]);
     }
 
     #[test]
