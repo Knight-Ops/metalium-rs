@@ -1211,6 +1211,37 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
 ///
 /// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
 /// cache with one 64-token chunk; prompts of 32 and 256 tokens, `TT_GEN_NEW` tokens each.
+/// NC's waits over one generation of `new` tokens from a `len`-token prompt
+/// (`burn_tt::probe_nc_waits`), per decode step (the prompt's replays included): the units' mean
+/// and the busiest unit's, in us at the profile mode's measured 1350 ticks/us.
+fn report_nc_waits(waits: &[[u32; 8]], len: usize, new: usize) {
+    let us = |c: f64| c / 1350.0 / new as f64;
+    let names = ["fetch", "credits", "drain", "issue", "call", "B pump"];
+    let busy: Vec<&[u32; 8]> = waits.iter().filter(|w| w.iter().any(|&c| c > 0)).collect();
+    let mut line = format!(
+        "NC waits, {len}-token prompt, {} units, us a step:",
+        busy.len()
+    );
+    // The pump's issuing turns, a step, and the longest one, in us.
+    let turns = busy.iter().map(|w| w[6]).max().unwrap_or(0);
+    let longest = busy.iter().map(|w| w[7]).max().unwrap_or(0);
+    line += &format!(
+        " B pump turns max {} a step, longest {:.1} us;",
+        turns as usize / new,
+        longest as f64 / 1350.0
+    );
+    for (k, name) in names.iter().enumerate() {
+        let sum: f64 = busy.iter().map(|w| w[k] as f64).sum();
+        let max = busy.iter().map(|w| w[k]).max().unwrap_or(0) as f64;
+        line += &format!(
+            " {name} mean {:.1} max {:.1};",
+            us(sum / busy.len().max(1) as f64),
+            us(max)
+        );
+    }
+    println!("{line}");
+}
+
 #[test]
 #[ignore = "a probe: cargo xtask bench --filter silicon_bench_models::traced_generation_stream_ceiling"]
 fn traced_generation_stream_ceiling() {
@@ -1251,6 +1282,7 @@ fn traced_generation_stream_ceiling() {
     probe_background_stream(background);
     probe_space_report(true);
     let residency = std::env::var("TT_PROBE_RESIDENCY").is_ok_and(|v| v == "1");
+    let nc_waits = std::env::var("TT_PROBE_NC_WAITS").is_ok_and(|v| v == "1");
     tt_kernels::residency::probe_residency_plan(residency);
     with_device(Config::default(), |d| {
         conditions(card());
@@ -1277,7 +1309,16 @@ fn traced_generation_stream_ceiling() {
             let p = gen_prompt(len, config.vocab);
             let mut step = Vec::new();
             for i in 0..WARMUPS + SAMPLES {
+                // With `TT_PROBE_NC_WAITS=1`, NC's waits over one measured generation (firmware
+                // built with the profile feature): what B's waits for its writer are made of.
+                let nc_waits = nc_waits && i == WARMUPS;
+                if nc_waits {
+                    burn_tt::probe_nc_waits(d).unwrap();
+                }
                 let out = g.generate_tokens(&p, new).unwrap();
+                if nc_waits {
+                    report_nc_waits(&burn_tt::probe_nc_waits(d).unwrap(), len, new);
+                }
                 if i >= WARMUPS {
                     step.push(median_ms(&out.times[1..]));
                 }

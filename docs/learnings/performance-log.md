@@ -345,6 +345,99 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## Phase 4 re-scoped and a trace's reader sections read ahead: the small ops shorter, the step not (2026-10-21, card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) Phases 4 and 5a. Conditions as the entry below (1.7B, every
+tile, `TT_TILES=all`, release, residency and busy prefetch at cap 2 on, `traced_generation_stream_ceiling`, 2 warmups and
+9 samples, validated). The bench needs `TT_TILES=all`: on one tile its traces hold 200 KB of programs and attention's
+next list does not fit the 240 KB cache (`1792619251`, refused by name).
+
+- **What changed:** the row scatter reads its indices' face, not the whole index tile (64 B a decode step's position, not
+  4,160); the planner also tries leaving out first what spares the least GDDR a byte (it keeps the plan that spares
+  more: on the 1.7B the plan is the same, the region 95,680 of 98,304 bytes, and the mask's 8,320 and RoPE's tables'
+  4,160 do not fit what is left); B reads a replay's next `PAIR_CALL`'s first reader chunk ahead on a transaction ID of
+  its own (`dm::TXN_FETCH`), while it waits for the pair before it.
+
+  | 1.7B step, ms | 32 / 256-token prompt | Run |
+  |---|--:|---|
+  | before (the default) | 18.39 / 19.90 | `1792615740` |
+  | the index read only | 18.32 / 19.78 | `1792619550` |
+  | and the sections read ahead | 18.44 / 19.83 | `1792619858` |
+  | the same, prefetch cap 3 / 4 | 18.25 / 20.02; 18.31 / 20.20 | `1792620617`, `1792620765` |
+  | the same, busy prefetch off | **19.27 / 20.48** (19.51 / 20.76 before, `1792615881`) | `1792620919` |
+
+- **The profile** (`Step(64)`, `--profile`, `1792620146`, against `1792609145`): the small ops **5.00 -> 4.47 ms** (fetch
+  0.83 -> 0.23, control 0.57 -> 0.75, barrier 1.32 -> 1.14, writer 0.49 -> 0.32); RMSNorm 0.89 -> 0.67 ms (fetch 35%
+  -> 6%), `gamma`'s multiply's fetch 31% -> 15%, the cache write 0.48 -> 0.28 ms. **But the products 12.92 -> 13.46
+  ms**, and the summed spans are 17.93 against 17.92.
+- **What it says:** under busy prefetch the step is bound by the weight stream the small ops' windows carry, not by the
+  small ops. What they give up, the next product waits for (its data share is unchanged at 75%, its barriers 15% ->
+  17%). Off, the same changes are worth 0.24 / 0.28 ms. The products take 5.26 GB in 13.46 ms, about 391 GB/s: the
+  lever now is the rate the weights stream at, not the small ops' length.
+- **135M** (no busy prefetch: its `K` is 576): **7.61 / 9.06 ms** against 7.74 / 9.16 (`1792621076`).
+
+## Busy prefetch held back by a shared transaction count, and fixed (2026-10-21, card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) 3b; [operating
+notes](silicon-operating-notes.md#a-transaction-ids-outstanding-count-is-the-tiles-not-the-cores-2026-10-21-card-0).
+Conditions as the entry below (1.7B, every tile, release, residency on, `traced_generation_stream_ceiling`).
+
+- **The add's 70.5 us under busy prefetch (cap 2), split** by the profile mode's new `fetch` and `writer` stamps
+  (`1792605585`; off `1792605144`): writer 66%, barrier 25%, fetch 2%, data 5%; off, 8.1 us with writer 19%.
+- **NC's own waits** (profile image, `TT_PROBE_NC_WAITS=1`, a step, units' mean / busiest; off then on): fetch 98 / 189
+  then 88 / 177 us; credits 7.7 / 16.7 then 6.1 / 13.1 ms (the products' compute, shorter with the prefetch); drain 29
+  / 65 then 30 / 68 us; L1 write issue 106 / 219 then 106 / 215 us; a `CALL` less its parts ~397 us both ways. B's pump:
+  at most 7,488 issuing turns a step, the longest 0.4 us. None of it was the add's wait: NC's list-end drain of the
+  prefetch ID (the NIU's count, B's reads) was.
+- **After the fix** (only B drains the prefetch ID):
+
+  | Busy prefetch | Off | Cap 1 | Cap 2 | Cap 4 | Cap 8 |
+  |---|--:|--:|--:|--:|--:|
+  | Step, ms | 19.51 / 20.75 | 19.71 / 20.46 | **18.40 / 19.92** | 18.73 / 20.54 | 19.08 / 20.74 |
+  | Run | `1792608298` | `1792608441` | `1792608583` | `1792608724` | `1792608865` |
+
+  Profile at cap 2 (`1792609145`): the add 12.8 us (70.5 before), products 12.92 ms (14.79 off), summed spans 17.92 ms
+  (19.01 off); RMSNorm's and `gamma`'s multiply's largest share is now `fetch` (35%, 31%), the trace's own reads.
+- **The other traced workloads, busy prefetch off / cap 2** (`1792612512` / `1792612811`): 135M decode step 7.74 / 8.37
+  / 9.16 against 7.77 / 8.38 / 9.17 ms, prefill 1575 / 4651 / 5863 against 1572 / 4652 / 5862 tokens/s; ResNet-18
+  traced 13.94 against 14.13 ms (between processes: 14.10, 14.11, 14.12, 13.94 alternating off and on,
+  `1792613197`-`1792613224`); ViT-Tiny 9.31 against 9.32. No change: none has a one-row product with `K` of 1,024 or
+  more, which busy prefetch needs. The 1.7B in the same runs 19.50 / 20.74 against 18.41 / 19.94.
+- **On by default** (busy prefetch, prefetch cap 2), no settings: 1.7B **18.39 / 19.90 ms** (`1792615740`, builds 65.4
+  / 11.4 s), `TT_BUSY_PREFETCH=0` 19.51 / 20.76 (`1792615881`).
+
+## The products' outputs in their readers' L1 (2026-10-21, card 0)
+
+[planned-l1-residency.md](../plans/planned-l1-residency.md) Phase 3. A product's `SCATTER` now counts as a plain write,
+so its output goes into the L1 of the units that read it (`WRITE_L1`, unicast to at most four readers), and a plan whose
+period pinning loses tensors for room is planned unpinned too. Conditions: every tile, release, F32, 512-position cache,
+`traced_generation_stream_ceiling`, decode-step medians at 32 / 256-token prompts, 2 warmups and 9 samples, validated.
+
+| 1.7B configuration | ms | First / second build | Run |
+|---|--:|--:|---|
+| residency off | 21.02 / 22.21 | 54.4 / 8.72 s | `1792593062` |
+| Phase 2 (2h, the default before) | 20.07 / 21.28 | 65.0 / 11.1 s | `1792554892` |
+| `SCATTER` plain, pinned plan | 20.00 / 21.18 | 64.3 / 11.1 s | `1792592920` |
+| **and the `Room` trigger (unpinned)** | **19.50 / 20.71** | 65.3 / 11.2 s | `1792595329` |
+| the same, busy prefetch cap 1 | 19.74 / 20.66 | | `1792595603` |
+| cap 2 | 19.75 / 21.37 | | `1792595746` |
+| cap 4 | 20.36 / 22.20 | | `1792595888` |
+| cap 8 | 20.63 / 22.31 | | `1792596032` |
+
+- **Why the pinned plan gained only 0.07 ms.** The residency report (`TT_PROBE_RESIDENCY=1`, `1792594850`) left 143
+  tensors out for room: the products' outputs (`qkv` 20,800 B a unit, `gate|up` and `silu_mul`'s output 33,280) and the
+  residual stream's two adds (12,480), which the leave-out order drops first because their classes live longest. The
+  layer before the period kept all of its own in a 79 KB region. Unpinned (`1792595172`): 393 of 548 tensors resident in
+  95,680 of 98,304 bytes, 262 MB of reads and 122 MB of writes a step spared (pinned: 108 and 36).
+- **The profile** (`Step(64)`, `--profile`, busy prefetch off, `1792596738`, against `1792538078`): products 14.75 ->
+  14.79 ms, their writes 88.1 -> 6.3 MB; the adds 0.66 -> 0.39 ms (13.7 -> 8.0 us), RMSNorm 0.87 -> 0.67, RoPE 0.80 ->
+  0.68, `silu_mul` 0.45 -> 0.37; the add, RMSNorm and `silu_mul` read no GDDR. Summed spans 19.58 -> 19.01 ms.
+- **Busy prefetch** (cap 2, `1792597186`): the products 14.79 -> 11.25 ms, but the adds 0.39 -> 3.38 ms (70.5 us each)
+  with no GDDR read left, RoPE 0.68 -> 1.18, RMSNorm 0.67 -> 1.14: the wait is not at the GDDR controllers (operating
+  notes, "GDDR reads are one queue", the 2026-10-21 correction).
+- **135M** (same bench): on **7.74 / 9.18 ms** (`1792597666`), off 8.17 / 9.58 (`1792597699`); Phase 2 was 8.12 / 9.57.
+- **Gates:** card 0 `1792596373` (`step217`, `step219`, `step220`, `step188`, `step193`, `step209`, `step210`, 27 of 27); `--smoke` 1,180 of 1,180 (`1792597728`).
+
 ## Residency on by default, its region sized under the products' cliff (2026-10-21, card 0)
 
 [planned-l1-residency.md](../plans/planned-l1-residency.md) 2h.

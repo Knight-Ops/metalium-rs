@@ -344,7 +344,7 @@ pub(crate) fn scatter_rows_work(dst: &DramTensor, n: usize, values_tiles: usize)
 /// batch the record writes a repeated row once, from its last index. With one
 /// batch of indices (32 or fewer: a decode step's row a head), units left
 /// over after the column groups split the indices into ranges, at least
-/// [`SCATTER_SPLIT_ROWS`] each: every job reads the whole index tile, and a
+/// [`SCATTER_SPLIT_ROWS`] each: every job reads every index, and a
 /// repeated row is written only by the job whose range holds its last index
 /// (`record::scatter_rows_range`), so still once.
 pub(crate) fn scatter_rows_jobs(
@@ -464,7 +464,21 @@ pub(crate) fn scatter_rows_jobs(
                     } else {
                         indices.tile(0, b)
                     };
-                    let mut read_side = vec![read(index_tile, at, 0)];
+                    // Sixteen indices or fewer sit in face 0, which the record reads alone:
+                    // its row 0 (`[1, n]`), or its first rows' column 0 (`[n, 1]`), from
+                    // `TILE_DATA` on. A decode step's one position is 64 bytes, not the tile.
+                    let count = 32.min(n - b * 32) as u64;
+                    let read_index = if count <= 16 {
+                        let len = if column { count * 64 } else { 64 };
+                        let mut r = read(index_tile, at, 0);
+                        r[3] = (index_tile.offset() + TILE_DATA) as u32;
+                        r[4] = (at + TILE_DATA) as u32;
+                        r[5] = len as u32;
+                        r
+                    } else {
+                        read(index_tile, at, 0)
+                    };
+                    let mut read_side = vec![read_index];
                     for j in j0..j1 {
                         let slot = first + (j - j0) as u64 * TILE_SLOT;
                         read_side.push(read(vt.tile(v0[0] + b, v0[1] + j), slot, j - j0 + 1));

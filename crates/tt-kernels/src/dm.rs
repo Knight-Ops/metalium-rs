@@ -303,12 +303,12 @@ impl<N: NocId> DataMover<N> {
         }
         d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), dm::TILE_IN_FLIGHT_CAP)?;
         if mover.core == tt_isa::tensix::Core::B {
-            // `TT_PREFETCH_CAP` (a development knob, decode-to-bandwidth.md Phase 8): the prefetch
-            // reads' cap; unset or 0, `TILE_IN_FLIGHT_CAP`.
+            // The prefetch reads' cap: `PREFETCH_CAP_DEFAULT`, or `TT_PREFETCH_CAP` (a development
+            // knob, decode-to-bandwidth.md Phase 8; 0 is `TILE_IN_FLIGHT_CAP`).
             let cap = std::env::var("TT_PREFETCH_CAP")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+                .unwrap_or(dm::PREFETCH_CAP_DEFAULT);
             d.write32(w, tile, mover.at(dm::PREFETCH_CAP), cap)?;
             // The semantic guard of an `encoded-guard` image (`encoded::guard`): which
             // `TARG_ADDR_HI` words are a usable DRAM endpoint. Other images ignore it.
@@ -395,6 +395,27 @@ impl<N: NocId> DataMover<N> {
         self.mover
     }
 
+    /// NC's waits since they were last taken, in tile cycles, in `tt_isa::dataflow::NcWait` order
+    /// (`tt_isa::dataflow::NC_WAITS`; counted only by an image built with the profile feature),
+    /// and zeroed. `None` for B. Dev-facing.
+    pub fn take_nc_waits<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+    ) -> Result<Option<[u32; 8]>> {
+        use tt_isa::dataflow::{NC_WAITS, NC_WAIT_WORDS};
+        if self.mover != dm::Mover::NC {
+            return Ok(None);
+        }
+        let mut out = [0u32; NC_WAIT_WORDS as usize];
+        for (k, v) in out.iter_mut().enumerate() {
+            let at = NC_WAITS + k as u64 * 4;
+            *v = d.read32(w, self.tile, at)?;
+            d.write32(w, self.tile, at, 0)?;
+        }
+        Ok(Some(out))
+    }
+
     /// What the in-flight cap (`tt_isa::noc::niu::InFlight`) has cost this
     /// mover since it started: the requests that waited for room, and the tile
     /// cycles they waited. Two PCIe reads; not on any hot path.
@@ -405,13 +426,8 @@ impl<N: NocId> DataMover<N> {
         })
     }
 
-    /// Cap this mover's requests in flight at `cap` from its next list: 0 for
-    /// `tt_isa::noc::niu::MAX_IN_FLIGHT`, otherwise clamped to
-    /// `1..=MAX_IN_FLIGHT`. A mover starts at `dm::TILE_IN_FLIGHT_CAP`; this is
-    /// for the gates that force the throttle and the benchmarks that compare
-    /// caps.
     /// Cap this mover's prefetch reads (`dm::TXN_PREFETCH`) in flight at `cap` from its next list
-    /// (0: `dm::TILE_IN_FLIGHT_CAP`).
+    /// (0: `dm::TILE_IN_FLIGHT_CAP`). A mover starts at `dm::PREFETCH_CAP_DEFAULT`.
     pub fn set_prefetch_cap<T: Transport>(
         &self,
         d: &mut Device<T>,
@@ -422,6 +438,11 @@ impl<N: NocId> DataMover<N> {
         Ok(())
     }
 
+    /// Cap this mover's requests in flight at `cap` from its next list: 0 for
+    /// `tt_isa::noc::niu::MAX_IN_FLIGHT`, otherwise clamped to
+    /// `1..=MAX_IN_FLIGHT`. A mover starts at `dm::TILE_IN_FLIGHT_CAP`; this is
+    /// for the gates that force the throttle and the benchmarks that compare
+    /// caps.
     pub fn set_in_flight_cap<T: Transport>(
         &self,
         d: &mut Device<T>,

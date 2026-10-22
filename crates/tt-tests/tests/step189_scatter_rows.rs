@@ -23,8 +23,12 @@
 //!   downloaded, no mask loop), a trace replays it at the indices it finds,
 //!   and a ragged result feeds reductions and matmuls exactly.
 //!
+//! Sixteen indices or fewer are read as their tile's face 0 alone (a decode step's one
+//! position is 64 bytes, not the tile): 16 and 17 indices of each form are among the cases.
+//!
 //! Watched failing: with the tile copy skipped (the table is written), with the
-//! column flag dropped (the wrong words read as indices), and, in the record's
+//! column flag dropped (the wrong words read as indices), with a column of
+//! sixteen indices read as 64 bytes (the rest stale), and, in the record's
 //! unit tests (`tt_isa::dm::record`), with the face row off by one and with
 //! the repeated-row check removed.
 
@@ -175,7 +179,7 @@ fn scattered_rows_are_the_host_s_writes_bit_for_bit() {
         for (rows, cols) in [(100, 70), (64, 64), (33, 32), (40, 800), (97, 33)] {
             let bits = raw_bits(rows as u64 * 1000 + cols as u64, rows * cols);
             let table = s.upload_bits(&bits, rows, cols, Elem::F32).unwrap();
-            for n in [1usize, 31, 32, 33, 70] {
+            for n in [1usize, 16, 17, 31, 32, 33, 70] {
                 let idx = indices(rows, n);
                 let values = raw_bits(n as u64 * 7 + 3, n * cols);
                 let dv = s.upload_bits(&values, n, cols, Elem::F32).unwrap();

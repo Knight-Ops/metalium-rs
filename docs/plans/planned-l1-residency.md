@@ -1,9 +1,15 @@
 # Planned L1 residency: activations that survive between ops
 
-Status: **scheduled; Phases 1 and 2 done** (2026-10-21; a proposal until 2026-10-20): rows read whole on many units
+Status: **scheduled; Phases 1, 2 and 3 done** (2026-10-21; a proposal until 2026-10-20): rows read whole on many units
 held by two of their readers (2f), never-read writes dropped (2g), the region sized by its plan under the products' cliff,
 plans cached, and residency **on by default** (2h): a 1.7B step 21.00 / 22.25 -> 20.07 / 21.28 ms; slower builds
-accepted. Next: Phase 3. Asked for after Phase 8 of
+accepted. Phase 3, the products' outputs written into their readers' L1: **19.50 / 20.71 ms**, the residual stream,
+RMSNorm and `silu_mul` reading no GDDR; and, found by probing why busy-unit prefetch still did not pay, NC no longer
+waits for B's prefetch reads at a list's end, so busy prefetch is on by default at a prefetch cap of 2: **18.39 / 19.90
+ms**. Phase 4, re-scoped (q and the context were resident already): the cache write's index read narrowed and a second
+leave-out order; Phase 5a, a replay's next reader section read ahead: the small ops 5.00 -> 4.47 ms, **the step
+unchanged** (18.32-18.44 / 19.78-19.83 ms), the weight stream under busy prefetch taking what they gave up. Next: the
+rate the weights stream at, not the small ops (Phase 5b, the stored layer, deferred on that finding). Asked for after Phase 8 of
 [decode-to-bandwidth.md](decode-to-bandwidth.md): the space audit, busy-unit prefetch and the prefetch pump.
 It is the "sharded, L1-resident tensors" gap of [tt-metal-concepts-review.md](../learnings/tt-metal-concepts-review.md)
 (G12). That gap was deferred "until a measured op chain is GDDR-bound", and that measurement now exists. It is designed
@@ -553,11 +559,182 @@ Add, RMSNorm, `gamma`'s multiply, and the next product's packed `A`. This is wha
     - make `Applied::verify` share `check_op`'s walk;
     - keep plans across processes, keyed as the cache is.
 
+### Phase 3. The products' outputs into their readers' L1 (done 2026-10-21)
+
+`qkv` → RoPE and the cache write, `gate|up` → `silu_mul`, `o` and `down` → the residual adds. A product writes its
+output with NC's `SCATTER` record (`tensor.rs` `push_jobs`, `push_stream_jobs`, `push_k_jobs`), which the plan did not
+count as a plain move, so every product's output had `Reason::NoPath` and stayed in GDDR (2e: "the residual add still
+reads the product's output from GDDR").
+
+- [x] **3a. `SCATTER` as a plain write** (`residency::plain`). A `SCATTER` expands to whole-tile `WRITE`s exactly as a
+  `WRITE_RUN` does, and `Applied::rewrite` already expands records on the host, so the output side needed no new record,
+  no firmware change and no change to the products' builders: each output tile becomes a `WRITE_L1` to each unit that
+  reads it. Every reader's input was already plain (RoPE's `READ_RUN`s and partner `READ`s, `silu_mul`'s and the add's
+  flagless `READ_RUN`s, the cache write's `READ`s). A K-blocked product that reloads its partials (prefill's `down`)
+  still reads and writes `C` in one op (`ReadAndWritten`) and stays in GDDR.
+- [x] **Unicast to few readers** (`residency::UNICAST_READERS` = 4). A tile at most four units besides its writer read
+  goes to each by `WRITE_L1`, not by a multicast over their rectangles: RoPE reads each `qkv` tile on two neighbouring
+  units, and many producers' path-reserved multicasts serialize (2e). Not measured apart from 3a.
+- [x] **A pinning that costs room is not kept** (`Plan::make_rows`). Pinned, an address holds its class's largest member
+  in every repeat, and the costliest class leaves first: with the products' outputs as candidates, the 1.7B's pinned plan
+  left 143 tensors out for room, the residual stream first (its classes live longest), and kept only 254 resident (the
+  layer outside the period kept all of its own). `Room` now also makes the planner plan without the pinning and keep the
+  plan that spares more: **393 of 548 tensors resident** (Phase 1's estimate was 401), 262 MB of reads and 122 MB of
+  writes a step spared (was 108 and 36), a region of 95,680 bytes of the 98,304 budget. **Cost:** a step's layers no
+  longer share addresses, which Phase 5's stored layer wants; programs are unaffected (the region's addresses are in
+  the movers' entries, not in kernels). Making the pinned assignment fit as tightly is part of Phase 5.
+- [x] **The report names what room left out** (`Plan::report`: `left xN Room (B a unit): ...`).
+- [x] **Gates** (ttsim, then card 0):
+  - `residency.rs` units `a_scatter_writes_into_its_readers_l1` (a `SCATTER`'s writes are plain and become a
+    `WRITE_L1` to each reader, by unicast to two neighbours; a reader reads its own region; watched failing with
+    `SCATTER` not plain and with the unicast rule off) and `a_pinning_that_costs_room_is_not_kept` (watched failing
+    without the `Room` trigger).
+  - `step219` `a_product_writes_into_the_residual_add_bit_for_bit`: norm, `gamma`, a `K` = 2048 product, the
+    residual add, on 8 units: bit for bit, the output resident, the planned trace moving fewer GDDR bytes by at least
+    what the output moved (20.6 -> 18.4 MB); **negative control:** the output placed over a tensor still to be read is
+    refused by `Plan::check` and, applied anyway, gives other bits. Watched failing with `SCATTER` not plain.
+  - `step219` `products_under_busy_prefetch_are_bit_for_bit`: two such layers with busy-unit prefetch on.
+  - `step219`'s Llama test now asserts the products' outputs resident in every trace (24 a trace, read by RoPE,
+    `silu_mul`, the adds, the cache write and attention): `Step(16)` 3.24 -> 1.53 MB of GDDR (2.14 at Phase 2),
+    `Chunk(4)` 4.09 -> 1.90 (2.52).
+  - Card 0: `step217`, `step219`, `step220`, `step188` (the 1.7B against Flex, and traced against eager; no planned
+    capture refused), `step193`, `step209`, `step210`, 27 of 27 (`1792596373`); `--smoke` 1,180 of 1,180 (`1792597728`, residency on,
+    `step12_mnist` included).
+- [x] **Measured** (1.7B, card 0, every tile, release, 32 / 256-token prompts, ms):
+
+  | | Step | Run |
+  |---|--:|---|
+  | residency off | 21.02 / 22.21 | `1792593062` |
+  | Phase 2 (2h) | 20.07 / 21.28 | `1792554892` |
+  | 3a, pinned plan | 20.00 / 21.18 | `1792592920` |
+  | **3a and the `Room` trigger** | **19.50 / 20.71** | `1792595329` |
+  | the same, busy prefetch cap 1 / 2 / 4 / 8 | 19.74 / 20.66; 19.75 / 21.37; 20.36 / 22.20; 20.63 / 22.31 | `1792595603`, `1792595746`, `1792595888`, `1792596032` |
+
+  The profile (`Step(64)`, `1792596738`, against Phase 2's `1792538078`): products 14.79 ms (unchanged) writing 6.3 MB
+  (was 88.1); the adds 0.66 -> **0.39 ms** (8.0 us each), RMSNorm 0.87 -> 0.67, RoPE 0.80 -> 0.68, `silu_mul` 0.45 ->
+  0.37; the add, RMSNorm and `silu_mul` read no GDDR, RoPE only its tables. 19.01 ms of summed spans, was 19.58.
+  The 135M: **7.74 / 9.18 ms** against 8.17 / 9.58 off (`1792597666`, `1792597699`; Phase 2 8.12 / 9.57).
+- **Finding: busy prefetch is no longer held back by GDDR.** With it on (cap 2, `1792597186`) the products go 14.79 ->
+  11.25 ms, but the adds 0.39 -> **3.38 ms (70.5 us each) while reading nothing from GDDR**, RoPE 0.68 -> 1.18, RMSNorm
+  0.67 -> 1.14. Phase 8's account ("GDDR is one queue": the add waits behind the stream at the controllers) does not
+  explain an op whose reads are all `READ_L1` of its own unit's region.
+- [x] **3b. The probe, and the fix** (2026-10-21, card 0). The wait was not the `READ_L1`s (the kernel entries that wait
+  for them stayed at 1%):
+  - **The profile mode stamps more** (firmware `profile` feature, `OPS` mode): B's fetches of a trace's stream chunks and
+    reader sections (`fetch`), and its waits for NC to finish a pair (`writer`), as entries headed by `CALL` and
+    `PAIR_CALL`, which no real stamped entry is (`tt_isa::dm::trace_mode::{FETCH, WRITER_WAIT}`); new columns in
+    `summary.md`, `ops.tsv` and `trace.json`. Under busy prefetch the add's 70.5 us were **66% `writer`**, 2% `fetch`
+    (`1792605585`; off, `1792605144`: 19% of 8.1 us).
+  - **NC counts its own waits** (a profile image only): its section fetches, credit waits, drains, L1 write issues and
+    whole `CALL`s, and B's pump turns, summed into `tt_isa::dataflow::NC_WAITS` (`Session::probe_nc_waits`,
+    `burn_tt::probe_nc_waits`, `TT_PROBE_NC_WAITS=1` on `traced_generation_stream_ceiling`). None changed with busy
+    prefetch; B's pump turns were at most 0.4 us each. What was left was NC's list-end `noc::wait(PREFETCH_TXN)`: a
+    transaction ID's outstanding count is the tile's NIU's, so NC waited for **B's** prefetch reads, which B kept in
+    flight by pumping more while it waited for NC
+    ([operating notes](../learnings/silicon-operating-notes.md#a-transaction-ids-outstanding-count-is-the-tiles-not-the-cores-2026-10-21-card-0)).
+  - **Fixed:** only B drains the prefetch ID at a list's end (`mover.rs` `finish_prefetch`). Busy prefetch pays:
+
+    | 1.7B step (ms), residency on | Busy prefetch off | cap 1 | cap 2 | cap 4 | cap 8 |
+    |---|--:|--:|--:|--:|--:|
+    | before the fix | 19.50 / 20.71 | 19.74 / 20.66 | 19.75 / 21.37 | 20.36 / 22.20 | 20.63 / 22.31 |
+    | after (`1792608298`-`1792608865`) | 19.51 / 20.75 | 19.71 / 20.46 | **18.40 / 19.92** | 18.73 / 20.54 | 19.08 / 20.74 |
+
+    The profile at cap 2 (`1792609145`): the add 12.8 us, products 12.92 ms (14.79 off), summed spans 17.92 ms (19.01
+    off). What the stream still costs the small ops is mostly the trace's own fetches (RMSNorm 35% `fetch`, `gamma`'s
+    multiply 31%): Phase 5's stored layer.
+  - **Gates** (the mover changed): `step50`, `step172`, `step173`, `step215`, `step216`, `step218`, `step219`, `step220`
+    on ttsim and on card 0 in the safe image (35 of 35, `1792609649`), `fast-reads` (40 of 40, `1792609825`) and
+    `fast-reads` + `encoded-guard` (41 of 41, `1792610007`); `step188`, `step193`, `step209`, `step210` (11 of 11,
+    `1792610184`) and, with busy prefetch at cap 2, `step188`, `step193`, `step216`, `step219` (17 of 17, `1792610404`, no
+    planned capture refused); `--smoke` 1,180 of 1,180 (`1792610630`); `silicon_profile_mode` (now asserting `fetch` and
+    `writer` are attributed, inside each op's span) and `step23` with the `profile` feature (6 of 6, `1792612369`). Firmware clippy plain, `profile`, `fast-reads`,
+    `encoded-guard`. **Not gated:** no test fails if NC waits on the prefetch ID again; the evidence is the profile
+    before and after.
+  - **The other traced workloads with it** (card 0, every tile, release; busy prefetch off / on at cap 2, `1792612512` /
+    `1792612811`): the 135M's decode step 7.74 / 8.37 / 9.16 against 7.77 / 8.38 / 9.17 ms, its prefill 1575 / 4651 /
+    5863 against 1572 / 4652 / 5862 tokens/s, its build 27.1 / 26.9 s; ResNet-18 traced 13.94 / 14.13 ms, ViT-Tiny 9.31 /
+    9.32. **None changes, as expected:** busy prefetch engages only for a one-row product with a packed `A`, which needs
+    `K` of at least 1,024 (`PACKED_A_K_TILES`): the 135M's width is 576, ViT's and ResNet's products have many rows or a
+    short `K`, and MNIST's training products have a batch of rows and `K` = 784. ResNet's 0.2 ms is between processes,
+    not the setting: four alternating runs gave 14.10 off, 14.11 on, 14.12 off, 13.94 on (`1792613197`-`1792613224`).
+    The 1.7B in the same runs: 19.50 / 20.74 off, **18.41 / 19.94** on. Gates with it on: `step165`, `step166`,
+    `step167` F32, `step185`, `step187`, 15 of 15 (`1792613099`), besides 3b's.
+  - [x] **Busy prefetch on by default, at a prefetch cap of 2** (2026-10-21): `Session`'s `busy_prefetch` is on
+    (`TT_BUSY_PREFETCH=0` turns it off) and a mover's prefetch ID starts at `dm::PREFETCH_CAP_DEFAULT` = 2
+    (`TT_PREFETCH_CAP` overrides; 0 is `TILE_IN_FLIGHT_CAP`). The cap is the idle units' prefetch's too; with busy
+    prefetch off, cap 2 and the old default of 8 measured alike (19.51 / 20.75, 19.50 / 20.71). `step215` now sets the
+    prefetch ID's full cap itself: its claim is that the ID is not the mover's own, measured at that cap. With no
+    settings: the 1.7B **18.39 / 19.90 ms** (`1792615740`), 19.51 / 20.76 with `TT_BUSY_PREFETCH=0` (`1792615881`);
+    gates `step165`-`step167`, `step185`, `step187`, `step188`, `step193`, `step209`, `step210`, `step215`-`step217`,
+    `step219`, `step220`, 44 of 44 (`1792613854`, no planned capture refused); `--smoke` 1,180 of 1,180
+    (`1792614168`); ttsim `step215`, `step216`, `step217`, `step219`.
+
+### Phase 4. Attention's operands (re-scoped, done 2026-10-21)
+
+Planned as "attention's rows and context, per head", but Phases 2 and 3 had made them resident already, with nothing
+attention-specific: RoPE's query is read by attention from L1, attention's packed context twin is held for `o`'s packed
+`A`, and the context's own row, which nothing reads, is never written (2g). What attention and its neighbours still read
+from GDDR in a 1.7B step (`Step(64)`, profile `1792609145`): the KV cache (state, by design), the mask (6.4 MB a step at
+64 positions, 51 MB at 512; `Room`), RoPE's cos and sin (25.6 MB; `Room`) and the cache write's I32 index tile (12.8 MB:
+64 units x 48 ops, a whole tile for one position).
+
+- [x] **The index read narrowed** (`index::scatter_rows_jobs`): sixteen indices or fewer sit in face 0, which
+  `SCATTER_ROWS` reads alone (row 0 of a `[1, n]` tensor's tile, column 0 of an `[n, 1]` one's first rows), so a batch
+  of them reads 64 bytes (`[1, n]`) or 64 a row (`[n, 1]`) from `TILE_DATA`, one `READ` as before. Gate `step189`, now
+  with 16 and 17 indices, row and column: bit for bit; **watched failing** with the column form read as 64 bytes (the
+  mover refuses the stale words as indices). The cache write 0.48 -> 0.28 ms a step.
+- [x] **A second leave-out order** (`Plan::make_rows`, `LeaveOut::LeastSpared`): where a class finds no room, each plan
+  is made again leaving out first the class that spares the fewest GDDR bytes a byte of its address, and the plan that
+  spares more is kept (the first on a tie). Unit `a_short_region_keeps_what_spares_most_a_byte` (a one-tile tensor
+  read by eight ops kept over a three-tile one read once): **watched failing** without the new order. **On the 1.7B it
+  changes nothing:** the region is 95,680 of 98,304 bytes and the mask (8,320) and the tables (4,160 each) do not fit the
+  2,624 left in either order. They would at the products' floor (110,464), not measured: the step is not bound by the
+  small ops (Phase 5a's finding).
+- [ ] **Not built: the mask read as row 0.** `SCALE_MASK_FILL`'s row broadcast unpacks only row 0 of each mask tile
+  (`sfpu::kernel`, `Operands::RowBroadcast`), so 32x fewer bytes would do, but as plain `READ`s that is two entries a
+  tile against one tile read: a `READ_RUN` flag would be needed to make it cheaper, a mover change not justified while
+  the step is bound by the weight stream.
+- [x] **Gate** `step219` `a_decoder_s_attention_operands_stay_in_l1_bit_for_bit` (card 0): a Llama with 64-wide heads
+  and `K` = 1,024, every tile, so the native RoPE, attention as one op and `o`'s packed `A` are the 1.7B's paths. RoPE's
+  query, attention's context twin, the mask and RoPE's tables resident; attention's unread rows dropped; bit for bit
+  against the unplanned traces, `Step(64)` 61.6 -> 48.3 MB of GDDR. Found on the way: a step attends whole tiles of
+  positions to run attention as one op (`attention::fits`), and a product of `K` under 1,024 gathers its `A`, which has
+  no L1 path, so on the 135M attention's context goes to `o` through GDDR.
+
+### Phase 5a. A replay's next reader section read ahead (done 2026-10-21)
+
+The layer sub-traces' cheaper first step ([layer-sub-traces.md](../proposals/layer-sub-traces.md)): every chunk a replay
+runs was read, then waited for, in turn (`call_chunks`). B now reads the first chunk of the next `PAIR_CALL`'s reader
+section ahead, into `dataflow::AHEAD_CHUNK` (the free 2 KiB after `OUTER_CHUNK`), on a transaction ID of its own
+(`dm::TXN_FETCH` = 8), and the pair waits only for that ID. It is issued when an outer chunk lands (its first pair) and
+when a pair's reader section ends (the next one, found as the first `PAIR_CALL` in the outer chunk whose section is
+stored later), so it lands while B waits for NC. A chunk read ahead is used only by the pair it was read for, and is
+drained by B alone, before it is used and at a list's end (an ID's count is the tile's NIU's, 3b). No format change; B's
+safe image 33,152 of 43,008 bytes.
+
+- [x] **Gates** (ttsim, then card 0): `step39`, `step172`, `step173`, `step215` on ttsim in the safe, `fast-reads` and
+  `fast-reads` + `encoded-guard` images, `step216` in the safe one; on card 0 the safe image 63 of 63 (`1792618297`: `step39`,
+  `step50`, `step172`, `step173`, `step185`, `step187`, `step188`, `step193`, `step209`, `step210`, `step215`,
+  `step216`, `step218`-`step220`), `fast-reads` 57 of 57 (`1792618769`), `fast-reads` + `encoded-guard` 58 of 58
+  (`1792619005`); `silicon_profile_mode` and `step23` with the `profile` feature, 6 of 6 (`1792622726`, the `fetch`
+  column now the wait left); `--smoke` 1,181 of 1,181 (`1792621118`, `step12_mnist` included). Phase 4's gates with
+  `step188`, `step193`, `step209`, `step210`, `step217`, `step220`: 28 of 28 (`1792617802`). Firmware clippy plain,
+  `encoded-guard`, `profile`, `fast-reads`. **Watched failing:** the read ahead
+  taken for the pair before (`>=` for `>`) and used without the match check: `step216` differs.
+- [x] **Measured** (1.7B, `1792619550`-`1792620919`, [log](../learnings/performance-log.md)): a step's fetch 0.83 -> 0.23 ms
+  and the small ops 5.00 -> 4.47 ms, with Phase 4's index read, but the products 12.92 -> 13.46 ms: 18.44 / 19.83 ms
+  against 18.39 / 19.90 before and 18.32 / 19.78 with the index read only; prefetch caps 3 and 4 no better. With busy
+  prefetch off, 19.51 / 20.76 -> 19.27 / 20.48. **The step is bound by the weight stream that busy prefetch reads in the
+  small ops' windows:** what the small ops give up, the next product waits for. The 135M (no busy prefetch) 7.74 / 9.16
+  -> 7.61 / 9.06.
+- **So Phase 5b (the stored layer body) is deferred:** what it would take from the small ops (fetch 0.23 ms and part of
+  control's 0.75 a step) moves into the products the same way. The lever is the stream's rate under the small ops (the
+  products reach about 391 GB/s; the target is 460-486).
+
 ### Later phases
 
-3. **Products into their consumers:** `qkv` → RoPE, `gate|up` → `silu_mul`, `o` → the residual add (tile-sharded).
-4. **Attention's rows and context** (per head). The KV cache stays in GDDR.
-5. **Sub-traces on the plan** (`layer-sub-traces.md`): one stored layer whose only arguments are GDDR references.
+5. **Sub-traces on the plan** (`layer-sub-traces.md`, 5b): one stored layer whose only arguments are GDDR references.
+   Deferred by 5a's finding; first make the pinned plan spare as much as the unpinned one (Phase 3's cost).
 6. **Prefill chunks, traced inference (ViT, ResNet blocks), then traced training** once trace segmentation exists.
 
 ## Expected

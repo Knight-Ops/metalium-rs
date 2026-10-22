@@ -185,6 +185,9 @@ fn a_prefetch_stays_in_flight_past_the_movers_drains_until_its_wait() {
             .collect();
         let t = tile(d, GATE_TILE.0, GATE_TILE.1);
         let mut m = DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).unwrap();
+        // The prefetch ID at its full cap: what this gate measures is that its reads are not under
+        // the mover's own ID, not the default cap (`dm::PREFETCH_CAP_DEFAULT`).
+        m.set_prefetch_cap(d, &w, dm::TILE_IN_FLIGHT_CAP).unwrap();
         let want = expected(&mirror);
         let want_last = last_slots(&want);
 

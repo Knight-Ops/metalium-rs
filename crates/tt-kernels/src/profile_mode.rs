@@ -16,9 +16,10 @@
 //!   wait for the slowest unit.
 //!
 //! Each span is split by the kind of entry it spent its time in (`OpTime`): the barrier, the kernels'
-//! wait, the control entries (launches, kernels, circular buffers, descriptor pokes) and data
-//! movement. In the default [`Detail::Ops`] the data entries are not stamped (they keep the mover's
-//! untraced fast paths); their time is the span less the rest.
+//! wait, the control entries (launches, kernels, circular buffers, descriptor pokes), a replay's
+//! fetches of its own stream and sections, B's waits for its writer core, and data movement. In the
+//! default [`Detail::Ops`] the data entries are not stamped (they keep the mover's untraced fast
+//! paths); their time is the span less the rest.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -92,6 +93,12 @@ pub struct OpTime {
     pub kernels: u64,
     /// In `LAUNCH`, `KERNEL`, `CB` and `POKE` entries.
     pub control: u64,
+    /// B fetching the trace from GDDR: a chunk of its stream or of a `PAIR_CALL`'s reader section,
+    /// read and waited for (`tt_isa::dm::trace_mode::FETCH`). Replays, [`Detail::Ops`] only.
+    pub fetch: u64,
+    /// B waiting for NC to finish a pair's writer section: NC's fetch of it and its writes
+    /// (`tt_isa::dm::trace_mode::WRITER_WAIT`). [`Detail::Ops`] only: in `Full` it is data.
+    pub writer: u64,
     /// Moving data: the reads, writes, gathers and scatters ([`Detail::Full`]), or, in
     /// [`Detail::Ops`], the span less everything above.
     pub data: u64,
@@ -203,7 +210,7 @@ impl OpBytes {
 
 impl OpTime {
     fn finish(mut self, detail: Detail, data: u64) -> Self {
-        let known = self.barrier + self.kernels + self.control;
+        let known = self.barrier + self.kernels + self.control + self.fetch + self.writer;
         match detail {
             Detail::Ops => self.data = self.span.saturating_sub(known),
             Detail::Full => {
@@ -238,6 +245,8 @@ impl Classes {
                         op::BARRIER => self.time.barrier += d,
                         op::KERNEL_WAIT => self.time.kernels += d,
                         op::LAUNCH | op::KERNEL | op::CB | op::POKE => self.time.control += d,
+                        tt_isa::dm::trace_mode::FETCH => self.time.fetch += d,
+                        tt_isa::dm::trace_mode::WRITER_WAIT => self.time.writer += d,
                         _ => self.data += d,
                     }
                 }
@@ -575,6 +584,8 @@ impl TraceSamples {
                         barrier: m(|t| t.barrier),
                         kernels: m(|t| t.kernels),
                         control: m(|t| t.control),
+                        fetch: m(|t| t.fetch),
+                        writer: m(|t| t.writer),
                         data: m(|t| t.data),
                         other: m(|t| t.other),
                     }
@@ -603,6 +614,8 @@ impl Total {
         self.time.barrier += t.barrier;
         self.time.kernels += t.kernels;
         self.time.control += t.control;
+        self.time.fetch += t.fetch;
+        self.time.writer += t.writer;
         self.time.data += t.data;
         self.time.other += t.other;
     }
@@ -631,15 +644,15 @@ impl ProfileReport {
         let total: u64 = rows.iter().map(|(_, t)| t.time.span).sum();
         let _ = writeln!(
             out,
-            "| label | {count} | us | % | us each | barrier | kernels | control | data | other |"
+            "| label | {count} | us | % | us each | barrier | kernels | control | fetch | writer | data | other |"
         );
-        let _ = writeln!(out, "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
+        let _ = writeln!(out, "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
         for (label, t) in rows {
             let pct = |c: u64| 100.0 * c as f64 / t.time.span.max(1) as f64;
             let _ =
                 writeln!(
                 out,
-                "| {} | {} | {:.1} | {:.1} | {:.2} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% |",
+                "| {} | {} | {:.1} | {:.1} | {:.2} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% |",
                 if label.is_empty() { "(unlabelled)" } else { label },
                 t.count,
                 self.us(t.time.span),
@@ -648,6 +661,8 @@ impl ProfileReport {
                 pct(t.time.barrier),
                 pct(t.time.kernels),
                 pct(t.time.control),
+                pct(t.time.fetch),
+                pct(t.time.writer),
                 pct(t.time.data),
                 pct(t.time.other),
             );
@@ -832,13 +847,13 @@ impl ProfileReport {
             top.sort_by_key(|(_, m)| std::cmp::Reverse(m.span));
             let _ = writeln!(
                 out,
-                "\nCostliest ops:\n\n| op | label | what | units | us | barrier | kernels | control | data |\n|--:|---|---|--:|--:|--:|--:|--:|--:|"
+                "\nCostliest ops:\n\n| op | label | what | units | us | barrier | kernels | control | fetch | writer | data |\n|--:|---|---|--:|--:|--:|--:|--:|--:|--:|--:|"
             );
             for (i, m) in top.into_iter().take(25) {
                 let o = &t.ops[i];
                 let _ = writeln!(
                     out,
-                    "| {i} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
+                    "| {i} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
                     o.label,
                     o.what,
                     o.units,
@@ -846,6 +861,8 @@ impl ProfileReport {
                     self.us(m.barrier),
                     self.us(m.kernels),
                     self.us(m.control),
+                    self.us(m.fetch),
+                    self.us(m.writer),
                     self.us(m.data)
                 );
             }
@@ -858,7 +875,7 @@ impl ProfileReport {
     /// (medians over their samples). Microseconds.
     pub fn tsv(&self, name: &dyn Fn(u64) -> String) -> String {
         let mut out = String::from(
-            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\n",
+            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\tfetch_us\twriter_us\n",
         );
         let none = OpBytes::default();
         let mut row = |source: &str,
@@ -869,7 +886,7 @@ impl ProfileReport {
             let b = o.3;
             let _ = writeln!(
                 out,
-                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
+                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.3}\t{:.3}",
                 o.0,
                 o.1,
                 o.2,
@@ -886,6 +903,8 @@ impl ProfileReport {
                 b.a,
                 b.b,
                 gbps(b.read + b.write, self.us(t.span)),
+                self.us(t.fetch),
+                self.us(t.writer),
             );
         };
         for (i, s) in self.eager.iter().enumerate() {
@@ -920,10 +939,12 @@ impl ProfileReport {
             for (label, what, t) in ops {
                 let dur = self.us(t.span);
                 events.push(format!(
-                    "{{\"ph\":\"X\",\"pid\":{pid},\"tid\":0,\"name\":{label:?},\"ts\":{at:.3},\"dur\":{dur:.3},\"args\":{{\"what\":{what:?},\"barrier_us\":{:.3},\"kernels_us\":{:.3},\"control_us\":{:.3},\"data_us\":{:.3}}}}}",
+                    "{{\"ph\":\"X\",\"pid\":{pid},\"tid\":0,\"name\":{label:?},\"ts\":{at:.3},\"dur\":{dur:.3},\"args\":{{\"what\":{what:?},\"barrier_us\":{:.3},\"kernels_us\":{:.3},\"control_us\":{:.3},\"fetch_us\":{:.3},\"writer_us\":{:.3},\"data_us\":{:.3}}}}}",
                     self.us(t.barrier),
                     self.us(t.kernels),
                     self.us(t.control),
+                    self.us(t.fetch),
+                    self.us(t.writer),
                     self.us(t.data)
                 ));
                 at += dur;

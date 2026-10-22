@@ -97,8 +97,8 @@ pub struct Use {
     /// GDDR bytes: `[read, written]`.
     pub bytes: [u64; 2],
     /// Every access was a whole move the planned capture can redirect ([`Applied::rewrite`]): a
-    /// plain `READ` or `WRITE`, or one a `READ_RUN` without flags or a `WRITE_RUN` expands to.
-    /// Not a product's `GATHER` or `SCATTER`, a padding fill, a row select or scatter, a
+    /// plain `READ` or `WRITE`, or one a `READ_RUN` without flags, a `WRITE_RUN` or a product's
+    /// `SCATTER` expands to. Not a product's `GATHER`, a padding fill, a row select or scatter, a
     /// transposing or broadcasting read.
     pub plain: bool,
 }
@@ -398,11 +398,16 @@ fn walk(entries: &[[u32; 8]], f: &mut impl FnMut([u32; 8], bool)) -> u64 {
 }
 
 /// Whether move `w`, plain or expanded from the record `head`, is one [`Applied::rewrite`]
-/// redirects: a plain `READ` or `WRITE`, or a `READ_RUN` without flags or a `WRITE_RUN`.
+/// redirects: a plain `READ` or `WRITE`, or a `READ_RUN` without flags, a `WRITE_RUN` or a
+/// `SCATTER`. A product's `SCATTER` expands to whole-tile writes as a `WRITE_RUN` does, so its
+/// output can go straight into its consumers' L1 (`docs/plans/planned-l1-residency.md` Phase 3).
 fn plain(head: Option<[u32; 8]>, w: [u32; 8]) -> bool {
     match head {
         None => matches!(w[0], op::READ | op::WRITE),
-        Some(h) => (h[0] == record::READ_RUN && h[4] == 0) || h[0] == record::WRITE_RUN,
+        Some(h) => {
+            (h[0] == record::READ_RUN && h[4] == 0)
+                || matches!(h[0], record::WRITE_RUN | record::SCATTER)
+        }
     }
 }
 
@@ -528,6 +533,15 @@ pub enum Reason {
     Room,
 }
 
+/// Which class a region that is short leaves out first ([`Plan::make_rows`] tries both).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum LeaveOut {
+    /// The largest `bytes x lifetime`: what holds the most region for longest.
+    Longest,
+    /// The fewest GDDR bytes spared a byte of its address.
+    LeastSpared,
+}
+
 /// How a plan delivers a resident row that an op reads whole on many units ([`Tensor::replicated`]:
 /// a product's packed `A`, RMSNorm's twin), `docs/plans/planned-l1-residency.md` 2f.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -549,6 +563,11 @@ pub enum Rows {
 /// against 9-17 through GDDR); in a step the other rows have fewer readers, and 2 holders cost
 /// each producer fewer writes.
 pub const HOLDERS: usize = 2;
+
+/// A resident tile that at most this many units besides its writer read is written to each by
+/// unicast (`op::WRITE_L1`), not by a multicast over their rectangles: a product's output tile is
+/// read by one unit (the residual add, `silu_mul`) or two (RoPE's tile and its partner).
+pub const UNICAST_READERS: usize = 4;
 
 /// The holders of a [`Rows::Held`] tensor ([`holders`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -686,9 +705,11 @@ impl Plan {
     ///
     /// The period's pinning (one address for the tensor at one place of every repeat) is what
     /// lets a layer's repeats share a body (`docs/proposals/layer-sub-traces.md`), not what makes
-    /// a plan correct. Where it costs tensors (a repeat's two tensors live at once, or one stays in
-    /// GDDR), the graph is planned without it too, and the plan that spares more GDDR bytes is
-    /// kept (the periodic one on a tie).
+    /// a plan correct. Where it costs tensors (a repeat's two tensors live at once, one stays in
+    /// GDDR, or a class finds no room), the graph is planned without it too, and the plan that
+    /// spares more GDDR bytes is kept (the periodic one on a tie). Where a class finds no room,
+    /// each is planned again leaving out first what spares least a byte, not what holds the most
+    /// region longest, and the same rule keeps one.
     pub fn make_within(g: &Graph, budget: u64, capable: impl Fn(&Op, &Use) -> bool) -> Plan {
         Self::make_rows(g, budget, Rows::Multicast, capable)
     }
@@ -701,22 +722,44 @@ impl Plan {
         capable: impl Fn(&Op, &Use) -> bool,
     ) -> Plan {
         let period = period(&g.ops.iter().map(|o| &o.signature).collect::<Vec<_>>());
-        let pinned = Self::make_inner(g, budget, rows, &capable, period);
-        let costs = pinned.place.iter().any(|p| {
-            matches!(
-                p,
-                Place::Gddr(Reason::OutlivesPeriod | Reason::RepeatInGddr)
-            )
-        });
-        if period.is_none() || !costs {
-            return pinned;
+        let make = |period, leave| Self::make_inner(g, budget, rows, &capable, period, leave);
+        let pinned = make(period, LeaveOut::Longest);
+        let room = |p: &Plan| p.place.contains(&Place::Gddr(Reason::Room));
+        // Pinning costs tensors where a repeat's two live at once, one stays in GDDR, or a class
+        // takes its room in every repeat while the tensors themselves would share it (a layer's
+        // products' outputs beside its residual stream, Phase 3).
+        let costs = period.is_some()
+            && pinned.place.iter().any(|p| {
+                matches!(
+                    p,
+                    Place::Gddr(Reason::OutlivesPeriod | Reason::RepeatInGddr | Reason::Room)
+                )
+            });
+        // The candidates, the first kept on a tie: pinned, then not, each leaving out first what
+        // holds the most region longest, then what spares the least a byte (Phase 4: a mask or a
+        // table every layer reads lives the whole step and spares the most).
+        let mut candidates = vec![(pinned, true)];
+        if costs {
+            candidates.push((make(None, LeaveOut::Longest), false));
         }
-        let free = Self::make_inner(g, budget, rows, &capable, None);
+        if room(&candidates[0].0) {
+            candidates.push((make(period, LeaveOut::LeastSpared), true));
+        }
+        if period.is_some() && candidates.iter().any(|(p, pinned)| !pinned && room(p)) {
+            candidates.push((make(None, LeaveOut::LeastSpared), false));
+        }
         let spared = |p: &Plan| p.gddr_avoided(g).iter().sum::<u64>();
-        if spared(&free) > spared(&pinned) {
-            Plan { period, ..free }.unpinned()
+        let mut best = 0;
+        for (i, (p, _)) in candidates.iter().enumerate() {
+            if spared(p) > spared(&candidates[best].0) {
+                best = i;
+            }
+        }
+        let (plan, is_pinned) = candidates.swap_remove(best);
+        if is_pinned {
+            plan
         } else {
-            pinned
+            Plan { period, ..plan }.unpinned()
         }
     }
 
@@ -734,6 +777,7 @@ impl Plan {
         rows: Rows,
         capable: &impl Fn(&Op, &Use) -> bool,
         period: Option<Period>,
+        leave: LeaveOut,
     ) -> Plan {
         let (neediest, _) = neediest(g);
         // Each tensor on its own first.
@@ -858,19 +902,43 @@ impl Plan {
                     dropped,
                 };
             }
-            let cost = |m: &Vec<usize>| -> u64 {
-                let life: usize = m
-                    .iter()
-                    .filter_map(|&t| g.tensors[t].lifetime())
-                    .map(|(a, b)| b - a + 1)
-                    .sum();
-                class_bytes(g, m) * life as u64
+            let worst = match leave {
+                LeaveOut::Longest => {
+                    let cost = |m: &Vec<usize>| -> u64 {
+                        let life: usize = m
+                            .iter()
+                            .filter_map(|&t| g.tensors[t].lifetime())
+                            .map(|(a, b)| b - a + 1)
+                            .sum();
+                        class_bytes(g, m) * life as u64
+                    };
+                    let (worst, _) = classes
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|&(i, m)| (cost(m), i))
+                        .expect("not empty");
+                    worst
+                }
+                LeaveOut::LeastSpared => {
+                    // `spared / bytes`, compared across: `spared_a * bytes_b` against the other.
+                    let of = |m: &Vec<usize>| -> (u128, u128) {
+                        let spared: u64 = m
+                            .iter()
+                            .map(|&t| g.tensors[t].gddr_bytes().iter().sum::<u64>())
+                            .sum();
+                        (spared as u128, class_bytes(g, m).max(1) as u128)
+                    };
+                    let (worst, _) = classes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| (i, of(m)))
+                        .min_by(|(i, (sa, ba)), (j, (sb, bb))| {
+                            (sa * bb).cmp(&(sb * ba)).then(j.cmp(i))
+                        })
+                        .expect("not empty");
+                    worst
+                }
             };
-            let (worst, _) = classes
-                .iter()
-                .enumerate()
-                .max_by_key(|&(i, m)| (cost(m), i))
-                .expect("not empty");
             for &t in &classes[worst] {
                 reason[t] = Some(Reason::Room);
             }
@@ -1141,15 +1209,21 @@ impl Plan {
                 "RESIDENCY   in GDDR, {r:?}: {count} tensors, {bytes} B moved"
             );
         }
-        // The internal tensors left out for a reason other than room, by what made them.
+        // The internal tensors left out, by what made them; those left out for room with what
+        // they would take a unit.
         let mut left: BTreeMap<String, usize> = BTreeMap::new();
         for (t, p) in self.place.iter().enumerate() {
             if let Place::Gddr(r) = p {
-                if !matches!(r, Reason::Output | Reason::Room) {
-                    *left
-                        .entry(format!("{r:?}: {}", describe(g, t)))
-                        .or_default() += 1;
-                }
+                let what = match r {
+                    Reason::Output => continue,
+                    Reason::Room => format!(
+                        "Room ({} B a unit): {}",
+                        g.tensors[t].bytes_a_unit(),
+                        describe(g, t)
+                    ),
+                    r => format!("{r:?}: {}", describe(g, t)),
+                };
+                *left.entry(what).or_default() += 1;
             }
         }
         for (what, count) in left.iter().take(32) {
@@ -1535,7 +1609,15 @@ impl Applied {
                             .filter(|&&v| v != u)
                             .map(|&v| self.coords[v])
                             .collect();
-                        for (s, e) in rectangles(&others) {
+                        // A tile few units read goes to each by unicast: many producers'
+                        // path-reserved multicasts serialize (2e), and a unicast to a neighbour
+                        // costs no more than one to a rectangle of two.
+                        let rects = if others.len() <= UNICAST_READERS {
+                            others.iter().map(|&t| (t, t)).collect()
+                        } else {
+                            rectangles(&others)
+                        };
+                        for (s, e) in rects {
                             out.push(if s == e {
                                 [op::WRITE_L1, s.0 as u32, s.1 as u32, to, w[4], len, 0, 0]
                             } else {
@@ -1932,6 +2014,105 @@ mod tests {
         assert!(matches!(tight.place[1], Place::Resident { .. }));
     }
 
+    /// Pinned, an address holds its class's largest member in every repeat: where a layer's large
+    /// tensors are different ones in different layers (`a` 4 tiles in the first, `b` in the second),
+    /// the classes take 8 slots where the tensors need 5. With room for 5, the pinned plan leaves a
+    /// class out (`Room`), so the plan without the pinning, which keeps everything, is the one kept.
+    #[test]
+    fn a_pinning_that_costs_room_is_not_kept() {
+        // Tensors: per layer `a`, then `b`; then the tail's input.
+        let sizes = [(4usize, 1usize), (1, 4), (1, 1)];
+        let mut tiles = Vec::new();
+        for &(a, b) in &sizes {
+            tiles.extend([a, b]);
+        }
+        tiles.push(1);
+        let all: Vec<Vec<u32>> = tiles.iter().map(|&n| (0..n as u32).collect()).collect();
+        let mut ops: Vec<(&str, Vec<Access>)> = vec![("head", vec![(6, 0, true, &all[6][..])])];
+        for i in 0..sizes.len() {
+            let (a, b) = (2 * i, 2 * i + 1);
+            ops.push(("p", vec![(a, 0, true, &all[a][..])]));
+            ops.push((
+                "q",
+                vec![(a, 0, false, &all[a][..]), (b, 0, true, &all[b][..])],
+            ));
+            ops.push(("s", vec![(b, 0, false, &all[b][..])]));
+        }
+        ops.push(("tail", vec![(6, 0, false, &all[6][..])]));
+        let ops: Vec<(&str, &[Access])> = ops.iter().map(|(s, a)| (*s, a.as_slice())).collect();
+        let g = graph(&tiles, &ops);
+        let budget = 6 * ONE;
+        let pinned = Plan::make_inner(
+            &g,
+            budget,
+            Rows::Multicast,
+            &|_, _| true,
+            period(&g.ops.iter().map(|o| &o.signature).collect::<Vec<_>>()),
+            LeaveOut::Longest,
+        );
+        assert!(
+            pinned.place.contains(&Place::Gddr(Reason::Room)),
+            "pinned, the classes do not fit: {:?}",
+            pinned.place
+        );
+        let p = Plan::make_within(&g, budget, |_, _| true);
+        p.check(&g).unwrap();
+        assert!(!p.pinned);
+        assert!(
+            p.place.iter().all(|p| matches!(p, Place::Resident { .. })),
+            "{:?}",
+            p.place
+        );
+    }
+
+    /// Phase 4: a small tensor read by many ops over a long life (a mask, a table every layer
+    /// reads) spares more a byte than a large one read once beside it, so where only one fits it
+    /// is the one kept, though it holds its room longer.
+    #[test]
+    fn a_short_region_keeps_what_spares_most_a_byte() {
+        // Tensor 0: one tile, written by op 0, read by ops 1-8. Tensor 1: three tiles, written
+        // by op 4, read by op 5. At op 4 both live: four slots against a budget of three.
+        let one: &[u32] = &[0];
+        let three: &[u32] = &[0, 1, 2];
+        let sigs: Vec<String> = (0..9).map(|k| format!("op{k}")).collect();
+        let mut ops: Vec<(&str, Vec<Access>)> = vec![(&sigs[0], vec![(0, 0, true, one)])];
+        for (k, sig) in sigs.iter().enumerate().skip(1) {
+            let mut a = vec![(0, 0, false, one)];
+            match k {
+                4 => a.push((1, 0, true, three)),
+                5 => a.push((1, 0, false, three)),
+                _ => {}
+            }
+            ops.push((sig, a));
+        }
+        let ops: Vec<(&str, &[Access])> = ops.iter().map(|(s, a)| (*s, a.as_slice())).collect();
+        let g = graph(&[1, 3], &ops);
+        let budget = 3 * ONE;
+        let longest = Plan::make_inner(
+            &g,
+            budget,
+            Rows::Multicast,
+            &|_, _| true,
+            None,
+            LeaveOut::Longest,
+        );
+        assert_eq!(longest.place[0], Place::Gddr(Reason::Room));
+        assert!(matches!(longest.place[1], Place::Resident { .. }));
+        let p = Plan::make_within(&g, budget, |_, _| true);
+        p.check(&g).unwrap();
+        assert!(
+            matches!(p.place[0], Place::Resident { .. }),
+            "{:?}",
+            p.place
+        );
+        assert_eq!(p.place[1], Place::Gddr(Reason::Room));
+        assert!(
+            p.gddr_avoided(&g).iter().sum::<u64>() > longest.gddr_avoided(&g).iter().sum::<u64>()
+        );
+        // Deterministic.
+        assert_eq!(p.place, Plan::make_within(&g, budget, |_, _| true).place);
+    }
+
     #[test]
     fn outputs_and_ops_without_a_path_stay_in_gddr() {
         let mut g = residual(2);
@@ -2108,6 +2289,89 @@ mod tests {
                 "unit {u}"
             );
         }
+    }
+
+    /// Phase 3: a product's output (`[1, 4]` tiles, tensor 0) written by `SCATTER`s, units 0 and 1
+    /// two columns each, and read by the next op sharded: tile 0 by its writer, tile 1 by unit 2,
+    /// tile 2 by unit 3, tile 3 by units 4 and 5 (a RoPE partner). Each expanded write is plain
+    /// and becomes a `WRITE_L1` to each reader, by unicast even where two readers are neighbours;
+    /// each reader reads its tile from its own region.
+    #[test]
+    fn a_scatter_writes_into_its_readers_l1() {
+        let mut alloc = crate::tensor::DramAlloc::new(&tt_isa::dram::Dram::FULL);
+        alloc.start_log();
+        let c = crate::tensor::DramTensor::alloc(&mut alloc, 32, 128).unwrap();
+        let index = Index::new(alloc.logged());
+        let scatter = |j0: u32| {
+            let mut e = vec![[record::SCATTER, 0x4_0010, SLOT as u32, 0, 1, j0, 2, 0]];
+            e.extend(c.tensor_ref().encode());
+            e
+        };
+        let mut whole = Vec::new();
+        assert_eq!(walk(&scatter(0), &mut |w, p| whole.push((w[0], p))), 0);
+        assert_eq!(
+            whole,
+            [(op::WRITE, true); 2],
+            "a SCATTER's writes are plain"
+        );
+        let writes: Vec<Access> = vec![(0, 0, true, &[0, 1]), (0, 1, true, &[2, 3])];
+        let reads: Vec<Access> = vec![
+            (0, 0, false, &[0]),
+            (0, 2, false, &[1]),
+            (0, 3, false, &[2]),
+            (0, 4, false, &[3]),
+            (0, 5, false, &[3]),
+        ];
+        let g = graph(&[4], &[("matmul", &writes), ("add", &reads)]);
+        let plan = Plan::make_rows(&g, 96 << 10, Rows::Held(HOLDERS), |_, u| u.plain);
+        plan.check(&g).unwrap();
+        assert!(plan.held.is_empty(), "a sharded output is not held");
+        let coords = [1u8, 2, 3, 4, 5, 6].map(|x| (x, 2)).to_vec();
+        let base = tt_isa::l1::DATA.end - (96 << 10);
+        let a = Applied::new(g, plan, vec![0, 0], base, coords).expect("the output resident");
+        let at = |u: usize, tile: u32| a.address(0, u, tile).unwrap() as u32;
+        let to = |u: usize, tile: u32, from: u32| {
+            let (x, y) = a.coords[u];
+            [
+                op::WRITE_L1,
+                x as u32,
+                y as u32,
+                at(u, tile) + 16,
+                from,
+                4096,
+                0,
+                0,
+            ]
+        };
+        assert_eq!(
+            a.rewrite(&index, 0, 0, &scatter(0)).unwrap(),
+            [to(0, 0, 0x4_0010), to(2, 1, 0x4_0010 + SLOT as u32)]
+        );
+        assert_eq!(
+            a.rewrite(&index, 0, 1, &scatter(2)).unwrap(),
+            [
+                to(3, 2, 0x4_0010),
+                to(4, 3, 0x4_0010 + SLOT as u32),
+                to(5, 3, 0x4_0010 + SLOT as u32)
+            ]
+        );
+        // Unit 5 reads tile 3 (a `READ_RUN` of one tile) from its own region.
+        let mut read = vec![[record::READ_RUN, 3, 1, 0x5_0000, 0, 4, 0, 0]];
+        read.extend(c.tensor_ref().encode());
+        let (x, y) = a.coords[5];
+        assert_eq!(
+            a.rewrite(&index, 1, 5, &read).unwrap(),
+            [[
+                op::READ_L1,
+                x as u32,
+                y as u32,
+                at(5, 3),
+                0x5_0000,
+                SLOT as u32,
+                0,
+                0
+            ]]
+        );
     }
 
     /// `Rows::Multicast` keeps Phase 2's copies (a multicast a write), and `Rows::Gddr` keeps the

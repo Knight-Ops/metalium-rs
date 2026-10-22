@@ -2044,7 +2044,9 @@ fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
 /// The events unit stream `uc`'s entries `range` could stamp in the profile mode, at most, in
 /// [`crate::profile_mode::Detail::Ops`] and in `Full`: three a stamped entry (its begin and end and a
 /// `KICK` or `ROLES_DONE` inside), and for a `PAIR_CALL`, its reader section's entries (B runs them;
-/// NC, which runs the writer's, does not stamp).
+/// NC, which runs the writer's, does not stamp). B also stamps each fetch of a chunk of the stream
+/// or of a reader section, and its wait for its writer (`tt_isa::dm::trace_mode::FETCH`,
+/// `WRITER_WAIT`): two events each, and `range` may touch one chunk more than it fills.
 fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
@@ -2062,12 +2064,17 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2
             i += (tt_isa::dm::record::len(head) as usize).max(1);
         }
     };
+    let chunks = |n: usize| 2 * n.div_ceil(tt_isa::dm::TRACE_CHUNK_ENTRIES as usize) as u32;
+    let fetches = chunks(range.len()) + 2;
+    let mut waits = 0;
     let mut i = range.start;
     while i < range.end.min(uc.stream.len()) {
         let head = uc.stream[i][0];
         if head == tt_isa::dm::op::PAIR_CALL {
+            waits += 2;
             if let Some(k) = uc.pair_calls.iter().position(|&at| at == i) {
                 if let Some(reader) = uc.pending_sections.get(2 * k) {
+                    waits += chunks(reader.len());
                     add(reader);
                 }
             }
@@ -2076,7 +2083,7 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2
         }
         i += (tt_isa::dm::record::len(head) as usize).max(1);
     }
-    count
+    count.map(|c| c + fetches + waits)
 }
 
 /// [`trace::OpRecord::shape`] of an op laid out as `queues`: each unit's steps, their kinds and
@@ -2207,10 +2214,11 @@ impl<T: Transport> Session<T> {
             streamed_k: true,
             weight_prefetch: true,
             prefetch_anchor: None,
-            // `TT_BUSY_PREFETCH=1`: the product's own units read their first job's `B` ahead too.
-            // Off by default: B issues a prefetch's reads before the next op's entries, so the
-            // op after the last product waits for them (decode-to-bandwidth.md Phase 8).
-            busy_prefetch: std::env::var("TT_BUSY_PREFETCH").is_ok_and(|v| v == "1"),
+            // The product's own units read their first job's `B` ahead too; `TT_BUSY_PREFETCH=0`
+            // turns it off. On by default since NC stopped draining B's prefetch ID at a list's end
+            // (`docs/plans/planned-l1-residency.md` 3b): a 1.7B step 19.51 -> 18.40 ms at the
+            // prefetch cap of 2 (`dm::PREFETCH_CAP_DEFAULT`), nothing measured slower.
+            busy_prefetch: std::env::var("TT_BUSY_PREFETCH").map_or(true, |v| v != "0"),
             busy_anchor: None,
             busy_moves: Vec::new(),
             // `TT_L1_REGION=<bytes>`: captures keep that much of each unit's `DATA` arena, at its
@@ -7657,8 +7665,8 @@ impl<T: Transport> Session<T> {
 
     /// Whether, in a capture, the units a one-row product with a packed `A` runs on read their
     /// first job's `B` ahead too, as soon as the last such product is done and under the ops
-    /// between (off by default; `TT_BUSY_PREFETCH=1` turns it on; `docs/plans/decode-to-bandwidth.md`
-    /// Phase 8: the mover issues the reads before the next op's entries, so that op waits). A unit does where every op it ran since planned `DATA` below that `B`'s ring (at
+    /// between (on by default; `TT_BUSY_PREFETCH=0` turns it off; `docs/plans/decode-to-bandwidth.md`
+    /// Phase 8, `docs/plans/planned-l1-residency.md` 3b). A unit does where every op it ran since planned `DATA` below that `B`'s ring (at
     /// the arena's end, `matmul::plan_layout_packed_a`): its reads are a prefetch
     /// (`record::GATHER_PREFETCH`), which those ops' drains leave in flight, and the job waits for
     /// them before its kernel (`tensor::BUSY_PREFETCH`). Off, those units read `B` in the job.
@@ -8230,6 +8238,26 @@ impl<T: Transport> Session<T> {
             }
         }
         Ok(sum)
+    }
+
+    /// Every unit's NC waits since they were last taken, in tile cycles, in
+    /// `tt_isa::dataflow::NcWait` order (`DataMover::take_nc_waits`), and zeroed: what B's
+    /// waits for its writer core are made of. Counted only by firmware built with the profile
+    /// feature; zeros otherwise. Waits for what is queued first. Dev-facing.
+    #[doc(hidden)]
+    pub fn probe_nc_waits(&mut self) -> Result<Vec<[u32; 8]>, TensorError> {
+        self.sync()?;
+        let mut out = Vec::with_capacity(self.units.len());
+        for u in 0..self.units.len() {
+            let Session { dev, units, .. } = self;
+            let unit = &units[u];
+            let waits = match (unit.resident.as_ref(), unit.nc.as_ref()) {
+                (Some(r), Some(nc)) => nc.take_nc_waits(dev, r.window())?.unwrap_or_default(),
+                _ => [0; 8],
+            };
+            out.push(waits);
+        }
+        Ok(out)
     }
 
     pub fn into_device(mut self) -> Device<T> {

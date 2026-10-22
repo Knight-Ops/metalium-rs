@@ -1214,6 +1214,32 @@ programs.
   1.61x (`1792465817`, `1792465464`). There is no idle GDDR bandwidth under the small ops to take for free: what a
   window streams, its ops wait for. Throttling the stream (ID 6's cap 1-2) traded the two at best ~0.2-0.4 ms a 1.7B
   step.
+- **Correction (2026-10-21, card 0): GDDR is not the whole wait.** With planned residency's Phase 3, the residual add
+  reads both operands from its own unit's L1 region (`READ_L1`, no GDDR read at all) and takes 8.0 us a call. With busy
+  prefetch on (cap 2) it takes **70.5 us** still reading no GDDR, and RoPE and RMSNorm slow ~1.7x (profiles
+  `1792596738` off, `1792597186` on). So a small op on a unit that is reading a product's weights ahead waits on that
+  unit's own side, not at the controllers. **Cause (probed 2026-10-21):** the next entry.
+
+## A transaction ID's outstanding count is the tile's, not the core's (2026-10-21, card 0)
+
+`noc::wait(id)` spins on the NIU's `reqs_outstanding(id)` counter, and the NIU is the tile's: B and NC issuing under the
+same ID on the same NoC count into one counter, and either core's wait waits for both.
+- **What it cost:** NC ended every `CALL` (a pair's writer section) with `noc::wait(PREFETCH_TXN)`, though it never
+  issues a prefetch. Under busy-unit prefetch B keeps ID 6's reads in flight on NoC #0, and while it waits for NC to
+  finish a pair (`finish_pair`) it issues another each turn the cap has room. NC's `DONE` came only when the count
+  happened to reach zero: the residual add's wait for its writer was 66% of a 70.5 us call (1.7B decode, cap 2, profile
+  `1792605585`), against 1.5 us with the prefetch off.
+- **How it was found:** the profile mode now stamps B's trace fetches and its waits for NC (`fetch`, `writer`
+  columns), and a profile image counts NC's own waits (`tt_isa::dataflow::NC_WAITS`, `TT_PROBE_NC_WAITS=1` on the
+  stream-ceiling bench). NC's section fetches (~0.1 ms a step), credit waits, write issues and drains did not change
+  with the prefetch, nor did its `CALL`s less their parts; B's pump turns were each at most 0.4 us. What was left was
+  NC's list-end drain.
+- **Fixed:** only B drains the prefetch ID at a list's end (`finish_prefetch`). The add 70.5 -> 12.8 us under cap 2,
+  and busy prefetch pays for the first time: a 1.7B step 19.51 / 20.75 -> **18.40 / 19.92 ms** (`1792608298`,
+  `1792608583`).
+- **Still shared:** NC's `noc::wait(TXN)` (before a `Pop`, at a section's end) also drains NoC #0's `TXN` count, B's
+  ordinary reads. Measured small (NC's drains ~30 us a 1.7B step); a wait that must be one core's alone needs an ID
+  only that core issues on.
 
 ## NC writes another tile's L1 (2026-10-20, ttsim and card 0)
 

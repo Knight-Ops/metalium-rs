@@ -46,10 +46,43 @@ pub const WAIT_REASON: u64 = ROLE_PROGRESS + 12;
 /// The transfer channel's received and consumed counters.
 pub const TRANSFER: u64 = WAIT_REASON + 20;
 pub const END: u64 = TRANSFER + 8;
+/// NC -> host, in an image built with the profile feature only: the tile cycles NC has spent
+/// waiting, summed (wrapping) until the host zeroes them, a word each in [`NcWait`] order.
+pub const NC_WAITS: u64 = END;
+/// What NC waits for, in [`NC_WAITS`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum NcWait {
+    /// A chunk of a `CALL`'s stream (a `PAIR_CALL`'s writer section) arriving from GDDR.
+    Fetch = 0,
+    /// Results to write: a `CB` `Wait` on the output stream's credits.
+    Credits = 1,
+    /// Its writes landing before a `CB` `Pop` hands their slots back.
+    Drain = 2,
+    /// Issuing its writes into other tiles' L1 (`op::WRITE_L1`, `WRITE_L1_MCAST`): the NIU taking
+    /// each request.
+    Issue = 3,
+    /// Not a wait: the whole of each `CALL` (a pair's writer section), from taking it to reporting
+    /// it done, which the others are parts of.
+    Call = 4,
+    /// B's, not NC's: issuing queued prefetch reads from its waits (the mover's `pump`), the time
+    /// a wait for a barrier, the roles or NC goes on past what it waited for.
+    Pump = 5,
+    /// Not cycles: how many of [`NcWait::Pump`]'s turns issued a read.
+    PumpTurns = 6,
+    /// Not a sum: the longest of those turns, in cycles.
+    PumpLongest = 7,
+}
+/// Words at [`NC_WAITS`].
+pub const NC_WAIT_WORDS: u64 = 8;
 pub const OUTER_CHUNK: u64 = 0x1_3000;
 const _: () = assert!(OUTER_CHUNK >= dm::nc::STUB_AT + 8);
 const _: () = assert!(OUTER_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_BYTES <= dm::LIST);
-const _: () = assert!(END <= mailbox::PROGRAM_REGION);
+/// Where B reads a trace's next [`dm::op::PAIR_CALL`]'s first reader chunk ahead, on
+/// [`dm::TXN_FETCH`], while it runs what comes before the pair: the free L1 between
+/// [`OUTER_CHUNK`] and the list, one chunk.
+pub const AHEAD_CHUNK: u64 = OUTER_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_BYTES;
+const _: () = assert!(AHEAD_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_BYTES <= dm::LIST);
+const _: () = assert!(NC_WAITS + NC_WAIT_WORDS * 4 <= mailbox::PROGRAM_REGION);
 
 /// Which credit channel a `CB` entry names (`dm::op::CB` word 1).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

@@ -510,6 +510,11 @@ pub trait Engine {
     fn probe_captures(&mut self) -> Result<u64, TtError> {
         Err(no_traces())
     }
+    /// Every unit's NC waits since last taken, zeroed (`Session::probe_nc_waits`).
+    #[doc(hidden)]
+    fn probe_nc_waits(&mut self) -> Result<Vec<[u32; 8]>, TtError> {
+        Err(no_traces())
+    }
     /// Overwrite `input`'s values, replay `trace`, and read `output` back:
     /// one round trip.
     fn run_trace(
@@ -3966,6 +3971,9 @@ impl Engine for KmdEngine {
     }
     fn probe_captures(&mut self) -> Result<u64, TtError> {
         Ok(self.session.probe_captures())
+    }
+    fn probe_nc_waits(&mut self) -> Result<Vec<[u32; 8]>, TtError> {
+        Ok(self.session.probe_nc_waits()?)
     }
     fn has_pending_plan(&mut self) -> Result<bool, TtError> {
         Ok(self.session.has_pending_plan())

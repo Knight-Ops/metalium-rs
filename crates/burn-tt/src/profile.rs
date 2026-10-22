@@ -10,7 +10,8 @@
 //!
 //! * `summary.md`:
 //!   - every Burn op's device time (eager ops each timed alone), split into barrier, kernels,
-//!     control and data;
+//!     control, a replay's fetches of its own stream (`fetch`), B's waits for its writer core
+//!     (`writer`) and data;
 //!   - every trace's ops the same way, by name (`SharedStateTraces` keys, `TracedInference::set_name`),
 //!     with how many replays covered them;
 //!   - each trace's replays (input write, replay, output read);

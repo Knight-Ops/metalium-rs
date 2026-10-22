@@ -891,6 +891,14 @@ pub fn probe_captures(device: TtDevice) -> Result<u64, TtError> {
     server::run(device, |e, _| e.probe_captures())
 }
 
+/// Every unit's NC waits since they were last taken, in tile cycles, zeroed: what B's waits for
+/// its writer core are made of (`tt_kernels::session::Session::probe_nc_waits`; counted only by
+/// firmware built with the profile feature). Dev-facing.
+#[doc(hidden)]
+pub fn probe_nc_waits(device: TtDevice) -> Result<Vec<[u32; 8]>, TtError> {
+    server::run(device, |e, _| e.probe_nc_waits())
+}
+
 /// Detailed timing breakdown of a traced training step.
 #[derive(Clone, Debug, Default)]
 pub struct StepTiming {

@@ -30,6 +30,23 @@ const PREFETCH_TXN: TxnId = match TxnId::new(dm::TXN_PREFETCH) {
     None => panic!(),
 };
 
+/// RISCV B's trace fetches read ahead ([`fetch_ahead`]): drained only by B, before it runs the
+/// chunk they bring and at a list's end.
+const FETCH_TXN: TxnId = match TxnId::new(dm::TXN_FETCH) {
+    Some(t) => t,
+    None => panic!(),
+};
+
+/// The chunk [`fetch_ahead`] is reading into `dataflow::AHEAD_CHUNK`: the next `PAIR_CALL`'s
+/// first reader chunk, as `[channel, offset, entries]`. RISCV B only. In local data RAM, set
+/// before the first list.
+#[link_section = ".local"]
+static mut AHEAD: Option<[u32; 3]> = None;
+/// The outer chunk of the replay B is running, `(at, entries)`, which [`fetch_ahead`] looks
+/// through for the next `PAIR_CALL`. In local data RAM, set before the first list.
+#[link_section = ".local"]
+static mut OUTER: Option<(u64, u32)> = None;
+
 /// The ID RISCV B's reads go out on: `TXN`, or `PREFETCH_TXN` while a prefetch record expands
 /// ([`run_record`]). In local data RAM, set before the first list.
 #[link_section = ".local"]
@@ -87,20 +104,44 @@ fn pump(most: u32) {
     let Some(c) = pump_slot().as_mut() else {
         return;
     };
+    // In a profile image, the time a wait's turn spends here (`tt_isa::dataflow::NcWait::Pump`);
+    // not a drain's, which is the prefetch's own owner waiting for it.
+    let since = if STAMPS { wall_clock() } else { 0 };
+    let issued = pump_reads(c, most, all);
+    if STAMPS && !all && issued {
+        use tt_isa::dataflow::{NcWait, NC_WAITS};
+        let took = wall_clock().wrapping_sub(since);
+        let word = |w: NcWait| NC_WAITS + w as u64 * 4;
+        wr(word(NcWait::Pump), rd(word(NcWait::Pump)).wrapping_add(took));
+        wr(word(NcWait::PumpTurns), rd(word(NcWait::PumpTurns)).wrapping_add(1));
+        if took > rd(word(NcWait::PumpLongest)) {
+            wr(word(NcWait::PumpLongest), took);
+        }
+    }
+}
+
+/// [`pump`]'s reads from `c`: up to `most`, or with `all` every one left. Whether it issued any.
+#[inline(always)]
+fn pump_reads(c: &mut record::PrefetchCursor, most: u32, all: bool) -> bool {
     // SAFETY: as `pump_slot`.
     let (me, usable) = unsafe { PUMP_AT };
+    let mut issued_any = false;
     for _ in 0..most {
         if !all && !noc::has_room(PREFETCH_TXN) {
-            return;
+            return issued_any;
         }
         let e = match c.next() {
             None => {
                 *pump_slot() = None;
-                return;
+                return issued_any;
             }
             Some(Ok(e)) => e,
-            Some(Err(code)) => return pump_fail(code),
+            Some(Err(code)) => {
+                pump_fail(code);
+                return issued_any;
+            }
         };
+        issued_any = true;
         let issued = Descriptor::decode(usable, e[0], e[1], e[2], e[3], e[4], e[5]).and_then(|d| {
             let port = d.range.channel().port_for(Niu::Noc0, d.port);
             let mv = DramMove::new(d.range, port, d.l1, false, me, PREFETCH_TXN, Niu::Noc0)
@@ -120,9 +161,97 @@ fn pump(most: u32) {
             Ok(())
         });
         if let Err(code) = issued {
-            return pump_fail(code);
+            pump_fail(code);
+            return issued_any;
         }
     }
+    issued_any
+}
+
+/// At a list's or a descriptor's end on B: issue what is left of the queued prefetch, wait for
+/// every prefetch read to land, and report its first refusal. Nothing on NC, which issues no
+/// prefetch: a transaction ID's outstanding count is the NIU's, shared by the tile's cores, so NC
+/// waiting on `PREFETCH_TXN` waited for B's reads. B, pumping more of them while it waited for NC
+/// to finish a pair, kept the count above zero, and NC's `DONE` came only when the count
+/// happened to reach it: ~46 us a residual add under busy-unit prefetch
+/// (`docs/plans/planned-l1-residency.md`, Phase 3's finding).
+fn finish_prefetch() -> Result<(), u32> {
+    if IS_NC {
+        return Ok(());
+    }
+    let pumped = pump_finish();
+    noc::wait(PREFETCH_TXN);
+    // A chunk read ahead and never run (the replay stopped first) lands before the list is done.
+    noc::wait(FETCH_TXN);
+    // SAFETY: as `pump_slot`.
+    unsafe {
+        AHEAD = None;
+        OUTER = None;
+    }
+    pumped
+}
+
+/// On B inside a replay: read the first chunk of the first `PAIR_CALL` of the outer chunk whose
+/// reader section starts past `after` (sections are stored in the stream's order), on
+/// `FETCH_TXN` into `dataflow::AHEAD_CHUNK`, while B runs the entries before it. Nothing if a
+/// chunk is already read ahead, outside a replay, or with no such pair in this outer chunk.
+/// The stream does not change while it replays, so what lands is what a fetch at the pair would
+/// read; the pair checks that the chunk is its own ([`take_ahead`]).
+#[inline(never)]
+fn fetch_ahead(me: (u8, u8), usable: u32, after: Option<u32>) {
+    // SAFETY: as `pump_slot`.
+    let (Some((at, n)), None) = (unsafe { OUTER }, unsafe { AHEAD }) else {
+        return;
+    };
+    let mut i = 0u32;
+    while i < n {
+        let a = at + i as u64 * dm::ENTRY_BYTES;
+        let head = rd(a);
+        if head == op::PAIR_CALL {
+            let (channel, offset, count) = (rd(a + 4), rd(a + 8), rd(a + 12));
+            if after.is_none_or(|after| offset > after) {
+                let entries = count.min(dm::TRACE_CHUNK_ENTRIES);
+                let issued = Descriptor::decode(
+                    usable,
+                    op::READ,
+                    channel,
+                    0,
+                    offset,
+                    tt_isa::dataflow::AHEAD_CHUNK as u32,
+                    entries * dm::ENTRY_BYTES as u32,
+                )
+                .and_then(|d| {
+                    let port = d.range.channel().port_for(Niu::Noc0, d.port);
+                    let mv = DramMove::new(d.range, port, d.l1, false, me, FETCH_TXN, Niu::Noc0)
+                        .map_err(|_| dm::error::ALIGNMENT)?;
+                    for r in mv.words() {
+                        noc::issue_dram_on::<false>(
+                            r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, FETCH_TXN,
+                        );
+                    }
+                    Ok(())
+                });
+                // A read the descriptor refuses is left for the pair's own fetch to refuse.
+                if issued.is_ok() {
+                    unsafe { AHEAD = Some([channel, offset, entries]) };
+                }
+                return;
+            }
+        }
+        i += record::len(head) as u32;
+    }
+}
+
+/// Whether the chunk read ahead is `[channel, offset, entries]`, waiting for it to land; any other
+/// chunk read ahead is drained and dropped, since its buffer is reused.
+fn take_ahead(want: [u32; 3]) -> bool {
+    // SAFETY: as `pump_slot`.
+    let Some(got) = (unsafe { (*core::ptr::addr_of_mut!(AHEAD)).take() })
+    else {
+        return false;
+    };
+    noc::wait(FETCH_TXN);
+    got == want
 }
 
 /// Issue what is left of the queued prefetch and report its first refusal: before a prefetch
@@ -407,6 +536,32 @@ fn list_settings() {
 /// when a request has to wait.
 fn wall_clock() -> u32 {
     rd(tt_isa::tensix::timestamper::WALL_CLOCK_L)
+}
+
+/// The clock NC's waits are timed from, in a profile image (`tt_isa::dataflow::NC_WAITS`); 0
+/// otherwise, and on B.
+#[inline(always)]
+fn nc_clock() -> u32 {
+    if STAMPS && IS_NC {
+        wall_clock()
+    } else {
+        0
+    }
+}
+
+/// Add the cycles since `since` ([`nc_clock`]) to NC's total for `what`, in a profile image.
+#[inline(always)]
+fn nc_waited(what: tt_isa::dataflow::NcWait, since: u32) {
+    if STAMPS && IS_NC {
+        add_wait(what, since);
+    }
+}
+
+/// Add the cycles since `since` to the total for `what` at `tt_isa::dataflow::NC_WAITS`.
+#[inline(always)]
+fn add_wait(what: tt_isa::dataflow::NcWait, since: u32) {
+    let at = tt_isa::dataflow::NC_WAITS + what as u64 * 4;
+    wr(at, rd(at).wrapping_add(wall_clock().wrapping_sub(since)));
 }
 
 /// After a list: if any of its requests waited for room under the in-flight
@@ -880,10 +1035,16 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
                 (Endpoint::Writer, 4)
             };
             if matches!(action, Action::Push | Action::Pop) {
+                let since = nc_clock();
                 noc::wait(TXN);
+                nc_waited(tt_isa::dataflow::NcWait::Drain, since);
                 publish();
             }
+            let since = nc_clock();
             tt_firmware::dataflow::buffer(stream, action, capacity, endpoint, actor)?;
+            if action == Action::Wait {
+                nc_waited(tt_isa::dataflow::NcWait::Credits, since);
+            }
         }
         Entry::Released { target, which } => {
             reader_only()?;
@@ -932,7 +1093,9 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             if !IS_NC {
                 return Err(dm::error::DIRECTION);
             }
+            let since = nc_clock();
             issue_l1_write(me, (x, y), to, from, len)?;
+            nc_waited(tt_isa::dataflow::NcWait::Issue, since);
         }
         Entry::L1Read {
             x,
@@ -960,7 +1123,9 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             if !IS_NC {
                 return Err(dm::error::DIRECTION);
             }
+            let since = nc_clock();
             multicast_l1(me, start, end, [to, from, len], run)?;
+            nc_waited(tt_isa::dataflow::NcWait::Issue, since);
         }
         Entry::Kernel {
             generation,
@@ -1256,6 +1421,15 @@ static mut IN_CALL: bool = false;
 /// Whether stamps now fall inside the scope's window (`dm::TRACE_WINDOW`): every stamp the mover
 /// makes inside a scope (entries, a launch's `KICK`, a wait's `ROLES_DONE`, `THROTTLE`) obeys it, or a
 /// long replay's launches alone would outrun the buffer.
+/// Whether B stamps a trace's fetches and its waits for its writer
+/// (`dm::trace_mode::FETCH`, `dm::trace_mode::WRITER_WAIT`): in `OPS` mode only, within the
+/// window. `FULL` stamps the `PAIR` entry a wait would sit inside, and its readers take no
+/// entry inside another. NC never does: its stamps would interleave with B's in the tile's one
+/// stream.
+fn stamps_waits() -> bool {
+    !IS_NC && trace_mode() == dm::trace_mode::OPS && in_window()
+}
+
 fn in_window() -> bool {
     let (lo, hi) = unsafe { TRACE_WINDOW };
     let b = unsafe { TRACE_BARRIERS };
@@ -1288,7 +1462,10 @@ fn begin_pair() -> Result<u32, u32> {
 }
 
 fn finish_pair(sequence: u32, result: Result<(), u32>) -> Result<(), u32> {
+    use tt_isa::mailbox::trace as ev;
     let mut poll = tt_firmware::dataflow::Poll::new();
+    let stamped = stamps_waits();
+    trace(stamped, ev::ENTRY_BEGIN, dm::trace_mode::WRITER_WAIT);
     let result = result.and_then(|()| loop {
         poll.tick()?;
         pump(PUMP_TURN);
@@ -1297,6 +1474,9 @@ fn finish_pair(sequence: u32, result: Result<(), u32>) -> Result<(), u32> {
             return if error == 0 { Ok(()) } else { Err(error) };
         }
     });
+    if result.is_ok() {
+        trace(stamped, ev::ENTRY_END, dm::trace_mode::WRITER_WAIT);
+    }
     if let Err(code) = result {
         tt_firmware::dataflow::abort_with(code);
         // NC reads this packet's writer entries out of B's ring and may still
@@ -1366,6 +1546,10 @@ fn pair_call(
         generation_base,
         0,
     );
+    // The next pair's first reader chunk, read while B waits for this one's writer.
+    if result.is_ok() {
+        fetch_ahead(me, usable, Some(reader[1]));
+    }
     finish_pair(sequence, result)
 }
 
@@ -1635,29 +1819,49 @@ fn call_chunks(
         M.trace_chunk
     };
     while done < count {
+        use tt_isa::mailbox::trace as ev;
         let n = (count - done).min(dm::TRACE_CHUNK_ENTRIES);
-        let read = [
-            op::READ,
-            channel,
-            0,
-            offset + done * dm::ENTRY_BYTES as u32,
-            chunk as u32,
-            n * dm::ENTRY_BYTES as u32,
-            0,
-            0,
-        ];
-        if IS_NC {
-            let descriptor =
-                Descriptor::decode(usable, read[0], read[1], read[2], read[3], read[4], read[5])?;
-            issue_via::<true>(
-                noc::me(Niu::Noc1),
-                descriptor,
-                descriptor.range.channel().port_for(Niu::Noc1, 0),
-            )?;
+        let stamped = stamps_waits();
+        trace(stamped, ev::ENTRY_BEGIN, dm::trace_mode::FETCH);
+        let since = nc_clock();
+        // A pair's first reader chunk may have been read ahead ([`fetch_ahead`]): then only its
+        // wait is left, and the `FETCH` stamp is that wait.
+        let ahead = !IS_NC
+            && done == 0
+            && unsafe { PAIR_ACTIVE }
+            && take_ahead([channel, offset, n]);
+        let chunk = if ahead {
+            tt_isa::dataflow::AHEAD_CHUNK
         } else {
-            exec(me, usable, read)?;
+            chunk
+        };
+        if !ahead {
+            let read = [
+                op::READ,
+                channel,
+                0,
+                offset + done * dm::ENTRY_BYTES as u32,
+                chunk as u32,
+                n * dm::ENTRY_BYTES as u32,
+                0,
+                0,
+            ];
+            if IS_NC {
+                let descriptor = Descriptor::decode(
+                    usable, read[0], read[1], read[2], read[3], read[4], read[5],
+                )?;
+                issue_via::<true>(
+                    noc::me(Niu::Noc1),
+                    descriptor,
+                    descriptor.range.channel().port_for(Niu::Noc1, 0),
+                )?;
+            } else {
+                exec(me, usable, read)?;
+            }
+            noc::wait(TXN);
         }
-        noc::wait(TXN);
+        nc_waited(tt_isa::dataflow::NcWait::Fetch, since);
+        trace(stamped, ev::ENTRY_END, dm::trace_mode::FETCH);
         // The chunk is in L1, written by the NoC past the L0 cache.
         publish();
         let mut i = 0u32;
@@ -1679,12 +1883,21 @@ fn call_chunks(
             return Err(dm::error::LENGTH);
         }
         publish();
+        // An outer chunk: its first pair's first reader chunk read ahead now.
+        let outer = !IS_NC && !unsafe { PAIR_ACTIVE };
+        if outer {
+            unsafe { OUTER = Some((chunk, n)) };
+            fetch_ahead(me, usable, None);
+        }
         let previous = unsafe { CALL_BASE };
         unsafe {
             CALL_BASE = generation_base;
         }
         flip_trace_domain();
         let result = run_entries(me, usable, chunk, n);
+        if outer {
+            unsafe { OUTER = None };
+        }
         flip_trace_domain();
         unsafe {
             CALL_BASE = previous;
@@ -1724,6 +1937,12 @@ pub extern "Rust" fn firmware_main() -> ! {
     noc::set_clock(wall_clock);
     // Nothing is in flight yet: the prefetch ID's cap, once (`set_cap` resets its room).
     noc::set_cap(PREFETCH_TXN, dm::TILE_IN_FLIGHT_CAP);
+    noc::set_cap(FETCH_TXN, dm::TILE_IN_FLIGHT_CAP);
+    // SAFETY: as `pump_slot`.
+    unsafe {
+        AHEAD = None;
+        OUTER = None;
+    }
     set_read_txn(TXN);
     *pump_slot() = None;
     // SAFETY: as `pump_slot`.
@@ -1745,8 +1964,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             let slot = rd(M.at(dm::QUEUE_SLOTS) + (done % dm::QUEUE_LEN) as u64 * 4);
             let result = run_list_at(me, usable, slot & 0xffff, slot >> 16);
             // A list is done when everything it read has landed, prefetches too.
-            let pumped = pump_finish();
-            noc::wait(PREFETCH_TXN);
+            let pumped = finish_prefetch();
             let result = result.and(pumped);
             publish_stalls(&mut stalls, trace_mode() != 0 && in_window());
             // Everything the list moved has landed before it is reported.
@@ -1781,7 +1999,8 @@ pub extern "Rust" fn firmware_main() -> ! {
                 run_entries(me, usable, address, count)
             }
         } else if rd(M.at(dm::OP)) == op::CALL && M == dm::Mover::NC {
-            call(
+            let since = nc_clock();
+            let r = call(
                 me,
                 usable,
                 rd(M.at(dm::CHANNEL)),
@@ -1789,7 +2008,9 @@ pub extern "Rust" fn firmware_main() -> ! {
                 rd(M.at(dm::LEN)),
                 0,
                 0,
-            )
+            );
+            nc_waited(tt_isa::dataflow::NcWait::Call, since);
+            r
         } else if rd(M.at(dm::OP)) == op::LIST {
             run_list(me, usable, rd(M.at(dm::LEN)))
         } else {
@@ -1804,8 +2025,7 @@ pub extern "Rust" fn firmware_main() -> ! {
             )
             .and_then(|d| run(me, d))
         };
-        let pumped = pump_finish();
-        noc::wait(PREFETCH_TXN);
+        let pumped = finish_prefetch();
         let result = result.and(pumped);
         publish_stalls(&mut stalls, trace_mode() != 0 && in_window());
         if let Err(code) = result {

@@ -90,6 +90,16 @@ pub mod trace_mode {
     /// (`tt_kernels::profile`).
     pub const OPS: u32 = 3;
 
+    /// What B stamps, in `OPS` mode, as an entry headed by this op around each of a
+    /// trace's fetches from GDDR: a chunk of its stream, or of a `PAIR_CALL`'s reader section (the
+    /// read and the wait for it). No entry is headed by `CALL` (a stream's `CALL` is refused), so
+    /// the stamp is never a real entry's.
+    pub const FETCH: u32 = super::op::CALL;
+    /// What B stamps, in `OPS` mode, as an entry headed by this op around its wait for
+    /// NC to finish a pair's writer section (its fetch and its writes). A `PAIR_CALL` entry itself
+    /// is never stamped, so the stamp is never a real entry's.
+    pub const WRITER_WAIT: u32 = super::op::PAIR_CALL;
+
     /// Is an entry headed by `op` stamped in `OPS` mode?
     pub const fn ops_stamped(op: u32) -> bool {
         matches!(
@@ -135,6 +145,14 @@ pub const TXN_PREFETCH: u8 = 6;
 /// [`TXN_NC`], whose counter a broadcast would leave meaningless. Nothing waits on it: a multicast
 /// is counted by its acknowledgements.
 pub const TXN_NC_MCAST: u8 = 7;
+/// The NoC transaction ID of RISCV B's trace fetches read ahead: the next [`op::PAIR_CALL`]'s first
+/// reader chunk, into [`crate::dataflow::AHEAD_CHUNK`] while B runs the entries before the pair.
+/// Apart from [`TXN_B`], whose drain at every chunk's end would wait for it. Only B waits on it,
+/// before it runs that chunk and at a list's end: an ID's outstanding count is the tile's NIU's,
+/// so NC waiting on it would wait for B's reads (`docs/learnings/silicon-operating-notes.md`,
+/// "A transaction ID's outstanding count is the tile's"). Its cap is [`TILE_IN_FLIGHT_CAP`], set
+/// once when the mover starts.
+pub const TXN_FETCH: u8 = 8;
 /// Word 6 of an [`op::WRITE_L1_MCAST`]: counted with the run it belongs to, not on its own.
 pub const MCAST_RUN_ACKS: u32 = 1;
 
@@ -246,6 +264,10 @@ const _: () = assert!(ENCODE_KEY + 4 <= TRACE_WINDOW);
 /// share GDDR with the ops they run under, whose latency-bound reads queue behind them
 /// (`docs/plans/decode-to-bandwidth.md` Phase 8).
 pub const PREFETCH_CAP: u64 = MAILBOX_BASE + 0xF8;
+/// The [`PREFETCH_CAP`] a host sets unless told otherwise (`tt_kernels::dm::DataMover::start`,
+/// `TT_PREFETCH_CAP`): two reads in flight, where busy-unit prefetch measured best on a 1.7B decode
+/// step (18.40 ms against 18.73 at 4 and 19.08 at 8, `docs/plans/planned-l1-residency.md` 3b).
+pub const PREFETCH_CAP_DEFAULT: u32 = 2;
 const _: () = assert!(TRACE_WINDOW + 4 <= PREFETCH_CAP);
 const _: () = assert!(PREFETCH_CAP + 4 <= MAILBOX_BASE + 0x100);
 

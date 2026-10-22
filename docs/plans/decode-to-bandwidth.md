@@ -716,7 +716,18 @@ the host ~0.8).
     the step even and 0.1 ms better under busy prefetch; rows read whole on many units, by multicast, cost 23 ms more
     (contended multicasts). 2f (rows held by two of their readers) and 2g (never-read writes dropped): 21.03 -> 20.06
     ms a step (`1792537293`), but busy prefetch still does not pay (cap 2, 20.13): Phase 3 (the products' outputs)
-    decides whether residency frees the windows.
+    decides whether residency frees the windows. **Phase 3 (2026-10-21):** the products' outputs resident, the adds,
+    RMSNorm and `silu_mul` reading no GDDR, 19.50 / 20.71 ms (`1792595329`); busy prefetch still does not pay (cap 1,
+    19.74 / 20.66; cap 2, 19.75 / 21.37), but **not because of GDDR**: under it the products go 14.79 -> 11.25 ms and
+    the add 8 -> 70 us a call with no GDDR read left (`1792597186`). **The cause** (probed 2026-10-21): NC drained the
+    prefetch transaction ID at every list's end, and an ID's outstanding count is the tile's NIU's, so NC waited for B's
+    prefetch reads while B, waiting for NC, issued more. Only B drains it now, and **busy prefetch pays**: cap 2, 18.40 /
+    19.92 ms against 19.51 / 20.75 off (`1792608583`, `1792608298`); caps 1 / 4 / 8 19.71 / 20.46, 18.73 / 20.54, 19.08 /
+    20.74 ([planned-l1-residency.md](planned-l1-residency.md) 3b). **On by default** since (2026-10-21), at a prefetch
+    cap of 2 (`dm::PREFETCH_CAP_DEFAULT`; `TT_BUSY_PREFETCH=0` turns it off): 18.39 / 19.90 ms with no settings
+    (`1792615740`). **Then (2026-10-21)** [planned-l1-residency.md](planned-l1-residency.md) Phase 4 (re-scoped) and 5a, the
+    reader sections read ahead: the small ops 5.00 -> 4.47 ms, the products 12.92 -> 13.46, the step unchanged (18.44 /
+    19.83, `1792619858`): **under busy prefetch the step is bound by the weight stream the small ops' windows carry.**
 - [ ] `down` prefetched: the first chunk batches' `B` gathers of `push_stream_jobs` on idle units. ~0.7 ms.
 - [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
   reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small

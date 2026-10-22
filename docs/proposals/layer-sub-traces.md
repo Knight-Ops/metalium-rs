@@ -1,6 +1,10 @@
 # Layer sub-traces: one stored layer, called once a layer
 
-Status: **proposal, unscheduled** (2026-10-20). Asked for on 2026-10-19: trace storage and L1 are running out, so
+Status: **proposal; its cheaper first step done, the body deferred** (2026-10-21). The next reader section's first
+chunk is read ahead on its own transaction ID ([planned-l1-residency.md](../plans/planned-l1-residency.md) Phase 5a): a
+1.7B step's fetch 0.83 -> 0.23 ms, but the step is unchanged, since under busy prefetch what the small ops give up the
+products wait for. A stored body would take the rest of the fetch and some control the same way, so it waits until the
+weight stream, not the small ops, sets the step. (2026-10-20: proposal, unscheduled.) Asked for on 2026-10-19: trace storage and L1 are running out, so
 what could rearchitecting free? This note is the trace-storage half. The L1 half is in
 [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8: the space audit, and the packed-`A` ring reclaim,
 which is done. Roadmap: Track 1, "Decode at GDDR's bandwidth", and Track 2, "Trace segmentation".
@@ -110,8 +114,9 @@ trace segmentation.
   - This is the same mechanism as Phase 8 Step 3's prefetch ID: `noc::wait(TXN)` would no longer drain it.
   - It halves the serial fetches with no format change.
   - The same goes for a `PAIR_CALL`'s next section (decode-small-ops S5, "the next reader section fetched ahead").
-- **Measure the fetch's share first.** Use `TT_PROFILE_DETAIL=full`, with and without a background stream, so that
-  what residency would save is known.
+- **Measure the fetch's share first.** Use the profile mode's default detail (`OPS`): B stamps a trace's fetches
+  (`dm::trace_mode::FETCH`) only there, and `TT_PROFILE_DETAIL=full` puts them in `other`. Measured 2026-10-21: 0.83 ms of
+  a 1.7B step's 5.00 ms of small ops (`1792609145`), 0.23 with the section read ahead (`1792620146`).
 
 ## With planned L1 residency
 

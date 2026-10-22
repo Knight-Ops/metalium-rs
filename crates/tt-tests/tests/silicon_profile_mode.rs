@@ -7,7 +7,8 @@
 //!   back under their labels (the attention by its parts), with positive spans.
 //! * **A trace too long for one stamp buffer is covered window by window.** A chain of 600 captured
 //!   ops (whose launch stamps alone outrun a buffer), replayed, gets every op attributed after a few
-//!   replays, none twice in one replay, and no replay overflows.
+//!   replays, none twice in one replay, and no replay overflows. B's fetches of the trace and its
+//!   waits for its writer core are attributed too, within each op's span.
 //! * **The windows stitch to the whole.** On a trace short enough to stamp whole, the per-op spans
 //!   stitched from windows sum to what whole-trace profiles measure, within the spread of those.
 //! * **Negative control:** with the window off, the long trace overflows the stamp buffer. The run
@@ -130,6 +131,23 @@ fn a_long_trace_is_covered_window_by_window() {
                 assert!(t.samples.iter().all(|s| s.len() <= replays));
                 eprintln!("{}", p.summary());
                 assert!(p.summary().contains("chain of 600"), "named");
+                // B's fetches of the trace and its waits for its writer are stamped too, inside
+                // each op's span.
+                let medians: Vec<_> = t.medians().into_iter().flatten().collect();
+                let sum = |f: fn(&burn_tt::profile::OpTime) -> u64| -> u64 {
+                    medians.iter().map(f).sum()
+                };
+                eprintln!(
+                    "fetch {} writer {} span {} cycles",
+                    sum(|m| m.fetch),
+                    sum(|m| m.writer),
+                    sum(|m| m.span)
+                );
+                assert!(sum(|m| m.fetch) > 0, "the replay's fetches are stamped");
+                assert!(sum(|m| m.writer) > 0, "B's waits for NC are stamped");
+                for m in &medians {
+                    assert!(m.barrier + m.kernels + m.control + m.fetch + m.writer <= m.span);
+                }
                 break;
             }
             assert!(

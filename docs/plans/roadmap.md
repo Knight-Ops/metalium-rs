@@ -419,8 +419,25 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         bytes at `K` = 2048; `K` = 4096 is never `K`-whole today), each plan's region sized under its graph's cap,
         plans cached by key, each planned op checked before it is queued, and **residency on by default**
         (`TT_RESIDENCY=0` off): a 1.7B step 21.00 / 22.25 -> **20.07 / 21.28 ms** (`1792556241`, `1792554892`), no
-        traced workload slower; builds +20-70%, accepted (a build's time is not a target). Next: Phase 3 (the products' outputs, which the residual
-        add still reads from GDDR).
+        traced workload slower; builds +20-70%, accepted (a build's time is not a target). **Phase 3 done** (2026-10-21,
+        gate `step219`, card 0 `1792596373`): a product's `SCATTER` counts as a plain write, so its output goes straight
+        into its readers' L1 (`qkv` to RoPE and the cache write, `gate|up` to `silu_mul`, `o` and `down` to the adds), and a
+        plan whose pinning costs room is planned unpinned too: 393 of 548 tensors resident, the adds, RMSNorm and
+        `silu_mul` reading no GDDR, a 1.7B step **19.50 / 20.71 ms** (`1792595329`). Busy prefetch still did not pay, and
+        not because of GDDR: under it the add took 70 us with nothing to read from GDDR (`1792597186`). **Probed and
+        fixed** (2026-10-21; profile-mode `fetch` and `writer` columns, NC's own wait counters): NC drained the prefetch
+        transaction ID at every list's end, and that count is the tile's NIU's, so NC waited for B's prefetch reads while
+        B issued more. Only B drains it now: with busy prefetch at cap 2 a step is **18.40 / 19.92 ms** (`1792608583`),
+        the first time busy prefetch pays; **on by default** since, at a prefetch cap of 2 (`TT_BUSY_PREFETCH=0` turns it
+        off): a 1.7B step **18.39 / 19.90 ms** with no settings (`1792615740`), the 135M, ResNet-18 and ViT-Tiny
+        unchanged. **Phase 4, re-scoped, and Phase 5a** (2026-10-21, gates `step189`, `step219`, card 0 `1792617802`,
+        `1792618297`): q and the context were resident already; the cache write reads its index's face, not the tile;
+        the planner tries a second leave-out order (no change on the 1.7B, whose region is full); and B reads a
+        replay's next reader section ahead on a transaction ID of its own (`dm::TXN_FETCH`). The small ops 5.00 ->
+        4.47 ms a step, fetch 0.83 -> 0.23, **but the step is unchanged** (18.44 / 19.83 ms, `1792619858`; 19.27 / 20.48
+        with busy prefetch off, was 19.51 / 20.76): the products took what the small ops gave up (12.92 -> 13.46 ms,
+        profile `1792620146`). **Next: the rate the weights stream at under the small ops** (the products reach ~391
+        GB/s against 460-486), not the small ops; the stored layer (5b) is deferred on that finding.
         With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is

@@ -29,7 +29,10 @@
 //! And through Burn: a traced generation of a synthetic four-layer Llama on `Tt` (step197's), its
 //! decode steps and prefill chunk captured twice with residency on (`burn_tt::set_residency`,
 //! `SharedStateTraces::capture`), gives the tokens and the logits of the generation without, bit
-//! for bit, and each of its traces moves fewer GDDR bytes than the same trace without.
+//! for bit, and each of its traces moves fewer GDDR bytes than the same trace without. Phase 4:
+//! on a two-layer Llama with 64-wide heads and `o`'s `K` of 1,024 on every tile (the 1.7B's paths:
+//! the native RoPE, attention as one op, a packed `A`), attention's operands are resident -- RoPE's
+//! query, attention's context twin, the step's mask, RoPE's tables -- and its unread rows dropped.
 
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::tensor::{DramTensor, Eltwise};
@@ -426,6 +429,216 @@ fn a_row_read_whole_is_held_by_two_units_bit_for_bit() {
     });
 }
 
+/// `y = x + a`, `z = y * gamma`, `p = z @ w`, `p + y`: a layer's `o` or `down` product and the
+/// residual add after it. `p` is made and read inside the graph.
+fn product_into_add<T: tt_device::Transport>(
+    s: &mut Session<T>,
+    x: &DramTensor,
+    a: &DramTensor,
+    gamma: &DramTensor,
+    w: &DramTensor,
+) -> DramTensor {
+    use tt_kernels::kind;
+    let y = s.eltwise(op(kind::ADD), x, Some(a)).unwrap();
+    let p = into_product(s, &y, a, gamma, w);
+    let out = s.eltwise(op(kind::ADD), &p, Some(&y)).unwrap();
+    for t in [y, p] {
+        s.free(t).unwrap();
+    }
+    out
+}
+
+/// The resident tensors of `plan` that a product (an op whose first list is the matmul's) writes.
+fn product_outputs(
+    g: &tt_kernels::residency::Graph,
+    plan: &tt_kernels::residency::Plan,
+) -> Vec<usize> {
+    plan.resident()
+        .filter(|&t| {
+            g.tensors[t]
+                .uses
+                .iter()
+                .any(|u| !u.writes.is_empty() && g.ops[u.op].what.starts_with("matmul"))
+        })
+        .collect()
+}
+
+/// Phase 3: a product's output (its `SCATTER`) goes straight into the L1 of the units that read
+/// it, the residual add's: bit for bit, the output resident, and the planned trace moves fewer
+/// GDDR bytes than the plain one by at least what the output moved there. **The negative
+/// control:** the output placed on the slot of a tensor still to be read when it is written is
+/// refused by `Plan::check` and, applied anyway, gives other bits.
+#[test]
+fn a_product_writes_into_the_residual_add_bit_for_bit() {
+    use tt_kernels::residency::Place;
+    with_session(|s| {
+        s.set_count_trace_bytes(true);
+        let seeds = [60u64, 61, 62];
+        let a = s.upload(&values(2, K), 1, K).unwrap();
+        let gamma = s.upload(&values(3, K), 1, K).unwrap();
+        let w = s.upload(&values(4, K * K), K, K).unwrap();
+        let x = s.upload(&values(seeds[0], K), 1, K).unwrap();
+        let mut fresh = Vec::new();
+        for &seed in &seeds {
+            s.write(&x, &values(seed, K)).unwrap();
+            let out = product_into_add(s, &x, &a, &gamma, &w);
+            fresh.push(bits(&s.download(&out).unwrap()));
+            s.free(out).unwrap();
+        }
+        s.set_residency(tt_kernels::session::RESIDENCY_REGION);
+        s.write(&x, &values(seeds[0], K)).unwrap();
+        s.begin_trace_plan_pass().unwrap();
+        let out = product_into_add(s, &x, &a, &gamma, &w);
+        let plain = s.end_trace().unwrap();
+        let (got, plain_bytes) = run_trace(s, plain, &x, &out, &seeds);
+        assert_eq!(got, fresh, "the plain trace");
+        let mut moved_by_output = 0;
+        assert!(s.probe_mutate_plan(|g, plan| {
+            let outputs = product_outputs(g, plan);
+            assert_eq!(outputs.len(), 1, "the product's output is resident");
+            let t = outputs[0];
+            moved_by_output = g.tensors[t]
+                .uses
+                .iter()
+                .map(|u| u.bytes[0] + u.bytes[1])
+                .sum();
+            for u in &g.tensors[t].uses {
+                eprintln!(
+                    "tensor {t}: op {} `{}` reads on {} units, writes on {}",
+                    u.op,
+                    g.ops[u.op].what,
+                    u.reads.len(),
+                    u.writes.len()
+                );
+            }
+        }));
+        s.write(&x, &values(seeds[0], K)).unwrap();
+        assert!(s.begin_trace_planned().unwrap());
+        let planned_out = product_into_add(s, &x, &a, &gamma, &w);
+        let planned = s.end_trace().unwrap();
+        let (got, planned_bytes) = run_trace(s, planned, &x, &planned_out, &seeds);
+        eprintln!(
+            "GDDR bytes: plain {plain_bytes}, planned {planned_bytes}; the output moved \
+             {moved_by_output}"
+        );
+        assert_eq!(got, fresh, "the planned trace");
+        assert!(
+            planned_bytes + moved_by_output <= plain_bytes,
+            "the planned trace moves {planned_bytes} B, the plain {plain_bytes} B, the output \
+             {moved_by_output} B"
+        );
+        for id in [plain, planned] {
+            s.release_trace(id).unwrap();
+        }
+        // The negative control: the output put on the slot of `y`, which the add reads after it.
+        s.write(&x, &values(seeds[0], K)).unwrap();
+        s.begin_trace_plan_pass().unwrap();
+        let again = product_into_add(s, &x, &a, &gamma, &w);
+        let plain = s.end_trace().unwrap();
+        assert!(s.probe_mutate_plan(|g, plan| {
+            let p = product_outputs(g, plan)[0];
+            let (sp, _) = g.tensors[p].lifetime().unwrap();
+            let live = plan
+                .resident()
+                .find(|&t| {
+                    let (st, et) = g.tensors[t].lifetime().unwrap();
+                    t != p && st < sp && sp < et
+                })
+                .expect("a resident tensor live across the product");
+            let Place::Resident { offset: to, .. } = plan.place[live] else {
+                unreachable!()
+            };
+            if let Place::Resident { offset, .. } = &mut plan.place[p] {
+                *offset = to;
+            }
+            assert!(
+                plan.check(g).is_err(),
+                "the check took the output over {live}"
+            );
+        }));
+        assert!(s.begin_trace_planned().unwrap());
+        let wrong_out = product_into_add(s, &x, &a, &gamma, &w);
+        let wrong = s.end_trace().unwrap();
+        s.write(&x, &values(seeds[0], K)).unwrap();
+        s.replay(wrong).unwrap();
+        s.sync().unwrap();
+        assert_ne!(
+            bits(&s.download(&wrong_out).unwrap()),
+            fresh[0],
+            "an output written over a tensor still to be read changed nothing"
+        );
+        for id in [plain, wrong] {
+            s.release_trace(id).unwrap();
+        }
+        for t in [out, planned_out, again, wrong_out, x, a, gamma, w] {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// Phase 3 under busy-unit prefetch (`Session::set_busy_prefetch`): two layers of
+/// [`product_into_add`], the second product's `B` read ahead on its own units while the first
+/// layer's add runs, as the first product's output arrives in their L1. Bit for bit, both outputs
+/// resident.
+#[test]
+fn products_under_busy_prefetch_are_bit_for_bit() {
+    with_session(|s| {
+        s.set_count_trace_bytes(true);
+        s.set_busy_prefetch(true);
+        let seeds = [70u64, 71];
+        let a = s.upload(&values(2, K), 1, K).unwrap();
+        let gamma = s.upload(&values(3, K), 1, K).unwrap();
+        let w = [
+            s.upload(&values(4, K * K), K, K).unwrap(),
+            s.upload(&values(5, K * K), K, K).unwrap(),
+        ];
+        let x = s.upload(&values(seeds[0], K), 1, K).unwrap();
+        let layers = |s: &mut Session<_>| {
+            let h = product_into_add(s, &x, &a, &gamma, &w[0]);
+            let out = product_into_add(s, &h, &a, &gamma, &w[1]);
+            s.free(h).unwrap();
+            out
+        };
+        let mut fresh = Vec::new();
+        for &seed in &seeds {
+            s.write(&x, &values(seed, K)).unwrap();
+            let out = layers(s);
+            fresh.push(bits(&s.download(&out).unwrap()));
+            s.free(out).unwrap();
+        }
+        s.set_residency(tt_kernels::session::RESIDENCY_REGION);
+        s.write(&x, &values(seeds[0], K)).unwrap();
+        s.begin_trace_plan_pass().unwrap();
+        let out = layers(s);
+        let plain = s.end_trace().unwrap();
+        let (got, plain_bytes) = run_trace(s, plain, &x, &out, &seeds);
+        assert_eq!(got, fresh, "the plain trace");
+        assert!(s.probe_mutate_plan(|g, plan| {
+            assert_eq!(
+                product_outputs(g, plan).len(),
+                2,
+                "both products' outputs resident"
+            );
+        }));
+        s.write(&x, &values(seeds[0], K)).unwrap();
+        assert!(s.begin_trace_planned().unwrap());
+        let planned_out = layers(s);
+        let planned = s.end_trace().unwrap();
+        let (got, planned_bytes) = run_trace(s, planned, &x, &planned_out, &seeds);
+        eprintln!("GDDR bytes: plain {plain_bytes}, planned {planned_bytes}");
+        assert_eq!(got, fresh, "the planned trace");
+        assert!(planned_bytes < plain_bytes);
+        for id in [plain, planned] {
+            s.release_trace(id).unwrap();
+        }
+        s.set_busy_prefetch(false);
+        let [w0, w1] = w;
+        for t in [out, planned_out, x, a, gamma, w0, w1] {
+            s.free(t).unwrap();
+        }
+    });
+}
+
 /// 2h: the region is sized by the plan pass, never more than leaves every op laid out as in it
 /// (`residency::cap`), nor than the 96 KiB ceiling. Here a product whose `K` = 2048 and whose
 /// columns outnumber its units twice over, so a narrower block is a different deal: its widest
@@ -751,8 +964,34 @@ fn a_traced_decoder_keeps_its_planned_traces_bit_for_bit() {
         drop(plain);
         burn_tt::set_residency(d, tt_kernels::session::RESIDENCY_REGION).unwrap();
         let before = burn_tt::probe_captures(d).unwrap();
+        tt_kernels::residency::probe_residency_plan(true);
         let planned = TracedGenerator::<_, Tt>::new(&model, &shapes, &d).unwrap();
+        tt_kernels::residency::probe_residency_plan(false);
         let first_build = burn_tt::probe_captures(d).unwrap() - before;
+        // Phase 3: every trace keeps its products' outputs in L1 for what reads them (`qkv` for
+        // RoPE and the cache write, `gate|up` for `silu_mul`, `o` and `down` for the adds).
+        for (g, plan) in tt_kernels::residency::take_plans() {
+            let outputs = product_outputs(&g, &plan);
+            let mut readers: Vec<&str> = outputs
+                .iter()
+                .flat_map(|&t| &g.tensors[t].uses)
+                .filter(|u| !u.reads.is_empty())
+                .map(|u| g.ops[u.op].label)
+                .collect();
+            readers.sort();
+            readers.dedup();
+            eprintln!(
+                "{} ops: {} product outputs resident, read by {readers:?}",
+                g.ops.len(),
+                outputs.len()
+            );
+            assert!(
+                outputs.len() >= 4 * config.layers,
+                "{} of a step's {} layers' product outputs resident",
+                outputs.len(),
+                config.layers
+            );
+        }
         let got = planned.generate(&prompt, 4).unwrap();
         ladder_support::assert_same(&got, &want, "residency-planned traces");
         let planned_bytes = bytes(&planned);
@@ -784,6 +1023,137 @@ fn a_traced_decoder_keeps_its_planned_traces_bit_for_bit() {
         ladder_support::assert_same(&got, &want, "traces captured under cached plans");
         assert_eq!(bytes(&again), planned_bytes);
         drop(again);
+        burn_tt::set_residency(d, 0).unwrap();
+        burn_tt::set_count_trace_bytes(d, false).unwrap();
+    });
+}
+
+/// The capture's tensors that an op labelled `writer` writes and one labelled `reader` reads.
+fn between(g: &tt_kernels::residency::Graph, writer: &str, reader: &str) -> Vec<usize> {
+    (0..g.tensors.len())
+        .filter(|&t| {
+            let uses = &g.tensors[t].uses;
+            uses.iter()
+                .any(|u| !u.writes.is_empty() && g.ops[u.op].label == writer)
+                && uses
+                    .iter()
+                    .any(|u| !u.reads.is_empty() && g.ops[u.op].label == reader)
+        })
+        .collect()
+}
+
+/// Phase 4: attention's operands stay in L1, on a decoder whose heads are 64 wide (the native
+/// RoPE's, which the 32-wide one above does not take): RoPE's query for attention, attention's
+/// packed context for `o`, the step's mask for every layer's attention and RoPE's tables for
+/// every layer's RoPE, each resident, and the context's own row, which nothing reads, never
+/// written. The KV cache is the trace's state and stays in GDDR. Bit for bit against the
+/// unplanned traces, moving fewer GDDR bytes.
+#[test]
+fn a_decoder_s_attention_operands_stay_in_l1_bit_for_bit() {
+    use burn_tt::{Tt, TtDevice};
+    use tt_kernels::residency::{Place, Reason};
+    use tt_models::generate::{Shapes, TracedGenerator};
+    use tt_models::llama::{Llama, LlamaConfig};
+    use tt_tests::burn_device::{with_device, Config};
+    let config = LlamaConfig {
+        // `o`'s `K` of 1,024 reads its `A` as a packed row (`PACKED_A_K_TILES`), the 1.7B's path;
+        // a narrower product gathers the context, which has no L1 path.
+        hidden: 1024,
+        heads: 16,
+        kv_heads: 16,
+        head_dim: 64,
+        ff: 1024,
+        vocab: 100,
+        layers: 2,
+        rope_theta: 10_000.0,
+        eps: 1e-5,
+        tied_head: true,
+    };
+    let bytes = |g: &TracedGenerator<'_, Llama<Tt>, Tt>| -> Vec<(String, u64)> {
+        g.trace_ops()
+            .unwrap()
+            .into_iter()
+            .map(|(k, ops)| (k, ops.iter().map(|o| o.bytes.read + o.bytes.write).sum()))
+            .collect()
+    };
+    // Every tile, as the 1.7B runs: a head a unit, the region a unit's share.
+    let every = Config {
+        tiles: Some(burn_tt::TileChoice::All),
+        ..Config::default()
+    };
+    with_device(every, |d: TtDevice| {
+        burn_tt::set_count_trace_bytes(d, true).unwrap();
+        let model = Llama::<Tt>::new(&config, &d).fused();
+        // A step attends whole tiles of positions to run attention as one op (`attention::fits`).
+        let (shapes, prompt) = (Shapes::new(64, &[4]), [3, 14, 15, 92, 65]);
+        burn_tt::set_residency(d, 0).unwrap();
+        let plain = TracedGenerator::<_, Tt>::new(&model, &shapes, &d).unwrap();
+        let want = plain.generate(&prompt, 4).unwrap();
+        let plain_bytes = bytes(&plain);
+        drop(plain);
+        burn_tt::set_residency(d, tt_kernels::session::RESIDENCY_REGION).unwrap();
+        tt_kernels::residency::probe_residency_plan(true);
+        let planned = TracedGenerator::<_, Tt>::new(&model, &shapes, &d).unwrap();
+        tt_kernels::residency::probe_residency_plan(false);
+        let mut steps = 0;
+        for (g, plan) in tt_kernels::residency::take_plans() {
+            if !g.ops.iter().any(|o| o.label == "attention/rows") {
+                continue;
+            }
+            steps += 1;
+            let resident = |what: &str, ts: &[usize], at_least: usize| {
+                let places: Vec<&Place> = ts.iter().map(|&t| &plan.place[t]).collect();
+                eprintln!("{} ops: {what}: {places:?}", g.ops.len());
+                assert!(
+                    ts.len() >= at_least,
+                    "{what}: {} tensors, at least {at_least} wanted",
+                    ts.len()
+                );
+                assert!(
+                    places.iter().all(|p| matches!(p, Place::Resident { .. })),
+                    "{what}: {places:?}"
+                );
+            };
+            let layers = config.layers;
+            resident(
+                "RoPE's query for attention",
+                &between(&g, "rope/native", "attention/rows"),
+                layers,
+            );
+            resident(
+                "attention's context for `o`",
+                &between(&g, "attention/rows", "float_matmul"),
+                layers,
+            );
+            resident("the mask", &between(&g, "int_greater", "attention/rows"), 1);
+            resident("RoPE's tables", &between(&g, "rope", "rope/native"), 2);
+            let unread: Vec<usize> = (0..g.tensors.len())
+                .filter(|&t| {
+                    plan.place[t] == Place::Gddr(Reason::NeverRead)
+                        && g.tensors[t]
+                            .uses
+                            .iter()
+                            .any(|u| g.ops[u.op].label == "attention/rows")
+                })
+                .collect();
+            assert!(
+                unread.len() >= layers && unread.iter().all(|t| plan.dropped.contains(t)),
+                "attention's unread context rows dropped: {unread:?} of {:?}",
+                plan.dropped
+            );
+        }
+        assert!(steps > 0, "no planned trace ran attention as one op");
+        let got = planned.generate(&prompt, 4).unwrap();
+        ladder_support::assert_same(&got, &want, "residency-planned traces, 64-wide heads");
+        for ((key, p), (k2, q)) in plain_bytes.iter().zip(&bytes(&planned)) {
+            assert_eq!(key, k2);
+            eprintln!("{key}: GDDR {p} B plain, {q} B planned");
+            assert!(
+                q < p,
+                "{key}: the planned trace moves {q} B, the plain {p} B"
+            );
+        }
+        drop(planned);
         burn_tt::set_residency(d, 0).unwrap();
         burn_tt::set_count_trace_bytes(d, false).unwrap();
     });
