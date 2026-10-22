@@ -1343,6 +1343,38 @@ the arena it plans in (`l1::arena`) only through the choices sized from it, and 
   [decode-length-cost.md](../completed-plans/decode-length-cost.md)). Every trace gate passes in both layouts on card
   0, and `step147` on both cards.
 
+## The Tensix L1 map, and changing it (2026-10-22, ttsim and card 0)
+
+Since 2026-10-22 (`docs/plans/decode-to-bandwidth.md`, "Room for a second job's `B`", M2) a Tensix tile's L1 is, in
+order: the five baby RISC-V images and B's mover list (`0x0..0x1A000`), NC's mover image (`..0x20000`), **`DATA`**
+(`0x20000..0x100000`, 896 KiB, unchanged), **`CAPTURE_ONLY`** (`0x100000..0x116000`, where the mailboxes were: only a
+trace's capture plans there), **`PROGRAMS`** (the four fixed program slots, `0x116000..0x136000`), **`MAILBOXES`**
+(`0x136000..0x140000`, 40 KiB: the single-core and role mailboxes with their guard blocks and `Dst` dumps, both movers'
+mailboxes, the probes' scratch, NC's list ring), `TRACE` (the timestamper's buffer) and the program cache
+(`0x144000..0x180000`). `tt_isa::l1::REGIONS` and `l1::FIXED` (every block of the mailboxes) are checked at compile time.
+
+- **Every L1 address is a constant of `tt-isa`, shared by host and firmware.** A change of the map rebuilds every image
+  (`tt-firmware-images` embeds them) and needs no address edited elsewhere: the only literals were the probes' scratch,
+  now `mailbox::PROBE_SCRATCH`.
+- **After a map change, the first process on a card is a `Session` bring-up.** L1 survives between processes, and a core
+  still running an image of the old map polls addresses that are now `DATA` or `PROGRAMS`: an old mover reading a
+  garbage queue issues arbitrary NoC reads. A `Session` holds every baby core before it writes anything, and its
+  driver cleanup holds them again when the process ends; processes outside a `Session` (the harness's single-core
+  runs, probes) are not covered if they crash, so start with a `Session` gate. The first run after M2 was
+  `step185`/`step187`/`step188`/`step191`/`step219`/`step221`, then `step221` again in a new process.
+- **Growing `DATA` is not free even when nothing moves into it.** The first form of this change gave `DATA` the 88 KiB
+  (to `0x116000`); every choice sized from the arena changed with it: a `K` = 1024 product took 6 columns, not 5, and
+  left its residency region half the room; a `[512]^3` product's blocks and an element-wise op's run lengths changed
+  (36-37 tiles instead of 32, whose layouts then met in one half); a 113-tile `K` no longer needed a continuation; and on
+  one tile the longer column-sum runs' programs no longer fit the program cache beside a traced 135M's
+  (`step193`, silicon only). Hence the capture-only arena: eager sizes stay as they were, and only a capture, whose
+  choices are pinned (P3), sees the room.
+- **What guards it:** `step221_l1_map` poisons the capture-only arena (the old mailboxes) and every word of `MAILBOXES`
+  no `FIXED` block holds, runs eager ops, a norm, a product and a planned capture with replays, and requires every
+  poisoned word intact; on ttsim it also opens a
+  second session on the first's L1 and requires the same bits (ttsim starts every process from zeroed L1, so this is
+  how a gate there sees state an earlier process left).
+
 ## Handling silicon runs
 
 Rules that held through the Phase 10 close-out; follow them for any new probe.

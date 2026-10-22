@@ -289,7 +289,7 @@ frontiers must be addressed:
 ### 8.1. Trace Cache Segmentation & Instruction Streaming
 
 #### Physical Constraint: 240 KB L1 Program Cache
-Each Tensix tile provides 1.5 MiB of local L1 SRAM (`tt_isa::tensix::L1_SIZE`), of which **240 KiB** is left for the firmware program cache (`tt_isa::l1::PROGRAM_CACHE`: L1 after the program slots and the 16 KiB trace buffer).
+Each Tensix tile provides 1.5 MiB of local L1 SRAM (`tt_isa::tensix::L1_SIZE`), of which **240 KiB** is left for the firmware program cache (`tt_isa::l1::PROGRAM_CACHE`: L1 after the program slots, the mailboxes and the 16 KiB trace buffer).
 When capturing a large enough network's entire training step (forward pass, loss, backward pass, optimizer updates, and parameter writebacks) on a single tile, the unrolled kernel instruction stream can exceed 240 KiB. `Session` then refuses with:
 ```text
 a list's programs do not fit an empty program cache

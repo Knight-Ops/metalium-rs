@@ -5,13 +5,17 @@
 //! `tt-isa` is `no_std` with no dependencies: it is the one crate both targets
 //! can share.
 //!
-//! The mailbox sits at 1 MiB into L1, clear of every core's default reset PC
-//! (the highest is NC's at `0x1_2000`) with a wide margin for code growth.
+//! The mailboxes sit together above the data arena and the program slots
+//! (`crate::l1`): the single-core one, the three roles', the two movers', the
+//! probes' scratch and RISCV NC's list ring, 40 KiB up to the trace buffer.
 
-/// Byte offset of the mailbox within a tile's L1.
 pub mod guard;
 
-pub const MAILBOX_BASE: u64 = 0x0010_0000;
+/// Byte offset of the single-core mailbox within a tile's L1: the first of the
+/// mailboxes, right after the program slots ([`PROGRAM_REGION_END`]).
+pub const MAILBOX_BASE: u64 = 0x0013_6000;
+/// The end of the mailboxes: everything [`MAILBOX_BASE`] begins, up to the trace buffer.
+pub const MAILBOX_REGION_END: u64 = 0x0014_0000;
 
 /// Offsets of the words the firmware runtime itself writes, from whichever base
 /// the image was linked with: [`MAILBOX_BASE`] for Tensix images,
@@ -168,11 +172,11 @@ pub mod loops {
     }
 }
 
-/// Where the host points the timestamper's event buffer: after the program
-/// slots, 1024 events. Sized for a profiled list (`trace`): the mover records
+/// Where the host points the timestamper's event buffer: after the mailboxes,
+/// 1024 events. Sized for a profiled list (`trace`): the mover records
 /// two events per list entry or record, never per expanded move, and each
 /// role three per run, so a full list of records with a kernel apiece fits.
-pub const TRACE_BUFFER: u64 = PROGRAM_REGION_END;
+pub const TRACE_BUFFER: u64 = MAILBOX_REGION_END;
 /// Bytes in [`TRACE_BUFFER`].
 pub const TRACE_BUFFER_BYTES: u64 = 1024 * crate::tensix::timestamper::EVENT_BYTES;
 
@@ -275,7 +279,12 @@ pub mod trace {
 /// firmware never pushes from wherever a stale or corrupt pointer says. They were
 /// once 256 words inside each mailbox, which a 32x32 matmul outgrows several times
 /// over: its flushed configuration alone is a hundred-odd.
-pub const PROGRAM_REGION: u64 = 0x0012_0000;
+///
+/// They sit right after the data arena (`crate::l1::DATA`) and before the
+/// mailboxes, so a trace -- which runs every kernel from the program cache and
+/// leaves the slots idle -- can plan into them as one arena with `DATA`
+/// (`crate::l1::TRACE_ARENA`).
+pub const PROGRAM_REGION: u64 = 0x0011_6000;
 /// Bytes in one program slot.
 pub const PROGRAM_SLOT: u64 = 0x8000;
 /// Slots: the single-core mailbox's, then one per Tensix thread.
@@ -291,7 +300,7 @@ pub const PROGRAM_MAX: u32 = (PROGRAM_SLOT / 4) as u32;
 ///
 /// `Dst` is not reachable over the NoC, so this is the only way a host sees a
 /// compute result. Sixteen 32-bit datums per row.
-pub const DUMP: u64 = MAILBOX_BASE + 0x2000;
+pub const DUMP: u64 = MAILBOX_BASE + 0x400;
 /// Most `Dst` rows a run may copy out.
 pub const DUMP_MAX_ROWS: u32 = 16;
 /// Datums in one `Dst` row.
@@ -301,6 +310,20 @@ pub const DUMP_ROW_WORDS: u32 = 16;
 pub const fn dump_offset(row: u32, column: u32) -> u64 {
     DUMP + ((row * DUMP_ROW_WORDS + column) as u64) * 4
 }
+
+/// L1 the development probes own, which no shipped image touches: the instruction-cache probes'
+/// timings ([`icache_results`]) and the `.ttinsn` experiment's block ([`TTINSN_SCRATCH`]).
+pub const PROBE_SCRATCH: u64 = MAILBOX_BASE + 0x3400;
+/// [`PROBE_SCRATCH`]'s length.
+pub const PROBE_SCRATCH_BYTES: u64 = 0x600;
+/// Where instruction-cache probe `i` (B, NC, T0, T1, T2) writes its timings: 0x100 bytes each.
+pub const fn icache_results(i: u64) -> u64 {
+    PROBE_SCRATCH + i * 0x100
+}
+/// The `.ttinsn` experiment's block (`tt-firmware` `bin/ttinsn_t1.rs`).
+pub const TTINSN_SCRATCH: u64 = PROBE_SCRATCH + 0x500;
+const _: () = assert!(icache_results(5) <= TTINSN_SCRATCH);
+const _: () = assert!(TTINSN_SCRATCH + 0x100 <= PROBE_SCRATCH + PROBE_SCRATCH_BYTES);
 
 // Compile-time rather than a test: if the mailbox ever moved past the end of L1,
 // every access to it would be out of bounds, and that should stop the build rather
@@ -320,6 +343,7 @@ const _: () = assert!(UNWEDGE + 4 <= MOP_CFG_VALID);
 const _: () = assert!(MOP_CFG + 9 * 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE_BUFFER + TRACE_BUFFER_BYTES <= crate::tensix::L1_SIZE);
 const _: () = assert!(TRACE_BUFFER % 16 == 0);
+const _: () = assert!(PROGRAM_REGION_END == MAILBOX_BASE && MAILBOX_BASE % 0x1000 == 0);
 
 /// One mailbox per Tensix thread, for the three-role datapath.
 ///
@@ -331,10 +355,10 @@ const _: () = assert!(TRACE_BUFFER % 16 == 0);
 /// reports through its own mailbox, laid out like the single-core one above:
 /// the same offsets, from a per-thread base.
 pub mod role {
-    /// First role mailbox, clear of the single-core mailbox, program and dump.
-    pub const BASE: u64 = 0x0011_0000;
-    /// Distance between role mailboxes: room for the program and the dump.
-    pub const STRIDE: u64 = 0x4000;
+    /// First role mailbox, after the single-core mailbox and its dump.
+    pub const BASE: u64 = super::MAILBOX_BASE + STRIDE;
+    /// Distance between mailboxes: the words, the guard block (`super::guard`) and the dump.
+    pub const STRIDE: u64 = 0x800;
 
     /// The mailbox of the role that runs on Tensix thread `thread` (0, 1 or 2).
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -423,9 +447,9 @@ pub mod role {
         Mailbox::of(2).dump_offset(super::DUMP_MAX_ROWS - 1, super::DUMP_ROW_WORDS - 1) + 4
             <= crate::tensix::L1_SIZE
     );
-    // The role mailboxes end before the program region begins, and the last
-    // role's slot is the region's last.
-    const _: () = assert!(BASE + 3 * STRIDE <= super::PROGRAM_REGION);
+    // The role mailboxes end inside the mailboxes, and the last role's slot is
+    // the program region's last.
+    const _: () = assert!(BASE + 3 * STRIDE <= super::MAILBOX_REGION_END);
     const _: () =
         assert!(Mailbox::of(2).program() + super::PROGRAM_SLOT == super::PROGRAM_REGION_END);
     const _: () =
@@ -553,7 +577,7 @@ mod tests {
                 assert!(a_end <= b.program() || b.program() + PROGRAM_SLOT <= a.program());
             }
             // Nothing else the host stages lands in a slot.
-            assert!(a.dump_offset(DUMP_MAX_ROWS - 1, DUMP_ROW_WORDS - 1) < PROGRAM_REGION);
+            assert!(a.dump_offset(0, 0) >= PROGRAM_REGION_END);
         }
     }
 

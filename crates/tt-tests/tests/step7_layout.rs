@@ -20,8 +20,8 @@ use tt_tests::harness::{in_device, tile, Dev};
 /// Where the tiled buffer is staged.
 ///
 /// Inside L1 (1536 KiB), clear of the firmware load address (`0x6000`) and of the
-/// mailbox regions at `0x10_0000` and above, and 16-byte aligned as a tile base must
-/// be (`UNPACR_Regular.md:113`).
+/// program slots and mailboxes past the data arena (`l1::DATA`), and 16-byte aligned
+/// as a tile base must be (`UNPACR_Regular.md:113`).
 const STAGE: u64 = 0x2_0000;
 
 /// Values unique per element and exactly representable in every format in scope, so

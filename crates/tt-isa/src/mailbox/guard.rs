@@ -245,7 +245,7 @@ pub const fn snapshot_value(snapshot: u32, index: u32) -> u32 {
 }
 
 const _: () = assert!(OFFSET % 16 == 0 && OFFSET > crate::mailbox::MAILBOX_SIZE);
-const _: () = assert!(Guard::BYTES + OFFSET < 0x2000);
+const _: () = assert!(Guard::BYTES + OFFSET <= crate::mailbox::DUMP - crate::mailbox::MAILBOX_BASE);
 const _: () = assert!(Guard::BYTES % 16 == 0);
 
 #[cfg(test)]

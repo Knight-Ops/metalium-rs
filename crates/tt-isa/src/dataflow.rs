@@ -82,7 +82,7 @@ const _: () = assert!(OUTER_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_B
 /// [`OUTER_CHUNK`] and the list, one chunk.
 pub const AHEAD_CHUNK: u64 = OUTER_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_BYTES;
 const _: () = assert!(AHEAD_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_BYTES <= dm::LIST);
-const _: () = assert!(NC_WAITS + NC_WAIT_WORDS * 4 <= mailbox::PROGRAM_REGION);
+const _: () = assert!(NC_WAITS + NC_WAIT_WORDS * 4 <= mailbox::PROBE_SCRATCH);
 
 /// Which credit channel a `CB` entry names (`dm::op::CB` word 1).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

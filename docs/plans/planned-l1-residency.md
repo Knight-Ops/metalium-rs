@@ -145,6 +145,9 @@ DATA.base                                                        DATA.end
   given the reduced arena). Busy-unit prefetch keeps its rule: the ops between two products must plan below the ring.
 - **Budget:** products need ~553 KB at `K` = 2048 since the packed-`A` reclaim, and small ops 12-50 KB. The 254 KB that
   reclaim freed is what this region and the sub-traces' stored bodies (~7 KB a unit) use.
+- **Since the mailboxes were packed** (2026-10-22, decode-to-bandwidth.md "Room for a second job's `B`", M2): `DATA` is
+  unchanged; the 88 KiB the mailboxes left (`l1::CAPTURE_ONLY`) and the program slots after it are for captures only
+  (P1-P3 there), whose block widths stay pinned to `DATA`'s.
 
 ### Hazards
 

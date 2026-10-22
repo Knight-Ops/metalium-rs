@@ -24,7 +24,7 @@ use tt_isa::tile::{L1Format, TileDescriptor, TileImage};
 
 /// Where the input tile image is staged, and where the packer writes.
 ///
-/// Both clear of the firmware at `0x6000` and the mailbox at `0x10_0000`, and
+/// Both clear of the firmware at `0x6000` and the mailboxes past the data arena, and
 /// 16-byte aligned: the packer writes L1 in 16-byte units (`PACR.md`), and a tile
 /// base must be 16-byte aligned anyway (`UNPACR_Regular.md:113`).
 pub const STAGE: u64 = 0x2_0000;

@@ -22,10 +22,10 @@ use crate::dram::{Dram, DramRange};
 pub mod encoded;
 pub mod record;
 
-/// The mover's mailbox: the slot after the three role mailboxes
-/// ([`crate::mailbox::role`]), which ends exactly where the program region begins.
+/// The mover's mailbox: the page after the three role mailboxes
+/// ([`crate::mailbox::role`]).
 pub const MAILBOX_BASE: u64 = crate::mailbox::role::BASE + 3 * crate::mailbox::role::STRIDE;
-const _: () = assert!(MAILBOX_BASE + 0x100 <= crate::mailbox::PROGRAM_REGION);
+// Its extent, mailbox and endpoints, is checked with every fixed block (`crate::l1::FIXED`).
 const _: () = assert!(MAILBOX_BASE % 16 == 0);
 
 /// Where the image is linked and loaded: RISCV B has no reset-PC override and
@@ -694,8 +694,8 @@ impl Mover {
 /// NC's own slot, from its default reset PC (`0x1_2000`) to the mover's list
 /// (`0x1_4000`), is 8 KiB, and the mover image is twice that. So the image
 /// lives in the free L1 between B's mover area and the data arena
-/// ([`crate::l1::NC_IMAGE`]), its list ring, scratch and trace chunk in the
-/// mailbox region's free stretch below the role mailboxes -- the program
+/// ([`crate::l1::NC_IMAGE`]), its list ring, scratch and trace chunk last in
+/// the mailboxes, past both movers' mailboxes -- the program
 /// cache keeps all of the top of L1, which a long column sum needs
 /// (`step21_one_launch`) -- and NC's reset PC holds a two-instruction jump to
 /// the image ([`nc::stub`]). Its reset PC is never moved:
@@ -712,9 +712,8 @@ pub mod nc {
     const _: () = assert!(
         IMAGE_BASE >= super::TRACE_CHUNK + super::TRACE_CHUNK_ENTRIES as u64 * super::ENTRY_BYTES
     );
-    /// NC's list ring, as [`super::LIST`] is B's: in the mailbox region, past
-    /// the single-core mailbox's `Dst` dump (`crate::mailbox::DUMP`) and
-    /// before the role mailboxes (`crate::mailbox::role::BASE`).
+    /// NC's list ring, as [`super::LIST`] is B's: last in the mailboxes, past
+    /// both movers' mailboxes and the probes' scratch.
     pub const LIST: u64 = crate::mailbox::MAILBOX_BASE + 0x4000;
     const _: () = assert!(
         LIST >= crate::mailbox::DUMP
@@ -729,8 +728,7 @@ pub mod nc {
     /// NC's mover mailbox: B's layout ([`super::SEQ`] and on, offset by
     /// `MAILBOX_BASE - super::MAILBOX_BASE`), one page after B's.
     pub const MAILBOX_BASE: u64 = super::MAILBOX_BASE + 0x1000;
-    const _: () = assert!(MAILBOX_BASE + 0x100 <= crate::mailbox::PROGRAM_REGION);
-    const _: () = assert!(END <= crate::mailbox::role::BASE);
+    const _: () = assert!(END <= crate::mailbox::MAILBOX_REGION_END);
     const _: () = assert!(STUB_AT + 8 <= super::LIST);
 
     /// The two instructions at [`STUB_AT`]: `lui t0, %hi(target)` and

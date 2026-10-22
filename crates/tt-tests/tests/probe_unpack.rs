@@ -45,7 +45,7 @@ use tt_tests::harness::{self, in_device, survives, Run, SENTINEL};
 const SCRATCH_GPR: u32 = 8;
 
 /// Where the tile image is staged. Clear of the firmware at `0x6000` and of the
-/// mailbox at `0x10_0000`, and 16-byte aligned as a tile base must be
+/// mailboxes past the data arena (`l1::DATA`), and 16-byte aligned as a tile base must be
 /// (`UNPACR_Regular.md:113`).
 const STAGE: u64 = 0x2_0000;
 

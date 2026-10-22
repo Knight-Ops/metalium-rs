@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The mailboxes packed: the L1 map before room for a second `B`](#the-mailboxes-packed-the-l1-map-before-room-for-a-second-b-2026-10-22-card-0) | 2026-10-22 | the mailboxes moved into 40 KiB above the program slots, 88 KiB of capture-only L1 left beside `DATA`; nothing uses it yet: a 1.7B step 16.79 / 18.20 -> **16.76 / 18.17 ms**, the 135M, ResNet-18 and ViT-Tiny unchanged; a first form that grew `DATA` itself changed every arena-sized choice |
 | [Each unit's own prefetch anchor](#each-units-own-prefetch-anchor-2026-10-22-card-0) | 2026-10-22 | each unit's prefetch anchored at the last weight-streaming product it took part in, not the last overall: `gate\|up`'s busy units that sat out `o` read under RoPE, the cache write and attention; a 1.7B step 16.87 / 18.29 -> **16.79 / 18.20 ms**, 429 GB/s, the same 3.48 GB read ahead (L1 holds one job a unit); the 135M 0.01-0.03 ms slower; on by default |
 | [A column's `K` chain handed between two units](#a-columns-k-chain-handed-between-two-units-2026-10-22-card-0) | 2026-10-22 | `down`'s whole columns handed at a chunk to spare units, as a second op, bit for bit: a 1.7B step 16.88 / 18.32 -> **17.07 / 18.51 ms** (slower; opt-in): `down` 179 -> 172 us, but the halves contend at GDDR (up to 137 us, not ~88) and `qkv` 51 -> 72 us as the spare units start its read ahead later |
 | [`down` prefetched, and the unit counts re-swept](#down-prefetched-and-the-unit-counts-re-swept-2026-10-22-card-0) | 2026-10-22 | each of 40 idle units reads a streamed column's first two chunks ahead: a 1.7B step 17.29 / 18.72 -> **16.87 / 18.30 ms**, 426 GB/s, `qkv` 90 -> 51 us a layer; the prefetch and stream unit counts kept at 40 / 64 / 40; `down`'s 24 busy units now bind it (a whole column each at one unit's rate) |
@@ -348,6 +349,27 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The mailboxes packed: the L1 map before room for a second `B` (2026-10-22, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, "Room for a second job's `B`", H0 and M2. Every tile
+(`TT_TILES=all`), release, the defaults, 2 warmups and 9 samples, validated.
+
+| Workload | Before (`1792702009`) | After (`1792711476`, `1792711624`, `1792711671`) |
+|---|--:|--:|
+| 1.7B decode step, 32 / 256-token prompts (`traced_generation_stream_ceiling`) | 16.79 / 18.20 ms | **16.76 / 18.17** |
+| 135M decode step, 32 / 256 | 7.61 / 9.10 (`1792679220`) | 7.62 / 9.09 |
+| ResNet-18 traced forward | 13.94-14.13 | 14.14 |
+| ViT-Tiny traced forward | 9.21 | 9.20 |
+
+- **The space report's baseline** (H0, `need` beside `top`, `1792702009`): a step's products reach the arena's top
+  (819,200 of `DATA` with the 96 KiB region) and need 807,040 (their probe floor); `down` 578,240; the row scatter and
+  select 208,000; RoPE's and the mask's block copies 532,480; RMSNorm's packed row 266,240; attention 33,280.
+- **A first form gave `DATA` the 88 KiB** (`0x20000..0x116000`): bit for bit on card 0 (31 of 31 model gates,
+  `1792706003`) and 16.73 / 18.15 ms (`1792708053`), but every choice sized from the arena moved: a `K` = 1024 product's
+  block (6 columns, its residency cap 97,984 -> 50,816 bytes), an element-wise op's run lengths (36-37 tiles, whose
+  layouts met in one half), `[512]^3`'s blocks, and on one tile a traced 135M's column sums, whose programs no longer fit
+  beside its traces (`--smoke` `1792706348`, 2 failed). Kept instead: `DATA` unchanged, the room capture-only.
 
 ## Each unit's own prefetch anchor (2026-10-22, card 0)
 

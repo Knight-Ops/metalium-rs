@@ -457,7 +457,11 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         the capture writes is never read ahead): a 1.7B step **16.79 / 18.20 ms** (`1792695341`; 16.87 / 18.29 before,
         `1792695646`), the 135M 0.01-0.03 ms slower. The same 3.48 GB is read ahead, only sooner: a unit's arena holds
         one job's `B`, so the window is bound by L1 (profile `1792696105`). Next (decode-to-bandwidth Phase 8):
-        room for more `B` a unit (the space audit's candidates).
+        room for more `B` a unit ([there](decode-to-bandwidth.md#room-for-a-second-jobs-b-2026-10-22)). **Under way**
+        (2026-10-22): the mailboxes packed into 40 KiB above the program slots (M2), leaving 88 KiB of capture-only L1
+        beside `DATA`, with the program slots after it (`DATA` itself unchanged: growing it changed every choice sized
+        from the arena); bit for bit, `--smoke` 1,188 of 1,188, the step unchanged (16.76 / 18.17 ms, `1792711476`). Next:
+        captures plan into that room and `PROGRAMS` (P1-P3), then a second `B` ring (R1-R4).
         With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is

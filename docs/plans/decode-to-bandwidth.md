@@ -898,15 +898,77 @@ the host ~0.8).
     carries the same reads sooner and cannot carry more. Adding idle units costs the small ops more than it gives.
   - **Next:** what binds the window is L1 per unit, i.e. the space audit's candidates (the block copies' batch, layer
     sub-traces). The next lever of "The stream's rate" is room for a second job's `B`, not an earlier start.
-- [ ] **With the next record or mover change:** `record::PrefetchCursor::new` does not refuse `GATHER_STREAM |
-  GATHER_PREFETCH`, though its doc says it refuses what the expansion refuses (`expand_for` does, with `RANGE`); only
-  the host's check stops the pair today (found 2026-10-22). Refuse it in the cursor, cover it in the cursor-against-
-  expansion unit test, and run the record gates (`step172`, `step173`, `step215`) in the three images.
-- [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
-  reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small
-  ops' entries (decode-step-bandwidth B2.1-B2.4).
+- [x] **`record::PrefetchCursor::new` refuses `GATHER_STREAM | GATHER_PREFETCH`** (2026-10-22, H0 of "Room for a second
+  job's `B`" below), as the expansion does (`RANGE`); before, only the host's check stopped the pair. The cursor-against-
+  expansion unit test's refusal table has the pair (**watched failing** first: `Ok(())` against `Err(2)`). ttsim
+  `step172`, `step173`, `step215` in the three images; card 0 `step215`, `step216` (`1792701998`); firmware clippy plain,
+  `encoded-guard`, `profile`, `fast-reads`.
+- [x] ~~Busy units stream too~~ (decode-step-bandwidth B2.1-B2.4): **superseded** by what was built since: the prefetch's
+  own transaction ID (`dm::TXN_PREFETCH`, waited on by `WAIT_PREFETCH`), `B`'s ring at the top of the arena with the
+  rule that the ops between two products plan below it (`matmul_requirements_top_b`, `session::busy_start`), and the
+  prefetch pump issuing the reads from the mover's waits instead of slicing them between the small ops' entries
+  (`record::PrefetchCursor`).
 - [x] Depth and the caps (`PREFETCH_UNITS`, `THIN_STREAM_UNITS`) re-tuned from a profile after Phases 6-7 (2026-10-22,
   "The stream's rate" 3 above: unchanged).
+
+### Room for a second job's `B` (2026-10-22)
+
+A unit's arena holds one job's `B` (the anchor's finding above), and there is no room for a second: `DATA` is 917,504
+bytes, the residency region keeps 98,304 of it, and a `K` = 2048 product needs 553,280 (`A`'s 3 slots, 2 outputs and a
+128-slot `B` ring at the arena's end), so even a one-column second ring (64 slots, 266,240 bytes) is 320 bytes short,
+with nothing left for the small ops. The room is elsewhere in L1: `MAILBOXES` is 128 KiB of which ~28 KiB is used, and
+`PROGRAMS` (4 x 32 KiB) is idle while a trace replays (every traced kernel runs from the program cache). Decided
+(2026-10-22): take both, then build a second ring. The new map:
+
+| Region | Before | Now |
+|---|---|---|
+| `DATA` | `0x20000..0x100000` (896 KiB) | unchanged |
+| `CAPTURE_ONLY` | - | `0x100000..0x116000` (88 KiB, where the mailboxes were) |
+| `PROGRAMS` | `0x120000..0x140000` | `0x116000..0x136000` |
+| `MAILBOXES` | `0x100000..0x120000` | `0x136000..0x140000` (40 KiB; each block in `l1::FIXED`) |
+| `TRACE_ARENA` (captures only, P1-P3) | - | `0x20000..0x136000` (+216 KiB) |
+
+- [x] **H0** (2026-10-22): the cursor's refusal (above), `DATA need` in the space report (`session::space_report`, beside
+  `top`). Baseline (card 0, every tile, `1792702009`): 1.7B **16.79 / 18.20 ms**; a step's products `top` 819,200 /
+  `need` 807,040 (the probe floor), `down` 578,240, the row scatter and select 208,000, RoPE's and the mask's block copies
+  532,480, RMSNorm's packed row 266,240.
+- [x] **M1, every fixed block named** (2026-10-22, nothing moved): `mailbox::PROBE_SCRATCH` (the icache and `.ttinsn`
+  probes' literals), `l1::FIXED` (every block of `MAILBOXES` with its extent, B's mailbox through its read endpoints,
+  NC's through its stream words), checked in order and inside the region at compile time; unit test
+  `every_fixed_block_lies_in_mailboxes_and_none_overlap` with a moved block refused.
+- [x] **M2, the mailboxes compacted** (2026-10-22; an ABI change). `MAILBOX_BASE` 0x136000, `DUMP` +0x400, role mailboxes 0x800
+  apart from +0x800 (words, guard at +0x100, dump at +0x400: the 16 KiB stride was room for programs that moved to
+  `PROGRAMS` long ago), B's mover mailbox +0x2000, NC's +0x3000, the probes' scratch +0x3400, NC's list ring +0x4000;
+  `PROGRAMS` moved down against what the mailboxes left (`l1::CAPTURE_ONLY`); `TRACE` and the program cache unchanged.
+  - **`DATA` itself stays 896 KiB.** The first form gave `DATA` the 88 KiB (`0x20000..0x116000`) and was measured (card 0:
+    31 of 31 model and residency gates, `1792706003`; 1.7B 16.73 / 18.15 ms, `1792708053`), but every choice sized from
+    the arena changed with it, which the gates found: a `K` = 1024 product took 6 columns, not 5, and its residency cap
+    fell from 97,984 to 50,816 bytes (`step219`'s attention test: the mask in GDDR); a pipelined element-wise op's runs
+    became 36-37 tiles, not 32, and a 37-tile run's `B` met a 36-tile run's outputs in one half (`step60`: a release
+    wait); `[512]^3`'s blocks changed (`step22`); `step85`'s 113-tile `K` no longer needed a continuation; and on one tile
+    a traced 135M's column sums took longer runs whose programs no longer fit beside its traces (`step193`, smoke run
+    `1792706348`, silicon only). So the room is capture-only: eager sizes are as before, and a capture's choices are
+    pinned to `DATA` (P3).
+  - New gate `step221_l1_map`: the capture-only arena (the old mailboxes) and every word of `MAILBOXES` outside `FIXED`
+    poisoned on every tile (on ttsim before the session opens), a workload of eager ops, a norm, a product and a
+    planned capture with replays, and every poisoned word intact, with a control (a word written at the old
+    single-core `STATUS` is reported, and only it); and, on ttsim, a second session opened on the first's L1 computes
+    the same bits (**watched failing** with `QUEUE_HEAD` left out of the mover's start: the second session's results
+    differ).
+  - **Gates.** ttsim: `step3`, `step4`, `step21`, `step22`, `step52`, `step60` (both), `step85`, `step172`/`step173`/
+    `step215` in the three images, `step187`, `step193`, `step205`, `step216`-`step221`, `step12_mnist` (golden
+    unchanged), the `tt-kernels` unit tests; firmware clippy plain, `encoded-guard`, `profile`, `fast-reads`,
+    `ttinsn-experiment`. Card 0, a `Session` bring-up first: `step185`, `step187`, `step188` (bit for bit), `step191`,
+    `step193`, `step219`, `step221`, `silicon_probe_region_cliff`, 35 of 35 (`1792709565`); `step221` again in a new
+    process (`1792709899`); `--smoke` 1,188 of 1,188 (`1792709902`).
+  - **Measured** (card 0, every tile): 1.7B **16.76 / 18.17 ms** (`1792711476`; 16.79 / 18.20 before), the 135M 7.62 /
+    9.09 (`1792711624`), ResNet-18 traced 14.14 and ViT-Tiny 9.20 (`1792711671`): unchanged, as nothing uses the room
+    yet.
+- [ ] **P1**: `l1::TRACE_ARENA`, and the card's list checks (`Entry::decode`) against it.
+- [ ] **P2**: setup runs from the program cache; `PROGRAMS` slots forgotten at every replay.
+- [ ] **P3**: captures plan into `PROGRAMS` (`Session::set_trace_arena`), the products' chunk choice pinned.
+- [ ] **R1-R4**: a ring-indexed product layout; idle units take a second job; a two-deep prefetch queue on a second ID;
+  busy units read a second job ahead.
 
 ## The larger changes compared (2026-10-18)
 

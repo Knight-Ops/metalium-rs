@@ -29,13 +29,11 @@
 use tt_firmware::corpus::{self, experiment};
 use tt_firmware::ttinsn;
 use tt_firmware::{l1_read32, l1_write32, publish};
-use tt_isa::mailbox::MAILBOX_BASE;
 use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{RiscvT1, Thread1};
 
-/// The scratch block: free L1 inside the single-core mailbox's span, clear of
-/// the role mailboxes, which sit at `mailbox::role::BASE` and up.
-const SCRATCH: u64 = MAILBOX_BASE + 0x3500;
+/// The scratch block, in the probes' own L1 (`mailbox::PROBE_SCRATCH`).
+const SCRATCH: u64 = tt_isa::mailbox::TTINSN_SCRATCH;
 /// Host-written: 0 = the runner's own push, 1 = fused where a program matches.
 const MODE: u64 = SCRATCH;
 /// Written here: how many programs this run pushed fused (0 or 1).

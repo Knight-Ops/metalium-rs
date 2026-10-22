@@ -30,31 +30,31 @@ fn instruction_cache_size_by_timing() {
                 Core::B,
                 tt_firmware_images::ICACHE_B,
                 MAILBOX_BASE,
-                MAILBOX_BASE + 0x3000,
+                tt_isa::mailbox::icache_results(0),
             ),
             (
                 Core::NC,
                 tt_firmware_images::ICACHE_NC,
                 tt_isa::dm::nc::MAILBOX_BASE,
-                MAILBOX_BASE + 0x3100,
+                tt_isa::mailbox::icache_results(1),
             ),
             (
                 Core::T0,
                 tt_firmware_images::ICACHE_T[0],
                 role(0),
-                MAILBOX_BASE + 0x3200,
+                tt_isa::mailbox::icache_results(2),
             ),
             (
                 Core::T1,
                 tt_firmware_images::ICACHE_T[1],
                 role(1),
-                MAILBOX_BASE + 0x3300,
+                tt_isa::mailbox::icache_results(3),
             ),
             (
                 Core::T2,
                 tt_firmware_images::ICACHE_T[2],
                 role(2),
-                MAILBOX_BASE + 0x3400,
+                tt_isa::mailbox::icache_results(4),
             ),
         ] {
             d.write32(&w, t, mailbox + offset::STATUS, 0).unwrap();

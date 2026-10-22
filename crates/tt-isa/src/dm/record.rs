@@ -101,7 +101,7 @@ impl PrefetchCursor {
         if unpacked && (!b_t || flags & GATHER_BF16 != 0) {
             return Err(super::error::RANGE);
         }
-        if flags & GATHER_BF16 != 0 || (b_t && !unpacked) {
+        if flags & GATHER_BF16 != 0 || (b_t && !unpacked) || flags & GATHER_STREAM != 0 {
             return Err(super::error::RANGE);
         }
         let (_, cols) = (extent(rows)?, extent(cols)?);
@@ -1473,12 +1473,14 @@ mod tests {
             }
         }
         assert!(cases > 40);
-        // What the expansion refuses: an empty `B`, a transposing read, packed BF16, `kt` 0.
+        // What the expansion refuses: an empty `B`, a transposing read, packed BF16, a weight
+        // stream's cap with a prefetch's, `kt` 0.
         let empty = TensorRef::default();
         for (flags, b) in [
             (GATHER_A_RESIDENT, empty),
             (GATHER_A_RESIDENT | 2, t(2, 4)),
             (GATHER_A_RESIDENT | GATHER_BF16, t(2, 4)),
+            (GATHER_A_RESIDENT | GATHER_STREAM, t(2, 4)),
         ] {
             let [a0, a1] = t(2, 4).encode();
             let [b0, b1] = b.encode();

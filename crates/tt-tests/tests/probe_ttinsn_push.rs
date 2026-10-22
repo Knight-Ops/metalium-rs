@@ -335,12 +335,12 @@ fn the_programs_are_runnable_by_the_runner() {
 mod experiment {
     use super::*;
     use tt_device::trace::TraceEvent;
-    use tt_isa::mailbox::{trace as ev, MAILBOX_BASE};
+    use tt_isa::mailbox::trace as ev;
     use tt_kernels::runtime::{self, Kernel, Schedule};
     use tt_tests::harness::{in_device, tensix_tile, Dev};
 
     /// `ttinsn_t1.rs`'s scratch block.
-    const SCRATCH: u64 = MAILBOX_BASE + 0x3500;
+    const SCRATCH: u64 = tt_isa::mailbox::TTINSN_SCRATCH;
     const STAMP_VALUE: u32 = 0x7717_0001;
 
     /// The ttsim tests of this file run one at a time. Run concurrently they hung

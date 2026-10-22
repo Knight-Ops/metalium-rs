@@ -5124,7 +5124,8 @@ impl<T: Transport> Session<T> {
 
     /// [`probe_space_report`]'s lines for `c`, as it ends: per op kind (its label and first
     /// list's name), how many ops, the highest `DATA` address their plans reached
-    /// ([`trace::OpRecord::l1_top`]; "unplanned" counts ops whose layout was not planned while
+    /// ([`trace::OpRecord::l1_top`]) and the lowest arena end they need
+    /// ([`trace::OpRecord::l1_need`]) ("unplanned" counts ops whose layout was not planned while
     /// captured), their stream entries on all units (sections included), and the program-cache
     /// bytes they hold on the unit where they hold most (each program charged to the op that took
     /// it first); then how many ops are alike, by kind and entries a unit, which bounds what one
@@ -5136,6 +5137,7 @@ impl<T: Transport> Session<T> {
             ops: usize,
             unplanned: usize,
             top: u64,
+            need: u64,
             entries: u64,
             program_bytes: u64,
         }
@@ -5150,6 +5152,7 @@ impl<T: Transport> Session<T> {
                 k.unplanned += 1;
             }
             k.top = k.top.max(op.l1_top);
+            k.need = k.need.max(op.l1_need);
             k.entries += c
                 .units
                 .iter()
@@ -5194,9 +5197,10 @@ impl<T: Transport> Session<T> {
         rows.sort_by_key(|(_, k)| std::cmp::Reverse((k.program_bytes, k.entries)));
         for ((label, what), k) in rows {
             eprintln!(
-                "SPACE   {label:>18} {what:<28} ops {:>4}  DATA top {:>7} B ({} unplanned)  entries {:>8}  programs {:>6} B",
+                "SPACE   {label:>18} {what:<28} ops {:>4}  DATA top {:>7} B need {:>7} B ({} unplanned)  entries {:>8}  programs {:>6} B",
                 k.ops,
                 k.top.saturating_sub(data.base),
+                k.need.saturating_sub(data.base),
                 k.unplanned,
                 k.entries,
                 k.program_bytes,

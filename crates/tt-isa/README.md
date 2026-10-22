@@ -24,13 +24,13 @@ build for both does not belong here.
 | `arc` | The ARC telemetry tags: how to ask a chip what it is (harvesting, translation). |
 | `dram` | GDDR6 channels (`Dram`, `DramRange`); only a chip's grid can produce a range. |
 | `eth` | Ethernet tile register map, firmware-owned L1, and the `eth::mover` protocol. |
-| `mailbox` | The L1 contract between host and firmware: status words, role mailboxes, program region. `mailbox::guard` is the role-side deadline, blocked status and host release that make a blocking instruction safe to run. |
+| `mailbox` | The L1 contract between host and firmware: status words, role mailboxes, program region, the probes' scratch (`PROBE_SCRATCH`). `mailbox::guard` is the role-side deadline, blocked status and host release that make a blocking instruction safe to run. |
 | `packer`, `unpacker` | Checked staging of packer ReLU and edge masking, and of unpacker tileize and transpose modes. |
 | `hazard` | A hazard table over the backend wait rules and a checker that reports missing and redundant waits in a program. |
 | `tag_search` | The L1 tag-search accelerator's registers and helpers (host and ttsim only: armed trigger loads hang the core on silicon). |
 | `dm` | The RISCV B data mover protocol: descriptors, list entries (`op::READ`, `WRITE`, `LIST`, `COMPUTE`, `KERNEL`, `WAIT`, ...), element-wise `kind`s. |
 | `dm::record` | Op records (`GATHER`, `SCATTER`, `ELTWISE`, `SUM`): a whole op in a few list entries, `expand`ed on the tile and, first, on the host. |
-| `l1` | The fixed L1 region map (`REGIONS`: images, mover list, data arena, mailboxes, program slots, trace, program cache), checked at compile time. Kernels never address `l1::DATA` directly; `tt_kernels::l1` places buffers there. |
+| `l1` | The fixed L1 region map (`REGIONS`: images, mover list, data arena, program slots, mailboxes, trace, program cache) and every block of the mailboxes (`FIXED`), checked at compile time. Kernels never address `l1::DATA` directly; `tt_kernels::l1` places buffers there. |
 | `tile` | Tile layout in L1 (`TileDescriptor`, `TileImage`). |
 | `numerics` | Bit-exact models of hardware arithmetic (`fma_bh`, a port of the spec's `fma.c`). |
 
