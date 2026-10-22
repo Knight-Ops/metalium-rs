@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [`down` prefetched, and the unit counts re-swept](#down-prefetched-and-the-unit-counts-re-swept-2026-10-22-card-0) | 2026-10-22 | each of 40 idle units reads a streamed column's first two chunks ahead: a 1.7B step 17.29 / 18.72 -> **16.87 / 18.30 ms**, 426 GB/s, `qkv` 90 -> 51 us a layer; the prefetch and stream unit counts kept at 40 / 64 / 40; `down`'s 24 busy units now bind it (a whole column each at one unit's rate) |
 | [The weight stream metered](#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0) | 2026-10-22 | prefetched bytes charged to their product, the prefetch `WAIT` stamped, every unit timed: a 1.7B step's weights stream at **389 GB/s**, 2.97 GB read ahead; unit 0 waits 28 / 67 us a layer for its own prefetch in `qkv` / `gate\|up`; the units read unevenly by where they sit among the readers; a weight stream's reads at 2 in flight even them out: a 1.7B step 18.44 / 19.83 -> **17.27 / 18.71 ms**, 416 GB/s, the 135M unchanged |
 | [Residency on by default, its region sized under the products' cliff](#residency-on-by-default-its-region-sized-under-the-products-cliff-2026-10-21-card-0) | 2026-10-21 | a region costs a product only past its plan's floor (110,464 bytes at `K` = 2048: +8-10% one 64-byte step past it); each plan's region sized under its graph's cap, plans cached, residency on by default: a 1.7B step 21.00 / 22.25 -> **20.07 / 21.28 ms**, nothing slower; builds +20-70% (open) |
 | [Rows held by a few of their readers, and never-read writes dropped](#rows-held-by-a-few-of-their-readers-and-never-read-writes-dropped-2026-10-20-card-0) | 2026-10-20 | a row many units read whole, held by 2 of them instead of multicast to all, and the writes nothing reads dropped: with `TT_RESIDENCY=1` a 1.7B step 21.03 / 22.25 -> **20.06 / 21.28 ms** (card 0); of the probe's three ways, multicast acknowledgements counted once a run changed nothing |
@@ -345,6 +346,61 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## `down` prefetched, and the unit counts re-swept (2026-10-22, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, "The stream's rate", Step 2 levers 3, 3a and 4. 1.7B,
+every tile (`TT_TILES=all`), release, the defaults (residency, busy prefetch cap 2, stream cap 2),
+`traced_generation_stream_ceiling`, 2 warmups and 9 samples, validated; decode step at 32 / 256-token prompts.
+
+- **What changed:** a product whose `K` is streamed (`down`) is prefetched too (`Session::set_stream_prefetch`, on):
+  each idle unit takes a column and reads its first two chunks' `B` (the ring's two halves) as soon as the last
+  product is done; the counts are settings (`TT_PREFETCH_UNITS`, `TT_THIN_STREAM_UNITS`, `TT_STREAM_PREFETCH_UNITS`).
+- **The sweep** (whole-`K` prefetch units : weight-stream units : `down` prefetched : streamed prefetch units):
+
+  | Setting | ms | Run |
+  |---|--:|---|
+  | 40 : 64 : off (before) | 17.27 / 18.74 | `1792674690` |
+  | 48 : 64 : off | 17.43 / 18.87 | `1792674837` |
+  | 56 : 64 : off | 17.68 / 19.07 | `1792674983` |
+  | 32 : 64 : off | 17.03 / 18.45 | `1792675777` |
+  | **40 : 64 : on : 40** | **16.88 / 18.33; 16.87 / 18.32** | `1792675628`, `1792677187` |
+  | 32 : 64 : on : 40 | 16.88 / 18.29 | `1792676432` |
+  | 24 : 64 : on : 40 | 17.81 / 19.21 | `1792676581` |
+  | 16 : 64 : on : 40 | 17.79 / 19.12 | `1792676730` |
+  | 32 : 64 : on : 32 | 17.04 / 18.42 | `1792677483` |
+  | 40 : 64 : on : 32 | 17.10 / 18.53 | `1792677336` |
+  | 32 : 64 : on : 48 | 16.98 / 18.45 | `1792676879` |
+  | 32 : 64 : on : 56 | 17.21 / 18.61 | `1792677027` |
+  | 56 : 64 : on : 56 | 17.32 / 18.70 | `1792676072` |
+  | 40 : 56 : on : 40 | 17.30 / 18.67 | `1792677630` |
+  | 40 : 80 : on : 40 | 16.99 / 18.48 | `1792677779` |
+  | 40 : 64 : on : 40, `TT_STREAM_CAP` 3 / 4 | 17.09 / 18.50; 17.48 / 18.94 | `1792678560`, `1792678709` |
+
+  The counts stay where they were; `down` prefetched is the gain. Repeats of one setting agree within ~0.02 ms.
+- **The other traced workloads, on / off** (`1792679220` / `1792679522`): the 135M decode step 7.62 / 8.29 / 9.10
+  against 7.61 / 8.30 / 9.10 ms (its products do not stream), prefill 1589 / 4644 / 5843 against 1589 / 4643 / 5844
+  tokens/s; ResNet-18 traced 13.94 against 14.13 ms; ViT-Tiny 9.21 / 9.21. The 1.7B in the same runs 16.87 / 18.30
+  against 17.29 / 18.72.
+- **The profile** (`Step(64)`, `--profile`, `1792678073`, against `1792638075`): the step's weights at **426 GB/s**
+  (416), 3.48 GB read ahead (2.97), the summed spans 16.36 ms (16.76). A layer's ops 647 -> 626 us:
+
+  | Product | Span us, before -> now | Prefetch wait | Per-unit work now |
+  |---|--:|--:|---|
+  | `qkv` | 90.4 -> **50.8** | 43.9 -> 8.0 | units 0-23 16-45 us, 24-63 9-19, idle 64-103 13-14 |
+  | `down` | 156.9 -> **179.1** | 0 | busy units 0-23 138-177 us, idle 64-103 81-94 |
+  | `gate\|up`, `o` | unchanged (234, 22) | | |
+
+- **What it says:**
+  - **`qkv`'s wait was `down`'s.** With 40 of `down`'s 64 columns on idle units, units 24-63 run no `down` job, and
+    their `qkv` prefetch, moved to just after `down`, starts while units 0-23 still read.
+  - **What binds now is `down`'s busy units.** Each of units 0-23 reads a whole 1.06 MB column in the span at one
+    unit's rate (~6 GB/s at the stream cap of 2), ~176 us, while the idle units, half of theirs read ahead, finish in
+    ~90 us: `down` reads ~260 GB/s in its span. More idle units cannot remove the last whole column (56 slower), and
+    a higher stream cap slows the rest (3, 4).
+  - **The next levers:** a column's `K` chain handed between two units in order, each reading its half of `B` (the
+    second ahead), the second reloading the first's FP32 partial (the chain unchanged, bit for bit); and the GDDR
+    idle before `o` (~50 us a layer).
 
 ## The weight stream metered: what is read ahead, the prefetch's wait, and each unit's own time (2026-10-22, card 0)
 

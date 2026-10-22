@@ -509,7 +509,8 @@ reservation and no store-time pass.
       **40 25.61 / 26.03 / 26.40 / 27.23 at `Step(64)` to `Step(512)` (`1792363365`, the setting)**, 56 25.96
       (`1792360408`).
 - [ ] **Left:**
-  - prefetch for a K-blocked product (`down`'s column is 1 MB);
+  - ~~prefetch for a K-blocked product (`down`'s column is 1 MB)~~ (2026-10-22: a streamed column's first two chunks,
+    Phase 8);
   - the small ops made latency-tolerant of the stream (the one-unit statistic spread over units, decode-small-ops).
 
 ## The 2026-10-19 review: what caps decode in F32
@@ -777,17 +778,60 @@ the host ~0.8).
        `fast-reads` 17 of 17 (`1792637187`), `fast-reads` + `encoded-guard` 18 of 18 (`1792637329`); `--smoke` 1,182 of 1,182
        (`1792639145`, `step12_mnist` included).
        `TT_IN_FLIGHT_CAP` (B's own cap, a development knob) stays for further sweeps.
-    3. [ ] `PREFETCH_UNITS` / `THIN_STREAM_UNITS` re-tuned. The idle prefetch's cap is settled: its lists read at the
-       stream cap; at B's cap of 8 instead, no different (`1792638681`, `1792638827`).
-    3a. [ ] **`qkv` waits for its prefetch** (94.5 us a layer, 45 of it unit 0's prefetch `WAIT`): its window (the
-       residual add and RMSNorm) is too short for 51 MB. Candidates: more of the window (the prefetch issued before
-       `down`'s barrier, 2d), or more units on it.
-    4. [ ] `down` prefetched (below): ranked last, since its median unit is at the ceiling and its window is ~16 us.
-- [ ] `down` prefetched: the first chunk batches' `B` gathers of `push_stream_jobs` on idle units. ~0.7 ms.
+    3. [x] **`PREFETCH_UNITS` / `THIN_STREAM_UNITS` re-tuned** (2026-10-22): the counts are settings
+       (`Session::set_prefetch_units`, `set_thin_stream_count`, `set_stream_prefetch_units`; development knobs
+       `TT_PREFETCH_UNITS`, `TT_THIN_STREAM_UNITS`, `TT_STREAM_PREFETCH_UNITS`), each a whole-`K` or a streamed
+       product's, since the two answer differently. **They stay at 40 / 64 / 40.** 1.7B, card 0, 32 / 256-token prompts:
+       - `down` not prefetched: 40 units 17.27 / 18.74 ms (`1792674690`), 48 17.43 / 18.87, 56 17.68 / 19.07, 32 17.03 /
+         18.45 (`1792674837`, `1792674983`, `1792675777`);
+       - `down` prefetched (4 below), whole-`K` / streamed units: 40 / 40 **16.88 / 18.33, 16.87 / 18.32** (`1792675628`,
+         `1792677187`); 32 / 40 16.88 / 18.29 (`1792676432`); 24 / 40 17.81 / 19.21; 16 / 40 17.79 / 19.12; 32 / 32 17.04
+         / 18.42; 40 / 32 17.10 / 18.53; 32 / 48 16.98 / 18.45; 32 / 56 17.21 / 18.61; 56 / 56 17.32 / 18.70;
+       - a weight stream on 56 or 80 units (40 / 40): 17.30 / 18.67, 16.99 / 18.48 (`1792677630`, `1792677779`); the
+         stream cap 3 or 4: 17.09 / 18.50, 17.48 / 18.94 (`1792678560`, `1792678709`).
+       The idle prefetch's cap is settled: its lists read at the stream cap; at B's cap of 8 instead, no different
+       (`1792638681`, `1792638827`). Gate: `step205` `the_prefetch_and_the_stream_take_the_session_s_unit_counts`
+       (ttsim; watched failing with either count ignored).
+    3a. [x] **`qkv` waits for its prefetch** (94.5 us a layer, 45 of it unit 0's prefetch `WAIT`). **Closed by 4**, not
+       by its own candidates: with `down` prefetched, `down`'s columns move to 40 idle units, its busy units drop to 24,
+       and `qkv`'s busy units start their prefetch sooner: `qkv` **90.4 -> 50.8 us** a layer, its prefetch wait 43.9 ->
+       8.0 (profile `1792678073` against `1792638075`). Not built, with the reason: the prefetch issued before `down`'s
+       barrier (`down` reads at ~434 GB/s in its span, so those reads come out of its share); more idle units on `qkv`
+       (48 and 56 measured slower, 3); a wider job a prefetching unit (its wait is gone).
+    4. [x] **`down` prefetched** (2026-10-22, below).
+- [x] **`down` prefetched** (2026-10-22; `Session::set_stream_prefetch`, on, `TT_STREAM_PREFETCH=0` turns it off).
+  `BlockPlan::push_prefetched_jobs` takes a streamed product too: each idle unit (at most
+  `set_stream_prefetch_units`, 40) takes a column and its first two chunks' `B` gathers (the ring's two halves) move
+  into its `PREFETCH` list; the third chunk refills the first half after the first chunk's kernel, as unprefetched.
+  `push_stream_jobs` deals the plan's `col_runs`. Nothing changed in the session or the firmware.
+  - **Gates:** unit `a_streamed_product_s_idle_units_read_their_columns_first_two_chunks_ahead` (every `B` tile once,
+    chunks 0-1 in the list, halves kept, the idle units' columns, at most the streamed count, none when off);
+    `step205` `streamed_products_prefetch_their_first_chunks_and_replay_as_the_ops_run_fresh` (ttsim: under a K-block
+    limit of 8 every product streams, the second and third take units 4-7, bit for bit against the ops run fresh;
+    **watched failing with three chunks read ahead**, element 0 92.7 against 656.6); card 0 35 of 35 (`1792678887`:
+    `step185`, `step187`, `step188`, `step191`, `step205`, `step216`, `step219`); `--smoke` 1,184 of 1,184
+    (`1792679835`, `step12_mnist` included).
+  - **Measured** (card 0, every tile; on `1792679220`, off `1792679522`): 1.7B **17.29 / 18.72 -> 16.87 / 18.30 ms**;
+    the 135M 7.62 / 8.29 / 9.10 against 7.61 / 8.30 / 9.10 (its products do not stream), prefill unchanged; ResNet-18
+    traced 13.94 against 14.13, ViT-Tiny 9.21 / 9.21.
+  - **The profile** (`Step(64)`, `1792678073`): the step's weights at **426 GB/s** (416 before), 3.48 GB read ahead
+    (2.97); a layer's ops 647 -> 626 us: `qkv` 90 -> 51, `down` 157 -> **179** (21.3 of its 68.2 MB ahead). **What binds
+    now is `down`'s busy units:** units 0-23 each read a whole 1.06 MB column in its span at one unit's rate (~176 us at
+    the stream cap of 2, ~6 GB/s), while the idle units finish their halves in ~85-94 us; `down` reads ~260 GB/s in its
+    span. More idle units cannot help while any unit reads a whole column (56 measured slower), nor a higher stream cap
+    (3, 4 slower). **Next:** a column's `K` chain handed between two units in order (the second reads its half of `B`
+    ahead while the first computes, then reloads the first's FP32 partial: the same chain, bit for bit), so no unit
+    reads a whole column in the span; and the window before `o` (~50 us a layer of GDDR idle: `o`'s 17 MB lands in
+    ~35 us of a 64 us window, and `gate|up`'s prefetch starts only at `o`'s barrier).
+- [ ] **With the next record or mover change:** `record::PrefetchCursor::new` does not refuse `GATHER_STREAM |
+  GATHER_PREFETCH`, though its doc says it refuses what the expansion refuses (`expand_for` does, with `RANGE`); only
+  the host's check stops the pair today (found 2026-10-22). Refuse it in the cursor, cover it in the cursor-against-
+  expansion unit test, and run the record gates (`step172`, `step173`, `step215`) in the three images.
 - [ ] Busy units stream too: prefetch reads on a transaction ID of their own, waited on only by their kernel; a
   reserved top-of-arena range small ops never plan into; the capture slicing a product's prefetch between the small
   ops' entries (decode-step-bandwidth B2.1-B2.4).
-- [ ] Depth and the caps (`PREFETCH_UNITS`, `THIN_STREAM_UNITS`) re-tuned from a profile after Phases 6-7.
+- [x] Depth and the caps (`PREFETCH_UNITS`, `THIN_STREAM_UNITS`) re-tuned from a profile after Phases 6-7 (2026-10-22,
+  "The stream's rate" 3 above: unchanged).
 
 ## The larger changes compared (2026-10-18)
 

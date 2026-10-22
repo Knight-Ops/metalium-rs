@@ -96,7 +96,8 @@ pub const RMS_DIVIDE_TILES: usize = 2;
 /// in order, on one unit.
 pub const ARGMAX_UNITS: usize = 64;
 
-/// The units a one-tile-row product's weight stream saturates GDDR with: each streams ~7 GB/s,
+/// The default of the units a one-tile-row product's weight stream runs on
+/// ([`Session::set_thin_stream_count`], `TT_THIN_STREAM_UNITS`): each streams ~7 GB/s,
 /// and 64 reach ~450 GB/s dealt a column a unit (Blackhole, card 0,
 /// `docs/learnings/silicon-operating-notes.md`, "A decode product's weights"). Past it, SmolLM2-1.7B's
 /// `q|k|v`, `gate|up` and head ran slower on 120 units than on 64 (180 / 383 / 1,051 against 160 /
@@ -108,8 +109,12 @@ pub const THIN_STREAM_UNITS: usize = 64;
 /// 135M head, `K` = 18 tiles: 308 us on 120 units, 318 on 64).
 pub const THIN_STREAM_K_TILES: usize = 32;
 
-/// Most units a product's weight prefetch takes ([`Session::set_weight_prefetch`]): each streams
-/// ~7 GB/s, and the ops the prefetch runs under read GDDR too.
+/// The default of the most units a product's weight prefetch takes ([`Session::set_weight_prefetch`],
+/// [`Session::set_prefetch_units`], `TT_PREFETCH_UNITS`; a streamed product's,
+/// [`Session::set_stream_prefetch_units`]): each streams ~7 GB/s, and the ops the prefetch runs under
+/// read GDDR too. Re-swept with `down` prefetched (`docs/learnings/performance-log.md`, "`down`
+/// prefetched, and the unit counts re-swept"): a SmolLM2-1.7B step is fastest at 32-40 for whole-`K`
+/// products and 40 for streamed ones (24 and 56 slower), and 64 stream units ([`THIN_STREAM_UNITS`]).
 pub const PREFETCH_UNITS: usize = 40;
 
 /// The `K` (tiles) from which a one-row product packs its `A` ([`Session::set_packed_thin_a`]):
@@ -163,6 +168,15 @@ pub fn probe_background_stream(background: Option<ProbeBackground>) {
 
 /// `TT_RESIDENCY_ROWS`: `gddr`, `mcast` or `held:<h>` ([`crate::residency::Rows`]); anything else,
 /// or nothing, the default `held:2` ([`crate::residency::HOLDERS`]).
+/// A unit count from the development knob `name` (a positive integer), else `default`.
+fn units_from_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
 fn residency_rows_from_env() -> crate::residency::Rows {
     use crate::residency::{Rows, HOLDERS};
     match std::env::var("TT_RESIDENCY_ROWS").as_deref() {
@@ -620,6 +634,12 @@ pub struct Session<T: Transport> {
     streamed_k: bool,
     /// [`Session::set_weight_prefetch`].
     weight_prefetch: bool,
+    /// [`Session::set_prefetch_units`].
+    prefetch_units: usize,
+    /// [`Session::set_stream_prefetch`].
+    stream_prefetch: bool,
+    /// [`Session::set_stream_prefetch_units`].
+    stream_prefetch_units: usize,
     /// While a prefetching product is queued in a capture: the barrier its `PREFETCH` lists wait
     /// for (`enqueue_work_inner`).
     prefetch_anchor: Option<u32>,
@@ -668,6 +688,8 @@ pub struct Session<T: Transport> {
     unpack_transposed_b: bool,
     /// [`Session::set_thin_stream_units`].
     thin_stream_units: bool,
+    /// [`Session::set_thin_stream_count`].
+    thin_stream_count: usize,
     /// [`Session::host_times`].
     host: HostTimes,
     /// Host memory the card moves tensors through ([`Session::host_dma`]),
@@ -2261,6 +2283,13 @@ impl<T: Transport> Session<T> {
             release_rects: None,
             streamed_k: true,
             weight_prefetch: true,
+            // `TT_PREFETCH_UNITS=<n>`: a development knob for the sweep of
+            // `docs/plans/decode-to-bandwidth.md` Phase 8, "The stream's rate".
+            prefetch_units: units_from_env("TT_PREFETCH_UNITS", PREFETCH_UNITS),
+            // `TT_STREAM_PREFETCH=0` turns it off.
+            stream_prefetch: std::env::var("TT_STREAM_PREFETCH").map_or(true, |v| v != "0"),
+            // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
+            stream_prefetch_units: units_from_env("TT_STREAM_PREFETCH_UNITS", PREFETCH_UNITS),
             prefetch_anchor: None,
             // The product's own units read their first job's `B` ahead too; `TT_BUSY_PREFETCH=0`
             // turns it off. On by default since NC stopped draining B's prefetch ID at a list's end
@@ -2300,6 +2329,8 @@ impl<T: Transport> Session<T> {
             resident_matmul_a: true,
             unpack_transposed_b: true,
             thin_stream_units: true,
+            // `TT_THIN_STREAM_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
+            thin_stream_count: units_from_env("TT_THIN_STREAM_UNITS", THIN_STREAM_UNITS),
             host: HostTimes::new(),
             staging: None,
             host_dma: true,
@@ -6965,7 +6996,7 @@ impl<T: Transport> Session<T> {
         // `THIN_STREAM_UNITS` units, and more only share it while each pays its own `A` reads and
         // the deal's last round (`silicon_probe_decode_stream`).
         let units = if self.thin_stream_units && mt == 1 && kt >= THIN_STREAM_K_TILES {
-            units.min(THIN_STREAM_UNITS)
+            units.min(self.thin_stream_count)
         } else {
             units
         };
@@ -7013,6 +7044,8 @@ impl<T: Transport> Session<T> {
         };
         let packed_a = packed.as_ref().or(twin.as_ref()).map(|p| p.tensor_ref());
         let stream_k = self.streamed_k;
+        let stream_prefetch = self.stream_prefetch;
+        let prefetch_units = [self.prefetch_units, self.stream_prefetch_units];
         // In a capture, the units past the product's own that ran nothing since the last
         // weight-streaming product: each can read a job's `B` while the ops between run.
         let spread = self.units.len();
@@ -7026,7 +7059,7 @@ impl<T: Transport> Session<T> {
                     Some((rel, lens)) => (
                         (units..spread)
                             .filter(|&u| c.units[u].stream.len() == lens[u])
-                            .take(PREFETCH_UNITS)
+                            .take(self.prefetch_units.max(self.stream_prefetch_units))
                             .collect(),
                         Some(*rel),
                     ),
@@ -7084,6 +7117,8 @@ impl<T: Transport> Session<T> {
                         unpack_b,
                         packed_a,
                         stream_k,
+                        stream_prefetch,
+                        prefetch_units,
                     },
                     &prefetch,
                     spread,
@@ -7746,6 +7781,27 @@ impl<T: Transport> Session<T> {
         self.weight_prefetch = on;
     }
 
+    /// The most idle units one product's weight prefetch takes ([`Session::set_weight_prefetch`]):
+    /// [`PREFETCH_UNITS`] by default, `TT_PREFETCH_UNITS=<n>` at open; 0 takes none.
+    pub fn set_prefetch_units(&mut self, units: usize) {
+        self.prefetch_units = units;
+    }
+
+    /// Whether [`Session::set_weight_prefetch`] also takes a product whose `K` is streamed
+    /// ([`Session::set_streamed_k`]; a decode step's `down`): each idle unit takes a column and
+    /// reads its first two chunks' `B` ahead, the rest in the job (on by default;
+    /// `TT_STREAM_PREFETCH=0` turns it off).
+    pub fn set_stream_prefetch(&mut self, on: bool) {
+        self.stream_prefetch = on;
+    }
+
+    /// The most idle units a streamed product's prefetch takes ([`Session::set_stream_prefetch`];
+    /// [`Session::set_prefetch_units`] is a whole-`K` product's): [`PREFETCH_UNITS`] by default,
+    /// `TT_STREAM_PREFETCH_UNITS=<n>` at open.
+    pub fn set_stream_prefetch_units(&mut self, units: usize) {
+        self.stream_prefetch_units = units;
+    }
+
     /// Whether, in a capture, the units a one-row product with a packed `A` runs on read their
     /// first job's `B` ahead too, as soon as the last such product is done and under the ops
     /// between (on by default; `TT_BUSY_PREFETCH=0` turns it off; `docs/plans/decode-to-bandwidth.md`
@@ -8116,6 +8172,12 @@ impl<T: Transport> Session<T> {
     /// default). The bits are the same on any number of units.
     pub fn set_thin_stream_units(&mut self, on: bool) {
         self.thin_stream_units = on;
+    }
+
+    /// How many units [`Session::set_thin_stream_units`] holds a weight stream to:
+    /// [`THIN_STREAM_UNITS`] by default, `TT_THIN_STREAM_UNITS=<n>` at open. At least 1.
+    pub fn set_thin_stream_count(&mut self, units: usize) {
+        self.thin_stream_count = units.max(1);
     }
 
     /// How the transcendentals run from the next element-wise op on

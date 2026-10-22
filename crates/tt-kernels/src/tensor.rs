@@ -1296,6 +1296,8 @@ pub fn matmul_dram(
             unpack_b: false,
             packed_a: None,
             stream_k: false,
+            stream_prefetch: false,
+            prefetch_units: [usize::MAX; 2],
         },
     )
 }
@@ -1364,6 +1366,11 @@ pub(crate) struct Reads {
     /// With `packed_a`, each output column's `K` in chunks the mover reads while the kernel
     /// computes the chunk before ([`BlockPlan::push_stream_jobs`]).
     pub stream_k: bool,
+    /// A streamed product's columns may be prefetched too ([`matmul_dram_prefetching`]).
+    pub stream_prefetch: bool,
+    /// The most prefetching units a product takes, its `K` whole and streamed: a streamed
+    /// column reads only its first chunks ahead, so the two kinds want different counts.
+    pub prefetch_units: [usize; 2],
 }
 
 /// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
@@ -1514,7 +1521,7 @@ pub const BUSY_PREFETCH: &str = "busy weight prefetch";
 /// [`matmul_dram_limited`], with `prefetch` (units at or past `units`, below `spread`) each
 /// taking one job of the product whose `B` its own list reads ahead ([`PREFETCH`],
 /// [`BlockPlan::push_prefetched_jobs`]) -- where the product is one row with a packed `A` and
-/// its `K` whole (a prefetching unit's one job is in the first half when pipelined). Returns the work, and `Some(spread)` when its jobs are dealt over
+/// its `K` whole or streamed (a prefetching unit's one job is in the first half when pipelined). Returns the work, and `Some(spread)` when its jobs are dealt over
 /// `spread` units (job `j` to unit `j % spread`), else `None` (over `units`, `prefetch` unused).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_dram_prefetching(
@@ -1628,11 +1635,17 @@ pub(crate) fn matmul_dram_prefetching(
             && kc < kt,
         busy: busy.to_vec(),
     };
+    let prefetch = &prefetch[..prefetch
+        .len()
+        .min(reads.prefetch_units[usize::from(plan.stream_k)])];
     let prefetching = !prefetch.is_empty()
         && plan.packed_a.is_some()
-        && !plan.stream_k
         && mt == 1
-        && kc >= kt
+        && if plan.stream_k {
+            reads.stream_prefetch
+        } else {
+            kc >= kt
+        }
         && prefetch.iter().all(|&u| (units..spread).contains(&u));
     let pushed = if prefetching {
         plan.push_prefetched_jobs(
@@ -1996,15 +2009,18 @@ fn packed_k_block(
 }
 
 impl BlockPlan {
-    /// The jobs of a one-row product with a packed `A` and its `K` whole, its first columns on
-    /// the `prefetch` units -- each a job of the plan's width, its gather's `B` reads moved into
-    /// a list of their own ahead of the job ([`PREFETCH`]), its gather left reading the packed
-    /// `A` -- and the rest dealt over the plan's units as [`thin_runs`] deals them. Laid out for
-    /// a deal over `spread` units: a regular unit `u`'s `k`th job at `k spread + u`, a
-    /// prefetching unit's at its own index. A prefetching unit's `B` slots are the job's own,
-    /// written by its `PREFETCH` list and read by its kernel, with nothing on the unit between
-    /// the two (the session takes as prefetching only units idle since the last product), so
-    /// each output column is its unprefetched self, bit for bit.
+    /// The jobs of a one-row product with a packed `A`, its `K` whole or streamed
+    /// ([`BlockPlan::push_stream_jobs`]), its first columns on the `prefetch` units -- each a job
+    /// of the plan's width (a column, streamed), its gather's `B` reads moved into a list of their
+    /// own ahead of the job ([`PREFETCH`]; streamed, its first two chunks', which fill the ring's
+    /// two halves), its gather left reading the packed `A` -- and the rest dealt over the plan's
+    /// units as [`thin_runs`] deals them. Laid out for a deal over `spread` units: a regular unit
+    /// `u`'s `k`th job at `k spread + u`, a prefetching unit's at its own index. A prefetching
+    /// unit's `B` slots are the job's own, written by its `PREFETCH` list and read by its kernel,
+    /// with nothing on the unit between the two (the session takes as prefetching only units
+    /// idle since the last product; a streamed job's third chunk refills the first half only
+    /// after the first chunk's kernel, as unprefetched), so each output column is its
+    /// unprefetched self, bit for bit.
     fn push_prefetched_jobs(
         &self,
         jobs: &mut Vec<Job>,
@@ -2014,7 +2030,9 @@ impl BlockPlan {
         spread: usize,
     ) -> Result<()> {
         let [_, kt, nt] = self.tiles;
-        let nc = self.block[1];
+        let nc = if self.stream_k { 1 } else { self.block[1] };
+        // The gathers each prefetched job reads ahead: a streamed column's first two chunks.
+        let ahead = if self.stream_k { 2 } else { 1 };
         let moved = (prefetch.len() * nc).min(nt);
         let mut regular = Vec::new();
         if moved < nt {
@@ -2048,14 +2066,18 @@ impl BlockPlan {
             let mut one = Vec::new();
             plan.push_jobs(&mut one, refs, transposed)?;
             let mut job = one.pop().expect("a job a block");
-            let Some(Step::List { entries, .. }) = job.first_mut() else {
-                unreachable!("a block's job starts with its gather")
-            };
-            let at = entries
-                .iter()
-                .position(|e| e[0] == record::GATHER)
-                .expect("a block's gather record");
-            let b_reads = entries.split_off(at);
+            let mut b_reads = Vec::new();
+            let gathers = job.iter_mut().filter_map(|step| match step {
+                Step::List { entries, .. } => entries
+                    .iter()
+                    .position(|e| e[0] == record::GATHER)
+                    .map(|at| (entries, at)),
+                _ => None,
+            });
+            for (entries, at) in gathers.take(ahead) {
+                b_reads.extend(entries.split_off(at));
+            }
+            assert!(!b_reads.is_empty(), "a block's gather record");
             job.insert(
                 0,
                 Step::List {
@@ -2145,7 +2167,12 @@ impl BlockPlan {
         let units = self.units.max(1);
         let mut a_read = vec![false; units];
         let live = self.live_rows(0, 1);
-        for j in 0..nt {
+        // A column a job: the plan's runs' columns, in order, or every column.
+        let cols: Vec<usize> = match &self.col_runs {
+            Some(runs) => runs.iter().flat_map(|r| r.clone()).collect(),
+            None => (0..nt).collect(),
+        };
+        for j in cols {
             let unit = jobs.len() % units;
             let mut steps = Vec::new();
             for c in 0..chunks {
@@ -6320,6 +6347,8 @@ mod tests {
                 unpack_b: false,
                 packed_a: None,
                 stream_k: false,
+                stream_prefetch: false,
+                prefetch_units: [usize::MAX; 2],
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,
@@ -6402,6 +6431,8 @@ mod tests {
                         unpack_b: false,
                         packed_a: packed.then(|| p.tensor_ref()),
                         stream_k: false,
+                        stream_prefetch: false,
+                        prefetch_units: [usize::MAX; 2],
                     },
                 )
                 .unwrap();
@@ -6478,6 +6509,8 @@ mod tests {
                     unpack_b: false,
                     packed_a: Some(p.tensor_ref()),
                     stream_k: false,
+                    stream_prefetch: false,
+                    prefetch_units: [usize::MAX; 2],
                 },
                 &[],
                 units,
@@ -6563,6 +6596,8 @@ mod tests {
                     unpack_b: false,
                     packed_a: Some(p.tensor_ref()),
                     stream_k: true,
+                    stream_prefetch: false,
+                    prefetch_units: [usize::MAX; 2],
                 },
             )
             .unwrap();
@@ -6600,6 +6635,100 @@ mod tests {
                 }
             }
             assert_eq!(b_tiles, (kt * nt) as u64, "[{k}, {n}]: every B tile once");
+        }
+    }
+
+    #[test]
+    fn a_streamed_product_s_idle_units_read_their_columns_first_two_chunks_ahead() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let (units, spread) = (64, 120);
+        let prefetch: Vec<usize> = (units..spread).collect();
+        let tiles = |entries: &[[u32; 8]]| {
+            let mut counted = crate::profile_mode::OpBytes::default();
+            counted.count(entries);
+            counted.b / tt_isa::dm::TILE_SLOT
+        };
+        // `down` (1.7B), and a short `K` under a block limit with fewer columns than idle units;
+        // a streamed product takes at most its own count (40) of the 56.
+        for (k, n, limit) in [(8192, 2048, None), (1056, 200, Some(9))] {
+            for on in [true, false] {
+                let mut alloc = DramAlloc::new(&Dram::FULL);
+                let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+                let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+                let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+                let (work, dealt) = super::matmul_dram_prefetching(
+                    &mut alloc,
+                    &a,
+                    false,
+                    &b,
+                    false,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    units,
+                    false,
+                    false,
+                    limit.and_then(std::num::NonZeroUsize::new),
+                    super::Reads {
+                        thin: true,
+                        resident_a: true,
+                        unpack_b: false,
+                        packed_a: Some(p.tensor_ref()),
+                        stream_k: true,
+                        stream_prefetch: on,
+                        prefetch_units: [usize::MAX, 40],
+                    },
+                    &prefetch,
+                    spread,
+                    &[],
+                )
+                .unwrap();
+                let (kt, nt) = ((k / 32) as u64, n.div_ceil(32));
+                let mut columns = 0;
+                let mut ahead = Vec::new();
+                for (slot, job) in work.jobs.iter().enumerate().filter(|(_, j)| !j.is_empty()) {
+                    let (pre, rest) = match job.first() {
+                        Some(Step::List {
+                            what: super::PREFETCH,
+                            entries,
+                        }) => (Some(tiles(entries)), &job[1..]),
+                        _ => (None, &job[..]),
+                    };
+                    let mut read = pre.unwrap_or(0);
+                    let mut first_two = 0;
+                    for (c, step) in rest.chunks(3).enumerate() {
+                        let [Step::List {
+                            entries: gather, ..
+                        }, Step::Kernel { half, .. }, Step::List { .. }] = step
+                        else {
+                            panic!("a chunk is a gather, a kernel and a scatter");
+                        };
+                        assert_eq!(*half, Some((c % 2) as u8), "slot {slot} chunk {c}");
+                        if c < 2 {
+                            first_two += tiles(gather);
+                        }
+                        read += tiles(gather);
+                    }
+                    assert_eq!(read, kt, "[{k}, {n}] slot {slot}: its column's B once");
+                    if let Some(pre) = pre {
+                        assert_eq!(first_two, 0, "[{k}, {n}] slot {slot}: chunks 0-1 ahead");
+                        assert!(
+                            pre < kt,
+                            "[{k}, {n}] slot {slot}: only the ring's two halves"
+                        );
+                        ahead.push(slot);
+                    }
+                    columns += 1;
+                }
+                assert_eq!(columns, nt, "[{k}, {n}]: a job a column");
+                if on {
+                    assert_eq!(dealt, Some(spread));
+                    let want: Vec<usize> = prefetch.iter().copied().take(nt.min(40)).collect();
+                    assert_eq!(ahead, want, "[{k}, {n}]: the idle units' columns");
+                } else {
+                    assert_eq!(dealt, None);
+                    assert!(ahead.is_empty());
+                }
+            }
         }
     }
 

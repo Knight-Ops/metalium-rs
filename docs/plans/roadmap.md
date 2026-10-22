@@ -442,9 +442,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         `gate|up` (drained at the prefetch cap of 2), and the low-numbered units read ~1.35x slower than the high ones,
         so the products wait for them. **Then** (same day): the prefetch `WAIT` drained at B's read cap (18.28 / 19.84 ms),
         and a weight stream's reads at 2 in flight (`record::GATHER_STREAM`, `dm::STREAM_CAP`), which serves the units
-        evenly: a 1.7B step **17.27 / 18.71 ms** (`1792637346`), its weights at 416 GB/s, the 135M unchanged. Next: `qkv`'s
-        prefetch (45 us a layer of waiting), the unit counts, `down` prefetched (decode-to-bandwidth Phase 8, "The
-        stream's rate").
+        evenly: a 1.7B step **17.27 / 18.71 ms** (`1792637346`), its weights at 416 GB/s, the 135M unchanged. **Then**
+        (same day): `down` prefetched, each of 40 idle units reading a column's first two chunks ahead, which also
+        ends `qkv`'s wait for its prefetch (90 -> 51 us a layer): a 1.7B step **16.87 / 18.30 ms** (`1792679220`; off
+        17.29 / 18.72, `1792679522`), its weights at 426 GB/s; the unit counts re-swept and kept (40 / 64 / 40); the
+        135M, ResNet-18 and ViT-Tiny unchanged. Next (decode-to-bandwidth Phase 8, "The stream's rate"): `down`'s 24
+        busy units each read a whole column at one unit's rate (~176 us a layer), so a column's `K` chain handed
+        between two units; then the GDDR idle before `o` (~50 us a layer).
         With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is

@@ -23,6 +23,16 @@
 //!   same. Claim three turns it off. (A decode step's attention at long context took the units
 //!   `o`'s weights stream on.)
 //!
+//! - **The counts are the session's** (`Session::set_prefetch_units`, `set_thin_stream_count`,
+//!   `TT_PREFETCH_UNITS` and `TT_THIN_STREAM_UNITS` at open): a prefetch takes at most its count
+//!   of the idle units, a weight stream runs on at most its count, and the bits are the same.
+//!
+//! - **A streamed product prefetches too** (`Session::set_stream_prefetch`): under a K-block limit
+//!   every product streams its `K` in chunks (a decode step's `down`), and an idle unit takes a
+//!   column, reading its first two chunks' `B` (the ring's two halves) ahead; the bits are the
+//!   same. Watched failing with three chunks read ahead (the third overwrites the first's half
+//!   before its kernel reads it).
+//!
 //! Watched failing: the prefetched columns not left out of the other units' deal (the rest
 //! dealt from column 0), which leaves the last columns uncomputed.
 
@@ -289,6 +299,145 @@ fn ops_after_a_streaming_product_keep_off_the_prefetch_s_units() {
         );
         s.release_trace(id).unwrap();
         for t in chain.w.into_iter().chain([x, y]) {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// Which of units 0-7 each product a capture recorded has entries on (`float_matmul` ops and
+/// their prefetch lists), in order.
+fn units_of_products<T: tt_device::Transport>(
+    s: &Session<T>,
+    id: tt_kernels::trace::TraceId,
+) -> Vec<Vec<bool>> {
+    s.trace_ops(id)
+        .unwrap()
+        .iter()
+        .filter(|op| op.what.contains("matmul") || op.what == tt_kernels::tensor::PREFETCH)
+        .map(|op| op.entries[..8].iter().map(|r| !r.is_empty()).collect())
+        .collect()
+}
+
+/// Claim five: with the prefetch held to two units, the second and third products take units
+/// 4-5 and not 6-7; with a weight stream held to two units and no prefetch, every product runs
+/// on units 0-1. Each capture's run and replay are the ops run fresh, bit for bit.
+#[test]
+fn the_prefetch_and_the_stream_take_the_session_s_unit_counts() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        let chain = Chain::upload(s);
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let warm = chain.forward(s, &x, Spread::Fixed(4));
+        let want = s.download(&warm).unwrap();
+        s.free(warm).unwrap();
+        let mut seen = Vec::new();
+        for (prefetch, stream) in [(2, None), (0, Some(2))] {
+            s.set_prefetch_units(prefetch);
+            if let Some(n) = stream {
+                s.set_thin_stream_count(n);
+            }
+            s.begin_trace().unwrap();
+            let y = chain.forward(s, &x, Spread::Fixed(4));
+            let id = s.end_trace().unwrap();
+            s.set_prefetch_units(tt_kernels::session::PREFETCH_UNITS);
+            s.set_thin_stream_count(tt_kernels::session::THIN_STREAM_UNITS);
+            assert_bits("the capture's own run", &s.download(&y).unwrap(), &want);
+            s.replay(id).unwrap();
+            s.sync().unwrap();
+            assert_bits("the replay", &s.download(&y).unwrap(), &want);
+            seen.push(units_of_products(s, id));
+            s.release_trace(id).unwrap();
+            s.free(y).unwrap();
+        }
+        let on = |units: &[usize]| -> Vec<bool> { (0..8).map(|u| units.contains(&u)).collect() };
+        let idle: Vec<_> = seen[0].iter().map(|p| p[4..].to_vec()).collect();
+        assert_eq!(
+            idle,
+            [
+                [false; 4],
+                [true, true, false, false],
+                [true, true, false, false]
+            ],
+            "a prefetch of two units takes units 4-5 only"
+        );
+        let two = on(&[0, 1]);
+        assert_eq!(
+            seen[1],
+            [two.clone(), two.clone(), two],
+            "a weight stream of two units runs on units 0-1"
+        );
+        for t in chain.w.into_iter().chain([x]) {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// Claim six: under a K-block limit of 8 tiles and unpipelined (a pipelined product of many
+/// columns a unit blocks its `K` instead), every product streams its `K` (1,024) in four chunks; with stream prefetch on, the second and third take units 4-7, reading their first two
+/// chunks ahead, and every run is the ops run fresh, bit for bit.
+#[test]
+fn streamed_products_prefetch_their_first_chunks_and_replay_as_the_ops_run_fresh() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        s.set_matmul_k_block_limit(std::num::NonZeroUsize::new(8));
+        s.set_pipeline(false);
+        let chain = Chain::upload(s);
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let warm = chain.forward(s, &x, Spread::Fixed(4));
+        s.free(warm).unwrap();
+        let mut runs = Vec::new();
+        for on in [false, true] {
+            s.write(&x, &values(10, K)).unwrap();
+            s.set_stream_prefetch(on);
+            s.begin_trace().unwrap();
+            let y = chain.forward(s, &x, Spread::Fixed(4));
+            let id = s.end_trace().unwrap();
+            s.set_stream_prefetch(true);
+            let ops = s.trace_ops(id).unwrap();
+            assert_eq!(
+                ops.iter()
+                    .filter(|op| op.what == "streamed matmul gather")
+                    .count(),
+                3,
+                "every product streams its K"
+            );
+            let used = on_idle_units(s, id);
+            let mut replays = vec![s.download(&y).unwrap()];
+            for round in 0..2u64 {
+                s.write(&x, &values(20 + round, K)).unwrap();
+                s.replay(id).unwrap();
+                s.sync().unwrap();
+                replays.push(s.download(&y).unwrap());
+            }
+            s.release_trace(id).unwrap();
+            s.free(y).unwrap();
+            runs.push((used, replays));
+        }
+        let mut fresh = Vec::new();
+        for seed in [10, 20, 21] {
+            s.write(&x, &values(seed, K)).unwrap();
+            let y = chain.forward(s, &x, Spread::Fixed(4));
+            fresh.push(s.download(&y).unwrap());
+            s.free(y).unwrap();
+        }
+        s.set_matmul_k_block_limit(None);
+        s.set_pipeline(true);
+        let (off, on) = (&runs[0], &runs[1]);
+        assert_eq!(
+            off.0,
+            [false, false, false],
+            "the control: no product on units 4-7"
+        );
+        assert_eq!(
+            on.0,
+            [false, true, true],
+            "the second and third products prefetch on units 4-7"
+        );
+        for (i, want) in fresh.iter().enumerate() {
+            assert_bits(&format!("unprefetched, run {i}"), &off.1[i], want);
+            assert_bits(&format!("prefetched, run {i}"), &on.1[i], want);
+        }
+        for t in chain.w.into_iter().chain([x]) {
             s.free(t).unwrap();
         }
     });
