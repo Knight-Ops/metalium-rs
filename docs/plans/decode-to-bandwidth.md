@@ -1009,8 +1009,35 @@ with nothing left for the small ops. The room is elsewhere in L1: `MAILBOXES` is
     (`1792719760`); the 135M 7.57 / 9.08 on (`1792719910`; 7.62 / 9.09 off); ResNet-18 14.15 and ViT-Tiny 9.22 on
     (`1792719944`). Neutral: the ring moved up, but a unit's busy prefetch was already bounded by what it holds, one
     job. **Opt-in until R2** uses the room.
-- [ ] **R1-R4**: a ring-indexed product layout; idle units take a second job; a two-deep prefetch queue on a second ID;
-  busy units read a second job ahead.
+- [x] **R1-R2, idle units take a second job: built, bit for bit, slower; opt-in** (2026-10-23; host;
+  `Session::set_prefetch_second_job`, `TT_PREFETCH_SECOND=1`). R1 needed no new layout code: a second ring is the same
+  top-`B` layout built while `l1::ring_end` is lowered by the first ring, and every memo of a ring's layout or programs
+  is keyed by the ring's end (P3). R2 (`BlockPlan::second_jobs`): each prefetching unit of a `K`-whole product whose `B`
+  sits against its ring's end (`Staging::Slots`) takes a one-column second job in round 1, its `B` in ring 2 and read
+  ahead in the unit's one `PREFETCH` list; none where ring 2 does not plan (outside the trace arena), none for a
+  pipelined product (its jobs stage `B` in a half of the arena, the second's where the first's is: found as wrong bits,
+  `step205`), and none where the plan's own units would run no more than a round anyway. Gate `step205`
+  `second_jobs_in_the_trace_arena_replay_as_the_ops_run_fresh` (a `[1, 2048] x [2048, 640]` product after another: bit
+  for bit, the prefetching units' entries 112 -> 132; **watched failing** with ring 2 on ring 1). ttsim with it on:
+  `step187`, `step193`, `step205`, `step216`, `step219`, `step222`; card 0 with it on, 47 of 47 (`1792721192`, `step188`
+  bit for bit); off (the default), ttsim `step187`, `step205`, `step216` and card 0 `step188`, `step205`, `step216`, 14 of
+  14 (`1792724145`).
+  - **Measured** (card 0, every tile, trace arena on): every `Slots` product, 1.7B **17.25 / 18.66 ms** (`1792721521`)
+    against 16.76 / 18.17 without (`1792721671`). Profile `1792721989` against `1792722444`: 266 MB more read ahead a
+    step (3,746 against 3,480), but the products 12.43 -> 12.88 ms, all of it barrier time (2.27 -> 3.27 ms): `qkv` 51
+    -> 80 us a layer and `o` 22 -> 33 (their weights were already read ahead whole: a second job is only a column more
+    of compute on an idle unit the others wait for), `gate|up` ~flat, `down` 171 -> 159. With `qkv` and `o` excluded
+    (the rule above): 17.18 / 18.54 ms (`1792723098`, against 16.77 / 18.14, `1792723249`); profile `1792723545`:
+    `gate|up` 231 -> 245 us a layer with 10.6 MB more of its 136 read ahead. **Why:** `gate|up`'s span is its busy
+    units' (432 columns over 64, so some take 7); 40 columns more on idle units leave 392, and some still take 7, while
+    the extra reads ahead contend with theirs.
+  - **What it says, with P3:** room for `B` is not what binds the window now. P3 gave a capture's ring 216 KiB more
+    room and nothing changed; R2 fills it and is slower. The Phase 8 probe's "~0.6 ms a step for every 100 KB a unit
+    freed" (made before busy prefetch, residency and the stream's rate) no longer holds. Not built, on this evidence:
+    R3-R4 (a two-deep prefetch queue on a second ID, busy units reading a second job ahead) -- a firmware change of the
+    mover's hot loops whose premise, that more bytes ahead shorten the products, the measurements contradict. What the
+    profile points at instead: a product's longest unit (the column deal against the units' count) and the aggregate
+    rate inside its span (`down`, the handoff's finding).
 
 ## The larger changes compared (2026-10-18)
 

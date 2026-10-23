@@ -1299,6 +1299,7 @@ pub fn matmul_dram(
             stream_prefetch: false,
             prefetch_units: [usize::MAX; 2],
             handoff: None,
+            second_job: false,
         },
     )
 }
@@ -1375,6 +1376,9 @@ pub(crate) struct Reads {
     /// With a streamed product prefetched, each column its own units would read whole is handed
     /// between two units at this chunk (`Some(0)`: half the chunks; [`Handoff`]).
     pub handoff: Option<usize>,
+    /// A `K`-whole product's prefetching units each take a second job of one column, its `B` in a
+    /// ring below the first's and read ahead with it ([`BlockPlan::push_prefetched_jobs`]).
+    pub second_job: bool,
 }
 
 /// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
@@ -1662,6 +1666,7 @@ pub(crate) fn matmul_dram_prefetching(
             && staging == Staging::Slots
             && kc < kt,
         busy: busy.to_vec(),
+        second_job: reads.second_job,
     };
     let prefetch = &prefetch[..prefetch
         .len()
@@ -1778,6 +1783,8 @@ struct BlockPlan {
     /// weight-streaming product planned, where all are known: the unit's first job reads its `B`
     /// ahead ([`BUSY_PREFETCH`]) if `B`'s ring lies above it. Empty: none does.
     busy: Vec<Option<u64>>,
+    /// [`Reads::second_job`].
+    second_job: bool,
 }
 
 /// A one-tile-row product's output columns, one run a job, in the order a
@@ -2110,7 +2117,27 @@ impl BlockPlan {
         let nc = if self.stream_k { 1 } else { self.block[1] };
         // The gathers each prefetched job reads ahead: a streamed column's first two chunks.
         let ahead = if self.stream_k { 2 } else { 1 };
-        let moved = (prefetch.len() * nc).min(nt);
+        let firsts = (prefetch.len() * nc).min(nt);
+        // A `K`-whole product's prefetching units each take a second column after their first
+        // job's, its `B` in a ring directly below the first job's (`crate::l1::ring_end` lowered by
+        // that ring), read ahead in the same list: what the window carries grows where L1 holds it
+        // (in a capture planning into the trace arena), and nothing changes where it does not. Only
+        // with `B` against the ring's end ([`Staging::Slots`]): a pipelined product's jobs stage
+        // `B` in a half of the arena, the second's where the first's is.
+        // And only where the plan's own units would still run more than a round of columns: where
+        // the first jobs leave less, the window already carries what the product reads, and a
+        // second job is only a column more of compute on a unit the others then wait for (a 1.7B
+        // step's `qkv` 51 -> 80 us and `o` 22 -> 33 us, profile `1792721989`).
+        let busy_rounds = (nt - firsts).div_ceil((self.units * nc).max(1));
+        let seconds = match self.second_job
+            && !self.stream_k
+            && self.staging == Staging::Slots
+            && busy_rounds > 1
+        {
+            true => self.second_jobs(refs, transposed, firsts, nt, prefetch.len())?,
+            false => Vec::new(),
+        };
+        let moved = firsts + seconds.len();
         let mut regular = Vec::new();
         // The regular jobs' columns, in their order (a streamed job's one).
         let mut regular_cols = Vec::new();
@@ -2140,10 +2167,10 @@ impl BlockPlan {
                 .collect();
         }
         let mut early = Vec::new();
-        for j0 in (0..moved).step_by(nc) {
+        for j0 in (0..firsts).step_by(nc) {
             let plan = BlockPlan {
                 units: 1,
-                col_runs: Some(std::iter::once(j0..(j0 + nc).min(moved)).collect()),
+                col_runs: Some(std::iter::once(j0..(j0 + nc).min(firsts)).collect()),
                 resident_a: false,
                 busy: Vec::new(),
                 ..self.clone()
@@ -2291,12 +2318,24 @@ impl BlockPlan {
                 ));
             }
         }
-        let rounds = regular.len().div_ceil(units).max(1);
+        let rounds = regular
+            .len()
+            .div_ceil(units)
+            .max(1 + usize::from(!seconds.is_empty()));
         let mut laid: Vec<Job> = vec![Vec::new(); rounds * spread];
         for (k, job) in regular.into_iter().enumerate() {
             laid[k / units * spread + k % units] = job;
         }
-        for (job, &u) in early.into_iter().zip(prefetch) {
+        let mut seconds = seconds.into_iter();
+        for (mut job, &u) in early.into_iter().zip(prefetch) {
+            // The second job's `B` reads after the first's, in its one list.
+            if let Some((b_reads, second)) = seconds.next() {
+                let Some(Step::List { entries, .. }) = job.first_mut() else {
+                    unreachable!("a prefetched job starts with its list");
+                };
+                entries.extend(b_reads);
+                laid[spread + u] = second;
+            }
             laid[u] = job;
         }
         for (u, job) in handed_ahead {
@@ -2304,6 +2343,57 @@ impl BlockPlan {
         }
         jobs.extend(laid);
         Ok(handed)
+    }
+
+    /// The second jobs of `count` prefetching units ([`Reads::second_job`]): columns `first..`, one
+    /// each, each its gather's `B` reads (split off, for the unit's prefetch list) and the job left
+    /// reading the packed `A`. Its `B` ring is directly below the first job's, which sits against
+    /// [`crate::l1::ring_end`] and is `kt` columns of the plan's width (a narrower last first job
+    /// leaves a gap). None where that does not plan: no second ring fits below the first.
+    fn second_jobs(
+        &self,
+        refs: [TensorRef; 3],
+        transposed: [bool; 2],
+        first: usize,
+        nt: usize,
+        count: usize,
+    ) -> Result<Vec<(Vec<[u32; 8]>, Job)>> {
+        let kt = self.tiles[1];
+        let ring = (kt * self.block[1]) as u64 * TILE_SLOT;
+        let top = crate::l1::ring_end();
+        if top < tt_isa::l1::DATA.base + ring {
+            return Ok(Vec::new());
+        }
+        let was = crate::l1::set_ring_end(Some(top - ring));
+        let built = (first..(first + count).min(nt))
+            .map(|j| {
+                let plan = BlockPlan {
+                    units: 1,
+                    col_runs: Some(std::iter::once(j..j + 1).collect()),
+                    resident_a: false,
+                    busy: Vec::new(),
+                    second_job: false,
+                    ..self.clone()
+                };
+                let mut one = Vec::new();
+                plan.push_jobs(&mut one, refs, transposed)?;
+                let mut job = one.pop().expect("a job a block");
+                let Some((entries, at)) = job.iter_mut().find_map(|step| match step {
+                    Step::List { entries, .. } => entries
+                        .iter()
+                        .position(|e| e[0] == record::GATHER)
+                        .map(|at| (entries, at)),
+                    _ => None,
+                }) else {
+                    unreachable!("a block's gather record");
+                };
+                let b_reads = entries.split_off(at);
+                Ok((b_reads, job))
+            })
+            .collect::<Result<Vec<_>>>();
+        crate::l1::set_ring_end(was);
+        // A second ring that does not plan below the first (outside the trace arena) is none.
+        Ok(built.unwrap_or_default())
     }
 }
 
@@ -2876,6 +2966,7 @@ pub(crate) fn matmul_dram_batched_limited(
         packed_a: None,
         stream_k: false,
         busy: Vec::new(),
+        second_job: false,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -6556,6 +6647,7 @@ mod tests {
                 stream_prefetch: false,
                 prefetch_units: [usize::MAX; 2],
                 handoff: None,
+                second_job: false,
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,
@@ -6641,6 +6733,7 @@ mod tests {
                         stream_prefetch: false,
                         prefetch_units: [usize::MAX; 2],
                         handoff: None,
+                        second_job: false,
                     },
                 )
                 .unwrap();
@@ -6720,6 +6813,7 @@ mod tests {
                     stream_prefetch: false,
                     prefetch_units: [usize::MAX; 2],
                     handoff: None,
+                    second_job: false,
                 },
                 &[],
                 units,
@@ -6808,6 +6902,7 @@ mod tests {
                     stream_prefetch: false,
                     prefetch_units: [usize::MAX; 2],
                     handoff: None,
+                    second_job: false,
                 },
             )
             .unwrap();
@@ -6887,6 +6982,7 @@ mod tests {
                         stream_prefetch: on,
                         prefetch_units: [usize::MAX, 40],
                         handoff: None,
+                        second_job: false,
                     },
                     &prefetch,
                     spread,
@@ -6999,6 +7095,7 @@ mod tests {
                     stream_prefetch: true,
                     prefetch_units: [usize::MAX, 40],
                     handoff: at,
+                    second_job: false,
                 },
                 &prefetch,
                 spread,

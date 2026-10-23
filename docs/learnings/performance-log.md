@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Room for a second job's `B`: the trace arena and second jobs](#room-for-a-second-jobs-b-the-trace-arena-and-second-jobs-2026-10-23-card-0) | 2026-10-23 | a capture's region at the top of `PROGRAMS` and its `B` rings past `DATA`: 16.78 / 18.15 ms, unchanged; idle units taking a second job's `B` there: bit for bit, **slower** (17.18 / 18.54 against 16.77 / 18.14), 266 MB more read ahead but longer barriers; room for `B` no longer binds |
 | [The mailboxes packed: the L1 map before room for a second `B`](#the-mailboxes-packed-the-l1-map-before-room-for-a-second-b-2026-10-22-card-0) | 2026-10-22 | the mailboxes moved into 40 KiB above the program slots, 88 KiB of capture-only L1 left beside `DATA`; nothing uses it yet: a 1.7B step 16.79 / 18.20 -> **16.76 / 18.17 ms**, the 135M, ResNet-18 and ViT-Tiny unchanged; a first form that grew `DATA` itself changed every arena-sized choice |
 | [Each unit's own prefetch anchor](#each-units-own-prefetch-anchor-2026-10-22-card-0) | 2026-10-22 | each unit's prefetch anchored at the last weight-streaming product it took part in, not the last overall: `gate\|up`'s busy units that sat out `o` read under RoPE, the cache write and attention; a 1.7B step 16.87 / 18.29 -> **16.79 / 18.20 ms**, 429 GB/s, the same 3.48 GB read ahead (L1 holds one job a unit); the 135M 0.01-0.03 ms slower; on by default |
 | [A column's `K` chain handed between two units](#a-columns-k-chain-handed-between-two-units-2026-10-22-card-0) | 2026-10-22 | `down`'s whole columns handed at a chunk to spare units, as a second op, bit for bit: a 1.7B step 16.88 / 18.32 -> **17.07 / 18.51 ms** (slower; opt-in): `down` 179 -> 172 us, but the halves contend at GDDR (up to 137 us, not ~88) and `qkv` 51 -> 72 us as the spare units start its read ahead later |
@@ -349,6 +350,28 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Room for a second job's `B`: the trace arena and second jobs (2026-10-23, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, P3 and R1-R2. 1.7B, every tile (`TT_TILES=all`),
+release, `traced_generation_stream_ceiling`, 2 warmups and 9 samples, validated; decode step at 32 / 256-token prompts.
+
+| Configuration | Step | Run |
+|---|--:|---|
+| defaults | 16.76 / 18.17 ms | `1792711476` |
+| trace arena (`TT_TRACE_ARENA=1`) | 16.78 / 18.15 | `1792719606` (off in the same build: 16.78 / 18.16, `1792719760`) |
+| trace arena, second jobs on every `Slots` product | 17.25 / 18.66 | `1792721521` (without: 16.76 / 18.17, `1792721671`) |
+| trace arena, second jobs where the busy units run more than a round | 17.18 / 18.54 | `1792723098` (without: 16.77 / 18.14, `1792723249`) |
+
+- **Profiles** (`Step(64)`, `--profile`): without second jobs `1792722444` (16.25 ms a replay: products 12.43 ms,
+  barriers 2.27, 3,480 MB read ahead); with them on every `Slots` product `1792721989` (16.66: products 12.88, barriers
+  3.27, 3,746 MB ahead; `qkv` 51 -> 80 us a layer, `o` 22 -> 33, `gate|up` ~flat, `down` 171 -> 159); with them only
+  where the busy units run more than a round `1792723545` (16.66: `gate|up` 231 -> 245 us, 66.0 MB of its 136.3 ahead
+  against 55.4).
+- **Why it does not pay:** where a product's weights were already read ahead whole (`qkv`, `o`), a second job is only
+  compute an idle unit adds to the span; where they were not (`gate|up`), the span is the busy units' longest deal (7
+  columns of 432 over 64 units), which 40 columns more on idle units do not shorten (392 still leaves units at 7), and
+  the extra reads ahead contend with theirs. More room for `B` a unit does not shorten the step now.
 
 ## The mailboxes packed: the L1 map before room for a second `B` (2026-10-22, card 0)
 

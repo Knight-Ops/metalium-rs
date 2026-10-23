@@ -727,6 +727,8 @@ pub struct Session<T: Transport> {
     prefetch_units: usize,
     /// [`Session::set_stream_prefetch`].
     stream_prefetch: bool,
+    /// [`Session::set_prefetch_second_job`].
+    prefetch_second_job: bool,
     /// [`Session::set_stream_prefetch_units`].
     stream_prefetch_units: usize,
     /// [`Session::set_stream_handoff`]: the chunk a handed column is handed at (`Some(0)`: half).
@@ -2389,6 +2391,7 @@ impl<T: Transport> Session<T> {
             prefetch_units: units_from_env("TT_PREFETCH_UNITS", PREFETCH_UNITS),
             // `TT_STREAM_PREFETCH=0` turns it off.
             stream_prefetch: std::env::var("TT_STREAM_PREFETCH").map_or(true, |v| v != "0"),
+            prefetch_second_job: std::env::var("TT_PREFETCH_SECOND").is_ok_and(|v| v == "1"),
             // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             stream_prefetch_units: units_from_env("TT_STREAM_PREFETCH_UNITS", PREFETCH_UNITS),
             // `TT_STREAM_HANDOFF=1` turns it on; `TT_STREAM_HANDOFF_AT=<h>` hands at chunk `h`
@@ -7319,6 +7322,7 @@ impl<T: Transport> Session<T> {
         let before: Vec<usize> = self.capture.as_ref().map_or(Vec::new(), |c| {
             c.units.iter().map(|u| u.stream.len()).collect()
         });
+        let second_job = self.prefetch_second_job;
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -7343,6 +7347,7 @@ impl<T: Transport> Session<T> {
                         stream_prefetch,
                         prefetch_units,
                         handoff,
+                        second_job,
                     },
                     &prefetch,
                     spread,
@@ -8064,6 +8069,18 @@ impl<T: Transport> Session<T> {
     /// `TT_STREAM_PREFETCH=0` turns it off).
     pub fn set_stream_prefetch(&mut self, on: bool) {
         self.stream_prefetch = on;
+    }
+
+    /// Whether each idle unit [`Session::set_weight_prefetch`] takes for a `K`-whole product also
+    /// takes a second column, its `B` in a ring directly below the first job's and read ahead in
+    /// the same list (`TT_PREFETCH_SECOND=1` at open; off by default;
+    /// `docs/plans/decode-to-bandwidth.md` Phase 8, R2). Only where that ring fits: in a capture
+    /// planning into the trace arena ([`Session::set_trace_arena`]). Placement only, so the bits are
+    /// the same. Cached residency plans are dropped: they hold each op's layout.
+    pub fn set_prefetch_second_job(&mut self, on: bool) {
+        self.prefetch_second_job = on;
+        self.plans.clear();
+        self.planned_base = None;
     }
 
     /// The most idle units a streamed product's prefetch takes ([`Session::set_stream_prefetch`];

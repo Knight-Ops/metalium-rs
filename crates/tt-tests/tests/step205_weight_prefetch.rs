@@ -253,6 +253,76 @@ fn prefetched_products_replay_as_the_ops_run_fresh() {
     });
 }
 
+/// Each idle unit's second job (`Session::set_prefetch_second_job`, in the trace arena,
+/// `docs/plans/decode-to-bandwidth.md` Phase 8, R2): a column more a prefetching unit, its `B` in a
+/// ring below the first job's and read ahead with it. A product of 20 columns at `K` = 2048 after
+/// another (whose barrier anchors the prefetch), `B` against its ring's end: it replays as it runs fresh,
+/// bit for bit, and its prefetching units run more of it (the second job's entries). Watched
+/// failing with the second ring placed on the first: the bits differ.
+#[test]
+fn second_jobs_in_the_trace_arena_replay_as_the_ops_run_fresh() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        s.set_trace_arena(true);
+        let w0 = s.upload(&values(1, K * 2048), K, 2048).unwrap();
+        let w1 = s.upload(&values(2, 2048 * 640), 2048, 640).unwrap();
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let forward = |s: &mut Session<_>, x: &DramTensor| {
+            let h = mm(s, x, &w0);
+            let y = mm(s, &h, &w1);
+            s.free(h).unwrap();
+            y
+        };
+        let warm = forward(s, &x);
+        s.free(warm).unwrap();
+        let mut fresh = Vec::new();
+        for seed in [10, 20, 21] {
+            s.write(&x, &values(seed, K)).unwrap();
+            let y = forward(s, &x);
+            fresh.push(s.download(&y).unwrap());
+            s.free(y).unwrap();
+        }
+        let mut entries = Vec::new();
+        for second in [false, true] {
+            s.set_prefetch_second_job(second);
+            s.write(&x, &values(10, K)).unwrap();
+            s.begin_trace().unwrap();
+            let y = forward(s, &x);
+            let id = s.end_trace().unwrap();
+            // The prefetching units' entries for each product, in order.
+            let ops = s.trace_ops(id).unwrap();
+            entries.push(
+                ops.iter()
+                    .filter(|op| op.what.contains("matmul"))
+                    .map(|op| op.entries[4..8].iter().map(|r| r.len()).sum::<usize>())
+                    .collect::<Vec<_>>(),
+            );
+            let mut got = vec![s.download(&y).unwrap()];
+            for seed in [20u64, 21] {
+                s.write(&x, &values(seed, K)).unwrap();
+                s.replay(id).unwrap();
+                s.sync().unwrap();
+                got.push(s.download(&y).unwrap());
+            }
+            for (i, (g, w)) in got.iter().zip(&fresh).enumerate() {
+                assert_bits(&format!("second jobs {second}, run {i}"), g, w);
+            }
+            s.release_trace(id).unwrap();
+            s.free(y).unwrap();
+        }
+        s.set_prefetch_second_job(false);
+        s.set_trace_arena(false);
+        eprintln!("prefetching units' entries a product, without and with: {entries:?}");
+        assert!(
+            entries[1][1] > entries[0][1],
+            "the prefetching units take second jobs: {entries:?}"
+        );
+        for t in [w0, w1, x] {
+            s.free(t).unwrap();
+        }
+    });
+}
+
 /// Claim three.
 #[test]
 fn a_unit_that_ran_an_op_since_the_last_product_does_not_prefetch() {

@@ -460,8 +460,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         room for more `B` a unit ([there](decode-to-bandwidth.md#room-for-a-second-jobs-b-2026-10-22)). **Under way**
         (2026-10-22): the mailboxes packed into 40 KiB above the program slots (M2), leaving 88 KiB of capture-only L1
         beside `DATA`, with the program slots after it (`DATA` itself unchanged: growing it changed every choice sized
-        from the arena); bit for bit, `--smoke` 1,188 of 1,188, the step unchanged (16.76 / 18.17 ms, `1792711476`). Next:
-        captures plan into that room and `PROGRAMS` (P1-P3), then a second `B` ring (R1-R4).
+        from the arena); bit for bit, `--smoke` 1,188 of 1,188, the step unchanged (16.76 / 18.17 ms, `1792711476`). Then
+        (2026-10-23) a capture's region at the top of `PROGRAMS` and its products' `B` rings past `DATA` (P1-P3, opt-in,
+        `TT_TRACE_ARENA=1`: 16.78 / 18.15 ms, unchanged), and idle units taking a second job's `B` in a second ring (R2,
+        opt-in, `TT_PREFETCH_SECOND=1`): bit for bit, but **slower**, 17.18 / 18.54 ms (`1792723098`): `gate|up`'s span
+        is its busy units' column count, which 40 more columns on idle units do not lower. **Room for `B` is not what
+        binds the window now**; the firmware half (R3-R4) is not built on that evidence. Next: what the profile points at,
+        a product's longest unit (the column deal) and the aggregate rate inside its span.
         With it,
         [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
         layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is
