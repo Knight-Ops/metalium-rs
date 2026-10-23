@@ -967,11 +967,94 @@ impl<N: NocId> DataMover<N> {
                     (since, ticks) = (Instant::now(), 0);
                     continue;
                 }
+                if std::env::var("TT_STALL_DUMP").is_ok_and(|v| v == "1") {
+                    self.dump_stall(d, w);
+                }
                 return Err(DmError::TimedOut { seq: number, done });
             }
             d.tick(CYCLES_PER_POLL);
             ticks += CYCLES_PER_POLL as u64;
         }
+    }
+
+    /// A stalled tile's state, on stderr (`TT_STALL_DUMP=1`, a development switch read when a
+    /// list times out): both movers' descriptor, queue and trace-progress words, the pair counters
+    /// and NC's wait reasons (`tt_isa::dataflow`), the head of the layer-body argument table, the
+    /// three roles' generation, acknowledgement, status and panic words, and the barrier words.
+    /// What it shows: whether the tile waits in a pair, for its roles or at a barrier.
+    fn dump_stall<T: Transport>(&self, d: &mut Device<T>, w: &Window) {
+        let nc = dm::Mover::NC;
+        let words = |d: &mut Device<T>, at: &[u64]| -> Vec<String> {
+            at.iter()
+                .map(|&a| match d.read32(w, self.tile, a) {
+                    Ok(v) => format!("{v:#x}"),
+                    Err(_) => "?".into(),
+                })
+                .collect()
+        };
+        let b = words(
+            d,
+            &[
+                dm::SEQ,
+                dm::DONE,
+                dm::ERROR,
+                dm::OP,
+                dm::QUEUE_HEAD,
+                dm::QUEUE_DONE,
+                dm::TRACE_PROGRESS,
+            ]
+            .map(|o| self.mover.at(o)),
+        );
+        let n = words(
+            d,
+            &[
+                dm::SEQ,
+                dm::DONE,
+                dm::ERROR,
+                dm::OP,
+                dm::L1_ADDR,
+                dm::LEN,
+                dm::TRACE_PROGRESS,
+            ]
+            .map(|o| nc.at(o)),
+        );
+        let flow = words(
+            d,
+            &(0..15)
+                .map(|i| tt_isa::dataflow::INPUT + 4 * i)
+                .collect::<Vec<_>>(),
+        );
+        let table = words(
+            d,
+            &(0..16)
+                .map(|i| tt_isa::dataflow::ARG_TABLE + 4 * i)
+                .collect::<Vec<_>>(),
+        );
+        use tt_isa::mailbox::role::Mailbox;
+        let roles = words(
+            d,
+            &(0..3u32)
+                .flat_map(|t| {
+                    let m = Mailbox::of(t);
+                    [m.generation(), m.ack(), m.status(), m.panic_code()]
+                })
+                .collect::<Vec<_>>(),
+        );
+        let barrier = words(
+            d,
+            &[
+                dm::BARRIER_COUNTER,
+                dm::BARRIER_POLL,
+                dm::BARRIER_RET,
+                dm::BARRIER_RELEASE,
+            ],
+        );
+        eprintln!(
+                "STALL tile {:?}: B [seq done error op qhead qdone progress] {b:?}; NC [seq done error op l1_addr len progress] {n:?}; \
+                 dataflow [input2 output2 abort role_progress3 wait_reason5 transfer2] {flow:?}; table {table:?}; \
+                 roles [gen ack status panic]x3 {roles:?}; barrier [counter poll ret release] {barrier:?}",
+                self.tile
+            );
     }
 
     /// Wait for every list enqueued so far.

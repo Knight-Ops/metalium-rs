@@ -640,8 +640,9 @@ the host ~0.8).
     2. the block copies' batch sized under a reservation: 532 -> ~266 KB on the units at the step's start, small;
     3. one layer sub-trace called 24 times: ~16x fewer stream entries and GDDR, and fewer stream fetches under load
        (the ops' tax is latency); large (argument refs in the mover). Proposal:
-       [layer-sub-traces.md](../proposals/layer-sub-traces.md) (17.8% of a layer's words differ from the next's, 86%
-       of them tensor references);
+       [layer-sub-traces.md](layer-sub-traces.md) (17.8% of a layer's words differ from the next's, 86%
+       of them tensor references). **Built 2026-10-23, opt-in:** 5.6x fewer entries (the argument tables, not
+       16x), and the step 0.15 ms slower with the body read from GDDR;
     4. `PROGRAMS` (4 x 32 KiB) and `MAILBOXES` (128 KiB) audited for what they still need: unmeasured;
     5. the timestamper's 16 KiB only under `profile`: small, little.
 - [x] **The packed-`A` ring planned with the slots it fills** (2026-10-20, `matmul::plan_layout_packed_a`, candidate 1

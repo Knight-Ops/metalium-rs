@@ -466,11 +466,15 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         opt-in, `TT_PREFETCH_SECOND=1`): bit for bit, but **slower**, 17.18 / 18.54 ms (`1792723098`): `gate|up`'s span
         is its busy units' column count, which 40 more columns on idle units do not lower. **Room for `B` is not what
         binds the window now**; the firmware half (R3-R4) is not built on that evidence. Next: what the profile points at,
-        a product's longest unit (the column deal) and the aggregate rate inside its span.
-        With it,
-        [layer-sub-traces.md](../proposals/layer-sub-traces.md) (one stored
-        layer called once a layer: a step's trace ~16x smaller, fewer stream fetches under load). `gamma`'s product is
-        deferred.
+        a product's longest unit (the column deal) and the aggregate rate inside its span. `gamma`'s product is
+        deferred. **Layer sub-traces built, opt-in** (2026-10-23, [layer-sub-traces.md](layer-sub-traces.md), gate
+        `step223`; `TT_SUB_TRACES=1`): one stored layer body a unit and a `CALL_BODY` a layer (`dm::op::CALL_BODY`,
+        arguments `dm::ARG_REF`/`ARG_WORD` from a table in L1), every stored layout emulated on the host against the
+        capture first; bit for bit on card 0 (`step185`-`step223`, `step188` included, `1792732559`). The decode trace's
+        layers 5.6x smaller, prefill's 8.4x (not 16x: the tables of tensor references), but a 1.7B step **0.15 ms
+        slower** (16.94 / 18.33 against 16.77 / 18.19, `1792735010`, `1792734860`): a body read from GDDR is fetched as
+        often as the layer was. Not the default; its Phase 5 (the body resident in L1) is worth at most the ~0.23 ms of
+        fetches and is not built.
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.
@@ -852,9 +856,10 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
     the mode.
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
-  ([traced-execution.md](traced-execution.md) §8). Related proposal (2026-10-20):
-  [layer-sub-traces.md](../proposals/layer-sub-traces.md), one stored layer called once a layer (a 1.7B step's
-  trace ~635 K -> ~40 K entries).
+  ([traced-execution.md](traced-execution.md) §8). Related, built and opt-in (2026-10-23):
+  [layer-sub-traces.md](layer-sub-traces.md), one stored layer called once a layer (a 1.7B decode trace's layers
+  5.6x fewer entries, prefill's 8.4x). It shrinks the streams in GDDR, not the programs, which are already shared by
+  hash: the program cache that segmentation must page is unchanged.
 - [x] **Trace size in GDDR** (2026-10-15, [decode-length-cost.md](../completed-plans/decode-length-cost.md) A0-A1).
   SmolLM2's step and 64/128/256 chunks held **3.75 GB** of trace streams; now **563 MB**, each trace exactly its
   entries. Every `PAIR_CALL` section had been an allocation of its own of at least one 4,160-byte slot, holding ~810

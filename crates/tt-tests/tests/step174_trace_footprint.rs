@@ -156,10 +156,11 @@ fn footprint_of_passes<T: tt_device::Transport>(
     assert_eq!(units.len(), sections.len());
     for (u, (fp, sec)) in units.iter().zip(&sections).enumerate() {
         let stored: u32 = sec.iter().sum();
-        // The stream's entries are its own plus every section's, padding included.
+        // The stream's entries are its own, a layer body's (`Session::set_sub_traces`) and every
+        // section's, padding included.
         assert_eq!(
             fp.stream.entries,
-            fp.top_level_entries + stored,
+            fp.top_level_entries + fp.body_entries + stored,
             "unit {u}: {fp:?} against sections {sec:?}"
         );
         // One PAIR_CALL names one reader and one writer section.
@@ -169,9 +170,12 @@ fn footprint_of_passes<T: tt_device::Transport>(
             "unit {u}"
         );
         assert!(fp.gddr_bytes >= fp.stream.entries as u64 * 32, "unit {u}");
-        // The stream and its sections share one region: their entries, each part from a 64-byte
-        // boundary, rounded up to whole slots once (not a slot a section).
-        let packed = fp.stream.entries as u64 * 32 + 64 * (sec.len() as u64 + 1);
+        // The stream and its sections share one region (with a body's argument tables): their
+        // entries, each part from a 64-byte boundary, rounded up to whole slots once (not a slot
+        // a section).
+        let parts =
+            sec.len() as u64 + 1 + u64::from(fp.body_entries > 0) + u64::from(fp.called_layers);
+        let packed = (fp.stream.entries + fp.table_entries) as u64 * 32 + 64 * parts;
         assert!(
             fp.gddr_bytes <= packed.next_multiple_of(tt_isa::dm::TILE_SLOT),
             "unit {u}: {} GDDR bytes for {} entries in {} sections",

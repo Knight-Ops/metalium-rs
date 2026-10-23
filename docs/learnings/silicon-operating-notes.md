@@ -1374,6 +1374,29 @@ mailboxes, the probes' scratch, NC's list ring), `TRACE` (the timestamper's buff
   poisoned word intact; on ttsim it also opens a
   second session on the first's L1 and requires the same bits (ttsim starts every process from zeroed L1, so this is
   how a gate there sees state an earlier process left).
+- **The free L1 below `OUTER_CHUNK` holds a layer body's argument table** (2026-10-23,
+  `docs/plans/layer-sub-traces.md`): `dataflow::ARG_TABLE` at `0x12040`, 126 entries, between NC's 8-byte stub at
+  `0x12000` and `OUTER_CHUNK` (`0x13000`). B reads a table there for each `CALL_BODY`, and NC reads it in place
+  during the body's pairs. Both fence after the read lands (`publish`), so neither core's L0 data cache serves a
+  previous layer's table. B's safe image is 35,284 of 43,008 bytes since (it was 33,668), NC's 19,020 of 24,576.
+
+## A stalled replay: what to read (2026-10-23, card 0)
+
+A list that stops making progress is reported as `descriptor N did not finish`, which names only the tile the host
+waited on. With `TT_STALL_DUMP=1` the host prints, for each tile whose wait times out (`DataMover::dump_stall`):
+- both movers' descriptor, queue and trace-progress words;
+- the pair counters and NC's wait reasons;
+- the roles' generation, acknowledgement, status and panic words;
+- the barrier counter, poll, return and release words.
+
+How to read it:
+- Roles with generation equal to acknowledgement are idle.
+- NC with `SEQ == DONE` is not in a pair.
+- If every unit's last release is below the coordinator's counter, the units wait at a release-mode barrier. The
+  coordinator never releases when an arrival is missing: look for the unit that stopped before arriving. That is how
+  the layer sub-traces' one silicon bug was found (a unit with no repeated ops given an empty body, which the mover
+  refuses, so it never reached its tail's arrival); bisecting by capture and then by unit, with a temporary knob,
+  found the unit.
 
 ## Handling silicon runs
 

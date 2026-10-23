@@ -704,7 +704,7 @@ impl Plan {
     /// (`Session::set_residency`), every op planned below it.
     ///
     /// The period's pinning (one address for the tensor at one place of every repeat) is what
-    /// lets a layer's repeats share a body (`docs/proposals/layer-sub-traces.md`), not what makes
+    /// lets a layer's repeats share a body (`docs/plans/layer-sub-traces.md`), not what makes
     /// a plan correct. Where it costs tensors (a repeat's two tensors live at once, one stays in
     /// GDDR, or a class finds no room), the graph is planned without it too, and the plan that
     /// spares more GDDR bytes is kept (the periodic one on a tie). Where a class finds no room,

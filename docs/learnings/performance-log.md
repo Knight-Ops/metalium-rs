@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Layer sub-traces: stored bodies and calls](#layer-sub-traces-stored-bodies-and-calls-2026-10-23-card-0) | 2026-10-23 | one layer body a unit and a `CALL_BODY` a layer (opt-in, `TT_SUB_TRACES=1`), bit for bit: the 1.7B's trace streams 675 -> 384 MB (`Step` 19.3 -> 4.9 MB, `Chunk(64)` 107 -> 21), but a 1.7B step **0.15 ms slower** (16.77 / 18.19 -> 16.94 / 18.33) and the 135M 0.05-0.08; not the default |
 | [Room for a second job's `B`: the trace arena and second jobs](#room-for-a-second-jobs-b-the-trace-arena-and-second-jobs-2026-10-23-card-0) | 2026-10-23 | a capture's region at the top of `PROGRAMS` and its `B` rings past `DATA`: 16.78 / 18.15 ms, unchanged; idle units taking a second job's `B` there: bit for bit, **slower** (17.18 / 18.54 against 16.77 / 18.14), 266 MB more read ahead but longer barriers; room for `B` no longer binds |
 | [The mailboxes packed: the L1 map before room for a second `B`](#the-mailboxes-packed-the-l1-map-before-room-for-a-second-b-2026-10-22-card-0) | 2026-10-22 | the mailboxes moved into 40 KiB above the program slots, 88 KiB of capture-only L1 left beside `DATA`; nothing uses it yet: a 1.7B step 16.79 / 18.20 -> **16.76 / 18.17 ms**, the 135M, ResNet-18 and ViT-Tiny unchanged; a first form that grew `DATA` itself changed every arena-sized choice |
 | [Each unit's own prefetch anchor](#each-units-own-prefetch-anchor-2026-10-22-card-0) | 2026-10-22 | each unit's prefetch anchored at the last weight-streaming product it took part in, not the last overall: `gate\|up`'s busy units that sat out `o` read under RoPE, the cache write and attention; a 1.7B step 16.87 / 18.29 -> **16.79 / 18.20 ms**, 429 GB/s, the same 3.48 GB read ahead (L1 holds one job a unit); the 135M 0.01-0.03 ms slower; on by default |
@@ -350,6 +351,50 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Layer sub-traces: stored bodies and calls (2026-10-23, card 0)
+
+[layer-sub-traces.md](../plans/layer-sub-traces.md). Every tile (`TT_TILES=all`), release, the defaults otherwise, 2
+warmups and 9 samples, validated; off and on (`TT_SUB_TRACES=1`) in the same build.
+
+| Workload | Off | On | Runs |
+|---|--:|--:|---|
+| 1.7B decode step, 32 / 256-token prompts (`traced_generation_stream_ceiling`) | 16.77 / 18.19 ms | **16.94 / 18.33** | `1792734860`, `1792735010` |
+| 1.7B decode step, 32 / 128 / 256 (`traced_generation`) | 16.81 / 17.27 / 18.20 | 16.96 / 17.40 / 18.33 | `1792735170`, `1792735711` |
+| 135M decode step, 32 / 256 | 7.71 / 9.14 | 7.76 / 9.23 | `1792736431`, `1792736481` |
+| ResNet-18 traced forward | 14.18 | 14.22 | same |
+| ViT-Tiny traced forward | 9.25 | 9.24 | same |
+| 1.7B stream ceiling second build | 12.77 s | 12.04 s | `1792735170`, `1792735711` |
+
+- **Trace streams in GDDR, 1.7B, 512-position cache** (`traced_generation`):
+
+  | Trace | Off | On |
+  |---|--:|--:|
+  | `Step(64)` (each of 64-512 alike) | 19.3 MB | **4.9 MB** |
+  | `Chunk(64)` | 107.4 MB | **20.6 MB** |
+  | `Chunk(128)` | 174.8 MB | **27.7 MB** |
+  | `Chunk(256)` | 315.6 MB | 315.6 MB |
+  | All | 675.0 MB | **383.6 MB** |
+
+  No unit made a body in `Chunk(256)`. Why is not reported by this bench; its tables are the likely cause (126
+  entries at most; `Chunk(64)`'s reach 90).
+- **What each unit stores** (the space report's `SUBTRACE` lines, the planned captures):
+  - 1.7B decode: 104 of 120 units call 22-23 of 23 layers (the others run no repeated op), layers 528,218 entries ->
+    bodies 22,966 + tables 52,888 + kept 18,846, **5.6x**.
+  - 1.7B prefill `Chunk(64)`: **8.4x**.
+  - 135M decode: 114 of 120 units, 28 repeats of 19 ops, 4.5x.
+  - 135M `Chunk(64)`: 6.5x.
+
+  A tensor reference costs two table entries, so the tables are most of what is left. Slots taking the same tensor
+  in every layer share one argument (2.8x -> 5.6x on the 1.7B decode).
+- **Why slower:** a body read from GDDR is fetched once a call, as often as the layer it replaces, and each call adds
+  its table's read and a re-read of the rest of its chunk (the stream's own chunks, now shorter, are not fewer than a
+  layer's body chunks saved). The fetches a resident body would take off the critical path were 0.23 ms a step
+  (planned-l1-residency 5a), so residency could at best win back that, less the table reads.
+- **Found by the first card run:** a unit that runs none of the repeated ops was given an empty body, which the mover
+  refuses, and every unit then waited at a barrier for its arrival (now `NoBody::Empty`; the host's emulation of the
+  stored layout refuses what the mover refuses). The operating notes say how it was read
+  ([silicon-operating-notes.md](silicon-operating-notes.md#a-stalled-replay-what-to-read-2026-10-23-card-0)).
 
 ## Room for a second job's `B`: the trace arena and second jobs (2026-10-23, card 0)
 

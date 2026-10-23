@@ -13,7 +13,7 @@ rate the weights stream at, not the small ops (Phase 5b, the stored layer, defer
 [decode-to-bandwidth.md](decode-to-bandwidth.md): the space audit, busy-unit prefetch and the prefetch pump.
 It is the "sharded, L1-resident tensors" gap of [tt-metal-concepts-review.md](../learnings/tt-metal-concepts-review.md)
 (G12). That gap was deferred "until a measured op chain is GDDR-bound", and that measurement now exists. It is designed
-together with [layer-sub-traces.md](../proposals/layer-sub-traces.md): a planned layer has the same L1 addresses in every repeat.
+together with [layer-sub-traces.md](layer-sub-traces.md): a planned layer has the same L1 addresses in every repeat.
 Roadmap: Track 1, "Decode at GDDR's bandwidth".
 
 ## Why
@@ -708,7 +708,7 @@ from GDDR in a 1.7B step (`Step(64)`, profile `1792609145`): the KV cache (state
 
 ### Phase 5a. A replay's next reader section read ahead (done 2026-10-21)
 
-The layer sub-traces' cheaper first step ([layer-sub-traces.md](../proposals/layer-sub-traces.md)): every chunk a replay
+The layer sub-traces' cheaper first step ([layer-sub-traces.md](layer-sub-traces.md)): every chunk a replay
 runs was read, then waited for, in turn (`call_chunks`). B now reads the first chunk of the next `PAIR_CALL`'s reader
 section ahead, into `dataflow::AHEAD_CHUNK` (the free 2 KiB after `OUTER_CHUNK`), on a transaction ID of its own
 (`dm::TXN_FETCH` = 8), and the pair waits only for that ID. It is issued when an outer chunk lands (its first pair) and
@@ -739,7 +739,10 @@ safe image 33,152 of 43,008 bytes.
 ### Later phases
 
 5. **Sub-traces on the plan** (`layer-sub-traces.md`, 5b): one stored layer whose only arguments are GDDR references.
-   Deferred by 5a's finding; first make the pinned plan spare as much as the unpinned one (Phase 3's cost).
+   **Built, opt-in** (2026-10-23, `TT_SUB_TRACES=1`): on a planned capture a layer's L1 words are the same in every
+   repeat, as expected (104 of 120 units call 22-23 of 23 layers; the others run no repeated op). As 5a's finding
+   predicted, the step is not faster: 0.15 ms slower with the body read from GDDR (`1792735010`). The body resident
+   in L1 is deferred there.
 6. **Prefill chunks, traced inference (ViT, ResNet blocks), then traced training** once trace segmentation exists.
 
 ## Expected

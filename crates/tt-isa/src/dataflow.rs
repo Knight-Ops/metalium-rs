@@ -75,6 +75,13 @@ pub enum NcWait {
 /// Words at [`NC_WAITS`].
 pub const NC_WAIT_WORDS: u64 = 8;
 pub const OUTER_CHUNK: u64 = 0x1_3000;
+/// Where B reads a layer body's argument table ([`dm::op::CALL_BODY`]), and NC reads it from
+/// while a body's pair runs: the free L1 between NC's stub and [`OUTER_CHUNK`].
+pub const ARG_TABLE: u64 = dm::nc::STUB_AT + 0x40;
+/// Entries [`ARG_TABLE`] holds: a body whose call needs more is not made
+/// (`tt_kernels::subtrace`).
+pub const ARG_TABLE_ENTRIES: u32 = ((OUTER_CHUNK - ARG_TABLE) / dm::ENTRY_BYTES) as u32;
+const _: () = assert!(ARG_TABLE % 64 == 0 && ARG_TABLE >= dm::nc::STUB_AT + 8);
 const _: () = assert!(OUTER_CHUNK >= dm::nc::STUB_AT + 8);
 const _: () = assert!(OUTER_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_BYTES <= dm::LIST);
 /// Where B reads a trace's next [`dm::op::PAIR_CALL`]'s first reader chunk ahead, on

@@ -370,6 +370,16 @@ pub const fn len(op: u32) -> usize {
     }
 }
 
+/// Where record `op`'s tensor references start, counted from its header: two entries each
+/// ([`TensorRef::encode`]). None for a plain entry or a [`POKE_RUN`], whose second entry is data.
+pub const fn references(op: u32) -> &'static [usize] {
+    match op {
+        GATHER => &[1, 3],
+        SCATTER | FILL_PAD | PAD_WRITE | READ_RUN | WRITE_RUN | SELECT_ROWS | SCATTER_ROWS => &[1],
+        _ => &[],
+    }
+}
+
 /// Is `op` a record header?
 pub const fn is_record(op: u32) -> bool {
     len(op) > 1

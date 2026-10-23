@@ -279,6 +279,29 @@ fn probing_space() -> bool {
     PROBE_SPACE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static PROBE_TABLES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What [`probe_sub_trace_tables`] does to a trace stored as sub-traces.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProbeTables {
+    /// Nothing.
+    Off = 0,
+    /// Each call is given the next call's argument table (the last, the first's), so its replays
+    /// read another layer's tensors: the negative control.
+    Rotate = 1,
+    /// Each call names one table entry fewer than it takes, which the mover refuses
+    /// (`dm::error::RANGE`) rather than read past the table.
+    Short = 2,
+}
+
+/// A development probe for the layer sub-traces' controls (`docs/plans/layer-sub-traces.md`).
+/// Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_sub_trace_tables(mode: ProbeTables) {
+    PROBE_TABLES.store(mode as u8, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Move unit `u`'s [`ProbeBackground`] reads, put at the front of its stream, to just after the
 /// last op it ran in `capture` (a step's first ops may reach every unit), so they run under the
 /// ops after it rather than hold that op up; the op records and `PAIR_CALL` positions follow.
@@ -780,6 +803,8 @@ pub struct Session<T: Transport> {
     l1_writes: crate::dm::L1Writes,
     /// [`Session::set_trace_arena`].
     trace_arena: bool,
+    /// [`Session::set_sub_traces`].
+    sub_traces: bool,
     /// What every unit's movers' lists may name in L1 now, and each started later
     /// (`DataMover::set_arena`): `DATA`, or the trace arena while a capture plans into it.
     mover_arena: tt_isa::l1::Region,
@@ -2438,6 +2463,7 @@ impl<T: Transport> Session<T> {
             captures: 0,
             l1_writes: Default::default(),
             trace_arena: std::env::var("TT_TRACE_ARENA").is_ok_and(|v| v == "1"),
+            sub_traces: std::env::var("TT_SUB_TRACES").is_ok_and(|v| v == "1"),
             mover_arena: tt_isa::l1::DATA,
             pending_shape: 0,
             resident_matmul_a: true,
@@ -5237,6 +5263,10 @@ impl<T: Transport> Session<T> {
             fullest.2,
         );
         Self::space_report_layers(c, &signatures);
+        let sub = crate::subtrace::report(c, tt_isa::dataflow::ARG_TABLE_ENTRIES as usize);
+        for line in sub.lines() {
+            eprintln!("{line}");
+        }
         let mut rows: Vec<_> = kinds.into_iter().collect();
         rows.sort_by_key(|(_, k)| std::cmp::Reverse((k.program_bytes, k.entries)));
         for ((label, what), k) in rows {
@@ -5500,6 +5530,12 @@ impl<T: Transport> Session<T> {
 
     fn store_trace(&mut self, capture: trace::Capture) -> Result<TraceId, TensorError> {
         let synced = self.sync();
+        // Each unit's layers as a body and calls, where they make one.
+        let mut bodies = if self.sub_traces {
+            crate::subtrace::plan(&capture, tt_isa::dataflow::ARG_TABLE_ENTRIES as usize)
+        } else {
+            Vec::new()
+        };
         let trace::Capture {
             epoch,
             barriers,
@@ -5600,7 +5636,11 @@ impl<T: Transport> Session<T> {
                 stored.push(None);
                 continue;
             }
-            match self.store_stream(u, &uc) {
+            let stored_stream = match bodies.get_mut(u).and_then(Option::take) {
+                Some((ranges, b)) => self.store_sub_stream(u, &uc, &ranges, &b),
+                None => self.store_stream(u, &uc),
+            };
+            match stored_stream {
                 Ok(t) => stored.push(Some(t)),
                 Err(e) => {
                     failure = Some(e);
@@ -5706,6 +5746,212 @@ impl<T: Transport> Session<T> {
             composition,
             top_level_entries: words.len() as u32,
             gddr_bytes: range.len(),
+            body_entries: 0,
+            table_entries: 0,
+            called_layers: 0,
+            barriers: barrier_entries(&uc.stream),
+            stream: region,
+        })
+    }
+
+    /// [`Session::store_stream`] for a unit whose layers `ranges` make the body and calls `b`
+    /// (`crate::subtrace`): in one region, the unit's own stream (what precedes the layers, a
+    /// `CALL_BODY` for each called layer and each other layer as captured, what follows) and its
+    /// pairs' sections, then the body's stream and its sections, then each call's argument table,
+    /// each from a 64-byte boundary.
+    fn store_sub_stream(
+        &mut self,
+        u: usize,
+        uc: &trace::UnitCapture,
+        ranges: &[core::ops::Range<usize>],
+        b: &crate::subtrace::UnitBody,
+    ) -> Result<trace::UnitTrace, TensorError> {
+        use tt_isa::dm::{op, record, ENTRY_BYTES};
+        type Entry = [u32; 8];
+        let align = |bytes: u64| bytes.next_multiple_of(tt_isa::dram::ALIGN);
+        // The unit's own stream, with the sections of its own pairs in order.
+        let mut top: Vec<Entry> = Vec::new();
+        let mut sections: Vec<&[Entry]> = Vec::new();
+        let mut keep = |top: &mut Vec<Entry>, r: core::ops::Range<usize>| {
+            for (k, &at) in uc.pair_calls.iter().enumerate() {
+                if r.contains(&at) {
+                    sections.push(&uc.pending_sections[2 * k]);
+                    sections.push(&uc.pending_sections[2 * k + 1]);
+                }
+            }
+            top.extend_from_slice(&uc.stream[r]);
+        };
+        let (first, last) = (ranges[0].start, ranges[ranges.len() - 1].end);
+        keep(&mut top, 0..first);
+        let mut calls = Vec::new();
+        for (r, call) in ranges.iter().zip(&b.calls) {
+            match call {
+                Some(c) => {
+                    top.push([op::CALL_BODY, 0, 0, 0, 0, 0, 0, 0]);
+                    calls.push(c);
+                }
+                None => keep(&mut top, r.clone()),
+            }
+        }
+        keep(&mut top, last..uc.stream.len());
+        let mut top = trace::chunked(&top);
+        let mut body = trace::chunked(&b.body.stream);
+        // The region: each part from a 64-byte boundary.
+        let mut end = 0u64;
+        let mut place = |entries: usize| {
+            let at = end;
+            end = align(end + entries as u64 * ENTRY_BYTES);
+            at
+        };
+        let top_at = place(top.len());
+        let section_at: Vec<u64> = sections.iter().map(|s| place(s.len())).collect();
+        let body_at = place(body.len());
+        let body_section_at: Vec<u64> = b.body.sections.iter().map(|s| place(s.len())).collect();
+        let table_at: Vec<u64> = calls.iter().map(|c| place(c.table.len())).collect();
+        let generations = {
+            let r = self.units[u].resident.as_ref().unwrap();
+            r.generation().wrapping_sub(uc.generation_base)
+        };
+        let Session { dev, dram, .. } = self;
+        let d = dram.as_mut().expect("checked at the capture's start");
+        let region = d.alloc.alloc_on(u % d.alloc.channel_count(), end)?;
+        let range = region.region().expect("a one-channel placement");
+        let (channel, base) = (range.channel().index() as u32, range.offset());
+        let at = |offset: u64| (base + offset) as u32;
+        // Each pair given its sections and each call its body and table, in order.
+        let body_entries = body.len() as u32;
+        let fill = |entries: &mut [Entry], pairs: &[u64], calls: &[&crate::subtrace::Call]| {
+            let (mut pair, mut call) = (0, 0);
+            let mut i = 0;
+            while i < entries.len() {
+                let e = &mut entries[i];
+                match e[0] {
+                    op::PAIR_CALL => {
+                        e[1] = channel;
+                        e[2] = at(pairs[2 * pair]);
+                        e[4] = channel;
+                        e[5] = at(pairs[2 * pair + 1]);
+                        pair += 1;
+                    }
+                    op::CALL_BODY => {
+                        let c = calls[call];
+                        *e = [
+                            op::CALL_BODY,
+                            channel,
+                            at(body_at),
+                            body_entries,
+                            c.generation_offset,
+                            c.barrier_offset,
+                            at(table_at[call]),
+                            c.table.len() as u32,
+                        ];
+                        call += 1;
+                    }
+                    _ => {}
+                }
+                i += record::len(e[0]).max(1);
+            }
+        };
+        fill(&mut top, &section_at, &calls);
+        fill(&mut body, &body_section_at, &[]);
+        let mut bytes = vec![0u8; range.len() as usize];
+        let put = |bytes: &mut Vec<u8>, at: u64, words: &[Entry]| {
+            for (i, word) in words.iter().flatten().enumerate() {
+                let at = at as usize + 4 * i;
+                bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        };
+        put(&mut bytes, top_at, &top);
+        for (s, &at) in sections.iter().zip(&section_at) {
+            put(&mut bytes, at, s);
+        }
+        put(&mut bytes, body_at, &body);
+        for (s, &at) in b.body.sections.iter().zip(&body_section_at) {
+            put(&mut bytes, at, s);
+        }
+        for (c, &at) in calls.iter().zip(&table_at) {
+            put(&mut bytes, at, &c.table);
+        }
+        // What the mover will run from the region, against what was captured: a layout the card
+        // would walk otherwise is not stored.
+        let stored: Vec<Entry> = bytes
+            .chunks_exact(32)
+            .map(|e| {
+                core::array::from_fn(|w| {
+                    u32::from_le_bytes(e[4 * w..4 * w + 4].try_into().unwrap())
+                })
+            })
+            .collect();
+        let runs = crate::subtrace::emulate(&stored, base, at(top_at), top.len() as u32, 0, 0);
+        if runs.as_ref() != Ok(&crate::subtrace::flattened(uc)) {
+            d.alloc.free(&region);
+            let why = match runs {
+                Err(e) => e,
+                Ok(r) => {
+                    let want = crate::subtrace::flattened(uc);
+                    let first = r
+                        .iter()
+                        .zip(&want)
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(r.len().min(want.len()));
+                    format!(
+                        "it runs {} entries against {} captured, first differing at {first}: {:x?} against {:x?}",
+                        r.len(),
+                        want.len(),
+                        r.get(first),
+                        want.get(first)
+                    )
+                }
+            };
+            eprintln!("sub-traces: unit {u} stored as captured: {why}");
+            return self.store_stream(u, uc);
+        }
+        // The controls' probe ([`probe_sub_trace_tables`]): calls made wrong after the check.
+        let probe = PROBE_TABLES.load(std::sync::atomic::Ordering::Relaxed);
+        if probe != ProbeTables::Off as u8 {
+            let mut call = 0;
+            let mut i = 0;
+            while i < top.len() {
+                let e = &mut top[i];
+                if e[0] == op::CALL_BODY {
+                    if probe == ProbeTables::Rotate as u8 {
+                        e[6] = at(table_at[(call + 1) % table_at.len()]);
+                    } else {
+                        e[7] -= 1;
+                    }
+                    call += 1;
+                }
+                i += record::len(e[0]).max(1);
+            }
+            put(&mut bytes, top_at, &top);
+        }
+        if let Err(e) = dev.dram_write(&d.w4, range, &bytes) {
+            d.alloc.free(&region);
+            return Err(e.into());
+        }
+        let all_sections: Vec<&[Entry]> = sections
+            .iter()
+            .copied()
+            .chain(b.body.sections.iter().map(Vec::as_slice))
+            .collect();
+        let mut composition = trace::Composition::of(&top, top.len());
+        composition.add(&trace::Composition::of(&body, body.len()));
+        for s in &all_sections {
+            composition.add(&trace::Composition::of(s, s.len()));
+        }
+        Ok(trace::UnitTrace {
+            channel,
+            offset: at(top_at),
+            count: top.len() as u32,
+            generations,
+            held_programs: uc.held_programs.clone(),
+            sections: all_sections.iter().map(|s| s.len() as u32).collect(),
+            composition,
+            top_level_entries: top.len() as u32,
+            gddr_bytes: range.len(),
+            body_entries: body.len() as u32,
+            table_entries: calls.iter().map(|c| c.table.len() as u32).sum(),
+            called_layers: calls.len() as u32,
             barriers: barrier_entries(&uc.stream),
             stream: region,
         })
@@ -5948,6 +6194,9 @@ impl<T: Transport> Session<T> {
                     stream: ut.composition.clone(),
                     top_level_entries: ut.top_level_entries,
                     gddr_bytes: ut.gddr_bytes,
+                    body_entries: ut.body_entries,
+                    table_entries: ut.table_entries,
+                    called_layers: ut.called_layers,
                     programs: live.len() as u32,
                     program_bytes: live
                         .iter()
@@ -8125,6 +8374,16 @@ impl<T: Transport> Session<T> {
         self.trace_arena = on;
         self.plans.clear();
         self.planned_base = None;
+    }
+
+    /// Whether a trace is stored as layer sub-traces (`TT_SUB_TRACES=1` at open; off by default;
+    /// `docs/plans/layer-sub-traces.md`): where a capture's ops repeat, each unit whose repeats
+    /// differ only by the tensors they touch and their counters keeps one repeat as a body and
+    /// calls it once a repeat with that repeat's arguments (`tt_isa::dm::op::CALL_BODY`); every
+    /// call is expanded on the host and compared with what was captured before it is stored, and a
+    /// unit whose layers do not allow it is stored as before. The replays run the same entries.
+    pub fn set_sub_traces(&mut self, on: bool) {
+        self.sub_traces = on;
     }
 
     /// Where, in a capture, each unit starts reading a product's weights ahead of it

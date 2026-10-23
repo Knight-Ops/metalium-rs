@@ -237,6 +237,12 @@ pub struct UnitFootprint {
     pub stream: Composition,
     /// Entries in the unit's own stream, padding included.
     pub top_level_entries: u32,
+    /// Stored as a layer body and calls (`Session::set_sub_traces`): entries in the body's own
+    /// stream, padding included (its sections are in `stream` with the others), in the calls'
+    /// argument tables, and how many layers are calls. All zero for a plain stream.
+    pub body_entries: u32,
+    pub table_entries: u32,
+    pub called_layers: u32,
     /// GDDR bytes of the stream and the sections, as allocated (whole slots).
     pub gddr_bytes: u64,
     /// Distinct programs this trace holds in the unit's program cache, and their bytes.
@@ -489,6 +495,11 @@ pub(crate) struct UnitTrace {
     pub(crate) composition: Composition,
     pub(crate) top_level_entries: u32,
     pub(crate) gddr_bytes: u64,
+    /// As [`UnitFootprint::body_entries`], [`UnitFootprint::table_entries`] and
+    /// [`UnitFootprint::called_layers`].
+    pub(crate) body_entries: u32,
+    pub(crate) table_entries: u32,
+    pub(crate) called_layers: u32,
     /// Its stream's `BARRIER` entries: `[arrivals, wait-only, the barriers both stand for]`.
     pub(crate) barriers: [u32; 3],
 }
@@ -519,7 +530,10 @@ impl Trace {
 
 /// Lay a unit's entries out for streaming: a `WAIT` wherever a record would
 /// otherwise cross a chunk of [`dm::TRACE_CHUNK_ENTRIES`], since the mover
-/// runs a chunk at a time (`dm::op::CALL`).
+/// runs a chunk at a time (`dm::op::CALL`), and before a layer body's call
+/// (`dm::op::CALL_BODY`) at an even entry: the mover reads the rest of the chunk
+/// again after the body, from the entry after the call, and a read's offset must
+/// be 64-byte aligned as the chunk's buffer is.
 pub(crate) fn chunked(entries: &[[u32; 8]]) -> Vec<[u32; 8]> {
     let chunk = dm::TRACE_CHUNK_ENTRIES as usize;
     let wait = [op::WAIT, 0, 0, 0, 0, 0, 0, 0];
@@ -531,6 +545,9 @@ pub(crate) fn chunked(entries: &[[u32; 8]]) -> Vec<[u32; 8]> {
             while out.len() % chunk != 0 {
                 out.push(wait);
             }
+        }
+        if entries[i][0] == op::CALL_BODY && out.len() % 2 == 0 {
+            out.push(wait);
         }
         out.extend_from_slice(&entries[i..i + n]);
         i += n;

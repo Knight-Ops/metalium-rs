@@ -44,6 +44,7 @@ pub mod session;
 pub mod sfpu;
 pub mod shard;
 pub mod source_banks;
+pub(crate) mod subtrace;
 pub mod tensor;
 pub mod trace;
 
