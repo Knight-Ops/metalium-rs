@@ -98,6 +98,23 @@ pub const PROGRAMS: Region = Region {
     end: mailbox::PROGRAM_REGION_END,
 };
 
+/// What a trace's capture plans in: [`DATA`], [`CAPTURE_ONLY`] and [`PROGRAMS`],
+/// one arena. The program slots are idle while a trace runs -- a traced kernel
+/// runs from the program cache -- and nothing in the arena lives from one replay
+/// to the next, so the eager runtime writes them between replays and forgets
+/// what it wrote after each (`tt_kernels::runtime::Resident`).
+pub const TRACE_ARENA: Region = Region {
+    name: "trace arena",
+    base: DATA.base,
+    end: PROGRAMS.end,
+};
+
+/// What a mover list may name in a tile's L1, as the card checks it
+/// (`dm::Entry::decode`): [`TRACE_ARENA`], never the images, the movers' lists,
+/// the mailboxes or the program cache. The host keeps an eager list to [`DATA`]
+/// (`tt_kernels::dm`).
+pub const LISTED: Region = TRACE_ARENA;
+
 /// The single-core, role and mover mailboxes, with their `Dst` dumps, the
 /// probes' scratch, and RISCV NC's mover list ring, scratch and trace chunk
 /// (`dm::nc::LIST..END`): each block in [`FIXED`].

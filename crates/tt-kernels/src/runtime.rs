@@ -601,6 +601,11 @@ pub struct Resident<N: NocId> {
     /// definitions too, which cost more than the PCIe writes it saved
     /// (`MEASURED`: 14 us per descriptor write, on silicon).
     slots: std::cell::RefCell<[Vec<u32>; 3]>,
+    /// A setup program already in the program cache, as its words and address: the next setup run
+    /// of exactly those words runs from there, and writes no fixed slot. A capture's own run sets
+    /// it ([`Resident::setup_from_cache`]): the slots are trace data while a capture plans into them
+    /// (`tt_isa::l1::TRACE_ARENA`).
+    setup_from: Option<(Vec<u32>, u32)>,
     /// The semaphores the tile is known to hold, as `(semaphore, value, max)`:
     /// set by a setup run, kept by kernels that restore theirs, dropped by
     /// anything else. A kernel touches only the semaphores it declares, so the
@@ -649,6 +654,7 @@ impl<N: NocId> Resident<N> {
             generation: 1,
             poisoned: false,
             slots: Default::default(),
+            setup_from: None,
             semaphores: None,
             semaphores_after: None,
             last_setup: None,
@@ -669,6 +675,7 @@ impl<N: NocId> Resident<N> {
                 false,
                 None,
                 (Vec::new(), 0),
+                None,
             )?;
             dev.write32(&r.window, tile, Mailbox::of(thread as u32).generation(), 1)?;
         }
@@ -924,6 +931,37 @@ impl<N: NocId> Resident<N> {
         *self.descriptors.borrow_mut() = [None; 3];
         self.semaphores = None;
         self.semaphores_after = None;
+        self.forget_program_slots();
+    }
+
+    /// What the fixed program slots hold is no longer known: a trace plans into them
+    /// (`tt_isa::l1::TRACE_ARENA`), so after a replay or a capture the next fixed-slot kernel
+    /// writes its programs again.
+    pub fn forget_program_slots(&mut self) {
+        self.slots.borrow_mut().iter_mut().for_each(Vec::clear);
+    }
+
+    /// The setup run [`Resident::reserve`] would run before `kernel` on this tile: its program,
+    /// or `None` where `kernel` sets no semaphores or the tile already holds them.
+    pub fn pending_setup(&self, kernel: &Kernel<'_>) -> Result<Option<Vec<Instruction>>, RunError> {
+        let (setup, _) = assemble(kernel)?;
+        Ok(setup.filter(|_| !self.setup_skipped(kernel)))
+    }
+
+    /// Run the next setup run whose program is `words` from the program cache at `at`, where the
+    /// caller placed it, not from role 0's fixed slot.
+    pub fn setup_from_cache(&mut self, words: Vec<u32>, at: u32) {
+        self.setup_from = Some((words, at));
+    }
+
+    /// Whether `kernel` needs no setup run: it clears nothing, and the tile holds its semaphores.
+    fn setup_skipped(&self, kernel: &Kernel<'_>) -> bool {
+        let clears = kernel.clear_dst && kernel.dump_rows > 0;
+        let holds = match (&kernel.schedule, &self.semaphores) {
+            (Schedule::Concurrent(i), Some(k)) => i.iter().all(|e| k.contains(e)),
+            _ => false,
+        };
+        !clears && holds
     }
 
     /// Role `thread`'s descriptor as a resident kernel runs it from a list:
@@ -1025,13 +1063,9 @@ impl<N: NocId> Resident<N> {
         };
         // The setup only initialises semaphores (nothing to clear), and they
         // already hold that: nothing to do.
-        let clears = kernel.clear_dst && kernel.dump_rows > 0;
+        let skip_setup = self.setup_skipped(kernel);
         let known = self.semaphores.take();
-        let holds = match (&init, &known) {
-            (Some(i), Some(k)) => i.iter().all(|e| k.contains(e)),
-            _ => false,
-        };
-        let skip_setup = !clears && holds;
+        let from = self.setup_from.take();
         // After the kernel: its own semaphores as it found them, everyone
         // else's untouched.
         self.semaphores_after = init.as_ref().map(|i| {
@@ -1052,7 +1086,29 @@ impl<N: NocId> Resident<N> {
                     thread: 0,
                     reason: e,
                 })?;
-            self.stage(dev, 0, 0, false, kernel.dst_fmt, true, false, None, stored)?;
+            // From the program cache, where the caller put it, or else role 0's fixed slot.
+            let at = match from {
+                Some((words, at)) if words == stored.0 => Some(at),
+                Some(_) => {
+                    return Err(RunError::Transport(TransportError::Hazard {
+                        address: 0,
+                        reason: "a setup program placed in the program cache is not the one run",
+                    }))
+                }
+                None => None,
+            };
+            self.stage(
+                dev,
+                0,
+                0,
+                false,
+                kernel.dst_fmt,
+                true,
+                false,
+                None,
+                stored,
+                at,
+            )?;
             let stuck = self.wait(dev, &[0], images, budget)?;
             if let Some((_, _, e)) = stuck.into_iter().next() {
                 self.poisoned = true;
@@ -1090,6 +1146,7 @@ impl<N: NocId> Resident<N> {
                 resident_programs,
                 kernel.mop_words(thread)?,
                 kernel.stored_program(thread, program)?,
+                None,
             )?;
         }
         clock.lap(dev, Phase::Programs);
@@ -1171,7 +1228,8 @@ impl<N: NocId> Resident<N> {
     }
 
     /// Write role `thread`'s descriptor and program; with `go`, also move its
-    /// generation so it runs.
+    /// generation so it runs. With `program_at`, the program is already in the
+    /// program cache there: the descriptor names it, and no fixed slot is written.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn stage<T: Transport>(
@@ -1185,6 +1243,7 @@ impl<N: NocId> Resident<N> {
         resident_programs: bool,
         mop_cfg: Option<[u32; 9]>,
         stored: (Vec<u32>, u32),
+        program_at: Option<u32>,
     ) -> Result<(), RunError> {
         let (w, tile) = (&self.window, self.tile);
         let mb = Mailbox::of(thread as u32);
@@ -1204,6 +1263,7 @@ impl<N: NocId> Resident<N> {
             trace: u32::from(traced),
             push_window,
             mop_cfg,
+            program_addr: program_at.unwrap_or(0),
             ..Default::default()
         };
         let mut descs = self.descriptors.borrow_mut();
@@ -1226,7 +1286,7 @@ impl<N: NocId> Resident<N> {
         descs[thread] = Some(writes.map(|(_, v)| v));
         drop(descs);
         let mut slots = self.slots.borrow_mut();
-        if !words.is_empty() && slots[thread] != words {
+        if program_at.is_none() && !words.is_empty() && slots[thread] != words {
             // Forget the slot first: if the write fails, it holds neither.
             slots[thread].clear();
             dev.l1_write(w, tile, mb.program(), &word_bytes(&words))?;

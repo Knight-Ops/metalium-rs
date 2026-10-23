@@ -299,6 +299,12 @@ pub const SMOKE: &[&str] = &[
     "step219_residency_decode::",
     // A row read whole on many units, delivered by each scheme (planned-l1-residency.md 2f).
     "step220_row_delivery::",
+    // The L1 map: nothing writes the old or the new mailboxes outside their blocks
+    // (decode-to-bandwidth.md Phase 8, M2).
+    "step221_l1_map::",
+    // A capture leaves the program slots alone, and the eager runtime writes them again after
+    // one (decode-to-bandwidth.md Phase 8, P2).
+    "step222_programs_for_traces::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

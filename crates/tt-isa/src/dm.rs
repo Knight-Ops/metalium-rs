@@ -376,7 +376,7 @@ pub mod op {
     /// at `from` to `to` in the L1 of the tile at `(x, y)`, through the NIU its writes go out on
     /// ([`super::WRITE_NOC`]). `(x, y)` is the tile's coordinate as the session names it, which
     /// with translation on is the same on both NoCs (`step50_noc1`). Both ranges inside
-    /// `crate::l1::DATA`, congruent mod 16; `len` at most `crate::noc::niu::MAX_REQUEST_BYTES`;
+    /// `crate::l1::LISTED`, congruent mod 16; `len` at most `crate::noc::niu::MAX_REQUEST_BYTES`;
     /// `(x, y)` a coordinate a Tensix tile could have (`crate::noc::grid::is_tensix_geometry`),
     /// which is all the card can check: the host narrows it to the tiles of its session that read
     /// what is written, and every one of them exists (`docs/plans/planned-l1-residency.md`).
@@ -914,8 +914,8 @@ impl Entry {
                 return Err(error::OP);
             }
             if slot % 16 != 0
-                || (slot as u64) < crate::l1::DATA.base
-                || slot as u64 + TILE_SLOT > crate::l1::DATA.end
+                || (slot as u64) < crate::l1::LISTED.base
+                || slot as u64 + TILE_SLOT > crate::l1::LISTED.end
             {
                 return Err(error::ALIGNMENT);
             }
@@ -940,8 +940,8 @@ impl Entry {
                 let end = at as u64 + (w[3] - 1) as u64 * stride as u64 + width as u64;
                 if at % width != 0
                     || stride % width != 0
-                    || (at as u64) < crate::l1::DATA.base
-                    || end > crate::l1::DATA.end
+                    || (at as u64) < crate::l1::LISTED.base
+                    || end > crate::l1::LISTED.end
                 {
                     return Err(error::ALIGNMENT);
                 }
@@ -980,8 +980,8 @@ impl Entry {
                 x += 1;
             }
             if from % 16 != to % 16
-                || !crate::l1::DATA.contains(from as u64, len as u64)
-                || !crate::l1::DATA.contains(to as u64, len as u64)
+                || !crate::l1::LISTED.contains(from as u64, len as u64)
+                || !crate::l1::LISTED.contains(to as u64, len as u64)
             {
                 return Err(error::ALIGNMENT);
             }
@@ -1004,8 +1004,8 @@ impl Entry {
                 return Err(error::RANGE);
             }
             if from % 16 != to % 16
-                || !crate::l1::DATA.contains(from as u64, len as u64)
-                || !crate::l1::DATA.contains(to as u64, len as u64)
+                || !crate::l1::LISTED.contains(from as u64, len as u64)
+                || !crate::l1::LISTED.contains(to as u64, len as u64)
             {
                 return Err(error::ALIGNMENT);
             }
@@ -1044,8 +1044,8 @@ impl Entry {
                 (w[3], if w[7] == 2 { BF16_TILE_SLOT } else { TILE_SLOT }),
             ] {
                 if at % 64 != 0
-                    || (at as u64) < crate::l1::DATA.base
-                    || at as u64 + len > crate::l1::DATA.end
+                    || (at as u64) < crate::l1::LISTED.base
+                    || at as u64 + len > crate::l1::LISTED.end
                 {
                     return Err(error::ALIGNMENT);
                 }
@@ -1406,7 +1406,7 @@ mod tests {
     #[test]
     fn an_l1_write_decodes_only_whole_and_only_on_nc() {
         use super::*;
-        let to = crate::l1::DATA.end as u32 - 4096;
+        let to = crate::l1::LISTED.end as u32 - 4096;
         let good = [op::WRITE_L1, 4, 4, to, 0x4_0010, 4096, 0, 0];
         assert_eq!(
             Entry::decode(0xFF, [op::WRITE_L1, 4, 4, to + 16, 0x4_0010, 64, 0, 0]),
@@ -1441,9 +1441,9 @@ mod tests {
         );
         assert_eq!(with(3, 0x1_0000), Err(error::ALIGNMENT), "below DATA");
         assert_eq!(
-            with(3, crate::l1::DATA.end as u32 - 64),
+            with(3, crate::l1::LISTED.end as u32 - 64),
             Err(error::ALIGNMENT),
-            "past DATA"
+            "past what a list may name"
         );
         assert!(Mover::NC.permits(op::WRITE_L1));
         assert!(!Mover::B.permits(op::WRITE_L1));
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn an_l1_read_decodes_only_whole_and_only_on_b() {
         use super::*;
-        let from = crate::l1::DATA.end as u32 - 4096;
+        let from = crate::l1::LISTED.end as u32 - 4096;
         let good = [op::READ_L1, 5, 4, from, 0x4_0010, 4096, 0, 0];
         assert_eq!(
             Entry::decode(0xFF, [op::READ_L1, 5, 4, from + 16, 0x4_0010, 64, 0, 0]),
@@ -1498,9 +1498,9 @@ mod tests {
             "the local side below DATA"
         );
         assert_eq!(
-            with(4, crate::l1::DATA.end as u32 - 48),
+            with(4, crate::l1::LISTED.end as u32 - 48),
             Err(error::ALIGNMENT),
-            "the local side past DATA"
+            "the local side past what a list may name"
         );
         assert!(Mover::B.permits(op::READ_L1));
         assert!(!Mover::NC.permits(op::READ_L1));
@@ -1511,7 +1511,7 @@ mod tests {
     #[test]
     fn a_multicast_decodes_only_over_tensix_columns() {
         use super::*;
-        let to = crate::l1::DATA.end as u32 - 4096;
+        let to = crate::l1::LISTED.end as u32 - 4096;
         let mc = |s: (u8, u8), e: (u8, u8), len: u32| {
             Entry::decode(
                 0xFF,
@@ -1632,6 +1632,52 @@ mod tests {
         assert_eq!(word(0, 1), Err(error::OP));
     }
 
+    /// Every entry that names L1 may name the trace arena -- `DATA`, the capture-only arena and
+    /// the program slots, where a trace's capture plans -- and nothing past it: placed at the
+    /// capture-only arena's start, the program slots' start and their last slot, each decodes; at
+    /// the mailboxes' base, none does (`docs/plans/decode-to-bandwidth.md` Phase 8, P1).
+    #[test]
+    fn entries_name_the_trace_arena_and_not_the_mailboxes() {
+        use super::*;
+        use crate::l1::{CAPTURE_ONLY, DATA, MAILBOXES, PROGRAMS};
+        let local = DATA.base as u32 + 0x2_0000;
+        // Each entry kind with `at` in the one place it names L1 the test moves.
+        let entries = |at: u32| {
+            [
+                [op::CHECK_FLAGS, at, 32, 32, 0, 0, 0, 0],
+                [op::COPY_WORDS, local, at, 16, 4, 4, 0, 0],
+                [op::COPY_WORDS, at, local, 16, 4, 4, 0, 0],
+                [op::COPY_HALFWORDS, local, at, 16, 2, 2, 0, 0],
+                [op::WRITE_L1, 4, 4, at, local, 64, 0, 0],
+                [op::WRITE_L1, 4, 4, local, at, 64, 0, 0],
+                [op::READ_L1, 5, 4, at, local, 64, 0, 0],
+                [op::READ_L1, 5, 4, local, at, 64, 0, 0],
+                [
+                    op::WRITE_L1_MCAST,
+                    mcast_corners((1, 2), (2, 3)),
+                    0,
+                    at,
+                    local,
+                    64,
+                    0,
+                    0,
+                ],
+                [op::INDEX_PICK, at, local, local + 0x1040, 35, 32, 32, 4],
+                [op::INDEX_PICK, local, at, local + 0x1040, 35, 32, 32, 4],
+                [op::INDEX_PICK, local, local + 0x1040, at, 35, 32, 32, 4],
+            ]
+        };
+        let last = (PROGRAMS.end - TILE_SLOT) as u32;
+        for at in [CAPTURE_ONLY.base as u32, PROGRAMS.base as u32, last] {
+            for e in entries(at) {
+                assert!(Entry::decode(0xFF, e).is_ok(), "{at:#x}: {e:x?}");
+            }
+        }
+        for e in entries(MAILBOXES.base as u32) {
+            assert_eq!(Entry::decode(0xFF, e), Err(error::ALIGNMENT), "{e:x?}");
+        }
+    }
+
     #[test]
     fn resident_index_selection_checks_every_slot_and_geometry() {
         use super::*;
@@ -1668,7 +1714,7 @@ mod tests {
                 let mut invalid = valid;
                 invalid[field] += 1;
                 assert_eq!(Entry::decode(0xff, invalid), Err(error::ALIGNMENT));
-                invalid[field] = crate::l1::DATA.end as u32 - 64;
+                invalid[field] = crate::l1::LISTED.end as u32 - 64;
                 assert_eq!(Entry::decode(0xff, invalid), Err(error::ALIGNMENT));
             }
         }
@@ -1689,7 +1735,7 @@ mod tests {
         assert!(!Mover::NC.permits(op::COPY_WORDS));
         for (index, value) in [
             (1, at + 1),
-            (2, crate::l1::DATA.end as u32),
+            (2, crate::l1::LISTED.end as u32),
             (3, 0),
             (3, 1025),
             (4, 3),
@@ -2010,7 +2056,7 @@ mod tests {
         bad_half[1] += 1;
         assert!(Entry::decode(ALL, bad_half).is_err());
         let mut bad_half = copy_half;
-        bad_half[2] = crate::l1::DATA.end as u32 - 2;
+        bad_half[2] = crate::l1::LISTED.end as u32 - 2;
         assert!(Entry::decode(ALL, bad_half).is_err());
         let mut bad = fill;
         bad[2] = 0x2000;

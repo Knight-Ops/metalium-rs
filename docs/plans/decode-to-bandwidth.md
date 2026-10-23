@@ -964,8 +964,29 @@ with nothing left for the small ops. The room is elsewhere in L1: `MAILBOXES` is
   - **Measured** (card 0, every tile): 1.7B **16.76 / 18.17 ms** (`1792711476`; 16.79 / 18.20 before), the 135M 7.62 /
     9.09 (`1792711624`), ResNet-18 traced 14.14 and ViT-Tiny 9.20 (`1792711671`): unchanged, as nothing uses the room
     yet.
-- [ ] **P1**: `l1::TRACE_ARENA`, and the card's list checks (`Entry::decode`) against it.
-- [ ] **P2**: setup runs from the program cache; `PROGRAMS` slots forgotten at every replay.
+- [x] **P1, the card's list checks take the trace arena** (2026-10-22; firmware). `l1::TRACE_ARENA` (`DATA`, `CAPTURE_ONLY`
+  and `PROGRAMS`) and `l1::LISTED`, what a list may name in L1 on the card: `Entry::decode`'s checks of `CHECK_FLAGS`,
+  `COPY_WORDS`/`COPY_HALFWORDS`, `WRITE_L1`, `READ_L1`, `WRITE_L1_MCAST` and `INDEX_PICK` take it (plain `READ`/`WRITE`
+  were bounded only by L1's size on the card, `DATA` by the host, `tt_kernels::dm::contained`, which is unchanged: an
+  eager list stays in `DATA`). The guard's `POKE` stays in `DATA`. Unit test
+  `entries_name_the_trace_arena_and_not_the_mailboxes` (every kind, at the capture-only arena's start, the program
+  slots' start and last slot: decoded; at the mailboxes' base: refused; **watched failing** with `LISTED` at `DATA`);
+  `step218` `the_tile_takes_a_write_into_the_trace_arena` (a raw `WRITE_L1` into a peer's capture-only arena and last
+  program slot lands byte for byte; **watched failing** on ttsim with the firmware's bound at `DATA`) and the mailboxes'
+  base added to the refused writes. ttsim `step172`, `step173`, `step215`, `step218` in the three images; firmware clippy
+  plain, `encoded-guard`, `profile`, `fast-reads`, `ttinsn-experiment`.
+- [x] **P2, captures and replays leave the program slots to the trace** (2026-10-22; host). A capture's own setup runs
+  (each unit's first kernel after `begin_capture` forgets the semaphores) run from the program cache, where the session
+  places the program first (`Resident::pending_setup`, `setup_from_cache`; the descriptor names it, no slot is written),
+  never role 0's fixed slot; and the runtime forgets what the slots hold at every replay, every capture's start and end
+  (`Resident::forget_program_slots`), so an eager fixed-slot kernel writes its programs again. New gate
+  `step222_programs_for_traces`: every unit's slots poisoned, a plan pass and a planned capture of a layer leave every
+  poisoned word, the replays bit for bit (**watched failing** with the setup in the slot again); a fixed-slot product
+  run after its slots were overwritten and a capture ended gives its own bits (**watched failing**, ttsim only: without
+  the forgetting it runs the overwritten words and ttsim refuses opcode 0). ttsim `step17`, `step22`, `step60`, `step187`,
+  `step193`, `step205`, `step216`-`step222`, `step12_mnist`, `tt-kernels` unit tests. Card 0 (P1 and P2): `step185`,
+  `step187`, `step188` (bit for bit), `step191`, `step193`, `step218`, `step219`, `step221`, `step222`, 46 of 46
+  (`1792713314`); `--smoke` 1,189 of 1,189 (`1792713658`); `step221` and `step222` added to it.
 - [ ] **P3**: captures plan into `PROGRAMS` (`Session::set_trace_arena`), the products' chunk choice pinned.
 - [ ] **R1-R4**: a ring-indexed product layout; idle units take a second job; a two-deep prefetch queue on a second ID;
   busy units read a second job ahead.

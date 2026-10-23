@@ -30,8 +30,12 @@
 //!   sent raw, and writes nothing.
 //! - **The tile refuses a malformed entry by itself** (sent past the host's check,
 //!   `enqueue_raw`): a coordinate outside the Tensix rows and columns, a length of zero or past one
-//!   request, an address outside `DATA`, addresses not congruent mod 16, and the entry on B. It
-//!   writes nothing for any of them. Only what the card's decode refuses is sent raw: a
+//!   request, an address below `DATA` or in the mailboxes, addresses not congruent mod 16, and the
+//!   entry on B. It writes nothing for any of them.
+//! - **The tile takes a write into the trace arena** (`l1::TRACE_ARENA`, where a capture plans:
+//!   `DATA`, the capture-only arena and the program slots; `docs/plans/decode-to-bandwidth.md`
+//!   Phase 8, P1): sent raw, as the host keeps its own lists to `DATA` until a capture asks, writes
+//!   into a peer's capture-only arena and its last program slot land byte for byte. Only what the card's decode refuses is sent raw: a
 //!   geometry-valid tile the chip may not have is never sent past the host.
 
 use tt_device::tlb::WindowKind;
@@ -250,7 +254,7 @@ fn the_tile_refuses_a_malformed_write_by_itself() {
         let w = d.alloc_window(WindowKind::TwoMib).unwrap();
         let (x, y) = (PEERS[0].0 as u32, PEERS[0].1 as u32);
         let to = window().start as u32;
-        let bad: [(&str, [u32; 8], u32, Mover); 7] = [
+        let bad: [(&str, [u32; 8], u32, Mover); 8] = [
             (
                 "the non-memory column",
                 [op::WRITE_L1, 8, y, to, SRC, 64, 0, 0],
@@ -278,6 +282,21 @@ fn the_tile_refuses_a_malformed_write_by_itself() {
             (
                 "below DATA",
                 [op::WRITE_L1, x, y, 0x1_0000, SRC, 64, 0, 0],
+                dm::error::ALIGNMENT,
+                Mover::NC,
+            ),
+            (
+                "the mailboxes",
+                [
+                    op::WRITE_L1,
+                    x,
+                    y,
+                    tt_isa::l1::MAILBOXES.base as u32,
+                    SRC,
+                    64,
+                    0,
+                    0,
+                ],
                 dm::error::ALIGNMENT,
                 Mover::NC,
             ),
@@ -324,6 +343,30 @@ const BESIDE: [(u8, u8); 2] = [
     (GATE_TILE.0, GATE_TILE.1 + 1),
     (GATE_TILE.0 + 3, GATE_TILE.1 + 1),
 ];
+
+#[test]
+fn the_tile_takes_a_write_into_the_trace_arena() {
+    use tt_isa::l1::{CAPTURE_ONLY, PROGRAMS};
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let mut nc = start(d, &w, Mover::NC);
+        let src = pattern(4096, 0x2218);
+        let gate = nc.tile();
+        d.l1_write(&w, gate, SRC as u64, &src).unwrap();
+        let (x, y) = PEERS[0];
+        let peer = tile(d, x, y);
+        for at in [CAPTURE_ONLY.base, PROGRAMS.end - 4096] {
+            d.l1_write(&w, peer, at, &[POISON; 4096]).unwrap();
+            let entry = [op::WRITE_L1, x as u32, y as u32, at as u32, SRC, 4096, 0, 0];
+            let n = nc.enqueue_raw(d, &w, &[entry]).unwrap();
+            nc.wait_for(d, &w, n).unwrap();
+            let mut got = vec![0u8; 4096];
+            d.l1_read(&w, peer, at, &mut got).unwrap();
+            assert_eq!(first_difference(&got, &src), None, "at {at:#x}");
+        }
+        nc.stop(d, &w).unwrap();
+    });
+}
 
 fn rect_tiles() -> Vec<(u8, u8)> {
     let ((x0, y0), (x1, y1)) = RECT;

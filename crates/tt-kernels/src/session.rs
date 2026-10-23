@@ -4732,6 +4732,17 @@ impl<T: Transport> Session<T> {
         self.stage(HostStage::Place, start);
         let start = self.mark();
         if let Some(kernel) = &kernel {
+            // A capture's own setup runs from the program cache, never role 0's fixed slot: the
+            // slots are trace data while a capture plans into them (`tt_isa::l1::TRACE_ARENA`).
+            if self.capture.is_some() {
+                let r = self.units[u].resident.as_ref().unwrap();
+                if let Some(setup) = r.pending_setup(kernel)? {
+                    let at = self.place_program(u, &setup)?;
+                    let words = setup.iter().map(|i| i.word()).collect();
+                    let r = self.units[u].resident.as_mut().unwrap();
+                    r.setup_from_cache(words, at as u32);
+                }
+            }
             let Session {
                 dev, units, images, ..
             } = self;
@@ -4985,6 +4996,13 @@ impl<T: Transport> Session<T> {
     /// Put `program` in unit `u`'s program cache and hold it there for a
     /// trace: its address.
     fn place_held(&mut self, u: usize, program: &[Instruction]) -> Result<u64, TensorError> {
+        let at = self.place_program(u, program)?;
+        self.units[u].programs.hold(at);
+        Ok(at)
+    }
+
+    /// Put `program` in unit `u`'s program cache, not held: its address.
+    fn place_program(&mut self, u: usize, program: &[Instruction]) -> Result<u64, TensorError> {
         use crate::program_cache::{CacheError, Placed};
         let words: Vec<u32> = program.iter().map(|i| i.word()).collect();
         for attempt in 0..2 {
@@ -5010,7 +5028,6 @@ impl<T: Transport> Session<T> {
                     )))
                 }
             };
-            unit.programs.hold(at);
             return Ok(at);
         }
         unreachable!("the second attempt returns")
@@ -5361,8 +5378,14 @@ impl<T: Transport> Session<T> {
             .as_mut()
             .map(|d| d.alloc.take_log())
             .unwrap_or_default();
-        // Ops after the capture plan in the whole arena again.
+        // Ops after the capture plan in the whole arena again, and what the capture's own run left in
+        // the program slots is not what the eager runtime last wrote there.
         crate::l1::set_arena_end(tt_isa::l1::DATA.end);
+        for unit in &mut self.units {
+            if let Some(r) = unit.resident.as_mut() {
+                r.forget_program_slots();
+            }
+        }
         // A unit that sat out the trace's last ops waits for its last barrier at the end of
         // its stream, so a replay leaves every unit it ran on past all of its barriers.
         let last = self.barriers.wrapping_sub(capture.barriers_base);
