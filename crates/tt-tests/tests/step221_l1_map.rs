@@ -158,6 +158,9 @@ fn workload<T: tt_device::Transport>(s: &mut Session<T>) -> Vec<Vec<u32>> {
         s.free(out).unwrap();
     }
     s.set_residency(tt_kernels::session::RESIDENCY_REGION);
+    // A capture in the trace arena writes the capture-only arena: off here, whatever the
+    // environment (`step222` covers it on).
+    s.set_trace_arena(false);
     s.write(&x, &values(seeds[0], K)).unwrap();
     s.begin_trace_plan_pass().unwrap();
     let plain_out = layer(s, &x, &a, &gamma, &w);

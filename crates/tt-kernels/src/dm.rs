@@ -177,10 +177,11 @@ fn containment() -> Containment {
     })
 }
 
-/// `op`'s access of `len` bytes at L1 address `l1` lies in the data arena.
-fn contained(op: u32, l1: u32, len: u64) -> Result<()> {
+/// `op`'s access of `len` bytes at L1 address `l1` lies in `arena`: the data arena, or the trace
+/// arena while a capture plans into it ([`DataMover::set_arena`]).
+fn contained(arena: tt_isa::l1::Region, op: u32, l1: u32, len: u64) -> Result<()> {
     let mode = containment();
-    if mode == Containment::Off || tt_isa::l1::DATA.contains(l1 as u64, len) {
+    if mode == Containment::Off || arena.contains(l1 as u64, len) {
         return Ok(());
     }
     if mode == Containment::Report {
@@ -190,10 +191,15 @@ fn contained(op: u32, l1: u32, len: u64) -> Result<()> {
     Err(DmError::Invalid(dm::error::RANGE))
 }
 
-/// [`Entry::decode`], and a read or write's L1 range must be in the data arena.
-fn decode_contained(usable: u32, e: [u32; 8]) -> std::result::Result<(), u32> {
+/// [`Entry::decode`], and a read or write's L1 range must be in `arena` ([`contained`]).
+fn decode_contained(
+    arena: tt_isa::l1::Region,
+    usable: u32,
+    e: [u32; 8],
+) -> std::result::Result<(), u32> {
     if let Entry::Move { descriptor, .. } = Entry::decode(usable, e)? {
-        contained(e[0], descriptor.l1, descriptor.range.len()).map_err(|_| dm::error::RANGE)?;
+        contained(arena, e[0], descriptor.l1, descriptor.range.len())
+            .map_err(|_| dm::error::RANGE)?;
     }
     Ok(())
 }
@@ -236,6 +242,9 @@ pub struct DataMover<N: NocId> {
     /// Where this mover's [`op::WRITE_L1`] entries may write ([`DataMover::set_l1_writes`]): none
     /// until the session says.
     l1_writes: L1Writes,
+    /// What this mover's lists may name in L1, as the host checks them: `tt_isa::l1::DATA`, or
+    /// `tt_isa::l1::TRACE_ARENA` while a capture plans into it ([`DataMover::set_arena`]).
+    arena: tt_isa::l1::Region,
     /// How long a descriptor may take on silicon. On ttsim the budget is
     /// simulated cycles instead, since the simulator's clock only moves when
     /// ticked.
@@ -379,6 +388,7 @@ impl<N: NocId> DataMover<N> {
             encode_reads: caps & dm::caps::FAST_READS != 0,
             context: encoded::Context::new(dram.usable_mask() as u32, (tile.x(), tile.y()), key),
             l1_writes: L1Writes::default(),
+            arena: tt_isa::l1::DATA,
             deadline: Duration::from_secs(1),
         })
     }
@@ -390,9 +400,9 @@ impl<N: NocId> DataMover<N> {
     /// Let this mover's [`op::WRITE_L1`] entries write into `writes` (see [`L1Writes`]); the
     /// default admits none. Host state only: what a list is checked against before it is queued.
     pub fn set_l1_writes(&mut self, writes: L1Writes) -> Result<()> {
-        let data = tt_isa::l1::DATA;
+        let listed = tt_isa::l1::LISTED;
         if !writes.window.is_empty()
-            && (writes.window.start < data.base || writes.window.end > data.end)
+            && (writes.window.start < listed.base || writes.window.end > listed.end)
         {
             return Err(DmError::Invalid(dm::error::RANGE));
         }
@@ -404,6 +414,17 @@ impl<N: NocId> DataMover<N> {
             return Err(DmError::Invalid(dm::error::RANGE));
         }
         self.l1_writes = writes;
+        Ok(())
+    }
+
+    /// Let this mover's lists name `arena` in L1: `tt_isa::l1::DATA`, or `tt_isa::l1::TRACE_ARENA`
+    /// while a capture plans into it (`docs/plans/decode-to-bandwidth.md` Phase 8, P3). Host state
+    /// only: what a list is checked against before it is queued.
+    pub fn set_arena(&mut self, arena: tt_isa::l1::Region) -> Result<()> {
+        if arena != tt_isa::l1::DATA && arena != tt_isa::l1::TRACE_ARENA {
+            return Err(DmError::Invalid(dm::error::RANGE));
+        }
+        self.arena = arena;
         Ok(())
     }
 
@@ -743,9 +764,14 @@ impl<N: NocId> DataMover<N> {
                 // The host's whole check of an encoded read, which the card only
                 // verifies (`encoded::verify`).
                 encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
-                contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
+                contained(
+                    self.arena,
+                    entries[i][0],
+                    entries[i][3],
+                    entries[i][7] as u64,
+                )?;
             } else if n == 1 {
-                decode_contained(usable, entries[i]).map_err(DmError::Invalid)?;
+                decode_contained(self.arena, usable, entries[i]).map_err(DmError::Invalid)?;
                 if matches!(
                     entries[i][0],
                     op::WRITE_L1 | op::WRITE_L1_MCAST | op::READ_L1
@@ -757,7 +783,8 @@ impl<N: NocId> DataMover<N> {
                 let rec = entries
                     .get(i..i + n)
                     .ok_or(DmError::Invalid(dm::error::LENGTH))?;
-                record::expand(rec, |e| decode_contained(usable, e)).map_err(DmError::Invalid)?;
+                record::expand(rec, |e| decode_contained(self.arena, usable, e))
+                    .map_err(DmError::Invalid)?;
             }
             i += n;
         }
@@ -806,7 +833,12 @@ impl<N: NocId> DataMover<N> {
                     return Err(DmError::Invalid(dm::error::OP));
                 }
                 encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
-                contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
+                contained(
+                    self.arena,
+                    entries[i][0],
+                    entries[i][3],
+                    entries[i][7] as u64,
+                )?;
             }
             i += record::len(entries[i][0]);
         }

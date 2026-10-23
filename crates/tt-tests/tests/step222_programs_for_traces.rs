@@ -8,6 +8,10 @@
 //!   (`runtime::Resident::setup_from_cache`), not role 0's fixed slot: with every unit's slots
 //!   poisoned before a plan pass and a planned capture of a layer, every poisoned word is intact
 //!   after both, and the replays equal the layer run fresh, bit for bit.
+//! - **A capture in the trace arena replays as the ops run fresh** (P3, `Session::set_trace_arena`):
+//!   its persistent region at the top of the trace arena, above `DATA`, its products' `B` rings
+//!   reaching up to it past `DATA`, a plan pass and a planned capture of the layer replay bit for
+//!   bit as it runs fresh and as the same captures outside the trace arena.
 //! - **After a capture the eager runtime writes its fixed slots again.** A fixed-slot kernel
 //!   (`Session::matmul`) whose programs the runtime last wrote, run again after its slots were
 //!   overwritten and a capture ended, gives its own result bit for bit: the capture made the
@@ -27,8 +31,8 @@ use tt_kernels::tensor::{DramTensor, Eltwise};
 use tt_tests::harness::BUDGET;
 use tt_ttsim::fork_scope;
 
-const K: usize = 512;
-const N: usize = 256;
+const K: usize = 1024;
+const N: usize = 512;
 const EPS: f32 = 1e-5;
 const POISON: u8 = 0xC3;
 const ROUTE: SrcRoute = SrcRoute::Tf32FromFp32;
@@ -147,6 +151,8 @@ fn a_captures_own_run_leaves_the_program_slots_alone() {
         let poison = vec![POISON; PROGRAMS.len() as usize];
         fill(s, &tiles, &poison);
         s.set_residency(tt_kernels::session::RESIDENCY_REGION);
+        // In the trace arena the capture plans into the slots: off here, whatever the environment.
+        s.set_trace_arena(false);
         s.write(&x, &values(seeds[0], K)).unwrap();
         s.begin_trace_plan_pass().unwrap();
         let plain_out = layer(s, &x, &a, &gamma, &w);
@@ -175,6 +181,89 @@ fn a_captures_own_run_leaves_the_program_slots_alone() {
             s.release_trace(id).unwrap();
         }
         for t in [plain_out, out, x, w, gamma, a] {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// A plan pass and a planned capture of the layer, replayed over `seeds` after the first: each
+/// result's bits, the region's base and the highest `l1_top` of the planned capture's ops.
+fn captured<T: tt_device::Transport>(
+    s: &mut Session<T>,
+    tensors: [&DramTensor; 4],
+    seeds: &[u64],
+    what: &str,
+) -> (Vec<Vec<u32>>, u64, u64) {
+    let [x, a, gamma, w] = tensors;
+    s.write(x, &values(seeds[0], K)).unwrap();
+    s.begin_trace_plan_pass().unwrap();
+    let plain_out = layer(s, x, a, gamma, w);
+    let plain = s.end_trace().unwrap();
+    let base = s
+        .probe_last_plan()
+        .unwrap_or_else(|| panic!("{what}: no plan"))
+        .region_base;
+    s.write(x, &values(seeds[0], K)).unwrap();
+    assert!(s.begin_trace_planned().unwrap(), "{what}: nothing resident");
+    let out = layer(s, x, a, gamma, w);
+    let planned = s.end_trace().unwrap();
+    let top = s
+        .trace_ops(planned)
+        .unwrap()
+        .iter()
+        .map(|o| o.l1_top)
+        .max()
+        .unwrap();
+    let mut got = vec![bits(&s.download(&out).unwrap())];
+    for &seed in &seeds[1..] {
+        s.write(x, &values(seed, K)).unwrap();
+        s.replay(planned).unwrap();
+        s.sync().unwrap();
+        got.push(bits(&s.download(&out).unwrap()));
+    }
+    for id in [plain, planned] {
+        s.release_trace(id).unwrap();
+    }
+    for t in [plain_out, out] {
+        s.free(t).unwrap();
+    }
+    (got, base, top)
+}
+
+#[test]
+fn a_capture_in_the_trace_arena_replays_as_the_ops_run_fresh() {
+    use tt_isa::l1::{DATA, TRACE_ARENA};
+    with_session(TileChoice::Count(8), |s| {
+        let seeds = [10u64, 20, 21];
+        let a = s.upload(&values(2, K), 1, K).unwrap();
+        let gamma = s.upload(&values(3, K), 1, K).unwrap();
+        let w = s.upload(&values(4, K * N), K, N).unwrap();
+        let x = s.upload(&values(seeds[0], K), 1, K).unwrap();
+        let mut fresh = Vec::new();
+        for &seed in &seeds {
+            s.write(&x, &values(seed, K)).unwrap();
+            let out = layer(s, &x, &a, &gamma, &w);
+            fresh.push(bits(&s.download(&out).unwrap()));
+            s.free(out).unwrap();
+        }
+        s.set_residency(tt_kernels::session::RESIDENCY_REGION);
+        s.set_trace_arena(false);
+        let (outside, base, top) = captured(s, [&x, &a, &gamma, &w], &seeds, "outside");
+        assert_eq!(outside, fresh, "outside the trace arena");
+        assert!(base < DATA.end && top <= base, "{base:#x} {top:#x}");
+        s.set_trace_arena(true);
+        let (inside, base, top) = captured(s, [&x, &a, &gamma, &w], &seeds, "inside");
+        assert_eq!(inside, fresh, "in the trace arena");
+        assert!(
+            (DATA.end..TRACE_ARENA.end).contains(&base),
+            "the region at {base:#x}"
+        );
+        assert!(
+            top > DATA.end && top <= base,
+            "the products' rings reach {top:#x}, the region at {base:#x}"
+        );
+        s.set_trace_arena(false);
+        for t in [x, w, gamma, a] {
             s.free(t).unwrap();
         }
     });

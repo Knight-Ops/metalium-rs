@@ -987,7 +987,28 @@ with nothing left for the small ops. The room is elsewhere in L1: `MAILBOXES` is
   `step193`, `step205`, `step216`-`step222`, `step12_mnist`, `tt-kernels` unit tests. Card 0 (P1 and P2): `step185`,
   `step187`, `step188` (bit for bit), `step191`, `step193`, `step218`, `step219`, `step221`, `step222`, 46 of 46
   (`1792713314`); `--smoke` 1,189 of 1,189 (`1792713658`); `step221` and `step222` added to it.
-- [ ] **P3**: captures plan into `PROGRAMS` (`Session::set_trace_arena`), the products' chunk choice pinned.
+- [x] **P3, a capture plans into the trace arena** (2026-10-23; host; opt-in, `Session::set_trace_arena`,
+  `TT_TRACE_ARENA=1`). Not as planned (the ops' arena widened, the products' chunk choice pinned): M2 showed that every
+  choice sized from the arena moves with it. Instead the capture's **persistent region moves to the top of the trace
+  arena** (`0x11E000..0x136000` at 96 KiB, in `PROGRAMS`), and **only the products' `B` rings reach past `DATA`**, up to
+  the region's base (`l1::ring_end`; in a plan pass, where the planned capture's region will begin), so ring 1 is
+  `0x9C000..0x11E000` (was `0x66000..0xE8000`). Every other layout, and every block width, group and run length, plans in
+  `DATA` as outside a capture, so the plan pass and the planned capture agree and the region never narrows a product
+  (no cap). The host's containment is per mover (`DataMover::set_arena`: `TRACE_ARENA` during the capture, `DATA`
+  otherwise); a layout planned past `DATA` into the trace arena is noted as the op's (`l1::Requirements::plan`; without
+  it the product's `l1_top` was 0 and no plan was made); a fixed region (`set_l1_region`, `TT_RESIDENCY_REGION`) stays at
+  `DATA`'s top. Gate `step222` `a_capture_in_the_trace_arena_replays_as_the_ops_run_fresh`: a plan pass and a planned
+  capture of a layer with a one-row product, in the trace arena and out of it, bit for bit as the ops run fresh, the
+  region at or above `DATA.end`, a ring reaching past it (**watched failing** with the movers' host containment left at
+  `DATA`: the gathers refused, `RANGE`). `step217`, `step219`'s cap test, `step221` and `step222`'s poison test pin it
+  off (they test a region inside `DATA`, or nothing in the capture-only arena). ttsim with it on and off: `step187`,
+  `step193`, `step205`, `step214`, `step216`-`step222`, `tt-kernels` unit tests. Card 0 with it on: `step185`,
+  `step187`, `step188` (bit for bit), `step191`, `step193`, `step205`, `step216`, `step219`, `step222`, 46 of 46
+  (`1792717686`); `--smoke` (off) 1,194 of 1,194 (`1792718017`).
+  - **Measured** (card 0, every tile): 1.7B **16.78 / 18.15 ms** on (`1792719606`) against 16.78 / 18.16 off
+    (`1792719760`); the 135M 7.57 / 9.08 on (`1792719910`; 7.62 / 9.09 off); ResNet-18 14.15 and ViT-Tiny 9.22 on
+    (`1792719944`). Neutral: the ring moved up, but a unit's busy prefetch was already bounded by what it holds, one
+    job. **Opt-in until R2** uses the room.
 - [ ] **R1-R4**: a ring-indexed product layout; idle units take a second job; a two-deep prefetch queue on a second ID;
   busy units read a second job ahead.
 

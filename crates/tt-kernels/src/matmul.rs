@@ -1742,9 +1742,10 @@ fn planned_slots(
 ) -> Result<Layout, crate::runtime::RunError> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = ([usize; 3], L1Format, Staging, usize, bool, u64);
+    type Key = ([usize; 3], L1Format, Staging, usize, bool, u64, u64);
     // Each layout with what its plan reached and needed, noted again on every hit
-    // (`crate::l1::note_planned`); by the arena's end too, which `B`'s ring may sit against.
+    // (`crate::l1::note_planned`); by the arena's end too, and the end `B`'s ring sits against
+    // (`crate::l1::ring_end`).
     static CACHE: OnceLock<Mutex<HashMap<Key, (Layout, crate::l1::Planned)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let key = (
@@ -1754,6 +1755,7 @@ fn planned_slots(
         a_slots,
         top_b,
         crate::l1::arena().end,
+        crate::l1::ring_end(),
     );
     if let Some((l, p)) = cache.lock().unwrap().get(&key) {
         crate::l1::note_planned(*p);
@@ -1761,6 +1763,11 @@ fn planned_slots(
     }
     let arena = match staging {
         Staging::SlotsHalf => half_arena(),
+        // `B` against the ring's end, `A` and the outputs at the arena's start.
+        _ if top_b => tt_isa::l1::Region {
+            end: crate::l1::ring_end(),
+            ..crate::l1::arena()
+        },
         _ => crate::l1::arena(),
     };
     let before = crate::l1::take_planned();
@@ -2094,6 +2101,7 @@ pub(crate) fn kernel_programs(
         bool,
         LiveRows,
         u64,
+        u64,
     );
     type Value = (Arc<[Vec<Instruction>; 3]>, [Option<MopConfig>; 3]);
     static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
@@ -2107,8 +2115,10 @@ pub(crate) fn kernel_programs(
         allow_mop,
         b_transposed,
         live,
-        // The layout was planned in the arena (`crate::l1::arena`).
+        // The layout was planned in the arena (`crate::l1::arena`), `B`'s ring against
+        // `crate::l1::ring_end`.
         crate::l1::arena().end,
+        crate::l1::ring_end(),
     );
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();

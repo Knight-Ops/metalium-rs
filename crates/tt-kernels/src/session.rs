@@ -776,6 +776,11 @@ pub struct Session<T: Transport> {
     /// Where this session's movers may write other tiles' L1 (`dm::L1Writes`): nowhere outside a
     /// planned capture.
     l1_writes: crate::dm::L1Writes,
+    /// [`Session::set_trace_arena`].
+    trace_arena: bool,
+    /// What every unit's movers' lists may name in L1 now, and each started later
+    /// (`DataMover::set_arena`): `DATA`, or the trace arena while a capture plans into it.
+    mover_arena: tt_isa::l1::Region,
     /// The shape of the op being queued ([`trace::OpRecord::shape`]).
     pending_shape: u64,
     /// [`Session::set_resident_matmul_a`].
@@ -2429,6 +2434,8 @@ impl<T: Transport> Session<T> {
             plans: Default::default(),
             captures: 0,
             l1_writes: Default::default(),
+            trace_arena: std::env::var("TT_TRACE_ARENA").is_ok_and(|v| v == "1"),
+            mover_arena: tt_isa::l1::DATA,
             pending_shape: 0,
             resident_matmul_a: true,
             unpack_transposed_b: true,
@@ -4265,6 +4272,7 @@ impl<T: Transport> Session<T> {
             epoch,
             release_rects,
             l1_writes,
+            mover_arena,
             ..
         } = self;
         let idle = units.iter().all(|u| u.queued.is_empty());
@@ -4307,8 +4315,10 @@ impl<T: Transport> Session<T> {
             nc.set_write_noc(dev, r.window(), crate::dm::WriteNoc::Noc1)?;
             let mut nc = nc;
             nc.set_l1_writes(l1_writes.clone())?;
+            nc.set_arena(*mover_arena)?;
             if let Some(b) = unit.mover.as_mut() {
                 b.set_l1_writes(l1_writes.clone())?;
+                b.set_arena(*mover_arena)?;
             }
             unit.nc = Some(nc);
             if profiling.is_some() {
@@ -4847,6 +4857,7 @@ impl<T: Transport> Session<T> {
         nc.set_write_noc(dev, window, crate::dm::WriteNoc::Noc1)?;
         let mut nc = nc;
         nc.set_l1_writes(self.l1_writes.clone())?;
+        nc.set_arena(self.mover_arena)?;
         unit.nc = Some(nc);
         Ok(())
     }
@@ -5129,11 +5140,24 @@ impl<T: Transport> Session<T> {
         }
         // The capture's own tensors, for its residency plan (`crate::residency`).
         self.dram_state()?.alloc.start_log();
-        // Its ops plan below the persistent region, if it keeps one.
-        if let Some(base) = region_base.filter(|&b| b < tt_isa::l1::DATA.end) {
-            crate::l1::set_arena_end(base);
+        // Its ops plan below the persistent region, if it keeps one. In the trace arena the region
+        // is above `DATA`, and only the products' `B` rings reach past it, up to the region's base
+        // (or, in a plan pass, where the planned capture's will be): every other layout is as it is
+        // outside a capture (`crate::l1::ring_end`).
+        let top = self.region_top();
+        let region_base = region_base.filter(|&b| b < top);
+        if let Some(base) = region_base {
+            crate::l1::set_arena_end(base.min(tt_isa::l1::DATA.end));
             if let Some(c) = self.capture.as_mut() {
                 c.region_base = Some(base);
+            }
+        }
+        if self.trace_arena {
+            let ring = region_base.unwrap_or(top - self.region_room());
+            crate::l1::set_ring_end(Some(ring.max(crate::l1::arena().end)));
+            if let Err(e) = self.set_mover_arena(tt_isa::l1::TRACE_ARENA) {
+                self.capture = None;
+                return Err(e);
             }
         }
         Ok(())
@@ -5378,9 +5402,11 @@ impl<T: Transport> Session<T> {
             .as_mut()
             .map(|d| d.alloc.take_log())
             .unwrap_or_default();
-        // Ops after the capture plan in the whole arena again, and what the capture's own run left in
-        // the program slots is not what the eager runtime last wrote there.
+        // Ops after the capture plan in the whole arena again, their lists in `DATA`, and what the
+        // capture's own run left in the program slots is not what the eager runtime last wrote there.
         crate::l1::set_arena_end(tt_isa::l1::DATA.end);
+        crate::l1::set_ring_end(None);
+        self.set_mover_arena(tt_isa::l1::DATA)?;
         for unit in &mut self.units {
             if let Some(r) = unit.resident.as_mut() {
                 r.forget_program_slots();
@@ -8072,6 +8098,18 @@ impl<T: Transport> Session<T> {
         self.busy_prefetch = on;
     }
 
+    /// Whether a capture plans into the trace arena (`tt_isa::l1::TRACE_ARENA`: `DATA`, the 88 KiB
+    /// the mailboxes left and the program slots, which a trace's kernels never run from;
+    /// `TT_TRACE_ARENA=1` at open; `docs/plans/decode-to-bandwidth.md` Phase 8, P3). On, a capture
+    /// keeps its persistent region at the top of the trace arena, above `DATA`, and its products'
+    /// `B` rings reach up to it; every other layout plans in `DATA` as outside a capture, so the
+    /// bits are the same. Cached residency plans are dropped: they hold each op's layout.
+    pub fn set_trace_arena(&mut self, on: bool) {
+        self.trace_arena = on;
+        self.plans.clear();
+        self.planned_base = None;
+    }
+
     /// Where, in a capture, each unit starts reading a product's weights ahead of it
     /// ([`Session::set_weight_prefetch`], [`Session::set_busy_prefetch`]): after the last
     /// weight-streaming product ([`PrefetchAnchor::Last`]), or after the last one the unit itself
@@ -8215,7 +8253,7 @@ impl<T: Transport> Session<T> {
                 .iter()
                 .map(|u| (u.tile.x(), u.tile.y()))
                 .collect(),
-            window: base..tt_isa::l1::DATA.end,
+            window: base..self.region_top(),
         };
         self.set_l1_writes(writes)?;
         let c = self.capture.as_mut().expect("begun above");
@@ -8233,7 +8271,7 @@ impl<T: Transport> Session<T> {
         allocs: &[tensor::Placement],
     ) -> Option<std::sync::Arc<crate::residency::Applied>> {
         use crate::residency::{Applied, Graph, Plan};
-        let end = tt_isa::l1::DATA.end;
+        let end = self.region_top();
         // An op that did not plan its layout while captured cannot be shown to stay below a
         // region (`TraceError::IntoRegion`).
         if c.ops.iter().any(|o| o.l1_top == 0) {
@@ -8249,7 +8287,9 @@ impl<T: Transport> Session<T> {
         let budget = if c.region_base.is_some() {
             end - kept
         } else {
-            crate::residency::cap(&g, end).min(self.residency_region)
+            crate::residency::cap(&g, end)
+                .min(self.residency_region)
+                .min(self.region_room())
         };
         // A row its readers take whole on many units goes as `residency_rows` says: held by a few
         // of them by default, since every producer multicasting it to all of them serializes
@@ -8308,6 +8348,43 @@ impl<T: Transport> Session<T> {
     #[doc(hidden)]
     pub fn probe_last_plan(&self) -> Option<std::sync::Arc<crate::residency::Applied>> {
         self.last_plan.clone()
+    }
+
+    /// Let every unit's movers' lists name `arena` in L1 (`DataMover::set_arena`), and each
+    /// started later.
+    fn set_mover_arena(&mut self, arena: tt_isa::l1::Region) -> Result<(), TensorError> {
+        for unit in self.units.iter_mut() {
+            for m in [unit.mover.as_mut(), unit.nc.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                m.set_arena(arena)?;
+            }
+        }
+        self.mover_arena = arena;
+        Ok(())
+    }
+
+    /// Where a capture's persistent region ends: the top of `DATA`, or of the trace arena
+    /// ([`Session::set_trace_arena`]).
+    fn region_top(&self) -> u64 {
+        if self.trace_arena {
+            tt_isa::l1::TRACE_ARENA.end
+        } else {
+            tt_isa::l1::DATA.end
+        }
+    }
+
+    /// The most a residency plan's region may take from the top ([`Session::region_top`]): what
+    /// [`Session::set_residency`] allows, and in the trace arena no more than lies above `DATA`,
+    /// so the region never narrows what the ops plan in.
+    fn region_room(&self) -> u64 {
+        if self.trace_arena {
+            self.residency_region
+                .min(tt_isa::l1::TRACE_ARENA.end - tt_isa::l1::DATA.end)
+        } else {
+            self.residency_region
+        }
     }
 
     /// Let every unit's movers write `writes` ([`crate::dm::L1Writes`]), and each started later.

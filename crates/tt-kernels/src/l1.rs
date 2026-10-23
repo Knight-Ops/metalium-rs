@@ -62,6 +62,37 @@ pub(crate) fn set_arena_end(end: u64) -> u64 {
     ARENA_END.with(|e| e.replace(end))
 }
 
+std::thread_local! {
+    /// Where a product's `B` ring sits against on this thread ([`ring_end`]); zero: the arena's end.
+    static RING_END: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Where a product's `B` ring is placed against (`matmul::matmul_requirements_top_b`): [`arena`]'s
+/// end, or, while a capture plans into the trace arena (`tt_isa::l1::TRACE_ARENA`), the base of its
+/// persistent region above `DATA` -- the one layout that reaches past `DATA`, so every other
+/// layout, and every choice sized from the arena, is as it is outside a capture
+/// (`docs/plans/decode-to-bandwidth.md` Phase 8, P3). Whatever caches a ring's layout, or programs
+/// that name its addresses, keys them by it.
+pub fn ring_end() -> u64 {
+    match RING_END.with(|e| e.get()) {
+        0 => arena().end,
+        end => end,
+    }
+}
+
+/// Make [`ring_end`] `end` on this thread (`None`: the arena's end), between [`arena`]'s end and
+/// the trace arena's, returning what it was.
+pub(crate) fn set_ring_end(end: Option<u64>) -> Option<u64> {
+    if let Some(end) = end {
+        assert!(
+            (arena().end..=tt_isa::l1::TRACE_ARENA.end).contains(&end),
+            "a ring end {end:#x} outside the trace arena"
+        );
+    }
+    let was = RING_END.with(|e| e.replace(end.unwrap_or(0)));
+    (was != 0).then_some(was)
+}
+
 /// What the L1 plans of one op reached ([`take_planned`]): its highest `DATA` address, and the
 /// lowest arena end ([`arena`]) at which its layouts are the ones it has. That leaves out room a
 /// plan declared it can do without ([`Requirements::slack`]: a product's `B` ring placed against
@@ -524,7 +555,9 @@ impl Requirements {
     /// memoised by shape.
     pub fn plan(&self, arena: Region) -> Result<Plan, PlanError> {
         let plan = self.plan_unnoted(arena)?;
-        if arena.base >= tt_isa::l1::DATA.base && arena.end <= tt_isa::l1::DATA.end {
+        // A layout in a tile's data arena, or past it into the trace arena (a product's `B` ring in
+        // a capture, `ring_end`): noted as the op's.
+        if arena.base >= tt_isa::l1::DATA.base && arena.end <= tt_isa::l1::TRACE_ARENA.end {
             let top = self
                 .buffers
                 .iter()

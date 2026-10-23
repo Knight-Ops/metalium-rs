@@ -666,6 +666,9 @@ fn the_region_is_sized_by_its_plan_and_never_past_its_cap() {
             s.free(out).unwrap();
         }
         s.set_residency(RESIDENCY_REGION);
+        // The cap is what a region inside `DATA` may take: off here, whatever the environment (in
+        // the trace arena the region is above `DATA`, `step222`).
+        s.set_trace_arena(false);
         // A plan pass, then its planned capture keeping `region` (`None`: the plan's own); the
         // planned trace's results, or why it was refused.
         let capture = |s: &mut Session<_>, region: Option<u64>| {
