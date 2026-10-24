@@ -562,8 +562,15 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
     [log](../learnings/performance-log.md#the-17b-against-its-roofline-and-a-prefill-products-rate-2026-10-17-cards-0-and-1)).
     For F32 on one card, the "realistic" targets are 25 ms a decode step and ~21 ms for a 256-token prefill; we are at
     47.44 ms and 297.4 ms (`1792258449`). Decode closes through the items above. Two items are new:
-    - [ ] **Prefill products that reuse their operands.**
-      - **Now:** a prefill-shaped product reaches 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,
+    - [ ] **Prefill products that reuse their operands** ([prefill-operand-reuse.md](prefill-operand-reuse.md)).
+      - **Step 1 built (2026-10-24), on by default** (`TT_MATMUL_BLOCK=off` turns it off): a job owns an `mb x nb` block of output
+        tiles and streams `K` in chunks, its partials in L1, its programs looped, bit for bit (`step229`, ttsim and
+        card 0). On card 0 the prefill products run **2.9-3.6x** faster at `m` >= 512 (`gate|up` 5.21 -> 18.23 TFLOPS,
+        `down` 2.80 -> 10.06 at `m` = 2048; `1792857503`, `1792857489`), bound now by the kernel's ~0.4-0.6 us a K-tile
+        pair (P4). The 1.7B's prefill at 8,192 positions with chunks of 512: 1,000 / 4,000 / 7,992 tokens
+        **1.24 / 6.81 / 18.33 -> 0.48 / 3.70 / 12.59 s** (`1792858000`). Next: the pair's cost (P4), then each operand out
+        of GDDR once (Step 2).
+      - **Before (2026-10-17):** a prefill-shaped product reached 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,
         `1792258604`). It is bound by GDDR because each unit gathers its own tiles: `B` is read `m / 32` times, `A`
         once per two-column block, up to once a unit. The largest product reads 3.2 GB for 77 MB.
       - **Step 1:** a 2-D blocked product. Each unit holds an `A` strip and a `B` strip in L1 and streams `K`,

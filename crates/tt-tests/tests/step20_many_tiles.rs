@@ -83,6 +83,9 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
         .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' deal gives every unit a block (`every_tile_worked`); a 2-D blocked
+        // product may leave one idle where its model rates it as fast (`step229` gates those).
+        s.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         f(&mut s);
     }) {
         panic!("{n} tiles: {e}");
@@ -100,6 +103,9 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
         .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' deal gives every unit a block (`every_tile_worked`); a 2-D blocked
+        // product may leave one idle where its model rates it as fast (`step229` gates those).
+        s.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         f(&mut s);
     }) {
         panic!("{n} tiles: {e}");

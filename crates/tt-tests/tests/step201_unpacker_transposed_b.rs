@@ -32,6 +32,9 @@ fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
         let mut s = Session::open(dev, tt_firmware_images::ROLES, tiles, |_, _| Ok(None)).unwrap();
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' gate: products of several tile rows would otherwise run blocked
+        // (`docs/plans/prefill-operand-reuse.md`; `step229` gates those).
+        s.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         f(&mut s);
     }) {
         panic!("{e}");
@@ -49,6 +52,9 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
         .unwrap();
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' gate: products of several tile rows would otherwise run blocked
+        // (`docs/plans/prefill-operand-reuse.md`; `step229` gates those).
+        s.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         f(&mut s);
     }) {
         panic!("{e}");

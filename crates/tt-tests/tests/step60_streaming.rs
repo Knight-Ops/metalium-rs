@@ -30,6 +30,9 @@ fn with_tiles(count: usize, test: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_
         session
             .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' gate: products of several tile rows would otherwise run blocked
+        // (`docs/plans/prefill-operand-reuse.md`; `step229` gates those).
+        session.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         session.set_pipeline(true);
         test(&mut session);
     })
@@ -48,6 +51,9 @@ fn with_tiles(count: usize, test: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
         session
             .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' gate: products of several tile rows would otherwise run blocked
+        // (`docs/plans/prefill-operand-reuse.md`; `step229` gates those).
+        session.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         session.set_pipeline(true);
         test(&mut session);
     })
@@ -459,6 +465,9 @@ fn firmware_configuration_is_fixed_and_rejected_during_capture() {
         session
             .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' gate: products of several tile rows would otherwise run blocked
+        // (`docs/plans/prefill-operand-reuse.md`; `step229` gates those).
+        session.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         session.set_pipeline(true);
     });
 }

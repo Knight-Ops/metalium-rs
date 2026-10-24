@@ -1465,6 +1465,7 @@ pub fn matmul_dram(
             handoff: None,
             second_job: false,
             balanced_deal: false,
+            block_stream: BlockStream::Off,
         },
     )
 }
@@ -1548,6 +1549,61 @@ pub(crate) struct Reads {
     /// reads over its prefetching units too, not its own units alone
     /// ([`BlockPlan::push_prefetched_jobs`], [`balanced_shares`]).
     pub balanced_deal: bool,
+    /// Whether a product of several tile rows runs as 2-D blocks with `K` streamed
+    /// ([`BlockStream`]).
+    pub block_stream: BlockStream,
+}
+
+/// Whether a GDDR product of at least two tile rows runs as `[mb, nb]` blocks of output tiles,
+/// each job streaming `K` in chunks of at most `kq` tiles and reading its `A` and `B` strips once
+/// (`BlockPlan::push_block_stream_jobs`, `docs/plans/prefill-operand-reuse.md`). Bit for bit the
+/// other paths: each output tile's `K` chain is the same, in the same order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BlockStream {
+    /// Never.
+    Off,
+    /// Where [`block_stream_plan`] finds a shape whose modelled time beats the other paths'.
+    #[default]
+    Auto,
+    /// Always where the product allows one, with this `[mb, kq, nb]` (each clamped to the
+    /// product): a gate's or a sweep's.
+    Fixed([usize; 3]),
+}
+
+impl BlockStream {
+    /// `TT_MATMUL_BLOCK`: `off`, `auto` or `mb,kq,nb`; [`BlockStream::Auto`] when unset.
+    pub fn from_env() -> Self {
+        match std::env::var("TT_MATMUL_BLOCK") {
+            Err(_) => BlockStream::Auto,
+            Ok(v) => v
+                .parse()
+                .unwrap_or_else(|e| panic!("TT_MATMUL_BLOCK={v}: {e}")),
+        }
+    }
+}
+
+impl std::str::FromStr for BlockStream {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "off" | "0" => Ok(BlockStream::Off),
+            "auto" | "1" => Ok(BlockStream::Auto),
+            _ => {
+                let parts: Vec<usize> = s
+                    .split(',')
+                    .map(|p| p.trim().parse::<usize>())
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| format!("expected `off`, `auto` or `mb,kq,nb`: {e}"))?;
+                match parts[..] {
+                    [mb, kq, nb] if mb > 0 && kq > 0 && nb > 0 => {
+                        Ok(BlockStream::Fixed([mb, kq, nb]))
+                    }
+                    _ => Err("expected `off`, `auto` or three positive `mb,kq,nb`".into()),
+                }
+            }
+        }
+    }
 }
 
 /// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
@@ -1785,6 +1841,41 @@ pub(crate) fn matmul_dram_prefetching(
         Some(_) if kc < kt => packed_k_block(kt, max_k_tiles, route, fidelity)?,
         _ => kc,
     };
+    // Several tile rows: 2-D blocks with `K` streamed, where the mode asks for them and the
+    // modelled time beats this plan's.
+    if reads.packed_a.is_none() && max_k_tiles.is_none() {
+        let [bmc, bnc] = blocks([mt, nt], [mc, nc], units);
+        let other = blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], units);
+        if let Some((shape, layout)) = block_stream_plan(
+            reads.block_stream,
+            [mt, kt, nt],
+            units,
+            other,
+            route,
+            fidelity,
+        ) {
+            let c = DramTensor::alloc(alloc, m, n)?;
+            let mut jobs = Vec::new();
+            push_block_stream_jobs(
+                &mut jobs,
+                &shape,
+                &layout,
+                [mt, kt, nt],
+                m,
+                [a.tensor_ref(), b.tensor_ref(), c.tensor_ref()],
+                [a_transposed, b_transposed],
+                if reads.thin {
+                    thin_rows(m, a_transposed)
+                } else {
+                    0
+                },
+                reads.unpack_b && b_transposed && route == SrcRoute::Tf32FromFp32,
+                route,
+                fidelity,
+            );
+            return Ok((Work { out: c, jobs }, None, None));
+        }
+    }
     // The plan's block is what runs, so the arena must keep it (`matmul::plan_floor`) -- except
     // where a packed `A`'s `K` is blocked: its blocks are `packed_k_block`'s, which notes its own
     // layout, and its jobs a column each, whatever the plan's width; and a smaller arena keeps `K`
@@ -3036,6 +3127,408 @@ impl BlockPlan {
             }
         }
         Ok(())
+    }
+}
+
+/// What [`block_stream_plan`]'s model takes a unit to spend on a K-tile pair, on an output tile's
+/// reload and pack a chunk, and on a chunk's batch (its launch, credits and retire), in us; and
+/// GDDR's read rates, a card's and one unit's, in bytes a us. From card 0's sweeps
+/// (`docs/plans/prefill-operand-reuse.md`, "Measured": a `kq` sweep of a `4 x 6` block of `down`,
+/// `1792857249`-`1792857286`, ~3-5 us a chunk of 24 outputs; blocks of 24-64 outputs, 0.4-0.6 us a
+/// pair at HiFi4). The card's rate is what a product reading under its compute reached: shapes
+/// that asked ~400 GB/s ran slower than their compute, none of the fast ones read more than ~315.
+const BLOCK_PAIR_US: f64 = 0.4;
+const BLOCK_OUTPUT_US: f64 = 0.15;
+const BLOCK_BATCH_US: f64 = 2.0;
+const CARD_READ_BYTES_PER_US: f64 = 320_000.0;
+const UNIT_READ_BYTES_PER_US: f64 = 7_000.0;
+const TILE_BYTES: f64 = 4096.0;
+
+/// The longest side of a block [`block_stream_plan`] considers: the kernel's programs are
+/// unrolled an output tile (P1b loops them).
+pub const BLOCK_SIDE_MAX: usize = 16;
+
+/// The programs [`block_stream_plan`] builds to check a candidate's fit, at most, before it gives
+/// up on a product.
+const BLOCK_FIT_TRIES: usize = 8;
+
+/// A K-streamed blocked product's shape ([`BlockStream`]): `[mb, kq, nb]`, its chunks a job, and
+/// what [`block_stream_plan`]'s model makes of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockStreamShape {
+    pub tiles: [usize; 3],
+    pub chunks: usize,
+    /// Modelled time, us.
+    pub us: f64,
+    /// GDDR bytes read.
+    pub bytes: f64,
+}
+
+/// [`BlockStreamShape`] of `[mt, kt, nt]` tiles in `[mb, kq, nb]` blocks over `units` units: `None`
+/// where the chunks a job are odd (a unit's chunks must alternate halves from job to job) or the
+/// block is wider than the product.
+pub fn block_stream_model(
+    [mt, kt, nt]: [usize; 3],
+    [mb, kq, nb]: [usize; 3],
+    units: usize,
+) -> Option<BlockStreamShape> {
+    if mb == 0 || kq == 0 || nb == 0 || mb > mt || nb > nt || kq > kt {
+        return None;
+    }
+    let chunks = kt.div_ceil(kq);
+    if chunks % 2 != 0 {
+        return None;
+    }
+    let (row_blocks, col_blocks) = (mt.div_ceil(mb), nt.div_ceil(nb));
+    let jobs = row_blocks * col_blocks;
+    let rounds = jobs.div_ceil(units.max(1)) as f64;
+    // Every block reads its rows' `A` and its columns' `B` once, over the whole of `K`.
+    let bytes = (col_blocks * mt + row_blocks * nt) as f64 * kt as f64 * TILE_BYTES;
+    let compute = chunks as f64 * BLOCK_BATCH_US
+        + (mb * nb) as f64 * (kt as f64 * BLOCK_PAIR_US + chunks as f64 * BLOCK_OUTPUT_US);
+    let read = (mb + nb) as f64 * kt as f64 * TILE_BYTES / UNIT_READ_BYTES_PER_US;
+    // A chunk's reads run under the chunk before's compute.
+    let us = (bytes / CARD_READ_BYTES_PER_US).max(rounds * compute.max(read));
+    Some(BlockStreamShape {
+        tiles: [mb, kq, nb],
+        chunks,
+        us,
+        bytes,
+    })
+}
+
+/// The same model of the product's other paths: `[mc, kc, nc]` as `matmul_dram_prefetching`
+/// runs it (after [`blocks`]), `K` whole (its reads and compute one after another under
+/// [`Staging::Slots`]) or in K blocks of one output tile, the partial through GDDR.
+pub fn blocked_paths_model(
+    [mt, kt, nt]: [usize; 3],
+    [mc, kc, nc]: [usize; 3],
+    units: usize,
+) -> f64 {
+    let units = units.max(1);
+    if kc >= kt {
+        let (row_blocks, col_blocks) = (mt.div_ceil(mc), nt.div_ceil(nc));
+        let rounds = (row_blocks * col_blocks).div_ceil(units) as f64;
+        let bytes = (col_blocks * mt + row_blocks * nt) as f64 * kt as f64 * TILE_BYTES;
+        let job = BLOCK_BATCH_US
+            + (mc * nc) as f64 * (kt as f64 * BLOCK_PAIR_US + BLOCK_OUTPUT_US)
+            + (mc + nc) as f64 * kt as f64 * TILE_BYTES / UNIT_READ_BYTES_PER_US;
+        (bytes / CARD_READ_BYTES_PER_US).max(rounds * job)
+    } else {
+        let blocks = kt.div_ceil(kc) as f64;
+        let rounds = (mt * nt).div_ceil(units) as f64;
+        let tiles = 2.0 * kt as f64 + 2.0 * (blocks - 1.0);
+        let bytes = (mt * nt) as f64 * tiles * TILE_BYTES;
+        let job = blocks * (BLOCK_BATCH_US + BLOCK_OUTPUT_US)
+            + kt as f64 * BLOCK_PAIR_US
+            + tiles * TILE_BYTES / UNIT_READ_BYTES_PER_US;
+        (bytes / CARD_READ_BYTES_PER_US).max(rounds * job)
+    }
+}
+
+/// The largest `kq <= limit` whose chunks a job are even, or the smallest above it.
+fn even_chunks(kt: usize, limit: usize) -> Option<usize> {
+    let even = |kq: usize| kt.div_ceil(kq) % 2 == 0;
+    (1..=limit.min(kt))
+        .rev()
+        .find(|&kq| even(kq))
+        .or_else(|| (limit + 1..=kt).find(|&kq| even(kq)))
+}
+
+/// Whether a block's first and continuing chunks' programs, as they run
+/// ([`matmul::block_stream_programs`]), fit a role's program slot and half the program cache, as
+/// [`k_block_size`] asks of a K block's.
+fn block_stream_programs_fit(
+    layout: &matmul::BlockStreamLayout,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> bool {
+    (0..2).all(|c| {
+        let (roles, loops) = matmul::block_stream_programs(
+            layout,
+            c,
+            layout.tiles,
+            route,
+            fidelity,
+            false,
+            matmul::LiveRows::All,
+        );
+        roles.iter().zip(loops.iter()).all(|(p, l)| {
+            let code = crate::code::Code {
+                ins: p.clone(),
+                loops: l.clone(),
+            };
+            code.stored().is_ok_and(|(words, _)| {
+                words.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                    && crate::program_cache::admitted(words.len())
+            })
+        })
+    })
+}
+
+/// The shape and layout a `[mt, kt, nt]`-tile product runs in under `mode` ([`BlockStream`]) on
+/// `units` units, in the current arena; `None` where it runs another way: [`BlockStream::Off`], a
+/// product of one tile row or one `K` tile, no shape that fits, or under [`BlockStream::Auto`] none
+/// whose modelled time beats `other_us` (the other paths', [`blocked_paths_model`]) by a tenth.
+/// Planned once a process for each question.
+pub(crate) fn block_stream_plan(
+    mode: BlockStream,
+    [mt, kt, nt]: [usize; 3],
+    units: usize,
+    other_us: f64,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> Option<(BlockStreamShape, matmul::BlockStreamLayout)> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    if mode == BlockStream::Off || mt < 2 || kt < 2 {
+        return None;
+    }
+    type Key = (BlockStream, [usize; 3], usize, u64, SrcRoute, Fidelity, u64);
+    type Value = Option<(
+        BlockStreamShape,
+        matmul::BlockStreamLayout,
+        crate::l1::Planned,
+    )>;
+    static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let arena = crate::l1::arena();
+    let key = (
+        mode,
+        [mt, kt, nt],
+        units,
+        other_us.to_bits(),
+        route,
+        fidelity,
+        arena.end,
+    );
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        // What the layout needs of the arena, noted again as a fresh plan would.
+        return v.clone().map(|(s, l, p)| {
+            crate::l1::note_planned(p);
+            (s, l)
+        });
+    }
+    let fits_arena = |[mb, kq, nb]: [usize; 3]| {
+        // Two semaphores pairs' worth of slack past the slots.
+        (2 * (kq * (mb + nb) + mb * nb)) as u64 * TILE_SLOT + 256 <= arena.len()
+    };
+    let mut candidates: Vec<BlockStreamShape> = match mode {
+        BlockStream::Off => Vec::new(),
+        BlockStream::Fixed([mb, kq, nb]) => {
+            // The program cache's variant holds six bits a side ([`push_block_stream_jobs`]).
+            let (mb, nb) = (mb.min(mt).min(63), nb.min(nt).min(63));
+            even_chunks(kt, kq)
+                .and_then(|kq| block_stream_model([mt, kt, nt], [mb, kq, nb], units))
+                .into_iter()
+                .collect()
+        }
+        BlockStream::Auto => {
+            let mut kqs: Vec<usize> = (1..=kt).filter(|&kq| kt.div_ceil(kq) % 2 == 0).collect();
+            // Of the `kq`s with the same chunks a job, the shortest: the same work and reloads
+            // in fewer slots.
+            kqs.dedup_by_key(|kq| kt.div_ceil(*kq));
+            let mut all = Vec::new();
+            for mb in 1..=mt.min(BLOCK_SIDE_MAX) {
+                for nb in 1..=nt.min(BLOCK_SIDE_MAX) {
+                    for &kq in &kqs {
+                        if fits_arena([mb, kq, nb]) {
+                            all.extend(block_stream_model([mt, kt, nt], [mb, kq, nb], units));
+                        }
+                    }
+                }
+            }
+            all
+        }
+    };
+    candidates.sort_by(|a, b| a.us.total_cmp(&b.us).then(a.bytes.total_cmp(&b.bytes)));
+    // The candidates' layouts are measurements: only the chosen one's plan is noted.
+    let chosen = crate::l1::unnoted(|| {
+        candidates
+            .into_iter()
+            .filter(|s| mode != BlockStream::Auto || s.us < 0.9 * other_us)
+            .filter(|s| fits_arena(s.tiles))
+            .take(BLOCK_FIT_TRIES)
+            .find(|s| {
+                matmul::block_stream_layout(s.tiles)
+                    .is_ok_and(|layout| block_stream_programs_fit(&layout, route, fidelity))
+            })
+    });
+    let value = chosen.and_then(|s| {
+        let before = crate::l1::take_planned();
+        let layout = matmul::block_stream_layout(s.tiles);
+        let planned = crate::l1::take_planned();
+        crate::l1::note_planned(before);
+        crate::l1::note_planned(planned);
+        Some((s, layout.ok()?, planned))
+    });
+    if let (BlockStream::Fixed(asked), None) = (mode, &value) {
+        // Once a question (the cache keeps the answer): a sweep must not time the other paths
+        // as if they were the blocked one.
+        eprintln!(
+            "TT_MATMUL_BLOCK={asked:?}: no such blocked product of {mt} x {kt} x {nt} tiles \
+             fits (L1 or a role's program); it runs the other paths"
+        );
+    }
+    cache.lock().unwrap().insert(key, value.clone());
+    value.map(|(s, l, _)| (s, l))
+}
+
+/// The shape [`block_stream_plan`] chooses, without its layout: what a gate or a benchmark reports.
+pub fn block_stream_choice(
+    mode: BlockStream,
+    tiles: [usize; 3],
+    units: usize,
+    other_us: f64,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> Option<BlockStreamShape> {
+    crate::l1::unnoted(|| block_stream_plan(mode, tiles, units, other_us, route, fidelity))
+        .map(|(s, _)| s)
+}
+
+/// A gate's negative control (`step229_block_stream_product`): a blocked product's chunks take
+/// their `K` ranges last first, so each output tile's chain is accumulated out of order. **The
+/// products are wrong** wherever the order matters.
+static PROBE_REVERSE_CHUNKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_REVERSE_CHUNKS`] on or off, process-wide. A gate's control, never a result.
+#[doc(hidden)]
+pub fn probe_reverse_chunks(on: bool) {
+    PROBE_REVERSE_CHUNKS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// One job a block of a K-streamed blocked product ([`BlockStream`], [`matmul::BlockStreamLayout`]):
+/// chunk `c` gathers its `A` and `B` tiles into input half `c % 2`, its kernel computes every output
+/// tile of the block over the chunk's pairs, continuing each from its partial in output set
+/// `1 - c % 2` (none for the first chunk) and packing it into set `c % 2`, and only the last chunk's
+/// are written out. A job's chunks are even, so a unit's batches alternate halves throughout and the
+/// session double-buffers them (`Step::Kernel::half`): the mover reads chunk `c + 1` while the kernel
+/// computes chunk `c`. Each output tile's `K` chain is the same in the same order, through FP32
+/// partials as a K block's are, so bit for bit.
+#[allow(clippy::too_many_arguments)]
+fn push_block_stream_jobs(
+    jobs: &mut Vec<Job>,
+    shape: &BlockStreamShape,
+    layout: &matmul::BlockStreamLayout,
+    [mt, kt, nt]: [usize; 3],
+    m: usize,
+    [ra, rb, rc]: [TensorRef; 3],
+    [a_transposed, b_transposed]: [bool; 2],
+    thin: u32,
+    unpack_b: bool,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) {
+    let [mb, kq, nb] = shape.tiles;
+    let chunks = shape.chunks;
+    debug_assert_eq!(chunks % 2, 0);
+    for i0 in (0..mt).step_by(mb) {
+        let rows = mb.min(mt - i0);
+        let live = matmul::LiveRows::for_job(m, i0, rows);
+        let thin = if i0 + rows == mt { thin } else { 0 };
+        for j0 in (0..nt).step_by(nb) {
+            let cols = nb.min(nt - j0);
+            let mut steps = Vec::with_capacity(3 * chunks);
+            let reversed = PROBE_REVERSE_CHUNKS.load(std::sync::atomic::Ordering::SeqCst);
+            for c in 0..chunks {
+                let range = if reversed { chunks - 1 - c } else { c };
+                let (k0, h) = (range * kq, c % 2);
+                let count = kq.min(kt - k0);
+                let (chunk, _) = layout.chunk(c, [rows, count, cols]);
+                let (mut ar, mut br) = (ra, rb);
+                ar.first += if a_transposed {
+                    (k0 * ar.ct as usize) as u32
+                } else {
+                    k0 as u32
+                };
+                br.first += if b_transposed {
+                    k0 as u32
+                } else {
+                    (k0 * br.ct as usize) as u32
+                };
+                let flags = u32::from(a_transposed)
+                    | u32::from(b_transposed) << 1
+                    | record::gather_rows(thin)
+                    | (count as u32) << 8
+                    | if probing_skip_a() {
+                        record::GATHER_A_RESIDENT
+                    } else {
+                        0
+                    }
+                    | if unpack_b {
+                        record::GATHER_B_UNPACK_TRANSPOSE
+                    } else {
+                        0
+                    };
+                let gather = probe_gather(
+                    Vec::new(),
+                    [
+                        [
+                            record::GATHER,
+                            flags,
+                            chunk.a_at as u32,
+                            chunk.b_at as u32,
+                            i0 as u32,
+                            rows as u32,
+                            j0 as u32,
+                            cols as u32,
+                        ],
+                        ar.encode()[0],
+                        ar.encode()[1],
+                        br.encode()[0],
+                        br.encode()[1],
+                    ],
+                    false,
+                );
+                let (roles, loops) = matmul::block_stream_programs(
+                    layout,
+                    c,
+                    [rows, count, cols],
+                    route,
+                    fidelity,
+                    unpack_b,
+                    live,
+                );
+                let scatter = if c + 1 == chunks {
+                    vec![
+                        [
+                            record::SCATTER,
+                            (layout.out_slot(h, cols, 0, 0) + TILE_DATA) as u32,
+                            TILE_SLOT as u32,
+                            i0 as u32,
+                            rows as u32,
+                            j0 as u32,
+                            cols as u32,
+                            0,
+                        ],
+                        rc.encode()[0],
+                        rc.encode()[1],
+                    ]
+                } else {
+                    Vec::new()
+                };
+                steps.extend([
+                    Step::List {
+                        what: "blocked matmul gather",
+                        entries: gather,
+                    },
+                    Step::Kernel {
+                        roles,
+                        init: layout.init.clone(),
+                        mop: Box::new([None; 3]),
+                        loops,
+                        half: Some(h as u8),
+                    },
+                    Step::List {
+                        what: "blocked matmul scatter",
+                        entries: scatter,
+                    },
+                ]);
+            }
+            jobs.push(steps);
+        }
     }
 }
 
@@ -7098,6 +7591,7 @@ mod tests {
                 handoff: None,
                 second_job: false,
                 balanced_deal: false,
+                block_stream: super::BlockStream::Off,
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,
@@ -7185,6 +7679,7 @@ mod tests {
                         handoff: None,
                         second_job: false,
                         balanced_deal: false,
+                        block_stream: super::BlockStream::Off,
                     },
                 )
                 .unwrap();
@@ -7266,6 +7761,7 @@ mod tests {
                     handoff: None,
                     second_job: false,
                     balanced_deal: false,
+                    block_stream: super::BlockStream::Off,
                 },
                 &[],
                 units,
@@ -7356,6 +7852,7 @@ mod tests {
                     handoff: None,
                     second_job: false,
                     balanced_deal: false,
+                    block_stream: super::BlockStream::Off,
                 },
             )
             .unwrap();
@@ -7437,6 +7934,7 @@ mod tests {
                         handoff: None,
                         second_job: false,
                         balanced_deal: false,
+                        block_stream: super::BlockStream::Off,
                     },
                     &prefetch,
                     spread,
@@ -7548,6 +8046,7 @@ mod tests {
                     handoff: None,
                     second_job: false,
                     balanced_deal: on,
+                    block_stream: super::BlockStream::Off,
                 },
                 &prefetch,
                 spread,
@@ -7690,6 +8189,7 @@ mod tests {
                     handoff: at,
                     second_job: false,
                     balanced_deal: false,
+                    block_stream: super::BlockStream::Off,
                 },
                 &prefetch,
                 spread,
@@ -8108,5 +8608,206 @@ mod overlap_tests {
         assert!(runs(1024, 32, Overlap::Captured));
         // A capture never asks less than a fresh op's one-unit share.
         assert!(pipeline_share(Overlap::Fresh, 1) > pipeline_share(Overlap::Captured, 1));
+    }
+}
+
+#[cfg(test)]
+mod block_stream_tests {
+    use super::*;
+
+    fn reads(mode: BlockStream) -> Reads {
+        Reads {
+            thin: true,
+            resident_a: true,
+            unpack_b: true,
+            packed_a: None,
+            stream_k: false,
+            stream_prefetch: false,
+            prefetch_units: [usize::MAX; 2],
+            handoff: None,
+            second_job: false,
+            balanced_deal: false,
+            block_stream: mode,
+        }
+    }
+
+    fn work(mkn: [usize; 3], units: usize, mode: BlockStream) -> Work {
+        let [m, k, n] = mkn;
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let a = DramTensor::alloc(&mut alloc, m, k).unwrap();
+        let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+        matmul_dram_limited(
+            &mut alloc,
+            &a,
+            false,
+            &b,
+            false,
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            units,
+            false,
+            true,
+            None,
+            reads(mode),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_blocked_job_reads_its_strips_once_and_writes_its_block_once() {
+        // 8 x 16 x 13 tiles, ragged along `N` against 3 x 5 blocks.
+        let [mt, kt, nt] = [8, 16, 13];
+        let [mb, kq, nb] = [3, 4, 5];
+        let work = work(
+            [mt * 32, kt * 32, nt * 32],
+            7,
+            BlockStream::Fixed([mb, kq, nb]),
+        );
+        let (row_blocks, col_blocks) = (mt.div_ceil(mb), nt.div_ceil(nb));
+        assert_eq!(work.jobs.len(), row_blocks * col_blocks);
+        let mut read_tiles = 0;
+        let mut written = 0;
+        for job in &work.jobs {
+            let halves: Vec<u8> = job
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Kernel { half, .. } => *half,
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(halves.len(), kt / kq, "a kernel a chunk");
+            assert_eq!(
+                halves.len() % 2,
+                0,
+                "chunks even, so units alternate halves"
+            );
+            assert!(halves.iter().enumerate().all(|(c, &h)| h as usize == c % 2));
+            let (mut k_read, mut scatters, mut block) = (0, 0, None);
+            for (index, step) in job.iter().enumerate() {
+                let Step::List { entries, .. } = step else {
+                    continue;
+                };
+                for e in entries {
+                    match e[0] {
+                        record::GATHER => {
+                            let count = record::gather_kt(e[1]) as usize;
+                            let [rows, cols] = [e[5] as usize, e[7] as usize];
+                            assert!(block.is_none_or(|b| b == [rows, cols]));
+                            block = Some([rows, cols]);
+                            read_tiles += (rows + cols) * count;
+                            k_read += count;
+                        }
+                        record::SCATTER => {
+                            assert_eq!(index, job.len() - 1, "only the last chunk writes");
+                            written += (e[4] * e[6]) as usize;
+                            scatters += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(k_read, kt, "the job reads its strips over `K` once");
+            assert_eq!(scatters, 1);
+        }
+        assert_eq!(written, mt * nt);
+        assert_eq!(read_tiles, (col_blocks * mt + row_blocks * nt) * kt);
+    }
+
+    #[test]
+    fn off_and_a_single_row_take_the_other_paths() {
+        for (mkn, mode) in [
+            ([256, 512, 512], BlockStream::Off),
+            ([1, 512, 512], BlockStream::Fixed([4, 4, 4])),
+            ([256, 32, 512], BlockStream::Fixed([4, 4, 4])),
+        ] {
+            let work = work(mkn, 8, mode);
+            assert!(work.jobs.iter().flatten().all(|s| !matches!(
+                s,
+                Step::List { what, .. } if what.starts_with("blocked")
+            )));
+        }
+    }
+
+    /// A looped block's programs are one output's block a role, whatever the block
+    /// (`docs/plans/prefill-operand-reuse.md` P1b); unrolled, the unpack role grows ~130 words an
+    /// output.
+    #[test]
+    fn looped_block_programs_do_not_grow_with_the_block() {
+        let stored = |tiles: [usize; 3], c: usize| -> [usize; 3] {
+            let layout = matmul::block_stream_layout(tiles).unwrap();
+            let (code, loops) = matmul::block_stream_kernel_looped(
+                &layout,
+                c,
+                tiles,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                false,
+                matmul::LiveRows::All,
+            )
+            .expect("the loops fit");
+            std::array::from_fn(|t| {
+                crate::code::Code {
+                    ins: code[t].clone(),
+                    loops: loops[t].clone(),
+                }
+                .stored()
+                .unwrap()
+                .0
+                .len()
+            })
+        };
+        for c in 0..2 {
+            let small = stored([2, 2, 2], c);
+            let large = stored([8, 2, 8], c);
+            assert_eq!(small, large, "chunk {c}: the same words, more repeats");
+            assert!(small.iter().all(|&w| w < 400), "chunk {c}: {small:?} words");
+        }
+    }
+
+    /// The model's choices for SmolLM2-1.7B's prefill products on 120 units, against its model of
+    /// the other paths. Printed for the plan's record; the bound is the model's, not a measurement.
+    #[test]
+    fn the_17b_prefill_products_plan_blocks_that_read_less() {
+        let units = 120;
+        let cases = [
+            ("gate|up", [2048, 16384]),
+            ("down", [8192, 2048]),
+            ("qkv", [2048, 3072]),
+            ("o", [2048, 2048]),
+        ];
+        for m in [64, 512, 2048] {
+            for (name, [k, n]) in cases {
+                let tiles = [m / 32, k / 32, n / 32];
+                let (shape, _) = matmul::plan_floor(
+                    [m, k, n],
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    Staging::Slots,
+                );
+                let [mc, kc, nc] = shape.unwrap().tiles;
+                let kc = if kc < tiles[1] {
+                    k_block_size(kc, SrcRoute::Tf32FromFp32, Fidelity::HiFi4).unwrap()
+                } else {
+                    kc
+                };
+                let [mc, nc] = blocks([tiles[0], tiles[2]], [mc, nc], units);
+                let other = blocked_paths_model(tiles, [mc, kc, nc], units);
+                let choice = block_stream_choice(
+                    BlockStream::Auto,
+                    tiles,
+                    units,
+                    other,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                );
+                println!(
+                    "m {m} {name}: other [{mc}, {kc}, {nc}] {other:.0} us; blocked {choice:?}"
+                );
+                if m >= 512 {
+                    let s = choice.expect("a long prefill's products block");
+                    assert!(s.us < other);
+                }
+            }
+        }
     }
 }

@@ -860,6 +860,455 @@ pub(crate) fn k_stream_layout(
     })
 }
 
+/// The L1 of a 2-D blocked product streamed over `K` ([`block_stream_layout`],
+/// `docs/plans/prefill-operand-reuse.md`): a job's `mb x nb` output tiles, its `K` in chunks of at
+/// most `kq` tiles. Chunk `c` gathers `A`'s `mb x kq` tiles and `B`'s `kq x nb` into input half
+/// `c % 2`, reloads each output's partial from output set `1 - c % 2` (none for the first chunk)
+/// and packs it into set `c % 2`: [`StreamLayout`]'s halves, for a block. The sets alternate as
+/// the inputs do because a unit's chunks are double-buffered and a chunk's gather is only ordered
+/// after the scatter two chunks back, so a partial packed in place could land on slots the last
+/// job's final scatter still reads.
+#[derive(Clone, Debug)]
+pub(crate) struct BlockStreamLayout {
+    /// `[mb, kq, nb]`: the block's output tiles and the longest chunk.
+    pub tiles: [usize; 3],
+    pub a_at: [u64; 2],
+    pub b_at: [u64; 2],
+    /// Each set's first output slot (its first byte: the packer writes past the header).
+    pub out: [u64; 2],
+    pub sems: MatmulSemaphores,
+    pub cleared: Semaphore,
+    pub loaded: Semaphore,
+    pub init: Vec<crate::runtime::SemaphoreInit>,
+}
+
+impl BlockStreamLayout {
+    /// Output tile `(i, j)` of a block `cols` wide: its slot in set `h`, header included, row-major
+    /// as `record::SCATTER` writes a block out.
+    pub fn out_slot(&self, h: usize, cols: usize, i: usize, j: usize) -> u64 {
+        self.out[h] + (i * cols + j) as u64 * tt_isa::dm::TILE_SLOT
+    }
+
+    /// Chunk `c` of a block of `rows x cols` output tiles, its `count` `K` tiles, as the
+    /// gather stages it (`record::GATHER`: `A` tile `(i, kk)` at `a_at + (i count + kk)`
+    /// slots, `B` tile `(kk, j)` at `b_at + (kk cols + j)`): its layout, its outputs row-major,
+    /// and their priors when it continues.
+    pub fn chunk(&self, c: usize, [rows, count, cols]: [usize; 3]) -> (Layout, Option<Vec<u64>>) {
+        use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+        let [mb, kq, nb] = self.tiles;
+        assert!(
+            (1..=mb).contains(&rows) && (1..=kq).contains(&count) && (1..=nb).contains(&cols),
+            "a chunk of {rows} x {count} x {cols} tiles in a {mb} x {kq} x {nb} layout"
+        );
+        let h = c % 2;
+        let (a_at, b_at) = (self.a_at[h], self.b_at[h]);
+        let mut outputs = Vec::with_capacity(rows * cols);
+        let mut priors = Vec::with_capacity(rows * cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                let pairs = (0..count)
+                    .map(|kk| {
+                        (
+                            a_at + (i * count + kk) as u64 * TILE_SLOT,
+                            b_at + (kk * cols + j) as u64 * TILE_SLOT,
+                        )
+                    })
+                    .collect();
+                outputs.push(OutputTile {
+                    pairs,
+                    out: self.out_slot(h, cols, i, j) + TILE_DATA,
+                });
+                priors.push(self.out_slot(1 - h, cols, i, j));
+            }
+        }
+        let layout = Layout {
+            a_at,
+            b_at,
+            outputs,
+            sems: self.sems,
+            init: self.init.clone(),
+        };
+        (layout, (c > 0).then_some(priors))
+    }
+}
+
+/// [`BlockStreamLayout`] for `[mb, kq, nb]`, planned in the current arena (`crate::l1::arena`).
+pub(crate) fn block_stream_layout(
+    [mb, kq, nb]: [usize; 3],
+) -> Result<BlockStreamLayout, crate::runtime::RunError> {
+    use crate::l1::{Endpoint, PlanError, Requirements};
+    use tt_isa::dm::TILE_SLOT;
+    let mut req = Requirements::new(1);
+    let mut ring = |name, pages: usize, from, to| {
+        req.cb(
+            name,
+            TILE_SLOT,
+            pages as u32,
+            tt_isa::dram::ALIGN,
+            from,
+            to,
+            0..1,
+        )
+    };
+    let a = [
+        ring(
+            "matmul A, half 0",
+            mb * kq,
+            Endpoint::Mover,
+            Endpoint::Unpack,
+        ),
+        ring(
+            "matmul A, half 1",
+            mb * kq,
+            Endpoint::Mover,
+            Endpoint::Unpack,
+        ),
+    ];
+    let b = [
+        ring(
+            "matmul B, half 0",
+            kq * nb,
+            Endpoint::Mover,
+            Endpoint::Unpack,
+        ),
+        ring(
+            "matmul B, half 1",
+            kq * nb,
+            Endpoint::Mover,
+            Endpoint::Unpack,
+        ),
+    ];
+    let out = [
+        ring(
+            "matmul out, set 0",
+            mb * nb,
+            Endpoint::Pack,
+            Endpoint::Mover,
+        ),
+        ring(
+            "matmul out, set 1",
+            mb * nb,
+            Endpoint::Pack,
+            Endpoint::Mover,
+        ),
+    ];
+    let sems = MatmulSemaphores::declare(&mut req, 0..1);
+    let cleared = req.semaphore("matmul cleared", 0, 0..1);
+    let loaded = req.semaphore("matmul loaded", 0, 0..1);
+    let slots = 2 * (kq * (mb + nb) + mb * nb);
+    let plan = req.plan(crate::l1::arena()).map_err(|e| match e {
+        PlanError::DoesNotFit { .. } | PlanError::TooManyPages { .. } => {
+            crate::runtime::RunError::DoesNotFit {
+                what: "a K-streamed blocked matmul",
+                bytes: slots as u64 * TILE_SLOT,
+                limit: crate::l1::arena().len(),
+            }
+        }
+        e => panic!("the blocked matmul's own requirements are invalid: {e}"),
+    })?;
+    Ok(BlockStreamLayout {
+        tiles: [mb, kq, nb],
+        a_at: a.map(|a| plan.addr(a)),
+        b_at: b.map(|b| plan.addr(b)),
+        out: out.map(|o| plan.addr(o)),
+        sems: MatmulSemaphores::planned(&plan, sems),
+        cleared: plan.semaphore(cleared),
+        loaded: plan.semaphore(loaded),
+        init: plan.semaphore_init(),
+    })
+}
+
+/// The three role programs of a [`BlockStreamLayout`] chunk: every output tile of the block over
+/// the chunk's pairs, continuing from `priors` when given.
+pub(crate) fn block_stream_kernel(
+    layout: &Layout,
+    priors: Option<&[u64]>,
+    reload: (Semaphore, Semaphore),
+    route: SrcRoute,
+    fidelity: Fidelity,
+    b_transposed: bool,
+    live: LiveRows,
+) -> [Vec<Instruction>; 3] {
+    let (in_fmt, out_fmt) = route.formats();
+    let items = matmul_items_continuing(
+        &layout.outputs,
+        layout.sems,
+        in_fmt,
+        out_fmt,
+        fidelity,
+        priors.map(|priors| Continuation {
+            priors,
+            cleared: reload.0,
+            loaded: reload.1,
+        }),
+        b_transposed,
+        live,
+    );
+    items.map(|items| crate::loops::lower_with(&items, false).words)
+}
+
+/// GPRs the looped block kernel ([`block_stream_kernel_looped`]) steps its addresses with, beside
+/// [`A_BASE_GPR`]..[`B_STRIDE_GPR`]: a slot, `A`'s row of the block and its step, `B`'s column, the
+/// prior partial, zero, and the packer's output.
+const SLOT_GPR: u32 = 28;
+const A_ROW_GPR: u32 = 29;
+const A_ROW_STEP_GPR: u32 = 30;
+const B_COL_GPR: u32 = 31;
+const PRIOR_GPR: u32 = 40;
+const ZERO_GPR: u32 = 41;
+const OUT_GPR: u32 = 42;
+
+/// [`block_stream_kernel`] with each output tile's block of each role stored once and repeated
+/// by the role runner (`crate::code::Loop`; `docs/plans/prefill-operand-reuse.md` P1b): its
+/// addresses -- `A`'s row and `B`'s column, the prior partial, the output -- stepped in GPRs, so a
+/// role's program does not grow with the block. The unpack role repeats an output a column inside
+/// a row; the math and pack roles an output a tile. Every output takes its pairs in the same order
+/// from the same slots, so the products are [`block_stream_kernel`]'s. `None` where the loops do not
+/// fit the runner's header.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_stream_kernel_looped(
+    layout: &BlockStreamLayout,
+    c: usize,
+    [rows, count, cols]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    b_transposed: bool,
+    live: LiveRows,
+) -> Option<crate::code::LoopedRoles> {
+    use crate::code::Loop;
+    use crate::datapath::{pack_dest_units, tile_base_units as units};
+    use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+    let (in_fmt, out_fmt) = route.formats();
+    let h = c % 2;
+    let continuing = c > 0;
+    let (a_at, b_at) = (layout.a_at[h], layout.b_at[h]);
+    let slot = units(TILE_SLOT);
+    let set =
+        |p: &mut Vec<Instruction>, gpr: u32, v: u32| p.extend(backend::set_gpr(gpr, v).unwrap());
+    let lowered = |items: Vec<Item>| crate::loops::lower_with(&items, false).words;
+    let PairCode {
+        prelude,
+        words,
+        ub,
+        pair_math,
+    } = pair_code((a_at, b_at), in_fmt, out_fmt, fidelity, b_transposed, live);
+
+    // Unpack: the strides `gpr_step` adds, and each stepped GPR a step before its first use (the
+    // blocks add first).
+    let mut unpack = prelude;
+    set(&mut unpack, A_STRIDE_GPR, slot);
+    set(&mut unpack, B_STRIDE_GPR, units(cols as u64 * TILE_SLOT));
+    set(&mut unpack, SLOT_GPR, slot);
+    set(&mut unpack, ZERO_GPR, 0);
+    let a_row_step = units(count as u64 * TILE_SLOT);
+    set(&mut unpack, A_ROW_STEP_GPR, a_row_step);
+    set(&mut unpack, A_ROW_GPR, units(a_at) - a_row_step);
+    let prior0 = layout.out_slot(1 - h, cols, 0, 0);
+    if continuing {
+        set(&mut unpack, PRIOR_GPR, units(prior0) - slot);
+    }
+    let row_block = unpack.len() as u32;
+    set(&mut unpack, B_COL_GPR, units(b_at) - slot);
+    unpack.push(encode::adddmareg(A_ROW_GPR, A_ROW_STEP_GPR, A_ROW_GPR).unwrap());
+    let col_block = unpack.len() as u32;
+    if continuing {
+        unpack.extend(sync::take(layout.cleared, Before::UNPACKER));
+        unpack.extend(crate::datapath::thread_config());
+        unpack.extend(crate::datapath::clear_unpacker0_adcs());
+        let mut prior_words = ConfigWords::new();
+        // Any prior: the base is the GPR's, written below.
+        crate::datapath::tile_unpack_config(&mut prior_words, prior0);
+        unpack.extend(config_program(&prior_words));
+        unpack.extend(crate::datapath::unpack_datums_to_dst_gpr(
+            PRIOR_GPR,
+            Some(SLOT_GPR),
+            crate::datapath::TILE_DATUMS,
+            0,
+        ));
+        unpack.extend(sync::post_after(Unit::Unpacker0, layout.loaded));
+        // The whole Src configuration again: `UnpackToDst` leaves different state behind.
+        unpack.extend(src_thread_config());
+        unpack.extend(crate::datapath::clear_unpacker0_adcs());
+        unpack.extend(config_program(&words));
+        for u in [Unpacker::SrcA, Unpacker::SrcB] {
+            unpack.push(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1));
+        }
+    }
+    // This output's first pair: `A`'s row and `B`'s column, as `gpr_retarget` sets them.
+    unpack.push(encode::adddmareg(B_COL_GPR, SLOT_GPR, B_COL_GPR).unwrap());
+    unpack.push(backend::wait_for_unpacker0(Before::CONFIG).unwrap());
+    unpack.push(backend::wait_for_unpacker1(Before::CONFIG).unwrap());
+    // `ADDDMAREG` names its result first.
+    unpack.push(encode::adddmareg(A_BASE_GPR, ZERO_GPR, A_ROW_GPR).unwrap());
+    unpack.push(encode::adddmareg(B_BASE_GPR, ZERO_GPR, B_COL_GPR).unwrap());
+    unpack.extend(write_bases());
+    let body: Vec<Item> = ub.iter().copied().chain(gpr_step()).map(Item::I).collect();
+    unpack.extend(lowered(vec![Item::Repeat {
+        times: count as u32,
+        body,
+    }]));
+    let end = unpack.len() as u32;
+    let mut unpack_loops = vec![Loop {
+        start: col_block,
+        len: end - col_block,
+        count: cols as u32,
+    }];
+    if rows > 1 {
+        unpack_loops.push(Loop {
+            start: row_block,
+            len: end - row_block,
+            count: rows as u32,
+        });
+    }
+    unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
+    unpack.push(backend::wait_for_unpacker1(Before::EVERYTHING).unwrap());
+
+    // Math: the same words every output.
+    let mut math = math_prelude();
+    let block = math.len() as u32;
+    math.extend(sync::take(layout.sems.free, Before::MATRIX));
+    math.push(encode::zeroacc(3, 0, 0, 0).unwrap());
+    if continuing {
+        math.extend(sync::post_after(Unit::Matrix, layout.cleared));
+        math.extend(sync::take(layout.loaded, Before::MATRIX));
+    }
+    math.extend(lowered(vec![Item::Repeat {
+        times: count as u32,
+        body: pair_math,
+    }]));
+    math.extend(sync::post_after(Unit::Matrix, layout.sems.ready));
+    let outputs = (rows * cols) as u32;
+    let math_loops = vec![Loop {
+        start: block,
+        len: math.len() as u32 - block,
+        count: outputs,
+    }];
+
+    // Pack: the whole configuration once, then each output's destination from its GPR.
+    let out0 = layout.out_slot(h, cols, 0, 0) + TILE_DATA;
+    let mut pw = ConfigWords::new();
+    crate::datapath::pack_config(&mut pw, out0);
+    let mut pack = config_program(&pw);
+    set(&mut pack, SLOT_GPR, slot);
+    set(&mut pack, OUT_GPR, pack_dest_units(out0) - slot);
+    let block = pack.len() as u32;
+    pack.push(backend::wait_for_packer(Before::CONFIG).unwrap());
+    pack.push(encode::adddmareg(OUT_GPR, SLOT_GPR, OUT_GPR).unwrap());
+    pack.push(crate::datapath::gpr_settled());
+    pack.push(
+        backend::write_word(
+            OUT_GPR,
+            tt_isa::cfg::generated::thcon::THCON_SEC0_REG1_L1_Dest_addr.addr32(),
+        )
+        .unwrap(),
+    );
+    pack.push(tt_isa::sfpu::nop());
+    pack.push(
+        backend::stallwait(
+            backend::block::PACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+    );
+    pack.extend(sync::take(layout.sems.ready, Before::PACKER));
+    pack.extend(lowered(crate::datapath::pack_rows_items(TILE_DST_ROWS)));
+    pack.extend(sync::post_after(Unit::Packer, layout.sems.free));
+    let pack_loops = vec![Loop {
+        start: block,
+        len: pack.len() as u32 - block,
+        count: outputs,
+    }];
+    pack.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
+
+    let code = [unpack, math, pack];
+    let loops = [unpack_loops, math_loops, pack_loops];
+    let fits = (0..3).all(|t| crate::code::check(&loops[t], code[t].len() as u32).is_ok());
+    fits.then_some((code, loops))
+}
+
+/// Whether a blocked product's roles repeat an output's block ([`block_stream_kernel_looped`]) rather
+/// than write every output out ([`block_stream_kernel`]): on by default.
+static BLOCK_LOOPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn [`block_stream_kernel_looped`] on or off, process-wide (a gate's comparison). The program
+/// cache keys on it.
+pub fn set_block_loops(on: bool) {
+    BLOCK_LOOPS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A kernel's three role programs and their block repeats, shared.
+pub(crate) type SharedLoopedRoles = (
+    std::sync::Arc<[Vec<Instruction>; 3]>,
+    std::sync::Arc<[Vec<crate::code::Loop>; 3]>,
+);
+
+/// A blocked product's chunk's programs and their loops: [`block_stream_kernel_looped`]'s where
+/// [`set_block_loops`] has them on and they fit, else [`block_stream_kernel`]'s. Built once a process
+/// for each chunk shape, half, layout and arena.
+pub(crate) fn block_stream_programs(
+    layout: &BlockStreamLayout,
+    c: usize,
+    tiles: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    b_transposed: bool,
+    live: LiveRows,
+) -> SharedLoopedRoles {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Key = (
+        [usize; 3],
+        [usize; 3],
+        usize,
+        bool,
+        SrcRoute,
+        Fidelity,
+        bool,
+        LiveRows,
+        u64,
+        MatmulSemaphores,
+        bool,
+    );
+    static CACHE: OnceLock<Mutex<HashMap<Key, SharedLoopedRoles>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let looped = BLOCK_LOOPS.load(std::sync::atomic::Ordering::Relaxed);
+    let key = (
+        tiles,
+        layout.tiles,
+        c % 2,
+        c > 0,
+        route,
+        fidelity,
+        b_transposed,
+        live,
+        crate::l1::arena().end,
+        layout.sems,
+        looped,
+    );
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return v.clone();
+    }
+    let built = looped
+        .then(|| block_stream_kernel_looped(layout, c, tiles, route, fidelity, b_transposed, live))
+        .flatten()
+        .unwrap_or_else(|| {
+            let (l, priors) = layout.chunk(c, tiles);
+            let roles = block_stream_kernel(
+                &l,
+                priors.as_deref(),
+                (layout.cleared, layout.loaded),
+                route,
+                fidelity,
+                b_transposed,
+                live,
+            );
+            (roles, Default::default())
+        });
+    let value = (Arc::new(built.0), Arc::new(built.1));
+    cache.lock().unwrap().insert(key, value.clone());
+    value
+}
+
 /// First/continuation programs share the Matrix Unit's original product order.
 pub(crate) fn k_block_kernel(
     layout: &Layout,
@@ -937,11 +1386,60 @@ pub(crate) fn matmul_items_reloading(
     b_transposed: bool,
     live: LiveRows,
 ) -> [Vec<Item>; 3] {
-    assert!(
-        outputs.iter().all(|o| !o.pairs.is_empty()),
-        "every output tile needs at least one operand pair"
-    );
-    let (a0, b0) = outputs[0].pairs[0];
+    if reload.is_some() {
+        assert_eq!(
+            outputs.len(),
+            1,
+            "a K block's continuation is one output tile"
+        );
+    }
+    let priors = reload.map(|r| [r.prior]);
+    matmul_items_continuing(
+        outputs,
+        sems,
+        in_fmt,
+        out_fmt,
+        fidelity,
+        reload.zip(priors.as_ref()).map(|(r, p)| Continuation {
+            priors: p,
+            cleared: r.cleared,
+            loaded: r.loaded,
+        }),
+        b_transposed,
+        live,
+    )
+}
+
+/// Each output tile's prior FP32 partial, in `outputs`' order, and the reset/load handshake a
+/// continuation reloads them through ([`Reload`] for a block of outputs).
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Continuation<'a> {
+    pub priors: &'a [u64],
+    pub cleared: Semaphore,
+    pub loaded: Semaphore,
+}
+
+/// What every tile pair of a product shares, built once: the unpack role's prelude and the `Src`
+/// configuration it writes (`words`, which a reload writes again after unpacking a prior to
+/// `Dst`), the pair's face block on the unpack role (`ub`, 24 words: the replay buffer holds it with
+/// [`gpr_step`]), and the pair on the math role.
+struct PairCode {
+    prelude: Vec<Instruction>,
+    words: ConfigWords,
+    ub: Vec<Instruction>,
+    pair_math: Vec<Item>,
+}
+
+/// [`PairCode`] for a product whose first pair is `(a0, b0)` (the bases its configuration names
+/// until a retarget moves them).
+fn pair_code(
+    (a0, b0): (u64, u64),
+    in_fmt: L1Format,
+    out_fmt: u32,
+    fidelity: Fidelity,
+    b_transposed: bool,
+    live: LiveRows,
+) -> PairCode {
     let mut prelude = src_thread_config();
     let mut words = ConfigWords::new();
     let descriptor = tile_descriptor(in_fmt);
@@ -958,12 +1456,6 @@ pub(crate) fn matmul_items_reloading(
     for u in [Unpacker::SrcA, Unpacker::SrcB] {
         prelude.push(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1));
     }
-    fn i(v: impl IntoIterator<Item = Instruction>) -> impl Iterator<Item = Item> {
-        v.into_iter().map(Item::I)
-    }
-    let mut unpack: Vec<Item> = i(prelude).collect();
-    let mut math: Vec<Item> = i(math_prelude()).collect();
-    let mut pack: Vec<Item> = Vec::new();
     let base = encode::UnpacrRegular::ZERO.multi_context_mode(1);
     let phases = fidelity.phases();
     let (face_rows, halves) = (live.face_rows(), live.halves());
@@ -1059,28 +1551,79 @@ pub(crate) fn matmul_items_reloading(
             Item::I(reset),
             Item::Repeat {
                 times: face_rows,
-                body: i(unit.iter().copied()).collect(),
+                body: unit.iter().copied().map(Item::I).collect(),
             },
         ]
     };
+    PairCode {
+        prelude,
+        words,
+        ub,
+        pair_math,
+    }
+}
+
+/// [`matmul_items_reloading`] for any number of outputs, each continuing from its own prior when
+/// `reload` is given: `Dst` is cleared before each output after the first (the first relies on
+/// [`math_prelude`]'s clear, as a K block's one output does), then the output's prior is loaded
+/// and its pairs accumulate onto it. One output in `Dst` at a time, as without a reload.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_items_continuing(
+    outputs: &[OutputTile],
+    sems: MatmulSemaphores,
+    in_fmt: L1Format,
+    out_fmt: u32,
+    fidelity: Fidelity,
+    reload: Option<Continuation<'_>>,
+    b_transposed: bool,
+    live: LiveRows,
+) -> [Vec<Item>; 3] {
+    if let Some(r) = reload {
+        assert_eq!(
+            r.priors.len(),
+            outputs.len(),
+            "a prior for every output tile"
+        );
+    }
+    assert!(
+        outputs.iter().all(|o| !o.pairs.is_empty()),
+        "every output tile needs at least one operand pair"
+    );
+    let (a0, b0) = outputs[0].pairs[0];
+    let PairCode {
+        prelude,
+        words,
+        ub,
+        pair_math,
+    } = pair_code((a0, b0), in_fmt, out_fmt, fidelity, b_transposed, live);
+    fn i(v: impl IntoIterator<Item = Instruction>) -> impl Iterator<Item = Item> {
+        v.into_iter().map(Item::I)
+    }
+    let mut unpack: Vec<Item> = i(prelude).collect();
+    let mut math: Vec<Item> = i(math_prelude()).collect();
+    let mut pack: Vec<Item> = Vec::new();
     let mut current = (a0, b0);
-    for output in outputs {
+    for (o, output) in outputs.iter().enumerate() {
         math.extend(i(sync::take(sems.free, Before::MATRIX)));
         // (mode, use_dst32b, addr_mod, imm10): all of `Dst`.
         if let Some(reload) = reload {
-            // math_prelude clears Dst before allowing T0 to load the prior.
-            // Each continuation contains one output tile, so no later clear
-            // can erase it. Both handshakes finish back at zero.
-            assert_eq!(outputs.len(), 1);
+            // math_prelude clears Dst before allowing T0 to load the first prior; each later
+            // output's clear comes once the packer has read the one before (`sems.free`), and
+            // before T0 loads its prior, so no clear erases a loaded prior. Both handshakes
+            // finish back at zero.
+            let prior = reload.priors[o];
+            if o > 0 {
+                math.push(Item::I(encode::zeroacc(3, 0, 0, 0).unwrap()));
+            }
             math.extend(i(sync::post_after(Unit::Matrix, reload.cleared)));
             math.extend(i(sync::take(reload.loaded, Before::MATRIX)));
             unpack.extend(i(sync::take(reload.cleared, Before::UNPACKER)));
             unpack.extend(i(crate::datapath::thread_config()));
             unpack.extend(i(crate::datapath::clear_unpacker0_adcs()));
             let mut prior_words = ConfigWords::new();
-            crate::datapath::tile_unpack_config(&mut prior_words, reload.prior);
+            crate::datapath::tile_unpack_config(&mut prior_words, prior);
             unpack.extend(i(config_program(&prior_words)));
-            unpack.extend(i(crate::datapath::unpack_tile_to_dst(reload.prior, 0)));
+            unpack.extend(i(crate::datapath::unpack_tile_to_dst(prior, 0)));
             unpack.extend(i(sync::post_after(Unit::Unpacker0, reload.loaded)));
             // Restore the complete Src configuration, including descriptor
             // words and ADCs; UnpackToDst leaves different state behind.

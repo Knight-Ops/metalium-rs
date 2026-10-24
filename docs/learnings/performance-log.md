@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Prefill products that reuse their operands](#prefill-products-that-reuse-their-operands-2026-10-24-card-0) | 2026-10-24 | 2-D blocked products, `K` streamed, partials in L1 (the default since; `TT_MATMUL_BLOCK=off` turns it off): the 1.7B's prefill products **2.9-3.6x** at `m` >= 512 (`gate\|up` 5.21 -> **18.23** TFLOPS at `m` = 2,048), compute-bound at ~0.4-0.6 us a K-tile pair; its prefill at 8,192 positions with chunks of 512 **1.24 / 6.81 / 18.33 -> 0.48 / 3.70 / 12.59 s** (1,000 / 4,000 / 7,992 tokens) |
 | [GDDR reused within a capture](#gddr-reused-within-a-capture-2026-10-24-card-0) | 2026-10-24 | 1.7B at 8,192 positions, chunk captures reusing their intermediates' GDDR (the default since; `TT_CHUNK_REUSE=0` turns it off): GDDR free after the build **2.10 -> 17.78 GB**, the build 226 -> 127 s, prefill unchanged; chunks of 512 now capture: prefill 1,000 / 7,992 tokens 1,236 / 18,323 -> **1,011 / 16,877 ms** |
 | [How much of the card's compute a long prefill uses](#how-much-of-the-cards-compute-a-long-prefill-uses-2026-10-24-card-0) | 2026-10-24 | 1.7B prefill at 8,192 positions: **1.1-1.7% of the ~166 TFLOPS derived peak** (1.87 TFLOPS over a 7,992-token prompt); a 64-token chunk's projections 3.73 TFLOPS with the Matrix Unit busy 4% of their span; products plateau at **5.2 TFLOPS** (`gate\|up`) and 2.8 (`down`) even at `m` = 2,048, GDDR-bound at ~400 GB/s: larger chunks do not raise the rate, operand reuse does |
 | [A long prompt's prefill: chunks attend to a prefix, the GQA mask read as a block](#a-long-prompts-prefill-chunks-attend-to-a-prefix-the-gqa-mask-read-as-a-block-2026-10-24-card-0) | 2026-10-24 | 1.7B, 8,192-position cache, chunks of 64: prefill of 1,000 / 4,000 / 7,992 tokens **4.69 / 18.46 / 36.63 s -> 1.24 / 6.81 / 18.33 s** (213-218 -> 809 / 587 / 436 tokens/s); the mask's row gather alone was 36% of a chunk; decode unchanged |
@@ -358,6 +359,56 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Prefill products that reuse their operands (2026-10-24, card 0)
+
+[prefill-operand-reuse.md](../plans/prefill-operand-reuse.md) Step 1: a job owns an `mb x nb` block of output tiles and
+streams `K` in chunks of `kq` tiles, its FP32 partials in L1 between chunks, each chunk's reads under the chunk before's
+compute; each output's block of each role is stored once and repeated by the runner (P1b). Bit for bit the other
+paths (`step229`, ttsim and card 0, `1792855491`, `1792857062`). All runs release, every tile, TF32/HiFi4.
+
+**The products** (`matmul_throughput`, `TT_MATMUL_SHAPES`, traced replay, 2 warmups and 7 samples; each replay equal to
+the eager product, which equals exact integer arithmetic on a grid). Off `1792857503`, `TT_MATMUL_BLOCK=auto`
+`1792857489`, same build:
+
+| Product | Off | Blocked | GDDR read, blocked |
+|---|--:|--:|--:|
+| `gate\|up` `[64,2048]@[2048,16384]` | 3.40 TFLOPS | **5.01** | 194 GB/s |
+| `gate\|up` `[512,2048]@[2048,16384]` | 4.89 | **14.06** | 211 |
+| `gate\|up` `[2048,2048]@[2048,16384]` | 5.21 | **18.23** | 339 |
+| `down` `[64,8192]@[8192,2048]` | 1.57 | **2.23** | 142 |
+| `down` `[512,8192]@[8192,2048]` | 2.73 | **7.07** | 225 |
+| `down` `[2048,8192]@[8192,2048]` | 2.80 | **10.06** | 209 |
+| `qkv` `[512,2048]@[2048,3072]` | 3.15 | **5.86** | 171 |
+| `o` `[512,2048]@[2048,2048]` | 2.69 | **4.21** | 134 |
+
+- **No longer GDDR-bound.** Fixed blocks on the `m` = 2048 products (`1792855574`-`1792855639`, unrolled;
+  `1792857227`-`1792857286`, looped): blocks of 24-64 outputs read 120-340 GB/s and are compute-bound (8x8 `gate|up`
+  15.48 TFLOPS); blocks of 8-12 read ~400-440 GB/s and are read-bound (`[2,16,4]` 9.20).
+- **What a pair and a reload cost** (a `4 x 6` block of `down` at `m` = 2048, `kq` 1 / 2 / 4 / 8: 6.77 / 7.80 / 8.12 /
+  8.66 TFLOPS, 5.07 / 4.40 / 4.23 / 3.97 ms a unit's two jobs): **~3-5 us a chunk** for 24 outputs' reloads and packs
+  and its batch (~0.15 us an output), and **~0.4-0.6 us a K-tile pair** (540-810 cycles against HiFi4's 64). The pair
+  is what binds now: ~16-20 TFLOPS on 120 units.
+- **Looped and unrolled programs run alike** (`[6,5,6]` 14.55 against 14.47 TFLOPS); looped, a role is under 400 words
+  whatever the block, unrolled the unpack role is ~130 words an output (8x8 does not fit `PROGRAM_MAX`).
+
+**The 1.7B's prefill** (`traced_generation_stream_ceiling`, `TT_GEN_MAX_LEN=8192`, `TT_GEN_PROMPTS=1000,4000,7992`,
+`TT_GEN_NEW=4`, 2 warmups and 3 samples, host time of the prompt's chunks and the first token):
+
+| | Before (`1792809505`, chunks of 64) | Chunks of 512, off (`1792856587`) | Chunks of 64, blocked (`1792857529`) | Chunks of 512, blocked (`1792858000`) |
+|---|--:|--:|--:|--:|
+| 1,000 tokens | 1,236 ms | 1,012 | 853 | **477** (2,095 tokens/s) |
+| 4,000 tokens | 6,812 | 5,845 | 5,289 | **3,702** (1,081) |
+| 7,992 tokens | 18,327 | 16,879 | 15,290 | **12,588** (635) |
+| Build, first / second | 213.5 / 69.3 s | 181.1 / 112.5 | 127.8 / 58.1 | 174.2 / 104.2 |
+
+- **Chunks of 512 now pay:** a chunk's products reuse their operands, so a larger `m` buys rate (`m` 64 -> 512:
+  `gate|up` 5.0 -> 14.1 TFLOPS) where before it bought only fewer chunks.
+- **Chunks of 512 need the looped kernel:** unrolled, the capture was refused ("a list's programs do not fit the
+  program cache ... the list needs 54176 bytes in 9 programs; the capture in progress holds 133712 of its 245760
+  bytes", `1792856420`).
+- **What is left at 7,992 tokens** is mostly attention over the prefix (the softmax's passes over the scores: 42% of a
+  64-token chunk at 8,192 positions before, `1792815504`): the fused long-context softmax is the next lever.
 
 ## GDDR reused within a capture (2026-10-24, card 0)
 

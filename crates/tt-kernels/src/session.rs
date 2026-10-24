@@ -765,6 +765,8 @@ pub struct Session<T: Transport> {
     prefetch_second_job: bool,
     /// [`Session::set_balanced_deal`].
     balanced_deal: bool,
+    /// [`Session::set_block_stream`].
+    block_stream: tensor::BlockStream,
     /// [`Session::set_stream_prefetch_units`].
     stream_prefetch_units: usize,
     /// [`Session::set_stream_handoff`]: the chunk a handed column is handed at (`Some(0)`: half).
@@ -2465,6 +2467,8 @@ impl<T: Transport> Session<T> {
             stream_prefetch: std::env::var("TT_STREAM_PREFETCH").map_or(true, |v| v != "0"),
             prefetch_second_job: std::env::var("TT_PREFETCH_SECOND").is_ok_and(|v| v == "1"),
             balanced_deal: std::env::var("TT_BALANCED_DEAL").is_ok_and(|v| v == "1"),
+            // `TT_MATMUL_BLOCK=off|auto|mb,kq,nb` (`docs/plans/prefill-operand-reuse.md`).
+            block_stream: tensor::BlockStream::from_env(),
             // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             stream_prefetch_units: units_from_env("TT_STREAM_PREFETCH_UNITS", PREFETCH_UNITS),
             // `TT_STREAM_HANDOFF=1` turns it on; `TT_STREAM_HANDOFF_AT=<h>` hands at chunk `h`
@@ -7766,6 +7770,7 @@ impl<T: Transport> Session<T> {
         });
         let second_job = self.prefetch_second_job;
         let balanced_deal = self.balanced_deal;
+        let block_stream = self.block_stream;
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -7792,6 +7797,7 @@ impl<T: Transport> Session<T> {
                         handoff,
                         second_job,
                         balanced_deal,
+                        block_stream,
                     },
                     &prefetch,
                     spread,
@@ -8489,6 +8495,14 @@ impl<T: Transport> Session<T> {
     /// kernel starts: the gates compare the two.
     pub fn set_streamed_k(&mut self, on: bool) {
         self.streamed_k = on;
+    }
+
+    /// Whether a product of several tile rows runs as 2-D blocks of output tiles, each job
+    /// streaming `K` and reading its `A` and `B` strips once ([`tensor::BlockStream`];
+    /// `docs/plans/prefill-operand-reuse.md`). Bit for bit the other paths. `TT_MATMUL_BLOCK` at
+    /// open; [`tensor::BlockStream::Auto`] by default.
+    pub fn set_block_stream(&mut self, mode: tensor::BlockStream) {
+        self.block_stream = mode;
     }
 
     /// Whether a captured one-row product with a packed `A` and its `K` whole puts its first
