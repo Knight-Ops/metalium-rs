@@ -570,6 +570,10 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         pair (P4). The 1.7B's prefill at 8,192 positions with chunks of 512: 1,000 / 4,000 / 7,992 tokens
         **1.24 / 6.81 / 18.33 -> 0.48 / 3.70 / 12.59 s** (`1792858000`). Next: the pair's cost (P4), then each operand out
         of GDDR once (Step 2).
+      - **Then the long-context softmax:** at 7,992 tokens a prefill is now mostly attention over the prefix, and the
+        softmax's six SFPU passes over the `[32 x 64, 8192]` scores were 42% of a 64-token chunk before (78.3 of 186.5 ms,
+        `1792815504`). Fusing them (one pass a row group, or a flash prefill attention) is the next lever for long
+        prompts ([kernel-fusion.md](kernel-fusion.md) Phase 4; the reduce/norm fuser of "attention as few jobs").
       - **Before (2026-10-17):** a prefill-shaped product reached 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,
         `1792258604`). It is bound by GDDR because each unit gathers its own tiles: `B` is read `m / 32` times, `A`
         once per two-column block, up to once a unit. The largest product reads 3.2 GB for 77 MB.
