@@ -237,17 +237,39 @@ impl<B: Backend> FixedCache<B> {
         start: Tensor<B, 1, Int>,
         c: usize,
     ) -> (FixedWrite<B>, Tensor<B, 1, Int>) {
+        self.chunk_write_within(start, c, self.max_len)
+    }
+
+    /// [`Self::chunk_write`] attending only to the cache's first `len` positions (`c <= len`):
+    /// what a chunk's attention costs then follows `len`, not [`Self::max_len`]. For a chunk whose
+    /// rows are all below `len` the result is the whole cache's bit for bit, since every position
+    /// at or past `len` is later than each of its tokens, and a masked position adds an exact zero
+    /// (`docs/plans/long-context.md` D2). A row at or past `len` does not see itself: wrong by
+    /// construction (choose `len` at or above `start + c`).
+    pub fn chunk_write_within(
+        &self,
+        start: Tensor<B, 1, Int>,
+        c: usize,
+        len: usize,
+    ) -> (FixedWrite<B>, Tensor<B, 1, Int>) {
         let max_len = self.max_len;
-        assert!(c <= max_len, "a chunk of at most {max_len} tokens");
+        assert!(
+            c <= len && len <= max_len,
+            "a chunk of {c} tokens attending to {len} of {max_len} positions"
+        );
         let layout = self.layout;
         let positions = self.positions.clone();
         let own = start.expand([c]) + positions.clone().narrow(0, 0, c);
-        let later = positions
-            .clone()
-            .reshape([1, max_len])
-            .expand([c, max_len])
-            .greater(own.clone().reshape([c, 1]).expand([c, max_len]))
-            .reshape([1, 1, c, max_len]);
+        let attended = if len == max_len {
+            positions.clone()
+        } else {
+            positions.clone().narrow(0, 0, len)
+        };
+        let later = attended
+            .reshape([1, len])
+            .expand([c, len])
+            .greater(own.clone().reshape([c, 1]).expand([c, len]))
+            .reshape([1, 1, c, len]);
         let rows = match layout {
             CacheLayout::PositionMajor { .. } => own.clone().reshape([c, 1]),
             // Head `h`'s token `i` at `h max_len + own[i]`, in the order a `[kv_heads, c]`
@@ -265,7 +287,7 @@ impl<B: Backend> FixedCache<B> {
                 layout,
                 rows,
                 later,
-                len: max_len,
+                len,
             },
             own,
         )

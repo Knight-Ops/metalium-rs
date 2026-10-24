@@ -185,7 +185,8 @@ fn eager_tokens(
     for chunk in tt_models::generate::schedule(p.len(), &shapes.chunks) {
         let mut t = p[chunk.start..chunk.start + chunk.n].to_vec();
         t.resize(chunk.c, 0);
-        let (l, state) = model.chunk(ids(&t), index(chunk.start), index(chunk.n - 1), &cache);
+        let len = shapes.chunk_len(chunk);
+        let (l, state) = model.chunk(ids(&t), index(chunk.start), index(chunk.n - 1), len, &cache);
         cache.set_state(state);
         logits = Some(l);
     }

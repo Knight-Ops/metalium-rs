@@ -394,6 +394,14 @@ pub(crate) struct Capture {
     pub(crate) plan_key: Option<u64>,
     /// While it applies a plan: its tensors' GDDR slots so far, grown as it allocates.
     pub(crate) index: crate::residency::Index,
+    /// Whether its own tensors' freed slots go to later allocations of it
+    /// (`Session::set_capture_reuse`, `docs/plans/long-context.md` 1.G).
+    pub(crate) reuse: bool,
+    /// The tensors it freed into its pool, in order: its own, never given back by the trace (their
+    /// slots are in `pool`, or another of its tensors').
+    pub(crate) pooled: Vec<Placement>,
+    /// What its pool held free when it ended (`DramAlloc::take_pool`): the trace's to give back.
+    pub(crate) pool: Vec<(usize, u64, u64)>,
 }
 
 impl Capture {
@@ -524,6 +532,9 @@ pub(crate) struct Trace {
     pub(crate) free_at_end: FreeSnapshot,
     /// Frees of what it holds, deferred to its release.
     pub(crate) freed: Vec<Placement>,
+    /// Slots its capture's own tensors gave back and no tensor took again (`Capture::pool`): its
+    /// replays write them, and its release gives them back.
+    pub(crate) pool: Vec<(usize, u64, u64)>,
     pub(crate) ops: Vec<OpRecord>,
     /// Per unit, its barriers in stream order, for the profile mode's per-unit times; empty
     /// unless the trace was stored in the profile mode.
@@ -622,6 +633,9 @@ mod tests {
             plan_pass: false,
             plan_key: None,
             index: Default::default(),
+            reuse: false,
+            pooled: Vec::new(),
+            pool: Vec::new(),
         }
     }
 

@@ -726,6 +726,11 @@ fn sim_factory(
             self.session.set_count_trace_bytes(on);
             Ok(())
         }
+        fn set_capture_reuse(&mut self, on: bool) -> Result<bool, TtError> {
+            let was = self.session.capture_reuse();
+            self.session.set_capture_reuse(on);
+            Ok(was)
+        }
         fn set_l1_region(&mut self, bytes: u64) -> Result<(), TtError> {
             self.session.set_l1_region(bytes);
             Ok(())

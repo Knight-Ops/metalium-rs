@@ -308,6 +308,9 @@ pub const SMOKE: &[&str] = &[
     // Layer sub-traces: a body called once a layer replays as the ops run fresh, another layer's
     // table diverges, a short one is refused (layer-sub-traces.md).
     "step223_sub_traces::",
+    // A grouped-query mask read as a block of whole tile rows, not a row gather
+    // (long-context.md D3).
+    "step227_block_broadcast::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

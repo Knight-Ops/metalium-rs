@@ -429,9 +429,10 @@ impl FixedShapeDecoder<TtBackend> for InLayout<'_> {
         tokens: Tensor<TtBackend, 2, Int>,
         start: Tensor<TtBackend, 1, Int>,
         last: Tensor<TtBackend, 1, Int>,
+        len: usize,
         cache: &LlamaCache<TtBackend>,
     ) -> (Tensor<TtBackend, 2>, Vec<Tensor<TtBackend, 4>>) {
-        self.model.chunk(tokens, start, last, cache)
+        self.model.chunk(tokens, start, last, len, cache)
     }
 
     fn step(

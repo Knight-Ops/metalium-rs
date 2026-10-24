@@ -324,10 +324,11 @@ impl<B: Backend> FixedShapeDecoder<B> for Gpt<B> {
         tokens: Tensor<B, 2, Int>,
         start: Tensor<B, 1, Int>,
         last: Tensor<B, 1, Int>,
+        len: usize,
         cache: &GptCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let [_, c] = tokens.dims();
-        let (write, own) = cache.kv.chunk_write(start, c);
+        let (write, own) = cache.kv.chunk_write_within(start, c, len);
         let positions = own.clamp_max(cache.kv.max_len() as i64 - 1);
         let (x, state) = self.blocks_fixed(tokens, positions, cache, &write);
         let row = self
@@ -429,6 +430,100 @@ fn a_step_attending_to_too_few_positions_diverges() {
             bits(&short),
             bits(&want),
             "a step attending to 32 positions must diverge"
+        );
+    });
+}
+
+/// Chunks attending to 8, 32 and then all 64 positions (`docs/plans/long-context.md` D2), decode
+/// steps to 32 and 64.
+fn prefix_shapes() -> Shapes {
+    long_shapes().with_prefixes(&[8, 32])
+}
+
+/// Prompts fed by chunks that attend to fewer positions than the cache holds: one chunk at 8 (5),
+/// a chunk at 8 then one at 32 (12), chunks up to 32 and a padded one (30), and one past 32 (36,
+/// whose last chunk attends to all 64). Equal to the growing cache (a Llama) and to the same
+/// schedule with every chunk attending to the whole cache (any decoder), so a chunk that attends
+/// to fewer positions changes no bit.
+#[test]
+fn chunks_attend_only_to_the_positions_in_use() {
+    with_device(Config::default(), |d| {
+        let shapes = prefix_shapes();
+        let whole = long_shapes().with_prefixes(&[]);
+        assert_eq!(shapes.prefixes, [8, 32, LONG]);
+        assert_eq!(whole.prefixes, [LONG]);
+        let (_, config) = synthetic_configs()[1];
+        let llama = Llama::<TtBackend>::new(&config, &d);
+        let g = traced(&llama, &shapes, &d);
+        let keys = g.footprint().unwrap()[0]
+            .traces
+            .iter()
+            .filter(|(k, _)| k.starts_with("Chunk"))
+            .count();
+        assert_eq!(
+            keys, 6,
+            "a chunk trace for each size and each length that holds it"
+        );
+        for (len, steps) in [(5, 3), (12, 3), (30, 4), (36, 2)] {
+            let p = prompt(len, config.vocab);
+            let got = generate(&g, &p, steps);
+            let growing = llama.generate(&p, steps, Precision::F32, &d);
+            assert_same(
+                &got,
+                &growing,
+                &format!("Llama, prompt {len}, growing cache"),
+            );
+            let all = generate_fixed(&llama, &p, steps, &whole, &d).unwrap();
+            assert_same(&got, &all, &format!("Llama, prompt {len}, whole cache"));
+        }
+        let gpt = Gpt::<TtBackend>::new(2, &d);
+        let g = traced(&gpt, &shapes, &d);
+        let p = prompt(30, GPT_VOCAB);
+        let got = generate(&g, &p, 4);
+        let all = generate_fixed(&gpt, &p, 4, &whole, &d).unwrap();
+        assert_same(&got, &all, "GPT, prompt 30, whole cache");
+    });
+}
+
+/// Negative control: a chunk of 8 at position 8 attending to only 8 positions sees neither itself
+/// nor anything before it but the first chunk's rows, so its logits differ from the chunk that
+/// attends to 16, which equal the growing cache's.
+#[test]
+fn a_chunk_attending_to_too_few_positions_diverges() {
+    with_device(Config::default(), |d| {
+        let (_, config) = synthetic_configs()[1];
+        let model = Llama::<TtBackend>::new(&config, &d);
+        let p = prompt(16, config.vocab);
+        let ids = |t: &[i32]| {
+            Tensor::<TtBackend, 2, Int>::from_data(
+                burn::tensor::TensorData::new(t.to_vec(), [1, t.len()]),
+                &d,
+            )
+        };
+        let at = |i: usize| {
+            Tensor::<TtBackend, 1, Int>::from_data(
+                burn::tensor::TensorData::new(vec![i as i32], [1]),
+                &d,
+            )
+        };
+        let mut cache = model.new_cache(LONG, &d);
+        let (_, state) = model.chunk(ids(&p[..8]), at(0), at(7), 8, &cache);
+        cache.set_state(state);
+        let second = |len| {
+            let (l, _) = model.chunk(ids(&p[8..]), at(8), at(7), len, &cache);
+            l.into_data().to_vec::<f32>().unwrap()
+        };
+        let (short, right) = (second(8), second(16));
+        let want = model.generate(&p, 1, Precision::F32, &d).logits[0].clone();
+        assert_eq!(
+            bits(&right),
+            bits(&want),
+            "the chunk that attends to its own rows"
+        );
+        assert_ne!(
+            bits(&short),
+            bits(&want),
+            "a chunk attending to 8 positions must diverge"
         );
     });
 }

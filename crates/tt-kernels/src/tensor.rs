@@ -258,6 +258,26 @@ pub struct DramAlloc {
     log: Option<Vec<Placement>>,
     /// The next placement's [`Placement::serial`].
     serial: u64,
+    /// A capture's own freed slots, while it reuses them ([`DramAlloc::start_pool`]).
+    pool: Option<Pool>,
+}
+
+/// The slots a capture's own tensors gave back during it (`docs/plans/long-context.md` 1.G):
+/// later allocations of the capture take them first, and the trace keeps what is left of them
+/// when it ends ([`DramAlloc::take_pool`]). Kept apart from the free lists, so nothing allocated
+/// outside the capture (or after it, while the trace lives) lands in slots a replay writes.
+#[derive(Debug)]
+struct Pool {
+    /// The capture's first placement's serial: only a tensor from it on is the capture's own.
+    from: u64,
+    /// Per channel, as `DramAlloc::free`.
+    free: Vec<BTreeMap<u64, u64>>,
+    /// Placements written by the host during the capture (an upload, a constant): a replay does
+    /// not write them again, so their slots are never another tensor's.
+    uploads: std::collections::HashSet<u64>,
+    /// Set while an upload allocates: it never takes the pool's slots, since the host writes it
+    /// at once, ahead of the queued ops that may still read them.
+    bypass: bool,
 }
 
 impl DramAlloc {
@@ -274,6 +294,80 @@ impl DramAlloc {
             free,
             log: None,
             serial: 0,
+            pool: None,
+        }
+    }
+
+    /// Keep the slots of the capture's own tensors freed from now on for its later allocations
+    /// ([`DramAlloc::give_to_pool`]), until [`DramAlloc::take_pool`].
+    pub(crate) fn start_pool(&mut self) {
+        self.pool = Some(Pool {
+            from: self.serial,
+            free: vec![BTreeMap::new(); self.channels.len()],
+            uploads: Default::default(),
+            bypass: false,
+        });
+    }
+
+    /// `f`'s allocations are uploads, written by the host: never from the pool, and never given
+    /// back to it.
+    pub(crate) fn uploading<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let Some(pool) = self.pool.as_mut() else {
+            return f(self);
+        };
+        pool.bypass = true;
+        let first = self.serial;
+        let out = f(self);
+        let pool = self.pool.as_mut().expect("kept above");
+        pool.bypass = false;
+        pool.uploads.extend(first..self.serial);
+        out
+    }
+
+    /// The host wrote `p` during the capture: as an upload, its slots are never given to the pool.
+    pub(crate) fn note_host_written(&mut self, p: &Placement) {
+        if let Some(pool) = self.pool.as_mut() {
+            pool.uploads.insert(p.serial);
+        }
+    }
+
+    /// Give `p`'s slots to the capture's pool if they are its own to reuse: allocated during the
+    /// capture, not by an upload. `false` (nothing done) otherwise, or with no pool.
+    pub(crate) fn give_to_pool(&mut self, p: &Placement) -> bool {
+        let Some(pool) = self.pool.as_mut() else {
+            return false;
+        };
+        if !p.owned || p.serial < pool.from || pool.uploads.contains(&p.serial) {
+            return false;
+        }
+        for (c, &b) in p.channels.iter().zip(&p.base) {
+            let i = self
+                .channels
+                .iter()
+                .position(|k| k == c)
+                .expect("a placement's channel is the allocator's");
+            release(&mut pool.free[i], b, p.slots * p.slot_bytes);
+        }
+        true
+    }
+
+    /// Stop pooling: the slots the pool still holds, `(channel index, offset, bytes)`, which the
+    /// trace keeps until it is released ([`DramAlloc::free_ranges`]).
+    pub(crate) fn take_pool(&mut self) -> Vec<(usize, u64, u64)> {
+        let Some(pool) = self.pool.take() else {
+            return Vec::new();
+        };
+        pool.free
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, f)| f.into_iter().map(move |(at, len)| (i, at, len)))
+            .collect()
+    }
+
+    /// Give back ranges [`DramAlloc::take_pool`] returned.
+    pub(crate) fn free_ranges(&mut self, ranges: &[(usize, u64, u64)]) {
+        for &(i, at, len) in ranges {
+            release(&mut self.free[i], at, len);
         }
     }
 
@@ -338,6 +432,25 @@ impl DramAlloc {
         let n = self.channels.len();
         let slots = (tiles.max(1)).div_ceil(n) as u64;
         let bytes = slots * slot_bytes;
+        // A capture's freed slots first, where every channel has the room (no placement takes
+        // some channels from the pool and some from the free lists).
+        if let Some(pool) = self.pool.as_mut().filter(|p| !p.bypass) {
+            let found: Vec<Option<u64>> = pool
+                .free
+                .iter()
+                .map(|f| f.iter().find(|(_, &len)| len >= bytes).map(|(&at, _)| at))
+                .collect();
+            if found.iter().all(Option::is_some) {
+                let base: Vec<u64> = found.into_iter().flatten().collect();
+                for (f, &at) in pool.free.iter_mut().zip(&base) {
+                    let len = f.remove(&at).expect("found above");
+                    if len > bytes {
+                        f.insert(at + bytes, len - bytes);
+                    }
+                }
+                return Ok(self.placed(base, slots, slot_bytes, tiles));
+            }
+        }
         let mut base = Vec::with_capacity(n);
         for i in 0..n {
             let Some((&at, &len)) = self.free[i].iter().find(|(_, &len)| len >= bytes) else {
@@ -359,6 +472,11 @@ impl DramAlloc {
             }
             base.push(at);
         }
+        Ok(self.placed(base, slots, slot_bytes, tiles))
+    }
+
+    /// The placement [`DramAlloc::alloc_slots`] made at `base`, given its serial and logged.
+    fn placed(&mut self, base: Vec<u64>, slots: u64, slot_bytes: u64, tiles: usize) -> Placement {
         self.serial += 1;
         let p = Placement {
             channels: self.channels.clone(),
@@ -373,7 +491,7 @@ impl DramAlloc {
         if let Some(log) = &mut self.log {
             log.push(p.clone());
         }
-        Ok(p)
+        p
     }
 
     /// Give `p`'s slots back; nothing, for a view.
@@ -3268,9 +3386,10 @@ pub struct Eltwise {
 
 /// What an element-wise op is once its operands' shapes are read: its kind
 /// (`ADD_ROW` is `ADD` with a row broadcast) and how `b` meets `a` -- the same
-/// shape, one row (`[1, cols]`) or one column (`[rows, 1]`), the last two only
-/// for the kinds that take one (`sfpu::ops::broadcasts`). Refuses anything
-/// else.
+/// shape, one row (`[1, cols]`), one column (`[rows, 1]`) or a block of whole
+/// tile rows repeated down `a`'s (`[R, cols]`, `R` a multiple of 32 dividing
+/// `a`'s rows), the last three only for the kinds that take one
+/// (`sfpu::ops::broadcasts`). Refuses anything else.
 pub fn broadcast_of(
     op: Eltwise,
     a: &DramTensor,
@@ -3315,11 +3434,52 @@ pub fn broadcast_of(
         (true, Some(b)) if broadcasts(op.kind) && shape(b) == (a.rows, 1) => {
             Ok((op.kind, Broadcast::Col))
         }
+        (true, Some(b)) if broadcasts(op.kind) && block_repeats(a, b).is_some() => {
+            Ok((op.kind, Broadcast::Block))
+        }
         (true, Some(b)) => Err(TensorError::Shape(format!(
-            "[{}, {}] and [{}, {}]: neither the same shape nor a row or column to broadcast",
+            "[{}, {}] and [{}, {}]: neither the same shape nor a row, a column or a block of whole \
+             tile rows to broadcast",
             a.rows, a.cols, b.rows, b.cols
         ))),
     }
+}
+
+/// How many times `b`'s rows repeat down `a`'s, if `b` is a [`Broadcast::Block`] of `a`: as
+/// wide, at least two repeats, and its rows whole tiles (so a repeat never splits one).
+///
+/// [`Broadcast::Block`]: crate::sfpu::ops::Broadcast::Block
+pub fn block_repeats(a: &DramTensor, b: &DramTensor) -> Option<usize> {
+    (b.cols == a.cols && b.rows % 32 == 0 && b.rows > 0 && b.rows < a.rows && a.rows % b.rows == 0)
+        .then(|| a.rows / b.rows)
+}
+
+/// `B`'s reads for a [`Broadcast::Block`] run over `A`'s tiles `first..first + count` (row-major,
+/// `ct` a tile row), the slots from `at` on: output tile `t` reads `B`'s tile `t % period`
+/// (`period` its tiles, `B`'s tile rows times `ct`), as plain `READ_RUN`s over `B`'s own grid, one
+/// for each stretch between wraps. What a row gather expanding `B` to `A`'s shape would put in
+/// each slot, with no list of rows.
+///
+/// [`Broadcast::Block`]: crate::sfpu::ops::Broadcast::Block
+fn block_reads(first: usize, count: usize, period: usize, at: u64, ct: usize) -> Vec<[u32; 8]> {
+    let mut out = Vec::new();
+    let mut n = 0;
+    while n < count {
+        let t = (first + n) % period;
+        let len = (period - t).min(count - n);
+        out.push([
+            record::READ_RUN,
+            t as u32,
+            len as u32,
+            (at + n as u64 * TILE_SLOT) as u32,
+            0,
+            ct as u32,
+            0,
+            0,
+        ]);
+        n += len;
+    }
+    out
 }
 
 /// The element type `kind`'s output has.
@@ -3550,11 +3710,18 @@ pub fn sfpu_eltwise_blocks(
             // A column's broadcast is the program's (`Program::broadcast_col0`): the
             // mover's datum-at-a-time copy cost ~10 us a tile.
             let flags = match bcast {
-                Broadcast::None => 0,
+                Broadcast::None | Broadcast::Block => 0,
                 Broadcast::Row => 1,
                 Broadcast::Col => record::READ_RUN_COL_AS_IT_LIES,
             };
-            gather.extend(read(rb, b_at, flags));
+            if bcast == Broadcast::Block {
+                let b = b.expect("a block broadcast's operand");
+                for h in block_reads(run.start, len, b.grid()[0] * ct, b_at, ct) {
+                    gather.extend([h, rb.encode()[0], rb.encode()[1]]);
+                }
+            } else {
+                gather.extend(read(rb, b_at, flags));
+            }
         }
         if let (Some(rc), Some(c_at)) = (&rc, layout.c_at) {
             gather.extend(read(rc, c_at, 0));
@@ -3633,6 +3800,12 @@ fn sfpu_divide(
         ops::{self, Broadcast},
     };
     use tt_isa::dm::op as mover;
+    if bcast == Broadcast::Block {
+        return Err(TensorError::Shape(format!(
+            "integer division {:#x} by a block of rows repeated: not implemented",
+            op.kind
+        )));
+    }
     // Reserve C as an independent status buffer through Requirements. The
     // actual unary/binary role signature never gathers or unpacks a C input.
     let layout = kernel::plan_layout(1, kernel::Operands::Ternary)
@@ -3669,7 +3842,7 @@ fn sfpu_divide(
         let mut gather = read(layout.a_at, 0, ra);
         if let Some(rb) = rb {
             let flags = match bcast {
-                Broadcast::None => 0,
+                Broadcast::None | Broadcast::Block => 0,
                 Broadcast::Row => 1,
                 Broadcast::Col => 2,
             };
@@ -6367,8 +6540,9 @@ pub mod stats {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocks, metadata, reference, runs, DramAlloc, DramTensor, Elem, Eltwise, Job,
-        MatmulPadding, OpPadding, Pad, PadNeed, Step, SumRows, TransferBatch, TRANSFER_SIDE_MAX,
+        block_repeats, blocks, broadcast_of, metadata, reference, runs, sfpu_eltwise, DramAlloc,
+        DramTensor, Elem, Eltwise, Job, MatmulPadding, OpPadding, Overlap, Pad, PadNeed, Step,
+        SumRows, TransferBatch, TILE_SLOT, TRANSFER_SIDE_MAX,
     };
     use crate::kind;
 
@@ -6491,6 +6665,88 @@ mod tests {
             }
         }
         assert!(checked > 100, "{checked}");
+    }
+
+    /// A [`Broadcast::Block`] op reads, beside each of `A`'s tiles `(i, j)`, `B`'s tile
+    /// `(i % B's tile rows, j)`: what a gather expanding `B` to `A`'s shape would have put in the
+    /// slot, over runs that start anywhere in a repeat and span several (one unit, several units,
+    /// both overlaps), with nothing else of `B` read.
+    ///
+    /// [`Broadcast::Block`]: crate::sfpu::ops::Broadcast::Block
+    #[test]
+    fn a_block_broadcast_reads_b_s_tile_rows_again_down_a() {
+        use crate::sfpu::ops::Broadcast;
+        let op = Eltwise {
+            kind: crate::kind::ADD,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let mut checked = 0;
+        for (b_rows, repeats, cols) in [(32, 2, 32), (64, 4, 96), (64, 3, 40), (96, 2, 300)] {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc_elem(&mut alloc, b_rows * repeats, cols, Elem::F32).unwrap();
+            let b = DramTensor::alloc_elem(&mut alloc, b_rows, cols, Elem::F32).unwrap();
+            assert_eq!(broadcast_of(op, &a, Some(&b)).unwrap().1, Broadcast::Block);
+            assert_eq!(block_repeats(&a, &b), Some(repeats));
+            let ([_, ct], [brt, _]) = (a.grid(), b.grid());
+            // What `B`'s tile `t` is read from, by a one-tile plain run.
+            let b_ref = b.tensor_ref().encode();
+            let source = |t: usize| {
+                let mut out = Vec::new();
+                expanded(
+                    &[
+                        [record::READ_RUN, t as u32, 1, 0, 0, ct as u32, 0, 0],
+                        b_ref[0],
+                        b_ref[1],
+                    ],
+                    &mut out,
+                );
+                let e = out[0].clone().unwrap();
+                (e[1], e[3])
+            };
+            for (units, overlap) in [
+                (1, Overlap::Off),
+                (3, Overlap::Fresh),
+                (5, Overlap::Captured),
+            ] {
+                let work = sfpu_eltwise(&mut alloc, op, &a, Some(&b), None, units, overlap, None)
+                    .unwrap()
+                    .unwrap();
+                for job in &work.jobs {
+                    let Step::List { entries, .. } = &job[0] else {
+                        panic!("a job begins with its gather")
+                    };
+                    // `A`'s run first, then `B`'s records.
+                    let (first, count) = (entries[0][1] as usize, entries[0][2] as usize);
+                    let b_at = entries[3][3];
+                    let mut reads = Vec::new();
+                    expanded(&entries[3..], &mut reads);
+                    let reads: Vec<[u32; 8]> = reads.into_iter().map(Result::unwrap).collect();
+                    assert_eq!(reads.len(), count, "a tile of B beside each tile of A");
+                    for (n, e) in reads.iter().enumerate() {
+                        let t = first + n;
+                        let (i, j) = (t / ct, t % ct);
+                        assert_eq!(e[4], b_at + (n as u64 * TILE_SLOT) as u32, "slot {n}");
+                        assert_eq!(
+                            (e[1], e[3]),
+                            source((i % brt) * ct + j),
+                            "A's tile ({i}, {j}) reads B's ({}, {j})",
+                            i % brt
+                        );
+                        checked += 1;
+                    }
+                }
+                alloc.free(&work.out.placement);
+            }
+        }
+        assert!(checked > 100, "{checked}");
+        // Not a block: a `B` whose rows are not whole tiles, or do not divide `A`'s.
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let a = DramTensor::alloc_elem(&mut alloc, 128, 64, Elem::F32).unwrap();
+        for rows in [16, 48, 96] {
+            let b = DramTensor::alloc_elem(&mut alloc, rows, 64, Elem::F32).unwrap();
+            assert!(broadcast_of(op, &a, Some(&b)).is_err(), "[{rows}, 64]");
+        }
     }
 
     /// `entries` with each record expanded, appended to `out`.

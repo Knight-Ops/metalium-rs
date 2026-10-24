@@ -1,8 +1,10 @@
 # Long context: traces that build at any length, prefill on long prompts, flash-decode past the fit limit
 
 Status (2026-10-24): **Part 1's gates pass: the 1.7B at its native 8,192 positions agrees with burn-flex (a
-7,992-token prompt), and synthetic GQA models generate at 32,768, traced equal to eager. Open: prefill speed at long
-prompts (D2/D3, flash prefill), the BF16 cache, and contexts past 32K. Part 2 (split flash-decode) parked.** Part 2, the split flash-decode, parked by decision (user, 2026-10-23).** Roadmap Track 1, "Long context".
+7,992-token prompt), and synthetic GQA models generate at 32,768, traced equal to eager. D2 and D3 done: a 1.7B prefill
+of 1,000 / 7,992 tokens at 8,192 positions 4.69 / 36.63 -> 1.24 / 18.33 s, bit for bit. Open: larger chunks at long
+context (1.G, GDDR reuse in a capture), the BF16 cache, and contexts past 32K. Part 2 (split flash-decode) parked by
+decision (user, 2026-10-23).** Roadmap Track 1, "Long context".
 SmolLM2-1.7B's native context is 8,192.
 
 **Where it stopped:**
@@ -136,14 +138,84 @@ Part 2's unsplit baseline and fallback.
   - [x] D1: a chunk writes the cache as a row scatter (`scatter_nd(Assign)`, in place in a capture), as a step does:
     `FixedWrite::Chunk` is gone, a chunk is `FixedWrite::Masked` of `c` rows. `Shapes` requires `max_len` a multiple
     of the largest chunk, so every row is in range.
-  - [ ] D2: a chunk attends to a bucketed prefix, `Key::Chunk(c, len)`; capture, prefill and `generate_fixed` choose
-    the same `len`. Masked positions add exact zeros, so a chunk at bucket `L` equals the chunk at `max_len`, bit for bit
-    (a small ttsim gate). **Deferred** (2026-10-23): it makes a chunk trace a chunk size and bucket (8 for `[64]` at
-    8,192), each ~50-100 KB of a unit's program cache, the limit this plan relieves; after D1 a chunk's cost at
-    `max_len` is its attention's reads, which a larger chunk (512) amortizes. Revisit once a trace's programs are
-    paged or flash prefill attention exists.
-  - [ ] D3: the GQA mask as a block broadcast in the binary SFPU ops (`B`'s `[R, C]` repeated down `A`'s rows) instead
-    of a row gather list.
+  - [x] D2 (2026-10-24): a chunk attends to a prefix, `Key::Chunk { c, len }`. `Shapes::prefixes` (the step lengths
+    by default, `with_prefixes(&[])` the whole cache) and `Shapes::chunk_len` (the smallest holding `start + c`, a
+    padded chunk's padding rows included) are what capture, prefill and `generate_fixed` all use;
+    `FixedShapeDecoder::chunk` takes `len`, `FixedCache::chunk_write_within`, `Llama::fixed_chunk_within`. Masked
+    positions add exact zeros, so a chunk at `L` equals the chunk at `max_len` bit for bit. Gates `step187`
+    `chunks_attend_only_to_the_positions_in_use` (prefixes 8, 32, 64 against the growing cache and the whole-cache
+    schedule, a Llama and the GPT decoder) and `a_chunk_attending_to_too_few_positions_diverges` (negative control);
+    ttsim and card 0. Unblocked by 1.E: one trace a size and length (8 for `[64]` at 8,192) need not fit together.
+  - [x] D3 (2026-10-24): the GQA mask as a block (`sfpu::ops::Broadcast::Block`, `tensor::block_repeats`): a second
+    operand `[R, C]`, `R` whole tiles dividing `A`'s rows, read as plain `READ_RUN`s over its own grid, one a stretch
+    between wraps (`tensor::block_reads`); host only, no kernel or firmware change. burn-tt routes it (`ops.rs`
+    `block_of`: 1 on a run of leading dimensions, `A`'s on the rest) before `expanded`'s row gather, now reported as
+    the part `broadcast/expand`. Gates: unit `a_block_broadcast_reads_b_s_tile_rows_again_down_a` (every slot through
+    `record::expand`; **watched failing** with the wrap a tile row late); `step227_block_broadcast` (`mask_fill`, an
+    addition and `attention` against the expanded operand bit for bit, small integers against burn-flex; a per-head
+    row and a 16-row block still gathered and right). `step224` prints each trace's row gathers: a chunk of the
+    two-layer GQA models runs 5, made once a chunk (its mask's positions expanded), 7 with blocks switched off.
+  - **Found on the way** (`step224` at 32,768, a chunk trace a length): a streamed segment's scripts were placed
+    without evicting what other traces hold, so with the traces holding nearly the whole cache a streamed reduction
+    was refused ("a list's programs do not fit", 82 KB free once evictable programs go, 4.7 KB needed). They now
+    evict as the kernels' programs do (`place_programs`); a replay restores them as it does its programs. Still
+    open: placement is first fit without compaction, so programs a capture protects can leave a run too small for
+    a program that fits the bytes (seen with `step226`'s cache cut to the larger trace exactly).
+  - Measured (card 0, `1792808294` -> `1792809099` -> `1792809505`,
+    [log](../learnings/performance-log.md#a-long-prompts-prefill-chunks-attend-to-a-prefix-the-gqa-mask-read-as-a-block-2026-10-24-card-0)):
+    a 1.7B chunk of 64 at 8,192 positions 293 -> 187 ms with D3 (the gather was 36%), then each chunk at its prefix:
+    prefill of 1,000 / 4,000 / 7,992 tokens **4.69 / 18.46 / 36.63 -> 1.24 / 6.81 / 18.33 s**, decode unchanged.
+- [ ] **1.G GDDR reuse within a capture** (found 2026-10-24). A capture defers every free (`Session::free_placement`), so a
+  trace holds every layer's intermediates: a 512-token chunk's scores at 8,192 positions (~48 GB over 24 layers) do not
+  fit, so a long prompt runs in chunks of 64; and since D2 a generator holds a chunk trace a length, so the 1.7B's
+  eager schedule no longer fits beside them (`step188` releases them first).
+  - **Why it is safe on the card** (read off the code, 2026-10-24): on a session of more than one unit every captured op
+    ends in a barrier whose target counts every earlier arrival (`Session::enqueue_work_inner`, `dm.rs` barrier
+    targets), and a unit that sat an op out waits for the latest target before its next list (`trace_behind`,
+    `catch_up_to`). So no unit starts op `m` before ops `0..m` are done everywhere, on replay and in the capture's own
+    run, and the host frees a tensor only after enqueuing its last reader: a later op may take its slots. The lists
+    that run ahead of barriers (`PREFETCH`, `BUSY_PREFETCH`) read only a `B` the capture neither allocated nor wrote.
+  - **What it must keep:**
+    - only a tensor born in the capture (its `Placement::serial` past the capture's start) and not uploaded during it
+      (an upload is written once, through the BAR, and not by a replay) gives its slots back; a tensor made before the
+      capture and freed in it is read again by the next replay, so its free stays deferred;
+    - one unit has no barriers: no reuse there;
+    - the trace owns every slot its internal tensors used: at its end, what of them is free is claimed for the trace
+      and given back once at `release_trace` (no double free: a placement over reused slots is never freed itself);
+      a tensor alive at the end keeps today's hold (`Trace::holds`);
+    - the residency planner attributes GDDR slots to tensors by address (`residency::Index`, one tensor an address):
+      with reuse it must find the tensor an address held at an op (the latest allocated by then).
+  - [x] G0: the meter (2026-10-24): the GDDR left after a build, reported by `traced_generation_stream_ceiling` and
+    printed by `step188`. The 1.7B at 8,192 positions with a chunk trace a length: **0.34 GB free after the build, 26.85
+    once its traces are released** (`step188`, card 1, `1792815355`); 2.10 GB in the bench's build (`1792816593`).
+  - [x] G1 (2026-10-24): `DramAlloc`'s capture pool (`start_pool`, `give_to_pool`, `take_pool`, `free_ranges`; uploads
+    and host writes through `uploading` and `note_host_written` never enter it), `Session::set_capture_reuse` (and
+    `TT_CAPTURE_REUSE=1`; nothing on one unit), the trace's `pool` given back at `release_trace`; a capture that reuses
+    makes no residency plan and applies none. `burn_tt::set_capture_reuse`; `TracedGenerator` turns it on for its
+    chunk captures only (the steps keep their residency plans), by default since G3 (`TT_CHUNK_REUSE=0` turns it
+    off). Gate `step228_capture_reuse`
+    (4 units, ttsim and card 0 `1792816577`): a chain freeing as it goes replays bit for bit as it ran, its trace
+    holding 299,520 bytes of GDDR against 965,120 without reuse, every byte back at the release; a tensor made before
+    the capture and a constant uploaded in it keep their slots (**watched failing** with `give_to_pool` taking them:
+    both replays diverge, `[false, false]`, since the capture's own run already wrote over them).
+    - Measured (1.7B, 8,192 positions, card 0; `1792816593` / `1792817025` / `1792817342`): GDDR free after the build
+      **2.10 -> 17.78 GB**, the build 226 -> 127 s, prefill unchanged (1,000 / 7,992 tokens 1,236 / 18,323 -> 1,255 /
+      18,438 ms); and **chunks of 512 now capture at 8,192** (14.79 GB free): 1,011 / 16,877 ms, 1.22x / 1.09x, the
+      products' plateau (below) capping what a larger chunk buys.
+  - [ ] G2: `residency::Index` by address and op; the planned capture over reused slots equals the unplanned one bit
+    for bit (`step219`, `step188` traced against eager). Needed only for reuse in captures that are planned (the decode
+    steps); the chunk captures reuse unplanned, so it waits on a measured need.
+  - [x] G3 (2026-10-24): on by default for chunk captures, without G2 (the chunk captures are unplanned). An engine
+    without it (the mesh engine) builds without reuse, unless `TT_CHUNK_REUSE=1` asked for it (then refused by name). With reuse
+    on, 22 of 22 traced gates passed on card 0 (`1792817785`: `step185`, `step187`, `step212`, `step224`, `step188`
+    with the native context). Prefill at chunks of 64 measured 0.6-1.5% slower in one run each (`1792816593` against
+    `1792817025`), not confirmed beyond noise. The price: on more than one unit a chunk's capture is no longer
+    residency-planned (no L1-resident intermediates; G2 would restore it), so `step219` now claims fewer bytes for the
+    planned steps and no more for the chunks. One rule (`Session::reuses_captures`: asked for and more than one unit)
+    decides both whether a capture reuses and whether a plan is refused for it; before it, a one-unit chunk ran a plan
+    pass every build, refused its plan and captured plainly again.
+  - [ ] Larger default chunks at long context (`TT_GEN_CHUNKS` 128-512 at 8,192 fit now); worth little until the
+    products reuse their operands (1.22x / 1.09x at 512).
 
 ## Part 2: flash-decode past the fit limit
 

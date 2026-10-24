@@ -880,6 +880,16 @@ pub fn set_count_trace_bytes(device: TtDevice, on: bool) -> Result<(), TtError> 
     server::run(device, move |e, _| e.set_count_trace_bytes(on))
 }
 
+/// Let the traces captured on `device` from here on reuse their own tensors' GDDR
+/// (`Session::set_capture_reuse`, `docs/plans/long-context.md` 1.G): an intermediate freed during
+/// a capture gives its slots to the capture's later ops, so a trace holds about what one layer's
+/// intermediates take, not every layer's. A capture that reuses is not planned for L1 residency.
+/// Returns the previous setting. Dev-facing.
+#[doc(hidden)]
+pub fn set_capture_reuse(device: TtDevice, on: bool) -> Result<bool, TtError> {
+    server::run(device, move |e, _| e.set_capture_reuse(on))
+}
+
 /// Keep `bytes` at the top of each unit's L1 arena for a persistent region in every trace captured
 /// on `device` from here on (`Session::set_l1_region`; 0 keeps none): the captured ops plan below
 /// it, and a capture with an op that does not is refused by name.

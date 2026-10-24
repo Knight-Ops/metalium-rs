@@ -581,6 +581,12 @@ pub trait Engine {
     fn set_count_trace_bytes(&mut self, _on: bool) -> Result<(), TtError> {
         Err(no_traces())
     }
+    /// Let the traces captured from here on reuse their own tensors' GDDR
+    /// (`Session::set_capture_reuse`); the previous setting.
+    #[doc(hidden)]
+    fn set_capture_reuse(&mut self, _on: bool) -> Result<bool, TtError> {
+        Err(no_traces())
+    }
     /// Keep `bytes` at the top of each unit's L1 arena for a persistent region in every trace
     /// captured from here on (`Session::set_l1_region`).
     #[doc(hidden)]
@@ -4036,6 +4042,11 @@ impl Engine for KmdEngine {
     fn set_count_trace_bytes(&mut self, on: bool) -> Result<(), TtError> {
         self.session.set_count_trace_bytes(on);
         Ok(())
+    }
+    fn set_capture_reuse(&mut self, on: bool) -> Result<bool, TtError> {
+        let was = self.session.capture_reuse();
+        self.session.set_capture_reuse(on);
+        Ok(was)
     }
     fn gddr_free_bytes(&mut self) -> Result<(u64, u64), TtError> {
         self.session.sync().map_err(TtError::from)?;

@@ -140,7 +140,18 @@ fn the_native_context_agrees_with_flex() {
     with_device(config(), |d| {
         let (model, _) =
             Llama::<TtBackend>::smollm2_1_7b_instruct(layers(), Precision::F32, &d).unwrap();
+        let gb = |(fullest, all): (u64, u64)| {
+            format!(
+                "{:.2} GB on the fullest channel, {:.2} in all",
+                fullest as f64 / 1e9,
+                all as f64 / 1e9
+            )
+        };
         let g = ladder_support::traced(&model, &shapes, &d);
+        eprintln!(
+            "built; GDDR free {}",
+            gb(burn_tt::gddr_free_bytes(d).unwrap())
+        );
         let t0 = std::time::Instant::now();
         let traced = ladder_support::generate(&g, &prompt, steps);
         eprintln!(
@@ -149,6 +160,14 @@ fn the_native_context_agrees_with_flex() {
             traced.tokens
         );
         ladder_support::compare("SmolLM2-1.7B at 8,192 positions", &host, &traced);
+        // The traces hold every intermediate of each chunk length's capture (a chunk trace a
+        // length, `Shapes::prefixes`; `docs/plans/long-context.md` 1.G), which the eager schedule's
+        // own cache and intermediates need: released first.
+        drop(g);
+        eprintln!(
+            "traces released; GDDR free {}",
+            gb(burn_tt::gddr_free_bytes(d).unwrap())
+        );
         let eager = generate_fixed(&model, &prompt, steps, &shapes, &d).unwrap();
         ladder_support::assert_same(&traced, &eager, "traced against eager at 8,192 positions");
     });

@@ -731,7 +731,7 @@ fn norm_backward_baselines() {
 /// arithmetic, and every replay equals the eager product bit for bit. The operands are integers in
 /// [-3, 3], so every term of a group of eight is a multiple of its quantum
 /// (`silicon-operating-notes.md`, "Matmul accumulation") and every sum (at most 6 x 2048) is exact
-/// in F32.
+/// in F32. `TT_MATMUL_SHAPES` (`m,k,n;...`) measures other shapes.
 #[test]
 #[ignore = "benchmark"]
 fn matmul_throughput() {
@@ -746,12 +746,26 @@ fn matmul_throughput() {
             println!("BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"tiles\":\"all\",\"warmups\":2,\"samples\":7,\"route\":\"Tf32FromFp32\",\"fidelity\":\"HiFi4\",\"inputs\":\"resident GDDR tensors\",\"timing\":\"eager: host dispatch through sync; replay: the card's side of a trace replay, input write and output read excluded; validation outside timing\"}}", tt_tests::bench::git_sha(), !cfg!(debug_assertions));
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             burn_tt::set_count_trace_bytes(d, true).unwrap();
-            for (m, k, n) in [
-                (256usize, 2048usize, 2048usize),
-                (256, 2048, 8192),
-                (1024, 2048, 2048),
-                (1024, 2048, 8192),
-            ] {
+            // `TT_MATMUL_SHAPES` (`m,k,n;m,k,n;...`) replaces the default shapes: a prefill chunk's
+            // own products, say.
+            let shapes: Vec<(usize, usize, usize)> = std::env::var("TT_MATMUL_SHAPES").map_or(
+                vec![
+                    (256, 2048, 2048),
+                    (256, 2048, 8192),
+                    (1024, 2048, 2048),
+                    (1024, 2048, 8192),
+                ],
+                |v| {
+                    v.split(';')
+                        .map(|s| {
+                            let d: Vec<usize> =
+                                s.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                            (d[0], d[1], d[2])
+                        })
+                        .collect()
+                },
+            );
+            for (m, k, n) in shapes {
                 let av: Vec<f32> = (0..m * k)
                     .map(|i| ((i / k * 7 + i % k * 3) % 5) as f32 - 2.0)
                     .collect();

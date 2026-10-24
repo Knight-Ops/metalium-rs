@@ -120,6 +120,18 @@ fn traces_build_and_fit_at_long_context() {
                             }
                         }
                     }
+                    // What each trace gathers by rows, for diagnosis: a chunk's grouped-query
+                    // mask is read as a block (`Broadcast::Block`, D3; asserted by `step227`), so
+                    // what is left is made once a chunk (its mask's own positions expanded), not
+                    // once a layer.
+                    for (key, ops) in g.trace_ops().unwrap() {
+                        let labels: Vec<_> = ops
+                            .iter()
+                            .filter(|o| o.what == "row gather list")
+                            .map(|o| o.label)
+                            .collect();
+                        eprintln!("  {key}: row gathers {labels:?}");
+                    }
                     assert!(over.is_empty(), "over budget:\n{}", over.join("\n"));
                 })
             });
@@ -228,7 +240,8 @@ fn probe_eager_chunks_gddr() {
         for (i, chunk) in schedule(p.len(), &shapes.chunks).into_iter().enumerate() {
             let mut t = p[chunk.start..chunk.start + chunk.n].to_vec();
             t.resize(chunk.c, 0);
-            let (l, state) = model.chunk(ids(&t), at(chunk.start), at(chunk.n - 1), &cache);
+            let len = shapes.chunk_len(chunk);
+            let (l, state) = model.chunk(ids(&t), at(chunk.start), at(chunk.n - 1), len, &cache);
             let _ = l.into_data();
             cache.set_state(state);
             if i % 32 == 0 {

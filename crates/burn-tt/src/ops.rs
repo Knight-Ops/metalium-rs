@@ -1194,6 +1194,9 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
     let cols = to[rank - 1];
     let input_cols = padded[rank - 1];
     let source = plain_dram(tensor);
+    // Reported apart from the op that broadcasts: a row list a row of the result, which an
+    // operand that is a block of whole tile rows avoids (`block_of`).
+    let _part = crate::report::part("broadcast/expand");
     let indices: Vec<_> = (0..rows)
         .map(|mut flat| {
             let mut coords = vec![0; rank - 1];
@@ -1371,7 +1374,7 @@ fn device_op_ungated(
             crate::tensor::stored_dims(x).expect("checked"),
             crate::tensor::stored_dims(y).expect("checked"),
         );
-        ((yr == 1 && yc == xc) || (yc == 1 && yr == xr))
+        ((yr == 1 && yc == xc) || (yc == 1 && yr == xr) || block_of(x, y))
             && broadcast_shape(x, y).is_some_and(|s| s == x)
     };
     let (a, b) = match &sb {
@@ -1410,6 +1413,28 @@ fn device_op_ungated(
         }
     };
     Some(device_result_shaped(device, id, dims, a.shape(), dtype))
+}
+
+/// Whether `y` broadcasts to `x` as a block of whole tile rows repeated down `x`'s matrix
+/// (`tt_kernels::sfpu::ops::Broadcast::Block`): `y` is 1 on a run of `x`'s leading dimensions and
+/// equal to `x` on the rest (`[1, 1, R, C]` against `[1, kv_heads, R, C]`, a grouped-query mask
+/// over each key/value head's scores), so `y`'s matrix is `x`'s first block of rows, and its rows
+/// are whole tiles. Not a dimension of 1 between others: `[kv_heads, 1, C]` against `[kv_heads,
+/// R, C]` repeats each row, not the block.
+fn block_of(x: &[usize], y: &[usize]) -> bool {
+    if y.len() > x.len() || x.len() < 2 {
+        return false;
+    }
+    let mut padded = vec![1; x.len() - y.len()];
+    padded.extend_from_slice(y);
+    let Some(lead) = padded.iter().position(|&d| d != 1) else {
+        return false;
+    };
+    let rows: usize = x[lead..x.len() - 1].iter().product();
+    lead > 0
+        && padded[lead..] == x[lead..]
+        && x[..lead].iter().product::<usize>() > 1
+        && rows % 32 == 0
 }
 
 /// `t`'s view and the block of its buffer it is, if it is one the card reads

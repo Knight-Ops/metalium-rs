@@ -2473,6 +2473,11 @@ pub enum Broadcast {
     Row,
     /// `[rows, 1]`: its one column to every column.
     Col,
+    /// `[R, cols]`, `R` a multiple of 32 that divides `A`'s rows: its rows repeated down `A`'s (a
+    /// grouped-query mask over each key/value head's scores). The program is the same-shape one:
+    /// only which of `B`'s tiles is read beside each of `A`'s changes
+    /// (`tensor::sfpu_eltwise_blocks`).
+    Block,
 }
 
 /// The kinds that take a broadcast second operand.
@@ -3001,6 +3006,7 @@ pub fn code_for(
     match bcast {
         Broadcast::None => code2(kind, scalars),
         _ if !broadcasts(kind) => None,
+        Broadcast::Block => code2(kind, scalars),
         Broadcast::Col => {
             let (_, math) = code2(kind, scalars)?;
             let mut p = Program::with_policy(super::LoopPolicy::Unrolled);

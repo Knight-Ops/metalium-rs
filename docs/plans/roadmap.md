@@ -572,6 +572,10 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         same mechanism as G7 in [decode-step-bandwidth.md](decode-step-bandwidth.md). ttsim refuses
         non-rectangular multicast.
       - **Target:** the products compute-bound, ~40x from today.
+      - **Measured again (2026-10-24, `1792816512`, `1792815504`):** the products plateau at 5.2 TFLOPS (`gate|up`) and
+        2.8 (`down`) from `m` = 512 to 2,048, GDDR-bound at ~400 GB/s, and a long prefill uses 1.1-1.7% of the card's
+        compute; this, not the chunk size, is what holds prefill
+        ([log](../learnings/performance-log.md#how-much-of-the-cards-compute-a-long-prefill-uses-2026-10-24-card-0)).
     - [ ] **Batched decode** (design: [batched-decode.md](../proposals/batched-decode.md), 2026-10-18; unscheduled:
       batch-1 prefill and decode come first, and are built with it in mind).
       - **The largest knob for total throughput:** a step reads every weight once whatever the batch, and up to 32
@@ -592,7 +596,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   step after 32 / 1,000 tokens, `1792793709`). Since: a trace's programs paged into the program cache (only one trace
   need fit) and two GDDR leaks fixed; synthetic GQA models generate traced equal to eager at 32,768 positions
   (`1792799289`); the 1.7B from a 7,992-token prompt gives burn-flex's tokens, traced in 38.7 s against 1,847 s
-  (`1792800061`). Left: prefill speed at long prompts, the BF16 cache, past 32K. Flash-decode's oracle is parked on the Matrix Unit model not being bit for bit on full-mantissa
+  (`1792800061`). Then (2026-10-24) a chunk attends to the prefix holding its rows (D2) and the GQA mask is read as a
+  block instead of a row gather a layer (D3): its prefill of 1,000 / 7,992 tokens **4.69 / 36.63 -> 1.24 / 18.33 s**, bit
+  for bit (`1792808294`, `1792809505`). A capture's own intermediates now give their GDDR to its later ops (1.G,
+  on by default for chunk captures, `TT_CHUNK_REUSE=0` turns it off): 2.10 -> 17.78 GB free after the 1.7B's build, and chunks of 512
+  capture at 8,192 (7,992 tokens in 16.9 s). **A long prefill uses 1.1-1.7% of the card's compute**: the products
+  plateau at ~5 TFLOPS, GDDR-bound, whatever the chunk size (Track 1, "Prefill products that reuse their operands").
+  Left: the BF16 cache, past 32K. Flash-decode's oracle is parked on the Matrix Unit model not being bit for bit on full-mantissa
   operands. Found before: SmolLM2-1.7B's native context is 8,192; the cached Qwen3.6-35B-A3B and Qwen3.8-27B are 262,144.
   - **The fast attention op is L1-bound:** `attention::fits` holds a head's whole `K` and `V` on one unit:
     `head_dim` 64 fits 512 positions, not 1024 (~864 at most); `head_dim` 256 ~288, and GQA groups x `dv/32` > 32
@@ -602,7 +612,8 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
     programs do not fit an empty program cache". **Not an oversized op** (traced 2026-10-23): every held trace's
     programs share a unit's 240 KiB program cache, and they grow with length (element-wise unpack and pack, and
     reductions, are unrolled a tile), so the bucket that does not fit fails. Unit 0 was at 232 of 240 KB at 512.
-  - **Prefill costs `max_len` a chunk:** a chunk attends to the whole cache and rewrites it by `mask_where`.
+  - **Prefill cost `max_len` a chunk** (fixed 2026-10-24, D1-D3): a chunk now writes only its rows, attends to its
+    prefix, and reads its GQA mask as a block.
   - **Plan:** [long-context.md](long-context.md) (Part 1 bit for bit: looped programs, cache-aware sizing, prefill;
     Part 2: flash-decode past the fit limit, an order change the user allowed there).
   - **Also:** `attention/widen` widens a BF16 cache to F32 every call (the whole cache a step).

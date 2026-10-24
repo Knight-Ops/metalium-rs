@@ -792,6 +792,8 @@ pub struct Session<T: Transport> {
     /// [`Session::set_residency`]: the most a residency-planned capture's region takes, or 0 for
     /// no residency.
     residency_region: u64,
+    /// [`Session::set_capture_reuse`].
+    capture_reuse: bool,
     /// [`Session::set_residency_fixed`].
     residency_fixed: bool,
     /// [`Session::probe_planned_region`].
@@ -1339,7 +1341,9 @@ fn place_programs<T: Transport>(
                 let length = words.len() as u32 | tt_isa::dataflow::STREAMED;
                 let words: Arc<[u32]> = words.into();
                 let hash = crate::program_cache::hash(&words);
-                let address = match cache.place_hashed(&words, hash) {
+                // As the kernels' programs above: another trace's held scripts may make room once
+                // nothing queued can run them (a replay restores them, as it does its programs).
+                let address = match cache.place_hashed_evicting(&words, hash, !in_flight) {
                     Ok(Placed::Hit(address)) => address,
                     Ok(Placed::Upload(address)) => {
                         let bytes: Vec<u8> =
@@ -2498,6 +2502,7 @@ impl<T: Transport> Session<T> {
                 (false, fixed) => fixed.unwrap_or(RESIDENCY_REGION),
             },
             residency_fixed: residency_region_from_env().is_some(),
+            capture_reuse: std::env::var("TT_CAPTURE_REUSE").is_ok_and(|v| v == "1"),
             probe_planned_region: None,
             planned_base: None,
             residency_rows: residency_rows_from_env(),
@@ -3395,7 +3400,11 @@ impl<T: Transport> Session<T> {
                 values.len()
             )));
         }
-        let t = DramTensor::alloc_elem(&mut self.dram_state()?.alloc, rows, cols, elem)?;
+        // Written by the host now and not by a replay: never a capture's reused slots.
+        let t = self
+            .dram_state()?
+            .alloc
+            .uploading(|a| DramTensor::alloc_elem(a, rows, cols, elem))?;
         if let Err(e) = self.write_src(&t, values, true) {
             let _ = self.free(t);
             return Err(e);
@@ -3414,6 +3423,11 @@ impl<T: Transport> Session<T> {
         fresh: bool,
     ) -> Result<(), TensorError> {
         t.check_write(values.len(), values.bits())?;
+        // What the host writes in a capture a replay does not write again: its slots are not the
+        // capture's to reuse.
+        if let Some(d) = self.dram.as_mut() {
+            d.alloc.note_host_written(&t.placement);
+        }
         let [rt, ct] = t.grid();
         let tiles = rt * ct;
         if tiles >= HOST_DMA_MIN_UPLOAD && self.capture.is_none() {
@@ -4044,9 +4058,15 @@ impl<T: Transport> Session<T> {
             let (_, twin) = self.twins.swap_remove(i);
             self.free_placement(twin.placement)?;
         }
-        // A trace's: its replays read or write it (`crate::trace`).
+        // A trace's: its replays read or write it (`crate::trace`). One the capture made itself
+        // (not an upload) it may take again, where the capture reuses: every op after its last
+        // reader runs after that reader's barrier (`Session::set_capture_reuse`).
         if let Some(c) = self.capture.as_mut() {
-            c.freed.push(p);
+            if c.reuse && self.dram.as_mut().is_some_and(|d| d.alloc.give_to_pool(&p)) {
+                c.pooled.push(p);
+            } else {
+                c.freed.push(p);
+            }
             return Ok(());
         }
         if let Some(t) = self.traces.values_mut().find(|t| t.holds(&p)) {
@@ -5222,6 +5242,9 @@ impl<T: Transport> Session<T> {
             plan_pass,
             plan_key: None,
             index: Default::default(),
+            reuse: self.reuses_captures(),
+            pooled: Vec::new(),
+            pool: Vec::new(),
         });
         self.captures += 1;
         if let Some(background) = probing_background() {
@@ -5232,6 +5255,9 @@ impl<T: Transport> Session<T> {
         }
         // The capture's own tensors, for its residency plan (`crate::residency`).
         self.dram_state()?.alloc.start_log();
+        if self.capture.as_ref().is_some_and(|c| c.reuse) {
+            self.dram_state()?.alloc.start_pool();
+        }
         // Its ops plan below the persistent region, if it keeps one. In the trace arena the region
         // is above `DATA`, and only the products' `B` rings reach past it, up to the region's base
         // (or, in a plan pass, where the planned capture's will be): every other layout is as it is
@@ -5507,6 +5533,11 @@ impl<T: Transport> Session<T> {
             .as_mut()
             .map(|d| d.alloc.take_log())
             .unwrap_or_default();
+        capture.pool = self
+            .dram
+            .as_mut()
+            .map(|d| d.alloc.take_pool())
+            .unwrap_or_default();
         // Ops after the capture plan in the whole arena again, their lists in `DATA`, and what the
         // capture's own run left in the program slots is not what the eager runtime last wrote there.
         crate::l1::set_arena_end(tt_isa::l1::DATA.end);
@@ -5555,7 +5586,9 @@ impl<T: Transport> Session<T> {
                     .unwrap_or_else(|| "the plan stopped applying".into()),
             ),
             _ => {
-                if capture.plan_pass {
+                // A capture that reused its tensors' slots has tensors that share addresses,
+                // which the planner cannot tell apart (`residency::Index`): it plans nothing.
+                if capture.plan_pass && !capture.reuse {
                     self.last_plan = self.plan_of(&capture, &allocs);
                 }
                 None
@@ -5616,6 +5649,7 @@ impl<T: Transport> Session<T> {
             mut ops,
             failed,
             region_base,
+            pool,
             ..
         } = capture;
         // What each op could stamp in each detail of the profile mode, on its busiest unit: what
@@ -5669,6 +5703,9 @@ impl<T: Transport> Session<T> {
         let give_back = |s: &mut Self, freed: Vec<tensor::Placement>| {
             for p in freed {
                 let _ = s.free_placement(p);
+            }
+            if let Ok(d) = s.dram_state() {
+                d.alloc.free_ranges(&pool);
             }
         };
         if let Err(e) = synced {
@@ -5762,6 +5799,7 @@ impl<T: Transport> Session<T> {
                 barriers,
                 free_at_end,
                 freed,
+                pool,
                 ops,
                 unit_barriers,
             },
@@ -6271,6 +6309,9 @@ impl<T: Transport> Session<T> {
         for p in t.freed {
             // Another trace may hold it too.
             self.free_placement(p)?;
+        }
+        if let Some(d) = self.dram.as_mut() {
+            d.alloc.free_ranges(&t.pool);
         }
         Ok(())
     }
@@ -8607,6 +8648,28 @@ impl<T: Transport> Session<T> {
     /// [`Session::begin_trace_planned`] to apply to a capture of the same graph. The planned
     /// capture keeps what its plan uses, no more than leaves every op laid out as in the plan
     /// pass (`crate::residency::cap`), nor than `bytes`.
+    /// Let the next captures reuse their own tensors' GDDR (`docs/plans/long-context.md` 1.G):
+    /// a tensor made during a capture (not uploaded or written by the host) and freed during it
+    /// gives its slots to the capture's later allocations, instead of the trace holding every
+    /// intermediate until it is released. Safe on the card because every captured op ends in a
+    /// barrier counting every earlier one, on more than one unit (with one unit it does nothing).
+    /// Off by default (`TT_CAPTURE_REUSE=1` turns it on); a capture that reuses is not planned for
+    /// L1 residency, whose planner tells tensors apart by address.
+    pub fn set_capture_reuse(&mut self, on: bool) {
+        self.capture_reuse = on;
+    }
+
+    /// [`Session::set_capture_reuse`].
+    pub fn capture_reuse(&self) -> bool {
+        self.capture_reuse
+    }
+
+    /// Whether the next capture reuses: asked for, and ordered by the barrier every captured op
+    /// ends in, which one unit does not have.
+    fn reuses_captures(&self) -> bool {
+        self.capture_reuse && self.units.len() > 1
+    }
+
     pub fn set_residency(&mut self, bytes: u64) {
         self.residency_region = bytes;
         self.plans.clear();
@@ -8687,6 +8750,10 @@ impl<T: Transport> Session<T> {
         applied: std::sync::Arc<crate::residency::Applied>,
         key: Option<u64>,
     ) -> Result<bool, TensorError> {
+        // A capture that reuses is never planned (`Session::set_capture_reuse`).
+        if self.reuses_captures() {
+            return Ok(false);
+        }
         // The region its plan sized (`plan_of`), whatever this session would keep now: an op the
         // region changed is laid out unlike the plan pass's, and refused by its shape.
         let base = applied.region_base;

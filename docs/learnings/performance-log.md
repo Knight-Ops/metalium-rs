@@ -12,6 +12,9 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [GDDR reused within a capture](#gddr-reused-within-a-capture-2026-10-24-card-0) | 2026-10-24 | 1.7B at 8,192 positions, chunk captures reusing their intermediates' GDDR (the default since; `TT_CHUNK_REUSE=0` turns it off): GDDR free after the build **2.10 -> 17.78 GB**, the build 226 -> 127 s, prefill unchanged; chunks of 512 now capture: prefill 1,000 / 7,992 tokens 1,236 / 18,323 -> **1,011 / 16,877 ms** |
+| [How much of the card's compute a long prefill uses](#how-much-of-the-cards-compute-a-long-prefill-uses-2026-10-24-card-0) | 2026-10-24 | 1.7B prefill at 8,192 positions: **1.1-1.7% of the ~166 TFLOPS derived peak** (1.87 TFLOPS over a 7,992-token prompt); a 64-token chunk's projections 3.73 TFLOPS with the Matrix Unit busy 4% of their span; products plateau at **5.2 TFLOPS** (`gate\|up`) and 2.8 (`down`) even at `m` = 2,048, GDDR-bound at ~400 GB/s: larger chunks do not raise the rate, operand reuse does |
+| [A long prompt's prefill: chunks attend to a prefix, the GQA mask read as a block](#a-long-prompts-prefill-chunks-attend-to-a-prefix-the-gqa-mask-read-as-a-block-2026-10-24-card-0) | 2026-10-24 | 1.7B, 8,192-position cache, chunks of 64: prefill of 1,000 / 4,000 / 7,992 tokens **4.69 / 18.46 / 36.63 s -> 1.24 / 6.81 / 18.33 s** (213-218 -> 809 / 587 / 436 tokens/s); the mask's row gather alone was 36% of a chunk; decode unchanged |
 | [The 1.7B at 8,192 positions from a 7,992-token prompt](#the-17b-at-8192-positions-from-a-7992-token-prompt-2026-10-24-card-0) | 2026-10-24 | traced prompt and 8 tokens 38.7 s against burn-flex's 1,847 s, the same tokens; chunks of 64 |
 | [The 1.7B at its native 8,192 positions](#the-17b-at-its-native-8192-positions-2026-10-23-card-0) | 2026-10-23 | first run past a 512-position cache, after looped element-wise and reduce programs (`long-context.md`): builds (235 s first, 72.5 s second), **17.0 ms** a step after 32 tokens, **26.0 ms** after 1,000 (attention as the composition at `Step(1024)`); past 8,192 the traces do not fit the program cache |
 | [Flash-decode's probe: a head's positions in two halves](#flash-decodes-probe-a-heads-positions-in-two-halves-2026-10-23-card-0) | 2026-10-23 | each head's attention as two halves on 64 units with **no exchange** (timing only): isolated, 80.6 -> 60.0 us at 512 positions; in a 1.7B step 16.81 / 18.19 -> **17.08 / 17.71 ms**, 19.7 us a layer at `Step(512)` before any exchange, below the 20 us-after-exchanges stop rule; stopped, A5 parked; today's job does not fit L1 past 512 positions, halves fit to 1024 |
@@ -355,6 +358,90 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## GDDR reused within a capture (2026-10-24, card 0)
+
+[long-context.md](../plans/long-context.md) 1.G. `traced_generation_stream_ceiling`, 1.7B, `TT_TILES=all`,
+`TT_GEN_MAX_LEN=8192`, `TT_GEN_PROMPTS=1000,7992`, `TT_GEN_NEW=4`, 2 warmups and 3 samples, release.
+
+| | No reuse, chunks of 64 (`1792816593`) | Chunk captures reuse (`TT_CHUNK_REUSE=1`, the default since), 64 (`1792817025`) | Reuse, chunks of 512 (`1792817342`) |
+|---|--:|--:|--:|
+| GDDR free after the build, all / fullest channel | 2.10 / 0.26 GB | **17.78 / 2.22** | 14.79 / 1.85 |
+| Build, first / second | 226.3 / 70.5 s | 126.9 / 56.0 | 182.5 / 112.9 |
+| Prefill, 1,000 tokens | 1,236 ms | 1,255 | **1,011** |
+| Prefill, 7,992 tokens | 18,323 ms | 18,438 | **16,877** |
+| Decode step after 1,000 / 7,992 | 26.07 / 54.87 ms | 25.98 / 54.98 | 26.05 / 54.92 |
+
+- The 1.7B's chunk traces held ~15.7 GB of intermediates (every layer's scores, a trace a length); reused, each holds
+  about one layer's. Without it, a 512-token chunk's capture at 8,192 positions needs ~48 GB.
+- `step188` (card 1, `1792815355`, no reuse): 0.34 GB free after its build, 26.85 GB once its traces are released.
+- A 512-token chunk is only 1.09-1.22x faster: its products run at the same GDDR-bound rate as a 64-token chunk's
+  ([below](#how-much-of-the-cards-compute-a-long-prefill-uses-2026-10-24-card-0)).
+
+## How much of the card's compute a long prefill uses (2026-10-24, card 0)
+
+Asked: with prefill chunks this large, is the card's compute saturated? No. Peak is the scoreboard's derived ~166 TFLOPS
+(HiFi4 on 120 tiles; not measured). FLOPs from the 1.7B's shapes: a 64-token chunk's projections 206.4 GFLOP, its
+`qk` and `pv` 51.5 GFLOP each at 8,192 positions (computed over the whole prefix, masked positions included).
+
+- **A whole prefill** (`1792809505`, the D2+D3 bench, 8,192-position cache, chunks of 64):
+
+  | Prompt | TFLOP issued (causal, useful) | Time | TFLOPS issued (useful) | Of ~166 |
+  |---|--:|--:|--:|--:|
+  | 1,000 tokens | 3.4 (3.3) | 1.236 s | 2.78 (2.69) | 1.7% |
+  | 4,000 | 15.1 (14.5) | 6.812 s | 2.22 (2.12) | 1.3% |
+  | 7,992 | 34.3 (32.0) | 18.327 s | 1.87 (1.75) | 1.1% |
+
+- **Inside a chunk** (profile mode, `1792815504`; device spans, medians over replays):
+
+  | `Chunk { c: 64, len }` | Replay | Projections | `qk` | `pv` | softmax (6 ops a layer) | scale and mask |
+  |---|--:|--:|--:|--:|--:|--:|
+  | `len` 1,024 | 82.1 ms | 59.7 ms (3.46 TFLOPS) | 1.5 ms | 2.8 ms | 11.7 ms | 1.1 ms |
+  | `len` 8,192 | 186.5 ms | 55.3 ms (**3.73 TFLOPS**, 2.2%) | 10.9 ms (4.75, 2.9%) | 20.6 ms (2.51, 1.5%) | **78.3 ms** (42%) | 11.4 ms |
+
+  The projections' span is 4% kernels and 91% data: they read 20.4 GB a chunk for 6.9 GB of weights (`B` 13.5 GB,
+  read once a 32-row tile row; `A` 6.8 GB, once a column block) at 369 GB/s. The softmax's SFPU ops move the
+  `[32 x 64, 8192]` scores (67 MB a tensor, six passes a layer) at 172 GB/s, 29% kernels.
+- **The products at prefill shapes, by `m`** (`matmul_throughput`, `TT_MATMUL_SHAPES`, every tile, TF32/HiFi4, traced
+  replay, 2 warmups and 7 samples, `1792816512`):
+
+  | Product | `m` 64 | 256 | 512 | 1,024 | 2,048 |
+  |---|--:|--:|--:|--:|--:|
+  | `gate\|up` `[m,2048]@[2048,16384]` | 3.37 TFLOPS (264 GB/s) | 4.78 (374) | 4.97 (389) | 5.14 (403) | **5.22** (409) |
+  | `down` `[m,8192]@[8192,2048]` | 1.56 (199) | | 2.76 (352) | | **2.82** (360) |
+
+- **What it says:** a product's GDDR traffic grows with `m` as fast as its work (`B` re-read `m / 32` times), so the rate
+  plateaus where GDDR does, at ~3% of the Matrix Unit's peak whatever the chunk size. Larger chunks (1.G) save the
+  per-chunk fixed cost and GDDR, not compute; the lever is operand reuse in the product (each unit holding `A` and
+  `B` strips and streaming `K`, then multicast along the grid: roadmap, "Prefill products that reuse their operands"),
+  and for long prefixes the softmax's passes over the scores (a fused or flash prefill attention).
+
+## A long prompt's prefill: chunks attend to a prefix, the GQA mask read as a block (2026-10-24, card 0)
+
+[long-context.md](../plans/long-context.md) D2 and D3. `traced_generation_stream_ceiling`, 1.7B, `TT_TILES=all`,
+`TT_GEN_MAX_LEN=8192`, chunks of 64, `TT_GEN_PROMPTS=1000,4000,7992`, `TT_GEN_NEW=4`, release, 2 warmups and 3 samples
+(`TT_GEN_SAMPLES=3`; the conditions line prints the default 9), host time of `generate_tokens`' first token (the
+prompt's chunks and the token read back).
+
+| | Before (`1792808294`) | Mask as a block, D3 (`1792809099`, `TT_GEN_PREFIXES=none`) | And a prefix, D2 (`1792809505`) |
+|---|--:|--:|--:|
+| Prefill, 1,000 tokens (16 chunks) | 4,689 ms | 2,987 | **1,236** (809 tokens/s) |
+| Prefill, 4,000 tokens (63 chunks) | 18,463 | 11,759 | **6,812** (587) |
+| Prefill, 7,992 tokens (125 chunks) | 36,626 | 23,328 | **18,327** (436) |
+| A chunk | ~293 ms at every start | ~187 | follows its prefix |
+| Decode step after 1,000 / 4,000 / 7,992 tokens | 26.03 / 36.80 / 54.80 ms | 26.02 / 36.82 / 54.91 | 25.96 / 36.91 / 54.91 |
+| Build, first / second | 179.3 / 61.8 s | 139.2 / 39.7 | 213.5 / 69.3 |
+
+- **The mask's row gather was 36% of a chunk** (293 -> 187 ms): `expanded` built a `(0, row)` list of `kv_heads R` rows
+  for the `[1, 1, 64, 8192]` mask against `[1, 32, 64, 8192]` scores in every layer, ~25 M read entries a chunk. Read as
+  a block (`Broadcast::Block`: plain `READ_RUN`s over the mask's own grid, wrapping every 64 rows) it is a few records a
+  run.
+- **A prefix** (`Shapes::chunk_len`: the smallest step length holding the chunk's rows) cuts each chunk to its context:
+  1,000 tokens 2.4x, 7,992 1.3x (half its chunks still attend to all 8,192). The build captures a chunk trace a length
+  (8 at 8,192), +54% build time (accepted).
+- Bit for bit throughout (gates `step187`, `step227`, `step224`, `step188`). Next for long prompts: larger chunks, which
+  need a capture to reuse GDDR (it holds every layer's scores), and the attention composition's own cost at long
+  prefixes.
 
 ## The 1.7B at 8,192 positions from a 7,992-token prompt (2026-10-24, card 0)
 

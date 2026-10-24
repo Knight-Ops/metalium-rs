@@ -931,6 +931,27 @@ fn never_read_writes_are_dropped_bit_for_bit() {
 
 mod ladder_support;
 
+/// Each planned step moves fewer GDDR bytes than its plain capture, by trace key. A chunk's
+/// capture on more than one unit reuses its own GDDR instead of being planned (`TracedGenerator`,
+/// `docs/plans/long-context.md` 1.G G3), moving what the plain one does; on one unit it is planned.
+fn planned_moves_less(plain: &[(String, u64)], planned: &[(String, u64)]) {
+    for ((key, p), (k2, q)) in plain.iter().zip(planned) {
+        assert_eq!(key, k2);
+        eprintln!("{key}: GDDR {p} B plain, {q} B planned");
+        if key.starts_with("Chunk") {
+            assert!(
+                q <= p,
+                "{key}: the planned trace moves {q} B, the plain {p} B"
+            );
+        } else {
+            assert!(
+                q < p,
+                "{key}: the planned trace moves {q} B, the plain {p} B"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_traced_decoder_keeps_its_planned_traces_bit_for_bit() {
     use burn_tt::{Tt, TtDevice};
@@ -998,14 +1019,7 @@ fn a_traced_decoder_keeps_its_planned_traces_bit_for_bit() {
         let got = planned.generate(&prompt, 4).unwrap();
         ladder_support::assert_same(&got, &want, "residency-planned traces");
         let planned_bytes = bytes(&planned);
-        for ((key, p), (k2, q)) in plain_bytes.iter().zip(&planned_bytes) {
-            assert_eq!(key, k2);
-            eprintln!("{key}: GDDR {p} B plain, {q} B planned");
-            assert!(
-                q < p,
-                "{key}: the planned trace moves {q} B, the plain {p} B"
-            );
-        }
+        planned_moves_less(&plain_bytes, &planned_bytes);
         drop(planned);
         // 2h: the plans are kept by their steps' keys, so a second build captures each trace
         // once, under its plan, and generates the same, bit for bit, moving the same bytes.
@@ -1148,14 +1162,7 @@ fn a_decoder_s_attention_operands_stay_in_l1_bit_for_bit() {
         assert!(steps > 0, "no planned trace ran attention as one op");
         let got = planned.generate(&prompt, 4).unwrap();
         ladder_support::assert_same(&got, &want, "residency-planned traces, 64-wide heads");
-        for ((key, p), (k2, q)) in plain_bytes.iter().zip(&bytes(&planned)) {
-            assert_eq!(key, k2);
-            eprintln!("{key}: GDDR {p} B plain, {q} B planned");
-            assert!(
-                q < p,
-                "{key}: the planned trace moves {q} B, the plain {p} B"
-            );
-        }
+        planned_moves_less(&plain_bytes, &bytes(&planned));
         drop(planned);
         burn_tt::set_residency(d, 0).unwrap();
         burn_tt::set_count_trace_bytes(d, false).unwrap();

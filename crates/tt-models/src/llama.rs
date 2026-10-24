@@ -770,9 +770,24 @@ impl<B: Backend> Llama<B> {
     /// [`Self::step_chunk`] that returns the new state instead of writing it.
     pub fn fixed_chunk(
         &self,
+        x: Tensor<B, 3>,
+        start: Tensor<B, 1, Int>,
+        last: Tensor<B, 1, Int>,
+        cache: &LlamaCache<B>,
+        dtype: DType,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        self.fixed_chunk_within(x, start, last, cache.max_len(), cache, dtype)
+    }
+
+    /// [`Self::fixed_chunk`] attending only to the cache's first `len` positions (every row of
+    /// the chunk below `len`): the same logits, at a cost that follows `len`
+    /// (`FixedCache::chunk_write_within`).
+    pub fn fixed_chunk_within(
+        &self,
         mut x: Tensor<B, 3>,
         start: Tensor<B, 1, Int>,
         last: Tensor<B, 1, Int>,
+        len: usize,
         cache: &LlamaCache<B>,
         dtype: DType,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
@@ -780,13 +795,13 @@ impl<B: Backend> Llama<B> {
         let hidden = self.config.hidden;
         let max_len = cache.max_len();
         assert!(
-            n == 1 && h == hidden && c <= max_len,
-            "a chunk of at most {max_len} tokens"
+            n == 1 && h == hidden && c <= len && len <= max_len,
+            "a chunk of {c} tokens attending to {len} of {max_len} positions"
         );
         if x.dtype() != dtype {
             x = x.cast(dtype);
         }
-        let (write, own) = cache.kv.chunk_write(start, c);
+        let (write, own) = cache.kv.chunk_write_within(start, c, len);
         let rope = cache.rope.at(own.clamp_max(max_len as i64 - 1));
         let (x, state) = self.layers_fixed(x, &rope, cache, &write);
         let row = self
@@ -871,10 +886,11 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         tokens: Tensor<B, 2, Int>,
         start: Tensor<B, 1, Int>,
         last: Tensor<B, 1, Int>,
+        len: usize,
         cache: &LlamaCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let x = self.embed(tokens);
-        self.fixed_chunk(x, start, last, cache, cache.kv.dtype())
+        self.fixed_chunk_within(x, start, last, len, cache, cache.kv.dtype())
     }
 
     fn step(

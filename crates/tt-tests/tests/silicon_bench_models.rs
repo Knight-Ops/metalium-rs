@@ -1213,8 +1213,10 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
 /// could stay in L1 between ops; `docs/plans/planned-l1-residency.md` Phase 1).
 ///
 /// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
-/// cache with one 64-token chunk; prompts of 32 and 256 tokens (or the comma-separated
-/// `TT_GEN_PROMPTS`), `TT_GEN_NEW` tokens each.
+/// cache with 64-token chunks (or the comma-separated `TT_GEN_CHUNKS`); prompts of 32 and 256
+/// tokens (or the comma-separated `TT_GEN_PROMPTS`), `TT_GEN_NEW` tokens each, each timed for its
+/// prefill and its median decode step over `TT_GEN_SAMPLES` samples (default 9). Chunks attend to
+/// the step lengths (or the comma-separated `TT_GEN_PREFIXES`, `none` for the whole cache).
 /// NC's waits over one generation of `new` tokens from a `len`-token prompt
 /// (`burn_tt::probe_nc_waits`), per decode step (the prompt's replays included): the units' mean
 /// and the busiest unit's, in us at the profile mode's measured 1350 ticks/us.
@@ -1297,7 +1299,21 @@ fn traced_generation_stream_ceiling() {
         );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = m.fused();
-        let shapes = Shapes::new(max_len, &[64]);
+        // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
+        let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
+            v.split(',').map(|n| n.trim().parse().unwrap()).collect()
+        });
+        // The lengths a chunk attends to (`TT_GEN_PREFIXES`, comma-separated; `none` for the
+        // whole cache, as before `docs/plans/long-context.md` D2; default the step lengths).
+        let shapes = match std::env::var("TT_GEN_PREFIXES").as_deref() {
+            Ok("none") => Shapes::new(max_len, &chunks).with_prefixes(&[]),
+            Ok(v) => Shapes::new(max_len, &chunks).with_prefixes(
+                &v.split(',')
+                    .map(|n| n.trim().parse().unwrap())
+                    .collect::<Vec<usize>>(),
+            ),
+            Err(_) => Shapes::new(max_len, &chunks),
+        };
         // The build, and a second one (with residency on, its plans cached: one capture a trace;
         // `docs/plans/planned-l1-residency.md` 2h).
         let build = |what: &str| {
@@ -1309,6 +1325,20 @@ fn traced_generation_stream_ceiling() {
                 "host",
                 Stats::of(vec![t.elapsed().as_secs_f64() * 1e3]),
             );
+            // What the weights, the cache and the traces leave of GDDR (`long-context.md` 1.G).
+            let (fullest, all) = burn_tt::gddr_free_bytes(d).unwrap();
+            report(
+                &format!("{name} stream ceiling ({mode}), {what} build, GDDR free"),
+                "GB",
+                "host",
+                Stats::of([all as f64 / 1e9]),
+            );
+            report(
+                &format!("{name} stream ceiling ({mode}), {what} build, GDDR free on the fullest channel"),
+                "GB",
+                "host",
+                Stats::of([fullest as f64 / 1e9]),
+            );
             g
         };
         drop(build("first"));
@@ -1316,10 +1346,12 @@ fn traced_generation_stream_ceiling() {
         let prompts: Vec<usize> = std::env::var("TT_GEN_PROMPTS").map_or(vec![32, 256], |v| {
             v.split(',').map(|n| n.trim().parse().unwrap()).collect()
         });
+        // A long prompt's prefill takes tens of seconds a sample: `TT_GEN_SAMPLES` takes fewer.
+        let samples = env("TT_GEN_SAMPLES", SAMPLES);
         for len in prompts {
             let p = gen_prompt(len, config.vocab);
-            let mut step = Vec::new();
-            for i in 0..WARMUPS + SAMPLES {
+            let (mut prefill, mut step) = (Vec::new(), Vec::new());
+            for i in 0..WARMUPS + samples {
                 // With `TT_PROBE_NC_WAITS=1`, NC's waits over one measured generation (firmware
                 // built with the profile feature): what B's waits for its writer are made of.
                 let nc_waits = nc_waits && i == WARMUPS;
@@ -1331,9 +1363,23 @@ fn traced_generation_stream_ceiling() {
                     report_nc_waits(&burn_tt::probe_nc_waits(d).unwrap(), len, new);
                 }
                 if i >= WARMUPS {
+                    prefill.push(ms(out.times[0]));
                     step.push(median_ms(&out.times[1..]));
                 }
             }
+            // The prompt's chunks and the first token read back (`generate_tokens`' first time).
+            report(
+                &format!("{name} stream ceiling ({mode}), {len}-token prompt, prefill"),
+                "ms",
+                "host",
+                Stats::of(prefill.clone()),
+            );
+            report(
+                &format!("{name} stream ceiling ({mode}), {len}-token prompt, prefill rate"),
+                "tokens/s",
+                "host",
+                Stats::of([len as f64 * 1e3 / median(&prefill)]),
+            );
             report(
                 &format!("{name} stream ceiling ({mode}), {len}-token prompt, decode step"),
                 "ms",
