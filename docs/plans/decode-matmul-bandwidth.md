@@ -275,7 +275,9 @@ unit at once (a convoy; small since P1).
 
 - [ ] Split-K for products with fewer output tiles than units (`o`, `down`): partial sums on two units, then one
   F32 add. This **changes accumulation order** (not bit for bit with today's), so it needs a derived bound and an
-  explicit decision before it is built. Do not start it unless the measured share justifies it.
+  explicit decision before it is built. Do not start it unless the measured share justifies it. Written up
+  2026-10-23 ([split-k-and-flash-decode.md](../proposals/split-k-and-flash-decode.md)): `down` only, ~0.2 ms a step
+  by the handoff's measurement; parked.
 
 ## Out of scope
 

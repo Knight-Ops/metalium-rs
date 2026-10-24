@@ -474,7 +474,21 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         layers 5.6x smaller, prefill's 8.4x (not 16x: the tables of tensor references), but a 1.7B step **0.15 ms
         slower** (16.94 / 18.33 against 16.77 / 18.19, `1792735010`, `1792734860`): a body read from GDDR is fetched as
         often as the layer was. Not the default; its Phase 5 (the body resident in L1) is worth at most the ~0.23 ms of
-        fetches and is not built.
+        fetches and is not built. **A product's longest unit, metered** (2026-10-23, gates `step216`, `step205`): each unit's
+        bytes in a product's span against its time (`skew.tsv`). `gate|up`'s units 0-47 read 5 columns in its span while
+        its 40 prefetching units finish in 13 us; dealing those columns over all 104 (opt-in, `TT_BALANCED_DEAL=1`) is bit
+        for bit but **not faster** (16.81 / 18.21 -> 16.86 / 18.21 ms, `1792763914`, `1792764065`): a unit reads slower as
+        more read, so the span's aggregate rate (~350-390 GB/s) does not move, and the head is slower (830 -> 925 us).
+        The longest unit does not bind; `down`'s firmware stream cap is not built on that evidence. Phase 8's levers are
+        spent at ~430 GB/s a replay (92% of the 469 measured); next is a decision: BF16 weight storage, or split-K /
+        flash-decode with numbers first ([there](decode-to-bandwidth.md#a-products-longest-unit-2026-10-23)). **The
+        order-changing levers, written up** (2026-10-23, [proposal](../proposals/split-k-and-flash-decode.md)):
+        flash-decode ~0.8-1.1 ms at 512 positions (attention 99 us a layer there, 28 at 64; recommended opt-in, variant
+        A), split-K ~0.2 ms (parked). **Flash-decode probed and stopped** (2026-10-23, `TT_PROBE_ATTENTION_SPLIT=1`):
+        two halves a head on 64 units, with no exchange yet, save 19.7 us a layer at `Step(512)` (1.7B 18.19 -> 17.71
+        ms, `1792788575`, `1792788725`) and cost 0.27 ms at shorter steps, below the probe's stop rule; parked. Today's
+        job does not fit L1 past 512 positions (the composition runs there); halves fit to 1024
+        ([log](../learnings/performance-log.md#flash-decodes-probe-a-heads-positions-in-two-halves-2026-10-23-card-0)).
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.
@@ -573,6 +587,29 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         and attended length; and the row scatter per sequence.
   - BF16 weights (half the bytes a token);
   - Llama-3.2-1B or Qwen2.5-1.5B for grouped-query attention, RoPE scaling and QKV biases.
+- [ ] **Long context: the 1.7B at its native 8K agrees with burn-flex; 32K works (synthetic)** (found 2026-10-23, card 0; [long-context.md](long-context.md); the split
+  flash-decode, Part 2, parked by decision 2026-10-23). The 1.7B now builds and decodes at its native 8,192 positions (17.0 / 26.0 ms a
+  step after 32 / 1,000 tokens, `1792793709`). Since: a trace's programs paged into the program cache (only one trace
+  need fit) and two GDDR leaks fixed; synthetic GQA models generate traced equal to eager at 32,768 positions
+  (`1792799289`); the 1.7B from a 7,992-token prompt gives burn-flex's tokens, traced in 38.7 s against 1,847 s
+  (`1792800061`). Left: prefill speed at long prompts, the BF16 cache, past 32K. Flash-decode's oracle is parked on the Matrix Unit model not being bit for bit on full-mantissa
+  operands. Found before: SmolLM2-1.7B's native context is 8,192; the cached Qwen3.6-35B-A3B and Qwen3.8-27B are 262,144.
+  - **The fast attention op is L1-bound:** `attention::fits` holds a head's whole `K` and `V` on one unit:
+    `head_dim` 64 fits 512 positions, not 1024 (~864 at most); `head_dim` 256 ~288, and GQA groups x `dv/32` > 32
+    never fit (Qwen3's 8 or 6 query heads a key/value head at 256). Longer runs as the composition.
+  - **The composition does not build at long lengths:** `TracedGenerator` for the 1.7B fails at `max_len` 2048
+    (`element-wise 0x1f5`, the scale and mask, `1792789393`) and 8192 (`Max over Cols`, `1792789257`): "a list's
+    programs do not fit an empty program cache". **Not an oversized op** (traced 2026-10-23): every held trace's
+    programs share a unit's 240 KiB program cache, and they grow with length (element-wise unpack and pack, and
+    reductions, are unrolled a tile), so the bucket that does not fit fails. Unit 0 was at 232 of 240 KB at 512.
+  - **Prefill costs `max_len` a chunk:** a chunk attends to the whole cache and rewrites it by `mask_where`.
+  - **Plan:** [long-context.md](long-context.md) (Part 1 bit for bit: looped programs, cache-aware sizing, prefill;
+    Part 2: flash-decode past the fit limit, an order change the user allowed there).
+  - **Also:** `attention/widen` widens a BF16 cache to F32 every call (the whole cache a step).
+  - **Qwen3.6/3.8 need more than length:** Gated DeltaNet linear attention (3 of 4 layers), a gated attention output,
+    25% partial rotary (M-RoPE), `head_dim` 256; MoE (256 experts, 8 active) for the 35B-A3B; 52 / 89 GB of BF16
+    weights against 32 GB a card. A 262K cache is 17.2 GB BF16 for the 27B (16 full-attention layers x 4 heads x
+    256 x 2), 5.4 GB for the 35B-A3B.
 - [ ] **Partial ops** (from the old coverage tracker): `float_matmul` edge shapes still
   staged through the host, `mean_dim`, gather/scatter/select, `slice_assign`/`cat`, conv
   acceptance, attention variants, `int_div`/`remainder` on card 1, ND indexing, GMPOOL

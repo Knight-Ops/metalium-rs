@@ -26,6 +26,9 @@ impl Loop {
     }
 }
 
+/// Three role programs and each one's block repeats, as a looped builder returns them.
+pub type LoopedRoles = ([Vec<Instruction>; 3], [Vec<Loop>; 3]);
+
 /// Why a program's loops cannot be handed to the runner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoopError {
@@ -164,6 +167,46 @@ fn span(ins: &[Instruction], ls: &[Loop], lo: u32, hi: u32, out: &mut Vec<Instru
         }
         at = l.end();
     }
+}
+
+/// What a role's stream does to the unpackers and packer, run on the host: the
+/// `Config` words every `UNPACR` and `PACR` reads, and the stream with the
+/// address plumbing (`SETDMAREG`, `ADDDMAREG`, `WRCFG`, `NOP`) left out. The
+/// oracle of a looped role against its unrolled form.
+#[cfg(test)]
+pub(crate) fn transfers(
+    stream: &[Instruction],
+) -> (Vec<std::collections::BTreeMap<u32, u32>>, Vec<u32>) {
+    let mut gpr = [0u32; 64];
+    let mut config = std::collections::BTreeMap::new();
+    let (mut seen, mut rest) = (Vec::new(), Vec::new());
+    for &i in stream {
+        let op = |name: &str| i.operand(name).expect(name);
+        match i.def().key() {
+            "SETDMAREG_Immediate" => {
+                let (half, v) = (op("ResultHalfReg"), op("NewValue"));
+                let (r, shift) = ((half / 2) as usize, 16 * (half % 2));
+                gpr[r] = gpr[r] & !(0xFFFF << shift) | v << shift;
+            }
+            "ADDDMAREG" => {
+                let (l, r) = (op("LeftReg") as usize, op("RightReg") as usize);
+                gpr[op("ResultReg") as usize] = gpr[l].wrapping_add(gpr[r]);
+            }
+            "WRCFG" => {
+                assert_eq!(op("Is128Bit"), 0);
+                config.insert(op("CfgIndex"), gpr[op("InputReg") as usize]);
+            }
+            "NOP" | "SFPNOP" => {}
+            _ if i == crate::datapath::gpr_settled() => {}
+            _ => {
+                if matches!(i.def().mnemonic(), "UNPACR" | "PACR") {
+                    seen.push(config.clone());
+                }
+                rest.push(i.word());
+            }
+        }
+    }
+    (seen, rest)
 }
 
 #[cfg(test)]

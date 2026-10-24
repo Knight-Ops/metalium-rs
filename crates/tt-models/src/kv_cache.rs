@@ -11,8 +11,9 @@
 //! form either way, so a decoder does not depend on the layout.
 //!
 //! A step's position (or a chunk's start) is a tensor. A step's keys and values are written at
-//! the rows that tensor names (`scatter_nd` with `Assign`: one row a head, not the whole cache); a
-//! chunk's land through `mask_where` where a mask built from its start is set. Attention reads
+//! the rows that tensor names (`scatter_nd` with `Assign`: one row a head, not the whole cache),
+//! and a chunk's `c` at the `c` rows from its start the same way, so neither costs the cache's
+//! length (`docs/plans/long-context.md` D1). Attention reads
 //! the positions a step attends to with those later than each query masked. A masked position adds an exact zero to a
 //! softmax's sum and to `P V`, so the step's arithmetic on the positions it attends to is a
 //! growing cache's (`step185_fixed_decode`).
@@ -83,27 +84,17 @@ impl CacheLayout {
 /// How a step's keys and values reach a layer's cache, and which positions each query attends to.
 #[derive(Clone, Debug)]
 pub enum FixedWrite<B: Backend> {
-    /// One token at a position. Position-major, the token's row of every head goes to row
-    /// `rows[0]` (`[1, 1]`, the position) of the cache's `[max_len, kv_heads head_dim]` rows;
-    /// head-major, head `h`'s key or value goes to row `rows[h]` (`[kv_heads, 1]`, `h max_len +
-    /// position`: made once a step, not once a layer) of its `[kv_heads max_len, head_dim]` rows.
-    /// The query attends to the first `len` positions but those set in `later` (`[1, 1, 1, len]`).
+    /// `t` tokens at consecutive positions: a step's one, or a chunk's `c`. Position-major, token
+    /// `i`'s row of every head goes to row `rows[i]` (`[t, 1]`, its position) of the cache's
+    /// `[max_len, kv_heads head_dim]` rows; head-major, head `h`'s key or value of token `i` goes
+    /// to row `rows[h t + i]` (`[kv_heads t, 1]`, `h max_len + position`: made once a step, not
+    /// once a layer) of its `[kv_heads max_len, head_dim]` rows. Query `i` attends to the first
+    /// `len` positions but those set in row `i` of `later` (`[1, 1, t, len]`).
     Masked {
         layout: CacheLayout,
         rows: Tensor<B, 2, Int>,
         later: Tensor<B, 4, Bool>,
         len: usize,
-    },
-    /// A chunk of `c` tokens at the positions set in `here` (the cache's shape, a run from the
-    /// chunk's start). Position-major, cache row `j` takes the chunk's row `index[j]` of its `[c,
-    /// kv_heads head_dim]` rows; head-major, cache row `j` of head `h` takes the chunk's row
-    /// `index[h max_len + j]` of its `[kv_heads c, head_dim]` keys and values. Query `i` attends to
-    /// every position but those set in row `i` of `later` (`[1, 1, c, max_len]`).
-    Chunk {
-        layout: CacheLayout,
-        here: Tensor<B, 4, Bool>,
-        later: Tensor<B, 4, Bool>,
-        index: Tensor<B, 1, Int>,
     },
 }
 
@@ -237,8 +228,10 @@ impl<B: Backend> FixedCache<B> {
         }
     }
 
-    /// The write of `c` tokens from `start` (`[1]`) on, and each token's own position (`[c]`,
-    /// running past `max_len` for a chunk that does: those rows are not written).
+    /// The write of `c` tokens from `start` (`[1]`) on, attending to every position of the cache,
+    /// and each token's own position (`[c]`). Every row must be below `max_len`: a generation's
+    /// schedule keeps them there where `max_len` is a multiple of its largest chunk
+    /// (`generate::Shapes`). Written as a step's are, at the chunk's rows only.
     pub fn chunk_write(
         &self,
         start: Tensor<B, 1, Int>,
@@ -248,13 +241,6 @@ impl<B: Backend> FixedCache<B> {
         assert!(c <= max_len, "a chunk of at most {max_len} tokens");
         let layout = self.layout;
         let positions = self.positions.clone();
-        let from = start.clone().expand([max_len]);
-        let here = positions
-            .clone()
-            .greater_equal(from.clone())
-            .bool_and(positions.clone().lower(from.clone().add_scalar(c as i64)))
-            .reshape([1, 1, max_len, 1])
-            .expand(layout.shape(max_len));
         let own = start.expand([c]) + positions.clone().narrow(0, 0, c);
         let later = positions
             .clone()
@@ -262,25 +248,24 @@ impl<B: Backend> FixedCache<B> {
             .expand([c, max_len])
             .greater(own.clone().reshape([c, 1]).expand([c, max_len]))
             .reshape([1, 1, c, max_len]);
-        let offset = (positions.clone() - from).clamp(0, c as i64 - 1);
-        let index = match layout {
-            CacheLayout::PositionMajor { .. } => offset,
-            CacheLayout::HeadMajor { kv_heads, .. } => {
-                let base = positions
-                    .narrow(0, 0, kv_heads)
-                    .mul_scalar(c as i64)
-                    .reshape([kv_heads, 1])
-                    .expand([kv_heads, max_len]);
-                (base + offset.reshape([1, max_len]).expand([kv_heads, max_len]))
-                    .reshape([kv_heads * max_len])
-            }
+        let rows = match layout {
+            CacheLayout::PositionMajor { .. } => own.clone().reshape([c, 1]),
+            // Head `h`'s token `i` at `h max_len + own[i]`, in the order a `[kv_heads, c]`
+            // reshape of the new keys gives them.
+            CacheLayout::HeadMajor { kv_heads, .. } => (positions
+                .narrow(0, 0, kv_heads)
+                .mul_scalar(max_len as i64)
+                .reshape([kv_heads, 1])
+                .expand([kv_heads, c])
+                + own.clone().reshape([1, c]).expand([kv_heads, c]))
+            .reshape([kv_heads * c, 1]),
         };
         (
-            FixedWrite::Chunk {
+            FixedWrite::Masked {
                 layout,
-                here,
+                rows,
                 later,
-                index,
+                len: max_len,
             },
             own,
         )
@@ -291,7 +276,7 @@ impl<B: Backend> FixedWrite<B> {
     /// The cache's layout this write was made for.
     pub fn layout(&self) -> CacheLayout {
         match self {
-            FixedWrite::Masked { layout, .. } | FixedWrite::Chunk { layout, .. } => *layout,
+            FixedWrite::Masked { layout, .. } => *layout,
         }
     }
 
@@ -308,38 +293,31 @@ impl<B: Backend> FixedWrite<B> {
         );
         match (self, self.layout()) {
             (FixedWrite::Masked { rows, .. }, CacheLayout::PositionMajor { .. }) => {
-                // The token's row (every head's, as its projection laid them out) written over the
+                // Each token's row (every head's, as its projection laid them out) written over the
                 // cache's row at its position: nothing else is read, moved or relaid.
                 let [_, _, max_len, w] = shape;
-                assert_eq!(t, 1, "a step writes one token");
+                assert_eq!(rows.dims(), [t, 1], "a row a token");
                 cache
                     .reshape([max_len, w])
                     .scatter_nd(
                         rows.clone(),
-                        new.swap_dims(1, 2).reshape([1, w]),
+                        new.swap_dims(1, 2).reshape([t, w]),
                         IndexingUpdateOp::Assign,
                     )
                     .reshape(shape)
             }
             (FixedWrite::Masked { rows, .. }, CacheLayout::HeadMajor { .. }) => {
-                // The new row of each head written over the cache's: nothing else is read or
-                // moved.
+                // Each head's new rows written over the cache's: nothing else is read or moved.
                 let [_, _, max_len, _] = shape;
-                assert_eq!(t, 1, "a step writes one token");
+                assert_eq!(rows.dims(), [kv * t, 1], "a row a head and token");
                 cache
                     .reshape([kv * max_len, d])
-                    .scatter_nd(rows.clone(), new.reshape([kv, d]), IndexingUpdateOp::Assign)
+                    .scatter_nd(
+                        rows.clone(),
+                        new.reshape([kv * t, d]),
+                        IndexingUpdateOp::Assign,
+                    )
                     .reshape(shape)
-            }
-            (FixedWrite::Chunk { here, index, .. }, layout) => {
-                // The chunk's rows laid over the whole cache by a row gather, kept where `here` is
-                // set.
-                let rows = match layout {
-                    CacheLayout::PositionMajor { .. } => new.swap_dims(1, 2).reshape([t, kv * d]),
-                    CacheLayout::HeadMajor { .. } => new.reshape([kv * t, d]),
-                };
-                let placed = rows.select(0, index.clone()).reshape(shape);
-                cache.mask_where(here.clone(), placed)
             }
         }
     }
@@ -350,10 +328,8 @@ impl<B: Backend> FixedWrite<B> {
     /// head `h` is the column block `h head_dim` of the positions' rows.
     pub fn attended(&self, cache: Tensor<B, 4>) -> Tensor<B, 4> {
         let [n, c1, max_len, c3] = cache.dims();
-        let len = match self {
-            FixedWrite::Masked { len, .. } => *len,
-            FixedWrite::Chunk { .. } => max_len,
-        };
+        let FixedWrite::Masked { len, .. } = self;
+        let len = *len;
         let cache = if len < max_len {
             cache.slice([0..n, 0..c1, 0..len, 0..c3])
         } else {
@@ -370,7 +346,7 @@ impl<B: Backend> FixedWrite<B> {
     /// The positions each query must not attend to, of those it reads: an attention mask.
     pub fn later(&self) -> Tensor<B, 4, Bool> {
         match self {
-            FixedWrite::Masked { later, .. } | FixedWrite::Chunk { later, .. } => later.clone(),
+            FixedWrite::Masked { later, .. } => later.clone(),
         }
     }
 }

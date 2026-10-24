@@ -266,7 +266,8 @@ pub trait FixedShapeDecoder<B: Backend> {
     /// `tokens` (`[1, c]` ids) from position `start` (`[1]`) on: the logits `[1, vocab]` of chunk
     /// row `last` (`[1]`), and the cache's new state with the chunk's positions written. Rows of a
     /// padded chunk past the prompt may write positions past it (a later step overwrites them
-    /// before anything reads them) and positions at or past `max_len` (which are not written).
+    /// before anything reads them), but none at or past `max_len`: [`Shapes`] keeps a schedule's
+    /// chunks inside the cache.
     fn chunk(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -402,6 +403,16 @@ impl Shapes {
         if !fits(&chunks) {
             return Err(GenerateError::Refused(format!(
                 "chunk sizes {chunks:?} for a cache of {max_len} positions"
+            )));
+        }
+        // A chunk writes its rows only (`FixedCache::chunk_write`), so none may fall past the
+        // cache: [`schedule`] starts every chunk but the last on a multiple of the largest, and
+        // the last at most the largest long, so a cache a multiple of the largest holds them all.
+        let largest = *chunks.last().unwrap();
+        if max_len % largest != 0 {
+            return Err(GenerateError::Refused(format!(
+                "a cache of {max_len} positions for chunks of up to {largest}: it must be a \
+                 multiple of the largest chunk"
             )));
         }
         if steps.last() != Some(&max_len) || !fits(&steps) {

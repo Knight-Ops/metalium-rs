@@ -1398,6 +1398,22 @@ How to read it:
   refuses, so it never reached its tail's arrival); bisecting by capture and then by unit, with a temporary knob,
   found the unit.
 
+## A role's addresses from GPRs: settle the Scalar Unit before `WRCFG` (2026-10-23, card 0)
+
+An element-wise kernel's and a reduction's unpack and pack now take each tile's L1 address from a Tensix GPR stepped
+by `ADDDMAREG`, so a tile's block is the same words for every tile and the runner repeats it
+(`sfpu::kernel::roles_looped`, `sfpu::reduce::roles_looped`; `docs/plans/long-context.md` 1.A). Written as
+`ADDDMAREG` then, at once, the `WRCFG` that reads the GPR into `THCON_SEC0_REG3_Base_address`, silicon unpacked from
+the GPR's old value where ttsim read the new one: every multi-tile element-wise and reduce gate failed on card 0
+(`1792793167`; an `add` returned `A`, `B` read from elsewhere). A `STALLWAIT` blocking the Configuration Unit on C0
+(this thread's Scalar Unit work outstanding) between them fixed all 39 (`1792793443`, `1792793456`):
+`datapath::gpr_settled`, before every `WRCFG` of a stepped GPR. tt-metal's Blackhole LLK does the same after its own
+GPR writes (`TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::THCON)`). The Wormhole page `ScalarUnit.md` says a thread's
+next instruction waits for a Scalar Unit instruction to complete; on Blackhole, for a `WRCFG` reading the result, that
+is not enough. `SETDMAREG` then `WRCFG` (every `config_program`) has always worked without it. The matmul's
+`gpr_step` (`ADDDMAREG`, `ADDDMAREG`, `WRCFG`, `WRCFG`) has none and passes; it is not known to be safe by
+construction. ttsim divergence row 104.
+
 ## Handling silicon runs
 
 Rules that held through the Phase 10 close-out; follow them for any new probe.

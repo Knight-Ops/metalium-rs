@@ -665,9 +665,11 @@ impl Drop for TracedInference {
 /// Two things to know:
 /// - A capture runs its step once, so it writes the state. A model whose state is a
 ///   cache must not rely on what the cache held before a capture.
-/// - The traces share the program cache (240 KiB of L1 a unit), and a capture that
-///   does not fit fails the attachment for good (its error is sticky). Measure the
-///   set with [`SharedStateTraces::footprint`] and reattach to retry with fewer.
+/// - Each trace's programs must fit a unit's program cache (240 KiB of L1) alone; the set need
+///   not fit together, since a replay puts back what another trace's programs took the room of
+///   (`tt_kernels::program_cache`, paged at a switch between traces). A capture that does not
+///   fit alone fails the attachment for good (its error is sticky). Measure the set with
+///   [`SharedStateTraces::footprint`].
 #[derive(Debug)]
 pub struct SharedStateTraces<K: Ord + Copy + std::fmt::Debug = usize> {
     device: TtDevice,
@@ -761,6 +763,7 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
             }
             h.finish()
         };
+        let held: Vec<K> = self.traces.keys().copied().collect();
         let (trace, first) =
             TracedInference::capture_donating_planned(inputs, &donated, plan_key, || {
                 let (outs, new) = f();
@@ -786,6 +789,12 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
                     return (outs, Vec::new());
                 }
                 (outs, new.into_iter().zip(state.iter().cloned()).collect())
+            })
+            // Which trace failed, and which hold the program cache beside it.
+            .map_err(|cause| TtError::Op {
+                what: format!("the capture of {key:?} beside the traces {held:?}"),
+                device: self.device,
+                cause: std::sync::Arc::new(cause),
             })?;
         if let Some(why) = mismatch {
             drop(trace);
@@ -845,6 +854,13 @@ impl<K> SetFootprint<K> {
     fn units(&self) -> impl Iterator<Item = &tt_kernels::trace::UnitFootprint> {
         self.traces.iter().flat_map(|(_, u)| u.iter().flatten())
     }
+}
+
+/// GDDR bytes free on `device`, on its fullest channel and in all, once what is queued has run.
+/// Dev-facing: what a run leaves (`docs/plans/long-context.md`).
+#[doc(hidden)]
+pub fn gddr_free_bytes(device: TtDevice) -> Result<(u64, u64), TtError> {
+    server::run(device, move |e, _| e.gddr_free_bytes())
 }
 
 /// Give `device`'s timestamper `bytes` of L1 per tile, taken from the top of the program

@@ -570,6 +570,11 @@ pub trait Engine {
     fn set_profile_buffer(&mut self, _bytes: Option<u64>) -> Result<(), TtError> {
         Err(no_traces())
     }
+    /// GDDR bytes free on the fullest channel and in all (`Session::dram_free_bytes_by_channel`).
+    #[doc(hidden)]
+    fn gddr_free_bytes(&mut self) -> Result<(u64, u64), TtError> {
+        Err(no_traces())
+    }
     /// Count what each op of every trace captured from here on moves through GDDR
     /// (`Session::set_count_trace_bytes`), read back with [`Engine::trace_ops`].
     #[doc(hidden)]
@@ -4031,6 +4036,12 @@ impl Engine for KmdEngine {
     fn set_count_trace_bytes(&mut self, on: bool) -> Result<(), TtError> {
         self.session.set_count_trace_bytes(on);
         Ok(())
+    }
+    fn gddr_free_bytes(&mut self) -> Result<(u64, u64), TtError> {
+        self.session.sync().map_err(TtError::from)?;
+        self.session
+            .dram_free_bytes_by_channel()
+            .ok_or_else(|| TtError::Device("no GDDR attached".into()))
     }
     fn set_l1_region(&mut self, bytes: u64) -> Result<(), TtError> {
         self.session.set_l1_region(bytes);

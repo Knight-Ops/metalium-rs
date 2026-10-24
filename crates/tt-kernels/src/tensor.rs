@@ -40,9 +40,12 @@ pub enum TensorError {
     Transport(TransportError),
     Mover(DmError),
     Run(RunError),
-    /// No channel has room for the tensor's share of slots.
+    /// No channel has room for the tensor's share of slots: the channel that refused it had
+    /// `free` bytes, the largest run of them `largest` (less than the share's, or it would fit).
     OutOfMemory {
         slots: u64,
+        free: u64,
+        largest: u64,
     },
     /// Shapes that do not compose, or an op this path does not support.
     Shape(String),
@@ -86,9 +89,15 @@ impl std::fmt::Display for TensorError {
             TensorError::Transport(e) => write!(f, "{e}"),
             TensorError::Mover(e) => write!(f, "{e}"),
             TensorError::Run(e) => write!(f, "{e}"),
-            TensorError::OutOfMemory { slots } => {
-                write!(f, "no room in GDDR for {slots} tile slots per channel")
-            }
+            TensorError::OutOfMemory {
+                slots,
+                free,
+                largest,
+            } => write!(
+                f,
+                "no room in GDDR for {slots} tile slots per channel: the channel that refused \
+                 them has {free} bytes free, the largest run {largest}"
+            ),
             TensorError::Shape(s) => write!(f, "{s}"),
             TensorError::Trace(e) => write!(f, "{e}"),
             TensorError::Elem { op, got, wants } => write!(
@@ -118,9 +127,17 @@ pub struct Placement {
     /// Did this placement allocate its slots? A view ([`DramTensor::rows_view`])
     /// did not, and freeing it gives nothing back.
     owned: bool,
+    /// When its slots were allocated, in the allocator's order (a view's are its parent's):
+    /// what a [`FreeSnapshot`] tells apart from its own moment.
+    serial: u64,
 }
 
 impl Placement {
+    /// The bytes it takes on each of its channels.
+    pub(crate) fn channel_bytes(&self) -> u64 {
+        self.slots * self.slot_bytes
+    }
+
     pub(crate) fn tensor_ref(&self, ct: usize) -> TensorRef {
         let mut r = TensorRef {
             n: self.channels.len() as u8,
@@ -198,12 +215,22 @@ impl Placement {
 pub(crate) struct FreeSnapshot {
     channels: Vec<DramChannel>,
     free: Vec<BTreeMap<u64, u64>>,
+    /// The serial the allocator's next placement takes.
+    serial: u64,
 }
 
 impl FreeSnapshot {
     /// Were all of `p`'s slots free then -- so allocated since, and nothing
-    /// captured then can name them?
+    /// captured then can name them? A placement allocated after the snapshot was: what then
+    /// occupied its slots was freed since, and a trace that named that had its free deferred
+    /// until the trace's release, so it was not, or its slots would not have come back. Without
+    /// that, a slot in use at a trace's end and freed and reused since would be the trace's for
+    /// good, and every eager op beside live traces would leak its buffers into them
+    /// (`docs/plans/long-context.md`: an eager 32K prefill beside 13 traces filled 31 GB).
     pub(crate) fn was_free(&self, p: &Placement) -> bool {
+        if p.serial >= self.serial {
+            return true;
+        }
         p.channels.iter().zip(&p.base).all(|(c, &at)| {
             let len = p.slots * p.slot_bytes;
             let Some(i) = self.channels.iter().position(|k| k == c) else {
@@ -229,6 +256,8 @@ pub struct DramAlloc {
     /// The tensors allocated since [`DramAlloc::start_log`], in order, while one is kept: a
     /// capture's own tensors (`crate::residency`).
     log: Option<Vec<Placement>>,
+    /// The next placement's [`Placement::serial`].
+    serial: u64,
 }
 
 impl DramAlloc {
@@ -244,6 +273,7 @@ impl DramAlloc {
             channels,
             free,
             log: None,
+            serial: 0,
         }
     }
 
@@ -281,6 +311,7 @@ impl DramAlloc {
         if free > len {
             self.free[channel].insert(at + len, free - len);
         }
+        self.serial += 1;
         Ok(Placement {
             channels: vec![self.channels[channel]],
             base: vec![at],
@@ -289,6 +320,7 @@ impl DramAlloc {
             tiles: 1,
             first: 0,
             owned: true,
+            serial: self.serial - 1,
         })
     }
 
@@ -309,11 +341,17 @@ impl DramAlloc {
         let mut base = Vec::with_capacity(n);
         for i in 0..n {
             let Some((&at, &len)) = self.free[i].iter().find(|(_, &len)| len >= bytes) else {
+                let free = self.free[i].values().sum();
+                let largest = self.free[i].values().copied().max().unwrap_or(0);
                 // Give back what this call already took.
                 for (j, &b) in base.iter().enumerate() {
                     release(&mut self.free[j], b, bytes);
                 }
-                return Err(TensorError::OutOfMemory { slots });
+                return Err(TensorError::OutOfMemory {
+                    slots,
+                    free,
+                    largest,
+                });
             };
             self.free[i].remove(&at);
             if len > bytes {
@@ -321,6 +359,7 @@ impl DramAlloc {
             }
             base.push(at);
         }
+        self.serial += 1;
         let p = Placement {
             channels: self.channels.clone(),
             base,
@@ -329,6 +368,7 @@ impl DramAlloc {
             tiles,
             first: 0,
             owned: true,
+            serial: self.serial - 1,
         };
         if let Some(log) = &mut self.log {
             log.push(p.clone());
@@ -357,12 +397,18 @@ impl DramAlloc {
         FreeSnapshot {
             channels: self.channels.clone(),
             free: self.free.clone(),
+            serial: self.serial,
         }
     }
 
     /// The chip's usable channels, in the allocator's order.
     pub(crate) fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Free bytes on every channel together.
+    pub fn free_bytes_total(&self) -> u64 {
+        self.free.iter().flat_map(|f| f.values()).sum()
     }
 
     /// Free bytes on the fullest channel.
@@ -1300,6 +1346,7 @@ pub fn matmul_dram(
             prefetch_units: [usize::MAX; 2],
             handoff: None,
             second_job: false,
+            balanced_deal: false,
         },
     )
 }
@@ -1379,6 +1426,10 @@ pub(crate) struct Reads {
     /// A `K`-whole product's prefetching units each take a second job of one column, its `B` in a
     /// ring below the first's and read ahead with it ([`BlockPlan::push_prefetched_jobs`]).
     pub second_job: bool,
+    /// A `K`-whole product whose own units would run more than a round deals the columns its span
+    /// reads over its prefetching units too, not its own units alone
+    /// ([`BlockPlan::push_prefetched_jobs`], [`balanced_shares`]).
+    pub balanced_deal: bool,
 }
 
 /// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
@@ -1667,6 +1718,7 @@ pub(crate) fn matmul_dram_prefetching(
             && kc < kt,
         busy: busy.to_vec(),
         second_job: reads.second_job,
+        balanced_deal: reads.balanced_deal,
     };
     let prefetch = &prefetch[..prefetch
         .len()
@@ -1785,6 +1837,8 @@ struct BlockPlan {
     busy: Vec<Option<u64>>,
     /// [`Reads::second_job`].
     second_job: bool,
+    /// [`Reads::balanced_deal`].
+    balanced_deal: bool,
 }
 
 /// A one-tile-row product's output columns, one run a job, in the order a
@@ -1814,6 +1868,17 @@ pub fn thin_runs(
             .map(|r| full + r.start..full + r.end),
     );
     Some(out)
+}
+
+/// How many of `left` columns each of `deal` units takes ([`Reads::balanced_deal`]): as even as
+/// integer division allows, the remainder to the last units of the deal (a product's prefetching
+/// units, which sit after its own and are served fastest; profile `1792629809`).
+pub fn balanced_shares(left: usize, deal: usize) -> Vec<usize> {
+    let Some(each) = left.checked_div(deal) else {
+        return Vec::new();
+    };
+    let more = deal - left % deal;
+    (0..deal).map(|d| each + usize::from(d >= more)).collect()
 }
 
 impl BlockPlan {
@@ -2138,10 +2203,19 @@ impl BlockPlan {
             false => Vec::new(),
         };
         let moved = firsts + seconds.len();
+        // The columns the span reads dealt over the prefetching units too: where the plan's own
+        // units would run more than a round, the prefetching units otherwise finish their job read
+        // ahead in ~13 us and wait at the barrier for units reading 5 columns more (a 1.7B step's
+        // `gate|up`, profile `1792762439`).
+        let balanced = self.balanced_deal
+            && seconds.is_empty()
+            && !self.stream_k
+            && self.staging == Staging::Slots
+            && busy_rounds > 1;
         let mut regular = Vec::new();
         // The regular jobs' columns, in their order (a streamed job's one).
         let mut regular_cols = Vec::new();
-        if moved < nt {
+        if moved < nt && !balanced {
             let rest = nt - moved;
             let runs = thin_runs([1, kt, rest], [kt, nc], Staging::Slots, self.units)
                 .unwrap_or_else(|| {
@@ -2200,6 +2274,9 @@ impl BlockPlan {
             early.push(job);
         }
         let units = self.units.max(1);
+        if balanced {
+            return self.push_balanced_jobs(jobs, refs, transposed, early, prefetch, spread);
+        }
         let mut handed = Vec::new();
         let mut handed_ahead = Vec::new();
         if let Some((at, rp)) = handoff.filter(|_| self.stream_k) {
@@ -2345,6 +2422,79 @@ impl BlockPlan {
         Ok(handed)
     }
 
+    /// The jobs of a product dealt by [`Reads::balanced_deal`], laid a round of `spread` units at a
+    /// time: each prefetching unit's job read ahead (`early`, columns `0..firsts`) and the plan's
+    /// own units' first round (read ahead where [`BUSY_PREFETCH`] allows) as without it; then the
+    /// columns left, in [`balanced_shares`] over the plan's units and then the prefetching ones, in
+    /// runs of at most the plan's width, each unit's after its first job in the same ring. Every
+    /// output tile's accumulation is unchanged: only which unit holds it moves.
+    fn push_balanced_jobs(
+        &self,
+        jobs: &mut Vec<Job>,
+        refs: [TensorRef; 3],
+        transposed: [bool; 2],
+        early: Vec<Job>,
+        prefetch: &[usize],
+        spread: usize,
+    ) -> Result<Vec<Job>> {
+        let [_, _, nt] = self.tiles;
+        let nc = self.block[1];
+        let units = self.units.max(1);
+        let firsts = (prefetch.len() * nc).min(nt);
+        let lead = (units * nc).min(nt - firsts);
+        let mut first_round = Vec::new();
+        BlockPlan {
+            col_runs: Some(
+                (0..lead)
+                    .step_by(nc)
+                    .map(|j| firsts + j..firsts + (j + nc).min(lead))
+                    .collect(),
+            ),
+            ..self.clone()
+        }
+        .push_jobs(&mut first_round, refs, transposed)?;
+        let deal: Vec<usize> = (0..units)
+            .chain(prefetch.iter().copied().take(early.len()))
+            .collect();
+        let mut at = firsts + lead;
+        let mut later: Vec<Vec<Job>> = Vec::with_capacity(deal.len());
+        for share in balanced_shares(nt - at, deal.len()) {
+            let mut own = Vec::new();
+            if share > 0 {
+                BlockPlan {
+                    units: 1,
+                    col_runs: Some(
+                        (0..share)
+                            .step_by(nc)
+                            .map(|j| at + j..at + (j + nc).min(share))
+                            .collect(),
+                    ),
+                    busy: Vec::new(),
+                    ..self.clone()
+                }
+                .push_jobs(&mut own, refs, transposed)?;
+            }
+            at += share;
+            later.push(own);
+        }
+        debug_assert_eq!(at, nt, "every column dealt");
+        let rounds = 1 + later.iter().map(Vec::len).max().unwrap_or(0);
+        let mut laid: Vec<Job> = vec![Vec::new(); rounds * spread];
+        for (u, job) in first_round.into_iter().enumerate() {
+            laid[u] = job;
+        }
+        for (job, &u) in early.into_iter().zip(prefetch) {
+            laid[u] = job;
+        }
+        for (&u, own) in deal.iter().zip(later) {
+            for (r, job) in own.into_iter().enumerate() {
+                laid[(1 + r) * spread + u] = job;
+            }
+        }
+        jobs.extend(laid);
+        Ok(Vec::new())
+    }
+
     /// The second jobs of `count` prefetching units ([`Reads::second_job`]): columns `first..`, one
     /// each, each its gather's `B` reads (split off, for the unit's prefetch list) and the job left
     /// reading the packed `A`. Its `B` ring is directly below the first job's, which sits against
@@ -2373,6 +2523,7 @@ impl BlockPlan {
                     resident_a: false,
                     busy: Vec::new(),
                     second_job: false,
+                    balanced_deal: false,
                     ..self.clone()
                 };
                 let mut one = Vec::new();
@@ -2967,6 +3118,7 @@ pub(crate) fn matmul_dram_batched_limited(
         stream_k: false,
         busy: Vec::new(),
         second_job: false,
+        balanced_deal: false,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -3800,13 +3952,17 @@ fn measure_sfpu_group(
             .0
             .map(|p| p.len())
     };
-    let (one, two) = (lens(1), lens(2));
+    // Two tiles and three: a run of two or more repeats one tile's block
+    // (`sfpu::kernel::roles_looped`), so nothing grows a tile, and the bound is
+    // only the arena's; a role that did grow is bounded by its slot.
+    let (two, three) = (lens(2), lens(3));
     let max = tt_isa::mailbox::PROGRAM_MAX as usize;
     let by_program = (0..3)
         .map(|r| {
-            let per = two[r] - one[r];
-            let fixed = one[r] - per;
-            (max - fixed) / per.max(1)
+            let per = three[r].saturating_sub(two[r]);
+            let fixed = two[r].saturating_sub(2 * per);
+            assert!(fixed < max, "a run's fixed program exceeds its slot");
+            (max - fixed).checked_div(per).unwrap_or(usize::MAX)
         })
         .min()
         .unwrap();
@@ -3990,7 +4146,7 @@ pub fn sfpu_reduce_then(
     for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
         let half = pipelined.then(|| half_of(j, units));
-        let (layout, roles) = match reduce_programs(op, axis, len, per, valid, half, then) {
+        let (layout, roles, loops) = match reduce_programs(op, axis, len, per, valid, half, then) {
             Ok(p) => p,
             Err(e) => {
                 alloc.free(&out.placement);
@@ -4038,7 +4194,7 @@ pub fn sfpu_reduce_then(
                 roles,
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
-                loops: Default::default(),
+                loops,
                 half,
             },
             Step::List {
@@ -4850,19 +5006,20 @@ fn reduce_chunked(
                 what: "reduce continuation gather",
                 entries: gather,
             });
+            let (roles, loops) = continuation_roles(
+                &c,
+                op,
+                axis,
+                first > 0,
+                count,
+                if last { valid } else { 32 },
+                last,
+            );
             steps.push(Step::Kernel {
-                roles: Arc::new(continuation_roles(
-                    &c,
-                    op,
-                    axis,
-                    first > 0,
-                    count,
-                    if last { valid } else { 32 },
-                    last,
-                )),
+                roles: Arc::new(roles),
                 init: c.layout.init.clone(),
                 mop: Box::new([None; 3]),
-                loops: Default::default(),
+                loops: Arc::new(loops),
                 half: None,
             });
             steps.push(Step::List {
@@ -4888,7 +5045,11 @@ fn reduce_chunked(
     Ok(Work { out, jobs })
 }
 
-type ReducePrograms = (crate::sfpu::reduce::Layout, Arc<[Vec<Instruction>; 3]>);
+type ReducePrograms = (
+    crate::sfpu::reduce::Layout,
+    Arc<[Vec<Instruction>; 3]>,
+    Arc<[Vec<crate::code::Loop>; 3]>,
+);
 
 /// Most output tiles one reduce run may take, from the slots the data arena
 /// (half of it, if `half`) holds and the role programs' length per output
@@ -4967,7 +5128,7 @@ fn measure_reduce_group(
     half: bool,
     then: ReduceThen,
 ) -> Option<usize> {
-    use crate::sfpu::reduce::{math_programs, plan_layout, roles};
+    use crate::sfpu::reduce::{math_programs, plan_layout, roles_code};
     const GROUP: usize = 64;
     let arena = if half {
         crate::matmul::half()
@@ -4983,7 +5144,10 @@ fn measure_reduce_group(
     let fin = finishing(op, axis, then)?;
     let lens = |n: usize| -> Option<[usize; 3]> {
         let layout = plan_layout(n, per).ok()?;
-        Some(roles(&layout, &inputs, &fin).map(|p| p.len()))
+        // As stored: a repeated block once, with its loop table
+        // (`sfpu::reduce::roles_code`).
+        let (code, loops) = roles_code(&layout, &inputs, &fin);
+        Some(std::array::from_fn(|t| code[t].len() + loops[t].len() + 1))
     };
     let max = tt_isa::mailbox::PROGRAM_MAX as usize;
     let one = lens(1)?;
@@ -4993,11 +5157,20 @@ fn measure_reduce_group(
     if by_slots == 1 {
         return Some(1);
     }
+    // Two outputs and three: looped, a further output costs nothing.
     let two = lens(2)?;
+    if two.iter().any(|&l| l > max) {
+        return Some(1);
+    }
+    if by_slots == 2 {
+        return Some(2);
+    }
+    let three = lens(3)?;
     let by_program = (0..3)
         .map(|r| {
-            let per_out = (two[r] - one[r]).max(1);
-            (max - (one[r] - per_out)) / per_out
+            let per_out = three[r].saturating_sub(two[r]);
+            let fixed = two[r].saturating_sub(2 * per_out);
+            (max - fixed).checked_div(per_out).unwrap_or(usize::MAX)
         })
         .min()
         .unwrap();
@@ -5014,7 +5187,9 @@ fn reduce_programs(
     half: Option<u8>,
     then: ReduceThen,
 ) -> Result<ReducePrograms> {
-    use crate::sfpu::reduce::{math_programs, plan_layout, plan_layout_in, roles, Axis, ReduceOp};
+    use crate::sfpu::reduce::{
+        math_programs, plan_layout, plan_layout_in, roles_code, Axis, ReduceOp,
+    };
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     type Key = (
@@ -5061,7 +5236,8 @@ fn reduce_programs(
     let (inputs, _) = math_programs(op, axis, per, valid);
     let fin = finishing(op, axis, then)
         .ok_or_else(|| TensorError::Shape("a reduction's finishing kind is no exact one".into()))?;
-    let p = (layout.clone(), Arc::new(roles(&layout, &inputs, &fin)));
+    let (roles, loops) = roles_code(&layout, &inputs, &fin);
+    let p = (layout.clone(), Arc::new(roles), Arc::new(loops));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, (p.clone(), planned));
@@ -6195,6 +6371,23 @@ mod tests {
         MatmulPadding, OpPadding, Pad, PadNeed, Step, SumRows, TransferBatch, TRANSFER_SIDE_MAX,
     };
     use crate::kind;
+
+    /// A placement allocated after a snapshot was free then, though its slots were in use at the
+    /// snapshot: what held them was freed and reused since. Before that rule, a slot in use at a
+    /// trace's end was the trace's for good, and an eager op's buffer landing on it could not be
+    /// freed while the trace lived.
+    #[test]
+    fn a_placement_allocated_after_a_snapshot_was_free_then() {
+        let mut alloc = DramAlloc::new(&tt_isa::dram::Dram::FULL);
+        let a = alloc.alloc(64).unwrap();
+        let snapshot = alloc.snapshot();
+        assert!(!snapshot.was_free(&a), "in use then");
+        alloc.free(&a);
+        let b = alloc.alloc(64).unwrap();
+        assert_eq!(b.base, a.base, "on the same slots");
+        assert!(snapshot.was_free(&b));
+        assert!(!snapshot.was_free(&a), "what was in use then still was");
+    }
     use tt_isa::dm::TILE_DATA;
     use tt_isa::dm::{fill, op, record};
     use tt_isa::dram::Dram;
@@ -6648,6 +6841,7 @@ mod tests {
                 prefetch_units: [usize::MAX; 2],
                 handoff: None,
                 second_job: false,
+                balanced_deal: false,
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,
@@ -6734,6 +6928,7 @@ mod tests {
                         prefetch_units: [usize::MAX; 2],
                         handoff: None,
                         second_job: false,
+                        balanced_deal: false,
                     },
                 )
                 .unwrap();
@@ -6814,6 +7009,7 @@ mod tests {
                     prefetch_units: [usize::MAX; 2],
                     handoff: None,
                     second_job: false,
+                    balanced_deal: false,
                 },
                 &[],
                 units,
@@ -6903,6 +7099,7 @@ mod tests {
                     prefetch_units: [usize::MAX; 2],
                     handoff: None,
                     second_job: false,
+                    balanced_deal: false,
                 },
             )
             .unwrap();
@@ -6983,6 +7180,7 @@ mod tests {
                         prefetch_units: [usize::MAX, 40],
                         handoff: None,
                         second_job: false,
+                        balanced_deal: false,
                     },
                     &prefetch,
                     spread,
@@ -7036,6 +7234,145 @@ mod tests {
                     assert!(ahead.is_empty());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn balanced_shares_are_even_with_the_remainder_last() {
+        assert!(super::balanced_shares(5, 0).is_empty());
+        assert_eq!(super::balanced_shares(0, 3), [0, 0, 0]);
+        assert_eq!(super::balanced_shares(7, 3), [2, 2, 3]);
+        assert_eq!(super::balanced_shares(2, 4), [0, 0, 1, 1]);
+        for (left, deal) in [(304, 104), (128, 104), (1, 1), (999, 7)] {
+            let s = super::balanced_shares(left, deal);
+            assert_eq!(s.iter().sum::<usize>(), left);
+            assert!(
+                s.windows(2).all(|w| w[0] <= w[1]),
+                "{left} over {deal}: {s:?}"
+            );
+            assert!(s[deal - 1] - s[0] <= 1, "{left} over {deal}: {s:?}");
+        }
+    }
+
+    /// A `K`-whole prefetched product dealt balanced ([`super::Reads::balanced_deal`]): the
+    /// prefetching units' jobs read ahead and the plan's units' first round as without it, then
+    /// the columns left over both, no unit more than its share and the remainder on the
+    /// prefetching units; every column exactly once. Nothing changes where the plan's own units
+    /// would run one round (`qkv`), or with it off.
+    #[test]
+    fn a_balanced_deal_gives_each_unit_its_in_span_share() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let (units, spread) = (64, 120);
+        let prefetch: Vec<usize> = (units..spread).collect();
+        let deal = |n: usize, on: bool| {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, 2048).unwrap();
+            let b = DramTensor::alloc(&mut alloc, 2048, n).unwrap();
+            let p = DramTensor::alloc(&mut alloc, 64, 32).unwrap();
+            let (work, ..) = super::matmul_dram_prefetching(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                None,
+                super::Reads {
+                    thin: true,
+                    resident_a: true,
+                    unpack_b: false,
+                    packed_a: Some(p.tensor_ref()),
+                    stream_k: false,
+                    stream_prefetch: true,
+                    prefetch_units: [40, 40],
+                    handoff: None,
+                    second_job: false,
+                    balanced_deal: on,
+                },
+                &prefetch,
+                spread,
+                &[],
+            )
+            .unwrap();
+            work.jobs
+        };
+        // Each job's columns, from its gathers' headers, wherever its lists sit.
+        let columns = |job: &Job| -> Vec<usize> {
+            job.iter()
+                .filter_map(|step| match step {
+                    Step::List { entries, .. } => Some(entries),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|e| e[0] == record::GATHER)
+                .flat_map(|e| e[6] as usize..(e[6] + e[7]) as usize)
+                .collect()
+        };
+        for (n, balances) in [(16384, true), (6144, false)] {
+            let nt = n / 32;
+            let (on, off) = (deal(n, true), deal(n, false));
+            for jobs in [&on, &off] {
+                let mut all: Vec<usize> = jobs.iter().flat_map(&columns).collect();
+                all.sort_unstable();
+                assert_eq!(
+                    all,
+                    (0..nt).collect::<Vec<_>>(),
+                    "[2048, {n}]: each column once"
+                );
+            }
+            let same = |x: &[Job], y: &[Job]| format!("{x:?}") == format!("{y:?}");
+            assert!(
+                same(&on[..spread], &off[..spread]),
+                "[2048, {n}]: the first round unchanged"
+            );
+            if !balances {
+                assert!(
+                    same(&on, &off),
+                    "[2048, {n}]: one round of the plan's units: unchanged"
+                );
+                continue;
+            }
+            // Each unit's columns after its first job.
+            let later = |jobs: &[Job]| -> Vec<usize> {
+                (0..spread)
+                    .map(|u| {
+                        jobs.iter()
+                            .skip(spread + u)
+                            .step_by(spread)
+                            .map(|j| columns(j).len())
+                            .sum()
+                    })
+                    .collect()
+            };
+            let (l_on, l_off) = (later(&on), later(&off));
+            // `gate|up`: 80 columns read ahead, 128 in the first round, 304 left.
+            let left = nt - 80 - 128;
+            assert_eq!(l_on.iter().sum::<usize>(), left);
+            assert_eq!(l_off.iter().sum::<usize>(), left);
+            let dealt: Vec<usize> = (0..104).collect();
+            let share = left.div_ceil(dealt.len());
+            assert!(dealt
+                .iter()
+                .all(|&u| l_on[u] + 1 >= share && l_on[u] <= share));
+            assert!(l_on[104..].iter().all(|&c| c == 0), "units past the deal");
+            assert!(
+                l_on[64..104].iter().all(|&c| c == share),
+                "the remainder on the prefetching units: {:?}",
+                &l_on[64..104]
+            );
+            assert_eq!(
+                l_off.iter().max(),
+                Some(&5),
+                "off: the plan's units read 5 more"
+            );
+            assert!(
+                l_off[64..].iter().all(|&c| c == 0),
+                "off: the prefetching units, none"
+            );
         }
     }
 
@@ -7096,6 +7433,7 @@ mod tests {
                     prefetch_units: [usize::MAX, 40],
                     handoff: at,
                     second_job: false,
+                    balanced_deal: false,
                 },
                 &prefetch,
                 spread,

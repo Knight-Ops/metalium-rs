@@ -105,3 +105,51 @@ fn traced_generation_equals_the_eager_one() {
         ladder_support::traced_equals_eager(&model, &shapes, lengths, steps, "SmolLM2-1.7B", &d);
     });
 }
+
+/// The 1.7B at its native context (`docs/plans/long-context.md`): an 8,192-position cache, a
+/// prompt of 7,992 tokens (the chat prompt repeated, so the next tokens are confident copies),
+/// traced on the card against burn-flex running the same fixed-shape schedule on the host: the
+/// top-1 prediction equal at the prompt and at every decode step, and the traced generation equal
+/// to the card's eager one bit for bit. Chunks of 64: a chunk's attention holds its scores
+/// `[32 heads, rows, 8,192]` several times over, and a capture keeps every layer's.
+#[cfg(feature = "silicon")]
+#[test]
+#[cfg_attr(
+    not(feature = "weights"),
+    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+)]
+fn the_native_context_agrees_with_flex() {
+    use tt_models::generate::{generate_fixed, Shapes};
+    use tt_tests::burn_device::with_device;
+
+    let shapes = Shapes::new(8192, &[64]);
+    let prompt: Vec<i32> = CHAT.iter().copied().cycle().take(37 * 216).collect();
+    let steps = 8;
+    let host = tt_ttsim::outside_fork(|| {
+        let (model, _) =
+            Llama::<Flex>::smollm2_1_7b_instruct(layers(), Precision::F32, &FlexDevice).unwrap();
+        let t0 = std::time::Instant::now();
+        let g = generate_fixed(&model, &prompt, steps, &shapes, &FlexDevice).unwrap();
+        eprintln!(
+            "burn-flex: {:.1} s, tokens {:?}",
+            t0.elapsed().as_secs_f64(),
+            g.tokens
+        );
+        g
+    });
+    with_device(config(), |d| {
+        let (model, _) =
+            Llama::<TtBackend>::smollm2_1_7b_instruct(layers(), Precision::F32, &d).unwrap();
+        let g = ladder_support::traced(&model, &shapes, &d);
+        let t0 = std::time::Instant::now();
+        let traced = ladder_support::generate(&g, &prompt, steps);
+        eprintln!(
+            "traced: {:.2} s for the prompt and {steps} tokens, tokens {:?}",
+            t0.elapsed().as_secs_f64(),
+            traced.tokens
+        );
+        ladder_support::compare("SmolLM2-1.7B at 8,192 positions", &host, &traced);
+        let eager = generate_fixed(&model, &prompt, steps, &shapes, &d).unwrap();
+        ladder_support::assert_same(&traced, &eager, "traced against eager at 8,192 positions");
+    });
+}

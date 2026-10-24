@@ -53,6 +53,30 @@ pub fn probe_stages(mask: u32) {
     PROBE_STAGES.store(mask | 1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Whether each head's positions run as two halves on two units ([`probe_split`]).
+static PROBE_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run each head whose positions are an even number of tiles as two jobs, each over half of
+/// them on its own unit, the first half's jobs then the second's, both writing the head's rows:
+/// flash-decode's reads and kernels with no exchange between the halves, so a probe can time
+/// them (the result is then wrong). For `silicon_probe_attention_rows` and
+/// `traced_generation_stream_ceiling` only.
+#[doc(hidden)]
+pub fn probe_split(on: bool) {
+    PROBE_SPLIT.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How many jobs a head runs as under [`probe_split`]: 2 for an even number of position tiles.
+#[doc(hidden)]
+pub fn probe_runs(l: usize) -> usize {
+    let nt = l / 32;
+    if PROBE_SPLIT.load(std::sync::atomic::Ordering::Relaxed) && nt >= 2 && nt % 2 == 0 {
+        2
+    } else {
+        1
+    }
+}
+
 /// Most row writes a job's last block may hold: two 64-byte face rows a row and output tile, for
 /// the result and for its packed twin.
 const MAX_ROW_WRITES: usize = 128;
@@ -355,11 +379,20 @@ pub fn attention_rows(
             )));
         }
     }
+    let runs = probe_runs(l);
+    let (l, nt) = (l / runs, nt / runs);
     let result = (|| {
         let at = plan_slots([kt, nt, dvt]).ok_or_else(|| shape_error("the job does not fit L1"))?;
         let rmask = mask.tensor_ref();
-        let mut jobs = Vec::with_capacity(items.len());
-        for (i, item) in items.iter().enumerate() {
+        let mut jobs = Vec::with_capacity(runs * items.len());
+        for (run, (i, item)) in
+            (0..runs).flat_map(|run| items.iter().enumerate().map(move |e| (run, e)))
+        {
+            let item = &Item {
+                k: [item.k[0] + run * l, item.k[1]],
+                v: [item.v[0] + run * l, item.v[1]],
+                ..*item
+            };
             let [qr, qc] = item.q;
             let r0 = qr % 32;
             if !fits([m, d, l, dv], r0) || qr + m > q.rows || qc % 32 != 0 || qc + d > q.cols {

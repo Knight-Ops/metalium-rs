@@ -88,6 +88,7 @@ Actionable technical specifications, interface contracts, and execution checklis
   - [`decode-matmul-bandwidth.md`](plans/decode-matmul-bandwidth.md): an LLM decode step's `m = 1` products against GDDR's bandwidth (P0-P3 done: thin activation reads, an even last round, fused projections; P5 open: one channel a column).
   - [`decode-to-bandwidth.md`](plans/decode-to-bandwidth.md): the umbrella plan for single-user decode at 90-95% of GDDR's bandwidth, ordering the decode plans below; with [`decode-attention.md`](plans/decode-attention.md) (attention reading the cache in place).
   - [`decode-small-ops.md`](plans/decode-small-ops.md): the decode step's non-matmul half (RMSNorm, RoPE, attention, SiLU): repack fixes first, then where fusion lives.
+  - [`long-context.md`](plans/long-context.md): real model context lengths (8K on the 1.7B, 32K synthetic): traces whose programs do not grow with length, prefill that costs the prompt not the cache, and flash-decode past the fused attention op's L1 limit.
   - [`in-place-cache-write.md`](plans/in-place-cache-write.md): writing a traced key/value cache in place (no whole-cache copy a write), and the donation and buffer-generation rules that make a read of the overwritten cache an error by name (was a proposal).
 
 ### 3. `docs/proposals/` — Feature Proposals & RFCs
@@ -96,6 +97,7 @@ Unscheduled design proposals and exploratory RFCs evaluating trade-offs before i
 - **Contents**:
   - [`x280-on-card-dispatch.md`](proposals/x280-on-card-dispatch.md): RFC proposing use of on-card SiFive X280 RISC-V cores for on-card host orchestration.
   - [`future-fusion-features.md`](proposals/future-fusion-features.md): RFCs for advanced fusion: Tiled Online Softmax FlashAttention, sharded multi-core L1 mesh tensor residency, and inter-core NoC streaming.
+  - [`split-k-and-flash-decode.md`](proposals/split-k-and-flash-decode.md): the two order-changing decode levers, for a decision: flash-decode (attention's positions split across units; ~0.8-1.1 ms of a 1.7B step at 512 positions, recommended opt-in as variant A) and split-K (~0.2 ms by the handoff's measurement, parked).
   - [`batched-decode.md`](proposals/batched-decode.md): batched decode laid out on Blackhole's tiles (sequences as the rows of a tile row, batches of 8/16/32, a paged position-major cache, per-sequence attention items, on-card sampling); unscheduled behind batch-1 speed.
 
 ### Completed plans: `docs/completed-plans/`

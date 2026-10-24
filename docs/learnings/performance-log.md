@@ -12,6 +12,10 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The 1.7B at 8,192 positions from a 7,992-token prompt](#the-17b-at-8192-positions-from-a-7992-token-prompt-2026-10-24-card-0) | 2026-10-24 | traced prompt and 8 tokens 38.7 s against burn-flex's 1,847 s, the same tokens; chunks of 64 |
+| [The 1.7B at its native 8,192 positions](#the-17b-at-its-native-8192-positions-2026-10-23-card-0) | 2026-10-23 | first run past a 512-position cache, after looped element-wise and reduce programs (`long-context.md`): builds (235 s first, 72.5 s second), **17.0 ms** a step after 32 tokens, **26.0 ms** after 1,000 (attention as the composition at `Step(1024)`); past 8,192 the traces do not fit the program cache |
+| [Flash-decode's probe: a head's positions in two halves](#flash-decodes-probe-a-heads-positions-in-two-halves-2026-10-23-card-0) | 2026-10-23 | each head's attention as two halves on 64 units with **no exchange** (timing only): isolated, 80.6 -> 60.0 us at 512 positions; in a 1.7B step 16.81 / 18.19 -> **17.08 / 17.71 ms**, 19.7 us a layer at `Step(512)` before any exchange, below the 20 us-after-exchanges stop rule; stopped, A5 parked; today's job does not fit L1 past 512 positions, halves fit to 1024 |
+| [A product's units metered, and a balanced deal](#a-products-units-metered-and-a-balanced-deal-2026-10-23-card-0) | 2026-10-23 | each unit's bytes in a product's span against its time (`skew.tsv`): `gate\|up`'s units 0-47 read 1.33 MB each at ~6 GB/s while its 40 prefetching units finish in 13 us; dealing those columns over all 104 units (opt-in, `TT_BALANCED_DEAL=1`) is bit for bit but **not faster** (16.81 / 18.21 -> 16.86 / 18.21 ms): each unit reads slower as more read, the span's aggregate rate stays ~350-390 GB/s, and the head gets slower (830 -> 925 us); the longest unit does not bind |
 | [Layer sub-traces: stored bodies and calls](#layer-sub-traces-stored-bodies-and-calls-2026-10-23-card-0) | 2026-10-23 | one layer body a unit and a `CALL_BODY` a layer (opt-in, `TT_SUB_TRACES=1`), bit for bit: the 1.7B's trace streams 675 -> 384 MB (`Step` 19.3 -> 4.9 MB, `Chunk(64)` 107 -> 21), but a 1.7B step **0.15 ms slower** (16.77 / 18.19 -> 16.94 / 18.33) and the 135M 0.05-0.08; not the default |
 | [Room for a second job's `B`: the trace arena and second jobs](#room-for-a-second-jobs-b-the-trace-arena-and-second-jobs-2026-10-23-card-0) | 2026-10-23 | a capture's region at the top of `PROGRAMS` and its `B` rings past `DATA`: 16.78 / 18.15 ms, unchanged; idle units taking a second job's `B` there: bit for bit, **slower** (17.18 / 18.54 against 16.77 / 18.14), 266 MB more read ahead but longer barriers; room for `B` no longer binds |
 | [The mailboxes packed: the L1 map before room for a second `B`](#the-mailboxes-packed-the-l1-map-before-room-for-a-second-b-2026-10-22-card-0) | 2026-10-22 | the mailboxes moved into 40 KiB above the program slots, 88 KiB of capture-only L1 left beside `DATA`; nothing uses it yet: a 1.7B step 16.79 / 18.20 -> **16.76 / 18.17 ms**, the 135M, ResNet-18 and ViT-Tiny unchanged; a first form that grew `DATA` itself changed every arena-sized choice |
@@ -351,6 +355,110 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The 1.7B at 8,192 positions from a 7,992-token prompt (2026-10-24, card 0)
+
+`step188_smollm2_1_7b::the_native_context_agrees_with_flex`, run `1792800061`, release, every tile, one run (a gate,
+not a benchmark: no warmups). `Shapes::new(8192, &[64])`: 125 chunks of 64 tokens, each attending to all 8,192
+positions, then 8 decode steps.
+
+| | Prompt (7,992 tokens) and 8 tokens |
+|---|--:|
+| burn-flex, host (`generate_fixed`, one core busy) | 1,846.7 s |
+| burn-tt, traced | **38.7 s** |
+
+The tokens are the same; the largest logit difference 0.166 on 33.7. The prefill is ~0.3 s a chunk: every chunk attends to
+the whole cache through the composition (D2 and flash prefill are open), which a timed benchmark should measure next.
+
+## The 1.7B at its native 8,192 positions (2026-10-23, card 0)
+
+[long-context.md](../plans/long-context.md): `traced_generation_stream_ceiling`, `TT_TILES=all`, `TT_GEN_MAX_LEN=8192`,
+`TT_GEN_PROMPTS=32,1000`, `TT_GEN_NEW=16`, release, 2 warmups and 9 samples, run `1792793709` (before: refused at
+2,048 and 8,192, `1792789393`, `1792789257`).
+
+| | 512-position cache (`1792763914`) | 8,192-position cache |
+|---|--:|--:|
+| Build, first / second | | 234.7 s / 72.5 s |
+| Decode step, 32-token prompt (`Step(64)`, the fused attention op) | 16.81 ms | **17.00 ms** |
+| Decode step, 1,000-token prompt (`Step(1024)`, attention as the composition) | | **25.98 ms** |
+
+- The first build's time is the eager warm-up of every bucket at 8,192 positions; the second build captures only.
+- One trace's residency-planned capture was refused ("op 34 is laid out unlike the plan pass's") and captured plainly.
+- Past the fused op's limit (512 positions at `head_dim` 64) attention costs ~9 ms more a step: flash-decode's case.
+
+## Flash-decode's probe: a head's positions in two halves (2026-10-23, card 0)
+
+[split-k-and-flash-decode.md](../proposals/split-k-and-flash-decode.md), P0 of its plan: before any exchange is built,
+time each head's attention as two halves of its positions on two units, with nothing exchanged between them
+(`tt_kernels::attention::probe_split`; the result is then wrong, its time is the point). Release, every tile
+(`TT_TILES=all`), 2 warmups and 9 samples.
+
+- **Isolated** (`silicon_probe_attention_rows::attention_rows_split_in_half`, 32 heads of `head_dim` 64, one query row,
+  nothing else reading GDDR; `1792787552` and its rerun):
+
+  | Positions | K and V | Today, 32 units | Halves, 64 units | One half a head, 32 units |
+  |--:|--:|--:|--:|--:|
+  | 128 | 2.10 MB | 33.2 us | 32.3 | 26.2 |
+  | 256 | 4.19 MB | 47.6 | 39.1 | 33.0 |
+  | 512 | 8.39 MB | 80.6 | 60.0 | 47.8 |
+  | 1024 | 16.78 MB | does not fit L1 | 105.9 | 80.7 |
+  | 2048 | 33.55 MB | does not fit | does not fit | does not fit |
+
+  Today's op costs ~18 us fixed plus ~4.3 GB/s a unit. A half on 64 units is slower than the same half on 32 (60.0
+  against 47.8 us): a unit reads slower as more read, as in the balanced deal.
+- **In a 1.7B step** (`traced_generation_stream_ceiling`, `TT_PROBE_ATTENTION_SPLIT=1`, every length split):
+
+  | | 32 / 256-token prompts | Run |
+  |---|--:|---|
+  | today | 16.81 / 18.19 ms | `1792788575` |
+  | halves, no exchange | 17.08 / 17.71 | `1792788725` |
+
+  At `Step(512)` (the 256-token prompt) the halves save 0.47 ms, **19.7 us a layer before any exchange**. At `Step(64)`
+  / `Step(128)` they cost 0.27 ms.
+- **What it says:** the bit-for-bit split (five exchanges: a run's pre-fold maximum and sum, the head's maximum and
+  `l` back, the partial `pv` chain) and the proposal's variant A (three) both start from those 19.7 us, so neither
+  clears the probe's stop rule (≥ 20 us a layer after the exchanges). A5 stays parked.
+- **What it found besides:** today's job does not fit L1 past 512 positions (`attention::fits`), so a longer cache's
+  decode runs attention as the composition. Halves fit to 1024. That, not the speed at 512, is what a split would buy
+  (revisit with a context past 512).
+
+## A product's units metered, and a balanced deal (2026-10-23, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, "A product's longest unit". 1.7B, every tile
+(`TT_TILES=all`), release, `traced_generation_stream_ceiling`, 2 warmups and 9 samples, validated.
+
+- **The meter** (no behaviour change): `trace::OpRecord::unit_bytes` (each unit's `OpBytes`, its own entries and its
+  lists read ahead; they sum to the op's, gate `step216`), joined in `skew.tsv` (`span_mb`, `ahead_mb`, `span_gbps`)
+  and in `summary.md`'s "Units against each other" (the slowest unit's MB and GB/s in its span, and the span's bytes at
+  469 GB/s).
+- **What it shows** (`Step(64)`, profile `1792762439`, per layer, medians):
+
+  | Product | Span us | Barrier us | In span / ahead MB | Span at 469 GB/s | Units |
+  |---|--:|--:|--:|--:|---|
+  | `qkv` | 54.3 | 33.6 | 0 / 51.1 | 0 | all read ahead |
+  | `o` | 22.7 | 5.0 | 0 / 17.0 | 0 | all read ahead |
+  | `gate\|up` | 231.9 | 13.4 | 80.9 / 55.4 | 172.6 | 0-47 1.33 MB each (5 columns) at ~6.0 GB/s, 48-63 1.07 MB; 64-103 none, done in 13 us |
+  | `down` | 172.0 | 3.6 | 46.9 / 21.3 | 99.9 | 0-23 a whole column (1.07 MB) at 6.8 GB/s; 64-103 half a column, 79 us |
+  | the head (once) | 830.5 | 68.4 | 359.9 / 55.4 | 767.3 | 0-63 5.4-5.7 MB at 7.2 GB/s; 64-103 none |
+
+- **The balanced deal** (`Session::set_balanced_deal`, `TT_BALANCED_DEAL=1`; host only): where a `K`-whole product's
+  own units would run more than a round, the columns left after the first round and the prefetching units' jobs are
+  dealt over both, the remainder on the prefetching units. Bit for bit (`step205`
+  `balanced_deals_replay_as_the_ops_run_fresh`, ttsim and card 0; card 0 with it on, 51 of 51, `1792763568`, `step188`
+  bit for bit).
+
+  | | Step, 32 / 256-token prompts | Run |
+  |---|--:|---|
+  | off | 16.81 / 18.21 ms | `1792763914` |
+  | on | 16.86 / 18.21 | `1792764065` |
+
+  Profile with it on (`1792764360`): `gate|up` 231.9 -> **229.4 us**, every one of its 104 units now reading 0.80 MB in
+  the span, but at 4.2-5.1 GB/s, not 6.0 (units 0-23 190 us median, 212 at most; 64-103 155 / 171), and its barrier 13
+  -> 86 us; the head **830 -> 925 us** (104 readers at 4.1-4.5 GB/s each, against 64 at 7.2).
+- **What it says:** a unit's rate falls about as the readers grow, so the span's aggregate rate stays where it was
+  (`gate|up` 349 -> 353 GB/s over its span, ~380 while its units read; the head 433 -> 389). The longest unit does not
+  bind; the aggregate rate inside the span does, and more readers lower it. A column (266 KB, ~60 us at a unit's
+  rate) is too coarse to even out the low-numbered units' slower service. Not the default.
 
 ## Layer sub-traces: stored bodies and calls (2026-10-23, card 0)
 

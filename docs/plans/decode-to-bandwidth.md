@@ -63,7 +63,8 @@ It orders the open items of the companion plans and adds two new ones:
 **Rules:**
 - **Bit for bit:** every phase keeps today's decode exactly.
 - **Order changes are decisions:** split-K and split-position attention change accumulation order. They come back
-  for a decision with measured numbers and are not built unasked. The target probably needs one of them.
+  for a decision with measured numbers and are not built unasked
+  ([split-k-and-flash-decode.md](../proposals/split-k-and-flash-decode.md), 2026-10-23). The target probably needs one of them.
 - **Not here:** BF16 weights and batched decode are separate items.
 
 ## Where the time goes
@@ -465,7 +466,9 @@ Reordered by Phase 0. A layer's products take ~907 us, against ~600 us for their
     27.90 -> 27.84 ms (`1792343591`); the barrier fell, the data phase rose. Reverted. The barrier skew is not
     channel locality.
 - [ ] **Decision point (ask the user):** split-K, if `o` and `down` remain short of the ceiling. Phase 0 shows 64
-  units can saturate, so this is now less likely to be needed.
+  units can saturate, so this is now less likely to be needed. Written up 2026-10-23
+  ([split-k-and-flash-decode.md](../proposals/split-k-and-flash-decode.md)): ~0.2 ms by the handoff's measurement,
+  parked.
 - [ ] **A product's block from what it runs, not a greedy probe** (found by planned-l1-residency 2h-i, 2026-10-21,
   `1792546573`). `matmul::plan_in` takes the widest block whose probe fits, and the probe charges `A` unpacked (`kt`
   slots) where the kernel runs a packed `A` (`kt/32 + 1`).
@@ -1039,6 +1042,52 @@ with nothing left for the small ops. The room is elsewhere in L1: `MAILBOXES` is
     mover's hot loops whose premise, that more bytes ahead shorten the products, the measurements contradict. What the
     profile points at instead: a product's longest unit (the column deal against the units' count) and the aggregate
     rate inside its span (`down`, the handoff's finding).
+
+### A product's longest unit (2026-10-23)
+
+The next lever R2 pointed at: a product's longest unit (its column deal against its units) and the aggregate rate
+inside its span ([log](../learnings/performance-log.md#a-products-units-metered-and-a-balanced-deal-2026-10-23-card-0)).
+
+- [x] **The meter** (no behaviour change): each unit's bytes in a product's span against its own time
+  (`trace::OpRecord::unit_bytes`, `skew.tsv`'s `span_mb`/`ahead_mb`/`span_gbps`, the slowest unit's MB and GB/s in
+  `summary.md`). Gate `step216` `what_a_product_reads_ahead_is_counted_as_its_own`: each op's units sum to its bytes,
+  and only a unit with a list read ahead counts any ahead (**watched failing** with those units' bytes dropped); card 0
+  `1792762291`. Profile `1792762439`: `gate|up` 231.9 us a layer against 172.6 for its 80.9 MB in span at 469 GB/s;
+  units 0-47 read 5 columns each (1.33 MB at ~6.0 GB/s) while the 40 prefetching units finish in 13 us; `down` 172.0
+  against 99.9, units 0-23 reading whole columns; the head 830.5 against 767.3.
+- [x] **The balanced deal: built, bit for bit, not faster; opt-in** (`Session::set_balanced_deal`,
+  `TT_BALANCED_DEAL=1`; `BlockPlan::push_balanced_jobs`, `tensor::balanced_shares`). Where a `K`-whole `Slots` product's
+  own units would run more than a round, every unit keeps its job read ahead (the prefetching units' and the first
+  round), and the columns left are dealt over the plan's units and the prefetching ones, the remainder on the latter.
+  Gates: unit `a_balanced_deal_gives_each_unit_its_in_span_share` (each column once, the first round unchanged, no unit
+  over its share, the remainder on the prefetching units, `qkv`'s one round unchanged; **watched failing** with the
+  later columns shifted one back) and `balanced_shares_are_even_with_the_remainder_last` (**watched failing** with the
+  remainder first); `step205` `balanced_deals_replay_as_the_ops_run_fresh` (ttsim and card 0: bit for bit, each unit's
+  columns in the span `[6, 6, 6, 6, 0, 0, 0, 0]` -> `[3; 8]`; **watched failing** with the later columns shifted, element
+  1248 202.0 against 376.4). Card 0 with it on, 51 of 51 (`1792763568`: `step185`, `step187`, `step188` bit for bit,
+  `step191`, `step193`, `step205`, `step216`, `step219`, `step222`, `step223`).
+  - **Measured** (card 0, every tile): 1.7B **16.81 / 18.21 ms** off (`1792763914`), **16.86 / 18.21** on
+    (`1792764065`). Profile on (`1792764360`): `gate|up` 231.9 -> 229.4 us, each of its 104 units reading 0.80 MB in
+    the span at 4.2-5.1 GB/s (was 6.0 on 64), its barrier 13 -> 86 us; the head 830 -> 925 us.
+  - **What it says:** the longest unit does not bind. A unit reads slower as more units read, so the span's aggregate
+    rate stays at ~350-390 GB/s (`gate|up`) or falls (the head: 433 -> 389). A column (266 KB, ~60 us at a unit's rate)
+    is too coarse to even out the low-numbered units' slower service.
+- [ ] ~~`down`'s tail: a stream cap set by its readers~~ (firmware). **Not built**, on the evidence above: the bound
+  inside a span is the aggregate rate, which more in flight a unit did not raise globally (`STREAM_CAP` 3-4 slower, "The
+  stream's rate" 3) and fewer readers do not lift. Revisit only with a measurement of GDDR's occupancy across
+  `down`'s span showing it idle while its 24 whole-column units read.
+
+**Where Phase 8 stands:** a 1.7B step at 16.8 / 18.2 ms, its weights at ~430 GB/s over a replay (92% of the
+469 GB/s measured ceiling, 84% of 512). Room for `B` (R2), the stored layer (sub-traces) and the deal (above) are all
+neutral or slower. What is left between the products and the ceiling is the aggregate rate inside the products' spans
+(~350-440 GB/s against 469) and the windows between them. The next decision is the user's: BF16 weight storage (half
+the bytes; F32's floor is ~14.3 ms) or the order-changing items (split-K, flash-decode), which come back with numbers
+before they are built (Rules): written up in
+[split-k-and-flash-decode.md](../proposals/split-k-and-flash-decode.md) (flash-decode ~0.8-1.1 ms at 512 positions,
+recommended opt-in; split-K ~0.2 ms, parked). **Flash-decode probed and stopped** (2026-10-23): two halves a head on
+64 units with no exchange save only 19.7 us a layer at `Step(512)` (18.19 -> 17.71 ms) before any exchange
+([log](../learnings/performance-log.md#flash-decodes-probe-a-heads-positions-in-two-halves-2026-10-23-card-0)). The
+F32 step's remaining lever is BF16 weight storage.
 
 ## The larger changes compared (2026-10-18)
 

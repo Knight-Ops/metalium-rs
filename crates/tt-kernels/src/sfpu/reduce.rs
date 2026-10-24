@@ -612,6 +612,221 @@ pub fn roles_at(
     [unpack, math, pack]
 }
 
+/// [`roles`] as the role slots hold them, with each role's block repeats
+/// ([`roles_code_at`]).
+pub fn roles_code(
+    layout: &Layout,
+    inputs: &[Vec<Instruction>],
+    finish: &[Instruction],
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
+    assert_eq!(inputs.len(), layout.per);
+    roles_code_at(layout, inputs, finish, |k, n| {
+        layout.in_at + (k * layout.per + n) as u64 * TILE_SLOT
+    })
+}
+
+/// [`roles_at`], with an output's middle inputs -- the same math program,
+/// read from consecutive slots -- one block repeated, and the outputs one
+/// block repeated around it, their addresses stepped in GPRs
+/// (`docs/plans/long-context.md` 1.A): a program's size does not grow with
+/// the inputs an output reduces, or the outputs. The unpacker and packer see
+/// the same addresses, in the same order, as [`roles_at`] gives them, and the
+/// math runs the same programs. [`roles_at`]'s programs where the inputs do not
+/// have that shape.
+pub fn roles_code_at(
+    layout: &Layout,
+    inputs: &[Vec<Instruction>],
+    finish: &[Instruction],
+    input: impl Fn(usize, usize) -> u64,
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
+    roles_looped(layout, inputs, finish, &input)
+        .unwrap_or_else(|| (roles_at(layout, inputs, finish, input), Default::default()))
+}
+
+/// GPRs [`roles_looped`] keeps its addresses in: clear of the ones
+/// `sfpu::kernel`'s notes name, as its own are.
+const FIRST_GPR: u32 = 32;
+const FIRST_STRIDE_GPR: u32 = 33;
+const MID_GPR: u32 = 34;
+const GAP_GPR: u32 = 35;
+const SLOT_GPR: u32 = 36;
+const OUT_GPR: u32 = 37;
+const PACK_SLOT_GPR: u32 = 39;
+
+fn roles_looped(
+    layout: &Layout,
+    inputs: &[Vec<Instruction>],
+    finish: &[Instruction],
+    input: &impl Fn(usize, usize) -> u64,
+) -> Option<crate::code::LoopedRoles> {
+    use crate::code::Loop;
+    use crate::datapath::{
+        pack_dest_units, pack_tile_from_dst_gpr, tile_base_units, unpack_datums_to_dst_gpr,
+        TILE_DATUMS,
+    };
+    use tt_isa::backend::set_gpr;
+    use tt_isa::isa::generated::encode;
+    let (outputs, per) = (layout.outputs, inputs.len());
+    // A first input, a middle of at least one, a last.
+    if per < 3 || inputs[1..per - 1].iter().any(|p| *p != inputs[1]) {
+        return None;
+    }
+    // Each output's inputs after its first are consecutive slots; its first, and its
+    // middle's start, a fixed distance on from the last output's.
+    let aligned = |a: u64| a % 16 == 0;
+    let consecutive = (0..outputs).all(|k| {
+        (1..per - 1).all(|n| input(k, n + 1) == input(k, n) + TILE_SLOT)
+            && (0..per).all(|n| aligned(input(k, n)))
+    });
+    let distance = |f: &dyn Fn(usize) -> u64| -> Option<u64> {
+        let d = f(1).checked_sub(f(0))?;
+        (1..outputs.saturating_sub(1))
+            .all(|k| f(k + 1).checked_sub(f(k)) == Some(d))
+            .then_some(d)
+    };
+    let (first_stride, gap) = if outputs > 1 {
+        (
+            distance(&|k| input(k, 0))?,
+            // From the last input read to the next output's first middle one, a slot back.
+            distance(&|k| input(k, 1))?.checked_sub(per as u64 * TILE_SLOT - TILE_SLOT)?,
+        )
+    } else {
+        (0, 0)
+    };
+    if !consecutive {
+        return None;
+    }
+    let units = |a: u64| tile_base_units(a);
+    let slot = units(TILE_SLOT);
+    let set = |p: &mut Vec<Instruction>, gpr: u32, v: u32| p.extend(set_gpr(gpr, v).unwrap());
+    let add = |gpr: u32, by: u32| encode::adddmareg(gpr, by, gpr).unwrap();
+    let s = layout.sems;
+
+    let mut unpack = thread_config();
+    unpack.extend(clear_unpacker0_adcs());
+    let mut words = ConfigWords::new();
+    tile_unpack_config(&mut words, layout.in_at);
+    unpack.extend(config_program(&words));
+    set(&mut unpack, SLOT_GPR, slot);
+    set(&mut unpack, FIRST_GPR, units(input(0, 0)));
+    set(&mut unpack, FIRST_STRIDE_GPR, units(first_stride));
+    // The middle steps before it reads: a slot back.
+    set(&mut unpack, MID_GPR, units(input(0, 1)) - slot);
+    set(&mut unpack, GAP_GPR, units(gap));
+    let mut unpack_loops = Vec::new();
+    let output_block = unpack.len() as u32;
+    let read = |p: &mut Vec<Instruction>, gpr: u32, step: Option<u32>| {
+        p.extend(sync::take(s.consumed, Before::UNPACKER));
+        p.extend(unpack_datums_to_dst_gpr(gpr, step, TILE_DATUMS, A_ROW));
+        p.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
+    };
+    read(&mut unpack, FIRST_GPR, None);
+    for count in middle_counts(per) {
+        let middle = unpack.len() as u32;
+        read(&mut unpack, MID_GPR, Some(SLOT_GPR));
+        unpack_loops.push(Loop {
+            start: middle,
+            len: unpack.len() as u32 - middle,
+            count,
+        });
+    }
+    read(&mut unpack, MID_GPR, Some(SLOT_GPR));
+    // On to the next output: written, so stepped after.
+    unpack.push(add(FIRST_GPR, FIRST_STRIDE_GPR));
+    unpack.push(add(MID_GPR, GAP_GPR));
+    if outputs > 1 {
+        unpack_loops.insert(
+            0,
+            Loop {
+                start: output_block,
+                len: unpack.len() as u32 - output_block,
+                count: outputs as u32,
+            },
+        );
+    }
+    unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
+
+    let mut math = vec![state_id()];
+    let mut math_loops = Vec::new();
+    let output_block = math.len() as u32;
+    let compute = |m: &mut Vec<Instruction>, n: usize| {
+        m.extend(sync::take(s.unpacked, Before::SFPU));
+        if n == 0 {
+            m.extend(sync::take(s.packed, Before::SFPU));
+        }
+        m.extend_from_slice(&inputs[n]);
+        m.extend(sync::post_after(Unit::Sfpu, s.consumed));
+    };
+    compute(&mut math, 0);
+    for count in middle_counts(per) {
+        let middle = math.len() as u32;
+        compute(&mut math, 1);
+        math_loops.push(Loop {
+            start: middle,
+            len: math.len() as u32 - middle,
+            count,
+        });
+    }
+    compute(&mut math, per - 1);
+    math.extend_from_slice(finish);
+    math.extend(sync::post_after(Unit::Sfpu, s.computed));
+    if outputs > 1 {
+        math_loops.insert(
+            0,
+            Loop {
+                start: output_block,
+                len: math.len() as u32 - output_block,
+                count: outputs as u32,
+            },
+        );
+    }
+
+    let mut pack = vec![state_id()];
+    set(&mut pack, PACK_SLOT_GPR, slot);
+    set(
+        &mut pack,
+        OUT_GPR,
+        pack_dest_units(layout.out_at + tt_isa::dm::TILE_DATA) - slot,
+    );
+    let output_block = pack.len() as u32;
+    pack.extend(sync::take(s.computed, Before::PACKER));
+    pack.extend(pack_tile_from_dst_gpr(
+        OUT_GPR,
+        Some(PACK_SLOT_GPR),
+        OUT_ROW,
+    ));
+    pack.extend(sync::post_after(Unit::Packer, s.packed));
+    let pack_loops = if outputs > 1 {
+        vec![Loop {
+            start: output_block,
+            len: pack.len() as u32 - output_block,
+            count: outputs as u32,
+        }]
+    } else {
+        Vec::new()
+    };
+    pack.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
+
+    let code = [unpack, math, pack];
+    let loops = [unpack_loops, math_loops, pack_loops];
+    let fits = (0..3).all(|t| crate::code::check(&loops[t], code[t].len() as u32).is_ok());
+    fits.then_some((code, loops))
+}
+
+/// The middle inputs of [`roles_looped`]'s output, `per - 2`, as the counts of
+/// sibling loops each within what one loop counts (`mailbox::loops`).
+fn middle_counts(per: usize) -> Vec<u32> {
+    let most = 1 << tt_isa::mailbox::loops::COUNT_BITS;
+    let mut left = per as u32 - 2;
+    let mut counts = Vec::new();
+    while left > 0 {
+        let n = left.min(most);
+        counts.push(n);
+        left -= n;
+    }
+    counts
+}
+
 /// A sum over rows too long for one run, in chunks of [`ROW_CHUNK`] row
 /// tiles: each chunk after the first starts from the last chunk's sums, read
 /// back as an input of one valid row ahead of its own tiles. Exactly Flex's
@@ -699,7 +914,7 @@ pub fn continuation_roles(
     tiles: usize,
     valid: u32,
     last: bool,
-) -> [Vec<Instruction>; 3] {
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
     let mut inputs = Vec::new();
     if prior {
         let mut p = Program::new();
@@ -718,7 +933,7 @@ pub fn continuation_roles(
         ));
     }
     let fin = if last { finish(op, axis) } else { Vec::new() };
-    roles_at(&c.layout, &inputs, &fin, |k, n| match (prior, n) {
+    roles_code_at(&c.layout, &inputs, &fin, |k, n| match (prior, n) {
         (true, 0) => c.prior_at + k as u64 * TILE_SLOT,
         (true, n) => c.layout.in_at + (k * ROW_CHUNK + n - 1) as u64 * TILE_SLOT,
         (false, n) => c.layout.in_at + (k * ROW_CHUNK + n) as u64 * TILE_SLOT,
@@ -786,6 +1001,132 @@ pub fn reference(op: ReduceOp, axis: Axis, a: &[f32], rows: usize, cols: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The looped reduce roles present every unpack and pack the configuration
+    /// [`roles_at`]'s do, and are otherwise the same stream: whole runs, and a
+    /// continuation's chunks after a prior; and their size does not grow with
+    /// the inputs an output reduces.
+    #[test]
+    fn looped_reduce_roles_unpack_and_pack_what_the_unrolled_ones_do() {
+        let expand = |code: &[Instruction], loops: &[crate::code::Loop]| {
+            crate::code::Code {
+                ins: code.to_vec(),
+                loops: loops.to_vec(),
+            }
+            .expand()
+        };
+        let compare = |what: &str,
+                       layout: &Layout,
+                       inputs: &[Vec<Instruction>],
+                       fin: &[Instruction],
+                       input: &dyn Fn(usize, usize) -> u64|
+         -> [usize; 3] {
+            let (looped, loops) = roles_looped(layout, inputs, fin, &input)
+                .unwrap_or_else(|| panic!("{what}: looped"));
+            let unrolled = roles_at(layout, inputs, fin, input);
+            for t in 0..3 {
+                let a = crate::code::transfers(&expand(&looped[t], &loops[t]));
+                let b = crate::code::transfers(&unrolled[t]);
+                assert_eq!(a.0.len(), b.0.len(), "{what}, role {t}: transfers");
+                for (n, (x, y)) in a.0.iter().zip(&b.0).enumerate() {
+                    for (addr, v) in y {
+                        assert_eq!(
+                            x.get(addr),
+                            Some(v),
+                            "{what}, role {t}: transfer {n}, word {addr}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    a.1, b.1,
+                    "{what}, role {t}: the stream outside the addresses"
+                );
+            }
+            std::array::from_fn(|t| {
+                crate::code::Code {
+                    ins: looped[t].clone(),
+                    loops: loops[t].clone(),
+                }
+                .stored()
+                .unwrap()
+                .0
+                .len()
+            })
+        };
+        for (op, axis) in [
+            (ReduceOp::Sum, Axis::Cols),
+            (ReduceOp::Max, Axis::Cols),
+            (ReduceOp::Sum, Axis::Rows),
+        ] {
+            for outputs in [1, 2, 5] {
+                let mut sizes = Vec::new();
+                for per in [3, 4, 17, 130, 131, 200] {
+                    let Ok(layout) = plan_layout(outputs, per) else {
+                        continue;
+                    };
+                    let (inputs, fin) = math_programs(op, axis, per, 7);
+                    let what = format!("{op:?} {axis:?}, {outputs} outputs of {per}");
+                    let input =
+                        |k: usize, n: usize| layout.in_at + (k * per + n) as u64 * TILE_SLOT;
+                    sizes.push(compare(&what, &layout, &inputs, &fin, &input));
+                }
+                // One loop counts 128; past it the middle is two sibling loops.
+                let (short, long): (Vec<_>, Vec<_>) =
+                    sizes.iter().enumerate().partition(|&(i, _)| i < 4);
+                for set in [short, long] {
+                    assert!(
+                        set.windows(2).all(|w| w[0].1 == w[1].1),
+                        "{op:?} {axis:?} {outputs}: stored words {sizes:?}"
+                    );
+                }
+            }
+        }
+        // A continuation's chunk: the prior's copy first, then its tiles, outputs
+        // `ROW_CHUNK` slots apart.
+        let c = plan_chunk_layout(3).unwrap();
+        for tiles in [2, 5, ROW_CHUNK] {
+            let mut copy = Program::new();
+            copy.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                p.store(LReg::L0, Format::Int32, OUT_ROW + o);
+            });
+            let mut inputs = vec![copy.finish()];
+            for n in 0..tiles {
+                inputs.push(accumulate(
+                    ReduceOp::Max,
+                    Axis::Cols,
+                    false,
+                    (n + 1 == tiles).then_some(9),
+                ));
+            }
+            let fin = finish(ReduceOp::Max, Axis::Cols);
+            let input = |k: usize, n: usize| match n {
+                0 => c.prior_at + k as u64 * TILE_SLOT,
+                n => c.layout.in_at + (k * ROW_CHUNK + n - 1) as u64 * TILE_SLOT,
+            };
+            compare(
+                &format!("continuation of {tiles}"),
+                &c.layout,
+                &inputs,
+                &fin,
+                &input,
+            );
+        }
+    }
+
+    /// Where the middle inputs' programs differ, or their slots are not
+    /// consecutive, there is nothing to repeat.
+    #[test]
+    fn roles_that_do_not_repeat_are_not_looped() {
+        let layout = plan_layout(1, 4).unwrap();
+        let (mut inputs, fin) = math_programs(ReduceOp::Sum, Axis::Cols, 4, 32);
+        let input = |_: usize, n: usize| layout.in_at + n as u64 * TILE_SLOT;
+        assert!(roles_looped(&layout, &inputs, &fin, &input).is_some());
+        let backwards = |_: usize, n: usize| layout.in_at + (3 - n) as u64 * TILE_SLOT;
+        assert!(roles_looped(&layout, &inputs, &fin, &backwards).is_none());
+        inputs[2].push(tt_isa::sfpu::nop());
+        assert!(roles_looped(&layout, &inputs, &fin, &input).is_none());
+    }
 
     fn data(rows: usize, cols: usize) -> Vec<f32> {
         (0..rows * cols)

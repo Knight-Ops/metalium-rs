@@ -38,8 +38,9 @@ pub enum TtError {
     TooFewTiles { asked: usize, have: usize },
     /// A run or a data mover did not finish within its budget.
     Timeout { detail: String },
-    /// No GDDR channel has room for a tensor.
-    OutOfMemory { slots: u64 },
+    /// No GDDR channel has room for a tensor: the channel that refused it had `free` bytes, the
+    /// largest run of them `largest`.
+    OutOfMemory { slots: u64, free: u64, largest: u64 },
     /// The engine cannot do this (an engine without device storage, a trace on
     /// an engine that captures none, an op the mesh does not run).
     Unsupported { what: String },
@@ -110,9 +111,14 @@ impl std::fmt::Display for TtError {
                 write!(f, "{asked} tiles asked for, the chip has {have}")
             }
             TtError::Timeout { detail } => write!(f, "{detail}"),
-            TtError::OutOfMemory { slots } => write!(
+            TtError::OutOfMemory {
+                slots,
+                free,
+                largest,
+            } => write!(
                 f,
-                "no room in GDDR for {slots} tile slots per channel: free tensors, or use a \
+                "no room in GDDR for {slots} tile slots per channel (the channel that refused \
+                 them has {free} bytes free, the largest run {largest}): free tensors, or use a \
                  smaller batch"
             ),
             TtError::Unsupported { what } => f.write_str(what),
@@ -207,7 +213,15 @@ impl From<RunError> for TtError {
 impl From<TensorError> for TtError {
     fn from(e: TensorError) -> Self {
         match e {
-            TensorError::OutOfMemory { slots } => TtError::OutOfMemory { slots },
+            TensorError::OutOfMemory {
+                slots,
+                free,
+                largest,
+            } => TtError::OutOfMemory {
+                slots,
+                free,
+                largest,
+            },
             TensorError::Transport(t) => t.into(),
             TensorError::Mover(m) => m.into(),
             TensorError::Run(r) => r.into(),
@@ -297,8 +311,20 @@ mod tests {
 
     #[test]
     fn running_out_of_gddr_is_out_of_memory() {
-        let e: TtError = TensorError::OutOfMemory { slots: 7 }.into();
-        assert_eq!(e, TtError::OutOfMemory { slots: 7 });
+        let e: TtError = TensorError::OutOfMemory {
+            slots: 7,
+            free: 3,
+            largest: 1,
+        }
+        .into();
+        assert_eq!(
+            e,
+            TtError::OutOfMemory {
+                slots: 7,
+                free: 3,
+                largest: 1
+            }
+        );
         let wrapped: TtError = TensorError::Run(RunError::Queued("x".into())).into();
         assert_eq!(wrapped, TtError::Device("x".into()));
     }

@@ -1204,13 +1204,17 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
 ///   reading GDDR all step ([`tt_kernels::session::probe_background_stream`]), `TT_PROBE_BG_TILES`
 ///   tiles a unit a replay (default 16,384: ~68 MB, ~10 ms at ~7 GB/s a unit).
 ///
+/// With `TT_PROBE_ATTENTION_SPLIT=1`, each head's attention runs as two halves of its positions on
+/// two units with no exchange ([`tt_kernels::attention::probe_split`]; flash-decode's P0, timing only).
+///
 /// Every capture also prints its space report (`SPACE` lines, [`tt_kernels::session::probe_space_report`]):
 /// what its ops take of a unit's `DATA`, the program cache and the stream. With `TT_PROBE_RESIDENCY=1`,
 /// its residency plan too (`RESIDENCY` lines, [`tt_kernels::residency::probe_residency_plan`]: what
 /// could stay in L1 between ops; `docs/plans/planned-l1-residency.md` Phase 1).
 ///
 /// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
-/// cache with one 64-token chunk; prompts of 32 and 256 tokens, `TT_GEN_NEW` tokens each.
+/// cache with one 64-token chunk; prompts of 32 and 256 tokens (or the comma-separated
+/// `TT_GEN_PROMPTS`), `TT_GEN_NEW` tokens each.
 /// NC's waits over one generation of `new` tokens from a `len`-token prompt
 /// (`burn_tt::probe_nc_waits`), per decode step (the prompt's replays included): the units' mean
 /// and the busiest unit's, in us at the profile mode's measured 1350 ticks/us.
@@ -1281,12 +1285,16 @@ fn traced_generation_stream_ceiling() {
     probe_skip_weight_reads(mode != "off");
     probe_background_stream(background);
     probe_space_report(true);
+    let split = std::env::var("TT_PROBE_ATTENTION_SPLIT").is_ok_and(|v| v == "1");
+    tt_kernels::attention::probe_split(split);
     let residency = std::env::var("TT_PROBE_RESIDENCY").is_ok_and(|v| v == "1");
     let nc_waits = std::env::var("TT_PROBE_NC_WAITS").is_ok_and(|v| v == "1");
     tt_kernels::residency::probe_residency_plan(residency);
     with_device(Config::default(), |d| {
         conditions(card());
-        println!("BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\"}}");
+        println!(
+            "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split}}}"
+        );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = m.fused();
         let shapes = Shapes::new(max_len, &[64]);
@@ -1305,7 +1313,10 @@ fn traced_generation_stream_ceiling() {
         };
         drop(build("first"));
         let g = build("second");
-        for len in [32, 256] {
+        let prompts: Vec<usize> = std::env::var("TT_GEN_PROMPTS").map_or(vec![32, 256], |v| {
+            v.split(',').map(|n| n.trim().parse().unwrap()).collect()
+        });
+        for len in prompts {
             let p = gen_prompt(len, config.vocab);
             let mut step = Vec::new();
             for i in 0..WARMUPS + SAMPLES {

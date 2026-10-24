@@ -323,6 +323,82 @@ fn second_jobs_in_the_trace_arena_replay_as_the_ops_run_fresh() {
     });
 }
 
+/// A balanced deal (`Session::set_balanced_deal`, `docs/plans/decode-to-bandwidth.md` Phase 8, "a
+/// product's longest unit"): a product of 40 columns at `K` = 2048 after another, whose own units
+/// 0-3 would run five rounds of two columns while units 4-7 take one job read ahead. With it on,
+/// the 24 columns after the first round are dealt over all eight units, so units 4-7 run three
+/// more each in the same ring after their job read ahead. It replays as it runs fresh, bit for
+/// bit, and each unit's columns read in the span are as dealt. Watched failing with each unit's later columns
+/// shifted one back (a column computed twice, the last never): the bits differ.
+#[test]
+fn balanced_deals_replay_as_the_ops_run_fresh() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        let w0 = s.upload(&values(1, K * 2048), K, 2048).unwrap();
+        let w1 = s.upload(&values(2, 2048 * 1280), 2048, 1280).unwrap();
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let forward = |s: &mut Session<_>, x: &DramTensor| {
+            let h = mm(s, x, &w0);
+            let y = mm(s, &h, &w1);
+            s.free(h).unwrap();
+            y
+        };
+        let warm = forward(s, &x);
+        s.free(warm).unwrap();
+        let mut fresh = Vec::new();
+        for seed in [10, 20, 21] {
+            s.write(&x, &values(seed, K)).unwrap();
+            let y = forward(s, &x);
+            fresh.push(s.download(&y).unwrap());
+            s.free(y).unwrap();
+        }
+        s.set_count_trace_bytes(true);
+        // Per unit, the second product's `B` read in its span (`OpRecord::unit_bytes`).
+        let mut in_span = Vec::new();
+        for balanced in [false, true] {
+            s.set_balanced_deal(balanced);
+            s.write(&x, &values(10, K)).unwrap();
+            s.begin_trace().unwrap();
+            let y = forward(s, &x);
+            let id = s.end_trace().unwrap();
+            let ops = s.trace_ops(id).unwrap();
+            let second = ops
+                .iter()
+                .filter(|op| op.what.contains("matmul"))
+                .nth(1)
+                .expect("two products");
+            let mut b = [0u64; 8];
+            for (u, bytes) in &second.unit_bytes {
+                b[*u as usize] = bytes.b - bytes.ahead.min(bytes.b);
+            }
+            in_span.push(b.map(|v| v / (64 * tt_isa::dm::TILE_SLOT)));
+            let mut got = vec![s.download(&y).unwrap()];
+            for seed in [20u64, 21] {
+                s.write(&x, &values(seed, K)).unwrap();
+                s.replay(id).unwrap();
+                s.sync().unwrap();
+                got.push(s.download(&y).unwrap());
+            }
+            for (i, (g, w)) in got.iter().zip(&fresh).enumerate() {
+                assert_bits(&format!("balanced {balanced}, run {i}"), g, w);
+            }
+            s.release_trace(id).unwrap();
+            s.free(y).unwrap();
+        }
+        s.set_balanced_deal(false);
+        s.set_count_trace_bytes(false);
+        // Columns of `B` (64 tiles each) read in the span, by unit. Units 4-7 read their job's
+        // two ahead and units 0-3 their first round's (busy prefetch), so 24 columns are left:
+        // without, six each on units 0-3 and none on 4-7; with, three on every unit.
+        eprintln!("columns read in the span by unit, without and with: {in_span:?}");
+        assert_eq!(in_span[0], [6, 6, 6, 6, 0, 0, 0, 0], "without");
+        assert_eq!(in_span[1], [3; 8], "with");
+        for t in [w0, w1, x] {
+            s.free(t).unwrap();
+        }
+    });
+}
+
 /// Claim three.
 #[test]
 fn a_unit_that_ran_an_op_since_the_last_product_does_not_prefetch() {

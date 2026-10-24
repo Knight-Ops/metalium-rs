@@ -204,7 +204,13 @@ Every phase is bit for bit with today's attention, and each head's positions kee
   - **Measured** (card 1, alone): 1.7B 35.64 / 36.22 / 37.20 -> 35.56 / 36.10 / 37.00 ms (`1792293194`).
     With the thin-product deal (decode-to-bandwidth Phase 4), see there.
 - [ ] **A5. Decision (ask the user):** split-position (flash-decode) attention, if A0-A4 leave attention exposed. It
-  changes the softmax's and `pv`'s accumulation order, so it needs a derived bound.
+  changes the softmax's and `pv`'s accumulation order, so it needs a derived bound. Written up 2026-10-23
+  ([split-k-and-flash-decode.md](../proposals/split-k-and-flash-decode.md)): attention is 99 us a layer at 512
+  positions (28 at 64), the context's whole cost; variant A keeps every `exp` and reorders only the softmax's sum and
+  `pv`'s chain. **Probed and stopped** (2026-10-23, `TT_PROBE_ATTENTION_SPLIT=1`): two halves on 64 units with no
+  exchange save 19.7 us a layer at `Step(512)` (1.7B 18.19 -> 17.71 ms) and cost 0.27 ms at shorter steps, before
+  the exchanges; parked. Past 512 positions today's job does not fit L1 (the composition runs); halves fit to 1024
+  ([log](../learnings/performance-log.md#flash-decodes-probe-a-heads-positions-in-two-halves-2026-10-23-card-0)).
 
 ## Gates, every phase
 

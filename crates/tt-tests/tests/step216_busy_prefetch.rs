@@ -232,7 +232,22 @@ fn counted<T: tt_device::Transport>(
     let y = forward(s, w, x);
     let id = s.end_trace().unwrap();
     s.set_busy_prefetch(true);
-    let bytes = s.trace_ops(id).unwrap().iter().map(|op| op.bytes).collect();
+    let ops = s.trace_ops(id).unwrap();
+    // Unit by unit, the same bytes: they sum to the op's, and only a unit with a list read
+    // ahead counts any ahead.
+    for (i, op) in ops.iter().enumerate() {
+        let mut sum = tt_kernels::profile_mode::OpBytes::default();
+        for (u, b) in &op.unit_bytes {
+            sum.add(b);
+            assert!(
+                b.ahead == 0 || op.ahead.iter().any(|(v, _)| *v == *u as usize),
+                "op {i}: unit {u} counts {} bytes ahead with no list read ahead",
+                b.ahead
+            );
+        }
+        assert_eq!(sum, op.bytes, "op {i}: its units' bytes sum to its own");
+    }
+    let bytes = ops.iter().map(|op| op.bytes).collect();
     s.release_trace(id).unwrap();
     s.free(y).unwrap();
     bytes

@@ -830,6 +830,98 @@ pub fn unpack_datums_to_dst(l1: u64, first: u32, count: u32, row: u32) -> Vec<In
     p
 }
 
+/// [`unpack_datums_to_dst`] with the base taken from `base_gpr` (in
+/// [`tile_base_units`], as the header-skipping base of the first datum), not
+/// an immediate: the same words for every tile, so a run of tiles is one block
+/// the runner repeats (`crate::code::Loop`). With `step`, the GPR holding the
+/// distance to the next tile is added to the base first, so the caller sets
+/// the base one step back. The unpacker sees the same base and destination,
+/// written in the same drained window, as [`unpack_datums_to_dst`] writes them.
+pub fn unpack_datums_to_dst_gpr(
+    base_gpr: u32,
+    step: Option<u32>,
+    count: u32,
+    row: u32,
+) -> Vec<Instruction> {
+    use tt_isa::backend::{self, Before};
+    assert!(count > 0 && count <= TILE_DATUMS);
+    let mut p = vec![backend::wait_for_unpacker0(Before::CONFIG).unwrap()];
+    if let Some(stride) = step {
+        // `step38_gpr_add`, as the matmul's `gpr_step`.
+        p.push(encode::adddmareg(base_gpr, stride, base_gpr).unwrap());
+    }
+    p.push(gpr_settled());
+    p.push(backend::write_word(base_gpr, thcon::THCON_SEC0_REG3_Base_address.addr32()).unwrap());
+    let mut words = ConfigWords::new();
+    words
+        .set(thcon::THCON_SEC0_REG5_Dest_cntx0_address, dst_address(row))
+        .unwrap();
+    p.extend(config_program(&words));
+    p.push(
+        backend::stallwait(
+            backend::block::UNPACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+    );
+    p.push(set_adc_x_unpack(0, count - 1));
+    p.push(unpack_instruction());
+    p
+}
+
+/// Hold the Configuration Unit until this thread's Scalar Unit work is done
+/// (C0): a `WRCFG` after it reads what the `ADDDMAREG`s before it wrote. Without
+/// it silicon unpacked from a GPR's old value where ttsim did not (card 0,
+/// `1792793167`); tt-metal's Blackhole LLK puts the same wait between its GPR
+/// writes and the `WRCFG`s that read them (`STALLWAIT(STALL_CFG, THCON)`).
+pub fn gpr_settled() -> Instruction {
+    use tt_isa::backend::{self, block, cond};
+    backend::stallwait(block::CONFIG, cond::SCALAR_OUTSTANDING).unwrap()
+}
+
+/// What `l1_dest` is in `THCON_SEC0_REG1_L1_Dest_addr` ([`pack_config`]): for
+/// [`pack_tile_from_dst_gpr`]'s GPR.
+pub fn pack_dest_units(l1_dest: u64) -> u32 {
+    (l1_dest / 16 - 1) as u32
+}
+
+/// [`pack_tile_from_dst`] with the destination taken from `dest_gpr` (in
+/// [`pack_dest_units`]), stepped first by `step`'s GPR as in
+/// [`unpack_datums_to_dst_gpr`]: every word [`pack_tile_from_dst`] writes,
+/// that one from the GPR.
+pub fn pack_tile_from_dst_gpr(dest_gpr: u32, step: Option<u32>, row: u32) -> Vec<Instruction> {
+    use tt_isa::backend::{self, Before};
+    let mut p = vec![backend::wait_for_packer(Before::CONFIG).unwrap()];
+    if let Some(stride) = step {
+        p.push(encode::adddmareg(dest_gpr, stride, dest_gpr).unwrap());
+    }
+    p.push(gpr_settled());
+    let dest = thcon::THCON_SEC0_REG1_L1_Dest_addr.addr32();
+    p.push(backend::write_word(dest_gpr, dest).unwrap());
+    let mut words = ConfigWords::new();
+    // Any address: its word is left out below, the GPR's written instead.
+    pack_config(&mut words, 16);
+    words
+        .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
+        .unwrap();
+    for &(addr32, value) in words.words() {
+        if addr32 != dest {
+            p.extend(backend::set_gpr(SCRATCH_GPR, value).unwrap());
+            p.push(backend::write_word(SCRATCH_GPR, addr32).unwrap());
+        }
+    }
+    p.push(tt_isa::sfpu::nop());
+    p.push(
+        backend::stallwait(
+            backend::block::PACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+    );
+    p.extend(pack_rows(TILE_DST_ROWS));
+    p
+}
+
 /// Pack `Dst` rows `row..row + 64` -- one FP32 tile's datums, faces in order,
 /// no header -- to `l1_dest`, after whatever pack came before. The packer's
 /// configuration is rewritten whole (as the matmul's pack role does per

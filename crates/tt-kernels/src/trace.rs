@@ -170,6 +170,9 @@ pub struct OpRecord {
     /// out of them to before the ops it runs under. Their bytes are counted as the op's
     /// (`OpBytes::ahead`).
     pub ahead: Vec<(usize, core::ops::Range<usize>)>,
+    /// What `bytes` is made of, unit by unit: (unit, what its entries and its lists read ahead
+    /// move), for each unit that moves anything; they sum to `bytes`. Counted with `bytes`.
+    pub unit_bytes: Vec<(u16, crate::profile_mode::OpBytes)>,
     /// For each idle unit's `PREFETCH` list in `ahead`, (unit, the barrier target it waits for,
     /// relative to the capture's first): the product it is anchored at
     /// (`Session::set_prefetch_anchor`).
@@ -489,6 +492,12 @@ pub(crate) struct UnitTrace {
     pub(crate) generations: u32,
     /// As [`UnitCapture::held_programs`].
     pub(crate) held_programs: Vec<(u64, u64)>,
+    /// Every program the stream names, once each: its address and words, which a replay puts
+    /// back where another trace's took the room (`ProgramCache::restore`), and their hash.
+    pub(crate) programs: Vec<(u64, std::sync::Arc<[u32]>, u64)>,
+    /// The program cache's generation and change count when the programs were last known
+    /// resident, so a replay that finds them unchanged restores nothing.
+    pub(crate) restored: Option<(u64, u64)>,
     /// As [`UnitCapture::sections`].
     pub(crate) sections: Vec<u32>,
     /// What the unit's stream and its sections are made of, and their GDDR bytes.
@@ -593,6 +602,7 @@ mod tests {
                     barrier: true,
                     stamps: [0; 2],
                     bytes: Default::default(),
+                    unit_bytes: Vec::new(),
                     ahead: Vec::new(),
                     ahead_waits: Vec::new(),
                     l1_top: 0,

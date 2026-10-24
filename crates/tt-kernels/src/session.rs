@@ -264,6 +264,17 @@ pub fn probe_busy_ignore_tops(on: bool) {
     PROBE_BUSY_TOPS.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+static PROBE_SKIP_RESTORE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A gate's negative control (`step226_paged_programs`, the simulator only): replays restore no
+/// program another trace's took the room of, so they run whatever lies at their addresses.
+/// Process-wide; never on silicon, where a stale program can hang a core.
+#[doc(hidden)]
+pub fn probe_skip_restore(on: bool) {
+    PROBE_SKIP_RESTORE.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 static PROBE_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the space audit): every
@@ -752,6 +763,8 @@ pub struct Session<T: Transport> {
     stream_prefetch: bool,
     /// [`Session::set_prefetch_second_job`].
     prefetch_second_job: bool,
+    /// [`Session::set_balanced_deal`].
+    balanced_deal: bool,
     /// [`Session::set_stream_prefetch_units`].
     stream_prefetch_units: usize,
     /// [`Session::set_stream_handoff`]: the chunk a handed column is handed at (`Some(0)`: half).
@@ -845,6 +858,8 @@ pub struct Session<T: Transport> {
     profile_roles: bool,
     /// [`Session::drains`].
     drains: u64,
+    /// [`Session::restored_bytes`].
+    restored_bytes: u64,
     profile: runtime::Profile,
     /// GDDR, once [`Session::enable_dram`] has been called.
     dram: Option<DramState>,
@@ -874,6 +889,8 @@ pub struct Session<T: Transport> {
     /// Placements freed while lists that may read them are queued: given back
     /// at the next sync.
     pending_frees: Vec<tensor::Placement>,
+    /// What `pending_frees` hold on a channel.
+    pending_bytes: u64,
     /// The trace being captured ([`Session::begin_trace`]).
     pub(crate) capture: Option<trace::Capture>,
     /// Finished traces, by number.
@@ -1282,7 +1299,9 @@ fn place_programs<T: Transport>(
                 }
                 let (words, len_word, h) =
                     stored_program(roles, &seg.kernel_loops[k], t).map_err(PlaceError::Failed)?;
-                let at = match cache.place_hashed(&words, h) {
+                // A trace's programs may make room only once nothing queued can run them: a
+                // replay restores them (`Session::replay`).
+                let at = match cache.place_hashed_evicting(&words, h, !in_flight) {
                     Ok(Placed::Hit(at)) => at,
                     Ok(Placed::Upload(at)) => {
                         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -1361,9 +1380,33 @@ fn place_programs<T: Transport>(
             cache.clear_unheld();
         }
     }
-    Err(PlaceError::Failed(TensorError::Shape(
-        "a list's programs do not fit an empty program cache".into(),
-    )))
+    // Cleared of everything no trace holds and still refused: say what the
+    // traces leave and what the list asked for.
+    let mut seen = std::collections::HashSet::new();
+    let mut needed = 0u64;
+    for (k, roles) in seg.kernel_roles.iter().enumerate() {
+        for (t, program) in roles.iter().enumerate() {
+            if program.is_empty() {
+                continue;
+            }
+            let (words, _, h) =
+                stored_program(roles, &seg.kernel_loops[k], t).map_err(PlaceError::Failed)?;
+            if seen.insert(h) {
+                needed += (words.len() as u64 * 4).next_multiple_of(16);
+            }
+        }
+    }
+    let room = cache.room();
+    Err(PlaceError::Failed(TensorError::Shape(format!(
+        "a list's programs do not fit the program cache of the unit at {tile:?}: the list needs \
+         {needed} bytes in {} programs; the capture in progress holds {} of its {} bytes, and \
+         the largest run it leaves is {} bytes (traces hold {})",
+        seen.len(),
+        room.protected,
+        room.region,
+        room.largest,
+        room.held
+    ))))
 }
 
 /// Why [`place_programs`] placed nothing.
@@ -2417,6 +2460,7 @@ impl<T: Transport> Session<T> {
             // `TT_STREAM_PREFETCH=0` turns it off.
             stream_prefetch: std::env::var("TT_STREAM_PREFETCH").map_or(true, |v| v != "0"),
             prefetch_second_job: std::env::var("TT_PREFETCH_SECOND").is_ok_and(|v| v == "1"),
+            balanced_deal: std::env::var("TT_BALANCED_DEAL").is_ok_and(|v| v == "1"),
             // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             stream_prefetch_units: units_from_env("TT_STREAM_PREFETCH_UNITS", PREFETCH_UNITS),
             // `TT_STREAM_HANDOFF=1` turns it on; `TT_STREAM_HANDOFF_AT=<h>` hands at chunk `h`
@@ -2483,6 +2527,7 @@ impl<T: Transport> Session<T> {
             pipelined: 0,
             profile_roles: true,
             drains: 0,
+            restored_bytes: 0,
             dram: None,
             profiling: None,
             profiler: None,
@@ -2496,6 +2541,7 @@ impl<T: Transport> Session<T> {
             math,
             barriers: 0,
             pending_frees: Vec::new(),
+            pending_bytes: 0,
             capture: None,
             traces: Default::default(),
             next_trace: 0,
@@ -4010,7 +4056,14 @@ impl<T: Transport> Session<T> {
         // A queued list may still read it, and the next allocation must not
         // hand its slots to an upload that would land first.
         if self.units.iter().any(|u| !u.queued.is_empty()) {
+            self.pending_bytes += p.channel_bytes();
             self.pending_frees.push(p);
+            // More waiting to be freed than is free: wait for the queue and take it back, rather
+            // than let a long chain of queued ops run GDDR out (an eager 32K prefill's 255
+            // chunks, each a new copy of the cache, filled 31 GB; `docs/plans/long-context.md`).
+            if self.pending_bytes > self.dram_state()?.alloc.free_bytes() {
+                self.sync()?;
+            }
             return Ok(());
         }
         self.dram_state()?.alloc.free(&p);
@@ -4233,6 +4286,7 @@ impl<T: Transport> Session<T> {
 
     fn apply_pending_frees(&mut self) {
         let frees = std::mem::take(&mut self.pending_frees);
+        self.pending_bytes = 0;
         if let Ok(d) = self.dram_state() {
             for p in &frees {
                 d.alloc.free(p);
@@ -4409,6 +4463,7 @@ impl<T: Transport> Session<T> {
                 barrier: self.units.len() > 1,
                 stamps: [0; 2],
                 bytes: Default::default(),
+                unit_bytes: Vec::new(),
                 ahead: std::mem::take(&mut self.prefetch_lists),
                 ahead_waits: std::mem::take(&mut self.prefetch_waits),
                 l1_top: planned.top,
@@ -4960,6 +5015,7 @@ impl<T: Transport> Session<T> {
             let relative = capture_commands(entries, base, |address| {
                 let programs = &mut self.units[u].programs;
                 if programs.hold(address) {
+                    programs.protect(address);
                     held.push((programs.generation(), address));
                 }
             })?;
@@ -4981,6 +5037,7 @@ impl<T: Transport> Session<T> {
                         };
                         let programs = &mut self.units[u].programs;
                         if programs.hold(address) {
+                            programs.protect(address);
                             held.push((programs.generation(), address));
                         }
                     }
@@ -5038,18 +5095,24 @@ impl<T: Transport> Session<T> {
     fn place_held(&mut self, u: usize, program: &[Instruction]) -> Result<u64, TensorError> {
         let at = self.place_program(u, program)?;
         self.units[u].programs.hold(at);
+        self.units[u].programs.protect(at);
         Ok(at)
     }
 
     /// Put `program` in unit `u`'s program cache, not held: its address.
     fn place_program(&mut self, u: usize, program: &[Instruction]) -> Result<u64, TensorError> {
         use crate::program_cache::{CacheError, Placed};
-        let words: Vec<u32> = program.iter().map(|i| i.word()).collect();
+        let words: Arc<[u32]> = program.iter().map(|i| i.word()).collect();
+        let hash = crate::program_cache::hash(&words);
         for attempt in 0..2 {
             let Session { dev, units, .. } = self;
             let unit = &mut units[u];
             let w = unit.resident.as_ref().unwrap().window();
-            let at = match unit.programs.place(&words) {
+            // Drained, a trace's programs may make room (a replay restores them).
+            let at = match unit
+                .programs
+                .place_hashed_evicting(&words, hash, attempt == 1)
+            {
                 Ok(Placed::Hit(at)) => at,
                 Ok(Placed::Upload(at)) => {
                     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -5425,8 +5488,17 @@ impl<T: Transport> Session<T> {
 
     /// End the capture: wait for its ops, and store each unit's stream in
     /// GDDR. On any failure nothing is kept, and what the capture held is
-    /// given back.
+    /// given back. Either way its programs are held as any trace's are from here
+    /// on, no longer protected ([`ProgramCache::protect`]).
     pub fn end_trace(&mut self) -> Result<TraceId, TensorError> {
+        let result = self.end_trace_inner();
+        for unit in &mut self.units {
+            unit.programs.unprotect_all();
+        }
+        result
+    }
+
+    fn end_trace_inner(&mut self) -> Result<TraceId, TensorError> {
         let Some(mut capture) = self.capture.take() else {
             return Err(TraceError::NotCapturing.into());
         };
@@ -5570,8 +5642,9 @@ impl<T: Transport> Session<T> {
         // as the movers expand them. The streams are not kept once stored.
         if self.profiler.is_some() || self.count_trace_bytes {
             for op in &mut ops {
-                for (uc, range) in units.iter().zip(&op.entries) {
-                    op_bytes(uc, range.clone(), &mut op.bytes);
+                let mut per_unit = vec![crate::profile_mode::OpBytes::default(); units.len()];
+                for ((uc, range), own) in units.iter().zip(&op.entries).zip(&mut per_unit) {
+                    op_bytes(uc, range.clone(), own);
                 }
                 // What its lists read ahead is its own too: counted again only where a list
                 // lies outside its entries (moved to before the ops it runs under).
@@ -5580,9 +5653,15 @@ impl<T: Transport> Session<T> {
                     op_bytes(&units[*u], r.clone(), &mut ahead);
                     let own = &op.entries[*u];
                     if !(own.start <= r.start && r.end <= own.end) {
-                        op.bytes.add(&ahead);
+                        per_unit[*u].add(&ahead);
                     }
-                    op.bytes.ahead += ahead.read;
+                    per_unit[*u].ahead += ahead.read;
+                }
+                for (u, b) in per_unit.into_iter().enumerate() {
+                    op.bytes.add(&b);
+                    if b != crate::profile_mode::OpBytes::default() {
+                        op.unit_bytes.push((u as u16, b));
+                    }
                 }
             }
         }
@@ -5641,7 +5720,22 @@ impl<T: Transport> Session<T> {
                 None => self.store_stream(u, &uc),
             };
             match stored_stream {
-                Ok(t) => stored.push(Some(t)),
+                Ok(mut t) => {
+                    // The words of every program it holds, resident now (protected since the
+                    // capture took them): what a replay restores.
+                    let cache = &self.units[u].programs;
+                    let mut seen = std::collections::BTreeSet::new();
+                    for &(generation, at) in &uc.held_programs {
+                        if generation == cache.generation() && seen.insert(at) {
+                            let (words, hash) = cache
+                                .resident_at(at)
+                                .expect("a capture's programs stay until it ends");
+                            t.programs.push((at, words, hash));
+                        }
+                    }
+                    t.restored = Some((cache.generation(), cache.changes()));
+                    stored.push(Some(t))
+                }
                 Err(e) => {
                     failure = Some(e);
                     break;
@@ -5742,6 +5836,8 @@ impl<T: Transport> Session<T> {
             count: words.len() as u32,
             generations,
             held_programs: uc.held_programs.clone(),
+            programs: Vec::new(),
+            restored: None,
             sections: uc.sections.clone(),
             composition,
             top_level_entries: words.len() as u32,
@@ -5945,6 +6041,8 @@ impl<T: Transport> Session<T> {
             count: top.len() as u32,
             generations,
             held_programs: uc.held_programs.clone(),
+            programs: Vec::new(),
+            restored: None,
             sections: all_sections.iter().map(|s| s.len() as u32).collect(),
             composition,
             top_level_entries: top.len() as u32,
@@ -5988,6 +6086,13 @@ impl<T: Transport> Session<T> {
             })
             .collect();
         let barriers = t.barriers;
+        // Its programs where it names them: another trace's may have taken the room since
+        // (`ProgramCache::restore`).
+        for (u, call) in calls.iter().enumerate() {
+            if call.is_some() {
+                self.restore_programs(u, id)?;
+            }
+        }
         // Every unit that runs the trace starts after the ops before it.
         for (u, call) in calls.iter().enumerate() {
             if call.is_some() {
@@ -6056,6 +6161,57 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
+    /// Put trace `id`'s programs back in unit `u`'s cache where its stream names them, unless
+    /// nothing has left the cache since they were last there. Programs the trace evicts to make
+    /// room may be another replay's still queued, so the unit drains first when it must.
+    fn restore_programs(&mut self, u: usize, id: TraceId) -> Result<(), TensorError> {
+        use crate::program_cache::{CacheError, Placed};
+        let (generation, changes) = {
+            let c = &self.units[u].programs;
+            (c.generation(), c.changes())
+        };
+        let Some(ut) = self.traces[&id.0].units[u].as_ref() else {
+            return Ok(());
+        };
+        if ut.restored == Some((generation, changes))
+            || PROBE_SKIP_RESTORE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let programs = ut.programs.clone();
+        for (at, words, hash) in &programs {
+            for attempt in 0..2 {
+                let Session { dev, units, .. } = self;
+                let unit = &mut units[u];
+                let idle = unit.queued.is_empty();
+                match unit.programs.restore(words, *hash, *at, idle) {
+                    Ok(Placed::Hit(_)) => break,
+                    Ok(Placed::Upload(_)) => {
+                        let w = unit.resident.as_ref().unwrap().window();
+                        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        dev.l1_write(w, unit.tile, *at, &bytes)?;
+                        self.restored_bytes += bytes.len() as u64;
+                        break;
+                    }
+                    Ok(Placed::Bypass) => unreachable!("restore never bypasses"),
+                    Err(CacheError::Full { .. }) if attempt == 0 => self.drain_unit(u)?,
+                    Err(CacheError::Full { bytes }) => {
+                        return Err(TensorError::Shape(format!(
+                            "a trace's {bytes}-byte program cannot be put back at {at:#x}: what \
+                             lies there is protected"
+                        )))
+                    }
+                }
+            }
+        }
+        let c = &self.units[u].programs;
+        let stamp = Some((c.generation(), c.changes()));
+        if let Some(ut) = self.traces.get_mut(&id.0).and_then(|t| t.units[u].as_mut()) {
+            ut.restored = stamp;
+        }
+        Ok(())
+    }
+
     /// The window of trace `id`'s ops its next replay stamps (`tt_isa::dm::TRACE_WINDOW`), its ops
     /// made known to the profile mode on its first replay.
     fn profile_window(&mut self, id: TraceId) -> u32 {
@@ -6083,6 +6239,7 @@ impl<T: Transport> Session<T> {
                         .filter(|r| r.len() > o.barrier as usize)
                         .count(),
                     bytes: o.bytes,
+                    unit_bytes: o.unit_bytes.clone(),
                 })
                 .collect();
             let stamps = ops.iter().map(|o| o.stamps[detail]).collect();
@@ -6181,14 +6338,8 @@ impl<T: Transport> Session<T> {
             .zip(&self.units)
             .map(|(ut, unit)| {
                 let ut = ut.as_ref()?;
-                // One hold per reference, so the same program appears often; a hold
-                // from before a reset names nothing.
-                let live: std::collections::BTreeSet<u64> = ut
-                    .held_programs
-                    .iter()
-                    .filter(|&&(generation, _)| generation == unit.programs.generation())
-                    .map(|&(_, at)| at)
-                    .collect();
+                // Its own programs, as it restores them: another trace's may lie at their
+                // addresses now.
                 let region = unit.programs.region();
                 Some(trace::UnitFootprint {
                     stream: ut.composition.clone(),
@@ -6197,10 +6348,11 @@ impl<T: Transport> Session<T> {
                     body_entries: ut.body_entries,
                     table_entries: ut.table_entries,
                     called_layers: ut.called_layers,
-                    programs: live.len() as u32,
-                    program_bytes: live
+                    programs: ut.programs.len() as u32,
+                    program_bytes: ut
+                        .programs
                         .iter()
-                        .filter_map(|&at| unit.programs.program_bytes(at))
+                        .map(|(_, words, _)| words.len() as u64 * 4)
                         .sum(),
                     cache_held_bytes: unit.programs.held_bytes(),
                     cache_bytes: region.end - region.base,
@@ -7572,6 +7724,7 @@ impl<T: Transport> Session<T> {
             c.units.iter().map(|u| u.stream.len()).collect()
         });
         let second_job = self.prefetch_second_job;
+        let balanced_deal = self.balanced_deal;
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -7597,6 +7750,7 @@ impl<T: Transport> Session<T> {
                         prefetch_units,
                         handoff,
                         second_job,
+                        balanced_deal,
                     },
                     &prefetch,
                     spread,
@@ -7733,7 +7887,8 @@ impl<T: Transport> Session<T> {
     ) -> Result<DramTensor, TensorError> {
         let [m, d, l, dv] = dims;
         let work = items.len() * (d / 32 + dv / 32) * l.div_ceil(32);
-        let units = self.spread_for(work).min(items.len()).max(1);
+        let jobs = items.len() * crate::attention::probe_runs(l);
+        let units = self.spread_for(work).min(jobs).max(1);
         let unpack_b = self.unpack_transposed_b;
         let cols = items.len() * m * dv;
         let twin = self.new_twin(1, cols, tensor::Elem::F32)?;
@@ -8332,6 +8487,19 @@ impl<T: Transport> Session<T> {
         self.planned_base = None;
     }
 
+    /// Whether a `K`-whole product whose own units would run more than a round of columns deals
+    /// the columns read in its span over the idle units [`Session::set_weight_prefetch`] takes as
+    /// well, after each one's job read ahead, rather than over its own units alone
+    /// (`TT_BALANCED_DEAL=1` at open; off by default; `docs/plans/decode-to-bandwidth.md` Phase 8,
+    /// "a product's longest unit"). The span's reads then end together, the remainder on the idle
+    /// units. Placement only, so the bits are the same. Cached residency plans are dropped: they
+    /// hold each op's layout.
+    pub fn set_balanced_deal(&mut self, on: bool) {
+        self.balanced_deal = on;
+        self.plans.clear();
+        self.planned_base = None;
+    }
+
     /// The most idle units a streamed product's prefetch takes ([`Session::set_stream_prefetch`];
     /// [`Session::set_prefetch_units`] is a whole-`K` product's): [`PREFETCH_UNITS`] by default,
     /// `TT_STREAM_PREFETCH_UNITS=<n>` at open.
@@ -8896,6 +9064,22 @@ impl<T: Transport> Session<T> {
     /// that unit's work overlapping the host's.
     pub fn drains(&self) -> u64 {
         self.drains
+    }
+
+    /// GDDR bytes free on the fullest channel, and in all, if the session has GDDR: what a
+    /// long-context run leaves (`docs/plans/long-context.md`). Dev-facing.
+    #[doc(hidden)]
+    pub fn dram_free_bytes_by_channel(&self) -> Option<(u64, u64)> {
+        self.dram
+            .as_ref()
+            .map(|d| (d.alloc.free_bytes(), d.alloc.free_bytes_total()))
+    }
+
+    /// Program bytes replays have put back in the program caches, where another trace's
+    /// programs had taken the room (`ProgramCache::restore`): what paging the traces' programs
+    /// costs, in uploads.
+    pub fn restored_bytes(&self) -> u64 {
+        self.restored_bytes
     }
 
     /// Whether a profile records the roles' events as well as the mover's

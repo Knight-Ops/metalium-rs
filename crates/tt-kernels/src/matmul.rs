@@ -1146,8 +1146,20 @@ pub(crate) fn matmul_items_reloading(
         }
         math.extend(i(sync::post_after(Unit::Matrix, sems.ready)));
 
+        // The packer's whole configuration before the first output; then only where each output
+        // goes, the one word that differs (`docs/plans/long-context.md` A3): every `PACR` sees what
+        // a whole rewrite a tile gave it, at a few words an output instead of the configuration's
+        // dozens, so a block's pack role no longer grows by those with its outputs.
         let mut pw = ConfigWords::new();
-        crate::datapath::pack_config(&mut pw, output.out);
+        if pack.is_empty() {
+            crate::datapath::pack_config(&mut pw, output.out);
+        } else {
+            pw.set(
+                tt_isa::cfg::generated::thcon::THCON_SEC0_REG1_L1_Dest_addr,
+                crate::datapath::pack_dest_units(output.out),
+            )
+            .unwrap();
+        }
         pack.extend(i(config_program(&pw)));
         pack.extend(i(sync::take(sems.ready, Before::PACKER)));
         pack.extend(crate::datapath::pack_rows_items(TILE_DST_ROWS));
@@ -2328,6 +2340,57 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `PACR` of a kernel's pack role sees the packer configuration a whole rewrite for its
+    /// output tile would give it, though only the first output's is written whole and each later
+    /// one's destination alone; and the pack role grows by a few words an output, not dozens.
+    #[test]
+    fn the_pack_role_configures_each_output_as_a_whole_rewrite_would() {
+        let pacrs = crate::code::transfers(&crate::datapath::pack_rows(TILE_DST_ROWS))
+            .0
+            .len();
+        let mut per_output = Vec::new();
+        for tiles in [[1, 2, 1], [2, 3, 5], [1, 2, 20]] {
+            let layout = plan_layout(tiles, L1Format::Fp32).unwrap();
+            let [_, _, pack] = matmul_items_reloading(
+                &layout.outputs,
+                layout.sems,
+                L1Format::Fp32,
+                0,
+                Fidelity::HiFi4,
+                None,
+                false,
+                LiveRows::All,
+            );
+            let stream = crate::loops::Item::unrolled(&pack);
+            let (seen, _) = crate::code::transfers(&stream);
+            assert_eq!(seen.len(), pacrs * layout.outputs.len(), "{tiles:?}");
+            for (k, output) in layout.outputs.iter().enumerate() {
+                let mut whole = ConfigWords::new();
+                crate::datapath::pack_config(&mut whole, output.out);
+                for config in &seen[k * pacrs..(k + 1) * pacrs] {
+                    for &(addr, value) in whole.words() {
+                        assert_eq!(
+                            config.get(&(addr as u32)),
+                            Some(&value),
+                            "{tiles:?} output {k} word {addr}"
+                        );
+                    }
+                }
+            }
+            let stored = crate::loops::lower_with(&pack, false).words.len();
+            per_output.push((stored, layout.outputs.len()));
+        }
+        let (a, b) = (per_output[1], per_output[2]);
+        let words_an_output = (b.0 - a.0) / (b.1 - a.1);
+        // 74 words an output when each wrote the whole configuration (16 words of three
+        // instructions and a separating `NOP`); its destination takes 4, the semaphores and
+        // `pack_rows` the rest.
+        assert!(
+            words_an_output <= 32,
+            "{words_an_output} pack words an output"
+        );
+    }
 
     #[test]
     fn lo_fidelity_is_the_established_encoding() {

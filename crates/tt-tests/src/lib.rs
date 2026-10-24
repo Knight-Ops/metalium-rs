@@ -9,7 +9,9 @@ pub mod backend;
 pub mod bench;
 pub mod burn_device;
 pub mod data;
+pub mod flash_oracle;
 pub mod harness;
+pub mod matrix_unit;
 pub mod mnist;
 #[cfg(not(feature = "silicon"))]
 pub mod topology;

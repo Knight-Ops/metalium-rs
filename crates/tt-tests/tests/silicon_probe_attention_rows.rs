@@ -254,3 +254,89 @@ fn rms_norm_one_op_against_two() {
         panic!("{e}");
     }
 }
+
+/// Flash-decode's probe (P0, no order change): the reads and kernels of a head's positions split
+/// in two, each half its own item, so `2 x heads` units each attend `l / 2` positions. The result
+/// is not attention (each half normalizes alone); its time is the point. Against today's op, one
+/// head a unit over all `l`, and the same halves on only `heads` units (a unit's rate alone).
+/// Isolated: nothing else reads GDDR beside it, unlike a replayed step.
+#[test]
+#[ignore = "benchmark"]
+fn attention_rows_split_in_half() {
+    let card = device_index();
+    if let Err(e) = fork_scope(|| {
+        let mut s = Session::open_card(card, tt_firmware_images::ROLES, TileChoice::All)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        let (heads, d) = (32usize, 64usize);
+        for l in [128usize, 256, 512, 1024, 2048] {
+            let q = s.upload(&floats(1, heads * d), heads, d).unwrap();
+            let k = s.upload(&floats(2, l * heads * d), l, heads * d).unwrap();
+            let v = s.upload(&floats(3, l * heads * d), l, heads * d).unwrap();
+            let time = |s: &mut Card, items: &[Item], len: usize, units: usize| {
+                let later: Vec<u32> = (0..len).map(|p| u32::from(p + 1 == len)).collect();
+                let mask = s.upload_bits(&later, 1, len, Elem::Bool).unwrap();
+                s.set_spread(tt_kernels::session::Spread::Fixed(units));
+                let fits = tt_kernels::attention::fits([1, d, len, d], 0);
+                let us = fits.then(|| {
+                    let (us, out) = op_us(s, |s| {
+                        s.attention_rows(
+                            &q,
+                            &k,
+                            &v,
+                            &mask,
+                            items,
+                            [1, d, len, d],
+                            0.125,
+                            SrcRoute::Tf32FromFp32,
+                            Fidelity::HiFi4,
+                            BUDGET,
+                        )
+                        .unwrap()
+                    });
+                    s.free(out).unwrap();
+                    us
+                });
+                s.free(mask).unwrap();
+                s.set_spread(tt_kernels::session::Spread::All);
+                us
+            };
+            let whole: Vec<Item> = (0..heads)
+                .map(|h| Item {
+                    q: [h, 0],
+                    k: [0, h * d],
+                    v: [0, h * d],
+                })
+                .collect();
+            let halves: Vec<Item> = (0..2 * heads)
+                .map(|j| {
+                    let (h, r) = (j % heads, (j / heads) * (l / 2));
+                    Item {
+                        q: [h, 0],
+                        k: [r, h * d],
+                        v: [r, h * d],
+                    }
+                })
+                .collect();
+            let today = time(&mut s, &whole, l, heads);
+            let split = time(&mut s, &halves, l / 2, 2 * heads);
+            let one_rate = time(&mut s, &halves[..heads], l / 2, heads);
+            let mb = (2 * l * heads * d * 4) as f64 / 1e6;
+            let show = |t: Option<f64>| t.map_or("does not fit".into(), |t| format!("{t:.1} us"));
+            println!(
+                "MEASURE attention-split l {l} ({mb:.2} MB): today {} on {heads} units, \
+                 halves {} on {} units, one half a head on {heads} units {}",
+                show(today),
+                show(split),
+                2 * heads,
+                show(one_rate)
+            );
+            for t in [q, k, v] {
+                s.free(t).unwrap();
+            }
+        }
+    }) {
+        panic!("{e}");
+    }
+}

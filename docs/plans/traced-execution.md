@@ -296,6 +296,11 @@ a list's programs do not fit an empty program cache
 ```
 The MNIST and `TinyTransformer` traces captured today fit; deeper training graphs would need program cache management.
 
+**Since 2026-10-23** ([long-context.md](long-context.md) 1.A, 1.E): element-wise and reduce programs no longer grow
+with their tile count (one tile's block, repeated), and the traces of a set need not fit the cache together: a trace
+keeps its programs' words and a replay puts back what another trace's took the room of. One trace's programs must
+still fit a unit's cache alone.
+
 #### Architectural Solution:
 1. **Instruction Segment Chunking**:
    - Rather than requiring the entire training step to reside concurrently in L1 SRAM, segment the trace into logical execution phases:

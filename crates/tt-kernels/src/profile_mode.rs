@@ -419,6 +419,23 @@ pub struct OpInfo {
     pub units: usize,
     /// What it moves through GDDR.
     pub bytes: OpBytes,
+    /// What `bytes` is made of, unit by unit (`trace::OpRecord::unit_bytes`).
+    pub unit_bytes: Vec<(u16, OpBytes)>,
+}
+
+impl OpInfo {
+    /// What unit `u` moved of it, if anything.
+    pub fn unit_bytes(&self, u: u16) -> Option<&OpBytes> {
+        self.unit_bytes
+            .iter()
+            .find(|(v, _)| *v == u)
+            .map(|(_, b)| b)
+    }
+
+    /// What unit `u` moved in the op's own span: its reads and writes less what it read ahead.
+    pub fn unit_span_bytes(&self, u: u16) -> u64 {
+        self.unit_bytes(u).map_or(0, |b| b.read + b.write - b.ahead)
+    }
 }
 
 /// One of a unit's `BARRIER` entries in a trace's stream, in the order the unit runs them: what
@@ -954,6 +971,10 @@ impl ProfileReport {
             median: u64,
             slowest: u64,
             slowest_units: BTreeMap<u16, u32>,
+            /// What the slowest unit moved in its own span, bytes.
+            slowest_bytes: u64,
+            /// What every unit moved in the op's span, bytes.
+            span_bytes: u64,
         }
         let mut labels: BTreeMap<&str, Skew> = BTreeMap::new();
         for (o, units) in t.ops.iter().zip(&per_op) {
@@ -970,6 +991,8 @@ impl ProfileReport {
             let last = work[work.len() - 1];
             s.slowest += last.0;
             *s.slowest_units.entry(last.1).or_default() += 1;
+            s.slowest_bytes += o.unit_span_bytes(last.1);
+            s.span_bytes += o.bytes.read + o.bytes.write - o.bytes.ahead;
         }
         let mut labels: Vec<_> = labels.into_iter().collect();
         labels.sort_by_key(|(_, s)| std::cmp::Reverse(s.slowest - s.fastest));
@@ -977,8 +1000,10 @@ impl ProfileReport {
             out,
             "\nUnits against each other (each unit's own stamps: its work from its last barrier's \
              release to its arrival; {} unit replays did not line up and are left out):\n\n\
-             | label | ops | units an op | fastest us | median us | slowest us | slowest - median us | slowest most often |\n\
-             |---|--:|--:|--:|--:|--:|--:|---|",
+             | label | ops | units an op | fastest us | median us | slowest us | slowest - median us | \
+             slowest's MB in its span | slowest's GB/s | all units' MB in the span at {CARD_READ_GBPS} GB/s, us | \
+             slowest most often |\n\
+             |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|",
             t.unit_mismatches
         );
         for (label, s) in labels {
@@ -991,7 +1016,7 @@ impl ProfileReport {
                 .collect();
             let _ = writeln!(
                 out,
-                "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} |",
+                "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} | {:.1} | {:.1} | {} |",
                 if label.is_empty() {
                     "(unlabelled)"
                 } else {
@@ -1003,6 +1028,9 @@ impl ProfileReport {
                 self.us(s.median),
                 self.us(s.slowest),
                 self.us(s.slowest - s.median),
+                s.slowest_bytes as f64 / 1e6,
+                gbps(s.slowest_bytes, self.us(s.slowest)),
+                s.span_bytes as f64 / CARD_READ_GBPS / 1e3,
                 often.join(", ")
             );
         }
@@ -1011,18 +1039,25 @@ impl ProfileReport {
     /// Every trace op's units, one line each, tab-separated: each unit's median work (from its last
     /// barrier's release to its arrival at the op's) and wait there, in microseconds.
     pub fn skew_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
-        let mut out = String::from("source\tindex\tlabel\twhat\tunit\tsamples\twork_us\twait_us\n");
+        let mut out = String::from(
+            "source\tindex\tlabel\twhat\tunit\tsamples\twork_us\twait_us\tspan_mb\tahead_mb\tspan_gbps\n",
+        );
         for (&id, t) in &self.traces {
             let source = name(id);
             for (i, (o, units)) in t.ops.iter().zip(t.unit_medians()).enumerate() {
                 for (u, work, wait, n) in units {
+                    let span = o.unit_span_bytes(u);
+                    let ahead = o.unit_bytes(u).map_or(0, |b| b.ahead);
                     let _ = writeln!(
                         out,
-                        "{source}\t{i}\t{}\t{}\t{u}\t{n}\t{:.3}\t{:.3}",
+                        "{source}\t{i}\t{}\t{}\t{u}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}",
                         o.label,
                         o.what,
                         self.us(work),
-                        self.us(wait)
+                        self.us(wait),
+                        span as f64 / 1e6,
+                        ahead as f64 / 1e6,
+                        gbps(span, self.us(work)),
                     );
                 }
             }
@@ -1366,6 +1401,7 @@ mod tests {
                         what: "y",
                         units: 1,
                         bytes: OpBytes::default(),
+                        unit_bytes: Vec::new(),
                     })
                     .collect(),
                 vec![9; n],
