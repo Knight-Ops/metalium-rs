@@ -15,37 +15,15 @@
 //!   `bne` (backward, to the loop head) and `jalr x0, 0(ra)` (return), over the
 //!   caller-saved `t0` and `t1`, loops at most two deep.
 
-use crate::{l1_write32, publish};
-use tt_isa::cfg::{generated::global::RISCV_IC_INVALIDATE_InvalidateAll, ConfigBank};
+use crate::l1_write32;
+use tt_isa::ttinsn::{addi, bne, RET};
 
 /// Words in an opcode bitmap: one bit per opcode byte.
 pub const OPCODE_WORDS: usize = 8;
 
 const ZERO: u32 = 0;
-const T0: u32 = 5;
-const T1: u32 = 6;
+use tt_isa::ttinsn::{MAX_COUNT, T0, T1};
 const A0: u32 = 10;
-/// `jalr x0, 0(ra)`.
-const RET: u32 = 0x0000_8067;
-/// Loop counts that fit `addi`'s signed 12-bit immediate.
-const MAX_COUNT: u32 = 2047;
-
-/// `addi rd, rs1, imm`.
-pub const fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
-    (((imm as u32) & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
-}
-
-/// `bne rs, x0, offset` (a B-type branch; `offset` in bytes, even, within +-4 KiB).
-pub const fn bne(rs: u32, offset: i32) -> u32 {
-    let imm = offset as u32;
-    ((imm >> 12 & 1) << 31)
-        | ((imm >> 5 & 0x3f) << 25)
-        | (rs << 15)
-        | (0b001 << 12)
-        | ((imm >> 1 & 0xf) << 8)
-        | ((imm >> 11 & 1) << 7)
-        | 0x63
-}
 
 fn has_opcode(opcodes: &[u32; OPCODE_WORDS], byte: u32) -> bool {
     opcodes[(byte >> 5) as usize] >> (byte & 31) & 1 != 0
@@ -171,54 +149,7 @@ pub unsafe fn translate(
     Some(out.len)
 }
 
-/// Invalidate T1's instruction cache after writing code to L1 at `last_written`
-/// (`InstructionCache.md`, "Cache invalidation": the write to the invalidate
-/// register must be processed after the writes to L1, or the flush can happen
-/// first and the prefetcher or branch predictor refill the cache with the old
-/// code).
-///
-/// The sequence the page gives -- a read back of the last write, consumed, then
-/// the mask store -- followed by the 24 instructions it says may be needed for
-/// the pipeline to drain. `mask` bit 2 is RISCV T1.
-///
-/// # Safety
-///
-/// Only this core's own cache (`mask` = 4) has been exercised; the Tensix backend
-/// must be out of reset.
-pub unsafe fn invalidate_icache(last_written: u64, mask: u32) {
-    publish();
-    let register = RISCV_IC_INVALIDATE_InvalidateAll.riscv_address(ConfigBank::Bank0);
-    // SAFETY: the documented register, a whole-word store (`sw`: RISC-V cannot
-    // write `Config` any narrower); the word holds only this field.
-    unsafe {
-        core::arch::asm!(
-            "lw   {t}, 0({last})",
-            "andi {t}, {t}, 0",
-            "sw   {mask}, 0({register})",
-            last = in(reg) last_written as u32,
-            mask = in(reg) mask,
-            register = in(reg) register as u32,
-            t = out(reg) _,
-            options(nostack),
-        );
-    }
-    for _ in 0..24 {
-        // SAFETY: a no-op; not `spin_loop`, whose `pause` Blackhole lacks.
-        unsafe { core::arch::asm!("nop") };
-    }
-}
-
-/// Call the code at `buffer` (a function taking nothing, returning `a0`).
-///
-/// # Safety
-///
-/// `buffer` holds valid RV32IM code ending in a return, and its cache lines are
-/// current (`invalidate_icache`).
-pub unsafe fn call(buffer: u64) -> u32 {
-    // SAFETY: the caller's contract.
-    let f: extern "C" fn() -> u32 = unsafe { core::mem::transmute(buffer as usize) };
-    f()
-}
+pub use crate::fused::{call, invalidate_icache};
 
 /// `a0 = value; ret`: the smallest code with an observable result, for the
 /// invalidation self-test.

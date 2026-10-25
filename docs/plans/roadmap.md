@@ -582,8 +582,11 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         - **The softmax as one op a tile row** (`Session::softmax_rows`, gate `step230`, bit for bit): its scores read
           three times instead of ~11, but `SUB_EXP` computed twice, on 64 units at `c` = 64. **Slower** (15.24 -> 19.82 s,
           12.58 -> 13.23 s), so it is opt-in (`TT_SOFTMAX_ROWS=1`).
-        - **Next for long prompts:** the other push-bound bodies (`.ttinsn` push, triggered, Track 2), then the data passes
-          (`SCALE_MASK_FILL` 475 us, the chunked `Max` and `Sum` ~220 us each a layer), each computed once over every unit.
+        - **Fused `.ttinsn` push** (2026-10-25, Track 2, [log](../learnings/performance-log.md#fused-ttinsn-push-from-the-host-the-default-2026-10-25-card-0)): measured with the profile mode's new push totals,
+          nothing in the 1.7B pushes at the runner's rate after the staging; fused code, now the default, takes 7,992
+          tokens **12.27 -> 12.06 s** at chunks of 64 and **10.00 -> 9.84 s** at 512 (`1792962530`).
+        - **Next for long prompts:** the data passes (`SCALE_MASK_FILL` 475 us, the chunked `Max` and `Sum` ~220 us each a
+          layer), each computed once over every unit.
       - **Before (2026-10-17):** a prefill-shaped product reached 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,
         `1792258604`). It is bound by GDDR because each unit gathers its own tiles: `B` is read `m / 32` times, `A`
         once per two-column block, up to once a unit. The largest product reads 3.2 GB for 77 MB.
@@ -1018,7 +1021,19 @@ the 1.7B's long prefill ("Fused `.ttinsn` push" below).
 - [ ] **Later:** L1-sharded tensor residency (G12) and FlashAttention
   ([future-fusion-features.md](../proposals/future-fusion-features.md)); on-card dispatch
   ([x280-on-card-dispatch.md](../proposals/x280-on-card-dispatch.md)).
-- [ ] **Fused `.ttinsn` push for SFPU kernels: triggered 2026-10-25, raised to a higher priority (user).**
+- [x] **Fused `.ttinsn` push for SFPU kernels: done 2026-10-25, on by default** (`TT_TTINSN=0` off;
+  [ttinsn-push.md](ttinsn-push.md), [log](../learnings/performance-log.md#fused-ttinsn-push-from-the-host-the-default-2026-10-25-card-0)). Host-side expansion: the host turns the math role's programs of
+  256 pushed words or more into fused code (`tt_isa::ttinsn`: emitted, validated as the gate for code written at
+  run time, and run on the host against the program's expansion word for word), places it in the program
+  cache flagged `FUSED`, and the runner invalidates its instruction cache once a run and calls it. Bit for bit
+  everywhere (gate `step231`, ttsim and card 0, with a negative control and a real address reuse on silicon;
+  the model gates `1792958143`; MNIST and conformance on ttsim). The profile mode now measures push-boundness
+  (`ProfileOptions::push`: the math role's push cycles, drain and words a kernel): after the staging below,
+  nothing in the 1.7B pushes at the runner's rate (`silu_mul` 5.6, RMSNorm 7.3 cycles a word, the products
+  ~40-500). Measured, card 0: the 1.7B's prefill 1.6-3.9% faster (7,992 tokens 9.84 s at chunks of 512),
+  decode 16.78 / 17.97 ms (was 16.83 / 18.28), ViT-Tiny 8.97 -> **8.32 ms**, ResNet-18 13.88 -> 13.74.
+  Left: the experiment image (`ttinsn_t1`) no longer fits T1's 10 KiB slot (slim or retire it). The record of
+  the trigger:
   Measured 2.7x on a push-bound kernel (2026-10-10). The trigger below fired on the 1.7B's long prefill
   (profile `1792900837`, card 0, a `Chunk { c: 64, len: 8192 }` replay of 161.9 ms):
   - attention's softmax is 78.2 ms (48%) and its scale and mask 11.4 ms (7%);
@@ -1113,10 +1128,11 @@ Training and inference both have to run across cards, so data parallelism, pipel
 - [ ] Packed BF16 over the mesh (operands are widened to F32 today).
 - [ ] Validate on a physical p300 (all silicon work used two cabled p150a cards).
 
-## Fused `.ttinsn` push for SFPU kernels (triggered 2026-10-25)
+## Fused `.ttinsn` push for SFPU kernels (triggered 2026-10-25, shipped 2026-10-25)
 
-**Status:** experiment complete 2026-10-10 (card 0); the follow-on was **parked by owner decision** until
-the trigger below fired. **It fired on 2026-10-25** (the 1.7B's prefill at 8,192 positions, profile
+**Status: shipped, on by default** ([ttinsn-push.md](ttinsn-push.md): host-side expansion, item 2 of the
+work list below; Track 2 has the numbers). Experiment complete 2026-10-10 (card 0); the follow-on was
+**parked by owner decision** until the trigger below fired. **It fired on 2026-10-25** (the 1.7B's prefill at 8,192 positions, profile
 `1792900837`: `SUB_EXP` and `DIV` push-bound at ~42% of a chunk replay's device time; Track 2's entry
 has the numbers), and the user raised it to a higher priority. The reasons it was parked (below) are kept
 as the record. Plan and full record:
@@ -1208,7 +1224,8 @@ Prefer, in this order (each step is cheaper than the next and may be enough):
 3. **Device translation** (`tt_firmware::ttinsn`, measured) on T1, or on idle T0/T2 (B is the worst
    choice: busy reader, small I-cache), with a translation cache keyed by the program's words.
 4. **Baked images** only for a short manifest of the heaviest kinds (the generator makes adding one a
-   one-line change); limited by the 16 KiB T1 slot and by scalars and tile counts being baked in.
+   one-line change); limited by the T1 slot (10 KiB since the role images were repacked, 2026-10-14; it was
+   16 KiB) and by scalars and tile counts being baked in.
 
 Work items whichever way (gathering is already off in every shipped image): hook both push paths (`run_in` and the streamed
 `push_body`); plan the code buffer through `l1::Requirements` (the experiment used the last 16 KiB of
@@ -1292,6 +1309,7 @@ deferred to later cleanup passes. B1 and B2 stay in Track 1 because models need 
 | [kernel-fusion.md](kernel-fusion.md), [traced-execution.md](traced-execution.md), [mixed-bfp-storage.md](mixed-bfp-storage.md) | Feature specs |
 | [burn-op-coverage.md](burn-op-coverage.md) | Generated operation status |
 | [ttinsn-push-experiment.md](ttinsn-push-experiment.md) | Done, result: go. Experiment record for `.ttinsn` push fusion |
+| [ttinsn-push.md](ttinsn-push.md) | Done 2026-10-25 but for the experiment image: fused `.ttinsn` push from the host, on by default |
 | [replay-fixed-cost.md](replay-fixed-cost.md) | Track 2 item 6, steps 1 and 6: where a traced replay's time goes, op by op, and the fixes |
 | [decode-length-cost.md](../completed-plans/decode-length-cost.md) | Done: trace size in GDDR, and a decode step that costs the context (GQA fold, step lengths) |
 | [traced-execution.md](traced-execution.md) §3 | Several traces over one state (`SharedStateTraces`) and the generic decoder driver (`tt_models::generate`) |

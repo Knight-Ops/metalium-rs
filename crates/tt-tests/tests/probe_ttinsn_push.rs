@@ -1,12 +1,13 @@
 //! The `.ttinsn` push-fusion experiment (`docs/plans/ttinsn-push-experiment.md`).
 //!
-//! Four things live here:
+//! Three things live here:
 //!
 //! * the **generator** for `crates/tt-firmware/src/ttinsn_programs.in`, the
 //!   programs the experiment image was built with, as fused `.ttinsn` words
-//!   (`TT_BLESS=1` rewrites it; without, the test fails if it is stale);
-//! * the **gate's** negative controls (`ttinsn_gate_*`): the instruction-set
-//!   check admits `.ttinsn` words in one image's one section and nowhere else;
+//!   (`TT_BLESS=1` rewrites it; without, the test fails if it is stale). The
+//!   build-time gate's negative controls (a stray `.word`, a run word with low
+//!   bits `11`, a non-Tensix opcode) were run by hand, not by a test here
+//!   (`docs/plans/ttinsn-push-experiment.md`, Results, Phase 2);
 //! * the **ttsim** decode-or-refuse probe;
 //! * the **silicon** rungs and measurement, behind the `ttinsn-experiment`
 //!   feature, run only through `cargo xtask silicon` on card 0.

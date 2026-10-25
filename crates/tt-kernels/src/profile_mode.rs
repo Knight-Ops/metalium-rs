@@ -29,7 +29,7 @@ use tt_device::trace::TraceEvent;
 use tt_isa::dm::op;
 use tt_isa::mailbox::trace as ev;
 
-use crate::profile::Event;
+use crate::profile::{Event, RoleTotal};
 
 /// How much of an op the movers stamp.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,6 +52,10 @@ pub struct ProfileOptions {
     /// Stamp a replay a window at a time. Off, a replay is stamped whole, which overflows the stamp
     /// buffer for any trace of more than ~100 ops (the negative control of the window).
     pub window: bool,
+    /// Have the math role total each kernel's pushing and its waits for the coprocessor
+    /// (`tt_isa::mailbox::trace_word::PUSH`), which the mover stamps after the kernel's
+    /// `ROLES_DONE`: [`UnitTime::push`]. Three mover stamps a kernel, no role stamps.
+    pub push: bool,
 }
 
 impl Default for ProfileOptions {
@@ -60,6 +64,7 @@ impl Default for ProfileOptions {
             detail: Detail::Ops,
             roles: false,
             window: true,
+            push: true,
         }
     }
 }
@@ -73,11 +78,14 @@ impl ProfileOptions {
         }
     }
 
-    /// Events an entry headed by `op` may stamp, at most: its begin and end, and the one event a
-    /// launch (`KICK`) or a kernels' wait (`ROLES_DONE`) adds inside it.
+    /// Events an entry headed by `op` may stamp, at most: its begin and end, the one event a
+    /// launch (`KICK`) or a kernels' wait (`ROLES_DONE`) adds inside it, and after a wait the math
+    /// role's two totals ([`ProfileOptions::push`]).
     pub fn stamps(&self, op: u32) -> u32 {
+        let waits = matches!(op, op::KERNEL | op::KERNEL_WAIT);
         match self.detail {
             Detail::Ops if !tt_isa::dm::trace_mode::ops_stamped(op) => 0,
+            _ if waits && self.push => 6,
             _ => 3,
         }
     }
@@ -109,7 +117,21 @@ pub struct OpTime {
     pub data: u64,
     /// [`Detail::Full`] only: the time between entries (the mover's own decode and dispatch).
     pub other: u64,
+    /// The math role's pushing in the op's kernels on this unit ([`ProfileOptions::push`]): inside
+    /// `kernels` and `data`, not a share of the span.
+    pub push: u64,
+    /// The math role's waits, after pushing, for the coprocessor to retire what it pushed.
+    pub drain: u64,
+    /// The instruction words the math role read and pushed (fused code's not counted). `push`
+    /// near ~3.3 cycles a word is the runner's own rate: the kernel is bound by its pushing;
+    /// far more, the pushes stalled on a full FIFO behind the backend or a semaphore.
+    pub words: u64,
 }
+
+/// The most cycles a word an op's pushing may take and still count as bound by the pushing
+/// (`ProfileReport`'s push table): the runner pushes at ~3.3 (`.ttinsn` experiment, card 0);
+/// a push that waited on a full FIFO takes far more.
+pub const PUSH_BOUND_CYCLES_A_WORD: f64 = 4.0;
 
 /// The card's measured GDDR read rate, 120 tiles (performance scoreboard, "GDDR6 reads, card,
 /// 120 tiles"): what a step's bytes are held against.
@@ -267,6 +289,11 @@ impl Classes {
                     }
                 }
             }
+            Event::RolePush { what, amount } => match what {
+                RoleTotal::Push => self.time.push += amount,
+                RoleTotal::Drain => self.time.drain += amount,
+                RoleTotal::Words => self.time.words += amount,
+            },
             _ => {}
         }
     }
@@ -363,16 +390,22 @@ pub fn unit_times(
     };
     let mut pairs = Vec::new();
     let mut open = None;
+    // The math role's totals since the last barrier: the work before the next arrival.
+    let mut totals = [0u64; 3];
     for &(event, t) in &stamps[start..] {
         match event {
             Event::Entry {
                 begin: true,
                 op: op::BARRIER,
-            } => open = Some(t),
+            } => open = Some((t, std::mem::take(&mut totals))),
             Event::Entry {
                 begin: false,
                 op: op::BARRIER,
-            } => pairs.push((open.take()?, t)),
+            } => {
+                let (arrive, totals) = open.take()?;
+                pairs.push((arrive, t, totals));
+            }
+            Event::RolePush { what, amount } => totals[what as usize] += amount,
             _ => {}
         }
     }
@@ -382,7 +415,7 @@ pub fn unit_times(
     let mut count = 0u32;
     for b in seq {
         if hi == 0 || (lo <= count && count < hi) {
-            let (arrive, release) = pairs.next()?;
+            let (arrive, release, [push, drain, words]) = pairs.next()?;
             if let (Some(k), Some(s)) = (b.arrival_of, since) {
                 out.push((
                     k as usize,
@@ -390,6 +423,9 @@ pub fn unit_times(
                         unit,
                         work: arrive.saturating_sub(s),
                         wait: release.saturating_sub(arrive),
+                        push,
+                        drain,
+                        words,
                     },
                 ));
             }
@@ -458,6 +494,24 @@ pub struct UnitTime {
     pub unit: u16,
     pub work: u64,
     pub wait: u64,
+    /// Of `work`, the math role's pushing ([`OpTime::push`]), 0 unless measured.
+    pub push: u64,
+    /// Of `work`, the math role's waits for the coprocessor after pushing ([`OpTime::drain`]).
+    pub drain: u64,
+    /// The words the math role pushed ([`OpTime::words`]).
+    pub words: u64,
+}
+
+/// One unit's medians on one op over the replays that stamped it ([`TraceSamples::unit_medians`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitMedian {
+    pub unit: u16,
+    pub work: u64,
+    pub wait: u64,
+    pub push: u64,
+    pub drain: u64,
+    pub words: u64,
+    pub samples: usize,
 }
 
 /// A trace's ops and their samples, one per replay that stamped them.
@@ -737,15 +791,18 @@ impl TraceSamples {
                         prefetch: m(|t| t.prefetch),
                         data: m(|t| t.data),
                         other: m(|t| t.other),
+                        push: m(|t| t.push),
+                        drain: m(|t| t.drain),
+                        words: m(|t| t.words),
                     }
                 })
             })
             .collect()
     }
 
-    /// Per op, each unit's median work and wait over the replays that stamped it, `(unit, work,
-    /// wait, samples)` by unit.
-    pub fn unit_medians(&self) -> Vec<Vec<(u16, u64, u64, usize)>> {
+    /// Per op, each unit's median work, wait and math role's totals over the replays that stamped
+    /// it, by unit.
+    pub fn unit_medians(&self) -> Vec<Vec<UnitMedian>> {
         self.units
             .iter()
             .map(|times| {
@@ -754,11 +811,17 @@ impl TraceSamples {
                     by.entry(t.unit).or_default().push(t);
                 }
                 by.into_iter()
-                    .map(|(u, ts)| {
-                        let n = ts.len();
-                        let work = median(ts.iter().map(|t| t.work).collect());
-                        let wait = median(ts.iter().map(|t| t.wait).collect());
-                        (u, work, wait, n)
+                    .map(|(unit, ts)| {
+                        let m = |f: fn(&UnitTime) -> u64| median(ts.iter().map(|t| f(t)).collect());
+                        UnitMedian {
+                            unit,
+                            work: m(|t| t.work),
+                            wait: m(|t| t.wait),
+                            push: m(|t| t.push),
+                            drain: m(|t| t.drain),
+                            words: m(|t| t.words),
+                            samples: ts.len(),
+                        }
                     })
                     .collect()
             })
@@ -790,6 +853,9 @@ impl Total {
         self.time.prefetch += t.prefetch;
         self.time.data += t.data;
         self.time.other += t.other;
+        self.time.push += t.push;
+        self.time.drain += t.drain;
+        self.time.words += t.words;
     }
 }
 
@@ -981,7 +1047,7 @@ impl ProfileReport {
             if units.is_empty() {
                 continue;
             }
-            let mut work: Vec<(u64, u16)> = units.iter().map(|&(u, w, ..)| (w, u)).collect();
+            let mut work: Vec<(u64, u16)> = units.iter().map(|m| (m.work, m.unit)).collect();
             work.sort_unstable();
             let s = labels.entry(o.label).or_default();
             s.ops += 1;
@@ -1036,28 +1102,119 @@ impl ProfileReport {
         }
     }
 
+    /// A trace's math role against its units' work, by label: per op, the slowest unit's work, and
+    /// its math role's pushing and its waits after pushing for the coprocessor
+    /// ([`ProfileOptions::push`]). A label whose pushing is most of its work, with little drain, is
+    /// bound by its pushing: what a faster push (`.ttinsn`) would take from.
+    fn push_table(&self, out: &mut String, t: &TraceSamples) {
+        let per_op = t.unit_medians();
+        if per_op.iter().flatten().all(|m| m.push == 0 && m.drain == 0) {
+            return;
+        }
+        #[derive(Default)]
+        struct Push {
+            ops: u64,
+            work: u64,
+            push: u64,
+            drain: u64,
+            words: u64,
+            /// Of `push`, the ops' whose pushing ran at the runner's own rate.
+            bound: u64,
+        }
+        let mut labels: BTreeMap<&str, Push> = BTreeMap::new();
+        let mut all = Push::default();
+        for (o, units) in t.ops.iter().zip(&per_op) {
+            let Some(slowest) = units.iter().max_by_key(|m| (m.work, m.unit)) else {
+                continue;
+            };
+            let bound = slowest.words > 0
+                && slowest.push as f64 <= PUSH_BOUND_CYCLES_A_WORD * slowest.words as f64;
+            for p in [labels.entry(o.label).or_default(), &mut all] {
+                p.ops += 1;
+                p.work += slowest.work;
+                p.push += slowest.push;
+                p.drain += slowest.drain;
+                p.words += slowest.words;
+                if bound {
+                    p.bound += slowest.push;
+                }
+            }
+        }
+        let mut labels: Vec<_> = labels.into_iter().collect();
+        labels.sort_by_key(|(_, p)| std::cmp::Reverse(p.bound));
+        let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+        let rate = |p: &Push| p.push as f64 / p.words.max(1) as f64;
+        // A fused push takes 1.19 cycles a word where the runner takes 3.31 (`.ttinsn` experiment).
+        let saved = |p: &Push| self.us(p.bound) * (1.0 - 1.19 / 3.31);
+        let _ = writeln!(
+            out,
+            "\nThe math role on each op's slowest unit (its own totals, stamped by the mover after each \
+             kernel): pushing {:.1} us of {:.1} us of work, {:.1} cycles a word; waiting after pushing \
+             {:.1} us. Pushing near the runner's ~3.3 cycles a word is bound by the pushing (at most \
+             {PUSH_BOUND_CYCLES_A_WORD} counts here: {:.1} us of it, {:.1}% of the work, and a fused push \
+             would save ~{:.1} us); far more, the pushes waited on a full FIFO behind the backend.\n\n\
+             | label | ops | slowest's work us | push us | words | cycles a word | push-bound us | \
+             fused saves ~us | drain us |\n\
+             |---|--:|--:|--:|--:|--:|--:|--:|--:|",
+            self.us(all.push),
+            self.us(all.work),
+            rate(&all),
+            self.us(all.drain),
+            self.us(all.bound),
+            pct(all.bound, all.work),
+            saved(&all),
+        );
+        for (label, p) in labels {
+            if p.push == 0 && p.drain == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "| {} | {} | {:.1} | {:.1} | {} | {:.1} | {:.1} | {:.1} | {:.1} |",
+                if label.is_empty() {
+                    "(unlabelled)"
+                } else {
+                    label
+                },
+                p.ops,
+                self.us(p.work),
+                self.us(p.push),
+                p.words,
+                rate(&p),
+                self.us(p.bound),
+                saved(&p),
+                self.us(p.drain),
+            );
+        }
+    }
+
     /// Every trace op's units, one line each, tab-separated: each unit's median work (from its last
     /// barrier's release to its arrival at the op's) and wait there, in microseconds.
     pub fn skew_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
         let mut out = String::from(
-            "source\tindex\tlabel\twhat\tunit\tsamples\twork_us\twait_us\tspan_mb\tahead_mb\tspan_gbps\n",
+            "source\tindex\tlabel\twhat\tunit\tsamples\twork_us\twait_us\tspan_mb\tahead_mb\tspan_gbps\tpush_us\tdrain_us\tpush_words\n",
         );
         for (&id, t) in &self.traces {
             let source = name(id);
             for (i, (o, units)) in t.ops.iter().zip(t.unit_medians()).enumerate() {
-                for (u, work, wait, n) in units {
+                for m in units {
+                    let u = m.unit;
                     let span = o.unit_span_bytes(u);
                     let ahead = o.unit_bytes(u).map_or(0, |b| b.ahead);
                     let _ = writeln!(
                         out,
-                        "{source}\t{i}\t{}\t{}\t{u}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}",
+                        "{source}\t{i}\t{}\t{}\t{u}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{:.3}\t{:.3}\t{}",
                         o.label,
                         o.what,
-                        self.us(work),
-                        self.us(wait),
+                        m.samples,
+                        self.us(m.work),
+                        self.us(m.wait),
                         span as f64 / 1e6,
                         ahead as f64 / 1e6,
-                        gbps(span, self.us(work)),
+                        gbps(span, self.us(m.work)),
+                        self.us(m.push),
+                        self.us(m.drain),
+                        m.words,
                     );
                 }
             }
@@ -1128,6 +1285,7 @@ impl ProfileReport {
             self.label_table(&mut out, &rows, "ops");
             self.bytes_tables(&mut out, t, &medians);
             self.skew_table(&mut out, t);
+            self.push_table(&mut out, t);
             let mut top: Vec<(usize, &OpTime)> = medians
                 .iter()
                 .enumerate()
@@ -1165,18 +1323,20 @@ impl ProfileReport {
     /// (medians over their samples). Microseconds.
     pub fn tsv(&self, name: &dyn Fn(u64) -> String) -> String {
         let mut out = String::from(
-            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\tfetch_us\twriter_us\tahead_bytes\tprefetch_us\n",
+            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\tfetch_us\twriter_us\tahead_bytes\tprefetch_us\tpush_us\tdrain_us\tpush_words\n",
         );
         let none = OpBytes::default();
+        // The math role's totals: an eager op's on its longest unit, a trace op's on its slowest.
         let mut row = |source: &str,
                        i: usize,
                        o: (&str, &str, usize, &OpBytes),
                        n: usize,
-                       t: &OpTime| {
+                       t: &OpTime,
+                       (push, drain, words): (u64, u64, u64)| {
             let b = o.3;
             let _ = writeln!(
                 out,
-                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.3}\t{:.3}\t{}\t{:.3}",
+                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.3}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{}",
                 o.0,
                 o.1,
                 o.2,
@@ -1197,21 +1357,31 @@ impl ProfileReport {
                 self.us(t.writer),
                 b.ahead,
                 self.us(t.prefetch),
+                self.us(push),
+                self.us(drain),
+                words,
             );
         };
         for (i, s) in self.eager.iter().enumerate() {
-            row("eager", i, (s.label, s.what, 0, &none), 1, &s.time);
+            let totals = (s.time.push, s.time.drain, s.time.words);
+            row("eager", i, (s.label, s.what, 0, &none), 1, &s.time, totals);
         }
         for (&id, t) in &self.traces {
             let source = name(id);
+            let units = t.unit_medians();
             for (i, (o, m)) in t.ops.iter().zip(t.medians()).enumerate() {
                 if let Some(m) = m {
+                    let totals = units[i]
+                        .iter()
+                        .max_by_key(|u| (u.work, u.unit))
+                        .map_or((m.push, m.drain, m.words), |u| (u.push, u.drain, u.words));
                     row(
                         &source,
                         i,
                         (o.label, o.what, o.units, &o.bytes),
                         t.samples[i].len(),
                         &m,
+                        totals,
                     );
                 }
             }
@@ -1352,6 +1522,9 @@ mod tests {
             unit: 5,
             work,
             wait,
+            push: 0,
+            drain: 0,
+            words: 0,
         };
         assert_eq!(
             unit_times(&v, &sat_out(), 5, 0, 0),
@@ -1375,6 +1548,50 @@ mod tests {
         // Stamps that do not line up with the stream are refused, not misattributed.
         assert_eq!(unit_times(&w, &sat_out(), 5, 1, 5), None, "one stamp short");
         assert_eq!(unit_times(&x, &sat_out(), 5, 2, 5), None, "one stamp over");
+    }
+
+    #[test]
+    fn the_math_roles_totals_go_to_the_op_whose_kernel_they_follow() {
+        // A kernel's three totals, in units of 64.
+        let totals = |push: u32, drain: u32, words: u32| {
+            [
+                (ev::ROLE_PUSH, push),
+                (ev::ROLE_DRAIN, drain),
+                (ev::ROLE_WORDS, words),
+            ]
+            .map(|(event, units)| TraceEvent {
+                token: ev::token_with(ev::MOVER, event, units),
+                cycles: 0,
+            })
+        };
+        let mut v = vec![e(ev::LIST_BEGIN, 1, 100)];
+        v.extend(entry(op::KERNEL_WAIT, 110, 140));
+        v.extend(totals(3, 1, 1));
+        v.extend(entry(op::BARRIER, 150, 160)); // arrives at 0
+        v.extend(entry(op::BARRIER, 200, 201)); // waits for 1 and 2
+        v.extend(entry(op::KERNEL_WAIT, 210, 240));
+        v.extend(totals(5, 0, 2));
+        v.extend(entry(op::KERNEL_WAIT, 245, 250));
+        v.extend(totals(2, 2, 1));
+        v.extend(entry(op::BARRIER, 260, 300)); // arrives at 3
+        v.extend(entry(op::BARRIER, 400, 401)); // waits for 4
+        let got = unit_times(&v, &sat_out(), 5, 0, 0).unwrap();
+        let sums: Vec<_> = got
+            .iter()
+            .map(|(k, t)| (*k, t.push, t.drain, t.words))
+            .collect();
+        assert_eq!(sums, vec![(0, 3 * 64, 64, 64), (3, 7 * 64, 2 * 64, 3 * 64)]);
+        // Unit 0's own op times carry them too.
+        let ops = attribute_replay(&v, 0, Detail::Ops);
+        assert_eq!((ops[0].push, ops[0].drain, ops[0].words), (3 * 64, 64, 64));
+        // A wait now stamps three more events when the totals are on.
+        let on = ProfileOptions::default();
+        let off = ProfileOptions { push: false, ..on };
+        assert_eq!(
+            (on.stamps(op::KERNEL_WAIT), off.stamps(op::KERNEL_WAIT)),
+            (6, 3)
+        );
+        assert_eq!(on.stamps(op::LAUNCH), 3);
     }
 
     #[test]

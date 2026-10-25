@@ -23,6 +23,7 @@ flowchart TD
         PL9["mixed-bfp-storage.md (BFP8/4/2 Contract & PRNG Diagnostics)"]
         PL10["ttinsn-push-experiment.md (done: result go)"]
         PL11["decode-to-bandwidth.md, decode-attention.md, decode-matmul-bandwidth.md, decode-small-ops.md, in-place-cache-write.md (LLM decode performance)"]
+        PL12["ttinsn-push.md (fused push from the host, the default)"]
     end
 
     subgraph Tier1["Tier 1: docs/learnings/ (Ground Truth & Learnings)"]
@@ -79,7 +80,8 @@ Actionable technical specifications, interface contracts, and execution checklis
   - [`burn-op-coverage.md`](plans/burn-op-coverage.md): Generated (`cargo xtask burn-coverage`) status of every Burn operation-trait method: native, composed or explicitly unsupported with its `[-]` reason.
   - [`new-op-definition-of-done.md`](plans/new-op-definition-of-done.md): The standing contract every new kernel/op must meet (oracle, simulator gate with negative control, silicon on one card, Burn routing, padding, findings logged).
   - [`burn-op-notes.md`](plans/burn-op-notes.md): Hand-written per-method Device and Item notes behind the generated Burn op table.
-  - [`ttinsn-push-experiment.md`](plans/ttinsn-push-experiment.md): Done (2026-10-10): `.ttinsn` push fusion measured 2.77x on a push-bound SFPU kernel on card 0; the follow-on is parked in the roadmap.
+  - [`ttinsn-push-experiment.md`](plans/ttinsn-push-experiment.md): Done (2026-10-10): `.ttinsn` push fusion measured 2.77x on a push-bound SFPU kernel on card 0; its follow-on is `ttinsn-push.md`.
+  - [`ttinsn-push.md`](plans/ttinsn-push.md): fused `.ttinsn` push from the host (2026-10-25): the math role's long programs as host-made, host-validated code in the program cache, on by default; the profile mode's push totals; one item left (the experiment image no longer fits T1's slot).
   - [`burn-backend-parity.md`](plans/burn-backend-parity.md): B0–B16 roadmap for `burn-tt` to achieve full backend parity with CubeCL/CUDA.
   - [`burn-native-cutover.md`](plans/burn-native-cutover.md): Native cutover record, retired Flex fallback, delivered tensor storage and deferred formats.
   - [`mixed-bfp-storage.md`](plans/mixed-bfp-storage.md): Delivered BFP8/4/2 storage and training contract, acceptance checklist, PRNG diagnostics and remaining application RNG work.

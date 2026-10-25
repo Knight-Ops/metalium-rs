@@ -175,13 +175,15 @@ pub(crate) fn session_text<T: tt_device::Transport>(s: &tt_kernels::session::Ses
     out
 }
 
-/// The profile mode's settings from the environment: `TT_PROFILE_DETAIL=full` for every entry.
+/// The profile mode's settings from the environment: `TT_PROFILE_DETAIL=full` for every entry,
+/// `TT_PROFILE_PUSH=0` for no math-role push totals (`ProfileOptions::push`).
 pub fn options_from_env() -> ProfileOptions {
     ProfileOptions {
         detail: match std::env::var("TT_PROFILE_DETAIL").as_deref() {
             Ok("full") => Detail::Full,
             _ => Detail::Ops,
         },
+        push: std::env::var("TT_PROFILE_PUSH").as_deref() != Ok("0"),
         ..ProfileOptions::default()
     }
 }

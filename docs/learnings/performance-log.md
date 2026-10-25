@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Fused `.ttinsn` push from the host, the default](#fused-ttinsn-push-from-the-host-the-default-2026-10-25-card-0) | 2026-10-25 | the math role's long programs as host-made, host-checked fused code in the program cache; the profile mode's push totals show nothing in the 1.7B pushing at the runner's rate after the staging (`silu_mul` 5.6, RMSNorm 7.3 cycles a word); bit for bit everywhere; the 1.7B's prefill 1.6-3.9% faster, decode 0.3-1.7%, ViT-Tiny 7.2%, ResNet-18 1.1%; on by default |
 | [The long-context softmax: `SUB_EXP` and `DIV` push-bound, their row loops staged to replay](#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0) | 2026-10-25 | at 8,192 positions the softmax is 48% of a 64-token chunk's replay and its `SUB_EXP` and `DIV` push-bound (bodies past the replay buffer); split into replayed row loops, bit for bit: the 1.7B's prefill of 7,992 tokens **15.24 -> 12.28 s** (chunks of 64), **12.58 -> 10.00 s** (512); the softmax as one streamed op per tile row measured slower, opt-in (`TT_SOFTMAX_ROWS=1`); the `.ttinsn` trigger fired |
 | [Residency plans over reused GDDR](#residency-plans-over-reused-gddr-2026-10-24-card-0) | 2026-10-24 | G2: chunk captures reuse their GDDR and keep their L1 residency plans; prefill 1.2-2.1% faster at reuse's free GDDR, the first build 2.4-6.6x longer |
 | [Prefill products that reuse their operands](#prefill-products-that-reuse-their-operands-2026-10-24-card-0) | 2026-10-24 | 2-D blocked products, `K` streamed, partials in L1 (the default since; `TT_MATMUL_BLOCK=off` turns it off): the 1.7B's prefill products **2.9-3.6x** at `m` >= 512 (`gate\|up` 5.21 -> **18.23** TFLOPS at `m` = 2,048), compute-bound at ~0.4-0.6 us a K-tile pair; its prefill at 8,192 positions with chunks of 512 **1.24 / 6.81 / 18.33 -> 0.48 / 3.70 / 12.59 s** (1,000 / 4,000 / 7,992 tokens) |
@@ -361,6 +362,63 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Fused `.ttinsn` push from the host, the default (2026-10-25, card 0)
+
+[ttinsn-push.md](../plans/ttinsn-push.md). The math role's programs of 256 pushed words or more run as fused
+`.ttinsn` code the host made, validated and ran against the program's expansion, placed in the program
+cache; the runner invalidates its instruction cache once a run and calls it (`Session::set_ttinsn`, on by
+default since this measurement, `TT_TTINSN=0` off). Bit for bit: gate `step231_ttinsn_push` (card 0,
+`1792956507`), the model gates with it on (`1792958143`: `step188` at 8K against burn-flex and traced
+against eager, `step165`, `step166`, `step209`, `step230`), `step12_mnist` and Burn's conformance on ttsim
+(`target/conformance/1792958174`, the 52 listed and no other).
+
+**What is push-bound, now measured.** The profile mode has the math role total each kernel's pushing, its
+wait after pushing and the words it pushed (`ProfileOptions::push`); cycles a word near the runner's 3.3 is
+push-bound, far more is a push stalled on a full FIFO. The 1.7B, 8,192 positions, a 1,000-token prompt in
+chunks of 64 (profile `1792956684`; with fused code `1792957400`), the slowest unit's math role summed by label:
+
+| Trace | Label | Push us | Words | Cycles a word |
+|---|---|--:|--:|--:|
+| `Step(1024)` | `float_matmul` | 7,193.7 | 19,712 | 493 |
+| | `attention/softmax` | 796.2 | 76,160 | 14.1 |
+| | `tt_rms_norm` | 217.4 | 40,320 | 7.3 |
+| | `tt_silu_mul` | 136.4 | 32,640 | 5.6 |
+| `Chunk { c: 64, len: 64 }` | `float_matmul` | 3,223.0 | 99,264 | 43.8 |
+| | `tt_rms_norm` | 296.1 | 30,272 | 13.2 |
+| | `attention/softmax` | 56.6 | 6,528 | 11.7 |
+
+Nothing pushes at the runner's rate: staging `SUB_EXP` and `DIV` took what was push-bound. The products are
+backend-bound. In profile-mode device time, fused code took a 64-token chunk's replay 5,388.8 -> 5,248.6 us
+(-2.6%), at 512 positions 24,606 -> 23,956 (-2.6%), and the decode step 17,434.7 -> 17,351.0 (-0.5%), of it
+RMSNorm 417.5 -> 375.6 us and `silu_mul` 283.8 -> 241.2.
+
+**The model figures** (`per_kind_push_table`, all forms; `2.8 * pushed / backend`, 2.80 a body pushed word for
+word): `SILU_MUL` same-shape 3,879 words a tile (2.80), decode row 487 (2.80); precise `GELU` 11,495 (2.80);
+`SUB_EXP` and `DIV` by a column 0.36 and 0.38 (staged), by a row 1,827 and 1,990 (2.80, always unrolled); the
+long transcendentals all at 2.80. The table had stopped at `BOOL_TO_I32` and left the fused kinds (`0x1f0`+)
+out; it covers them now.
+
+**Measured** (`cargo xtask bench --device 0 --release`, `TT_TILES=all`, medians, outputs validated by the
+bench; off / on run IDs):
+
+| Workload | Off | Fused | |
+|---|--:|--:|--:|
+| 1.7B prefill, 1,000 tokens, chunks of 64 (8,192 positions) | 765.7 ms | **746.4** | -2.5% |
+| 1.7B prefill, 7,992 tokens, chunks of 64 | 12,268 ms | **12,055** | -1.7% |
+| 1.7B prefill, 1,000 tokens, chunks of 512 | 415.8 ms | **399.8** (2,502 tokens/s) | -3.9% |
+| 1.7B prefill, 7,992 tokens, chunks of 512 | 9,999 ms | **9,842** (812 tokens/s) | -1.6% |
+| 1.7B decode step after 1,000 / 7,992 tokens (chunks of 512) | 25.73 / 53.55 ms | 25.53 / 53.23 | -0.8% / -0.6% |
+| 1.7B prefill, 32 / 256 tokens (512 positions) | 41.83 / 171.72 ms | 40.61 / 166.81 | -2.9% |
+| 1.7B decode step, 32 / 256-token prompt (512 positions) | 16.83 / 18.28 ms | **16.78 / 17.97** | -0.3% / -1.7% |
+| ViT-Tiny 224x224 traced | 8.97 ms | **8.32** | -7.2% |
+| ResNet-18 224x224 traced | 13.88 ms | **13.74** | -1.1% |
+
+Runs: chunks of 64 `1792960668` / `1792961057`; chunks of 512 `1792961449` / `1792962530`; 512 positions
+`1792963641` / `1792963811`; images `1792963983` / `1792963996` (burn-flex 106.0 / 105.5 ms ViT, 154.6 / 155.3
+ResNet in the same runs). ViT gains most: its precise `GELU` is the most push-bound kernel in a model. Builds
+take a little longer (the host fuses and checks each program once: chunks of 512 858 -> 878 s first build).
+Nothing measured was slower, so the fused path is the default (`--smoke` with it, card 0: 1,210 of 1,210, `1792964273`).
 
 ## The long-context softmax: `SUB_EXP` and `DIV` push-bound, their row loops staged to replay (2026-10-25, card 0)
 

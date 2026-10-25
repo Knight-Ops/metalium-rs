@@ -314,6 +314,7 @@ pub const SMOKE: &[&str] = &[
     // Attention's softmax over rows of any length as one op, bit for bit the composition
     // (roadmap Track 1, "The long-context softmax"; opt-in in burn-tt).
     "step230_softmax_rows::",
+    "step231_ttinsn_push::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

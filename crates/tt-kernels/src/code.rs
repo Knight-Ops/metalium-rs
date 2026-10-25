@@ -113,6 +113,47 @@ impl Code {
         let n = words.len() as u32;
         Ok((words, n | loops::LOOPED))
     }
+
+    /// The program as fused `.ttinsn` code (`tt_isa::ttinsn`): RISC-V code that pushes
+    /// [`Code::expand`]'s stream by executing it, its loops counted loops. Checked three ways
+    /// before it is returned: the loops as the runner checks them, the code by
+    /// `tt_isa::ttinsn::validate` (the gate for code written at run time), and its pushes, run
+    /// on the host, against [`Code::expand`] word for word. `Err` for a program with no fused
+    /// form (a seed directive, a body past a branch's reach), which the runner pushes instead.
+    pub fn fused(&self) -> Result<Vec<u32>, FuseError> {
+        use tt_isa::ttinsn;
+        check(&self.loops, self.ins.len() as u32).map_err(FuseError::Loops)?;
+        let code: Vec<u32> = self.ins.iter().map(|i| i.word()).collect();
+        let ls: Vec<(u32, u32, u32)> = self
+            .loops
+            .iter()
+            .map(|l| (l.start, l.len, l.count))
+            .collect();
+        let mut out = vec![0; code.len() + 4 * ls.len() + 1];
+        let n = ttinsn::emit(&code, &ls, &mut out).map_err(FuseError::Refused)?;
+        out.truncate(n);
+        let want = self.expand();
+        let mut at = 0;
+        let mut same = true;
+        ttinsn::execute(&out, |w| {
+            same &= want.get(at).is_some_and(|i| i.word() == w);
+            at += 1;
+        })
+        .map_err(FuseError::Refused)?;
+        if !same || at != want.len() {
+            return Err(FuseError::Differs);
+        }
+        Ok(out)
+    }
+}
+
+/// Why a program has no fused form ([`Code::fused`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FuseError {
+    Loops(LoopError),
+    Refused(tt_isa::ttinsn::Refusal),
+    /// The fused code would push other words than the runner: never expected, and refused.
+    Differs,
 }
 
 /// The runner's rules: at most `MAX` loops, inside the program, any two
@@ -250,6 +291,72 @@ mod tests {
             "two entries, their count, eight words"
         );
         assert_eq!(words[0], 2);
+    }
+
+    #[test]
+    fn fused_code_pushes_the_expansion() {
+        let c = Code {
+            ins: ins(8),
+            loops: vec![
+                Loop {
+                    start: 1,
+                    len: 5,
+                    count: 2,
+                },
+                Loop {
+                    start: 2,
+                    len: 2,
+                    count: 3,
+                },
+            ],
+        };
+        let fused = c.fused().unwrap();
+        assert_eq!(fused.len(), 8 + 2 * 3 + 1);
+        let mut pushed = Vec::new();
+        tt_isa::ttinsn::execute(&fused, |w| pushed.push(w)).unwrap();
+        let want: Vec<u32> = c.expand().iter().map(|i| i.word()).collect();
+        assert_eq!(pushed, want);
+    }
+
+    /// Every SFPU kind's three-role kernel, in each broadcast form and the decode form, over one
+    /// tile and three: the math role's program fuses, and its fused code pushes its expansion
+    /// word for word (checked inside `fused`). The others too, where they have a fused form.
+    #[test]
+    fn every_sfpu_kernel_fuses() {
+        use crate::sfpu::{kernel, ops, ops::Broadcast};
+        let mut fused = 0;
+        for kind in (1..=crate::kind::LAST).chain(0x100..=0x1ff) {
+            for (bcast, rows) in [
+                (Broadcast::None, 32),
+                (Broadcast::Row, 32),
+                (Broadcast::Col, 32),
+                (Broadcast::None, 1),
+            ] {
+                let Some((operands, math)) = ops::code_for_rows(kind, [0.5, 2.0], bcast, rows)
+                else {
+                    continue;
+                };
+                for tiles in [1usize, 3] {
+                    let layout = kernel::plan_layout(tiles, operands).unwrap();
+                    let (ins, loops) = kernel::roles_code(&layout, operands, &math);
+                    let code = Code {
+                        ins: ins[1].clone(),
+                        loops: loops[1].clone(),
+                    };
+                    // What the runner cannot hold looped is built unrolled (`roles_unrolled`).
+                    if code.stored().is_err() {
+                        continue;
+                    }
+                    match code.fused() {
+                        Ok(_) => fused += 1,
+                        Err(e) => {
+                            panic!("kind {kind:#x} {bcast:?} rows {rows} tiles {tiles}: {e:?}")
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fused > 400, "{fused}");
     }
 
     #[test]

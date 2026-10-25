@@ -243,6 +243,8 @@ fn panic(info: &PanicInfo) -> ! {
 /// Pushing Tensix instructions from a baby RISC-V core.
 pub mod corpus;
 pub mod dataflow;
+/// Calling fused `.ttinsn` code the host placed in the program cache.
+pub mod fused;
 /// Run-time `.ttinsn` translation: the experiment's, behind its feature.
 #[cfg(feature = "ttinsn-experiment")]
 pub mod ttinsn;

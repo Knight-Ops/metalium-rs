@@ -35,4 +35,5 @@ pub mod sync;
 pub mod tag_search;
 pub mod tensix;
 pub mod tile;
+pub mod ttinsn;
 pub mod unpacker;

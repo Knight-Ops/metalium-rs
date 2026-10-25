@@ -15,7 +15,7 @@
 use crate::{dm, l1, mailbox};
 
 pub const STREAMED: u32 = 1 << 30;
-pub const LENGTH_MASK: u32 = !(STREAMED | mailbox::loops::LOOPED);
+pub const LENGTH_MASK: u32 = !(STREAMED | mailbox::loops::LOOPED | crate::ttinsn::FUSED);
 pub const VERSION: u32 = 1;
 pub const STEP_WORDS: u32 = 4;
 
@@ -247,8 +247,10 @@ pub const fn reached(counter: u16, target: u16) -> bool {
     counter.wrapping_sub(target) as i16 >= 0
 }
 pub fn program(address: u32, length: u32) -> bool {
-    let words = length & !mailbox::loops::LOOPED;
+    let (looped, fused) = (mailbox::loops::LOOPED, crate::ttinsn::FUSED);
+    let words = length & !(looped | fused);
     length & STREAMED == 0
+        && length & (looped | fused) != (looped | fused)
         && address % 16 == 0
         && words <= mailbox::PROGRAM_MAX
         && l1::PROGRAM_CACHE.contains(address as u64, words as u64 * 4)

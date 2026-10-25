@@ -60,6 +60,9 @@ pub enum Event {
     /// The list just ended had requests wait `cycles` in all for room under
     /// the in-flight cap.
     Throttle { cycles: u32 },
+    /// After a kernel's `ROLES_DONE`: the math role's totals for it, `amount`
+    /// a multiple of 64.
+    RolePush { what: RoleTotal, amount: u64 },
     /// Anything else: a token no firmware of this build writes.
     Unknown(u32),
 }
@@ -101,6 +104,14 @@ impl Event {
                 what: RoleEvent::Acked,
             },
             (ev::MOVER, ev::THROTTLE) => Event::Throttle { cycles: detail },
+            (ev::MOVER, ev::ROLE_PUSH | ev::ROLE_DRAIN | ev::ROLE_WORDS) => Event::RolePush {
+                what: match event {
+                    ev::ROLE_PUSH => RoleTotal::Push,
+                    ev::ROLE_DRAIN => RoleTotal::Drain,
+                    _ => RoleTotal::Words,
+                },
+                amount: (detail as u64) << ev::PUSH_UNIT_SHIFT,
+            },
             (ev::MOVER, ev::KICK | ev::ROLES_DONE) => Event::Kick {
                 done: event == ev::ROLES_DONE,
                 generation: detail,
@@ -116,6 +127,17 @@ impl Event {
             _ => Event::Unknown(token),
         }
     }
+}
+
+/// What an [`Event::RolePush`] counts (`tt_isa::mailbox::PUSH_CYCLES` and its neighbours).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleTotal {
+    /// Cycles pushing instruction words.
+    Push,
+    /// Cycles waiting, after pushing, for the coprocessor to retire them.
+    Drain,
+    /// Instruction words the runner read and pushed.
+    Words,
 }
 
 /// The name a mover entry's first word goes by.
@@ -266,6 +288,8 @@ impl UnitProfile {
                     begin: e.cycles.saturating_sub(cycles as u64),
                     end: e.cycles,
                 }),
+                // Totals, not moments: the profile mode attributes them.
+                Event::RolePush { .. } => {}
                 Event::Role {
                     thread,
                     what: RoleEvent::Woke,

@@ -736,6 +736,20 @@ fn await_roles(generation: u32) -> Result<(), u32> {
     }
     let traced = trace_mode() != 0 && in_window();
     trace(traced, tt_isa::mailbox::trace::ROLES_DONE, generation);
+    if STAMPS && traced {
+        // The math role's pushing and its waits for the coprocessor, if it measured
+        // them (`mailbox::trace_word::PUSH`): written before its acknowledgement,
+        // which the polls above read through a fence.
+        use tt_isa::mailbox::trace as ev;
+        let math = Mailbox::of(1);
+        let unit = |cycles: u32| (cycles >> ev::PUSH_UNIT_SHIFT).min(ev::DETAIL_MAX);
+        let (push, drain) = (rd(math.push_cycles()), rd(math.drain_cycles()));
+        if push != 0 || drain != 0 {
+            trace(true, ev::ROLE_PUSH, unit(push));
+            trace(true, ev::ROLE_DRAIN, unit(drain));
+            trace(true, ev::ROLE_WORDS, unit(rd(math.push_words())));
+        }
+    }
     Ok(())
 }
 

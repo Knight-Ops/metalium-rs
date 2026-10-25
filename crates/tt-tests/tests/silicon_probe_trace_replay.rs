@@ -332,6 +332,7 @@ fn account(
             // Inside an entry they are part of its span; outside one they are unforeseen.
             Event::Kick { .. }
             | Event::Throttle { .. }
+            | Event::RolePush { .. }
             | Event::Role { .. }
             | Event::Unknown(_) => {
                 if open.is_none() {

@@ -661,23 +661,43 @@ fn how_push_bound_are_the_sfpu_math_programs() {
 /// stored once), what a `.ttinsn` image would have to contain. The ratio is the model's (`2.8 * pushed / backend`,
 /// the backend taken at one instruction a cycle), so it can only overstate how
 /// push-bound a kernel is: a slower real backend lowers it.
+///
+/// Every form a kind is built in is a row of its own (`form`): `none` the same shape, `row` and
+/// `col` its broadcasts (`row` is always unrolled), and `rows1` the decode form, a tile of which
+/// one tensor row is computed (`ops::code_for_rows`, unrolled since its body is short). `staged`
+/// says the body was split into replayed row loops (`sfpu::ops::staged`). Kinds the 2026-10-25
+/// staging left long are what `.ttinsn` would serve (`docs/plans/roadmap.md`, "Fused `.ttinsn`
+/// push").
 #[test]
 fn per_kind_push_table() {
     const CYCLES_PER_WORD: f64 = 2.8;
-    eprintln!("kind\toperands\tscalar_free\tstored\tpushed\tbackend\tratio");
-    for kind in (1..=tt_kernels::kind::LAST).chain(0x100..=kind_sfpu::LAST) {
-        let Some((operands, code)) = ops::code_for(kind, [0.5, 2.0], Broadcast::None) else {
-            continue;
-        };
-        let words = |c: &Code| c.expand().iter().map(|i| i.word()).collect::<Vec<u32>>();
-        let scalar_free = ops::code_for(kind, [0.75, 3.0], Broadcast::None)
-            .is_some_and(|(_, other)| words(&other) == words(&code));
-        let pushed = code.expand().len();
-        let stored = code.stored().map_or(0, |(w, _)| w.len());
-        let backend_words = backend_of_code(&code).len();
-        eprintln!(
-            "{kind:#x}\t{operands:?}\t{scalar_free}\t{stored}\t{pushed}\t{backend_words}\t{:.2}",
-            CYCLES_PER_WORD * pushed as f64 / backend_words as f64
-        );
+    eprintln!("kind\tform\toperands\tscalar_free\tstaged\tstored\tpushed\tbackend\tratio");
+    let forms = [
+        ("none", Broadcast::None, 32),
+        ("row", Broadcast::Row, 32),
+        ("col", Broadcast::Col, 32),
+        ("rows1", Broadcast::None, 1),
+    ];
+    // The original range, then the integer, rounding and index kinds and the fused ones past it.
+    for kind in (1..=tt_kernels::kind::LAST).chain(0x100..=0x1ff) {
+        for (form, bcast, rows) in forms {
+            let Some((operands, code)) = ops::code_for_rows(kind, [0.5, 2.0], bcast, rows) else {
+                continue;
+            };
+            if rows < 32 && !ops::row_limited(kind) {
+                continue;
+            }
+            let words = |c: &Code| c.expand().iter().map(|i| i.word()).collect::<Vec<u32>>();
+            let scalar_free = ops::code_for_rows(kind, [0.75, 3.0], bcast, rows)
+                .is_some_and(|(_, other)| words(&other) == words(&code));
+            let staged = rows == 32 && ops::is_staged(kind);
+            let pushed = code.expand().len();
+            let stored = code.stored().map_or(0, |(w, _)| w.len());
+            let backend_words = backend_of_code(&code).len();
+            eprintln!(
+                "{kind:#x}\t{form}\t{operands:?}\t{scalar_free}\t{staged}\t{stored}\t{pushed}\t{backend_words}\t{:.2}",
+                CYCLES_PER_WORD * pushed as f64 / backend_words as f64
+            );
+        }
     }
 }

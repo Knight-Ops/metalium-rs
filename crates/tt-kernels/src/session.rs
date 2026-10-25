@@ -32,6 +32,7 @@
 //! tiles -- and since no job's arithmetic depends on where it runs, the
 //! result is the same bits whatever the number of units.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tt_device::core_control::WaitError;
@@ -820,6 +821,8 @@ pub struct Session<T: Transport> {
     l1_writes: crate::dm::L1Writes,
     /// [`Session::set_trace_arena`].
     trace_arena: bool,
+    /// [`Session::set_ttinsn`].
+    ttinsn: bool,
     /// [`Session::set_sub_traces`].
     sub_traces: bool,
     /// What every unit's movers' lists may name in L1 now, and each started later
@@ -1225,10 +1228,15 @@ struct Segment {
 /// Keyed by the programs' allocations, which the memo keeps alive, so a key
 /// is never reused; cleared when it grows past `MEMO_MAX`, since some ops
 /// build fresh programs every call.
+///
+/// With `fuse` ([`Session::set_ttinsn`]), the math role's program as fused `.ttinsn` code when it
+/// pushes [`FUSE_MIN_WORDS`] words or more and has a fused form, its length flagged
+/// `tt_isa::ttinsn::FUSED`.
 fn stored_program(
     roles: &Arc<[Vec<Instruction>; 3]>,
     loops: &Arc<[Vec<crate::code::Loop>; 3]>,
     t: usize,
+    fuse: bool,
 ) -> Result<(Arc<[u32]>, u32, u64), TensorError> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -1239,7 +1247,9 @@ fn stored_program(
         [Option<Stored>; 3],
     );
     const MEMO_MAX: usize = 4096;
-    static MEMO: OnceLock<Mutex<HashMap<(usize, usize), Entry>>> = OnceLock::new();
+    // The roles' and loops' allocations, and whether the math role is fused.
+    type Key = (usize, usize, u8);
+    static MEMO: OnceLock<Mutex<HashMap<Key, Entry>>> = OnceLock::new();
     // No loops is one key, whichever allocation carries it: matmuls and
     // reductions build a fresh empty table for every kernel.
     let loops_key = if loops.iter().all(Vec::is_empty) {
@@ -1247,7 +1257,13 @@ fn stored_program(
     } else {
         Arc::as_ptr(loops) as usize
     };
-    let key = (Arc::as_ptr(roles) as usize, loops_key);
+    // 0 pushed, 1 fused, 2 fused and mutated ([`probe_fuse_mutation`]).
+    let fuse = match (fuse && t == 1, PROBE_FUSE_MUTATION.load(Ordering::Relaxed)) {
+        (false, _) => 0u8,
+        (true, false) => 1,
+        (true, true) => 2,
+    };
+    let key = (Arc::as_ptr(roles) as usize, loops_key, fuse);
     let mut memo = MEMO
         .get_or_init(Default::default)
         .lock()
@@ -1259,9 +1275,22 @@ fn stored_program(
         ins: roles[t].clone(),
         loops: loops[t].clone(),
     };
-    let (words, len_word) = code
-        .stored()
-        .map_err(|e| TensorError::Shape(e.to_string()))?;
+    let fused = (fuse != 0)
+        .then(|| fused_form(&code))
+        .flatten()
+        .map(|mut w| {
+            if fuse == 2 {
+                mutate_fused(&mut w);
+            }
+            let n = w.len() as u32;
+            (w, n | tt_isa::ttinsn::FUSED)
+        });
+    let (words, len_word) = match fused {
+        Some(f) => f,
+        None => code
+            .stored()
+            .map_err(|e| TensorError::Shape(e.to_string()))?,
+    };
     let h = crate::program_cache::hash(&words);
     let stored: Stored = (Arc::from(words), len_word, h);
     if memo.len() >= MEMO_MAX && !memo.contains_key(&key) {
@@ -1273,6 +1302,60 @@ fn stored_program(
     Ok(stored)
 }
 
+/// Pushed words from which the math role's program runs as fused `.ttinsn` code
+/// ([`Session::set_ttinsn`]): calling it costs the runner an instruction-cache invalidation
+/// (~330 cycles a run) that saves ~2.1 cycles a word pushed.
+pub const FUSE_MIN_WORDS: usize = 256;
+
+/// Kernels placed with fused math programs ([`Session::set_ttinsn`]), process-wide: what a gate
+/// asserts to know the fused path ran.
+static FUSED_PLACED: AtomicU64 = AtomicU64::new(0);
+
+/// [`FUSED_PLACED`].
+pub fn fused_placements() -> u64 {
+    FUSED_PLACED.load(Ordering::Relaxed)
+}
+
+/// Where the last fused program was placed, on whichever unit placed it last.
+static LAST_FUSED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// [`LAST_FUSED_AT`]: a gate's evidence that two fused programs ran from one address.
+#[doc(hidden)]
+pub fn probe_last_fused_at() -> u64 {
+    LAST_FUSED_AT.load(Ordering::Relaxed)
+}
+
+static PROBE_FUSE_MUTATION: AtomicBool = AtomicBool::new(false);
+
+/// A gate's negative control, never for use: fused code built from now on has the immediate of
+/// every `SFPLOADI` (the constants its program loads) changed in its lowest bit, after the host's
+/// checks (`crate::code::Code::fused`), so the card computes with other constants than the
+/// program's. (The first alone was not enough: precise `GELU`'s first constant reaches none of a
+/// gate's outputs.) A gate that compares fused against pushed results must then see them differ, which
+/// shows the card ran the fused code. The kernel's synchronisation is left as it was.
+#[doc(hidden)]
+pub fn probe_fuse_mutation(on: bool) {
+    PROBE_FUSE_MUTATION.store(on, Ordering::Relaxed);
+}
+
+/// [`probe_fuse_mutation`]'s change.
+fn mutate_fused(words: &mut [u32]) {
+    use tt_isa::isa::generated::defs::SFPLOADI;
+    for w in words.iter_mut() {
+        if *w & 3 != 3 && SFPLOADI.matches(w.rotate_right(2)) {
+            *w = (w.rotate_right(2) ^ 1).rotate_left(2);
+        }
+    }
+}
+
+/// `code` as fused `.ttinsn` code, if it pushes [`FUSE_MIN_WORDS`] words or more and has a fused
+/// form ([`crate::code::Code::fused`]).
+fn fused_form(code: &crate::code::Code) -> Option<Vec<u32>> {
+    let fused = code.fused().ok()?;
+    let pushed = tt_isa::ttinsn::validate(&fused).ok()?;
+    (pushed >= FUSE_MIN_WORDS as u64).then_some(fused)
+}
+
 fn place_programs<T: Transport>(
     dev: &mut Device<T>,
     window: &tt_device::Window,
@@ -1280,6 +1363,7 @@ fn place_programs<T: Transport>(
     cache: &mut ProgramCache,
     seg: &Segment,
     in_flight: bool,
+    fuse: bool,
 ) -> Result<Vec<[(u32, u32); 3]>, PlaceError> {
     use crate::program_cache::{CacheError, Placed};
     for attempt in 0..2 {
@@ -1303,8 +1387,8 @@ fn place_programs<T: Transport>(
                 if program.is_empty() {
                     continue;
                 }
-                let (words, len_word, h) =
-                    stored_program(roles, &seg.kernel_loops[k], t).map_err(PlaceError::Failed)?;
+                let (words, len_word, h) = stored_program(roles, &seg.kernel_loops[k], t, fuse)
+                    .map_err(PlaceError::Failed)?;
                 // A trace's programs may make room only once nothing queued can run them: a
                 // replay restores them (`Session::replay`).
                 let at = match cache.place_hashed_evicting(&words, h, !in_flight) {
@@ -1325,6 +1409,10 @@ fn place_programs<T: Transport>(
                         break 'kernels;
                     }
                 };
+                if len_word & tt_isa::ttinsn::FUSED != 0 {
+                    FUSED_PLACED.fetch_add(1, Ordering::Relaxed);
+                    LAST_FUSED_AT.store(at, Ordering::Relaxed);
+                }
                 p[t] = (at as u32, len_word);
             }
             placed.push(p);
@@ -1398,7 +1486,7 @@ fn place_programs<T: Transport>(
                 continue;
             }
             let (words, _, h) =
-                stored_program(roles, &seg.kernel_loops[k], t).map_err(PlaceError::Failed)?;
+                stored_program(roles, &seg.kernel_loops[k], t, fuse).map_err(PlaceError::Failed)?;
             if seen.insert(h) {
                 needed += (words.len() as u64 * 4).next_multiple_of(16);
             }
@@ -2518,6 +2606,7 @@ impl<T: Transport> Session<T> {
             captures: 0,
             l1_writes: Default::default(),
             trace_arena: std::env::var("TT_TRACE_ARENA").is_ok_and(|v| v == "1"),
+            ttinsn: std::env::var("TT_TTINSN").map_or(true, |v| v != "0"),
             sub_traces: std::env::var("TT_SUB_TRACES").is_ok_and(|v| v == "1"),
             mover_arena: tt_isa::l1::DATA,
             pending_shape: 0,
@@ -2661,6 +2750,7 @@ impl<T: Transport> Session<T> {
             // that failed; the profile goes on from an empty one.
             r.set_profiling(true);
             r.set_profile_roles(profile_roles);
+            r.set_profile_push(self.profiler.as_ref().is_some_and(|p| p.options.push));
             // The buffer the profile reads (`set_profile_buffer` may have moved it).
             let (buffer, bytes) = self.profile_buffer;
             dev.configure_trace(r.window(), unit.tile, buffer, bytes)?;
@@ -2719,12 +2809,14 @@ impl<T: Transport> Session<T> {
                 self.prepare_unit(u)?;
             }
             let profile_roles = self.profile_roles;
+            let profile_push = self.profiler.as_ref().is_some_and(|p| p.options.push);
             let Session { dev, units: us, .. } = self;
             let unit = &mut us[u];
             let r = unit.resident.as_mut().expect("prepared above");
             dev.configure_trace(r.window(), unit.tile, buffer, bytes)?;
             r.set_profiling(true);
             r.set_profile_roles(profile_roles);
+            r.set_profile_push(profile_push);
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, trace_word)?;
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
@@ -4823,11 +4915,21 @@ impl<T: Transport> Session<T> {
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
             let placed = {
-                let Session { dev, units, .. } = self;
+                let Session {
+                    dev, units, ttinsn, ..
+                } = self;
                 let unit = &mut units[u];
                 let w = unit.resident.as_ref().unwrap().window();
                 let in_flight = !unit.queued.is_empty();
-                match place_programs(dev, w, unit.tile, &mut unit.programs, seg, in_flight) {
+                match place_programs(
+                    dev,
+                    w,
+                    unit.tile,
+                    &mut unit.programs,
+                    seg,
+                    in_flight,
+                    *ttinsn,
+                ) {
                     Ok(p) => Ok(p),
                     Err(PlaceError::Full) => Err(()),
                     Err(PlaceError::Failed(e)) => return Err(e),
@@ -4839,10 +4941,12 @@ impl<T: Transport> Session<T> {
                     let d0 = self.mark();
                     self.drain_unit(u)?;
                     self.stage(HostStage::Drain, d0);
-                    let Session { dev, units, .. } = self;
+                    let Session {
+                        dev, units, ttinsn, ..
+                    } = self;
                     let unit = &mut units[u];
                     let w = unit.resident.as_ref().unwrap().window();
-                    place_programs(dev, w, unit.tile, &mut unit.programs, seg, false)?
+                    place_programs(dev, w, unit.tile, &mut unit.programs, seg, false, *ttinsn)?
                 }
             };
             for (&at, p) in seg.kernels.iter().zip(placed) {
@@ -5055,7 +5159,7 @@ impl<T: Transport> Session<T> {
                             continue;
                         }
                         let (words, _, hash) =
-                            stored_program(roles, &seg.kernel_loops[index], role)?;
+                            stored_program(roles, &seg.kernel_loops[index], role, self.ttinsn)?;
                         let address = match self.units[u].programs.place_hashed(&words, hash) {
                             Ok(crate::program_cache::Placed::Hit(address)) => address,
                             _ => {
@@ -8616,6 +8720,38 @@ impl<T: Transport> Session<T> {
         self.trace_arena = on;
         self.plans.clear();
         self.planned_base = None;
+    }
+
+    /// Whether the math role runs its long programs as fused `.ttinsn` code (on by default,
+    /// `TT_TTINSN=0` at open turns it off; `docs/plans/ttinsn-push.md`): a program of [`FUSE_MIN_WORDS`] pushed words
+    /// or more is placed in the program cache as RISC-V code that pushes its words by executing
+    /// them (`crate::code::Code::fused`, validated and run on the host against the program's own
+    /// expansion first), and the runner calls it instead of reading and storing each word (1.19
+    /// cycles a word against 3.31 on silicon). A program with no fused form is pushed as before.
+    /// The same words reach the coprocessor either way. For the kernels placed from now on; a
+    /// capture keeps the form it was captured with.
+    pub fn set_ttinsn(&mut self, on: bool) {
+        self.ttinsn = on;
+    }
+
+    /// [`Session::set_ttinsn`].
+    pub fn ttinsn(&self) -> bool {
+        self.ttinsn
+    }
+
+    /// A gate's tool, never for use: wait for everything queued, then forget every unit's program
+    /// cache (nothing held: no trace may be alive), so the next programs are placed from the
+    /// region's start again, over the words of the ones before. What a gate needs to make a fused
+    /// program run at an address another one's code was run from (`docs/plans/ttinsn-push.md`:
+    /// the runner invalidates its instruction cache first).
+    #[doc(hidden)]
+    pub fn probe_forget_programs(&mut self) -> Result<(), RunError> {
+        self.sync_run()?;
+        for unit in &mut self.units {
+            unit.programs.unpin_all();
+            unit.programs.clear();
+        }
+        Ok(())
     }
 
     /// Whether a trace is stored as layer sub-traces (`TT_SUB_TRACES=1` at open; off by default;

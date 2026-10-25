@@ -629,6 +629,9 @@ pub struct Resident<N: NocId> {
     /// Whether a profile records the roles' events too, or the mover's
     /// alone (`Resident::set_profile_roles`).
     profile_roles: bool,
+    /// Whether a profile has the math role total its pushing for the mover to
+    /// stamp (`Resident::set_profile_push`).
+    profile_push: bool,
     /// The last setup run's generation and program, until taken: a trace's
     /// capture records it as a kernel of its own (`crate::trace`).
     last_setup: Option<(u32, Vec<Instruction>)>,
@@ -662,6 +665,7 @@ impl<N: NocId> Resident<N> {
             pending: None,
             profiling: false,
             profile_roles: true,
+            profile_push: false,
             reservations: Default::default(),
         };
         for thread in 0..3 {
@@ -708,8 +712,24 @@ impl<N: NocId> Resident<N> {
         self.profile_roles = on;
     }
 
+    /// Whether a profile has the math role total each kernel's pushing and its
+    /// waits for the coprocessor, which the mover stamps after the kernel
+    /// (`mailbox::trace_word::PUSH`, `crate::profile_mode::ProfileOptions::push`).
+    /// Off by default.
+    pub fn set_profile_push(&mut self, on: bool) {
+        self.profile_push = on;
+    }
+
     fn roles_traced(&self) -> bool {
         self.profiling && self.profile_roles
+    }
+
+    /// Role `thread`'s `mailbox::TRACE` word: its runs stamped if `runs`, and the
+    /// math role's push totals in a profile that asks for them.
+    fn trace_word(&self, thread: usize, runs: bool) -> u32 {
+        let push = self.profiling && self.profile_push && thread == 1;
+        (if runs { mailbox::trace_word::RUNS } else { 0 })
+            | if push { mailbox::trace_word::PUSH } else { 0 }
     }
 
     /// The window this tile is reached through. A [`crate::dm::DataMover`] on
@@ -885,7 +905,7 @@ impl<N: NocId> Resident<N> {
             let d = mailbox::Descriptor {
                 thread_index: thread as u32,
                 dst_access_fmt: kernel.dst_fmt,
-                trace: u32::from(self.roles_traced()),
+                trace: self.trace_word(thread, self.roles_traced()),
                 push_window,
                 // A MOP configuration different from the queued kernels'
                 // would be rewritten under them.
@@ -982,7 +1002,7 @@ impl<N: NocId> Resident<N> {
         Ok(mailbox::Descriptor {
             thread_index: thread as u32,
             dst_access_fmt: kernel.dst_fmt,
-            trace: u32::from(kernel.trace || self.roles_traced()),
+            trace: self.trace_word(thread, kernel.trace || self.roles_traced()),
             push_window,
             mop_cfg: kernel.mop_words(thread)?,
             ..Default::default()
@@ -1260,7 +1280,7 @@ impl<N: NocId> Resident<N> {
             dst_access_fmt: dst_fmt,
             program_len: len,
             dump_row_count: dump,
-            trace: u32::from(traced),
+            trace: self.trace_word(thread, traced),
             push_window,
             mop_cfg,
             program_addr: program_at.unwrap_or(0),

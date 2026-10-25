@@ -848,6 +848,26 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
   (idle processes, always inside a forked child) and never single-threaded; not diagnosed. The
   experiment's ttsim tests serialize on a mutex.
 
+### Fused code from the program cache (2026-10-25, card 0)
+
+`docs/plans/ttinsn-push.md`; gate `step231_ttinsn_push` (ttsim and card 0, run `1792956507`), opt-in
+(`TT_TTINSN=1`).
+
+- **The shipped T1 runner calls code the host wrote into the program cache over the NoC** (fused `.ttinsn`
+  code, `tt_firmware::fused`), after invalidating its own instruction cache with the documented sequence,
+  once a run. The program cache reuses its addresses, so without the invalidation a run would execute what
+  the cache held of the previous program there (the experiment's stale-code control). Verified on silicon
+  with a real reuse: GELU's fused code run, the cache forgotten, TANH's fused code placed at the same address
+  (`Session::probe_forget_programs`, `probe_last_fused_at`): TANH's bits, not GELU's.
+- **The host's NoC writes need no device-side read-back before the invalidation**: the runner reads one
+  word of the code (any) as the sequence's read-back; the host's writes landed before the list that names
+  the code was queued (the order every resident program already relies on).
+- **The pushing measured from the runner** (the profile mode's push totals, `mailbox::PUSH_CYCLES`,
+  `PUSH_WORDS`): a push into a full instruction FIFO stalls the core, so cycles spent pushing are not
+  push-boundness. A kernel is bound by its pushing when its words go at the runner's ~3.3 cycles each; the
+  1.7B's products push at ~40-500 cycles a word (behind the Matrix Unit), its `silu_mul` at 5.6 and its
+  RMSNorm at 7.3 (runs `1792956684`).
+
 ## Card lock (2026-10-11, both cards)
 
 `Session::open_card` takes the driver lock `SESSION_LOCK` (index 63 of 64, clear of the Ethernet cores'

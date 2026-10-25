@@ -223,7 +223,15 @@ shippable build), whose `.ttinsn` words the gate validates word by word, and whi
 `.ttinsn` code to L1 at run time and invalidate its own instruction cache
 (`tt_firmware::ttinsn`, which checks every word it emits)
 (`docs/plans/ttinsn-push-experiment.md`); the gate refuses data directives in code
-for every image. Ethernet customer code runs on E1; leave E0
+for every image. **Fused code (on by default, `TT_TTINSN=0` off):** the shipped math
+role (T1) calls `.ttinsn` code the host wrote to the program cache, its length flagged
+`tt_isa::ttinsn::FUSED`, after invalidating its own instruction cache once a run
+(`tt_firmware::fused`). The build-time gate cannot see that code, so
+`tt_isa::ttinsn::validate` is its gate: only `code::Code::fused` makes it (emitted,
+validated, and run on the host against the program's own expansion word for word);
+never write code to the program cache any other way, never flag `FUSED` for T0 or T2
+(they refuse it), and change the skeleton only with `validate`'s mutation tests
+(`docs/plans/ttinsn-push.md`, gate `step231_ttinsn_push`). Ethernet customer code runs on E1; leave E0
 and firmware-owned L1 intact. Read the operating notes before low-level changes.
 
 ttsim is a non-reentrant process-wide singleton; violations call `_Exit`.

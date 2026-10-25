@@ -57,10 +57,23 @@ pub const DUMP_ROW_COUNT: u64 = MAILBOX_BASE + 0x28;
 /// First `Dst` row to copy.
 pub const DUMP_ROW_FIRST: u64 = MAILBOX_BASE + 0x2C;
 
-/// Non-zero: the firmware records its progress through the tile's timestamper
-/// (`tensix::timestamper`), which the host has configured. Zero on the
-/// simulator, whose timestamper support is probed separately.
+/// What the firmware records, a set of [`trace_word`] bits. [`trace_word::RUNS`]: its
+/// progress through the tile's timestamper (`tensix::timestamper`), which the host
+/// has configured. Zero on the simulator, whose timestamper support is probed
+/// separately.
 pub const TRACE: u64 = MAILBOX_BASE + 0x30;
+
+/// The bits of [`TRACE`]. Both are acted on only by an image built with the
+/// `profile` feature.
+pub mod trace_word {
+    /// Stamp each run's `START`, `PUSHED` and `RETIRED` (`super::trace`).
+    pub const RUNS: u32 = 1;
+    /// Total the run's pushing and its waits for the coprocessor into
+    /// [`super::PUSH_CYCLES`] and [`super::DRAIN_CYCLES`], for the data mover to
+    /// stamp at the kernel's end (`super::trace::ROLE_PUSH`). Set for the math
+    /// role by the profile mode.
+    pub const PUSH: u32 = 2;
+}
 
 /// Non-zero `n`: after every `n` instruction words pushed, the firmware waits
 /// for the coprocessor to retire everything it has pushed so far. Zero: it
@@ -126,6 +139,23 @@ pub const MOP_CFG: u64 = MAILBOX_BASE + 0x4C;
 
 /// Total size the firmware may assume is its own.
 pub const MAILBOX_SIZE: u64 = 0x70;
+
+/// Wall-clock cycles the last run spent pushing instruction words, written by a
+/// `profile` image's runner before it acknowledges, 0 unless its [`TRACE`] has
+/// [`trace_word::PUSH`]. Past [`MAILBOX_SIZE`], so no `POKE` reaches it: only the
+/// runner writes it, and the data mover reads it.
+pub const PUSH_CYCLES: u64 = MAILBOX_BASE + 0x80;
+/// Wall-clock cycles the last run waited, after pushing, for the coprocessor to
+/// retire what it pushed: as [`PUSH_CYCLES`]. A run whose pushes are the
+/// bottleneck waits little here.
+pub const DRAIN_CYCLES: u64 = MAILBOX_BASE + 0x84;
+/// Instruction words the last run's runner read and pushed, as [`PUSH_CYCLES`]: with it, whether
+/// the pushing ran at the runner's rate (~3.3 cycles a word on silicon, push-bound) or stalled on
+/// a full instruction FIFO (the backend, or a semaphore it waits on, set the pace). Fused code's
+/// words are not counted.
+pub const PUSH_WORDS: u64 = MAILBOX_BASE + 0x88;
+const _: () = assert!(PUSH_CYCLES >= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(PUSH_WORDS + 4 <= MAILBOX_BASE + guard::OFFSET);
 
 /// A program's block repeats: with [`loops::LOOPED`] set in its length
 /// ([`PROGRAM_LEN`], a `KERNEL` entry's), the program's first word is how
@@ -220,6 +250,17 @@ pub mod trace {
     /// waited in all, saturated at [`DETAIL_MAX`]. One per list, after its
     /// `LIST_END`, and only when something waited.
     pub const THROTTLE: u32 = 22;
+    /// After a stamped `ROLES_DONE`: the math role's [`super::PUSH_CYCLES`] for
+    /// the kernel, in units of `1 << PUSH_UNIT_SHIFT` cycles, saturated at [`DETAIL_MAX`].
+    /// Only when the role measured them (`super::trace_word::PUSH`).
+    pub const ROLE_PUSH: u32 = 23;
+    /// The math role's [`super::DRAIN_CYCLES`], as [`ROLE_PUSH`].
+    pub const ROLE_DRAIN: u32 = 24;
+    /// The math role's [`super::PUSH_WORDS`], in units of `1 << PUSH_UNIT_SHIFT` words.
+    pub const ROLE_WORDS: u32 = 25;
+    /// Cycles a [`ROLE_PUSH`] or [`ROLE_DRAIN`] detail counts: 64, so a detail
+    /// holds ~8.4 million (about 6 ms at 1.35 GHz).
+    pub const PUSH_UNIT_SHIFT: u32 = 6;
 
     /// The source of the data mover's events. Role runners use their Tensix
     /// thread, 0..3.
@@ -432,6 +473,15 @@ pub mod role {
         }
         pub const fn program_addr(self) -> u64 {
             self.base + (super::PROGRAM_ADDR - super::MAILBOX_BASE)
+        }
+        pub const fn push_cycles(self) -> u64 {
+            self.base + (super::PUSH_CYCLES - super::MAILBOX_BASE)
+        }
+        pub const fn drain_cycles(self) -> u64 {
+            self.base + (super::DRAIN_CYCLES - super::MAILBOX_BASE)
+        }
+        pub const fn push_words(self) -> u64 {
+            self.base + (super::PUSH_WORDS - super::MAILBOX_BASE)
         }
         /// This mailbox's program slot in [`super::PROGRAM_REGION`].
         pub const fn program(self) -> u64 {

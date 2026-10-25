@@ -2683,6 +2683,11 @@ const STAGE_ROWS: [u32; 3] = [
 /// constant a stage needs that an earlier one loaded is loaded again, the same value. `None` for
 /// a kind with no staged form, and under a row limit ([`super::with_rows`]), where every row loop is
 /// unrolled anyway and stages would only add their loads and stores.
+/// Whether `kind`'s whole-tile program is [`staged`] into replayed row loops.
+pub fn is_staged(kind: u32) -> bool {
+    staged(kind).is_some()
+}
+
 fn staged(kind: u32) -> Option<crate::code::Code> {
     if super::row_limit() < 32 {
         return None;
