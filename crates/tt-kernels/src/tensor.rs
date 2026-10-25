@@ -200,6 +200,13 @@ impl Placement {
         self.channels == other.channels && self.base == other.base
     }
 
+    /// Are `self` and `other` one allocation by when it was made, not where: where a capture
+    /// reuses its own tensors' GDDR (`DramAlloc::start_pool`), a later tensor can take an earlier
+    /// one's slots, base for base.
+    pub(crate) fn same_serial(&self, other: &Placement) -> bool {
+        self.serial == other.serial
+    }
+
     /// The whole of a one-channel placement's slots ([`DramAlloc::alloc_on`]).
     pub(crate) fn region(&self) -> Option<DramRange> {
         match self.channels[..] {

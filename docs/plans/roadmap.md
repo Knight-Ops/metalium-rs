@@ -611,7 +611,8 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   block instead of a row gather a layer (D3): its prefill of 1,000 / 7,992 tokens **4.69 / 36.63 -> 1.24 / 18.33 s**, bit
   for bit (`1792808294`, `1792809505`). A capture's own intermediates now give their GDDR to its later ops (1.G,
   on by default for chunk captures, `TT_CHUNK_REUSE=0` turns it off): 2.10 -> 17.78 GB free after the 1.7B's build, and chunks of 512
-  capture at 8,192 (7,992 tokens in 16.9 s). **A long prefill uses 1.1-1.7% of the card's compute**: the products
+  capture at 8,192 (7,992 tokens in 16.9 s). Since G2 those captures keep their L1 residency plans over the reused slots (1.2-2.1% faster prefill
+  at the same free GDDR; the first build longer, 893 s at chunks of 512). **A long prefill uses 1.1-1.7% of the card's compute**: the products
   plateau at ~5 TFLOPS, GDDR-bound, whatever the chunk size (Track 1, "Prefill products that reuse their operands").
   Left: the BF16 cache, past 32K. Flash-decode's oracle is parked on the Matrix Unit model not being bit for bit on full-mantissa
   operands. Found before: SmolLM2-1.7B's native context is 8,192; the cached Qwen3.6-35B-A3B and Qwen3.8-27B are 262,144.

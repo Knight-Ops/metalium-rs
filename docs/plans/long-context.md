@@ -202,16 +202,32 @@ Part 2's unsplit baseline and fallback.
       **2.10 -> 17.78 GB**, the build 226 -> 127 s, prefill unchanged (1,000 / 7,992 tokens 1,236 / 18,323 -> 1,255 /
       18,438 ms); and **chunks of 512 now capture at 8,192** (14.79 GB free): 1,011 / 16,877 ms, 1.22x / 1.09x, the
       products' plateau (below) capping what a larger chunk buys.
-  - [ ] G2: `residency::Index` by address and op; the planned capture over reused slots equals the unplanned one bit
-    for bit (`step219`, `step188` traced against eager). Needed only for reuse in captures that are planned (the decode
-    steps); the chunk captures reuse unplanned, so it waits on a measured need.
+  - [x] G2 (2026-10-24): a capture that reuses is planned. `OpRecord::allocs` (the capture's tensors allocated when the
+    op was queued); `residency::Index::extend` puts each allocation over the dead extents it overlaps, and
+    `Graph::from_capture` grows the index op by op, so an access is charged to the tensor its address held at that op
+    (the planned capture's `apply_plan` already grew it with the log). A tensor freed in the capture is matched by its
+    allocation (`Placement::same_serial`), not its address: by address, a chunk's output over a freed intermediate's
+    slots looked freed, never read, its writes dropped. `begin_applied` and `end_trace` no longer refuse a reusing
+    capture's plan. Gates: unit `an_address_is_the_tensor_that_held_it_at_the_op` (**watched failing** without the
+    overlap removed: the dead tensor named); `step228` `a_planned_capture_over_reused_slots_replays_as_it_ran` (ttsim and
+    card 0 `1792870177`: bit for bit, 663,552 B moved against 2,248,704 unplanned, 299,520 B held against 965,120
+    planned without reuse, the same plan either way; **watched failing** with the whole log's index: five of six
+    intermediates seen never read, one resident, the planned capture fails; and with freedom by address: the last op's
+    capture refused); `step219` again claims fewer bytes for every planned trace, chunks included (card 0 `1792870184`:
+    a chunk 3,387,264 -> 1,482,624 B). Card 0, all passing: `step185`, `step187`, `step212` (`1792870223`), `step224`,
+    `step188` with the native context, the same tokens as burn-flex, 16.91 GB free after its build (`1792870439`).
+    - Measured (1.7B, 8,192 positions, card 0, [log](../learnings/performance-log.md#residency-plans-over-reused-gddr-2026-10-24-card-0)):
+      prefill of 1,000 / 7,992 tokens 853.3 / 15,432 -> **841.4 / 15,244 ms** at chunks of 64 (`1792873658` ->
+      `1792873151`; the planned capture without reuse 841.4 / 15,243, `1792874014`), 484.3 / 12,629 -> **474.0 / 12,580**
+      at 512 (`1792875430` -> `1792875893`); GDDR free after the build 17.70 / 15.07 GB. The first build 92 -> 224 s at
+      64, 135 -> 893 s at 512 (two captures a chunk trace, and the host expands each graph's moves three times).
   - [x] G3 (2026-10-24): on by default for chunk captures, without G2 (the chunk captures are unplanned). An engine
     without it (the mesh engine) builds without reuse, unless `TT_CHUNK_REUSE=1` asked for it (then refused by name). With reuse
     on, 22 of 22 traced gates passed on card 0 (`1792817785`: `step185`, `step187`, `step212`, `step224`, `step188`
     with the native context). Prefill at chunks of 64 measured 0.6-1.5% slower in one run each (`1792816593` against
     `1792817025`), not confirmed beyond noise. The price: on more than one unit a chunk's capture is no longer
-    residency-planned (no L1-resident intermediates; G2 would restore it), so `step219` now claims fewer bytes for the
-    planned steps and no more for the chunks. One rule (`Session::reuses_captures`: asked for and more than one unit)
+    residency-planned (no L1-resident intermediates; G2 restored it), so `step219` claimed fewer bytes for the
+    planned steps and no more for the chunks until G2. One rule (`Session::reuses_captures`: asked for and more than one unit)
     decides both whether a capture reuses and whether a plan is refused for it; before it, a one-unit chunk ran a plan
     pass every build, refused its plan and captured plainly again.
   - [ ] Larger default chunks at long context (`TT_GEN_CHUNKS` 128-512 at 8,192 fit now); worth little until the

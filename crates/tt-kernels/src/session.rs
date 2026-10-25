@@ -827,6 +827,8 @@ pub struct Session<T: Transport> {
     mover_arena: tt_isa::l1::Region,
     /// The shape of the op being queued ([`trace::OpRecord::shape`]).
     pending_shape: u64,
+    /// The capture's tensors allocated when the op being queued was ([`trace::OpRecord::allocs`]).
+    pending_allocs: usize,
     /// [`Session::set_resident_matmul_a`].
     resident_matmul_a: bool,
     /// [`Session::set_unpack_transposed_b`].
@@ -2519,6 +2521,7 @@ impl<T: Transport> Session<T> {
             sub_traces: std::env::var("TT_SUB_TRACES").is_ok_and(|v| v == "1"),
             mover_arena: tt_isa::l1::DATA,
             pending_shape: 0,
+            pending_allocs: 0,
             resident_matmul_a: true,
             unpack_transposed_b: true,
             thin_stream_units: true,
@@ -4493,6 +4496,7 @@ impl<T: Transport> Session<T> {
                 l1_top: planned.top,
                 l1_need: planned.need,
                 shape: std::mem::take(&mut self.pending_shape),
+                allocs: std::mem::take(&mut self.pending_allocs),
             });
             // A unit's `BUSY_PREFETCH` list, queued with the product, moves back in its stream
             // to just after the last weight-streaming product, or as far towards its own anchor
@@ -4530,6 +4534,7 @@ impl<T: Transport> Session<T> {
         }
         if self.capture.is_some() {
             self.pending_shape = shape_of(&queues);
+            self.pending_allocs = self.dram.as_ref().map_or(0, |d| d.alloc.logged().len());
             self.apply_plan(&mut queues);
             // A planned capture whose plan stopped queues nothing more: what the plan put in L1
             // for the ops before is not in GDDR, where the next ops would read it. It is refused.
@@ -5590,9 +5595,7 @@ impl<T: Transport> Session<T> {
                     .unwrap_or_else(|| "the plan stopped applying".into()),
             ),
             _ => {
-                // A capture that reused its tensors' slots has tensors that share addresses,
-                // which the planner cannot tell apart (`residency::Index`): it plans nothing.
-                if capture.plan_pass && !capture.reuse {
+                if capture.plan_pass {
                     self.last_plan = self.plan_of(&capture, &allocs);
                 }
                 None
@@ -8654,21 +8657,14 @@ impl<T: Transport> Session<T> {
         self.planned_base = None;
     }
 
-    /// Plan captures for L1 residency from now on, in a region of at most `bytes` a unit (0 turns
-    /// it off; on at open with [`RESIDENCY_REGION`] unless `TT_RESIDENCY=0`;
-    /// `docs/plans/planned-l1-residency.md` Phase 2). A plan pass
-    /// ([`Session::begin_trace_plan_pass`]) then ends by planning which of its tensors could live
-    /// in a region at the top of each unit's arena (`crate::residency`), for
-    /// [`Session::begin_trace_planned`] to apply to a capture of the same graph. The planned
-    /// capture keeps what its plan uses, no more than leaves every op laid out as in the plan
-    /// pass (`crate::residency::cap`), nor than `bytes`.
     /// Let the next captures reuse their own tensors' GDDR (`docs/plans/long-context.md` 1.G):
     /// a tensor made during a capture (not uploaded or written by the host) and freed during it
     /// gives its slots to the capture's later allocations, instead of the trace holding every
     /// intermediate until it is released. Safe on the card because every captured op ends in a
     /// barrier counting every earlier one, on more than one unit (with one unit it does nothing).
-    /// Off by default (`TT_CAPTURE_REUSE=1` turns it on); a capture that reuses is not planned for
-    /// L1 residency, whose planner tells tensors apart by address.
+    /// Off by default (`TT_CAPTURE_REUSE=1` turns it on). A capture that reuses is planned for L1
+    /// residency as one that does not: the planner finds the tensor an address held at each op
+    /// (`crate::residency::Index`, G2).
     pub fn set_capture_reuse(&mut self, on: bool) {
         self.capture_reuse = on;
     }
@@ -8684,6 +8680,14 @@ impl<T: Transport> Session<T> {
         self.capture_reuse && self.units.len() > 1
     }
 
+    /// Plan captures for L1 residency from now on, in a region of at most `bytes` a unit (0 turns
+    /// it off; on at open with [`RESIDENCY_REGION`] unless `TT_RESIDENCY=0`;
+    /// `docs/plans/planned-l1-residency.md` Phase 2). A plan pass
+    /// ([`Session::begin_trace_plan_pass`]) then ends by planning which of its tensors could live
+    /// in a region at the top of each unit's arena (`crate::residency`), for
+    /// [`Session::begin_trace_planned`] to apply to a capture of the same graph. The planned
+    /// capture keeps what its plan uses, no more than leaves every op laid out as in the plan
+    /// pass (`crate::residency::cap`), nor than `bytes`.
     pub fn set_residency(&mut self, bytes: u64) {
         self.residency_region = bytes;
         self.plans.clear();
@@ -8764,10 +8768,6 @@ impl<T: Transport> Session<T> {
         applied: std::sync::Arc<crate::residency::Applied>,
         key: Option<u64>,
     ) -> Result<bool, TensorError> {
-        // A capture that reuses is never planned (`Session::set_capture_reuse`).
-        if self.reuses_captures() {
-            return Ok(false);
-        }
         // The region its plan sized (`plan_of`), whatever this session would keep now: an op the
         // region changed is laid out unlike the plan pass's, and refused by its shape.
         let base = applied.region_base;

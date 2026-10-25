@@ -15,8 +15,19 @@
 //!   writes it once; a replay does not), keep their slots: replayed twice, the second replay still
 //!   equals the eager run.
 //!
+//! - **Planned over reused slots** (G2): with L1 residency on, the chain's plan pass and planned
+//!   capture reuse their GDDR as a plain capture does; the planned trace keeps intermediates in L1,
+//!   replays as the chain runs eagerly, bit for bit, moves fewer GDDR bytes than the unplanned trace
+//!   with reuse, and holds less GDDR than the planned trace without it. The planner charges each
+//!   access to the tensor its address held at that op (`residency::Index`, `OpRecord::allocs`).
+//!
 //! Watched failing: with `DramAlloc::give_to_pool` taking a tensor from before the capture, and an
-//! upload, the second replay of their tests diverges.
+//! upload, the second replay of their tests diverges. With `Graph::from_capture` charging every
+//! access to the latest tensor at its address (the whole log's `Index`), the planned chain's plan
+//! sees five of its six intermediates never read, keeps one resident, and the planned capture
+//! fails (`Trace(Empty)`); with a tensor's freedom matched by address, not by allocation, the
+//! chain's output (over a freed intermediate's slots) is never read, its writes dropped, and the
+//! last op's capture is refused (`mover error 1`).
 
 use tt_kernels::kind;
 use tt_kernels::session::{Session, TileChoice};
@@ -127,9 +138,29 @@ fn free_total(s: &S<'_>) -> u64 {
 
 const SEEDS: [u64; 4] = [2, 3, 4, 5];
 
+/// What [`capture_chain_as`] found of one trace.
+struct Captured {
+    /// The GDDR it holds.
+    held: u64,
+    /// The GDDR bytes its ops move (`Session::set_count_trace_bytes`).
+    moved: u64,
+    /// Each replay against the eager chain.
+    same: Vec<bool>,
+    /// The tensors its plan keeps in L1, if it was planned.
+    resident: usize,
+}
+
 /// Capture `chain` over an input `x`, with reuse `on`: the GDDR the trace holds, and each replay
 /// (fresh inputs, `SEEDS`) against the eager chain. Released before returning, its GDDR checked.
 fn capture_chain(s: &mut S<'_>, on: bool) -> (u64, Vec<bool>) {
+    let c = capture_chain_as(s, on, false);
+    (c.held, c.same)
+}
+
+/// [`capture_chain`], `planned` as a residency plan pass and the planned capture applying it
+/// (`Session::begin_trace_plan_pass`, `Session::begin_trace_planned`), the pass's trace released
+/// before the planned capture as Burn's is.
+fn capture_chain_as(s: &mut S<'_>, on: bool, planned: bool) -> Captured {
     let want: Vec<Vec<u32>> = SEEDS
         .iter()
         .map(|&seed| {
@@ -145,11 +176,31 @@ fn capture_chain(s: &mut S<'_>, on: bool) -> (u64, Vec<bool>) {
     s.sync().unwrap();
     let before = free_total(s);
     s.set_capture_reuse(on);
-    s.begin_trace().unwrap();
+    s.set_count_trace_bytes(true);
+    let mut resident = 0;
+    if planned {
+        s.begin_trace_plan_pass().unwrap();
+        let y = chain(s, &x);
+        let id = s.end_trace().unwrap();
+        s.free(y).unwrap();
+        s.release_trace(id).unwrap();
+        let applied = s.probe_last_plan().expect("the chain is planned");
+        resident = applied.plan.resident().count();
+        assert!(s.begin_trace_planned().unwrap());
+    } else {
+        s.begin_trace().unwrap();
+    }
     let y = chain(s, &x);
     let id = s.end_trace().unwrap();
     s.set_capture_reuse(false);
+    s.set_count_trace_bytes(false);
     let held = before - free_total(s);
+    let moved = s
+        .trace_ops(id)
+        .unwrap()
+        .iter()
+        .map(|o| o.bytes.read + o.bytes.write)
+        .sum();
     let mut same = Vec::new();
     for (i, &seed) in SEEDS.iter().enumerate() {
         let fresh = s.upload(&values(seed, 32 * N), 32, N).unwrap();
@@ -167,7 +218,60 @@ fn capture_chain(s: &mut S<'_>, on: bool) -> (u64, Vec<bool>) {
         "reuse {on}: every byte back after the release"
     );
     s.free(x).unwrap();
-    (held, same)
+    Captured {
+        held,
+        moved,
+        same,
+        resident,
+    }
+}
+
+#[test]
+fn a_planned_capture_over_reused_slots_replays_as_it_ran() {
+    open(|s| {
+        let reused = capture_chain_as(s, true, false);
+        let planned_whole = capture_chain_as(s, false, true);
+        let planned = capture_chain_as(s, true, true);
+        eprintln!(
+            "reuse unplanned: {} B held, {} B moved; planned without reuse: {} B held, {} B moved; \
+             planned with reuse: {} B held, {} B moved, {} tensors resident",
+            reused.held,
+            reused.moved,
+            planned_whole.held,
+            planned_whole.moved,
+            planned.held,
+            planned.moved,
+            planned.resident
+        );
+        for (c, what) in [
+            (&reused, "unplanned"),
+            (&planned_whole, "planned without reuse"),
+        ] {
+            assert!(c.same.iter().all(|&x| x), "{what}: {:?}", c.same);
+        }
+        assert!(
+            planned.same.iter().all(|&x| x),
+            "planned with reuse, replays against eager: {:?}",
+            planned.same
+        );
+        assert!(planned.resident > 0, "nothing resident");
+        assert!(
+            planned.moved < reused.moved,
+            "planned moves {} B, not fewer than the unplanned {}",
+            planned.moved,
+            reused.moved
+        );
+        assert_eq!(
+            planned.moved, planned_whole.moved,
+            "the same plan, with or without reuse"
+        );
+        assert!(
+            planned.held < planned_whole.held,
+            "planned with reuse holds {} B, not fewer than without, {}",
+            planned.held,
+            planned_whole.held
+        );
+    });
 }
 
 #[test]

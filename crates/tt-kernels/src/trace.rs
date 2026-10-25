@@ -190,6 +190,11 @@ pub struct OpRecord {
     /// steps, their kinds and entry counts. A planned capture's ops must have their plan pass's
     /// (`crate::residency::Applied`).
     pub shape: u64,
+    /// How many of the capture's tensors were allocated when it was queued
+    /// (`DramAlloc::logged`): the ones its lists can name. Where a capture reuses its tensors'
+    /// GDDR (`Session::set_capture_reuse`), an address is the latest of these that holds it
+    /// (`crate::residency::Index`).
+    pub allocs: usize,
 }
 
 /// What a stored stream is made of: how many entries it holds, how many of those
@@ -619,6 +624,7 @@ mod tests {
                     l1_top: 0,
                     l1_need: 0,
                     shape: 0,
+                    allocs: 0,
                 })
                 .collect(),
             failed: false,

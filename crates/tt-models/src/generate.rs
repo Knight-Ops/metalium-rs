@@ -782,7 +782,8 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         let cache = &caches[prefill];
         // A chunk's traces reuse their own intermediates' GDDR (`burn_tt::set_capture_reuse`,
         // `docs/plans/long-context.md` 1.G; `TT_CHUNK_REUSE=0` turns it off): a long chunk's scores
-        // are held a layer at a time, not every layer's. The steps keep their L1 residency plans.
+        // are held a layer at a time, not every layer's, and their L1 residency plans are made over
+        // the reused slots (G2), as the steps' are.
         // An engine without it (a mesh) captures as before, unless `TT_CHUNK_REUSE=1` asked for it.
         let reuse = std::env::var("TT_CHUNK_REUSE").ok();
         let was = match reuse.as_deref() {

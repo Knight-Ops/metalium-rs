@@ -931,24 +931,17 @@ fn never_read_writes_are_dropped_bit_for_bit() {
 
 mod ladder_support;
 
-/// Each planned step moves fewer GDDR bytes than its plain capture, by trace key. A chunk's
-/// capture on more than one unit reuses its own GDDR instead of being planned (`TracedGenerator`,
-/// `docs/plans/long-context.md` 1.G G3), moving what the plain one does; on one unit it is planned.
+/// Each planned trace moves fewer GDDR bytes than its plain capture, by trace key: a chunk's
+/// capture, which reuses its own GDDR on more than one unit (`TracedGenerator`,
+/// `docs/plans/long-context.md` 1.G), is planned over the reused slots (G2).
 fn planned_moves_less(plain: &[(String, u64)], planned: &[(String, u64)]) {
     for ((key, p), (k2, q)) in plain.iter().zip(planned) {
         assert_eq!(key, k2);
         eprintln!("{key}: GDDR {p} B plain, {q} B planned");
-        if key.starts_with("Chunk") {
-            assert!(
-                q <= p,
-                "{key}: the planned trace moves {q} B, the plain {p} B"
-            );
-        } else {
-            assert!(
-                q < p,
-                "{key}: the planned trace moves {q} B, the plain {p} B"
-            );
-        }
+        assert!(
+            q < p,
+            "{key}: the planned trace moves {q} B, the plain {p} B"
+        );
     }
 }
 

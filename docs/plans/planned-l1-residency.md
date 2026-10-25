@@ -196,6 +196,11 @@ DATA.base                                                        DATA.end
 - [x] **The graph off the streams** (`tt_kernels::residency::Graph::from_capture`). A capture logs the tensors it allocates
   (`DramAlloc::start_log`); every op's records and moves, sections included, are expanded as the movers expand them and
   each GDDR access is charged to the tensor and tile it touches. The rest is external (weights, the cache, inputs).
+  A capture that reuses its own tensors' GDDR (`Session::set_capture_reuse`, [long-context.md](long-context.md) 1.G)
+  has tensors that share an address at different times: the index (`residency::Index`) grows op by op
+  (`OpRecord::allocs`, the tensors allocated when the op was queued), each allocation over the dead extents it
+  overlaps, so an access is charged to the tensor its address held at that op; a tensor is the capture's own by its
+  allocation (`Placement::same_serial`), not its address (G2, 2026-10-24).
 - [x] **The plan** (`residency::Plan::make`): the period (the space report's, now shared: `residency::period`); tensors
   at the same place of two repeats (the same op of the layer, the same of its tensors) in one class with one address, so
   the residual stream is pinned across a layer's end and the head's `x` sits where every layer's does; first-fit

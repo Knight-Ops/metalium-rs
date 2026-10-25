@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Residency plans over reused GDDR](#residency-plans-over-reused-gddr-2026-10-24-card-0) | 2026-10-24 | G2: chunk captures reuse their GDDR and keep their L1 residency plans; prefill 1.2-2.1% faster at reuse's free GDDR, the first build 2.4-6.6x longer |
 | [Prefill products that reuse their operands](#prefill-products-that-reuse-their-operands-2026-10-24-card-0) | 2026-10-24 | 2-D blocked products, `K` streamed, partials in L1 (the default since; `TT_MATMUL_BLOCK=off` turns it off): the 1.7B's prefill products **2.9-3.6x** at `m` >= 512 (`gate\|up` 5.21 -> **18.23** TFLOPS at `m` = 2,048), compute-bound at ~0.4-0.6 us a K-tile pair; its prefill at 8,192 positions with chunks of 512 **1.24 / 6.81 / 18.33 -> 0.48 / 3.70 / 12.59 s** (1,000 / 4,000 / 7,992 tokens) |
 | [GDDR reused within a capture](#gddr-reused-within-a-capture-2026-10-24-card-0) | 2026-10-24 | 1.7B at 8,192 positions, chunk captures reusing their intermediates' GDDR (the default since; `TT_CHUNK_REUSE=0` turns it off): GDDR free after the build **2.10 -> 17.78 GB**, the build 226 -> 127 s, prefill unchanged; chunks of 512 now capture: prefill 1,000 / 7,992 tokens 1,236 / 18,323 -> **1,011 / 16,877 ms** |
 | [How much of the card's compute a long prefill uses](#how-much-of-the-cards-compute-a-long-prefill-uses-2026-10-24-card-0) | 2026-10-24 | 1.7B prefill at 8,192 positions: **1.1-1.7% of the ~166 TFLOPS derived peak** (1.87 TFLOPS over a 7,992-token prompt); a 64-token chunk's projections 3.73 TFLOPS with the Matrix Unit busy 4% of their span; products plateau at **5.2 TFLOPS** (`gate\|up`) and 2.8 (`down`) even at `m` = 2,048, GDDR-bound at ~400 GB/s: larger chunks do not raise the rate, operand reuse does |
@@ -359,6 +360,39 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Residency plans over reused GDDR (2026-10-24, card 0)
+
+[long-context.md](../plans/long-context.md) 1.G G2. A capture that reuses its own tensors' GDDR is planned for L1
+residency again: the planner charges each access to the tensor its address held at that op. Before, a chunk capture
+that reused was not planned. `traced_generation_stream_ceiling`, 1.7B, `TT_TILES=all`, `TT_GEN_MAX_LEN=8192`,
+`TT_GEN_PROMPTS=1000,7992`, `TT_GEN_NEW=4`, 2 warmups and 9 samples, release, after the blocked products (`5ae40a2`).
+"Unplanned" is `TT_RESIDENCY=0`, which also leaves the decode steps unplanned; its prefill is the chunks as they ran
+before G2.
+
+| Chunks of 64 | G2 (`1792873151`) | Reuse, unplanned (`1792873658`) | Planned, no reuse (`TT_CHUNK_REUSE=0`, `1792874014`) |
+|---|--:|--:|--:|
+| Prefill, 1,000 / 7,992 tokens | **841.4 / 15,244 ms** | 853.3 / 15,432 | 841.4 / 15,243 |
+| GDDR free after the build | **17.70 GB** | 17.68 | 2.00 |
+| Build, first / second | 224.3 / 68.4 s | 91.8 / 47.7 | 230.0 / 70.9 |
+| Decode step after 1,000 / 7,992 | 26.01 / 54.91 ms | 23.69 / 53.82 | 26.01 / 54.87 |
+
+| Chunks of 512 | G2 (`1792875893`) | Reuse, unplanned (`1792875430`) |
+|---|--:|--:|
+| Prefill, 1,000 / 7,992 tokens | **474.0 / 12,580 ms** | 484.3 / 12,629 |
+| GDDR free after the build | 15.07 GB | 15.10 |
+| Build, first / second | 893.3 / 133.3 s | 135.2 / 91.6 |
+
+- **The plan was the slowdown:** without it a chunk is 1.4% / 1.2% slower at 64 (p10-p90 under 0.1%), 2.1% / 0.4% at
+  512. G2 matches the planned capture without reuse to 0.1% while it frees 15.7 GB more.
+- **The first build pays:** a planned chunk trace is captured twice (a plan pass and the planned capture), and the host
+  expands every move of its graph three times (the plan, each op's check, the verify). At 512 the first build took
+  893 s, just under `cargo xtask bench`'s default 900 s limit (`1792874529` timed out at it); a second build applies
+  the cached plans.
+- **One planned capture is refused in every planned build,** with or without reuse ("op 34 is laid out unlike the plan
+  pass's"), and captured plainly; it predates G2.
+- **Decode is 1-2 ms faster with `TT_RESIDENCY=0`** at 8,192 positions (23.69 against 26.01 ms after 1,000 tokens).
+  G2 does not touch the steps; not yet looked into.
 
 ## Prefill products that reuse their operands (2026-10-24, card 0)
 

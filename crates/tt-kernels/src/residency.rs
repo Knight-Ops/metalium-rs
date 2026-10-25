@@ -9,8 +9,10 @@
 //!   plain move of every op on every unit is expanded as the movers would expand it, and each GDDR
 //!   access is charged to the tensor whose slots it touches. The tensors a capture can plan are the
 //!   ones allocated during it (its allocator kept them, `DramAlloc::start_log`); the rest -- weights,
-//!   the cache, the inputs -- are external. A capture defers its frees, so no two of its tensors
-//!   share an address, and one freed before it ended was made and used up inside it.
+//!   the cache, the inputs -- are external. One freed before it ended was made and used up inside
+//!   it. A capture that reuses its own tensors' GDDR (`Session::set_capture_reuse`) gives a freed
+//!   tensor's slots to a later one, so an access is charged to the tensor that held its address
+//!   when its op was queued ([`Index`], `crate::trace::OpRecord::allocs`).
 //! - **The period** is the one the space report finds: the ops' signatures repeat every layer
 //!   ([`period`]). A tensor read or written at the same place of two repeats (the same op of the
 //!   layer, the same of its tensors) gets the same address in both, so every repeat of a layer runs
@@ -314,7 +316,11 @@ struct Extent {
     slot_bytes: u64,
 }
 
-/// Which GDDR slots belong to which of a capture's tensors.
+/// Which GDDR slots belong to which of a capture's tensors: each address, the latest allocation
+/// that holds it. A capture that reuses its tensors' GDDR allocates a tensor over the slots of one
+/// it freed, whose last reader was already queued (`docs/plans/long-context.md` 1.G); grown op by
+/// op ([`Index::extend`] to [`crate::trace::OpRecord::allocs`]), it names the tensor an address
+/// held at each op.
 #[derive(Default)]
 pub(crate) struct Index {
     /// Per chip channel index, by start.
@@ -324,19 +330,31 @@ pub(crate) struct Index {
 }
 
 impl Index {
+    #[cfg(test)]
     pub(crate) fn new(allocs: &[Placement]) -> Self {
         let mut index = Index::default();
         index.extend(allocs);
         index
     }
 
-    /// Add the allocations of `allocs` past those it holds (`allocs` the same log, grown): what
-    /// [`Index::new`] of the whole log would hold, a later tensor's slots over an earlier one's.
+    /// Add the allocations of `allocs` past those it holds (`allocs` the same log, grown), each
+    /// over whatever it overlaps: those slots were free when it was allocated, so the tensors that
+    /// held them before are dead.
     pub(crate) fn extend(&mut self, allocs: &[Placement]) {
         for (tensor, p) in allocs.iter().enumerate().skip(self.len) {
             let n = p.extents().count();
             for (pos, (c, base, bytes)) in p.extents().enumerate() {
-                self.channels.entry(c).or_default().insert(
+                let extents = self.channels.entry(c).or_default();
+                let dead: Vec<u64> = extents
+                    .range(..base + bytes)
+                    .rev()
+                    .take_while(|(_, e)| e.end > base)
+                    .map(|(&start, _)| start)
+                    .collect();
+                for start in dead {
+                    extents.remove(&start);
+                }
+                extents.insert(
                     base,
                     Extent {
                         end: base + bytes,
@@ -415,13 +433,18 @@ impl Graph {
     /// The graph of capture `c`, ending: `allocs` are the tensors allocated during it, in order
     /// ([`crate::tensor::DramAlloc::take_log`]).
     pub(crate) fn from_capture(c: &Capture, allocs: &[Placement]) -> Graph {
-        let index = Index::new(allocs);
+        // Grown op by op: with reuse, a later tensor takes an earlier one's slots.
+        let mut index = Index::default();
         let mut tensors: Vec<Tensor> = allocs
             .iter()
             .map(|p| Tensor {
                 tiles: p.tiles(),
                 slot_bytes: p.slot_bytes(),
-                internal: c.freed.iter().any(|f| f.owned() && f.same_allocation(p)),
+                internal: c
+                    .freed
+                    .iter()
+                    .chain(&c.pooled)
+                    .any(|f| f.owned() && f.same_serial(p)),
                 uses: Vec::new(),
             })
             .collect();
@@ -429,6 +452,7 @@ impl Graph {
         let signatures = signatures(c);
         let mut ops = Vec::with_capacity(c.ops.len());
         for (k, rec) in c.ops.iter().enumerate() {
+            index.extend(&allocs[..rec.allocs.min(allocs.len())]);
             let mut uses: BTreeMap<usize, Use> = BTreeMap::new();
             let mut order: Vec<usize> = Vec::new();
             let mut external = [0u64; 2];
@@ -2485,5 +2509,38 @@ mod tests {
             uses: vec![u(vec![one(0, &[0]), one(1, &[1])]), u(vec![one(0, &[1])])],
         };
         assert_eq!(t.bytes_a_unit(), (2 * SLOT).div_ceil(ALIGN) * ALIGN);
+    }
+
+    /// A capture that reuses its GDDR (`DramAlloc::start_pool`): `a` freed into the pool beside
+    /// the tensor before it, `b` allocated over both from the lower base. Grown op by op, the index
+    /// names `a` at `a`'s address before `b` is allocated and `b` after; `a`'s extent, which
+    /// starts nearer the address, is dead once `b` overlaps it.
+    #[test]
+    fn an_address_is_the_tensor_that_held_it_at_the_op() {
+        let mut alloc = crate::tensor::DramAlloc::new(&tt_isa::dram::Dram::FULL);
+        alloc.start_log();
+        alloc.start_pool();
+        let n = alloc.channel_count();
+        let p = alloc.alloc(n).unwrap();
+        let a = alloc.alloc(n).unwrap();
+        assert!(alloc.give_to_pool(&p) && alloc.give_to_pool(&a));
+        let b = alloc.alloc(2 * n).unwrap();
+        let log = alloc.take_log();
+        let at = |q: &Placement| {
+            let (c, base, _) = q.extents().next().unwrap();
+            (u32::from(c), base as u32)
+        };
+        let (channel, offset) = at(&a);
+        assert!(at(&b).1 < offset, "b starts below a, over p's slots");
+        let mut index = Index::default();
+        index.extend(&log[..2]);
+        assert_eq!(index.find(channel, offset), Some((1, 0)), "a, before b");
+        index.extend(&log[..3]);
+        assert_eq!(
+            index.find(channel, offset),
+            Some((2, n as u32)),
+            "b's second slot, once b is allocated"
+        );
+        assert_eq!(index.find(at(&p).0, at(&p).1), Some((2, 0)));
     }
 }
