@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The long-context softmax: `SUB_EXP` and `DIV` push-bound, their row loops staged to replay](#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0) | 2026-10-25 | at 8,192 positions the softmax is 48% of a 64-token chunk's replay and its `SUB_EXP` and `DIV` push-bound (bodies past the replay buffer); split into replayed row loops, bit for bit: the 1.7B's prefill of 7,992 tokens **15.24 -> 12.28 s** (chunks of 64), **12.58 -> 10.00 s** (512); the softmax as one streamed op per tile row measured slower, opt-in (`TT_SOFTMAX_ROWS=1`); the `.ttinsn` trigger fired |
 | [Residency plans over reused GDDR](#residency-plans-over-reused-gddr-2026-10-24-card-0) | 2026-10-24 | G2: chunk captures reuse their GDDR and keep their L1 residency plans; prefill 1.2-2.1% faster at reuse's free GDDR, the first build 2.4-6.6x longer |
 | [Prefill products that reuse their operands](#prefill-products-that-reuse-their-operands-2026-10-24-card-0) | 2026-10-24 | 2-D blocked products, `K` streamed, partials in L1 (the default since; `TT_MATMUL_BLOCK=off` turns it off): the 1.7B's prefill products **2.9-3.6x** at `m` >= 512 (`gate\|up` 5.21 -> **18.23** TFLOPS at `m` = 2,048), compute-bound at ~0.4-0.6 us a K-tile pair; its prefill at 8,192 positions with chunks of 512 **1.24 / 6.81 / 18.33 -> 0.48 / 3.70 / 12.59 s** (1,000 / 4,000 / 7,992 tokens) |
 | [GDDR reused within a capture](#gddr-reused-within-a-capture-2026-10-24-card-0) | 2026-10-24 | 1.7B at 8,192 positions, chunk captures reusing their intermediates' GDDR (the default since; `TT_CHUNK_REUSE=0` turns it off): GDDR free after the build **2.10 -> 17.78 GB**, the build 226 -> 127 s, prefill unchanged; chunks of 512 now capture: prefill 1,000 / 7,992 tokens 1,236 / 18,323 -> **1,011 / 16,877 ms** |
@@ -360,6 +361,62 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The long-context softmax: `SUB_EXP` and `DIV` push-bound, their row loops staged to replay (2026-10-25, card 0)
+
+Roadmap Track 1, "Then the long-context softmax". All runs: SmolLM2-1.7B-Instruct, `traced_generation_stream_ceiling`,
+`TT_TILES=all`, `TT_GEN_MAX_LEN=8192`, `TT_GEN_PROMPTS=1000,7992`, `TT_GEN_NEW=4`, 2 warmups and 3 samples, release,
+after G2 (`ee1a078`).
+
+**Where a long prompt's chunk goes now** (profile mode, `1792900837`, `Chunk { c: 64, len: 8192 }`, 161.9 ms a replay
+under the profile's stamping): `attention/softmax` 78.2 ms (48%), `float_matmul` 30.9 (19%), `attention/pv` 20.5,
+`attention/scale` 11.4 (7%), `attention/qk` 10.8. A layer's scale, mask and softmax, unit 0's spans:
+
+| Op | us | Read / written | GB/s |
+|---|--:|--:|--:|
+| `SCALE_MASK_FILL` (block mask) | 475 | 136 / 67 MB | 428 |
+| `Max`, chunked (`reduce_chunked`, `per` 256 > 219) | 221 | 72 / 4 MB | 346 |
+| `CLAMP_MIN` | 10 | | |
+| `SUB_EXP` (column broadcast) | **1,338** | 136 / 67 MB | 152 |
+| `Sum`, chunked | 219 | 72 / 4 MB | 349 |
+| `CLAMP_MIN` | 10 | | |
+| `DIV` (column broadcast) | **1,447** | 136 / 67 MB | 141 |
+
+- **`SUB_EXP` and `DIV` were push-bound, not GDDR-bound.** They move the bytes `SCALE_MASK_FILL` moves in under a third
+  of the time. Their row bodies were 57 and 62 words, past the 32-entry replay buffer. So the role runner pushed every
+  word of every row group: 1,939 and 2,102 words a tile, ~10 us a tile (`SCALE_MASK_FILL`'s 157 words replay).
+  Together they were ~2.8 ms of a layer's 3.7 ms, ~42% of the replay: the `.ttinsn` trigger (push-bound SFPU above ~20%
+  of device time, the model device-bound) fired.
+- **The softmax as one op per tile row measured slower** (`tt_kernels::softmax`, `Session::softmax_rows`, gate `step230`,
+  bit for bit on ttsim and card 0, `1792901932`). A job streams its row through L1 in three passes (scale and mask with
+  the maximum, `SUB_EXP` with the sum, `SUB_EXP` again with `DIV`), the statistics kept in L1. That cuts traffic from
+  ~11 score passes to 5 but computes `SUB_EXP` twice. At `c` = 64 it also has 64 jobs for 120 units, on kernels that are
+  compute-bound. 7,992 tokens **15.24 -> 19.82 s** at chunks of 64 (`1792902315` -> `1792901944`), **12.58 -> 13.23 s**
+  at 512 (`1792903237` -> `1792902720`); 1,000 tokens 841 -> 909 and 474 -> 488 ms. Kept opt-in (`TT_SOFTMAX_ROWS=1`).
+- **The bodies staged to replay** (`sfpu::ops::staged`). `SUB_EXP` is three row loops: the subtraction and
+  `exp`'s reduction; the polynomial; the range checks. `DIV` is four: the large-divisor scaling, the reciprocal's steps,
+  its specials, the divide. Each stage is the same instructions in the same order on the same registers; what a later
+  stage reads goes through free `Dst` rows raw (`Int32`). So it is bit for bit the one loop (unit gate
+  `staged_programs_are_the_body_bit_for_bit` over the specials, a stage's row swapped watched failing). Every stage
+  replays, and row-limited programs (decode's rows) keep the one loop, unrolled anyway. Card 0 gates: `step200`,
+  `step206`, `step209`, `step230`, `step32` (`1792939846`); `step183`, `step185`, `step187`, `step188` against burn-flex
+  (`1792941361`); `step12_mnist` goldens on ttsim.
+
+| 1.7B prefill at 8,192 positions | Before (`1792902315`, `1792903237`) | Staged (`1792939867`, `1792940254`) |
+|---|--:|--:|
+| 1,000 tokens, chunks of 64 | 840.8 ms | **766.6** |
+| 7,992 tokens, chunks of 64 | 15,244 ms | **12,281** (-19.4%) |
+| 1,000 tokens, chunks of 512 | 473.9 ms | **415.4** (2,407 tokens/s) |
+| 7,992 tokens, chunks of 512 | 12,582 ms | **9,998** (799 tokens/s, -20.5%) |
+| Decode step after 1,000 / 7,992 tokens | 25.94 / 54.91 ms | 25.69 / 53.66 |
+
+- **Decode unchanged:** the defaults (512-position cache, 32 / 256-token prompts, 9 samples) give **16.80 / 18.23 ms**
+  (`1792946169`) against 16.76 / 18.17 (`1792711476`): a decode row's programs are row-limited, and keep the one loop.
+- Gates after the row-limited exception, card 0 (`1792943736`): `step200`, `step209`, `step230`, `step224` (traced equal
+  to eager at 32K), `step227`, and `step188::the_native_context_agrees_with_flex` (2,138 s; at 1,800 s it timed out in
+  burn-flex's 1,472 s reference, `1792941361`).
+- Burn's conformance on ttsim (`cargo xtask conformance --release`, `target/conformance/1792946421`): 2,973 of 3,025,
+  the 52 listed failures and no other.
 
 ## Residency plans over reused GDDR (2026-10-24, card 0)
 

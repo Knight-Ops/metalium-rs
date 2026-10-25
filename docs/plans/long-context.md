@@ -4,7 +4,9 @@ Status (2026-10-24): **Part 1's gates pass: the 1.7B at its native 8,192 positio
 7,992-token prompt), and synthetic GQA models generate at 32,768, traced equal to eager. D2 and D3 done: a 1.7B prefill
 of 1,000 / 7,992 tokens at 8,192 positions 4.69 / 36.63 -> 1.24 / 18.33 s, bit for bit. Open: larger chunks at long
 context (1.G, GDDR reuse in a capture), the BF16 cache, and contexts past 32K. Part 2 (split flash-decode) parked by
-decision (user, 2026-10-23).** Roadmap Track 1, "Long context".
+decision (user, 2026-10-23).** Since (2026-10-25): attention's `SUB_EXP` and `DIV` replay instead of being pushed word by word, and a
+prefill of 7,992 tokens takes 12.28 / 10.00 s at chunks of 64 / 512 (was 15.24 / 12.58; roadmap, "The long-context
+softmax"). Roadmap Track 1, "Long context".
 SmolLM2-1.7B's native context is 8,192.
 
 **Where it stopped:**

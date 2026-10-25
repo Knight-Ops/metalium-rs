@@ -570,10 +570,20 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         pair (P4). The 1.7B's prefill at 8,192 positions with chunks of 512: 1,000 / 4,000 / 7,992 tokens
         **1.24 / 6.81 / 18.33 -> 0.48 / 3.70 / 12.59 s** (`1792858000`). Next: the pair's cost (P4), then each operand out
         of GDDR once (Step 2).
-      - **Then the long-context softmax:** at 7,992 tokens a prefill is now mostly attention over the prefix, and the
-        softmax's six SFPU passes over the `[32 x 64, 8192]` scores were 42% of a 64-token chunk before (78.3 of 186.5 ms,
-        `1792815504`). Fusing them (one pass a row group, or a flash prefill attention) is the next lever for long
-        prompts ([kernel-fusion.md](kernel-fusion.md) Phase 4; the reduce/norm fuser of "attention as few jobs").
+      - [x] **The long-context softmax** (2026-10-25, card 0,
+        [log](../learnings/performance-log.md#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0)).
+        - **Measured first** (profile `1792900837`): at 8,192 positions the softmax is 48% of a 64-token chunk's
+          replay. Its `SUB_EXP` and `DIV` are push-bound, not GDDR-bound: their row bodies (57 and 62 words) overflow the
+          32-entry replay buffer, so ~2,000 words a tile were pushed, ~10 us a tile, ~42% of the replay.
+        - **Replayable `SUB_EXP` and `DIV`** (`sfpu::ops::staged`, unit gate
+          `staged_programs_are_the_body_bit_for_bit`): each body is split into row loops that replay, its registers
+          handed on through free `Dst` rows raw, bit for bit. The 1.7B's prefill of 7,992 tokens **15.24 -> 12.28 s** at
+          chunks of 64, **12.58 -> 10.00 s** at 512; 1,000 tokens 474 -> 415 ms (`1792939867`, `1792940254`).
+        - **The softmax as one op a tile row** (`Session::softmax_rows`, gate `step230`, bit for bit): its scores read
+          three times instead of ~11, but `SUB_EXP` computed twice, on 64 units at `c` = 64. **Slower** (15.24 -> 19.82 s,
+          12.58 -> 13.23 s), so it is opt-in (`TT_SOFTMAX_ROWS=1`).
+        - **Next for long prompts:** the other push-bound bodies (`.ttinsn` push, triggered, Track 2), then the data passes
+          (`SCALE_MASK_FILL` 475 us, the chunked `Max` and `Sum` ~220 us each a layer), each computed once over every unit.
       - **Before (2026-10-17):** a prefill-shaped product reached 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,
         `1792258604`). It is bound by GDDR because each unit gathers its own tiles: `B` is read `m / 32` times, `A`
         once per two-column block, up to once a unit. The largest product reads 3.2 GB for 77 MB.
@@ -612,7 +622,8 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   for bit (`1792808294`, `1792809505`). A capture's own intermediates now give their GDDR to its later ops (1.G,
   on by default for chunk captures, `TT_CHUNK_REUSE=0` turns it off): 2.10 -> 17.78 GB free after the 1.7B's build, and chunks of 512
   capture at 8,192 (7,992 tokens in 16.9 s). Since G2 those captures keep their L1 residency plans over the reused slots (1.2-2.1% faster prefill
-  at the same free GDDR; the first build longer, 893 s at chunks of 512). **A long prefill uses 1.1-1.7% of the card's compute**: the products
+  at the same free GDDR; the first build longer, 893 s at chunks of 512), and since `SUB_EXP` and `DIV` replay (2026-10-25) 7,992 tokens
+  take **12.28 / 10.00 s** at chunks of 64 / 512 (were 15.24 / 12.58). **A long prefill uses 1.1-1.7% of the card's compute**: the products
   plateau at ~5 TFLOPS, GDDR-bound, whatever the chunk size (Track 1, "Prefill products that reuse their operands").
   Left: the BF16 cache, past 32K. Flash-decode's oracle is parked on the Matrix Unit model not being bit for bit on full-mantissa
   operands. Found before: SmolLM2-1.7B's native context is 8,192; the cached Qwen3.6-35B-A3B and Qwen3.8-27B are 262,144.
@@ -663,7 +674,8 @@ Track 1 model. Evidence and bottlenecks:
 and so the order to work in.** Against burn-flex on the same machine: ResNet-18 105x slower (16.3 s), SmolLM2 decode
 25x (619 ms a step) and ViT-Tiny 7.8x (815 ms), with a token embedding alone 15.9 s. The first two have a single cause
 each, and the cheapest wins; ViT and decode are host submission, the fusers' territory. The `.ttinsn` trigger (SFPU
-push above ~20% of device time with the model device-bound) has not fired: no model is device-bound yet.
+push above ~20% of device time with the model device-bound) had not fired then; it fired on 2026-10-25 on
+the 1.7B's long prefill ("Fused `.ttinsn` push" below).
 
 - [x] **1. Gather without staging** (2026-10-13, F32, I32 and Bool; ttsim and card 0). `select` along dim 0 of a
   rank-2 table with 1-D I32 indices runs `Session::select_rows` (`tt-kernels/src/index.rs`): per batch one tile of 32
@@ -1006,9 +1018,19 @@ push above ~20% of device time with the model device-bound) has not fired: no mo
 - [ ] **Later:** L1-sharded tensor residency (G12) and FlashAttention
   ([future-fusion-features.md](../proposals/future-fusion-features.md)); on-card dispatch
   ([x280-on-card-dispatch.md](../proposals/x280-on-card-dispatch.md)).
-- **Fused `.ttinsn` push for SFPU kernels: parked, evidence-triggered.** Measured 2.7x on a push-bound
-  kernel; not worth scheduling until a real model shows SFPU-bound device time. Everything is in
-  [Parked: fused `.ttinsn` push](#parked-fused-ttinsn-push-for-sfpu-kernels).
+- [ ] **Fused `.ttinsn` push for SFPU kernels: triggered 2026-10-25, raised to a higher priority (user).**
+  Measured 2.7x on a push-bound kernel (2026-10-10). The trigger below fired on the 1.7B's long prefill
+  (profile `1792900837`, card 0, a `Chunk { c: 64, len: 8192 }` replay of 161.9 ms):
+  - attention's softmax is 78.2 ms (48%) and its scale and mask 11.4 ms (7%);
+  - of a layer's 3.7 ms, `SUB_EXP` takes 1,338 us and `DIV` 1,447 us at ~10 us a tile, against 475 us for
+    the scale and mask, which moves the same bytes;
+  - their row bodies (57 and 62 words) do not fit the 32-entry replay buffer, so the runner pushed ~2,000
+    words a tile: push-bound SFPU kernels at ~42% of the replay's device time, the model device-bound.
+
+  A cheaper lever came first: the same bodies split into row loops that replay ("Replayable `SUB_EXP` and
+  `DIV`", Track 1). `.ttinsn` is next for what that leaves push-bound (the precise transcendentals, `gelu`
+  and the rest of `per_kind_push_table`). Record and work list:
+  [Fused `.ttinsn` push](#fused-ttinsn-push-for-sfpu-kernels-triggered-2026-10-25).
 
 ## Track 3: multi-chip (after the single-chip path is fast)
 
@@ -1074,6 +1096,10 @@ Training and inference both have to run across cards, so data parallelism, pipel
 - [ ] **Pipelining** (layers on different cards) over card-to-card `to_device`; micro-batching later.
 - [ ] **Tensor parallelism / a mesh device** (one op across cards): an eventual goal, not scheduled. Today's
   `Topology::Cards` (a matmul split along `N`, bit-identical to one card) is the proof of concept.
+  [sram-residency-and-multi-card-decode.md](../proposals/sram-residency-and-multi-card-decode.md) (2026-10-25, from
+  Cerebras' weight-resident pipeline): `N`-split products joined by all-gather keep a step bit for bit and halve each
+  card's weight stream (1.7B F32 ~16.8 -> ~10-12 ms est.). If the first step, an Ethernet hop's latency, comes in
+  under ~20 us, it is a candidate batch-1 lever that would reopen this decision. The decision stands until then.
 
 ### Existing items
 
@@ -1087,10 +1113,13 @@ Training and inference both have to run across cards, so data parallelism, pipel
 - [ ] Packed BF16 over the mesh (operands are widened to F32 today).
 - [ ] Validate on a physical p300 (all silicon work used two cabled p150a cards).
 
-## Parked: fused `.ttinsn` push for SFPU kernels
+## Fused `.ttinsn` push for SFPU kernels (triggered 2026-10-25)
 
-**Status:** experiment complete 2026-10-10 (card 0); follow-on **parked by owner decision**, to be
-revisited only when the trigger below fires. Plan and full record:
+**Status:** experiment complete 2026-10-10 (card 0); the follow-on was **parked by owner decision** until
+the trigger below fired. **It fired on 2026-10-25** (the 1.7B's prefill at 8,192 positions, profile
+`1792900837`: `SUB_EXP` and `DIV` push-bound at ~42% of a chunk replay's device time; Track 2's entry
+has the numbers), and the user raised it to a higher priority. The reasons it was parked (below) are kept
+as the record. Plan and full record:
 [ttinsn-push-experiment.md](ttinsn-push-experiment.md). Numbers and run IDs:
 [performance-log.md](../learnings/performance-log.md#ttinsn-push-fusion-precise-gelu-2026-10-10-card-0).
 
@@ -1157,7 +1186,7 @@ nothing.
 5. tt-metal solves this with a compiler we do not have; our stand-ins (baked images, run-time translator) are
    work to maintain.
 
-### Trigger: revisit when
+### Trigger: revisit when (fired 2026-10-25)
 
 A profile of a real Track 1 model (the ViT or LLM rungs) shows push-bound SFPU kernels above **~20% of
 device time** on the card, with the model device-bound (host overhead already handled by traces).
@@ -1166,7 +1195,7 @@ How to measure: traced runs record `START`/`PUSHED`/`RETIRED` per role through t
 `PUSHED -> RETIRED` tail is ~50 cycles is push-bound. `per_kind_push_table` (in
 `step121_wait_planner.rs`) lists which kinds can be.
 
-### If unparked: design and work list
+### Design and work list (now that it is unparked)
 
 Prefer, in this order (each step is cheaper than the next and may be enough):
 

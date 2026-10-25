@@ -6,8 +6,9 @@ paths (`step229`, ttsim and card 0; the model gates and the smoke set on card 0 
 takes **0.48 / 3.70 / 12.59 s** for 1,000 / 4,000 / 7,992 tokens (1.24 / 6.81 / 18.33 before)
 ([log](../learnings/performance-log.md#prefill-products-that-reuse-their-operands-2026-10-24-card-0)). The products
 are now bound by the kernel's compute, ~0.4-0.6 us a K-tile pair. Open: P4 (the pair) and P5 (Step 2). For long
-prompts the next lever is outside this plan: at 7,992 tokens a prefill is mostly attention over the prefix, whose
-softmax passes over the scores are to be fused (roadmap, "Then the long-context softmax"). Roadmap Track 1, "The roofline", "Prefill products that reuse their operands".
+prompts the next lever was outside this plan: at 7,992 tokens a prefill is mostly attention over the prefix. Its
+softmax's `SUB_EXP` and `DIV` turned out push-bound and now replay (2026-10-25: 12.58 -> 10.00 s at chunks of 512;
+roadmap, "The long-context softmax"). Roadmap Track 1, "The roofline", "Prefill products that reuse their operands".
 
 ## Why
 

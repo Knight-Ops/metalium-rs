@@ -1,8 +1,11 @@
 # Experiment: does `.ttinsn` push fusion speed up SFPU kernels?
 
 **Status:** complete 2026-10-10 on card 0. **Result: go.** A fused push is 2.78x faster on the
-push phase and 2.77x on a whole three-role `gelu` kernel; see [Results](#results). The follow-on (a shipped mechanism) is **parked** by owner decision until a real model shows push-bound
-SFPU device time; see the roadmap's "Parked" section for the reasoning, trigger and work list.
+push phase and 2.77x on a whole three-role `gelu` kernel; see [Results](#results). The follow-on (a shipped mechanism) was **parked** by owner decision until a real model showed push-bound
+SFPU device time. **That trigger fired on 2026-10-25** (SmolLM2-1.7B's prefill at 8,192 positions:
+`SUB_EXP` and `DIV` push-bound at ~42% of a chunk replay, profile `1792900837`), and the user raised the
+follow-on to a higher priority; see the roadmap's "Fused `.ttinsn` push" section for the evidence and the
+work list.
 **Decisions:** recorded at the bottom.
 **Reopens:** the P9 `[-]` for `.ttinsn` fusion
 ([close-out line 157](../completed-plans/hardware-coverage-closeout.md)). P9's own rule was

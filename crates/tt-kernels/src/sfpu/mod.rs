@@ -185,6 +185,11 @@ pub fn with_rows<R>(rows: u32, f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// The row limit programs built now take ([`with_rows`]): 32 outside it.
+pub(crate) fn row_limit() -> u32 {
+    ROWS.with(|r| r.get())
+}
+
 impl Default for Program {
     fn default() -> Self {
         Self::new()
@@ -668,6 +673,12 @@ impl Program {
     /// zero keeps its sign; a denormal result flushes, as documented). `max` is
     /// the scaling's register meanwhile, and holds `f32::MAX` again after.
     pub fn recip(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
+        self.recip_steps(x, d, t0, t1, max);
+        self.recip_specials(x, d, t0, t1, max);
+    }
+
+    /// [`Program::recip`]'s first stage: the seed and its two steps, scaled where `|x| > 2^100`.
+    pub(crate) fn recip_steps(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
         assert!(d != x && t0 != x && t1 != x && d != t0 && d != t1 && t0 != t1);
         assert!(max != x && max != d && max != t0 && max != t1);
         self.abs(x, t1);
@@ -693,6 +704,11 @@ impl Program {
                 }
             },
         );
+    }
+
+    /// [`Program::recip`]'s second stage: `1/±0`, a denormal and `1/±inf`, from `x` and the
+    /// steps' `d`; `max` holds `f32::MAX`.
+    pub(crate) fn recip_specials(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
         // `1/±0`, and a denormal, which the arithmetic flushes to a zero: the
         // seed's infinity met `0 * inf` in the steps. The magnitude by mask,
         // not `SFPABS`, which leaves a negative NaN negative -- it then passed

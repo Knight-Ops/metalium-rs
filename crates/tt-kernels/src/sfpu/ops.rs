@@ -399,20 +399,42 @@ pub fn accuracy(kind: u32) -> Accuracy {
 /// Outside `[-87.34, 88.72]` the result is `+0`
 /// (it would be denormal, which flushes) or `+inf`; a NaN stays one.
 pub fn exp_program(p: &mut Program, x: LReg, d: LReg) {
+    let [k, magic, t, nf, r, c] = exp_registers(x, d);
+    exp_reduce(p, x, [k, magic, t, nf, r]);
+    exp_poly(p, d, [magic, t, r, c]);
+    exp_range(p, x, d, [k, t]);
+}
+
+/// The scratch registers [`exp_program`] takes for `x` and `d`, in its order: `k`, `magic`, `t`,
+/// `nf`, `r`, `c`.
+fn exp_registers(x: LReg, d: LReg) -> [LReg; 6] {
     use LReg as R;
     let regs: Vec<LReg> = [R::L0, R::L1, R::L2, R::L3, R::L4, R::L5, R::L6, R::L7]
         .into_iter()
         .filter(|r| *r != x && *r != d)
         .collect();
-    let (k, magic, t, nf, r, c) = (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
+    [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]]
+}
+
+/// The magic number [`exp_program`] rounds `x log2 e` with: `1.5 * 2^23`.
+const EXP_MAGIC: u32 = 0x4b40_0000;
+
+/// [`exp_program`]'s first stage: `t = x log2 e + magic` and `r = x - n ln 2`; `magic` holds
+/// [`EXP_MAGIC`] after it.
+fn exp_reduce(p: &mut Program, x: LReg, [k, magic, t, nf, r]: [LReg; 5]) {
     p.loadi(k, std::f32::consts::LOG2_E);
-    p.loadi_bits(magic, 0x4b40_0000);
+    p.loadi_bits(magic, EXP_MAGIC);
     p.mad(x, k, magic, t);
     p.sub(t, magic, nf);
     p.loadi_bits(k, 0x3f31_8000); // ln2_hi = 0.693359375
     p.nmad(nf, k, x, r);
     p.loadi_bits(k, 0xb95e_8083); // ln2_lo = -2.12194440e-4
     p.nmad(nf, k, r, r);
+}
+
+/// [`exp_program`]'s second stage: `d = e^r 2^n` from `r` and `t`, `magic` holding
+/// [`EXP_MAGIC`].
+fn exp_poly(p: &mut Program, d: LReg, [magic, t, r, c]: [LReg; 4]) {
     // e^r = 1 + r(1 + r(1/2 + r(1/6 + r(1/24 + r(1/120 + r(1/720 + r/5040))))))
     p.loadi(d, 1.0 / 5040.0);
     for coeff in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5] {
@@ -425,6 +447,10 @@ pub fn exp_program(p: &mut Program, x: LReg, d: LReg) {
     p.isub_from(t, magic);
     p.shl(magic, 23, magic);
     p.iadd(magic, d);
+}
+
+/// [`exp_program`]'s last stage: `d` where `x` is out of range or a NaN.
+fn exp_range(p: &mut Program, x: LReg, d: LReg, [k, t]: [LReg; 2]) {
     // The range: below `ln 2^-126` a zero, above `ln f32::MAX` infinity
     // (which a positive NaN also passes), and a NaN restored.
     p.loadi_bits(k, 0xc2ae_ac50); // -87.336544
@@ -2638,6 +2664,96 @@ pub(crate) fn chain_link(
     binary_body(p, kind, a_at, b_at, out_at);
 }
 
+/// The `Dst` rows a [`staged`] program hands its registers on through, a row group's at each
+/// offset: free in a binary kernel, whose operands are at `A_ROW` and `B_ROW` and its result at
+/// `OUT_ROW` (`super::kernel`).
+const STAGE_ROWS: [u32; 3] = [
+    super::kernel::C_ROW,
+    super::kernel::SPILL_ROW,
+    super::kernel::SPILL_ROW + 64,
+];
+
+/// `kind`'s whole-tile program as row loops short enough to replay, where its body is not
+/// (`SUB_EXP`'s is 57 words, `DIV`'s 62, past the 32-entry replay buffer, so the role runner
+/// pushed every word of every row group: ~2,000 words and ~10 us a tile on silicon). Each stage
+/// is a row loop over the whole tile running a part of [`binary_body`]'s instructions, in their
+/// order, on the registers it uses; what a later stage reads it stores raw (`Format::Int32`) at
+/// [`STAGE_ROWS`] and loads raw, so every register holds the bits it held in one loop and the
+/// result is [`binary_body`]'s bit for bit (`staged_programs_are_the_body_bit_for_bit`). A
+/// constant a stage needs that an earlier one loaded is loaded again, the same value. `None` for
+/// a kind with no staged form, and under a row limit ([`super::with_rows`]), where every row loop is
+/// unrolled anyway and stages would only add their loads and stores.
+fn staged(kind: u32) -> Option<crate::code::Code> {
+    if super::row_limit() < 32 {
+        return None;
+    }
+    let (rx, ry, rz) = (STAGE_ROWS[0], STAGE_ROWS[1], STAGE_ROWS[2]);
+    let (i32_, f32_) = (Format::Int32, Format::Fp32);
+    use LReg as R;
+    let mut p = Program::new();
+    match kind {
+        // `SUB`, then `exp_program(L2 -> L7)`: `k, magic, t, nf, r, c` are `L0, L1, L3, L4, L5, L6`.
+        kind_sfpu::SUB_EXP => {
+            let [k, magic, t, nf, r, c] = exp_registers(R::L2, R::L7);
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L0, f32_, A_ROW + o);
+                p.load(R::L1, f32_, B_ROW + o);
+                p.sub(R::L0, R::L1, R::L2);
+                exp_reduce(p, R::L2, [k, magic, t, nf, r]);
+                p.store(R::L2, i32_, rx + o);
+                p.store(t, i32_, ry + o);
+                p.store(r, i32_, rz + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(t, i32_, ry + o);
+                p.load(r, i32_, rz + o);
+                p.loadi_bits(magic, EXP_MAGIC);
+                exp_poly(p, R::L7, [magic, t, r, c]);
+                p.store(R::L7, i32_, rz + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L2, i32_, rx + o);
+                p.load(R::L7, i32_, rz + o);
+                exp_range(p, R::L2, R::L7, [k, t]);
+                p.store(R::L7, f32_, OUT_ROW + o);
+            });
+        }
+        // `scale_large_divisor`, `recip`'s steps, its specials, then `divide`, as
+        // [`binary_body`]'s registers: `a, b, y, t, c, q` in `L0..L5`, `f32::MAX` in `L6` and
+        // `+inf` in `L7` throughout ([`binary_constants`]).
+        kind_sfpu::DIV => {
+            binary_constants(&mut p, kind, [0.0; 2]);
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L0, f32_, A_ROW + o);
+                p.load(R::L1, f32_, B_ROW + o);
+                scale_large_divisor(p, R::L0, R::L1, R::L3, R::L4);
+                p.store(R::L0, i32_, rx + o);
+                p.store(R::L1, i32_, ry + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L1, i32_, ry + o);
+                p.recip_steps(R::L1, R::L2, R::L3, R::L4, R::L6);
+                p.store(R::L2, i32_, rz + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L1, i32_, ry + o);
+                p.load(R::L2, i32_, rz + o);
+                p.recip_specials(R::L1, R::L2, R::L3, R::L4, R::L6);
+                p.store(R::L2, i32_, rz + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L0, i32_, rx + o);
+                p.load(R::L1, i32_, ry + o);
+                p.load(R::L2, i32_, rz + o);
+                divide(p, R::L0, R::L1, R::L2, R::L5, R::L3, R::L4, R::L7);
+                p.store(R::L5, f32_, OUT_ROW + o);
+            });
+        }
+        _ => return None,
+    }
+    Some(p.finish_code())
+}
+
 /// The constants [`binary_body`] needs for `kind`, loaded once.
 fn binary_constants(p: &mut Program, kind: u32, scalars: [f32; 2]) {
     if kind == kind_sfpu::ADD_RELU {
@@ -3157,6 +3273,9 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             },
             p.finish_code(),
         ));
+    }
+    if let Some(code) = staged(kind) {
+        return Some((Operands::Binary, code));
     }
     let scalar = scalars[0];
     let mut p = Program::new();
@@ -5998,6 +6117,74 @@ mod sub_exp_tests {
                     reference_for(kind_sfpu::EXP, 0.0, Broadcast::None, &d, None, rows, cols);
                 let got = reference_for(kind_sfpu::SUB_EXP, 0.0, bcast, &x, Some(&y), rows, cols);
                 assert_eq!(bits(&got), bits(&want), "[{rows}, {cols}] {bcast:?}");
+            }
+        }
+    }
+
+    /// `SUB_EXP` and `DIV` as staged row loops ([`staged`]) are [`binary_body`] in one loop, bit
+    /// for bit, over the specials both meet (zeros, denormals, infinities, NaNs of both signs,
+    /// `f32::MAX`, divisors past `2^100`, exponents past the range), plain and with a column
+    /// broadcast; and every stage replays (no row loop is pushed word by word).
+    #[test]
+    fn staged_programs_are_the_body_bit_for_bit() {
+        use super::super::interp::Vector;
+        let specials = [
+            0.0f32,
+            -0.0,
+            1.0e-40,
+            -3.0e-39,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            -f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0xffc0_1234),
+            f32::from_bits(0x42b1_7218), // `exp_range`'s bounds
+            f32::from_bits(0xc2ae_ac50),
+            300.0,
+            -300.0,
+            2.0e30,
+            -7.0e31,
+            1.5,
+        ];
+        for kind in [kind_sfpu::SUB_EXP, kind_sfpu::DIV] {
+            let (_, staged) = code2(kind, [0.0; 2]).unwrap();
+            assert!(
+                staged.loops.is_empty(),
+                "{kind:#x}: a stage did not fit the replay buffer: {:?}",
+                staged.loops
+            );
+            let staged = staged.expand();
+            let mut one = Program::new();
+            binary_constants(&mut one, kind, [0.0; 2]);
+            one.for_each_row_group(64, |p, o| {
+                binary_body(p, kind, A_ROW + o, B_ROW + o, OUT_ROW + o)
+            });
+            let one = one.finish();
+            for seed in 0..24u32 {
+                let tile = |salt: u32| -> Vec<u32> {
+                    let v = values(seed * 31 + salt, 1024);
+                    (0..1024)
+                        .map(|i| {
+                            if (i as u32 + seed + salt) % 5 == 0 {
+                                specials[(i * 7 + (seed + salt) as usize) % specials.len()]
+                                    .to_bits()
+                            } else {
+                                (v[i] * [1.0, 40.0, 1.0e-20, 1.0e25][(i / 7) % 4]).to_bits()
+                            }
+                        })
+                        .collect()
+                };
+                let (a, b) = (tile(1), tile(2));
+                let run = |program: &[tt_isa::isa::Instruction]| {
+                    let mut v = Vector::new();
+                    v.put_tile(A_ROW as usize, &a);
+                    v.put_tile(B_ROW as usize, &b);
+                    v.run(program).unwrap();
+                    v.tile(OUT_ROW as usize)
+                };
+                assert_eq!(run(&staged), run(&one), "{kind:#x}, seed {seed}");
             }
         }
     }
