@@ -387,6 +387,16 @@ pub trait Engine {
     fn rms(&mut self, _a: BufferId, _eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// `softmax(scale x, masked)` over each row of `x`, `mask` read for rows `r % mask_rows`,
+    /// left on the device (`tt_kernels::session::Session::softmax_rows`).
+    fn softmax_rows(
+        &mut self,
+        _x: BufferId,
+        _mask: BufferId,
+        _scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// `a / sqrt(mean(a a) + eps)` over each row, left on the device
     /// (`tt_kernels::session::Session::rms_norm`).
     fn rms_norm(&mut self, _a: BufferId, _eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
@@ -1783,6 +1793,18 @@ impl DramBuffers {
         Ok(self.insert(c))
     }
 
+    pub fn softmax_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        x: BufferId,
+        mask: BufferId,
+        scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (tx, tm) = (self.get(x)?.clone(), self.get(mask)?.clone());
+        let c = s.softmax_rows(&tx, &tm, scale).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
     pub fn rms_norm<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -3131,6 +3153,23 @@ pub(crate) fn argmax_row(device: TtDevice, a: BufferId) -> (BufferId, [usize; 2]
     )
 }
 
+/// `softmax(scale x, masked)` over each row of `x` on the device, without waiting
+/// (`Session::softmax_rows`).
+pub(crate) fn softmax_rows(
+    device: TtDevice,
+    x: BufferId,
+    mask: BufferId,
+    scale: f32,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "softmax_rows",
+        device,
+        dims_of(x),
+        move || format!("scale {scale:e}"),
+        move |engine, ids| engine.softmax_rows(ids.get(x)?, ids.get(mask)?, scale),
+    )
+}
+
 /// `a / sqrt(mean(a a) + eps)` over each row on the device, without waiting.
 pub(crate) fn rms_norm(device: TtDevice, a: BufferId, eps: f32) -> (BufferId, [usize; 2]) {
     submit(
@@ -3743,6 +3782,15 @@ impl Engine for KmdEngine {
     fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.rms(&mut self.session, a, eps)
+    }
+    fn softmax_rows(
+        &mut self,
+        x: BufferId,
+        mask: BufferId,
+        scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.softmax_rows(&mut self.session, x, mask, scale)
     }
     fn rms_norm(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
@@ -4739,6 +4787,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.rms(self.fabric.chips[0].session(), a, eps)
+    }
+    fn softmax_rows(
+        &mut self,
+        x: BufferId,
+        mask: BufferId,
+        scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.softmax_rows(self.fabric.chips[0].session(), x, mask, scale)
     }
     fn rms_norm(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;

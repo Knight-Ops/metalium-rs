@@ -58,7 +58,7 @@ pub use matmul_mode::{accurate_matmul, exact_matmul, with_matmul_mode, MatmulMod
 pub use ops::rope::{rope, rope_count};
 pub use ops::{
     set_accurate_matmul_slicing, set_argmax_row, set_attention_rows,
-    set_exact_matmul_chunk_products,
+    set_exact_matmul_chunk_products, set_softmax_rows,
 };
 pub use random::Draw;
 pub use report::{

@@ -3839,6 +3839,23 @@ static ATTENTION_ROWS: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 pub fn set_attention_rows(on: bool) {
     ATTENTION_ROWS.store(on, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// Whether attention's scale, mask and softmax run as one op over each row of the scores
+/// (`module::softmax_rows`, `Session::softmax_rows`); off unless asked for (`TT_SOFTMAX_ROWS=1`):
+/// a job a tile row takes `SUB_EXP` twice and fewer units than the composition, which is
+/// compute-bound there, so it measured slower (1.7B prefill at 8,192 positions, card 0).
+static SOFTMAX_ROWS: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| {
+        std::sync::atomic::AtomicBool::new(std::env::var("TT_SOFTMAX_ROWS").is_ok_and(|v| v == "1"))
+    });
+
+/// Turn off (or back on) attention's softmax as one op, process-wide: off, the scale and mask,
+/// the maximum, `SUB_EXP`, the sum and `DIV` run as their own ops. For gates' and benches'
+/// comparisons. Dev-facing.
+#[doc(hidden)]
+pub fn set_softmax_rows(on: bool) {
+    SOFTMAX_ROWS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
 pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
 mod interpolate;
@@ -3937,6 +3954,22 @@ pub mod module {
         // first are one pass.
         let mut causal = options.is_causal.then(|| causal_mask(device, &qs, &ks));
         let mask = mask.or_else(|| causal.take());
+        // One mask and nothing between the scale and the softmax: the scale, the mask and the
+        // softmax as one op over each row, where it takes the shapes.
+        if let (Some(m), None, None, None) = (&mask, options.softcap, &causal, &attn_bias) {
+            let probabilities = {
+                let _part = part("attention/softmax");
+                softmax_rows(&scores, m, scale)
+            };
+            if let Some(probabilities) = probabilities {
+                let out = {
+                    let _part = part("attention/pv");
+                    float::float_matmul(probabilities, value)
+                };
+                let _part = part("attention/narrow");
+                return cast_native(out, dtype);
+            }
+        }
         let (mut scores, mask) = match (mask, options.softcap) {
             (Some(mask), None) => {
                 let _part = part("attention/scale");
@@ -4135,6 +4168,52 @@ pub mod module {
             Shape::new([qs[0], qs[1], m, dv]),
             DType::F32,
             device,
+        ))
+    }
+
+    /// `softmax(scale scores, masked)` over the last dimension as one op
+    /// (`Session::softmax_rows`): bit for bit the scale and mask (`SCALE_MASK_FILL`), the clamped
+    /// maximum, `SUB_EXP`, the clamped sum and `DIV` the composition runs, with the scores read
+    /// three times instead of eleven and no row too long. `mask` is the scores' shape or a block of
+    /// whole tile rows repeated down them ([`block_of`]). `None` where it does not apply: F32
+    /// scores and a `Bool` mask, whole tiles, SFPU element-wise ops (not the matrix mode).
+    fn softmax_rows(scores: &TtTensor, mask: &TtTensor, scale: f64) -> Option<TtTensor> {
+        let device = scores.device;
+        if !SOFTMAX_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+            || !scores.is_storable()
+            || !mask.is_storable()
+            || scores.elem() != Some(Elem::F32)
+            || mask.elem() != Some(Elem::Bool)
+            || mask.device != device
+            || !crate::server::supports_dram(device)
+            || matches!(
+                crate::server::elementwise_mode(device),
+                crate::ElementwiseMode::Matrix { .. }
+            )
+        {
+            return None;
+        }
+        let (ss, ms) = (scores.shape().to_vec(), mask.shape().to_vec());
+        let ([xr, xc], [yr, yc]) = (
+            crate::tensor::stored_dims(&ss)?,
+            crate::tensor::stored_dims(&ms)?,
+        );
+        if !(ms == ss || block_of(&ss, &ms))
+            || xc != yc
+            || [xr, xc, yr].iter().any(|d| d % 32 != 0 || *d == 0)
+            || xr % yr != 0
+        {
+            return None;
+        }
+        let (dx, dm) = (plain_dram(scores), plain_dram(mask));
+        let (id, dims) =
+            crate::server::softmax_rows(device, dx.buffer.id, dm.buffer.id, scale as f32);
+        Some(device_result_shaped(
+            device,
+            id,
+            dims,
+            scores.shape(),
+            DType::F32,
         ))
     }
 

@@ -39,6 +39,7 @@ pub mod reduce;
 pub mod round;
 pub mod scan;
 pub mod select;
+pub mod softmax;
 pub mod sort;
 
 use tt_isa::frontend;

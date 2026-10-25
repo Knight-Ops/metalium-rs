@@ -97,7 +97,7 @@ impl ReduceOp {
         }
     }
 
-    fn format(self) -> Format {
+    pub(crate) fn format(self) -> Format {
         match self {
             Self::Max
             | Self::All
@@ -122,7 +122,7 @@ pub enum Axis {
 }
 
 /// `into = op(other, into)`, lanewise.
-fn combine(p: &mut Program, op: ReduceOp, other: LReg, into: LReg) {
+pub(crate) fn combine(p: &mut Program, op: ReduceOp, other: LReg, into: LReg) {
     match op {
         ReduceOp::Sum => p.add(other, into, into),
         ReduceOp::Max => p.if_(Cond::Less(into, other), |p| p.mov(other, into)),

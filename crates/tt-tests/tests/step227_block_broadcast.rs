@@ -149,6 +149,9 @@ fn a_grouped_query_mask_is_read_as_a_block_with_the_same_bits() {
                     options,
                 ))
             };
+            // The composition (its scale and mask one op), then the scale, mask and softmax as
+            // one op (`Session::softmax_rows`): each reads the mask as a block, and they agree.
+            burn_tt::set_softmax_rows(false);
             let (got, report) = burn_tt::with_report(|| run(tt_mask(m.clone(), block, &d)));
             assert!(
                 report.op("attention/scale").is_some_and(|s| s.jobs > 0),
@@ -160,6 +163,22 @@ fn a_grouped_query_mask_is_read_as_a_block_with_the_same_bits() {
             );
             let want = run(tt_mask(m.clone(), block, &d).expand(full));
             assert_eq!(got, want, "{what}: attention against the expanded mask");
+            burn_tt::set_softmax_rows(true);
+            let (fused, report) = burn_tt::with_report(|| run(tt_mask(m.clone(), block, &d)));
+            // Whole tiles, the scale, mask and softmax are one op; ragged, the composition.
+            assert_eq!(
+                report.op("attention/scale").is_none(),
+                c % 32 == 0,
+                "{what}: the softmax as one op where the scores are whole tiles"
+            );
+            assert!(
+                report.op("broadcast/expand").is_none(),
+                "{what}: attention gathered its mask"
+            );
+            assert_eq!(
+                fused, want,
+                "{what}: the softmax as one op against the composition"
+            );
         }
     });
 }

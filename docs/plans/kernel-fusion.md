@@ -254,6 +254,13 @@ flowchart TD
   - **Limit:** rows of up to 128 tiles (4096 columns); longer rows run the separate ops.
   - **Row-limited** (2026-10-16): a tile row of fewer than 32 rows runs only the row groups they occupy
     (`sfpu::reduce::row_offsets`); a decode row's kernel 14.95 -> 5.58 us (`step196`, decode-small-ops.md S3).
-- [ ] LayerNorm and softmax as reduce-maps.
-- [ ] Add L1 circular-buffer streaming path for rows too long for one job.
+- [ ] LayerNorm and softmax as reduce-maps. **Softmax, built and opt-in** (2026-10-25, `tt_kernels::softmax`,
+  `Session::softmax_rows`, gate `step230`; `TT_SOFTMAX_ROWS=1`): attention's scale, mask and softmax over each row, a tile
+  row a job, three passes streamed through L1, the statistics kept there, bit for bit the composition. **Slower than
+  the composition** on the 1.7B's long prefill. `SUB_EXP` and `DIV` are compute-bound there (push-bound, ~10 us a tile,
+  since staged to replay), and the op computes `SUB_EXP` twice on as many units as tile rows (64 at a 64-token chunk).
+  A reduce-map that pays must compute each element once over every unit
+  ([log](../learnings/performance-log.md#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0)).
+- [x] Add L1 circular-buffer streaming path for rows too long for one job (2026-10-25: the softmax op's passes, a
+  chunk a kernel in alternating halves, the unfolded accumulator carried in L1).
 - [ ] Benchmark fused transformer encoder layer in `step59_burn_transformer`.

@@ -43,6 +43,7 @@ pub mod runtime;
 pub mod session;
 pub mod sfpu;
 pub mod shard;
+pub mod softmax;
 pub mod source_banks;
 pub(crate) mod subtrace;
 pub mod tensor;

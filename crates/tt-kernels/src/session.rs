@@ -7344,6 +7344,22 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// `softmax(scale x, masked)` over each row of `x`, `mask` (`true` where not attended) read
+    /// for rows `r % mask.rows`: attention's scale, mask and softmax as one op, bit for bit the
+    /// six ops it replaces (`crate::softmax`), one job a tile row. Refused unless
+    /// `crate::softmax::fits`.
+    pub fn softmax_rows(
+        &mut self,
+        x: &DramTensor,
+        mask: &DramTensor,
+        scale: f32,
+    ) -> Result<DramTensor, TensorError> {
+        let units = self.spread_for(tiles_of(x)).min(x.rows / 32).max(1);
+        let alloc = &mut self.dram_state()?.alloc;
+        let work = crate::softmax::softmax_rows(alloc, x, mask, scale)?;
+        self.execute_on(work, units, RESET_BUDGET)
+    }
+
     /// Each row's `sqrt(mean(a a) + eps)` over its columns, `[rows, 1]`: RMSNorm's statistic,
     /// one job a tile row (`tensor::sfpu_rms`), bit for bit the ops it replaces.
     pub fn rms(&mut self, a: &DramTensor, eps: f32) -> Result<DramTensor, TensorError> {

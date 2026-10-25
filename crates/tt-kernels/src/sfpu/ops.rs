@@ -2623,6 +2623,21 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
     p.store(out, fmt, out_at);
 }
 
+/// `kind`'s constants and then its body for one row group, `a` at `a_at` and `b` at `b_at` in
+/// `Dst`, the result stored at `out_at`: one link of a chain of kinds in one program
+/// (`super::softmax`), each link the instructions the kind's own program runs on that row group.
+pub(crate) fn chain_link(
+    p: &mut Program,
+    kind: u32,
+    scalars: [f32; 2],
+    a_at: u32,
+    b_at: u32,
+    out_at: u32,
+) {
+    binary_constants(p, kind, scalars);
+    binary_body(p, kind, a_at, b_at, out_at);
+}
+
 /// The constants [`binary_body`] needs for `kind`, loaded once.
 fn binary_constants(p: &mut Program, kind: u32, scalars: [f32; 2]) {
     if kind == kind_sfpu::ADD_RELU {

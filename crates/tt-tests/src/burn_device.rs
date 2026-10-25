@@ -464,6 +464,14 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.rms(&mut self.session, a, eps)
         }
+        fn softmax_rows(
+            &mut self,
+            x: burn_tt::BufferId,
+            mask: burn_tt::BufferId,
+            scale: f32,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.softmax_rows(&mut self.session, x, mask, scale)
+        }
         fn rms_norm(
             &mut self,
             a: burn_tt::BufferId,
