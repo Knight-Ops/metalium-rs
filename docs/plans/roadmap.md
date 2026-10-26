@@ -497,6 +497,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         **11.76 / 12.24 / 12.95 ms** (`1793002379`; F32 16.79 / 17.19 / 18.09 in the same session), the 135M 7.30-8.55
         (7.64-8.89 in F32). `Llama::with_bf16_weights`, the benches' default (`TT_WEIGHT_STORAGE=f32` keeps F32). The
         weights take ~7.3 ms of a step; next, the ~4.4 ms of small ops and per-op cost they no longer hide (A5b).
+        **A5b, measured and built** (2026-10-26, [log](../learnings/performance-log.md#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1)):
+        a BF16 `Step(64)` is products 8.37 ms (426 GB/s) and 283 other ops 2.98 (profile `1793023409`; weights free
+        6.26 / 7.34 ms). BF16 tiles now take 2,112-byte L1 slots (`record::GATHER_B_BF16`, every layout by
+        `SrcRoute::b_slot`), bit for bit: 11.78 / 12.96 -> **11.68 / 12.90 ms**; more columns a job (`TT_BF16_PLANS=ring`,
+        `wide`) read more ahead but do not shorten a product (its span is its units' column work), so they stay
+        opt-in. **`fast-reads`** (card 1) takes a step 11.74 -> **11.54 ms**, all of it the products' read entries; the
+        small ops do not move. **Next: the small ops (~3 ms in 283 ops) and the products' barriers (~2.1-2.5 ms).**
         **Found and fixed on the way:** decode attention's job recorded too low an L1 top, so busy prefetch read the next
         weights over its `K` and `V` at `Step(512)` (a 1.7B traced generation chose other tokens at a 256-token prompt;
         gate `step209`).

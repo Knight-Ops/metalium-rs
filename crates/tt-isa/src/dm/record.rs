@@ -27,7 +27,8 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// bit 28 [`GATHER_STREAM`], bit 29 [`GATHER_B_BF16`]; bits 30-31 zero. Bit 2 selects packed
 /// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
 /// logical rows/columns and words 6/7 their tile row/column origins.
-/// GDDR slots are 2112 bytes; L1 slots remain 4160.
+/// GDDR slots are 2112 bytes; L1 slots remain 4160. A BF16 `B` ([`GATHER_B_BF16`]) is the
+/// exception: its tiles are 2,112-byte slots in L1 too, at `b_at + (kk * cols + j) * 2112`.
 /// Only local ragged lanes are zeroed, without changing the source tensor; a
 /// tile with at most 16 valid rows is read only through its last valid row of
 /// face 1 (faces 2 and 3 not at all), since the zeroing overwrites the rest.
@@ -63,8 +64,9 @@ pub const GATHER_PREFETCH: u32 = 1 << 27;
 pub const GATHER_STREAM: u32 = 1 << 28;
 /// [`GATHER`]'s flag for a `B` stored BF16 (a weight in half the bytes) beside an FP32 `A`:
 /// `B`'s tiles are BF16 images in [`super::BF16_TILE_SLOT`]-byte GDDR slots, each read whole
-/// into the start of its [`TILE_SLOT`] in L1, where the kernel unpacks it as BF16
-/// (`tt_kernels::matmul::SrcRoute::Tf32WithBf16B`). `B` untransposed only (not bit 1, not
+/// into a [`super::BF16_TILE_SLOT`]-byte L1 slot of its own (`b_at + (kk * cols + j) * 2112`:
+/// twice the tiles an FP32 `B`'s ring holds, `docs/plans/bf16-weight-storage.md` A5b), where the
+/// kernel unpacks it as BF16 (`tt_kernels::matmul::SrcRoute::Tf32WithBf16B`). `B` untransposed only (not bit 1, not
 /// [`GATHER_B_UNPACK_TRANSPOSE`]), and not with packed BF16 (bit 2), which is both operands; with
 /// every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is the
 /// writer's (zero for a stored weight): nothing is filled.
@@ -77,8 +79,8 @@ const GATHER_FLAG_BITS: u32 = GATHER_A_RESIDENT
     | GATHER_B_BF16
     | 0xff;
 
-/// `B`'s GDDR slot and read length under `flags`: [`super::BF16_TILE_SLOT`] for
-/// [`GATHER_B_BF16`], else [`TILE_SLOT`].
+/// `B`'s slot under `flags`, in GDDR and L1 alike, and each read's length:
+/// [`super::BF16_TILE_SLOT`] for [`GATHER_B_BF16`], else [`TILE_SLOT`].
 const fn gather_b_slot(flags: u32) -> u64 {
     if flags & GATHER_B_BF16 != 0 {
         super::BF16_TILE_SLOT
@@ -101,7 +103,7 @@ pub struct PrefetchCursor {
     j0: u32,
     /// `B` read as it lies, transposed by the kernel ([`GATHER_B_UNPACK_TRANSPOSE`]).
     unpacked: bool,
-    /// `B`'s GDDR slot, and each read's length ([`GATHER_B_BF16`]).
+    /// `B`'s slot in GDDR and L1, and each read's length ([`GATHER_B_BF16`]).
     slot: u32,
     next: u32,
 }
@@ -176,7 +178,7 @@ impl Iterator for PrefetchCursor {
                 ch,
                 (kk + self.j0 + j) % PORTS,
                 off,
-                self.b_at + (kk * self.cols + j) * TILE_SLOT as u32,
+                self.b_at + (kk * self.cols + j) * self.slot,
                 self.slot,
                 0,
                 0,
@@ -755,7 +757,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             for kk in 0..kt {
                 let mut row = if b_t { None } else { Some(b.cursor(kk, j0)?) };
                 for j in 0..cols {
-                    let to = b_at + (kk * cols + j) * TILE_SLOT as u32;
+                    let to = b_at + (kk * cols + j) * b_slot as u32;
                     emit(match row.as_mut() {
                         // A BF16 `B` (untransposed): its own slot, read whole.
                         Some(r) if b_slot != TILE_SLOT => {
@@ -1662,8 +1664,8 @@ mod tests {
 
     /// A BF16 `B` ([`GATHER_B_BF16`]) is read from its own slots: each tile's whole
     /// [`super::super::BF16_TILE_SLOT`] from where a BF16 tensor keeps it (slot `t / n` of 2,112
-    /// bytes on channel `t % n`), into the same L1 slot an FP32 `B`'s tile goes to, and `A`'s
-    /// entries are untouched -- whole, thin, transposed, resident, streamed. A transposed `B` and
+    /// bytes on channel `t % n`), into a 2,112-byte L1 slot of its own (an FP32 `B`'s ring holds
+    /// half the tiles in the same bytes), and `A`'s entries are untouched -- whole, thin, transposed, resident, streamed. A transposed `B` and
     /// packed BF16 are refused.
     #[test]
     fn a_bf16_b_reads_its_own_slots_whole() {
@@ -1720,13 +1722,17 @@ mod tests {
                     b.channels[c] as u32,
                     was[2],
                     b.base[c] + slot * BF16_TILE_SLOT as u32,
-                    0x6_0000 + (kk * cols + j) * TILE_SLOT as u32,
+                    0x6_0000 + (kk * cols + j) * BF16_TILE_SLOT as u32,
                     BF16_TILE_SLOT as u32,
                     0,
                     0,
                 ];
                 assert_eq!(*got, want, "{flags:#x}, B tile {n}");
-                assert_eq!(got[4], was[4], "the FP32 B's L1 slot");
+                assert_eq!(
+                    got[4] - 0x6_0000,
+                    (was[4] - 0x6_0000) / TILE_SLOT as u32 * BF16_TILE_SLOT as u32,
+                    "the FP32 B's L1 slot, compacted"
+                );
                 cases += 1;
             }
         }

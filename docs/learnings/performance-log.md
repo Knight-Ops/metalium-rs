@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Compact BF16 slots, and where a BF16 decode step goes](#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1) | 2026-10-26 | a 1.7B BF16 step is products 8.37 ms + 283 small ops 2.98 (weights free 6.26 ms); compact BF16 `B` slots in L1, bit for bit, 11.78 -> 11.68 ms; more read ahead (`ring`, `wide`) does not shorten a product; `fast-reads` 11.74 -> **11.54 ms** (card 1), all of it the weight stream, nothing for small ops |
 | [Re-tuned for BF16 weights](#re-tuned-for-bf16-weights-2026-10-26-card-0) | 2026-10-26 | a BF16 weight stream on 96 units (64 for F32) at 3 reads in flight (2 for F32): the 1.7B's BF16 decode step 12.89 -> **11.72 ms** at a 32-token prompt |
 | [Where a K-tile pair goes](#where-a-k-tile-pair-goes-2026-10-26-card-1) | 2026-10-26 | a blocked prefill product's pair is bound by `B`'s unpacks (each face twice a pair), not the Matrix Unit (HiFi4 = LoFi at ~15 TFLOPS with an F32 `B`), the drain or the unpackers' speed setting; a BF16 `B` lifts it to 16 (HiFi4) and 21.6 (LoFi) |
 | [Attention's batched products as 2-D blocks](#attentions-batched-products-as-2-d-blocks-2026-10-26-card-0) | 2026-10-26 | attention's `P V` and `Q K^T` a head at a time as K-streamed 2-D blocks, bit for bit: the 1.7B's prefill of 7,992 tokens at chunks of 512 **8.42 -> 6.62 s**, 1,000 tokens 386 -> 375 ms |
@@ -367,6 +368,60 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Compact BF16 slots, and where a BF16 decode step goes (2026-10-26, cards 0 and 1)
+
+[bf16-weight-storage.md](../plans/bf16-weight-storage.md) A5b. Asked: why half the weight bytes did not halve a step
+(16.80 -> 11.72 ms), and whether the `fast-reads` image helps now that small ops are a larger share. SmolLM2-1.7B-Instruct,
+weights stored BF16, `TT_TILES=all`, 512-position cache, release.
+
+**Where the step goes** (profile mode, `traced_generation_stream_ceiling`, card 0, `1793023409`, before this work):
+
+| `Step(64)` replay | us | MB | GB/s |
+|---|--:|--:|--:|
+| products (121 ops) | 8,368 | 3,568 (1,771 of `B` read ahead) | 426 |
+| everything else (283 ops) | 2,983 | 47 | 16 |
+| all | 11,351 | 3,615 | 318 |
+
+A layer: `qkv` 37.3 us (26.0 MB, all read ahead; 22.6 us barrier), `o` 18.0 (8.7, all ahead), `gate|up` 124.4 (69.2 MB,
+**32.4 ahead**: one 2-column job a unit, 120 units), `down` 122.4 (34.6 MB, 6.5 ahead; 64 units at ~230 GB/s in its span,
+with the next `qkv` read ahead beside it). With the weights free (`TT_PROBE_STREAM=skip`, `1793024167`) a step is
+**6.26 / 7.34 ms** at 32 / 256 tokens; the weights alone at 469 GB/s take ~7.3. F32's step hid the small ops under a
+weight stream twice as long; BF16's does not.
+
+**Compact BF16 `B` slots** (`record::GATHER_B_BF16` puts a tile in a 2,112-byte L1 slot; every layout steps `B` by
+`SrcRoute::b_slot`), bit for bit (card 0, 21 of 21 gates, `1793029808`). How a job uses the room is
+`TT_BF16_PLANS`. Stream-ceiling bench, card 0, 7 samples, decode step at 32 / 256 tokens:
+
+| | ms | Run |
+|---|--:|---|
+| the commit before (`22a265f`, a worktree) | 11.78 / 12.96 | `1793028095` |
+| **compact, FP32 widths (`f32`, the default)** | **11.68 / 12.90** | `1793027730` |
+| compact, 3 columns a job (`ring`: an FP32 ring's bytes) | 11.81 / 12.99 | `1793029006` |
+| compact, 4 columns (`wide`) | 13.10 / 14.12 | `1793026815` |
+| compact, second ring (`TT_TRACE_ARENA=1 TT_PREFETCH_SECOND=1`) | 11.88 / 13.08 | `1793027910` |
+
+- **`wide`:** its 540 KB rings reach below the ops between products, so busy units stop reading them ahead: `qkv`
+  26.0 -> 3.2 MB ahead, `gate|up` 32.4 -> 3.2 (profile `1793028276`).
+- **`ring`:** `gate|up` reads 48.7 MB ahead (was 32.4), but its span stays 125.0 us (was 124.4) and its barrier grows
+  10.9 -> 27.9 us (profile `1793029342`). A product's span is its units' own column work, not the bytes left to read:
+  room for `B` does not bind under BF16 either (the F32 finding, decode-to-bandwidth "A product's longest unit").
+- Traced generation with the default, tokens checked (card 0): 1.7B **11.73 / 12.23 / 12.95 ms** at 32 / 128 / 256
+  tokens (`1793030086`; burn-flex 301.5 / 345.5 / 360.0), 135M 7.26 / 7.85 / 8.52 (`1793030687`).
+
+**The `fast-reads` image** (host-encoded reads; card 1, same card both ways; gates 21 of 21 with it, `1793030396`):
+
+| Traced generation | safe | `fast-reads` |
+|---|--:|--:|
+| 1.7B decode step, 32 / 128 / 256 tokens | 11.74 / 12.26 / 12.98 ms (`1793031435`) | **11.54 / 12.04 / 12.72** (`1793030673`) |
+| 1.7B first token, 32 tokens | 37.06 ms | 36.59 |
+| 135M decode step | 7.32 / 7.90 / 8.53 (`1793032023`) | 7.34 / 7.82 / 8.44 (`1793031282`) |
+
+Profiled (card 0, `1793031058` against `1793023409`): the products 8.37 -> **8.13 ms** (439 GB/s; 1.68 M read entries a
+step), everything else 2.98 -> 3.01. `fast-reads` buys the weight stream's per-entry cost (~0.2 ms a 1.7B step, 1.7-2%)
+and nothing for the small ops: they move 47 MB in ~21,700 entries, and their time is barriers, kernels, control and
+one-tile data latency (`rms_norm`, `add`, `mul`, `rope`, `attention/rows` within 1% in both images). The 135M, all
+small ops, is unchanged.
 
 ## Re-tuned for BF16 weights (2026-10-26, card 0)
 

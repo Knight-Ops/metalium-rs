@@ -2049,7 +2049,8 @@ pub(crate) fn matmul_dram_prefetching(
 }
 
 /// [`record::GATHER_B_BF16`] where `route` reads a BF16 `B` ([`SrcRoute::Tf32WithBf16B`]): its
-/// tiles from their BF16 slots, into the slots an FP32 `B`'s take.
+/// tiles from their BF16 slots into 2,112-byte L1 slots, which every layout of the route plans
+/// ([`SrcRoute::b_slot`]).
 fn gather_b_format(route: SrcRoute) -> u32 {
     if route.bf16_b() {
         record::GATHER_B_BF16
@@ -2196,10 +2197,14 @@ impl BlockPlan {
                 // The second half's layout is the first's moved up, and noted there.
                 let up = if half == Some(1) { matmul::half() } else { 0 };
                 let planned = crate::l1::planned_shifted(up, || match self.packed_a {
-                    Some(_) => {
-                        matmul::plan_layout_packed_a(tiles, in_fmt, staging, packed_a_slots(kt))
-                    }
-                    None => matmul::plan_layout_in(tiles, in_fmt, staging),
+                    Some(_) => matmul::plan_layout_packed_a(
+                        tiles,
+                        in_fmt,
+                        staging,
+                        packed_a_slots(kt),
+                        self.route.b_slot(),
+                    ),
+                    None => matmul::plan_layout_route(tiles, in_fmt, staging, self.route.b_slot()),
                 });
                 let layout = match planned {
                     Ok(l) if half == Some(1) => l.shifted(matmul::half()),
@@ -2399,7 +2404,9 @@ fn packed_k_block(
         if kc > limit {
             continue;
         }
-        let Ok((layout, reload)) = matmul::k_block_layout_with(kc, packed_a_slots(kc)) else {
+        let Ok((layout, reload)) =
+            matmul::k_block_layout_with(kc, packed_a_slots(kc), route.b_slot())
+        else {
             continue;
         };
         let layout = matmul::Layout {
@@ -2783,7 +2790,7 @@ impl BlockPlan {
         count: usize,
     ) -> Result<Vec<(Vec<[u32; 8]>, Job)>> {
         let kt = self.tiles[1];
-        let ring = (kt * self.block[1]) as u64 * TILE_SLOT;
+        let ring = (kt * self.block[1]) as u64 * self.route.b_slot();
         let top = crate::l1::ring_end();
         if top < tt_isa::l1::DATA.base + ring {
             return Ok(Vec::new());
@@ -2843,7 +2850,7 @@ fn stream_chunks(
         if kt.div_ceil(kq) % 2 != 0 || kq > limit {
             continue;
         }
-        let Ok(layout) = matmul::k_stream_layout(kq, a_slots) else {
+        let Ok(layout) = matmul::k_stream_layout(kq, a_slots, route.b_slot()) else {
             continue;
         };
         let fits = (0..2).all(|c| {
@@ -3043,10 +3050,12 @@ impl BlockPlan {
                 let mut steps = Vec::new();
                 for k0 in (0..kt).step_by(self.k_block) {
                     let count = self.k_block.min(kt - k0);
-                    let (layout, reload) = match self.packed_a {
-                        Some(_) => matmul::k_block_layout_with(count, packed_a_slots(count))?,
-                        None => matmul::k_block_layout(count)?,
+                    let a_slots = match self.packed_a {
+                        Some(_) => packed_a_slots(count),
+                        None => count,
                     };
+                    let (layout, reload) =
+                        matmul::k_block_layout_with(count, a_slots, self.route.b_slot())?;
                     let mut ar = ra;
                     let mut br = rb;
                     ar.first += if transposed[0] {
@@ -3376,9 +3385,9 @@ pub(crate) fn block_stream_plan(
             (s, l)
         });
     }
-    let fits_arena = |[mb, kq, nb]: [usize; 3]| {
+    let fits_arena = |tiles: [usize; 3]| {
         // Two semaphores pairs' worth of slack past the slots.
-        (2 * (kq * (mb + nb) + mb * nb)) as u64 * TILE_SLOT + 256 <= arena.len()
+        matmul::block_stream_bytes(tiles, route.b_slot()) + 256 <= arena.len()
     };
     let mut candidates: Vec<BlockStreamShape> = match mode {
         BlockStream::Off => Vec::new(),
@@ -3417,13 +3426,13 @@ pub(crate) fn block_stream_plan(
             .filter(|s| fits_arena(s.tiles))
             .take(BLOCK_FIT_TRIES)
             .find(|s| {
-                matmul::block_stream_layout(s.tiles)
+                matmul::block_stream_layout(s.tiles, route.b_slot())
                     .is_ok_and(|layout| block_stream_programs_fit(&layout, route, fidelity))
             })
     });
     let value = chosen.and_then(|s| {
         let before = crate::l1::take_planned();
-        let layout = matmul::block_stream_layout(s.tiles);
+        let layout = matmul::block_stream_layout(s.tiles, route.b_slot());
         let planned = crate::l1::take_planned();
         crate::l1::note_planned(before);
         crate::l1::note_planned(planned);
@@ -9096,7 +9105,7 @@ mod block_stream_tests {
     #[test]
     fn looped_block_programs_do_not_grow_with_the_block() {
         let stored = |tiles: [usize; 3], c: usize| -> [usize; 3] {
-            let layout = matmul::block_stream_layout(tiles).unwrap();
+            let layout = matmul::block_stream_layout(tiles, TILE_SLOT).unwrap();
             let (code, loops) = matmul::block_stream_kernel_looped(
                 &layout,
                 c,

@@ -1,6 +1,6 @@
 # BF16 weight storage: half the bytes a decode step reads, bit for bit
 
-Status (2026-10-26): **A0-A4 done: built, gated on ttsim and card 0, measured (decode 16.80 -> 12.95 ms), the benches' default; A5 open.** Roadmap Track 1, "The roofline";
+Status (2026-10-26): **A0-A5 done: built, gated on ttsim and card 0, measured (decode 16.80 -> 11.73 ms), the benches' default.** A5b's compact L1 slots are bit for bit and free L1, but do not shorten the step. Roadmap Track 1, "The roofline";
 [decode-to-bandwidth.md](decode-to-bandwidth.md) Phase 9. Decided by the user on 2026-10-26, once the F32 levers were
 spent (a 1.7B step at 16.8 / 18.2 ms, its weights at ~430 GB/s, 92% of the 469 GB/s read ceiling; F32's floor ~14.3 ms).
 
@@ -64,8 +64,37 @@ Measured, not assumed (A0): the vendored Blackhole unpacker page is a stub, and 
   (`THIN_STREAM_UNITS_BF16`; F32 keeps 64) at 3 reads in flight (the high half of `dm::STREAM_CAP`, taken by the mover
   for a `GATHER_B_BF16` record; F32 keeps 2, where 3 is slower). The prefetch units (40) and cap (2) stay. A 1.7B step
   12.89 -> **11.72 ms** at a 32-token prompt.
-- [ ] **A5b.** Compact BF16 L1 slots for the rings and the prefetch (twice the window a unit); then the small ops and
-  per-op cost, now ~4.4 ms of an 11.7 ms step beside ~7.3 ms of weights at 469 GB/s.
+- [x] **A5b. Compact BF16 L1 slots: built, bit for bit, the default; the room does not shorten the step**
+  (2026-10-26, card 0, [log](../learnings/performance-log.md#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1)).
+  - **Measured first** (profile `1793023409`): a 1.7B `Step(64)` replay is 11.35 ms, the products 8.37 ms at 426 GB/s
+    and 283 other ops 2.98 ms; 1,771 of the step's 3,555 MB of weights are read ahead, one job's `B` a unit (`gate|up`
+    32.4 of 69.2 MB a layer). Weights free (`TT_PROBE_STREAM=skip`, `1793024167`) a step is 6.26 / 7.34 ms.
+  - **Built:** `record::GATHER_B_BF16` now puts each BF16 tile in a 2,112-byte L1 slot (`b_at + (kk cols + j) 2112`;
+    an ABI change of the record, no `mover.rs` edit), and every layout that holds a BF16 `B` steps it by
+    `SrcRoute::b_slot`: `plan_layout_route` / `plan_layout_packed_a` (`plan_slots`), `k_block_layout_with`,
+    `k_stream_layout`, `block_stream_layout` (the looped kernel steps `B`'s column by a register of its own,
+    `B_SLOT_GPR`), the block-stream planner's `fits_arena`, R2's ring and the session's L1 footprint. A K-whole BF16
+    product's ring is 270 KB, not 532.
+  - **Plan widths** (`matmul::Bf16Plans`, `TT_BF16_PLANS`): `f32` (the default) plans an FP32 `B`'s columns; `ring` as
+    many as fit an FP32 ring's bytes (3 at `K` = 2048); `wide` as many as fit (4).
+  - **Gates:** record unit `a_bf16_b_reads_its_own_slots_whole` (the compact stride), `step172`/`step173` in the safe,
+    `fast-reads` and `fast-reads` + `encoded-guard` images; firmware clippy plain, `encoded-guard`, `profile` and the
+    `fast-reads` images; `step233` (ttsim, both 2-D block kernels now) **watched failing** with the record's stride left
+    at 4,160; unit `a_bf16_b_plans_compact_slots`; card 0 21 of 21 (`1793029808`: `step234`, `step233`, `step209`,
+    `step219`, `step188` traced = eager and = Flex).
+  - **Measured** (card 0, stream-ceiling bench, 32 / 256 tokens): the commit before 11.78 / 12.96 ms (`1793028095`);
+    compact at FP32 widths **11.68 / 12.90** (`1793027730`; traced generation, tokens checked, 11.73 / 12.23 / 12.95,
+    `1793030086`); `ring` 11.81 / 12.99 (`1793029006`); `wide` 13.10 / 14.12 (`1793026815`); compact with the second
+    ring (`TT_TRACE_ARENA=1 TT_PREFETCH_SECOND=1`) 11.88 / 13.08 (`1793027910`).
+  - **Why the room does not pay:** `wide`'s 4-column rings reach below the tops of the ops between products, so busy
+    units stop reading them ahead (`qkv` 26.0 -> 3.2 MB ahead, `gate|up` 32.4 -> 3.2; profile `1793028276`). `ring` reads
+    `gate|up` 48.7 MB ahead (was 32.4) and its span stays 125 us, its barrier 10.9 -> 27.9 us (profile `1793029342`): a
+    product's span is its units' own column work, not the bytes left to read, as in F32 (decode-to-bandwidth, "A
+    product's longest unit"). Compact rings stay for the L1 they free.
+  - **`fast-reads`** (card 1, same card; 21 of 21 gates with it, `1793030396`): a 1.7B step 11.74 / 12.26 / 12.98 ->
+    **11.54 / 12.04 / 12.72 ms** (`1793031435`, `1793030673`), the 135M unchanged (7.32 / 7.90 / 8.53 -> 7.34 / 7.82 /
+    8.44). Profiled, all of it is the products' 1.68 M read entries (8.37 -> 8.13 ms); the small ops are 2.98 -> 3.01 ms.
+  - **Next:** the 283 small ops' ~3 ms and the products' barriers (~2.1-2.5 ms a step), not the weight stream.
 
 ## Limits
 

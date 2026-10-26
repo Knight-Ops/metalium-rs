@@ -1097,6 +1097,21 @@ is BF16 widened at load, and the Matrix Unit multiplies a BF16 `SrcA` as the sam
 at 469 GB/s; the rest is what Phases 3 and 7 left, now exposed: the next work is there, and the stream's re-tuning for
 half-size tiles (A5).
 
+- **A5a** (the stream re-tuned): 11.72 ms. **A5b** (2026-10-26,
+  [log](../learnings/performance-log.md#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1)):
+  - **The decision rule, set before building:** build compact BF16 slots if a profile shows GDDR idle in the gaps
+    between products with weights left to read ahead. It did: `gate|up` read 32.4 of its 69.2 MB ahead (one 2-column
+    job a unit), ~41 MB read in a ~177 us stretch before it (profile `1793023409`). Weights free, a step is 6.26 / 7.34
+    ms (`1793024167`).
+  - **Built, bit for bit:** BF16 tiles in 2,112-byte L1 slots: 11.78 / 12.96 -> 11.68 / 12.90 ms.
+  - **Refuted for BF16 too:** more read ahead shortens no product. 3 columns a job read `gate|up` 48.7 MB ahead and its
+    span stayed 125 us; 4 columns put the rings below the small ops' L1 and lost the busy prefetch (13.10 ms). As in
+    "A product's longest unit", a product's span is its units' column work.
+  - `fast-reads`: 11.74 -> 11.54 ms (card 1), the products only.
+  - **What is left:** 283 small ops, ~3.0 ms a step, ~10.5 us each (barrier 20-40%, control 10-20%, one-tile data
+    latency), and the products' barriers (2.1-2.5 ms). That is Phase 7's S5 (each op's fixed cost) and
+    replay-fixed-cost P1 (barriers on the units an op ran on), and the 135M (7.3 ms, ~0.6 of it weights) measures it.
+
 ## The larger changes compared (2026-10-18)
 
 Four larger changes were left after Phases 1-4's bit-for-bit items. Each was checked against profile `1792298755`

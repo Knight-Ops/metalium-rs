@@ -2,8 +2,10 @@
 //! as the same weight in FP32, bit for bit, on every path a product takes: whole tiles, a thin
 //! last tile row, `K` blocks, a packed one-row `A`, a streamed `K`, 2-D blocks with `K` streamed,
 //! ragged edges, and a capture whose products read their weights ahead on idle units
-//! (`docs/plans/bf16-weight-storage.md` A2). Its `B` is read from BF16 slots
-//! (`record::GATHER_B_BF16`) and unpacked as BF16 (`SrcRoute::Tf32WithBf16B`, gate `step232`).
+//! (`docs/plans/bf16-weight-storage.md` A2). Its `B` is read from BF16 slots into 2,112-byte L1
+//! slots (`record::GATHER_B_BF16`, A5b: every layout steps `B` by `SrcRoute::b_slot`, the looped
+//! 2-D block kernel by a register of its own, so both block kernels are run) and unpacked as BF16
+//! (`SrcRoute::Tf32WithBf16B`, gate `step232`).
 //! The control stores a weight with mantissa bits below BF16's, which the storage rounds away.
 use tt_kernels::kind;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
@@ -173,11 +175,22 @@ fn a_stored_bf16_weight_multiplies_as_its_fp32_values() {
             assert_eq!(stored.elem, tt_kernels::tensor::Elem::Bf16);
             s.set_matmul_k_block_limit(limit.and_then(std::num::NonZeroUsize::new));
             s.set_block_stream(block);
-            let want = mm(s, &a, &w);
-            let got = mm(s, &a, &stored);
-            let (want_v, got_v) = (s.download(&want).unwrap(), s.download(&got).unwrap());
-            assert!(want_v.iter().any(|&v| v != 0.0), "{what}: an empty product");
-            assert_bits(what, &got_v, &want_v);
+            // 2-D blocks: the looped kernel and the unrolled one.
+            let loops: &[bool] = match block {
+                BlockStream::Off => &[true],
+                _ => &[true, false],
+            };
+            for &looped in loops {
+                tt_kernels::matmul::set_block_loops(looped);
+                let want = mm(s, &a, &w);
+                let got = mm(s, &a, &stored);
+                let (want_v, got_v) = (s.download(&want).unwrap(), s.download(&got).unwrap());
+                assert!(want_v.iter().any(|&v| v != 0.0), "{what}: an empty product");
+                assert_bits(&format!("{what}, looped {looped}"), &got_v, &want_v);
+                s.free(want).unwrap();
+                s.free(got).unwrap();
+            }
+            tt_kernels::matmul::set_block_loops(true);
             // The stored weight widens back to the values it was stored from, after the
             // products (watched failing: the widening kept a product's unpacker `Z` counter).
             let widened = s.widen_bf16(&stored).unwrap();
@@ -186,7 +199,7 @@ fn a_stored_bf16_weight_multiplies_as_its_fp32_values() {
                 &s.download(&widened).unwrap(),
                 &s.download(&w).unwrap(),
             );
-            for t in [a, w, stored, want, got, widened] {
+            for t in [a, w, stored, widened] {
                 s.free(t).unwrap();
             }
         }
