@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0) | 2026-10-26 | a small op is 9.8 us on unit 0 (135M; 11.6 on the 1.7B), ~3 of it its barrier; 194 of the 135M step's 591 barriers (82 of the 1.7B's 403) order nothing the data needs, and a capture drops them: 135M **7.35 -> 6.97 ms**, 1.7B 11.76 -> **11.59**; sparse waits after products would save 0.03-0.07 ms (the barrier time there is the slowest unit's work); one launch for back-to-back ops ~0.12 ms at best |
 | [Compact BF16 slots, and where a BF16 decode step goes](#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1) | 2026-10-26 | a 1.7B BF16 step is products 8.37 ms + 283 small ops 2.98 (weights free 6.26 ms); compact BF16 `B` slots in L1, bit for bit, 11.78 -> 11.68 ms; more read ahead (`ring`, `wide`) does not shorten a product; `fast-reads` 11.74 -> **11.54 ms** (card 1), all of it the weight stream, nothing for small ops |
 | [tt-metal's adjacent-core DRAM read gate on our mover](#tt-metals-adjacent-core-dram-read-gate-on-our-mover-2026-10-26-card-1) | 2026-10-26 | `gddr_adjacent_banks`: eight readers, one a channel, each on the tile beside its channel's NoC #0 endpoint, as tt-metal's Blackhole CI gate (490-512 GB/s): **507.7-508.3 GB/s** with a `fast-reads` image and tt-metal's 16 KiB packets as entries, **511.2** with 128 KiB entries (99.8% of 512), **496** the FF1 shape; the safe image 414 with packet entries (a safe entry costs ~359 cycles) and 511 with long ones |
 | [Re-tuned for BF16 weights](#re-tuned-for-bf16-weights-2026-10-26-card-0) | 2026-10-26 | a BF16 weight stream on 96 units (64 for F32) at 3 reads in flight (2 for F32): the 1.7B's BF16 decode step 12.89 -> **11.72 ms** at a 32-token prompt |
@@ -369,6 +370,72 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Which barriers a decode step needs (2026-10-26, card 0)
+
+[decode-small-ops.md](../plans/decode-small-ops.md) S5. SmolLM2-135M and 1.7B-Instruct, BF16 weights, `TT_TILES=all`,
+512-position cache, release, safe image, card 0, `Step(64)`. Before: 135M **7.35 / 7.85 / 8.52 ms** at 32 / 128 / 256
+tokens (`1793034872`), 1.7B **11.76 / 12.23 / 12.95** (`1793035290`).
+
+**A small op entry by entry** (unit 0, `TT_PROFILE_DETAIL=full`; the profile mode's new `entries.tsv`: each entry
+kind's time and the gap before it, `profile_mode::attribute_entries`; profiles `1793036629`, `1793036849`), us an op:
+
+| | 135M, 471 small ops | 1.7B, 307 |
+|---|--:|--:|
+| `BARRIER` + the gap before it (B waiting for NC's last writes) | 1.55 + 1.45 | 2.92 + 1.58 |
+| `CB` (2.8 / 3.4 an op) | 0.94 + 0.14 | 1.18 + 0.16 |
+| `LAUNCH` + the gap before it (the pair's start: handshake, reader section fetched) | 0.25 + 0.76 | 0.27 + 0.82 |
+| `KERNEL_WAIT` | 0.93 | 1.08 |
+| `RELEASED` | 0.57 | 0.93 |
+| data entries | ~2.7 | ~2.4 |
+| all | 9.84 | 11.64 |
+
+Against the 2026-10-14 table above (chain8, 8 tiles): `LAUNCH` 0.25 us (~320 cycles then, ~340 now), the pair's start
+and its section fetch ~1 us (~1,420 cycles then), `CB` ~0.33 us an entry (~345-560 cycles then). The `POKE` prologue is
+gone from a decode op (0.02 records an op: descriptors are written once a trace). **The barrier is the largest fixed
+cost:** a span less its slowest unit's work (`skew.tsv`) is 1.03 us median, 1.61 mean an op on the 135M, 0.96 of its
+7.06 ms (3.2 us after a product, ~1 after an element-wise op).
+
+**Which barriers the data needs** (`tt_kernels::barriers::analyse`, `TT_PROBE_BARRIERS=<dir>` writes one TSV a stored
+trace; runs `1793037761`, `1793037822`). Every move of every captured op, records expanded as the movers expand them,
+is a byte range of a GDDR channel or of another tile's L1 (`READ_L1`, `WRITE_L1`, `WRITE_L1_MCAST`); a row select or
+scatter touches every row its index could name; anything else would depend on everything (none in these traces). A
+barrier is unneeded when no unit of the next op depends on another unit's op since the last barrier kept:
+
+| `Step(64)` barriers | 135M (591) | 1.7B (403) |
+|---|--:|--:|
+| unneeded | **194**: RMSNorm -> `x gamma` 61, a product -> its residual add 31, RoPE -> RoPE -> the two cache scatters 89 | **82**: RoPE and the scatters 72 |
+| sparse (each unit of the next op on some of the units since) | 125 | 174 (RMSNorm on 32 units -> `x gamma` on 64: 49) |
+| full | 272 | 147 |
+
+**What-ifs** (each (op, unit) at its measured work, started when its own unit and the ops it depends on are done):
+pruning the unneeded barriers overlaps ops by 0.03 / 0.035 ms beyond the barriers' own cost; sparse waits after every
+product **0.029 / 0.070 ms**; after every barrier 0.076 / 0.139. The products' barrier time is not the barrier: the next
+norm needs the whole row and the next product the whole activation, so a product's consumers wait for most of its
+units, and the 2.1-2.5 ms is its slowest unit's work.
+
+**Pruned** (`Session::set_barrier_prune`, on; `TT_BARRIER_PRUNE=0` off; gate `step235`):
+
+| | before | pruned | runs |
+|---|--:|--:|---|
+| 135M decode step, 32 / 128 / 256 tokens | 7.35 / 7.85 / 8.52 | **6.97 / 7.54 / 8.27** | `1793034872`, `1793039044` (burn-flex 26.9 / 29.2 / 34.1) |
+| 1.7B decode step | 11.76 / 12.23 / 12.95 | **11.59 / 12.17 / 12.95** | `1793035290`, `1793039248` |
+| 135M `Step(64)` profile: ops, span, barrier | 592, 7.04 ms, 1.22 | 398, 6.73, 0.95 | `1793041760`, `1793041969` |
+| 1.7B `Step(64)` profile | 404, 11.37, 2.14 | 322, 11.24, 1.97 | `1793043047`, `1793042220` |
+
+The capture's own run keeps every barrier; a replay's ops between two kept barriers are one op of the trace (the
+profile names it with all their labels). The 1.7B gains less: fewer barriers go, and at 256 tokens its weights bound
+the step.
+
+**Following an operand's runs** (`TT_FOLLOW_RUNS=1`, opt-in): `x gamma` on RMSNorm's 32 units makes 49 more of the
+1.7B's barriers unneeded (131), and the step 11.63 / 12.11 / 12.93 ms (`1793040730`): the scale on half the units costs
+what the barriers did.
+
+**Negative control refuted:** with every barrier pruned (`barriers::probe_prune_every_barrier`), `step208`'s slow op on
+unit 0 and its readers on eight units gave the right bits in every replay, on ttsim and on card 0 at `K` 8,192 and
+65,536 (`1793038688`); ttsim's replays did not race even with the release broken. As replay-fixed-cost P1 found for
+dropped waits, a replay's start orders its units: the gate's control is the streams, and the classifier's are unit
+tests watched failing.
 
 ## Compact BF16 slots, and where a BF16 decode step goes (2026-10-26, cards 0 and 1)
 

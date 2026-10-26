@@ -376,10 +376,8 @@ Burn model gains.
   - RMSNorm's `x / stat * gamma` as one body. Today `gamma`'s `Reshape` puts the product in a block of its own, so
     the fuser cannot see it (decode-small-ops S3, R0).
   - The residual `Add` fused into the next norm's statistic.
-- [ ] **What is left per op** (decode-small-ops S5). With ~300 ops left, ~3.5 us of control an op is ~1 ms.
-  - Measure it.
-  - Then decide on a firmware change, such as one `PAIR_CALL` launch and its credits shared by back-to-back small
-    ops.
+- [x] **What is left per op** (decode-small-ops S5, 2026-10-26). Measured; the unneeded barriers are pruned from a
+  capture; one launch for back-to-back ops is not built (Phase 7).
 
 ### Phase 4. The products at the read ceiling, 22.8 -> ~15 ms
 
@@ -597,8 +595,12 @@ the host ~0.8).
 - [x] **Three copies gone** (2026-10-19): the same-shape reshape, the value's copy before its cache write
   (`Session::scatter_rows_into_block`), the context's repack and `o`'s packing (attention writes the row and its twin).
   ~0.36 ms. 1.7B **20.95 / 21.41 / 22.18 ms** (`1792444936`), 135M **8.00 / 8.59 / 9.38** (`1792445319`).
-- [ ] S5: measure the ~3.5 us of control an op, then back-to-back small ops sharing one `PAIR_CALL` and its credits,
-  and the next reader section fetched ahead.
+- [x] S5 (2026-10-26, [decode-small-ops.md](decode-small-ops.md) S5): measured per entry and per barrier. A small op
+  is 9.8 us on the 135M (11.6 on the 1.7B) on unit 0, ~3 of it its barrier; a host-side analysis of the captured
+  streams finds 194 of the 135M's 591 barriers (82 of the 1.7B's 403) unneeded by the data, and a capture now drops
+  them (`Session::set_barrier_prune`, on): 135M **7.35 -> 6.97 ms**, 1.7B 11.76 -> 11.59 at 32 tokens (card 0).
+  Sparse waits after products (what-if 0.03-0.07 ms) and back-to-back ops in one launch (~0.12 ms at best) are not
+  built.
 - [ ] The step's mask from the position in one op (8 int ops, ~80 us).
 
 ### Phase 8. A continuous weight stream
@@ -1111,6 +1113,9 @@ half-size tiles (A5).
   - **What is left:** 283 small ops, ~3.0 ms a step, ~10.5 us each (barrier 20-40%, control 10-20%, one-tile data
     latency), and the products' barriers (2.1-2.5 ms). That is Phase 7's S5 (each op's fixed cost) and
     replay-fixed-cost P1 (barriers on the units an op ran on), and the 135M (7.3 ms, ~0.6 of it weights) measures it.
+  - **S5 (2026-10-26):** the products' barrier time is the slowest unit's work: their consumers need most of their
+    units (a what-if of sparse waits saves 0.07 ms). Barriers no data needs are pruned: 1.7B 11.59 / 12.17 / 12.95 ms,
+    135M 6.97 / 7.54 / 8.27 (card 0).
 
 ## The larger changes compared (2026-10-18)
 

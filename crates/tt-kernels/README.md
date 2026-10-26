@@ -29,6 +29,7 @@ on-tile and chip-to-chip data movers. Shippable; depends on `tt-isa`, `tt-device
 | `prng` | Seeded random on the device: the host model of the hardware stream, the tile kernels and `Session::random_*`. |
 | `atomics` | The guarded runner for mutexes and L1 atomics: bounded deadline, blocked status and host release. |
 | `mesh_trace` | Capture and replay of a trace across chips, with the Ethernet transfers replayed in capture order. |
+| `barriers` | Which of a capture's barriers its data needs: every captured op's moves read off the streams as byte ranges of GDDR and of other tiles' L1, each barrier classed unneeded, sparse or full (`analyse`, `TT_PROBE_BARRIERS=<dir>`), and the unneeded ones dropped from the streams as the capture ends (`prune`, `Session::set_barrier_prune`). |
 
 A feature module adds its own `impl Session` block (`fp16`, `prng`, `mesh_trace`, `sfpu::sort`); `session.rs` keeps the core bring-up and the BF16 methods.
 

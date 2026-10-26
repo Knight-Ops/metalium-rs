@@ -756,6 +756,15 @@ pub struct Session<T: Transport> {
     packed_twins_on: bool,
     /// [`Session::set_barrier_release`].
     barrier_release: bool,
+    /// [`Session::set_barrier_prune`].
+    barrier_prune: bool,
+    /// What the last capture's pruning did ([`Session::last_barrier_prune`]).
+    last_prune: Option<Result<crate::barriers::Pruned, String>>,
+    /// [`Session::set_follow_runs`].
+    follow_runs: bool,
+    /// The last element-wise op's output in a capture, its tiles and the units its runs went to:
+    /// what an element-wise op reading it next follows ([`Session::set_follow_runs`]).
+    last_runs: Option<(tensor::Placement, usize, usize)>,
     /// The leader's release rectangles (`dm::BARRIER_RECTS`, [`release_rects`]): `None` where
     /// the units need more than `BARRIER_RECTS_MAX`, and barriers poll.
     release_rects: Option<Vec<(u32, u32)>>,
@@ -2566,6 +2575,12 @@ impl<T: Transport> Session<T> {
             twins: Vec::new(),
             // `TT_BARRIER_RELEASE=0`: every unit polls unit 0's counter, as before.
             barrier_release: std::env::var("TT_BARRIER_RELEASE").map_or(true, |v| v != "0"),
+            // `TT_BARRIER_PRUNE=0`: a capture keeps every barrier.
+            barrier_prune: std::env::var("TT_BARRIER_PRUNE").map_or(true, |v| v != "0"),
+            last_prune: None,
+            // `TT_FOLLOW_RUNS=1`: an element-wise op follows its operand's runs.
+            follow_runs: std::env::var("TT_FOLLOW_RUNS").is_ok_and(|v| v == "1"),
+            last_runs: None,
             release_rects: None,
             streamed_k: true,
             weight_prefetch: true,
@@ -4362,6 +4377,51 @@ impl<T: Transport> Session<T> {
         self.barrier_release && self.release_rects.is_some()
     }
 
+    /// Drop the barriers a capture's data does not need from its streams as it ends (on by
+    /// default; `TT_BARRIER_PRUNE=0` turns it off; `docs/plans/decode-small-ops.md` S5, A1): a
+    /// barrier after which no unit of the next op depends on another unit's op since the last
+    /// barrier kept ([`crate::barriers`]). The ops between two kept barriers become one op of the
+    /// trace, labelled with all their labels, and every unit that ran any of them arrives once, at
+    /// the run's end. The capture's own run keeps every barrier.
+    pub fn set_barrier_prune(&mut self, on: bool) {
+        self.barrier_prune = on;
+    }
+
+    /// In a capture, an element-wise op whose first operand the op before it made, over the
+    /// same tiles in runs on fewer units (RMSNorm's division, at least two tiles a unit), takes
+    /// that op's units, so each unit reads the tiles it wrote and the barrier between them is
+    /// unneeded ([`Session::set_barrier_prune`]). Placement only. Off by default
+    /// (`TT_FOLLOW_RUNS=1` turns it on): on the 1.7B it prunes 49 more barriers a step, and the
+    /// scale on half the units costs what they saved (11.59 / 12.17 / 12.95 -> 11.63 / 12.11 /
+    /// 12.93 ms, card 0, `1793040730`).
+    pub fn set_follow_runs(&mut self, on: bool) {
+        self.follow_runs = on;
+    }
+
+    /// The units an element-wise op over `a` (its spread `units`) runs on: see
+    /// [`Session::set_follow_runs`].
+    fn follow_runs(&self, a: &DramTensor, units: usize) -> usize {
+        match &self.last_runs {
+            Some((p, tiles, u))
+                if self.follow_runs
+                    && self.capture.is_some()
+                    && a.placement.same_serial(p)
+                    && tiles_of(a) == *tiles
+                    && *u < units =>
+            {
+                *u
+            }
+            _ => units,
+        }
+    }
+
+    /// What the last capture's barrier pruning did: `None` where it pruned nothing (off, nothing
+    /// unneeded, one unit), `Err` where a check refused it (the trace then keeps every barrier).
+    #[doc(hidden)]
+    pub fn last_barrier_prune(&self) -> Option<Result<crate::barriers::Pruned, String>> {
+        self.last_prune.clone()
+    }
+
     /// Wait at a barrier for unit 0's release rather than by polling its counter (on by
     /// default; `dm::op::BARRIER` word 6): unit 0 waits on the counter in its own L1, then
     /// multicasts each target it arrives at to every other unit's `dm::BARRIER_RELEASE`, and each
@@ -5780,7 +5840,32 @@ impl<T: Transport> Session<T> {
         let cached = capture
             .plan_key
             .map(|key| (key, capture.applied.clone().filter(|_| refused.is_none())));
+        // Which of its barriers its data needs (`crate::barriers`): written out for
+        // `TT_PROBE_BARRIERS`, and the rest dropped from its streams unless pruning is off.
+        let prune = self.barrier_prune
+            && !self.sub_traces
+            && self.units.len() > 1
+            && refused.is_none()
+            && capture.ops.len() > 1;
+        let barriers = (prune || crate::barriers::probe_dir().is_some()).then(|| {
+            let coords: Vec<(u8, u8)> = self
+                .units
+                .iter()
+                .map(|u| (u.tile.x(), u.tile.y()))
+                .collect();
+            crate::barriers::analyse(&capture, &coords)
+        });
+        self.last_prune = None;
+        if let (true, Some(a)) = (prune, &barriers) {
+            let keep = crate::barriers::keep_from(a);
+            if keep.iter().any(|&k| !k) {
+                self.last_prune = Some(crate::barriers::prune(&mut capture, &keep));
+            }
+        }
         let result = self.store_trace(capture);
+        if let (Some(a), Ok(id)) = (&barriers, &result) {
+            crate::barriers::write_probe(id.0, a);
+        }
         if let Some((key, applied)) = cached {
             match (applied, &result) {
                 (Some(applied), Ok(_)) => {
@@ -6741,6 +6826,7 @@ impl<T: Transport> Session<T> {
         // of its own, so every memo and cache key below carries the mode.
         let op = op.in_mode(self.math);
         let units = self.spread_for(tiles_of(a).max(b.map_or(0, tiles_of)));
+        let units = self.follow_runs(a, units);
         let overlap = self.overlap();
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
         let twin = self.new_twin(a.rows, a.cols, tensor::output_elem(kind))?;
@@ -6761,6 +6847,7 @@ impl<T: Transport> Session<T> {
         let out = self.execute_on(work, units, RESET_BUDGET);
         self.keep_twin(&out, twin)?;
         let out = out?;
+        self.last_runs = Some((out.placement.clone(), tiles_of(&out), units));
         out.set_pad(match tensor::eltwise_rows(kind, a.rows) {
             // Rows past `a`'s are left as `Dst` held them.
             32 => op.produces(&[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>()),
@@ -7631,6 +7718,7 @@ impl<T: Transport> Session<T> {
             self.free(packed)?;
         }
         let out = out?;
+        self.last_runs = Some((out.placement.clone(), tiles_of(&out), units));
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)
     }

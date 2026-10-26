@@ -504,6 +504,14 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         `wide`) read more ahead but do not shorten a product (its span is its units' column work), so they stay
         opt-in. **`fast-reads`** (card 1) takes a step 11.74 -> **11.54 ms**, all of it the products' read entries; the
         small ops do not move. **Next: the small ops (~3 ms in 283 ops) and the products' barriers (~2.1-2.5 ms).**
+        **S5, measured and built** (2026-10-26, card 0, [decode-small-ops.md](decode-small-ops.md) S5,
+        [log](../learnings/performance-log.md#which-barriers-a-decode-step-needs-2026-10-26-card-0)): a small op is
+        9.8 us on unit 0 (135M), ~3 of it its barrier. A capture now drops the barriers its data does not need
+        (`tt_kernels::barriers`, `Session::set_barrier_prune`, on; gate `step235`): 194 of the 135M step's 591, 82 of the
+        1.7B's 403. 135M 7.35 / 7.85 / 8.52 -> **6.97 / 7.54 / 8.27 ms**, 1.7B 11.76 / 12.23 / 12.95 -> **11.59 / 12.17 /
+        12.95**. The products' barrier time is their slowest unit's work (their consumers need most units: sparse waits
+        would save 0.03-0.07 ms), so A2 (sparse waits) and A3 (one launch for back-to-back ops, ~0.12 ms at best) are
+        not built.
         **Found and fixed on the way:** decode attention's job recorded too low an L1 top, so busy prefetch read the next
         weights over its `K` and `V` at `Step(512)` (a 1.7B traced generation chose other tokens at a 256-token prompt;
         gate `step209`).
@@ -935,7 +943,9 @@ the 1.7B's long prefill ("Fused `.ttinsn` push" below).
        - **The replay's start** (~170 us): every unit's catch-up and its `CALL` are two enqueues, since the mover takes
          a `CALL` only as a list of its own (a firmware change).
        - **P1, barriers on the units an op ran on** (~0.6 us an op, ~1.5 ms a step), and each op's ~3.5 us of control
-         (descriptor pokes, the `PAIR_CALL`'s launch and credits).
+         (descriptor pokes, the `PAIR_CALL`'s launch and credits). P1 done 2026-10-17; 2026-10-26 (decode-small-ops
+         S5) the control measured entry by entry and the barriers no data needs pruned from a capture (135M 7.35 ->
+         6.97 ms); one launch for back-to-back ops not built (~0.12 ms at best).
 - [x] **7. SmolLM2 back in `SMOKE`** (2026-10-13): `step167` F32 (33 s) and `step168` (about 3 minutes, all seven plans pass on
   card 0, run `1791852139`) are in; the BF16 `step167` gate (229 s) waits for item 5 (`xtask/src/silicon.rs`, `SMOKE`).
 - [x] **8. Firmware image budget** (2026-10-13, ttsim and card 0; [review](../proposals/firmware-architecture-review.md),

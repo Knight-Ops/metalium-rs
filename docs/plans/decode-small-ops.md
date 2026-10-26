@@ -2,7 +2,8 @@
 
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile". Written 2026-10-16 against `7e9def9`. Status: **S1, S2a, F0, S2b and S3
 done (2026-10-16; a 1.7B step 42.97 / 45.41 / 48.59 ms on `Tt` with S3's row-limited statistic, run `1792189445`);
-S1d done 2026-10-18 (the position-major cache); S4, S5 open.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
+S1d done 2026-10-18 (the position-major cache); S5 measured and A1 (barrier pruning) done 2026-10-26, A2 and A3
+refuted by their rules; S4 superseded by decode-attention.md.** Companion plans: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md) (the products, P5 open) and
 [in-place-cache-write.md](in-place-cache-write.md) (the cache write's copies). The whole step's byte budget, and the
 weight prefetch that would overlap these ops, are [decode-step-bandwidth.md](decode-step-bandwidth.md).
 
@@ -253,9 +254,92 @@ Superseded by [decode-attention.md](decode-attention.md) (2026-10-17), which tak
 
 ### S5. Each op's fixed cost
 
-- [ ] What is left per op once S1-S4 shrink the count: ~6 us for an element-wise op on 64 units (barrier, control,
+- [x] What is left per op once S1-S4 shrink the count: ~6 us for an element-wise op on 64 units (barrier, control,
   one tile in and out). roadmap Track 2 item 6, step 6's "P1, barriers on the units an op ran on" and "each op's
-  ~3.5 us of control" are the items; re-measure with the profile mode after S1-S4.
+  ~3.5 us of control" are the items; re-measure with the profile mode after S1-S4. **Measured and acted on
+  2026-10-26 (A0-A3 below; [log](../learnings/performance-log.md#which-barriers-a-decode-step-needs-2026-10-26-card-0)).**
+
+**A0. Measured (2026-10-26, card 0, BF16 weights, every tile, safe image).** Baselines: 135M **7.35 / 7.85 / 8.52 ms**
+at 32 / 128 / 256 tokens (`1793034872`), 1.7B **11.76 / 12.23 / 12.95** (`1793035290`).
+
+- **Where a small op's time goes** (unit 0, `TT_PROFILE_DETAIL=full`, `entries.tsv`, `Step(64)`; profiles `1793036629`,
+  `1793036849`). Each entry's time and the gap before it (the mover's dispatch, a pair's handshake, a section's
+  fetch), us an op:
+
+  | Small ops (135M 471, 1.7B 307) | 135M | 1.7B |
+  |---|--:|--:|
+  | `BARRIER` (arriving, waiting for the slowest unit) + gap before it (the writer's last writes) | 1.55 + 1.45 | 2.92 + 1.58 |
+  | `CB` credits (2.8-3.4 of them) | 0.94 + 0.14 | 1.18 + 0.16 |
+  | `LAUNCH` + gap before it (the pair's start: handshake and the reader section's fetch) | 0.25 + 0.76 | 0.27 + 0.82 |
+  | `KERNEL_WAIT` (the kernel's run) | 0.93 | 1.08 |
+  | `RELEASED` (B waiting for NC's output) | 0.57 | 0.93 |
+  | data entries (`READ_RUN`, `READ`, `READ_L1`, `GATHER`, `COPY_WORDS`) | ~2.7 | ~2.4 |
+  | all | **9.84** | **11.64** |
+
+  The barrier's own cost, the span less the slowest unit's work (`skew.tsv`): median 1.03, mean 1.61 us an op on the
+  135M, 0.96 ms of its 7.06 ms step (3.2 us after a product, ~1 us after an element-wise op).
+- **Which barriers the data needs** (`tt_kernels::barriers`, `TT_PROBE_BARRIERS=<dir>`: every move of every op read
+  off the captured streams, GDDR and other tiles' L1 byte for byte; runs `1793037761`, `1793037822`):
+
+  | `Step(64)` barriers | 135M (591) | 1.7B (403) |
+  |---|--:|--:|
+  | (a) unneeded: no unit of the next op depends on another unit's op since the last kept | **194** | **82** |
+  | (b) sparse: each depends on some of those units | 125 | 174 |
+  | (c) full | 272 | 147 |
+
+  135M (a): RMSNorm -> `x gamma` 61, a product -> its residual add 31, RoPE's two and the cache's two scatters 89. The
+  1.7B's RMSNorm divides on 32 units and `x gamma` runs on 64, so those 49 are (b); its products deal apart from the
+  adds after them.
+- **What-if** (each unit's measured work, ops ordered only by their dependencies): pruning (a) overlaps ops by only
+  0.03 ms (135M) and 0.035 (1.7B) beyond the barriers it removes; sparse waits after every product save **0.029 /
+  0.070 ms**, and after every barrier 0.076 / 0.139. A consumer of a product depends on most of its units (the next
+  norm reads the whole row, the next product the whole activation): the 2.1-2.5 ms at the products' barriers is the
+  slowest unit's work, not the barrier.
+- **Decision rules:** A1's (a) barriers x unit 0's measured barrier time: **0.324 ms** on the 135M (rule 0.2):
+  **build**. A2's what-if 0.029 ms (135M, rule 0.3) and 0.070 (1.7B, rule 0.5): **not built**. A3: the four classes
+  sum to 4.1-4.6 us on the ops A1 leaves adjacent, so the rule as written holds; what a merge removes is the second
+  op's `LAUNCH` and pair start, 1.2-1.3 us (`KERNEL_WAIT` is the kernel's run and `CB` is per block either way), on
+  the pairs a merge can take (same `init`/`mop`: RMSNorm -> `x gamma` 61 and RoPE -> RoPE 29 on the 135M, 24 on the
+  1.7B): ~0.12 / ~0.03 ms. The second op reads what the first's NC writes inside the same pair (a `RELEASED` wait,
+  credits carried across). **Not built**; see A3.
+
+**A1. Unneeded barriers pruned from a capture (done 2026-10-26, on by default, `TT_BARRIER_PRUNE=0` off).**
+`Session::set_barrier_prune`; `tt_kernels::barriers::{analyse, prune}` at `end_trace`, before the streams are stored.
+The ops between two kept barriers become one op of the trace, labelled with all their labels (the profile mode times
+them as one span); every unit that ran any of them arrives once, after its last, at the run's barrier; a wait waits
+for the last kept barrier at or before its own and stands for the runs since its unit's last count. The capture's
+own run keeps every barrier. Every check (targets, no wait for a run its unit still arrives at, every count ending at
+the runs) holds or nothing changes.
+
+- **Gate** `step235_barrier_pruning` (ttsim; card 0 `1793044484`): a same-deal chain of three element-wise ops is one
+  op and the product after it another; replays with fresh operands equal the eager run bit for bit, as does an eager
+  op after each; stream counts (two arrivals a unit, four unpruned). Classifier unit tests (`barriers::tests`): a RAW,
+  WAR and WAW in GDDR, another tile's L1 (unicast and multicast), an unplaced move, same-op concurrency, a sparse
+  run, pruning's renumbering; **watched failing** with the WAR dropped and with every dependency dropped, and the
+  gate with every barrier pruned (the product's barrier kept is asserted).
+- **Regression:** ttsim `step174`, `step176`, `step185` (weights), `step187`, `step193`, `step197`-`step199`, `step205`,
+  `step207`-`step210`, `step213`, `step214`, `step216`, `step217`, `step219`, `step222`, `step223`, `step226`,
+  `step228`, `step233`, `step39`, `step12_mnist` (e2e), the tt-kernels unit tests; card 0, `step176`, `step185`,
+  `step187`, `step188`, `step193`, `step205`, `step208`-`step210`, `step213`, `step223`, `step228`, `step12_mnist`
+  (one card), 61 of 61 (`1793044011`; `step235` there met `CardBusy` after `step188`, and passed alone).
+- **The plan's control refuted:** with every barrier pruned (`barriers::probe_prune_every_barrier`) `step208`'s slow
+  op and readers gave the right bits in every replay on ttsim and on card 0, at `K` 8,192 and 65,536 (`1793038688`);
+  ttsim's replays did not race even with `step208`'s release broken. As P1 found for dropped waits, a replay's start
+  orders its units; the control is the streams (the readers wait for nothing) and the classifier's unit tests.
+- **Measured** (card 0): 135M 7.35 / 7.85 / 8.52 -> **6.97 / 7.54 / 8.27 ms** (`1793039044`, burn-flex 26.9 / 29.2 /
+  34.1); 1.7B 11.76 / 12.23 / 12.95 -> **11.59 / 12.17 / 12.95** (`1793039248`). The 135M's `Step(64)` is 398 ops
+  (592).
+- **Aligning deals (opt-in, `TT_FOLLOW_RUNS=1`, `Session::set_follow_runs`):** an element-wise op whose operand the op
+  before made over the same tiles on fewer units takes those units. On the 1.7B, `x gamma` follows RMSNorm's 32: 49
+  more barriers pruned (131 of 403), and 11.63 / 12.11 / 12.93 ms (`1793040730`): within noise, the scale on half
+  the units costing what the barriers did. Gate: `step235`'s third claim (pruned with it, not without, replays bit
+  for bit).
+
+**A2. Sparse waits after a product: not built** (A0's what-if, above).
+
+**A3. Back-to-back ops in one launch: not built.** ~0.12 ms on the 135M at best (above), for a merge across ops whose
+second reads the first's output from GDDR inside one pair. The larger lever on the same ops is fusing them
+(`x / stat * gamma` as one op, decode-to-bandwidth Phase 7).
 
 ## Measurement and documentation
 
