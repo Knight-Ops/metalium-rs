@@ -1517,6 +1517,20 @@ pub fn probe_skip_a_reads(on: bool) {
     PROBE_SKIP_A.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// A development probe (`docs/plans/prefill-operand-reuse.md` P4, `silicon_probe_pair_cost`): a
+/// blocked product's chunks gather nothing (a `WAIT` stands in), so its kernels compute on whatever
+/// the slots hold. What is left is the kernels and their handshakes. **The products are wrong**;
+/// only their time means anything.
+static PROBE_SKIP_BLOCK_GATHERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BLOCK_GATHERS`] on or off, process-wide. Dev-facing: a timing bound, never a
+/// result.
+#[doc(hidden)]
+pub fn probe_skip_block_gathers(on: bool) {
+    PROBE_SKIP_BLOCK_GATHERS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn probing_skip_a() -> bool {
     PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -3559,6 +3573,12 @@ fn push_block_stream_jobs(
                     ],
                     false,
                 );
+                let gather = if PROBE_SKIP_BLOCK_GATHERS.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    vec![[tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]]
+                } else {
+                    gather
+                };
                 let (roles, loops) = matmul::block_stream_programs(
                     layout,
                     c,

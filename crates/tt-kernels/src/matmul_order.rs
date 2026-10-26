@@ -548,8 +548,17 @@ mod tests {
         )
     }
 
+    const ORDERS: [PairOrder; 6] = PairOrder::ALL;
+
     #[test]
     fn the_matmul_kernels_accumulate_in_the_canonical_order() {
+        for order in ORDERS {
+            ORDER_HERE.set(Some(order));
+            kernels_accumulate_in_the_canonical_order(order);
+        }
+    }
+
+    fn kernels_accumulate_in_the_canonical_order(order: PairOrder) {
         for shape in ["even", "runs", "scattered"] {
             for fidelity in FIDELITIES {
                 for live in LIVE {
@@ -561,7 +570,7 @@ mod tests {
                             assert_eq!(
                                 interpret(&u, &m),
                                 canonical(&outs, fidelity.phases(), live, b_transposed),
-                                "{shape}, {fidelity:?}, {live:?}, transposed {b_transposed}, {route:?}"
+                                "{order:?}, {shape}, {fidelity:?}, {live:?}, transposed {b_transposed}, {route:?}"
                             );
                         }
                     }
@@ -574,6 +583,13 @@ mod tests {
     /// with their block repeats expanded as the runner pushes them, then the frontend's.
     #[test]
     fn the_looped_block_kernel_accumulates_in_the_canonical_order() {
+        for order in ORDERS {
+            ORDER_HERE.set(Some(order));
+            looped_block_kernel_accumulates_in_the_canonical_order(order);
+        }
+    }
+
+    fn looped_block_kernel_accumulates_in_the_canonical_order(order: PairOrder) {
         for fidelity in FIDELITIES {
             for b_transposed in [false, true] {
                 for route in ROUTES {
@@ -605,8 +621,61 @@ mod tests {
                             LiveRows::All,
                             b_transposed
                         ),
-                        "{fidelity:?}, transposed {b_transposed}, {route:?}"
+                        "{order:?}, {fidelity:?}, transposed {b_transposed}, {route:?}"
                     );
+                }
+            }
+        }
+    }
+
+    /// Each order's math role is other words than the faces order's (but at one phase or one
+    /// half, where there is nothing to interleave), and the looped block kernel's math role
+    /// still has its fused `.ttinsn` form (`code::Code::fused`; the runner pushes it otherwise,
+    /// silently).
+    #[test]
+    fn each_order_is_its_own_words_and_keeps_the_fused_form() {
+        for fidelity in FIDELITIES {
+            for live in LIVE {
+                let outs = outputs("even", 2, 5);
+                let math = |order| {
+                    ORDER_HERE.set(Some(order));
+                    streams(&items(&outs, SrcRoute::Tf32FromFp32, fidelity, false, live)).1
+                };
+                let faces = math(PairOrder::Faces);
+                for order in ORDERS {
+                    let same = math(order) == faces;
+                    let alike = matches!(order, PairOrder::Faces | PairOrder::Auto)
+                        || order == PairOrder::PhasesOuter
+                            && (fidelity == Fidelity::Lo || live == LiveRows::Eight);
+                    assert_eq!(same, alike, "{order:?}, {fidelity:?}, {live:?}");
+                }
+            }
+            for order in ORDERS {
+                ORDER_HERE.set(Some(order));
+                for route in ROUTES {
+                    let shape = [2, 3, 2];
+                    let layout = block_stream_layout(shape, route.b_slot()).unwrap();
+                    for c in [0, 1] {
+                        let (code, loops) = block_stream_kernel_looped(
+                            &layout,
+                            c,
+                            shape,
+                            route,
+                            fidelity,
+                            false,
+                            LiveRows::All,
+                        )
+                        .expect("fits");
+                        let math = crate::code::Code {
+                            ins: code[1].clone(),
+                            loops: loops[1].clone(),
+                        };
+                        assert!(
+                            math.fused().is_ok(),
+                            "{order:?}, {fidelity:?}, {route:?}, chunk {c}: {:?}",
+                            math.fused().err()
+                        );
+                    }
                 }
             }
         }
@@ -669,6 +738,33 @@ mod tests {
 
     #[test]
     fn the_order_check_sees_k_reversed_and_phases_swapped() {
+        for order in ORDERS {
+            ORDER_HERE.set(Some(order));
+            sees_k_reversed_and_phases_swapped(order);
+        }
+    }
+
+    /// Whether `run` gives other terms than `want`, or the checker refuses the streams.
+    fn caught(want: &Order, run: impl FnOnce() -> Order + std::panic::UnwindSafe) -> bool {
+        std::panic::catch_unwind(run).map_or(true, |got| got != *want)
+    }
+
+    /// Address modifier 1, the next `SrcB` half in every whole order, moving `SrcB` nowhere.
+    fn half_step_lost(math: &[Instruction]) -> Vec<Instruction> {
+        let ab1 = thread::ADDR_MOD_AB_SEC1_SrcBIncr;
+        math.iter()
+            .map(|&i| {
+                if i.def().mnemonic() == "SETC16" && op(i, "CfgIndex") == u32::from(ab1.addr32()) {
+                    let v = ab1.insert(op(i, "NewValue") as u16, 0);
+                    tt_isa::backend::set_thread_entry(ab1.addr32(), v).unwrap()
+                } else {
+                    i
+                }
+            })
+            .collect()
+    }
+
+    fn sees_k_reversed_and_phases_swapped(order: PairOrder) {
         for b_transposed in [false, true] {
             let outs = outputs("even", 2, 4);
             let want = canonical(&outs, 4, LiveRows::All, b_transposed);
@@ -680,20 +776,29 @@ mod tests {
                 LiveRows::All,
             ));
             assert_eq!(interpret(&u, &m), want);
-            // The k'-reversed program computes every block's terms, in another order.
-            let reversed = interpret(&k_reversed(&u, b_transposed), &m);
-            assert_ne!(reversed, want, "k' reversed");
-            for (r, w) in reversed.iter().zip(&want) {
-                for (block, terms) in w {
-                    let mut a = r[block].clone();
-                    let mut b = terms.clone();
-                    a.sort();
-                    b.sort();
-                    assert_eq!(a, b, "the same terms, reordered");
+            if order.whole().is_none() {
+                // The k'-reversed program computes every block's terms, in another order.
+                let reversed = interpret(&k_reversed(&u, b_transposed), &m);
+                assert_ne!(reversed, want, "k' reversed");
+                for (r, w) in reversed.iter().zip(&want) {
+                    for (block, terms) in w {
+                        let mut a = r[block].clone();
+                        let mut b = terms.clone();
+                        a.sort();
+                        b.sort();
+                        assert_eq!(a, b, "the same terms, reordered");
+                    }
                 }
+            } else {
+                // `k'` is in the RWCs here: a lost `SrcB` step reads one half twice.
+                let (u, m) = (u.clone(), half_step_lost(&m));
+                assert!(
+                    caught(&want, move || interpret(&u, &m)),
+                    "{order:?}: half step lost"
+                );
             }
             let swapped = interpret(&u, &phases_swapped(&m));
-            assert_ne!(swapped, want, "phases swapped");
+            assert_ne!(swapped, want, "{order:?}: phases swapped");
         }
     }
 }
