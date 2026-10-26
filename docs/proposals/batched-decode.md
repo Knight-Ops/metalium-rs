@@ -85,6 +85,24 @@ of `B` into 8 rows of `Dst`.
 - **Pages make the tile shape and the cache shape the same:** a page is exactly the tile row `qk`/`pv` read. A head's
   keys in a page are a tile-aligned column block, read in place, transposed by the unpacker (A0b).
 
+### How many sequences fit: the cache bounds concurrency
+From the Cerebras review ([sram-residency-and-multi-card-decode.md](sram-residency-and-multi-card-decode.md)): every
+sequence in flight needs its own cache, so the GDDR left after the weights sets the batch's ceiling, not the tiles.
+- **A position costs** `layers × 2 × kv_heads × d × bytes`. For the 1.7B (24 layers, 32 key/value heads of 64):
+  - 393,216 B at F32;
+  - 196,608 at BF16;
+  - ~106 KB at BFP8 (1,104 B a tile).
+- **The pool is** a card's GDDR (32 GB on a p150a; datasheet, not yet read from ARC) less the weights (6.96 GB at
+  F32), traces and activations: ~24 GB.
+- **That holds:**
+  - ~61K positions at F32, so 7 sequences at 8K;
+  - ~122K at BF16, so 14 sequences at 8K;
+  - ~225K at BFP8, so 27 sequences at 8K.
+
+  Batch 32 at 8K therefore needs a narrower cache, a GQA model, or a second card's GDDR.
+- **The page pool should be sized by this formula at load,** with the batch buckets capped to what fits. A request
+  that cannot get its pages waits for a free slot. It never fails mid-generation.
+
 ### Attention: per sequence, batched over sequences and heads
 - **The shape:** for sequence `b` and key/value head `h`, `q` is `[groups, d]` (GQA folded into rows, as today).
   - `K` and `V` are the sequence's pages' column blocks, `qk = q K^T` over its pages, then the softmax, then `P V`.
@@ -133,4 +151,6 @@ of `B` into 8 rows of `Dst`.
 3. **B2:** the paged cache, and the batched write with `B` indices.
 4. **B3:** per-sequence attention items with per-item `K` (pages).
 5. **B4:** on-card argmax and the slotted generator with buckets.
-6. **B5:** measure tokens/s at batch 8, 16 and 32 on the 1.7B, against the roofline's batch rows.
+6. **B5:** measure tokens/s at batch 8, 16 and 32 on the 1.7B, against the roofline's batch rows. Report each batch
+   as total tokens/s *at its per-sequence tokens/s* (later, per watt). A larger batch counts as a gain only at the
+   per-user speed it keeps, as the Cerebras review argues.

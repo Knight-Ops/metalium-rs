@@ -10,6 +10,7 @@ flowchart TD
         P1["x280-on-card-dispatch.md<br/><i>(Proposed, unscheduled)</i>"]
         P2["future-fusion-features.md<br/><i>(FlashAttention, Sharded L1, NoC stream)</i>"]
         P3["batched-decode.md<br/><i>(tile-row batches, paged position-major cache)</i>"]
+        P4["sram-residency-and-multi-card-decode.md<br/><i>(L1 weights rejected, exact 2-card TP)</i>"]
     end
 
     subgraph Tier2["Tier 2: docs/plans/ (Active Specs)"]
@@ -101,6 +102,7 @@ Unscheduled design proposals and exploratory RFCs evaluating trade-offs before i
   - [`future-fusion-features.md`](proposals/future-fusion-features.md): RFCs for advanced fusion: Tiled Online Softmax FlashAttention, sharded multi-core L1 mesh tensor residency, and inter-core NoC streaming.
   - [`split-k-and-flash-decode.md`](proposals/split-k-and-flash-decode.md): the two order-changing decode levers, for a decision: flash-decode (attention's positions split across units; ~0.8-1.1 ms of a 1.7B step at 512 positions, recommended opt-in as variant A) and split-K (~0.2 ms by the handoff's measurement, parked).
   - [`batched-decode.md`](proposals/batched-decode.md): batched decode laid out on Blackhole's tiles (sequences as the rows of a tile row, batches of 8/16/32, a paged position-major cache, per-sequence attention items, on-card sampling); unscheduled behind batch-1 speed.
+  - [`sram-residency-and-multi-card-decode.md`](proposals/sram-residency-and-multi-card-decode.md): Cerebras' weight-resident wafer pipeline against Blackhole. Weights resident in L1 are rejected with the arithmetic. Exact tensor parallelism across two cards (`N`-split products, all-gather, bit for bit) is a candidate batch-1 lever, gated on measuring an Ethernet hop. Pipelined micro-batches are noted for batched decode.
 
 ### Completed plans: `docs/completed-plans/`
 Plans whose checklists are closed move here as a record, with their evidence. They are not updated; current behaviour lives in `docs/learnings/` and the active plans, and any item still open is carried in [`roadmap.md`](plans/roadmap.md).
