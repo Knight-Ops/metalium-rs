@@ -38,6 +38,8 @@ struct Opts {
     /// Extra `tt-tests` features for the build, beyond `silicon`.
     features: Vec<String>,
     timeout: Duration,
+    /// `--timeout-secs` was given: it holds for every test, [`LONG`] included.
+    timeout_given: bool,
     /// Run each test in burn-tt's profile mode (`TT_PROFILE`), each into a directory of its own.
     profile: bool,
 }
@@ -52,6 +54,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         release: false,
         features: Vec::new(),
         timeout: Duration::from_secs(120),
+        timeout_given: false,
         profile: false,
     };
     let mut smoke = false;
@@ -80,6 +83,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
                     v.parse()
                         .map_err(|_| format!("`--timeout-secs {v}`: expected a number"))?,
                 );
+                o.timeout_given = true;
             }
             "--smoke" => smoke = true,
             "--include-ignored" => o.include_ignored = true,
@@ -106,6 +110,16 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
 /// minute finding it. Simulator validation is plain `cargo test`; this is the
 /// tier that says burn-tt still computes what Burn's CPU backend computes, on
 /// the hardware it is for.
+/// Gates that need longer than the default limit, by `binary::test`, with the least time each
+/// is given unless `--timeout-secs` says otherwise: about 1.7x its last measured run.
+const LONG: &[(&str, u64)] = &[
+    // 2,138 s on card 0, 1,472 of it burn-flex's 8,192-position reference (`1792941361`).
+    (
+        "step188_smollm2_1_7b::the_native_context_agrees_with_flex",
+        3600,
+    ),
+];
+
 pub const SMOKE: &[&str] = &[
     // The B mover's read mode, whichever way the firmware was built: the safe image's
     // refusals, or with `--feature fast-reads` the encoded reads' (step172).
@@ -471,7 +485,8 @@ usage: cargo xtask silicon [options]
                         (adds the filters in `SMOKE`, after any given)
   --include-ignored     also run #[ignore] tests (the exploratory probes)
   --keep-going          do not stop at the first failure
-  --timeout-secs N      per-test wall-clock limit (default 120)
+  --timeout-secs N      per-test wall-clock limit (default 120; the few gates listed
+                        in `LONG` get at least theirs unless this is given)
   --feature NAME        also build `tt-tests` with this feature (repeatable): the opt-in
                         experiment `ttinsn-experiment`, or the B mover's read mode,
                         `fast-reads` (host-encoded reads) or `encoded-guard` (and the card's
@@ -704,7 +719,11 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
                 println!("dev{dev} profile {}", at.display());
                 env.push(("TT_PROFILE", at.display().to_string()));
             }
-            let verdict = run_one(&bin.exe, test, &bin.dir, &env, o.timeout, &out_path)?;
+            let timeout = match LONG.iter().find(|(name, _)| *name == full) {
+                Some(&(_, secs)) if !o.timeout_given => o.timeout.max(Duration::from_secs(secs)),
+                _ => o.timeout,
+            };
+            let verdict = run_one(&bin.exe, test, &bin.dir, &env, timeout, &out_path)?;
             let secs = started.elapsed().as_secs_f64();
             log.line(&format!(
                 "{} boot={boot} dev={dev} END {full} {verdict} {secs:.2}s",

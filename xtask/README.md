@@ -41,7 +41,7 @@ directly, one test per process, single-threaded.
 | `--include-ignored` | Also run `#[ignore]` probes. |
 | `--keep-going` | Do not stop at the first failure. |
 | `--feature NAME` | Also build `tt-tests` with this feature (repeatable). For opt-in experiments such as `ttinsn-experiment`, and for the B mover's read mode: `fast-reads` (host-encoded reads, checksum on the card) or `encoded-guard` (plus the semantic guard). The default is the safe mode. |
-| `--timeout-secs N` | Per-test wall-clock limit (default 120). |
+| `--timeout-secs N` | Per-test wall-clock limit (default 120). The gates in `LONG` (`src/silicon.rs`), such as the 1.7B at its native context, get at least their own limit unless this is given. |
 | `--release` | Optimised build. Quote timings only from this. |
 | `--list` | Print the selection without touching a card. |
 
