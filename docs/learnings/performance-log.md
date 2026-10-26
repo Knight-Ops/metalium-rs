@@ -13,6 +13,7 @@ The chronology is the [Change log](#change-log).
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
 | [Compact BF16 slots, and where a BF16 decode step goes](#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1) | 2026-10-26 | a 1.7B BF16 step is products 8.37 ms + 283 small ops 2.98 (weights free 6.26 ms); compact BF16 `B` slots in L1, bit for bit, 11.78 -> 11.68 ms; more read ahead (`ring`, `wide`) does not shorten a product; `fast-reads` 11.74 -> **11.54 ms** (card 1), all of it the weight stream, nothing for small ops |
+| [tt-metal's adjacent-core DRAM read gate on our mover](#tt-metals-adjacent-core-dram-read-gate-on-our-mover-2026-10-26-card-1) | 2026-10-26 | `gddr_adjacent_banks`: eight readers, one a channel, each on the tile beside its channel's NoC #0 endpoint, as tt-metal's Blackhole CI gate (490-512 GB/s): **507.7-508.3 GB/s** with a `fast-reads` image and tt-metal's 16 KiB packets as entries, **511.2** with 128 KiB entries (99.8% of 512), **496** the FF1 shape; the safe image 414 with packet entries (a safe entry costs ~359 cycles) and 511 with long ones |
 | [Re-tuned for BF16 weights](#re-tuned-for-bf16-weights-2026-10-26-card-0) | 2026-10-26 | a BF16 weight stream on 96 units (64 for F32) at 3 reads in flight (2 for F32): the 1.7B's BF16 decode step 12.89 -> **11.72 ms** at a 32-token prompt |
 | [Where a K-tile pair goes](#where-a-k-tile-pair-goes-2026-10-26-card-1) | 2026-10-26 | a blocked prefill product's pair is bound by `B`'s unpacks (each face twice a pair), not the Matrix Unit (HiFi4 = LoFi at ~15 TFLOPS with an F32 `B`), the drain or the unpackers' speed setting; a BF16 `B` lifts it to 16 (HiFi4) and 21.6 (LoFi) |
 | [Attention's batched products as 2-D blocks](#attentions-batched-products-as-2-d-blocks-2026-10-26-card-0) | 2026-10-26 | attention's `P V` and `Q K^T` a head at a time as K-streamed 2-D blocks, bit for bit: the 1.7B's prefill of 7,992 tokens at chunks of 512 **8.42 -> 6.62 s**, 1,000 tokens 386 -> 375 ms |
@@ -422,6 +423,83 @@ step), everything else 2.98 -> 3.01. `fast-reads` buys the weight stream's per-e
 and nothing for the small ops: they move 47 MB in ~21,700 entries, and their time is barriers, kernels, control and
 one-tile data latency (`rms_norm`, `add`, `mul`, `rope`, `attention/rows` within 1% in both images). The 135M, all
 small ops, is unchanged.
+
+## tt-metal's adjacent-core DRAM read gate on our mover (2026-10-26, card 1)
+
+What the Blackhole CI of tt-metal asks of DRAM reads, built on our movers, and what card 1 gives. The gate is
+`tests/tt_metal/tt_metal/perf_microbenchmark/8_dram_adjacent_core_read` (`test_dram_read_all_core` in
+`tests/scripts/test_moreh_microbenchmark.py`, tt-metal `a11d86c19d3`): **8 readers, one on each DRAM bank**, each on the
+worker tile beside the bank's NoC #0 endpoint (`get_optimal_dram_to_physical_worker_assignment`: the endpoint's row, never
+above row 2, in the column right of the DRAM column, moved right past a harvested column), each streaming **its own
+bank** in packets of the most whole tiles under 16 KiB. The metric is every byte over the kernel's device duration, in
+decimal GB/s, required to lie in **490.0-512.0** on Blackhole. Its shapes: `k` = 524,288 with `n` = 1,024 (BFP8, 1,088-byte
+tiles, 15 a packet), 1,024 (BF16, 2,048 B, 8 a packet) or 2,048 (BFP4, 576 B, 28 a packet), 8 banks, and the padded FF1
+shape (`k` 2,048, `n` 3,840, BF16, under 2 MiB a bank).
+
+**Ours:** `silicon_bench_memory::gddr_adjacent_banks` (`Mix::Adjacent`, `adjacent_tiles`, `ADJ_PORT`). The placement is
+tt-metal's, derived from the same SOC descriptor (`blackhole_140_arch.yaml`: NoC #0's subchannel 2 on channels 0, 4, 5, 6,
+7 and 0 on 1-3, each one an endpoint NoC #0 owns here, `DramChannel::owns`, so SYS-1419's one-NoC-per-endpoint rule
+holds). On card 1 the readers are the tiles at raw (1,11), (1,2), (1,9), (1,5) for channels 0-3 and **(11,11), (11,3),
+(11,8), (11,6)** for 4-7: column 10 is harvested on this card, so tt-metal's rule moves the east readers right to 11. The
+metric is the gate's: all bytes over the first barrier release to the last list end on tile 0's clock (each tile's events
+less its measured offset, at most 18 cycles uncertain), AICLK 1,350 MHz. Run it with
+`cargo xtask bench --device 1 --feature profile [--feature fast-reads] --filter silicon_bench_memory::gddr_adjacent_banks`:
+**the default image has no stamps** (`--feature profile`), and a run without them used to read empty traces
+(`silicon_bench_memory`'s fleet now refuses by name).
+
+| Format (entry) | safe image | `fast-reads` |
+|---|--:|--:|
+| BFP8, 16,320 B packet entries (tt-metal's packet) | 414.1 (cap 8), 423.8 (cap 128) | **508.2** (cap 8) |
+| BF16, 16,384 B packet entries | 413.9, 423.4 | **507.7** |
+| BFP4, 16,128 B packet entries | 409.2, 418.8 | **507.8** |
+| FF1 (1.88 MiB a bank), 16,384 B entries | 405.7, 415.0 | **496.1** |
+| BFP8 / BF16 / BFP4, 128 KiB entries (8 packets) | **511.1-511.2**, any cap | **511.2** |
+| FF1, 128 KiB entries (15 of them) | 493.8 | 494.3 |
+
+GB/s, medians of 9 runs, run `1793028275` (safe) and `1793028574` (`fast-reads`), card 1, `22a265f03c08+dirty`. Gate
+verdict: with `fast-reads` **every format passes as shipped** (packet entries, the mover's default cap of 8); the safe image
+fails with packet entries (**414 against 490**) and passes with long ones. The bytes of each reader's data are checked after
+the timing (a distinct pattern at each channel's last entries, run alone, compared in L1; a reader on the wrong channel fails).
+With the card-side semantic guard as well (`--feature fast-reads --feature encoded-guard`, run `1793029168`, card 1) the packet-entry rates are
+**507.9 / 507.4 / 507.2** (BFP8 / BF16 / BFP4) and **495.7** (FF1), 0.1% under the unguarded 508.2 / 507.7 / 507.8 / 496.1: the guard's ~18 cycles
+an entry (109 against 91) are hidden behind a 16 KiB packet's ~256 cycles of NoC time.
+The BFP formats differ from BF16 in packet size only (the bank holds no tile format here), and cap 8, 32 and 128 give the
+same rate once an entry is long.
+
+**What it means.**
+- **One safe-mode tile cannot feed a bank with single 16 KiB reads.** A safe entry costs ~359 device cycles, so one tile
+  issues at most ~52 GB/s (the table's 51.9 each tile) where a bank supplies 64: eight of them reach 414. The host-encoded
+  reads (~175 cycles an entry) give each tile 63.8 GB/s, the bank's rate. This is `docs/learnings/performance-scoreboard.md`'s
+  one-tile row seen from the gate.
+- **A DRAM channel read from one tile, through one endpoint, in long runs, gives 63.9 GB/s: 99.8% of 64** (16 Gbps x 32 pins,
+  a reasoned peak). That is above the 487-489 GB/s the decode weight streams reach and the 496 the 120-tile aggregate does,
+  so **those are not the channels' limit**: they are the many readers an endpoint serves, and the crossing traffic. tt-metal's
+  DRAM-sharded matmul is this pattern (a bank's weights read by the core beside it); whether a bank-sharded weight layout is
+  worth building for decode is open (comparison file, F27).
+- **tt-metal's gate is met on the hardware**: 490 is 95.7% of 512, and this reaches 99.2% with its packets and 99.8% with long
+  entries.
+
+**Checks that the span is the data.**
+- The host's time from the last list submitted to the last seen done exceeds the device span by 260.4-261.6 us at every
+  rate and cap (510 entries a list, 8 MB to 532 MB moved), which is the host's posted upload of 511-entry lists reaching the
+  card. A fraction of the bytes missing from the device span would grow with the bytes; this constant does not.
+- The mover's `LIST_END` is "every move in it having landed" (`silicon_bench_memory` header), and `gddr_in_flight` asserts a
+  channel's total stays under its ceiling (here every run is under 512 x 1.02).
+
+**Differences from tt-metal's kernel, which the number is read with.**
+- Theirs is a compiled reader keeping up to two 1 MiB blocks of packets in flight on three transaction IDs and a static
+  virtual channel (`bank & 3`); ours is the mover with an in-flight cap (`ADJ_CAPS`, default 8, 32, 128) and the NoC's own
+  virtual-channel choice.
+- A list holds `dm::LIST_MAX` = 512 entries, so each reader streams 7.8-8.3 MiB with packet entries and 62.8-63.8 MiB with long
+  entries, against the gate's 68-128 MiB (the 1.88 MiB FF1 shape is whole). The span is 0.13-1.05 ms and the barrier's release
+  spread (0.4-0.5 us) is under 0.4% of it.
+- tt-metal starts its eight through one dispatch command and reserves cores for fast dispatch (110 of 120 here); ours start
+  from a barrier counter on tile 0.
+- Card 1 was otherwise idle (the card lock); the host was busy compiling for part of the first run, which a device-timed
+  span does not see.
+
+Not run: tt-metal's own binary on this card (the v0.7.7 build in `crates/tt-tests/bench/tt_metal_dram_read/` is the other
+comparison, above), and card 0.
 
 ## Re-tuned for BF16 weights (2026-10-26, card 0)
 

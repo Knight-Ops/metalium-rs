@@ -1334,10 +1334,51 @@ deferred to later cleanup passes. B1 and B2 stay in Track 1 because models need 
 - [ ] Upstream PR to `burn-dispatch` (a closed enum) and `burn-router`/`burn-remote` gate
   for `BackendIr` (B12 is implemented, gate never run).
 
+## Against tt-metal (analysis 2026-10-26, a standing re-runnable review)
+
+[tt-metal-comparison.md](../learnings/tt-metal-comparison.md) compares our performance results and limits with
+tt-metal's own LLM stack (local checkout at `a11d86c19d3`), and lists the fixes below with their first
+measurements (F-numbers are that file's section 6). Re-run it with
+[tt-metal-comparison-method.md](../learnings/tt-metal-comparison-method.md) after a new tt-metal release or when one
+of these closes. Not scheduled; in the order the review suggests, evidence first:
+
+- [ ] **F1** a same-card, same-model baseline: run tt_transformers on card 0 (SmolLM2-1.7B or Llama-3.2-1B) beside
+  our numbers. Every tt-metal comparison so far is a derived figure for a different model mix. **F11** (mostly done 2026-10-26: our mirror of tt-metal's
+  490 GB/s adjacent-core DRAM gate, `silicon_bench_memory::gddr_adjacent_banks`, gives 507.7-511.2 GB/s with `fast-reads` on
+  card 1, runs `1793028574` / `1793028275`; left: tt-metal's own binary on the card, and the gate as a standing check).
+  **F27** bank-sharded weights read by the tile beside each channel (one reader a channel reaches 99.8% of it; decode's
+  weight stream 84%). **F12** do our readers leak the NoC VC state that
+  costs tt-metal about 20% of DRAM read bandwidth after a DRAM-sharded reader?
+- [ ] **F2** one card-to-card Ethernet hop with our E1 movers (4-16 KiB, no host): the go/no-go of
+  [sram-residency-and-multi-card-decode.md](../proposals/sram-residency-and-multi-card-decode.md). tt-metal's
+  published all-gather is about 5 us at that size (kill threshold about 20 us). **F13** do our two QSFP links match
+  tt-metal's `p150_x2` topology?
+- [ ] **F3** make program size independent of length (tile counts as arguments and loops, as tt-metal's kernels do):
+  the root of "a list's programs do not fit". **F4** re-measure trace size (1.5 GB for the 1.7B on 2026-10-15
+  against tt-metal's 56-70 MB for an 8B decode) and look at sharing identical entries across units. **F5** a
+  streamed attention that keeps the composition's order (or a decision on flash-decode's order change). **F14** trace
+  a prefill only where it pays.
+- [ ] **F6** replay plus `SFPLOADMACRO` for `exp` and reciprocal, against our staged row loops and `.ttinsn`
+  (is their accurate path bit-exact?). **F9** separate fidelity from structure in prefill (our products at
+  HiFi2 and LoFi) before more multicast work. **F10** the Blackhole DRISC tensor prefetcher. **F16** split the
+  per-op control cost (about 4.1 us against tt-metal's 1.3 us traced minimum).
+- [ ] **F7** native top-k and trace-compatible on-card sampling (112 ms a token today; tt-metal samples in a
+  separate trace, top-k at most 32). **F8** BFP8 and BFP4 weights and a BFP8 KV cache as opt-in decode modes, with
+  measured speed and accuracy on the 1.7B. **F15** model coverage from tt_transformers (QKV bias, RoPE scaling,
+  sliding window, MoE). **F17** batch, paged KV and serving, with their KV-capacity ceiling.
+- [ ] **F18** read the ARC firmware bundle version at attach and refuse below a tested minimum (tt-metal gates on
+  18.10.0, 19.8.1, 19.12.0). **F19** reconcile upstream's errata (tt-metal#16439, SYS-1419, the VC leak) with
+  [silicon-operating-notes.md](../learnings/silicon-operating-notes.md).
+- [ ] **F20-F26** repository hygiene found by the same review: simulator suite on branch pushes, a `LICENSE` file and
+  the CC BY-ND question, a pinned toolchain, typed errors for the `session.rs` unwraps, tighter ship checks, and
+  the stale roadmap and scoreboard lines the review listed (this file's lines 17 and the conformance headline among
+  them).
+
 ## How the other docs relate
 
 | Doc | Role now |
 |---|---|
+| [tt-metal-comparison.md](../learnings/tt-metal-comparison.md), [tt-metal-comparison-method.md](../learnings/tt-metal-comparison-method.md) | Learnings: the 2026-10-26 comparison with tt-metal and the procedure for re-running it |
 | [burn-backend-parity.md](burn-backend-parity.md) | B0–B16 detail |
 | [kernel-fusion.md](kernel-fusion.md), [traced-execution.md](traced-execution.md), [mixed-bfp-storage.md](mixed-bfp-storage.md) | Feature specs |
 | [burn-op-coverage.md](burn-op-coverage.md) | Generated operation status |

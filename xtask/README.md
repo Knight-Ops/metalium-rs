@@ -57,7 +57,8 @@ Background: [`docs/learnings/silicon-operating-notes.md`](../docs/learnings/sili
 The benchmark preset of `cargo xtask silicon`: always `--release
 --include-ignored`, a 900 s per-test limit unless `--timeout-secs` is given, and
 by default the `BENCH` selection in `src/silicon.rs`:
-- `silicon_bench_memory`: GDDR6 through the data mover, one tile and every tile.
+- `silicon_bench_memory`: GDDR6 through the data mover, one tile and every tile, and tt-metal's adjacent-core
+  DRAM read gate (`gddr_adjacent_banks`). Its spans are the mover's stamps, so run it with `--feature profile`.
 - `silicon_bench_path`: B through T0/T1/T2, hop by hop, and real ops.
 - `silicon_eth_clock`: E1's cycle counter, gated alone.
 - `silicon_bench_eth`: one link, both links, both directions.

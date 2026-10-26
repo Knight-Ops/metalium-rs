@@ -35,6 +35,7 @@ flowchart TD
         L5["tt-metal-concepts-review.md (G1-G16 System Concepts)"]
         L6["streaming-dataflow-architecture.md (Reader/Writer Contract)"]
         L7["kernel-fusion-architecture.md (Two-Stage Fusion & Dst/L1)"]
+        L8["tt-metal-comparison.md (+ method): where we stand against tt-metal, fixes to investigate"]
     end
 
     subgraph Done["docs/completed-plans/ (archive)"]
@@ -69,6 +70,7 @@ Permanent, cumulative empirical realities discovered through silicon execution, 
   - [`performance-log.md`](learnings/performance-log.md): Run history and evidence: cycle counts, instruction latencies, DRAM bandwidth saturation, icache measurements, change log.
   - [`riscv-guide-review.md`](learnings/riscv-guide-review.md): Measured facts vs external misconceptions regarding baby RISC-V cores, caches, and memory maps.
   - [`tt-metal-concepts-review.md`](learnings/tt-metal-concepts-review.md): Architectural comparison of tt-metal concepts (G1–G16) vs this native Rust stack.
+  - [`tt-metal-comparison.md`](learnings/tt-metal-comparison.md): Dated snapshot (2026-10-26) of the project's state and of every performance result and limit against tt-metal's own LLM stack (traces, dispatch cost, attention, SFPU, multi-chip, DRAM), with fixes to investigate (F1-F27). Re-run it with [`tt-metal-comparison-method.md`](learnings/tt-metal-comparison-method.md): the procedure, claims sheet and agent prompts.
   - [`streaming-dataflow-architecture.md`](learnings/streaming-dataflow-architecture.md): The core architectural contract of the GDDR streaming scheduler (B reader on NoC0, T0–T2 compute, NC writer on NoC1, streaming credits, transfer channels).
   - [`kernel-fusion-architecture.md`](learnings/kernel-fusion-architecture.md): Architectural ground truth on two-stage kernel fusion (Burn IR vs. Tensix hardware), Dst register allocation, and L1 Circular Buffer streaming.
 
