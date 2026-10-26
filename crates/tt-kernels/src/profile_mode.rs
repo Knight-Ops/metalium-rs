@@ -369,6 +369,72 @@ pub fn attribute_replay(events: &[TraceEvent], lo: u32, detail: Detail) -> Vec<O
     out
 }
 
+/// One entry kind's share of an op on unit 0 ([`attribute_entries`]), in tile cycles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntryCost {
+    /// Entries of the kind the op ran.
+    pub count: u64,
+    /// Inside them, from each one's begin stamp to its end.
+    pub cycles: u64,
+    /// Before them: from the end of the entry before (or the op's start) to each one's begin --
+    /// the mover's decode and dispatch, and what runs unstamped there: a pair's handshake with
+    /// its writer core, a stream chunk's or a reader section's fetch.
+    pub gap: u64,
+}
+
+/// Each op's entries by kind (the head's first word), as [`attribute_replay`] splits a replay.
+pub type EntryCosts = BTreeMap<u32, EntryCost>;
+
+/// [`Detail::Full`]: one replay's ops on unit 0, as [`attribute_replay`] returns them (the same ops,
+/// in the same order), each split by the kind of entry it ran. A `PAIR_CALL` itself is never
+/// stamped: its reader section's entries are, and its handshake and its wait for the writer core
+/// are the gaps before the entries that follow them.
+pub fn attribute_entries(events: &[TraceEvent], lo: u32) -> Vec<EntryCosts> {
+    let stamps: Vec<(Event, u64)> = events.iter().filter_map(mover).collect();
+    let start = stamps
+        .iter()
+        .rposition(|(e, _)| matches!(e, Event::List { begin: true, .. }))
+        .unwrap_or(0);
+    let mut timing = matches!(
+        (lo, stamps.get(start)),
+        (0, Some((Event::List { begin: true, .. }, _)))
+    );
+    let mut last = stamps.get(start).map_or(0, |s| s.1);
+    let mut open: Vec<(u32, u64)> = Vec::new();
+    let mut costs = EntryCosts::new();
+    let mut out = Vec::new();
+    for &(event, t) in &stamps[start..] {
+        match event {
+            Event::Entry { begin: true, op } => {
+                if open.is_empty() {
+                    costs.entry(op).or_default().gap += t.saturating_sub(last);
+                }
+                open.push((op, t));
+            }
+            Event::Entry { begin: false, op } => {
+                if let Some(at) = open.iter().rposition(|&(o, _)| o == op) {
+                    let (_, t0) = open.remove(at);
+                    let c = costs.entry(op).or_default();
+                    c.count += 1;
+                    c.cycles += t.saturating_sub(t0);
+                }
+                last = t;
+                if op == op::BARRIER {
+                    // An entry whose end fell outside the window never closes: the op ends here.
+                    open.clear();
+                    let done = std::mem::take(&mut costs);
+                    if timing {
+                        out.push(done);
+                    }
+                    timing = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// One replay's stamps on unit `unit`, whose barriers are `seq` in stream order, stamped within the
 /// window `lo..hi` (`hi` 0 for none): each op it arrived at whose work is wholly stamped, as `(op,
 /// time)`. The mover stamps a barrier when its count of the trace's barriers so far lies in the
@@ -523,6 +589,9 @@ pub struct TraceSamples {
     pub units: Vec<Vec<UnitTime>>,
     /// Units' replays whose barrier stamps did not line up with their streams: not attributed.
     pub unit_mismatches: u32,
+    /// [`Detail::Full`]: per op, unit 0's entries by kind ([`attribute_entries`]), summed over the
+    /// replays that stamped it (`samples[k].len()` of them).
+    pub entries: Vec<EntryCosts>,
     /// Per unit, its barriers in stream order (empty where unknown).
     unit_barriers: Vec<Vec<UnitBarrier>>,
     pub replays: u32,
@@ -597,6 +666,7 @@ impl Profiler {
             TraceSamples {
                 samples: vec![Vec::new(); ops.len()],
                 units: vec![Vec::new(); ops.len()],
+                entries: vec![EntryCosts::new(); ops.len()],
                 ops,
                 stamps,
                 segmented,
@@ -701,6 +771,18 @@ impl Profiler {
                     for (k, time) in attribute_replay(unit0, lo, detail).into_iter().enumerate() {
                         if let Some(s) = t.samples.get_mut(first + k) {
                             s.push(time);
+                        }
+                    }
+                    if detail == Detail::Full {
+                        for (k, costs) in attribute_entries(unit0, lo).into_iter().enumerate() {
+                            if let Some(sum) = t.entries.get_mut(first + k) {
+                                for (op, c) in costs {
+                                    let s = sum.entry(op).or_default();
+                                    s.count += c.count;
+                                    s.cycles += c.cycles;
+                                    s.gap += c.gap;
+                                }
+                            }
                         }
                     }
                     for (u, events) in units.iter().enumerate() {
@@ -1222,6 +1304,38 @@ impl ProfileReport {
         out
     }
 
+    /// [`Detail::Full`]: every trace op's entries on unit 0 by kind, one line a kind, averaged over
+    /// the replays that stamped the op ([`attribute_entries`]). Microseconds a replay. Empty
+    /// without full detail.
+    pub fn entries_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
+        let mut out = String::from(
+            "source\tindex\tlabel\twhat\tunits\tsamples\tentry\tname\tcount\tus\tgap_us\n",
+        );
+        for (&id, t) in &self.traces {
+            let source = name(id);
+            for (i, (o, costs)) in t.ops.iter().zip(&t.entries).enumerate() {
+                let n = t.samples[i].len();
+                if n == 0 {
+                    continue;
+                }
+                for (&op, c) in costs {
+                    let _ = writeln!(
+                        out,
+                        "{source}\t{i}\t{}\t{}\t{}\t{n}\t{op:#x}\t{}\t{:.2}\t{:.3}\t{:.3}",
+                        o.label,
+                        o.what,
+                        o.units,
+                        crate::profile::op_name(op),
+                        c.count as f64 / n as f64,
+                        self.us(c.cycles) / n as f64,
+                        self.us(c.gap) / n as f64,
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// The report as markdown: eager ops by label, then each trace by label and its costliest ops.
     /// `name` names a trace by its session id.
     pub fn summary(&self, name: &dyn Fn(u64) -> String) -> String {
@@ -1489,6 +1603,45 @@ mod tests {
         let ops = attribute_replay(&v, 1, Detail::Ops);
         assert_eq!(ops.len(), 1, "{ops:?}");
         assert_eq!(ops[0].span, 50);
+    }
+
+    #[test]
+    fn entries_are_split_by_kind_with_the_gaps_before_them() {
+        let ops = attribute_entries(&replay(), 0);
+        assert_eq!(ops.len(), 3, "the ops attribute_replay returns");
+        for (k, o) in ops.iter().enumerate() {
+            let launch = o[&op::LAUNCH];
+            // The first op's launch follows the list's start by 2, a later one its barrier by 2.
+            assert_eq!(
+                (launch.count, launch.cycles, launch.gap),
+                (1, 2, 2),
+                "op {k}"
+            );
+            assert_eq!(
+                o[&op::KERNEL_WAIT],
+                EntryCost {
+                    count: 1,
+                    cycles: 30,
+                    gap: 6
+                }
+            );
+            assert_eq!(
+                o[&op::BARRIER],
+                EntryCost {
+                    count: 1,
+                    cycles: 9,
+                    gap: 1
+                }
+            );
+            let all: u64 = o.values().map(|c| c.cycles + c.gap).sum();
+            assert_eq!(all, 50, "the op's span, entries and gaps");
+        }
+        let v: Vec<TraceEvent> = replay().into_iter().skip(5 + 6).collect();
+        assert_eq!(
+            attribute_entries(&v, 1).len(),
+            1,
+            "a partial first op is dropped"
+        );
     }
 
     /// A unit that runs ops 0 and 3 of five: its arrivals at 0 and 3, a wait standing for 1 and 2

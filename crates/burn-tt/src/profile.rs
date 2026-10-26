@@ -21,6 +21,8 @@
 //! * `skew.tsv`: every trace op's units, one per line: each unit's work and its wait at the op's
 //!   barrier, from its own stamps.
 //! * `trace.json`: the same as a Perfetto/Chrome trace, spans named by Burn op.
+//! * `entries.tsv` (`TT_PROFILE_DETAIL=full` only): every trace op's entries on unit 0 by kind,
+//!   their time and the gaps before them (`tt_kernels::profile_mode::attribute_entries`).
 //!
 //! `TT_PROFILE_DETAIL=full` stamps every data entry too (fewer ops per replay window). A
 //! `TT_PROFILE` ending in `.json` keeps the raw timestamp trace of every entry instead
@@ -130,6 +132,14 @@ impl Profile {
         std::fs::write(dir.join("summary.md"), self.summary())?;
         std::fs::write(dir.join("ops.tsv"), self.device.tsv(&name))?;
         std::fs::write(dir.join("skew.tsv"), self.device.skew_tsv(&name))?;
+        if self
+            .device
+            .traces
+            .values()
+            .any(|t| t.entries.iter().any(|e| !e.is_empty()))
+        {
+            std::fs::write(dir.join("entries.tsv"), self.device.entries_tsv(&name))?;
+        }
         std::fs::write(dir.join("trace.json"), self.device.chrome_trace(&name))
     }
 }
