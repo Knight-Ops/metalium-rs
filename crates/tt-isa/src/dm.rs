@@ -274,8 +274,27 @@ pub const PREFETCH_CAP: u64 = MAILBOX_BASE + 0xF8;
 /// step (18.40 ms against 18.73 at 4 and 19.08 at 8, `docs/plans/planned-l1-residency.md` 3b).
 pub const PREFETCH_CAP_DEFAULT: u32 = 2;
 /// Host -> RISCV B: the in-flight cap of a weight stream's reads (`record::GATHER_STREAM`),
-/// read as each such record starts; 0 is [`TILE_IN_FLIGHT_CAP`].
+/// read as each such record starts; 0 is [`TILE_IN_FLIGHT_CAP`]. The low 16 bits are an FP32
+/// stream's, the high 16 a stream of BF16 weights' (`record::GATHER_B_BF16`, half the bytes a
+/// read; 0 there is the low half's) ([`stream_caps`]).
 pub const STREAM_CAP: u64 = MAILBOX_BASE + 0xFC;
+/// [`STREAM_CAP`]'s word for an FP32 stream's cap and a BF16 stream's.
+pub const fn stream_caps(f32_cap: u32, bf16_cap: u32) -> u32 {
+    (f32_cap & 0xffff) | (bf16_cap & 0xffff) << 16
+}
+/// The cap [`STREAM_CAP`]'s `word` gives a stream record, BF16 (`bf16`) or not.
+pub const fn stream_cap(word: u32, bf16: bool) -> u32 {
+    let cap = if bf16 && word >> 16 != 0 {
+        word >> 16
+    } else {
+        word & 0xffff
+    };
+    if cap == 0 {
+        TILE_IN_FLIGHT_CAP
+    } else {
+        cap
+    }
+}
 const _: () = assert!(PREFETCH_CAP + 4 <= STREAM_CAP);
 const _: () = assert!(STREAM_CAP + 4 <= MAILBOX_BASE + 0x100);
 /// The [`STREAM_CAP`] a host sets unless told otherwise (`tt_kernels::dm::DataMover::start`,
@@ -283,6 +302,11 @@ const _: () = assert!(STREAM_CAP + 4 <= MAILBOX_BASE + 0x100);
 /// 17.27 / 18.91 ms against 18.28 / 19.84 at the tile cap of 8 (4: 17.80 / 19.32, 1: 18.13 /
 /// 19.99), its products' units served evenly (`docs/plans/decode-to-bandwidth.md` Phase 8).
 pub const STREAM_CAP_DEFAULT: u32 = 2;
+/// [`STREAM_CAP_DEFAULT`] for a stream of BF16 weights (`TT_STREAM_CAP_BF16`): three in flight, half
+/// the bytes each. SmolLM2-1.7B with its weights stored BF16, 96 stream units (card 0, 2026-10-26):
+/// 11.91 / 13.14 ms at 2, 11.77 / 12.99 at 3, 11.70 / 12.93 at 4 (32 / 256-token prompts), where an
+/// FP32 stream at 3 is slower (16.82 -> 17.15 ms).
+pub const STREAM_CAP_BF16_DEFAULT: u32 = 3;
 const _: () = assert!(TRACE_WINDOW + 4 <= PREFETCH_CAP);
 const _: () = assert!(PREFETCH_CAP + 4 <= MAILBOX_BASE + 0x100);
 
@@ -1419,6 +1443,21 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stream's cap from [`STREAM_CAP`]'s word: the low half for FP32, the high half for BF16
+    /// unless it is 0, and 0 the tile cap; an older host's plain word is both.
+    #[test]
+    fn a_stream_cap_word_holds_an_fp32_cap_and_a_bf16_one() {
+        let w = stream_caps(2, 3);
+        assert_eq!((stream_cap(w, false), stream_cap(w, true)), (2, 3));
+        assert_eq!((stream_cap(2, false), stream_cap(2, true)), (2, 2));
+        let w = stream_caps(0, 4);
+        assert_eq!(
+            (stream_cap(w, false), stream_cap(w, true)),
+            (TILE_IN_FLIGHT_CAP, 4)
+        );
+        assert_eq!(stream_cap(0, true), TILE_IN_FLIGHT_CAP);
+    }
     /// `WRITE_L1`: a Tensix coordinate, both ranges in `DATA` and congruent mod 16, at most one
     /// request, the reserved words zero; and only NC runs it.
     #[test]

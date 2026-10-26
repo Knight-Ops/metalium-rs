@@ -59,9 +59,13 @@ Measured, not assumed (A0): the vendored Blackhole unpacker page is a stub, and 
   them); the library keeps it explicit (`Llama::with_bf16_weights`), since only the caller knows its checkpoint is
   BF16. Prefill products gain less (a pair is bound by `B`'s unpacks, which BF16 halves: ~1.07x at HiFi4,
   `silicon_probe_pair_cost`).
-- [ ] **A5. Re-tune for half-size `B` tiles**: compact BF16 L1 slots for the rings and the prefetch (twice the window a
-  unit), the unit counts (40 / 64 / 40), `STREAM_CAP`, the prefetch cap; then the small ops, which are now a larger
-  share.
+- [x] **A5a. The stream re-tuned** (2026-10-26, card 0,
+  [log](../learnings/performance-log.md#re-tuned-for-bf16-weights-2026-10-26-card-0)): a BF16 weight stream on 96 units
+  (`THIN_STREAM_UNITS_BF16`; F32 keeps 64) at 3 reads in flight (the high half of `dm::STREAM_CAP`, taken by the mover
+  for a `GATHER_B_BF16` record; F32 keeps 2, where 3 is slower). The prefetch units (40) and cap (2) stay. A 1.7B step
+  12.89 -> **11.72 ms** at a 32-token prompt.
+- [ ] **A5b.** Compact BF16 L1 slots for the rings and the prefetch (twice the window a unit); then the small ops and
+  per-op cost, now ~4.4 ms of an 11.7 ms step beside ~7.3 ms of weights at 469 GB/s.
 
 ## Limits
 

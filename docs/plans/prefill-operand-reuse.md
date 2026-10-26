@@ -118,6 +118,11 @@ has 64 x 64 output tiles: 8x8 blocks are 64 jobs on 120 units).
     phases interleaved over `Dst` row groups (halves or `fj`) so no `MVMUL` waits on the last. Both need `Src` row
     addressing that Blackhole's pages do not document (`SrcB` past row 16 only by a flat unpack of contiguous faces,
     `fpu.rs`); probe it on ttsim and card 0 first.
+- [ ] ~~**P7. An opt-in lower fidelity for prefill**~~ (asked for 2026-10-26; **not built**, on the arithmetic): `LoFi` keeps
+  `A`'s 7 significant bits and `B`'s 5 (`MVMUL`'s phase 0, step158), about 2^-4.5 of each product, against TF32's
+  ~2^-11; `HiFi2` still cuts one operand to 7 bits (~2^-7). And it pays only where `B`'s unpacks no longer bind: with
+  an F32 `B` LoFi is no faster (14.57 against 14.95 TFLOPS), with a BF16 `B` 1.18-1.35x (`silicon_probe_pair_cost`).
+  The faster pair is the structural one in P4, which keeps every bit.
 - [ ] **P5. Step 2: each operand out of GDDR about once** (multicast along the grid's rows and columns, or strips held
   by a few units and pulled): needs a cross-unit ready/free credit, which does not exist. Worth it once P4 makes the
   products read-bound again.

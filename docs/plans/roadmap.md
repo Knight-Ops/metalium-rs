@@ -493,8 +493,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         [bf16-weight-storage.md](bf16-weight-storage.md), gates `step232`-`step234`): every weight but the embedding
         table stored BF16 and read as BF16 by each product, **bit for bit the F32 step** (the checkpoint is BF16 widened
         at load): a 1.7B step **16.80 / 17.19 -> 12.95 / 13.35 / 14.13 ms** at 32 / 128 / 256 tokens (`1792990193`,
-        `1792989603`), below F32's ~14.3 ms floor. Opt-in for now (`TT_WEIGHT_STORAGE=bf16`, `Llama::with_bf16_weights`).
-        The weights now take ~7.3 ms of it; next, the ~5.6 ms of small ops and per-op cost they no longer hide (A5).
+        `1792989603`), below F32's ~14.3 ms floor; then a BF16 stream on 96 units at 3 reads in flight (A5a):
+        **11.76 / 12.24 / 12.95 ms** (`1793002379`; F32 16.79 / 17.19 / 18.09 in the same session), the 135M 7.30-8.55
+        (7.64-8.89 in F32). `Llama::with_bf16_weights`, the benches' default (`TT_WEIGHT_STORAGE=f32` keeps F32). The
+        weights take ~7.3 ms of a step; next, the ~4.4 ms of small ops and per-op cost they no longer hide (A5b).
+        **Found and fixed on the way:** decode attention's job recorded too low an L1 top, so busy prefetch read the next
+        weights over its `K` and `V` at `Step(512)` (a 1.7B traced generation chose other tokens at a 256-token prompt;
+        gate `step209`).
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.

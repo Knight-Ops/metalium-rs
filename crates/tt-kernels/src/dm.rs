@@ -331,11 +331,18 @@ impl<N: NocId> DataMover<N> {
             d.write32(w, tile, mover.at(dm::PREFETCH_CAP), cap)?;
             // A weight stream's reads' cap: `STREAM_CAP_DEFAULT`, or `TT_STREAM_CAP` (a development
             // knob, decode-to-bandwidth.md Phase 8; 0 is `TILE_IN_FLIGHT_CAP`).
-            let cap = std::env::var("TT_STREAM_CAP")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(dm::STREAM_CAP_DEFAULT);
-            d.write32(w, tile, mover.at(dm::STREAM_CAP), cap)?;
+            // `TT_STREAM_CAP_BF16`, a BF16 weights' stream's (`dm::stream_caps`).
+            let env = |key: &str, default: u32| {
+                std::env::var(key)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(default)
+            };
+            let caps = dm::stream_caps(
+                env("TT_STREAM_CAP", dm::STREAM_CAP_DEFAULT),
+                env("TT_STREAM_CAP_BF16", dm::STREAM_CAP_BF16_DEFAULT),
+            );
+            d.write32(w, tile, mover.at(dm::STREAM_CAP), caps)?;
             // The semantic guard of an `encoded-guard` image (`encoded::guard`): which
             // `TARG_ADDR_HI` words are a usable DRAM endpoint. Other images ignore it.
             let bits: Vec<u8> = encoded::endpoint_bitmap(dram.usable_mask() as u32)

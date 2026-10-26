@@ -1767,10 +1767,10 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
         if stream {
             noc::set_cap_in_flight(
                 TXN,
-                match rd(M.at(dm::STREAM_CAP)) {
-                    0 => dm::TILE_IN_FLIGHT_CAP,
-                    cap => cap,
-                },
+                dm::stream_cap(
+                    rd(M.at(dm::STREAM_CAP)),
+                    rec[0][1] & record::GATHER_B_BF16 != 0,
+                ),
             );
         }
         let result =

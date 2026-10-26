@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Re-tuned for BF16 weights](#re-tuned-for-bf16-weights-2026-10-26-card-0) | 2026-10-26 | a BF16 weight stream on 96 units (64 for F32) at 3 reads in flight (2 for F32): the 1.7B's BF16 decode step 12.89 -> **11.72 ms** at a 32-token prompt |
 | [Where a K-tile pair goes](#where-a-k-tile-pair-goes-2026-10-26-card-1) | 2026-10-26 | a blocked prefill product's pair is bound by `B`'s unpacks (each face twice a pair), not the Matrix Unit (HiFi4 = LoFi at ~15 TFLOPS with an F32 `B`), the drain or the unpackers' speed setting; a BF16 `B` lifts it to 16 (HiFi4) and 21.6 (LoFi) |
 | [Attention's batched products as 2-D blocks](#attentions-batched-products-as-2-d-blocks-2026-10-26-card-0) | 2026-10-26 | attention's `P V` and `Q K^T` a head at a time as K-streamed 2-D blocks, bit for bit: the 1.7B's prefill of 7,992 tokens at chunks of 512 **8.42 -> 6.62 s**, 1,000 tokens 386 -> 375 ms |
 | [BF16 weight storage: half the bytes a decode step reads](#bf16-weight-storage-half-the-bytes-a-decode-step-reads-2026-10-26-card-0) | 2026-10-26 | every 1.7B weight but the embedding table stored BF16, read as BF16 by each product, bit for bit the F32 step: decode **16.80 -> 12.95 ms** at a 32-token prompt (13.35 / 14.13 at 128 / 256), first token 40.6 -> 37.2 ms; found an F32 traced-generation token mismatch at 256 tokens that predates it |
@@ -366,6 +367,32 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Re-tuned for BF16 weights (2026-10-26, card 0)
+
+[bf16-weight-storage.md](../plans/bf16-weight-storage.md) A5. With a stored weight's reads half the bytes, the decode
+stream's unit count and in-flight cap were swept again (`traced_generation_stream_ceiling`, SmolLM2-1.7B-Instruct, its
+weights stored BF16, `TT_TILES=all`, 512-position cache, release, card 0; decode step at 32 / 256-token prompts):
+
+| Setting | ms | Run |
+|---|--:|---|
+| 64 stream units, cap 2 (as F32) | 12.89 / 14.09 | `1792998462` |
+| `TT_THIN_STREAM_UNITS` 80 / 88 / **96** / 104 / 112 / 120 | 12.26 / 12.40 / **11.96** / 12.21 / 12.32 / 12.21 (at 32) | `1792999691`, `1792999865`, `1792998640`, `1793000037`, `1793000209`, `1792998812` |
+| prefetch units 56 / 24 (40 the default) | 12.81 / 14.21 | `1792998983`, `1792999158` |
+| prefetch cap 3 | 12.81 | `1792999332` |
+| stream cap 3 (64 units) | 12.58 | `1792999507` |
+| 96 units, stream cap 3 / 4 | **11.72 / 12.95**; 11.70 / 12.93 | `1793000381`, `1793000552` |
+| F32 weights, stream cap 2 / 3 | 16.82 / 18.11; 17.15 / 18.47 | `1793001433`, `1793001606` |
+
+- **96 units** a BF16 stream (`THIN_STREAM_UNITS_BF16`, `TT_THIN_STREAM_UNITS_BF16`; F32 keeps 64): `q|k|v`'s 96
+  columns a unit each, and half-size reads need more readers to fill GDDR.
+- **The traced generation with both** (`traced_generation`, card 0, burn-flex 1 sample, the run's tokens checked
+  against the logits path at every prompt): SmolLM2-1.7B **11.76 / 12.24 / 12.95 ms** stored BF16 against 16.79 /
+  17.19 / 18.09 in F32 (`1793002379`, `1793002966`; burn-flex 298.8 / 305.9 / 327.2), first token 37.0 / 48.4 / 83.5
+  against 40.6 / 57.0 / 94.6 ms; SmolLM2-135M 7.30 / 7.88 / 8.55 against 7.64 / 8.20 / 8.89 (`1793003555`,
+  `1793003695`; burn-flex 26.4-30.7).
+- **A cap of 3 for a BF16 stream only** (`dm::STREAM_CAP`'s high half, `STREAM_CAP_BF16_DEFAULT`, `TT_STREAM_CAP_BF16`):
+  it helps BF16 and costs F32 0.33 ms, so the mover takes the cap by the record's `GATHER_B_BF16`.
 
 ## Where a K-tile pair goes (2026-10-26, card 1)
 

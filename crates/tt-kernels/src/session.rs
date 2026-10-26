@@ -105,6 +105,14 @@ pub const ARGMAX_UNITS: usize = 64;
 /// 352 / 1,024 us).
 pub const THIN_STREAM_UNITS: usize = 64;
 
+/// [`THIN_STREAM_UNITS`] for a weight stored BF16 (`SrcRoute::Tf32WithBf16B`,
+/// [`Session::set_thin_stream_count_bf16`], `TT_THIN_STREAM_UNITS_BF16`): a unit's reads are half
+/// the bytes, so more units read together before GDDR saturates. Swept on SmolLM2-1.7B with its
+/// weights stored BF16 (card 0, 2026-10-26, `docs/learnings/performance-log.md`, "Re-tuned for BF16
+/// weights"): a step at a 32-token prompt 12.89 ms at 64, 12.26 at 80, 12.40 at 88, **11.96 at
+/// 96**, 12.21 at 104, 12.32 at 112, 12.21 at 120.
+pub const THIN_STREAM_UNITS_BF16: usize = 96;
+
 /// The `K` (tiles) from which a one-tile-row product is a weight stream ([`THIN_STREAM_UNITS`]):
 /// with a short `K` each unit's `A` reads and kernel are a larger share, and more units help (the
 /// 135M head, `K` = 18 tiles: 308 us on 120 units, 318 on 64).
@@ -842,6 +850,8 @@ pub struct Session<T: Transport> {
     thin_stream_units: bool,
     /// [`Session::set_thin_stream_count`].
     thin_stream_count: usize,
+    /// [`Session::set_thin_stream_count_bf16`].
+    thin_stream_count_bf16: usize,
     /// [`Session::host_times`].
     host: HostTimes,
     /// Host memory the card moves tensors through ([`Session::host_dma`]),
@@ -2619,6 +2629,11 @@ impl<T: Transport> Session<T> {
             thin_stream_units: true,
             // `TT_THIN_STREAM_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             thin_stream_count: units_from_env("TT_THIN_STREAM_UNITS", THIN_STREAM_UNITS),
+            // `TT_THIN_STREAM_UNITS_BF16=<n>`: as `TT_THIN_STREAM_UNITS`, for a stored BF16 `B`.
+            thin_stream_count_bf16: units_from_env(
+                "TT_THIN_STREAM_UNITS_BF16",
+                THIN_STREAM_UNITS_BF16,
+            ),
             host: HostTimes::new(),
             staging: None,
             host_dma: true,
@@ -7803,7 +7818,11 @@ impl<T: Transport> Session<T> {
         // `THIN_STREAM_UNITS` units, and more only share it while each pays its own `A` reads and
         // the deal's last round (`silicon_probe_decode_stream`).
         let units = if self.thin_stream_units && mt == 1 && kt >= THIN_STREAM_K_TILES {
-            units.min(self.thin_stream_count)
+            units.min(if route.bf16_b() {
+                self.thin_stream_count_bf16
+            } else {
+                self.thin_stream_count
+            })
         } else {
             units
         };
@@ -9276,6 +9295,12 @@ impl<T: Transport> Session<T> {
     /// [`THIN_STREAM_UNITS`] by default, `TT_THIN_STREAM_UNITS=<n>` at open. At least 1.
     pub fn set_thin_stream_count(&mut self, units: usize) {
         self.thin_stream_count = units.max(1);
+    }
+
+    /// [`Session::set_thin_stream_count`] for a product whose `B` is a stored BF16 weight:
+    /// [`THIN_STREAM_UNITS_BF16`] by default, `TT_THIN_STREAM_UNITS_BF16=<n>` at open. At least 1.
+    pub fn set_thin_stream_count_bf16(&mut self, units: usize) {
+        self.thin_stream_count_bf16 = units.max(1);
     }
 
     /// How the transcendentals run from the next element-wise op on
