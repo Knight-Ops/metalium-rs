@@ -66,6 +66,9 @@ fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
         .unwrap();
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The refill rules of whole-tile reads: a thin read of a ragged `A` leaves its output's
+        // padding undefined by design, and `step190` gates what follows one.
+        s.set_thin_matmul_reads(false);
         f(&mut s);
     }) {
         panic!("{e}");
@@ -83,6 +86,9 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
         .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The refill rules of whole-tile reads: a thin read of a ragged `A` leaves its output's
+        // padding undefined by design, and `step190` gates what follows one.
+        s.set_thin_matmul_reads(false);
         f(&mut s);
     }) {
         panic!("{e}");

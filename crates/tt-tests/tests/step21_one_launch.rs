@@ -60,6 +60,9 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
         .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // One list per tile is the per-tile path's: a product of several tile rows would
+        // otherwise run blocked (`step229` gates those).
+        s.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         f(&mut s);
     }) {
         panic!("{n} tiles: {e}");
@@ -77,6 +80,9 @@ fn with_tiles(n: usize, f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
         .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // One list per tile is the per-tile path's: a product of several tile rows would
+        // otherwise run blocked (`step229` gates those).
+        s.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         f(&mut s);
     }) {
         panic!("{n} tiles: {e}");
