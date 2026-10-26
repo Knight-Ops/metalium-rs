@@ -31,7 +31,7 @@ use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
 use tt_kernels::tensor::{DramTensor, Pad};
 use tt_tests::backend::GATE_TILE;
 use tt_tests::harness::BUDGET;
-use tt_ttsim::fork_scope;
+use tt_ttsim::{fork_scope, outside_fork};
 
 const ROUTE: SrcRoute = SrcRoute::Tf32FromFp32;
 const FIDELITY: Fidelity = Fidelity::HiFi4;
@@ -398,15 +398,22 @@ fn columns_dealt_evenly_equal_one_units_product() {
     use tt_kernels::matmul::Staging;
     use tt_kernels::session::Spread;
     let (m, k, n) = (1, 2048, 192);
-    let plan = tt_kernels::matmul::plan_in([m, k, n], ROUTE, FIDELITY, Staging::Slots).unwrap();
+    // In the parent, so through `outside_fork`: the planner's first call initialises its cache,
+    // and a sibling test forking at that instant would leave its child waiting on it forever.
+    let (plan, runs, blocks) = outside_fork(|| {
+        (
+            tt_kernels::matmul::plan_in([m, k, n], ROUTE, FIDELITY, Staging::Slots).unwrap(),
+            tt_kernels::tensor::thin_runs([1, 64, 6], [64, 2], Staging::Slots, 2).unwrap(),
+            tt_kernels::tensor::blocks([1, 6], [1, 2], 2),
+        )
+    });
     assert_eq!(
         plan.tiles,
         [1, 64, 2],
         "the plan's width this case is built on"
     );
-    let runs = tt_kernels::tensor::thin_runs([1, 64, 6], [64, 2], Staging::Slots, 2).unwrap();
     assert_eq!(runs, [0..2, 2..4, 4..5, 5..6]);
-    assert_eq!(tt_kernels::tensor::blocks([1, 6], [1, 2], 2), [1, 2]);
+    assert_eq!(blocks, [1, 2]);
     with_tiles(TileChoice::Count(2), |s| {
         let (av, bv) = (floats(7, m * k), floats(8, k * n));
         let a = s.upload(&av, m, k).unwrap();
