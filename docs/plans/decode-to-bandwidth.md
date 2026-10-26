@@ -1089,6 +1089,14 @@ recommended opt-in; split-K ~0.2 ms, parked). **Flash-decode probed and stopped*
 ([log](../learnings/performance-log.md#flash-decodes-probe-a-heads-positions-in-two-halves-2026-10-23-card-0)). The
 F32 step's remaining lever is BF16 weight storage.
 
+### Phase 9. BF16 weight storage (2026-10-26)
+
+[bf16-weight-storage.md](bf16-weight-storage.md): the weights stored BF16, half the bytes, bit for bit (the checkpoint
+is BF16 widened at load, and the Matrix Unit multiplies a BF16 `SrcA` as the same value in TF32, gate `step232`). A
+1.7B step **16.80 -> 12.95 ms** at a 32-token prompt (`1792990193`, `1792989603`). The weights take ~7.3 ms of that
+at 469 GB/s; the rest is what Phases 3 and 7 left, now exposed: the next work is there, and the stream's re-tuning for
+half-size tiles (A5).
+
 ## The larger changes compared (2026-10-18)
 
 Four larger changes were left after Phases 1-4's bit-for-bit items. Each was checked against profile `1792298755`

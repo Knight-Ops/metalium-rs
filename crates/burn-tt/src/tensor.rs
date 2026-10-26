@@ -661,7 +661,7 @@ impl TtTensor {
                             let bits = v.into_iter().map(u32::from).collect();
                             server::upload_bits(self.device, bits, rows, cols, Elem::Bool)
                         }
-                        None => panic!(
+                        Some(Elem::Bf16) | None => panic!(
                             "callers check the dtype: {:?} is not stored",
                             self.cell.dtype
                         ),

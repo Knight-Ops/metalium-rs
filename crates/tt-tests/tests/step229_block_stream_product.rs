@@ -314,3 +314,103 @@ fn chunks_accumulated_out_of_order_are_caught() {
         s.free(b).unwrap();
     });
 }
+
+/// A batched product (`Session::matmul_dram_batched`: attention's `P V` and `Q K^T`, a head an
+/// item) takes the blocked path a head at a time: bit for bit the other paths, `B` transposed
+/// (`K^T`) or not, and the chunks last first (the control) change the outputs, so the blocked path
+/// is the one that ran.
+#[test]
+fn batched_products_in_blocks_are_the_other_paths_bit_for_bit() {
+    use tt_kernels::tensor::Block;
+    with_session(4, |s| {
+        let heads = 3;
+        // `P V`: each head's `P` `[96, 256]` stacked by rows, its `V` `[256, 64]` side by side.
+        let (m, k, n) = (96, 256, 64);
+        let p = s.upload(&specials(heads * m * k, 3), heads * m, k).unwrap();
+        let v = s
+            .upload(&specials(k * heads * n, 17), k, heads * n)
+            .unwrap();
+        let pv: Vec<_> = (0..heads)
+            .map(|h| {
+                (
+                    Block {
+                        at: [h * m, 0],
+                        transposed: false,
+                    },
+                    Block {
+                        at: [0, h * n],
+                        transposed: false,
+                    },
+                )
+            })
+            .collect();
+        // `Q K^T`: each head's `Q` `[96, 64]` and `K` `[160, 64]`, stacked by rows.
+        let (qm, qk, qn) = (96, 64, 160);
+        let q = s
+            .upload(&specials(heads * qm * qk, 5), heads * qm, qk)
+            .unwrap();
+        let kk = s
+            .upload(&specials(heads * qn * qk, 7), heads * qn, qk)
+            .unwrap();
+        let qkt: Vec<_> = (0..heads)
+            .map(|h| {
+                (
+                    Block {
+                        at: [h * qm, 0],
+                        transposed: false,
+                    },
+                    Block {
+                        at: [h * qn, 0],
+                        transposed: true,
+                    },
+                )
+            })
+            .collect();
+        let run = |s: &mut Session<_>, a, b, items: &[(Block, Block)], mkn| {
+            let out = s
+                .matmul_dram_batched(
+                    a,
+                    b,
+                    items,
+                    mkn,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    BUDGET * 40,
+                )
+                .unwrap();
+            let v = s.download(&out).unwrap();
+            s.free(out).unwrap();
+            v
+        };
+        for (what, a, b, items, mkn) in [
+            ("P V", &p, &v, &pv, [m, k, n]),
+            ("Q K^T", &q, &kk, &qkt, [qm, qk, qn]),
+        ] {
+            s.set_block_stream(BlockStream::Off);
+            let want = run(s, a, b, items, mkn);
+            for shape in [[3, 2, 2], [1, 4, 1], [2, 1, 3]] {
+                s.set_block_stream(BlockStream::Fixed(shape));
+                let got = run(s, a, b, items, mkn);
+                same(&got, &want, &format!("{what}, {shape:?}"));
+            }
+            s.set_block_stream(BlockStream::Fixed([3, 2, 2]));
+            tensor::probe_reverse_chunks(true);
+            let reversed = run(s, a, b, items, mkn);
+            tensor::probe_reverse_chunks(false);
+            let differ = reversed
+                .iter()
+                .zip(&want)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            assert!(
+                differ > want.len() / 4,
+                "{what}: the chunks last first changed only {differ} of {} outputs",
+                want.len()
+            );
+        }
+        s.set_block_stream(BlockStream::Off);
+        for t in [p, v, q, kk] {
+            s.free(t).unwrap();
+        }
+    });
+}

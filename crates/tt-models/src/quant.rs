@@ -2,7 +2,9 @@
 //!
 //! Six formats meet in one network: F32, BF16 and F16 (logical dtypes, the matrix is computed in
 //! that dtype) and BFP8, BFP4 and BFP2 (block floating point, physical storage of a logical F32
-//! tensor that the device decodes as it computes, `burn_tt::storage`). A [`Plan`] names the format
+//! tensor that the device decodes as it computes, `burn_tt::storage`). A seventh, [`Format::Bf16Stored`],
+//! is BF16 storage of a logical F32 matrix: computed in F32 on the same values, at half the bytes
+//! ([`Plan::bf16_weights`], `docs/plans/bf16-weight-storage.md`). A [`Plan`] names the format
 //! of each matrix by a substring of its parameter path (`layers.3.mlp.down_proj.weight`), and
 //! [`apply`] rewrites a model's matrices accordingly.
 //!
@@ -27,6 +29,10 @@ pub enum Format {
     Bfp8,
     Bfp4,
     Bfp2,
+    /// BF16 storage of a logical F32 matrix: rounded to BF16 (ties-even, which changes nothing in
+    /// a BF16 checkpoint's weights) and computed in F32. burn-tt reads it as a product's `B`
+    /// directly, bit for bit the product of the same values held in F32.
+    Bf16Stored,
 }
 
 impl Format {
@@ -53,6 +59,7 @@ impl Format {
             Format::Bfp8 => StorageFormat::Bfp8,
             Format::Bfp4 => StorageFormat::Bfp4,
             Format::Bfp2 => StorageFormat::Bfp2,
+            Format::Bf16Stored => StorageFormat::Bf16,
             _ => StorageFormat::F32,
         }
     }
@@ -73,6 +80,14 @@ impl Plan {
     pub fn rule(mut self, pattern: &str, format: Format) -> Self {
         self.rules.push((pattern.to_string(), format));
         self
+    }
+
+    /// Every matrix stored BF16 ([`Format::Bf16Stored`]) but the embedding table, whose rows a
+    /// lookup reads (an output head tied to it is stored on its own, [`crate::llama::Llama::untied`]).
+    pub fn bf16_weights() -> Self {
+        Self::new()
+            .rule("embed_tokens", Format::F32)
+            .rule("", Format::Bf16Stored)
     }
 
     pub fn format(&self, name: &str) -> Format {
@@ -153,8 +168,8 @@ impl<B: StorageBackend> Quantizer<B> for Native {
     fn matrix(&self, format: Format, t: Tensor<B, 2>) -> Tensor<B, 2> {
         if let Some(dtype) = format.half() {
             t.cast(dtype)
-        } else if format.bfp_width().is_some() {
-            // Block formats take a logical F32 tensor (`StorageBackend`).
+        } else if format.storage() != StorageFormat::F32 {
+            // Stored formats take a logical F32 tensor (`StorageBackend`).
             t.cast(DType::F32).with_storage(format.storage())
         } else {
             t
@@ -165,7 +180,7 @@ impl<B: StorageBackend> Quantizer<B> for Native {
         let own = t.dtype();
         if let Some(dtype) = format.half() {
             t.cast(dtype).cast(own)
-        } else if format.bfp_width().is_some() {
+        } else if format.storage() != StorageFormat::F32 {
             t.cast(DType::F32).with_storage(format.storage())
         } else {
             t
@@ -196,6 +211,8 @@ impl<B: Backend> Quantizer<B> for Emulated {
             t.cast(dtype)
         } else if format.bfp_width().is_some() {
             Self::round(format, t.cast(DType::F32))
+        } else if format == Format::Bf16Stored {
+            t.cast(DType::BF16).cast(DType::F32)
         } else {
             t
         }
@@ -207,6 +224,8 @@ impl<B: Backend> Quantizer<B> for Emulated {
             t.cast(dtype).cast(own)
         } else if format.bfp_width().is_some() {
             Self::round(format, t.cast(DType::F32))
+        } else if format == Format::Bf16Stored {
+            t.cast(DType::BF16).cast(own)
         } else {
             t
         }

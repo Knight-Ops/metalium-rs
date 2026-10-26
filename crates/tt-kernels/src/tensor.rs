@@ -604,11 +604,16 @@ pub trait OpPadding {
 ///   so the raw bits are the useful form -- and `i32::MIN` has one.
 /// - `Bool` is `0` or `1` as an `I32` (never `1.0`: an FP32 op sees `1` as a
 ///   denormal and would flush it).
+///
+/// `Bf16` is the exception: BF16 datums in [`crate::bf16::TILE_SLOT`]-byte slots (a weight
+/// stored in half the bytes, `docs/plans/bf16-weight-storage.md`), which only a product reads,
+/// as its `B` ([`SrcRoute::Tf32WithBf16B`]); every other op refuses it by its elem.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
     F32,
     I32,
     Bool,
+    Bf16,
 }
 
 /// A `[rows, cols]` matrix of 32-bit datums in GDDR, tiled, FP32 unless
@@ -657,6 +662,30 @@ impl DramTensor {
     pub fn tile(&self, i: usize, j: usize) -> DramRange {
         let [_, ct] = self.grid();
         self.placement.slot(i * ct + j)
+    }
+
+    /// A BF16 tensor's slots as a stored BF16 weight ([`Elem::Bf16`]): a product's `B`
+    /// ([`SrcRoute::Tf32WithBf16B`]), whose padding is `pad`.
+    pub fn from_bf16(t: crate::bf16::Bf16Tensor, pad: Pad) -> Self {
+        let d = DramTensor {
+            rows: t.rows,
+            cols: t.cols,
+            elem: Elem::Bf16,
+            placement: t.placement,
+            pad: std::cell::Cell::new(Pad::Undefined),
+        };
+        d.set_pad(pad);
+        d
+    }
+
+    /// A stored BF16 weight's slots as a [`crate::bf16::Bf16Tensor`] (the same allocation,
+    /// for the BF16 ops: widening, downloading); `None` for any other elem.
+    pub fn as_bf16(&self) -> Option<crate::bf16::Bf16Tensor> {
+        (self.elem == Elem::Bf16).then(|| crate::bf16::Bf16Tensor {
+            rows: self.rows,
+            cols: self.cols,
+            placement: self.placement.clone(),
+        })
     }
 
     /// Allocate a `[rows, cols]` FP32 tensor, contents undefined.
@@ -1806,7 +1835,19 @@ pub(crate) fn matmul_dram_prefetching(
     busy: &[Option<u64>],
 ) -> Result<(Work, Option<usize>, Option<Handoff>)> {
     a.expect("a matmul", Elem::F32)?;
-    b.expect("a matmul", Elem::F32)?;
+    b.expect(
+        "a matmul",
+        if route.bf16_b() {
+            Elem::Bf16
+        } else {
+            Elem::F32
+        },
+    )?;
+    if route.bf16_b() && b_transposed {
+        return Err(TensorError::Shape(
+            "a BF16 `B` is read untransposed: store its transpose".into(),
+        ));
+    }
     let (m, ka) = if a_transposed {
         (a.cols, a.rows)
     } else {
@@ -2007,6 +2048,16 @@ pub(crate) fn matmul_dram_prefetching(
     ))
 }
 
+/// [`record::GATHER_B_BF16`] where `route` reads a BF16 `B` ([`SrcRoute::Tf32WithBf16B`]): its
+/// tiles from their BF16 slots, into the slots an FP32 `B`'s take.
+fn gather_b_format(route: SrcRoute) -> u32 {
+    if route.bf16_b() {
+        record::GATHER_B_BF16
+    } else {
+        0
+    }
+}
+
 /// How one `[m, k, n]` product is cut into jobs: what [`matmul_dram`] and
 /// [`matmul_dram_batched`] share.
 #[derive(Clone)]
@@ -2123,7 +2174,7 @@ impl BlockPlan {
         let unpack_b = self.unpack_b && b_transposed;
         let [mc, nc] = self.block;
         let (units, staging) = (self.units, self.staging);
-        let (in_fmt, out_fmt) = self.route.formats();
+        let in_fmt = self.route.formats().0;
         // Per unit, the `A` rows and slots its last block here read: a session deals job `j` to
         // unit `j % units`, and a unit runs its jobs in order with nothing between them.
         let mut last_a: Vec<Option<(usize, usize, u64)>> = vec![None; units.max(1)];
@@ -2191,7 +2242,8 @@ impl BlockPlan {
                         record::GATHER_B_UNPACK_TRANSPOSE
                     } else {
                         0
-                    };
+                    }
+                    | gather_b_format(self.route);
                 let mut gather = Vec::new();
                 if let (Some(pa), false) = (self.packed_a, resident) {
                     gather.extend(packed_a_reads(pa, 0, kt, a_at));
@@ -2236,8 +2288,14 @@ impl BlockPlan {
                     unpack_b,
                     live,
                     || {
-                        matmul::matmul_kernel(
-                            &outputs, sems, in_fmt, out_fmt, fidelity, allow_mop, unpack_b, live,
+                        matmul::matmul_kernel_with(
+                            &outputs,
+                            sems,
+                            self.route.src_formats(),
+                            fidelity,
+                            allow_mop,
+                            unpack_b,
+                            live,
                         )
                     },
                 );
@@ -2862,7 +2920,8 @@ impl BlockPlan {
                         record::GATHER_B_UNPACK_TRANSPOSE
                     } else {
                         0
-                    };
+                    }
+                    | gather_b_format(self.route);
                 let gather = probe_gather(
                     gather,
                     [
@@ -3023,7 +3082,8 @@ impl BlockPlan {
                             record::GATHER_B_UNPACK_TRANSPOSE
                         } else {
                             0
-                        };
+                        }
+                        | gather_b_format(self.route);
                     let gather = match self.packed_a {
                         Some(pa) => packed_a_reads(pa, k0, count, layout.a_at),
                         None => Vec::new(),
@@ -3468,7 +3528,8 @@ fn push_block_stream_jobs(
                         record::GATHER_B_UNPACK_TRANSPOSE
                     } else {
                         0
-                    };
+                    }
+                    | gather_b_format(route);
                 let gather = probe_gather(
                     Vec::new(),
                     [
@@ -3649,6 +3710,7 @@ pub fn matmul_dram_batched(
         None,
         [false; 2],
         false,
+        BlockStream::Off,
     )
 }
 
@@ -3674,6 +3736,7 @@ pub(crate) fn matmul_dram_batched_limited(
     max_k_tiles: Option<std::num::NonZeroUsize>,
     padded: [bool; 2],
     unpack_b: bool,
+    block_stream: BlockStream,
 ) -> Result<Work> {
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
@@ -3715,6 +3778,39 @@ pub(crate) fn matmul_dram_batched_limited(
             operand(b, padded[1], bb.at, eb, "a batched matmul's right operand")?,
             [ba.transposed, bb.transposed],
         ));
+    }
+    // Each product as 2-D blocks with `K` streamed (`docs/plans/prefill-operand-reuse.md`), where
+    // the mode asks for them and the model beats this plan's on the units each product gets:
+    // attention's `P V` over a long prefix otherwise reads `P` once an output column and `V` once
+    // an output row, with every partial through GDDR (one output tile a job, `push_k_jobs`).
+    if max_k_tiles.is_none() {
+        let [bmc, bnc] = blocks([mt, nt], [mc, nc], per_item);
+        let other = blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], per_item);
+        if let Some((shape, layout)) =
+            block_stream_plan(block_stream, [mt, kt, nt], per_item, other, route, fidelity)
+        {
+            let rows = if batch == 1 { m } else { batch * mt * 32 };
+            let c = DramTensor::alloc(alloc, rows, n)?;
+            let mut jobs = Vec::new();
+            for (i, (ra, rb, t)) in refs.into_iter().enumerate() {
+                let mut rc = c.tensor_ref();
+                rc.first += (i * mt * nt) as u32;
+                push_block_stream_jobs(
+                    &mut jobs,
+                    &shape,
+                    &layout,
+                    [mt, kt, nt],
+                    m,
+                    [ra, rb, rc],
+                    t,
+                    0,
+                    unpack_b && t[1] && route == SrcRoute::Tf32FromFp32,
+                    route,
+                    fidelity,
+                );
+            }
+            return Ok(Work { out: c, jobs });
+        }
     }
     let plan = BlockPlan {
         tiles: [mt, kt, nt],
@@ -7242,6 +7338,7 @@ mod tests {
                     Some(Elem::F32) | None => floats.to_vec(),
                     Some(Elem::Bool) => vec![f32::from_bits(1)],
                     Some(Elem::I32) => [1, u32::MAX, 0x8000_0000].map(f32::from_bits).to_vec(),
+                    Some(Elem::Bf16) => unreachable!("no element-wise kind takes BF16"),
                 }
             };
             for s in scalars {

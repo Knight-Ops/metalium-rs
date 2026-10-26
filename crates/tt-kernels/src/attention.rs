@@ -205,6 +205,15 @@ fn build_kernels(
     unpack_b: bool,
 ) -> Result<Vec<Step>> {
     let at = plan_slots([kt, nt, dvt]).ok_or_else(|| shape_error("the job does not fit L1"))?;
+    // The job's slots, up to its last: what the op reaches in `DATA` (`trace::OpRecord::l1_top`).
+    // Its products' and reductions' own layouts note far less, and a busy unit's weight prefetch
+    // lands above the highest top the ops before its product noted (`Session::busy_start`): left
+    // out, a 1.7B step at 512 positions read `B` over its own `K` and `V` slots and chose other
+    // tokens (found 2026-10-26, `silicon_bench_models::traced_generation`, 256-token prompt).
+    crate::l1::note_planned_top(slot_at(
+        crate::l1::arena().base,
+        slots_needed([kt, nt, dvt]),
+    ));
     let (in_fmt, out_fmt) = route.formats();
     let live = LiveRows::for_rows(rows);
     let slot = |base: u64, n: usize| base + n as u64 * TILE_SLOT;

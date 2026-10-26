@@ -154,6 +154,15 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// A logical F32 buffer stored as BF16 (`store`: `Session::store_bf16`, half the bytes, read
+    /// by a product as its `B`) or such a buffer widened back to F32 (`Session::widen_bf16`).
+    fn cast_bf16_storage(
+        &mut self,
+        _id: BufferId,
+        _store: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// Put a row-major `[rows, cols]` matrix of `elem` datums on the device, as
     /// their bits (`hardware-coverage.md` D3): an `I32`'s two's complement, a
     /// `Bool`'s `0` or `1`.
@@ -931,6 +940,22 @@ impl DramBuffers {
             let t = s.bfp_to_f32(t).map_err(error)?;
             Ok(self.insert(t))
         }
+    }
+
+    pub fn cast_bf16_storage<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+        store: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let t = self.get(id)?;
+        let out = if store {
+            s.store_bf16(t)
+        } else {
+            s.widen_bf16(t)
+        }
+        .map_err(TtError::from)?;
+        Ok(self.insert(out))
     }
 
     pub fn matmul_bfp<T: tt_device::Transport>(
@@ -2856,6 +2881,22 @@ pub(crate) fn cast_bfp(
     )
 }
 
+/// [`Engine::cast_bf16_storage`]: `id` stored as BF16, or widened back to F32.
+pub(crate) fn cast_bf16_storage(
+    device: TtDevice,
+    id: BufferId,
+    dims: [usize; 2],
+    store: bool,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "cast_bf16_storage",
+        device,
+        dims,
+        move || format!("BF16 storage, store {store}"),
+        move |engine, ids| engine.cast_bf16_storage(ids.get(id)?, store),
+    )
+}
+
 pub(crate) fn matmul_bfp(
     device: TtDevice,
     a: BufferId,
@@ -3608,6 +3649,16 @@ impl Engine for KmdEngine {
             .as_mut()
             .ok_or_else(unsupported)?
             .cast_bfp(&mut self.session, id, format)
+    }
+    fn cast_bf16_storage(
+        &mut self,
+        id: BufferId,
+        store: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .cast_bf16_storage(&mut self.session, id, store)
     }
     fn matmul_bfp(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers.as_mut().ok_or_else(unsupported)?.matmul_bfp(

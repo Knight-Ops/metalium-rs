@@ -280,3 +280,81 @@ fn positions_in_another_order_give_other_bits() {
         );
     });
 }
+
+/// **What a job reaches of L1 is what its op records** (`trace::OpRecord::l1_top`): the job lays its
+/// slots from `DATA`'s base (`q`, `K`, the mask, the scores twice, the statistics, `V`, the
+/// output), and a busy unit's weight prefetch lands above the highest top the ops before its
+/// product recorded (`Session::busy_start`). Watched failing: the top recorded was the job's
+/// products' own layouts', far below its `K` and `V` slots, and the 1.7B's step at 512 positions
+/// read its next weights over them (`silicon_bench_models::traced_generation`, 256-token prompt).
+#[test]
+fn a_captured_job_records_the_l1_its_slots_reach() {
+    use tt_kernels::attention::Item;
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::session::{Session, TileChoice as Tiles};
+    use tt_kernels::tensor::Elem;
+    tt_ttsim::fork_scope(|| {
+        let mut sim = tt_ttsim::Simulator::open().unwrap();
+        let dev = tt_device::Device::open(sim.transport()).unwrap();
+        let mut s = Session::open(dev, tt_firmware_images::ROLES, Tiles::Count(2), |_, _| {
+            Ok(None)
+        })
+        .unwrap();
+        s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+            .unwrap();
+        let (heads, d) = (2usize, 64usize);
+        for l in [64usize, 512] {
+            let q = s.upload(&values(1, heads * d, false), heads, d).unwrap();
+            let k = s
+                .upload(&values(2, l * heads * d, false), l, heads * d)
+                .unwrap();
+            let v = s
+                .upload(&values(3, l * heads * d, false), l, heads * d)
+                .unwrap();
+            let last: Vec<u32> = (0..l).map(|p| u32::from(p + 1 == l)).collect();
+            let mask = s.upload_bits(&last, 1, l, Elem::Bool).unwrap();
+            let items: Vec<Item> = (0..heads)
+                .map(|h| Item {
+                    q: [h, 0],
+                    k: [0, h * d],
+                    v: [0, h * d],
+                })
+                .collect();
+            s.begin_trace().unwrap();
+            let out = s
+                .attention_rows(
+                    &q,
+                    &k,
+                    &v,
+                    &mask,
+                    &items,
+                    [1, d, l, d],
+                    0.125,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    tt_tests::harness::BUDGET,
+                )
+                .unwrap();
+            let id = s.end_trace().unwrap();
+            let (kt, nt, dvt) = (d / 32, l / 32, d / 32);
+            let slots = kt + kt * nt + nt + 2 * nt + 2 + nt * dvt + dvt;
+            let reach = tt_isa::l1::DATA.base + slots as u64 * tt_isa::dm::TILE_SLOT;
+            let top = s
+                .trace_ops(id)
+                .unwrap()
+                .iter()
+                .map(|op| op.l1_top)
+                .max()
+                .unwrap();
+            assert!(
+                top >= reach,
+                "l {l}: the op recorded L1 to {top:#x}, its slots reach {reach:#x}"
+            );
+            s.release_trace(id).unwrap();
+            for t in [q, k, v, mask, out] {
+                s.free(t).unwrap();
+            }
+        }
+    })
+    .unwrap();
+}

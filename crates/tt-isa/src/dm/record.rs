@@ -24,7 +24,7 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// column `j` of `B` to `b_at + (kk * cols + j) * TILE_SLOT`. `flags`: bit 0
 /// `A` is read transposed, bit 1 `B`, bits 8..=24 `kt` ([`gather_kt`]), bit 25
 /// [`GATHER_A_RESIDENT`], bit 26 [`GATHER_B_UNPACK_TRANSPOSE`], bit 27 [`GATHER_PREFETCH`],
-/// bit 28 [`GATHER_STREAM`]; bits 29-31 zero. Bit 2 selects packed
+/// bit 28 [`GATHER_STREAM`], bit 29 [`GATHER_B_BF16`]; bits 30-31 zero. Bit 2 selects packed
 /// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
 /// logical rows/columns and words 6/7 their tile row/column origins.
 /// GDDR slots are 2112 bytes; L1 slots remain 4160.
@@ -61,9 +61,31 @@ pub const GATHER_PREFETCH: u32 = 1 << 27;
 /// (`docs/plans/decode-to-bandwidth.md` Phase 8, "The stream's rate"). The reads are the
 /// record's as without it. Not with [`GATHER_PREFETCH`], whose reads have a cap of their own.
 pub const GATHER_STREAM: u32 = 1 << 28;
+/// [`GATHER`]'s flag for a `B` stored BF16 (a weight in half the bytes) beside an FP32 `A`:
+/// `B`'s tiles are BF16 images in [`super::BF16_TILE_SLOT`]-byte GDDR slots, each read whole
+/// into the start of its [`TILE_SLOT`] in L1, where the kernel unpacks it as BF16
+/// (`tt_kernels::matmul::SrcRoute::Tf32WithBf16B`). `B` untransposed only (not bit 1, not
+/// [`GATHER_B_UNPACK_TRANSPOSE`]), and not with packed BF16 (bit 2), which is both operands; with
+/// every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is the
+/// writer's (zero for a stored weight): nothing is filled.
+pub const GATHER_B_BF16: u32 = 1 << 29;
 /// [`GATHER`]'s flag bits that are not `kt`.
-const GATHER_FLAG_BITS: u32 =
-    GATHER_A_RESIDENT | GATHER_B_UNPACK_TRANSPOSE | GATHER_PREFETCH | GATHER_STREAM | 0xff;
+const GATHER_FLAG_BITS: u32 = GATHER_A_RESIDENT
+    | GATHER_B_UNPACK_TRANSPOSE
+    | GATHER_PREFETCH
+    | GATHER_STREAM
+    | GATHER_B_BF16
+    | 0xff;
+
+/// `B`'s GDDR slot and read length under `flags`: [`super::BF16_TILE_SLOT`] for
+/// [`GATHER_B_BF16`], else [`TILE_SLOT`].
+const fn gather_b_slot(flags: u32) -> u64 {
+    if flags & GATHER_B_BF16 != 0 {
+        super::BF16_TILE_SLOT
+    } else {
+        TILE_SLOT
+    }
+}
 
 /// A prefetch [`GATHER`]'s reads one at a time: a record with [`GATHER_PREFETCH`] and
 /// [`GATHER_A_RESIDENT`] reads only `B`, tile by tile, and a mover can issue them while it would
@@ -79,6 +101,8 @@ pub struct PrefetchCursor {
     j0: u32,
     /// `B` read as it lies, transposed by the kernel ([`GATHER_B_UNPACK_TRANSPOSE`]).
     unpacked: bool,
+    /// `B`'s GDDR slot, and each read's length ([`GATHER_B_BF16`]).
+    slot: u32,
     next: u32,
 }
 
@@ -101,6 +125,9 @@ impl PrefetchCursor {
         if unpacked && (!b_t || flags & GATHER_BF16 != 0) {
             return Err(super::error::RANGE);
         }
+        if flags & GATHER_B_BF16 != 0 && (b_t || flags & GATHER_BF16 != 0) {
+            return Err(super::error::RANGE);
+        }
         if flags & GATHER_BF16 != 0 || (b_t && !unpacked) || flags & GATHER_STREAM != 0 {
             return Err(super::error::RANGE);
         }
@@ -117,6 +144,7 @@ impl PrefetchCursor {
             cols,
             j0,
             unpacked,
+            slot: gather_b_slot(flags) as u32,
             next: 0,
         }))
     }
@@ -138,9 +166,9 @@ impl Iterator for PrefetchCursor {
         let (kk, j) = (self.next / self.cols, self.next % self.cols);
         self.next += 1;
         let at = if self.unpacked {
-            self.b.tile(self.j0 + j, kk)
+            self.b.tile_in(self.j0 + j, kk, self.slot as u64)
         } else {
-            self.b.tile(kk, self.j0 + j)
+            self.b.tile_in(kk, self.j0 + j, self.slot as u64)
         };
         Some(at.map(|(ch, off)| {
             [
@@ -149,7 +177,7 @@ impl Iterator for PrefetchCursor {
                 (kk + self.j0 + j) % PORTS,
                 off,
                 self.b_at + (kk * self.cols + j) * TILE_SLOT as u32,
-                TILE_SLOT as u32,
+                self.slot,
                 0,
                 0,
             ]
@@ -435,12 +463,17 @@ impl TensorRef {
 
     /// `(channel, offset)` of tile `(i, j)`'s slot.
     fn tile(&self, i: u32, j: u32) -> Result<(u32, u32), u32> {
+        self.tile_in(i, j, TILE_SLOT)
+    }
+
+    /// [`TensorRef::tile`] in slots of `slot` bytes.
+    fn tile_in(&self, i: u32, j: u32, slot: u64) -> Result<(u32, u32), u32> {
         if self.n == 0 {
             return Err(super::error::RANGE);
         }
         let t = self.first + i * self.ct + j;
         let (s, c) = (t / self.n as u32, t % self.n as u32);
-        let offset = (self.base[c as usize] as u64) + s as u64 * TILE_SLOT;
+        let offset = (self.base[c as usize] as u64) + s as u64 * slot;
         let offset = u32::try_from(offset).map_err(|_| super::error::RANGE)?;
         Ok((self.channels[c as usize] as u32, offset))
     }
@@ -564,6 +597,10 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             let resident = flags & GATHER_A_RESIDENT != 0;
             let b_unpacked = flags & GATHER_B_UNPACK_TRANSPOSE != 0;
             if b_unpacked && (!b_t || flags & GATHER_BF16 != 0) {
+                return Err(super::error::RANGE);
+            }
+            let b_slot = gather_b_slot(flags);
+            if flags & GATHER_B_BF16 != 0 && (b_t || flags & GATHER_BF16 != 0) {
                 return Err(super::error::RANGE);
             }
             // A prefetch's reads stay in flight under the entries after it: plain reads only,
@@ -720,6 +757,12 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 for j in 0..cols {
                     let to = b_at + (kk * cols + j) * TILE_SLOT as u32;
                     emit(match row.as_mut() {
+                        // A BF16 `B` (untransposed): its own slot, read whole.
+                        Some(r) if b_slot != TILE_SLOT => {
+                            let mut e = read(r.next_with_slot(b_slot)?, kk, j0 + j, to);
+                            e[5] = b_slot as u32;
+                            e
+                        }
                         Some(r) => read(r.next()?, kk, j0 + j, to),
                         // The kernel transposes it: the tile as it lies.
                         None if b_unpacked => read(b.tile(j0 + j, kk)?, kk, j0 + j, to),
@@ -1438,6 +1481,8 @@ mod tests {
                     GATHER_A_RESIDENT | 1,
                     GATHER_A_RESIDENT | gather_rows(5),
                     GATHER_A_RESIDENT | 2 | GATHER_B_UNPACK_TRANSPOSE,
+                    GATHER_A_RESIDENT | GATHER_B_BF16,
+                    GATHER_A_RESIDENT | gather_rows(5) | GATHER_B_BF16,
                 ] {
                     let head = |f: u32| [GATHER, f | kt << 8, 0x2_0000, 0x6_0000, 0, 1, j0, cols];
                     let rec = |f: u32| {
@@ -1491,6 +1536,11 @@ mod tests {
             (GATHER_A_RESIDENT | 2, t(2, 4)),
             (GATHER_A_RESIDENT | GATHER_BF16, t(2, 4)),
             (GATHER_A_RESIDENT | GATHER_STREAM, t(2, 4)),
+            (GATHER_A_RESIDENT | GATHER_B_BF16 | 2, t(2, 4)),
+            (
+                GATHER_A_RESIDENT | GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
+                t(2, 4),
+            ),
         ] {
             let [a0, a1] = t(2, 4).encode();
             let [b0, b1] = b.encode();
@@ -1601,12 +1651,92 @@ mod tests {
                 "{flags:#x}"
             );
         }
-        for bad in [1 << 29, 1 << 31] {
+        for bad in [1 << 30, 1 << 31] {
             assert_eq!(
                 gather(bad, a0, b0),
                 Err(super::super::error::LENGTH),
                 "{bad:#x}"
             );
+        }
+    }
+
+    /// A BF16 `B` ([`GATHER_B_BF16`]) is read from its own slots: each tile's whole
+    /// [`super::super::BF16_TILE_SLOT`] from where a BF16 tensor keeps it (slot `t / n` of 2,112
+    /// bytes on channel `t % n`), into the same L1 slot an FP32 `B`'s tile goes to, and `A`'s
+    /// entries are untouched -- whole, thin, transposed, resident, streamed. A transposed `B` and
+    /// packed BF16 are refused.
+    #[test]
+    fn a_bf16_b_reads_its_own_slots_whole() {
+        use super::super::BF16_TILE_SLOT;
+        let mut a = t(3, 5);
+        a.first = 2;
+        let mut b = t(3, 7);
+        b.first = 4;
+        let [a0, a1] = a.encode();
+        let [b0, b1] = b.encode();
+        let (i0, rows, j0, cols, kt) = (1u32, 2u32, 2u32, 3u32, 4u32);
+        let gather = |flags: u32| {
+            let head = [
+                GATHER,
+                flags | kt << 8,
+                0x2_0000,
+                0x6_0000,
+                i0,
+                rows,
+                j0,
+                cols,
+            ];
+            let mut got = Vec::new();
+            expand(&[head, a0, a1, b0, b1], |e| {
+                got.push(e);
+                Ok(())
+            })
+            .map(|_| got)
+        };
+        let mut cases = 0;
+        for flags in [
+            0,
+            1,
+            gather_rows(5),
+            GATHER_A_RESIDENT,
+            GATHER_STREAM,
+            GATHER_A_RESIDENT | GATHER_PREFETCH,
+        ] {
+            let f32_b = gather(flags).unwrap();
+            let bf16_b = gather(flags | GATHER_B_BF16).unwrap();
+            assert_eq!(f32_b.len(), bf16_b.len(), "{flags:#x}");
+            let first_b = f32_b.iter().position(|e| e[4] >= 0x6_0000).unwrap();
+            assert_eq!(
+                bf16_b[..first_b],
+                f32_b[..first_b],
+                "A's entries, {flags:#x}"
+            );
+            for (n, (got, was)) in bf16_b[first_b..].iter().zip(&f32_b[first_b..]).enumerate() {
+                let (kk, j) = (n as u32 / cols, n as u32 % cols);
+                let tile = b.first + kk * b.ct + j0 + j;
+                let (slot, c) = (tile / b.n as u32, (tile % b.n as u32) as usize);
+                let want = [
+                    op::READ,
+                    b.channels[c] as u32,
+                    was[2],
+                    b.base[c] + slot * BF16_TILE_SLOT as u32,
+                    0x6_0000 + (kk * cols + j) * TILE_SLOT as u32,
+                    BF16_TILE_SLOT as u32,
+                    0,
+                    0,
+                ];
+                assert_eq!(*got, want, "{flags:#x}, B tile {n}");
+                assert_eq!(got[4], was[4], "the FP32 B's L1 slot");
+                cases += 1;
+            }
+        }
+        assert!(cases > 50);
+        for bad in [
+            GATHER_B_BF16 | 2,
+            GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
+            GATHER_B_BF16 | GATHER_BF16,
+        ] {
+            assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
         }
     }
 

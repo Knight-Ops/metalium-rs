@@ -3145,6 +3145,45 @@ impl<T: Transport> Session<T> {
         self.execute(work, RESET_BUDGET)
     }
 
+    /// `input` stored as a BF16 weight ([`tensor::Elem::Bf16`], half the bytes): what a product
+    /// reads as its `B` through [`SrcRoute::Tf32WithBf16B`], equal bit for bit to the product of
+    /// `input` wherever `input` holds BF16 values (a BF16 checkpoint widened to F32). The
+    /// conversion is [`Session::bf16_from_f32`]'s (ties-even, NaNs quieted, BF16 subnormals to
+    /// signed zero, as `Src` flushes them anyway); its padding is zero.
+    pub fn store_bf16(&mut self, input: &DramTensor) -> Result<DramTensor, TensorError> {
+        input.expect("BF16 storage", tensor::Elem::F32)?;
+        let repaired = self.meet(input, tensor::PadNeed::Zero)?;
+        let stored = self.bf16_from_f32(repaired.as_ref().unwrap_or(input));
+        if let Some(r) = repaired {
+            self.free(r)?;
+        }
+        Ok(DramTensor::from_bf16(stored?, tensor::Pad::Zero))
+    }
+
+    /// A weight's BF16 bits (row-major), uploaded as a stored BF16 weight
+    /// ([`Session::store_bf16`]'s result, exactly these bits, padding zero): a BF16 checkpoint's
+    /// own values, with no conversion on the card (which ttsim cannot run: divergence "BF16 late
+    /// narrowing").
+    pub fn upload_bf16_weight(
+        &mut self,
+        bits: &[u16],
+        rows: usize,
+        cols: usize,
+    ) -> Result<DramTensor, TensorError> {
+        let t = self.upload_bf16(bits, rows, cols)?;
+        Ok(DramTensor::from_bf16(t, tensor::Pad::Zero))
+    }
+
+    /// A stored BF16 weight ([`Session::store_bf16`]) widened to a new FP32 tensor, for any op
+    /// but a product's `B`.
+    pub fn widen_bf16(&mut self, stored: &DramTensor) -> Result<DramTensor, TensorError> {
+        stored.expect("widening a stored BF16 weight", tensor::Elem::Bf16)?;
+        let t = stored.as_bf16().expect("a stored BF16 weight");
+        let out = self.bf16_to_f32(&t)?;
+        out.set_pad(stored.pad());
+        Ok(out)
+    }
+
     pub fn free_bf16(&mut self, tensor: crate::bf16::Bf16Tensor) -> Result<(), TensorError> {
         self.free_placement(tensor.placement)
     }
@@ -7707,7 +7746,22 @@ impl<T: Transport> Session<T> {
         use tensor::OpPadding;
         // Before any padding fill: an integer tensor is refused untouched.
         a.expect("a matmul", tensor::Elem::F32)?;
-        b.expect("a matmul", tensor::Elem::F32)?;
+        // A stored BF16 weight is read as it is, as BF16 into `SrcA`: the product of the same
+        // values in FP32 bit for bit (`SrcRoute::Tf32WithBf16B`, gate `step232`).
+        let route = match (b.elem, route) {
+            (tensor::Elem::Bf16, SrcRoute::Tf32FromFp32 | SrcRoute::Tf32WithBf16B) => {
+                SrcRoute::Tf32WithBf16B
+            }
+            (tensor::Elem::Bf16, _) => {
+                return Err(TensorError::Shape(format!(
+                    "a stored BF16 `B` multiplies through TF32 only, not {route:?}"
+                )))
+            }
+            _ => {
+                b.expect("a matmul", tensor::Elem::F32)?;
+                route
+            }
+        };
         // A single-face TF32 operand has a validated Src transpose route.
         // Conversion is already required by this product; arbitrary storage
         // transpose and physically packed BF16 remain raw-copy operations.
@@ -7773,7 +7827,7 @@ impl<T: Transport> Session<T> {
             && !a_transposed
             && a.cols % 32 == 0
             && kt >= PACKED_A_K_TILES
-            && route == SrcRoute::Tf32FromFp32;
+            && matches!(route, SrcRoute::Tf32FromFp32 | SrcRoute::Tf32WithBf16B);
         // The op that made `A` may have packed it already (`Session::set_packed_twins`).
         let twin = packs.then(|| self.packed_twin(a).cloned()).flatten();
         let packed = if packs && twin.is_none() {
@@ -8225,6 +8279,7 @@ impl<T: Transport> Session<T> {
             let pipeline = self.pipeline;
             let max_k_tiles = self.matmul_k_block_limit;
             let unpack_b = self.unpack_transposed_b;
+            let block_stream = self.block_stream;
             let out = self
                 .dram_state()
                 .and_then(|d| {
@@ -8242,6 +8297,7 @@ impl<T: Transport> Session<T> {
                         max_k_tiles,
                         padded,
                         unpack_b,
+                        block_stream,
                     )
                 })
                 .and_then(|work| self.execute_on(work, units, budget))?;

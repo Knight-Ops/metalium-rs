@@ -136,6 +136,10 @@ fn roles(layout: &kernel::Layout, compress: bool) -> [Vec<Instruction>; 3] {
         // eight 128-datum chunks by MOVA2D instead of UnpackToDst, which
         // cannot widen this format. Each bank is released exactly once.
         unpack = datapath::src_thread_config();
+        // Every counter from zero: a product's face selects (`SETADCZW`) leave unpacker 0's `Z`
+        // where its last face was, which would offset every datum read here
+        // (`step233`'s widening after a product).
+        unpack.extend(datapath::clear_unpacker0_adcs());
         let mut empty = tt_isa::matrix::Banks::after_reset();
         for chunk in 0..8 {
             unpack.extend(sync::take(s.free, Before::UNPACKER));

@@ -1098,6 +1098,34 @@ The probe is `silicon_probe_decode_stream`, traced, so the times are the card's.
     unpacks and multiplies all four faces (64 `MVMUL`s a pair at HiFi4), where row 0 needs 16. Whether a pair is
     bound by its `MVMUL`s or its unpacks is unmeasured.
 
+## A BF16 `B` beside a TF32 `A`: the same product (2026-10-26, card 0 and ttsim)
+
+Gate `step232_mixed_src_formats` (card 0 `1792986764`): `A` FP32 in L1 unpacked to `SrcB` under `OutDataFormat` TF32
+(4), `B` BF16 in L1 unpacked to `SrcA` under BF16 (5), is **bit for bit the product of the same values both in FP32
+through TF32**, at LoFi, HiFi2 and HiFi4, with signed zeros, BF16 subnormals, `bf16::MAX`, infinities and NaN in `B`.
+So the Matrix Unit takes the two `Src` registers in different formats, and a BF16 datum in `SrcA` is the TF32 datum of
+the same value (the phases slice by bit position). What it buys: a weight stored BF16 (half the bytes) multiplies as
+its F32 widening (`SrcRoute::Tf32WithBf16B`, [bf16-weight-storage.md](../plans/bf16-weight-storage.md)). BF16 in with
+TF32 out (code 5 in, 4 out) is not a way to write it: the specification calls a mismatched pair undefined and ttsim
+refuses it (`in_data_format=5 mismatches out_data_format=4`); not tried on silicon. Blackhole's `UNPACR_Regular.md` is
+a stub; this is measured, not read off Wormhole's `WriteSrcBF16`.
+
+**A trap found on the way (fixed):** unpacker 0's address counters outlive a kernel. A product's face selects
+(`SETADCZW`) leave its `Z` counter on a later face; the BF16 widening (`bf16::expand`, through `SrcA` and `MOVA2D`) set
+only `X`, so every widening after any product read the wrong datums (on ttsim and card 0 alike: `step233`'s widening,
+elements shifted by whole faces). It now clears the counters first, as the narrowing always did. Any kernel that
+unpacks after another must set every counter it relies on.
+
+## An op's recorded L1 top must cover everything it lays out (2026-10-26, card 0 and 1)
+
+Busy prefetch places a unit's next weight ring above the highest `l1_top` the ops since the last product recorded
+(`Session::busy_start`), so an op that lays out L1 itself must note its whole reach (`crate::l1::note_planned_top`), not
+leave it to the layouts of the kernels it calls. Decode attention's job did not: at `Step(512)` its `K` and `V` slots
+sat above what its inner products and reductions noted, the next weights landed on them, and a 1.7B step chose other
+tokens (found in `silicon_bench_models::traced_generation`'s 256-token prompt, which the bit-for-bit gates at shorter
+lengths never reached; gate `step209` `a_captured_job_records_the_l1_its_slots_reach`). Symptom to recognise: a traced
+run that disagrees with itself between the logits path and the token path, fixed by `TT_BUSY_PREFETCH=0`.
+
 ## A matmul's transposed `B` through unpacker 0 (2026-10-17, card 0)
 
 From [decode-attention.md](../plans/decode-attention.md) A0b; gate `step201_unpacker_transposed_b`.

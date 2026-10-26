@@ -422,14 +422,46 @@ fn write_bases() -> [Instruction; 4] {
 /// plus its stride (`ADDDMAREG`, `step38_gpr_add`), written back. The same
 /// eight words every pair.
 fn gpr_step() -> Vec<Instruction> {
-    let mut p = vec![
-        backend::wait_for_unpacker0(Before::CONFIG).unwrap(),
-        backend::wait_for_unpacker1(Before::CONFIG).unwrap(),
+    let mut p = Vec::new();
+    if !PROBE_NO_DRAIN.load(std::sync::atomic::Ordering::Relaxed) {
+        p.extend([
+            backend::wait_for_unpacker0(Before::CONFIG).unwrap(),
+            backend::wait_for_unpacker1(Before::CONFIG).unwrap(),
+        ]);
+    }
+    p.extend([
         encode::adddmareg(A_BASE_GPR, A_STRIDE_GPR, A_BASE_GPR).unwrap(),
         encode::adddmareg(B_BASE_GPR, B_STRIDE_GPR, B_BASE_GPR).unwrap(),
-    ];
+    ]);
     p.extend(write_bases());
     p
+}
+
+/// A probe only (`silicon_probe_pair_cost`): [`gpr_step`] without its wait for both unpackers to
+/// drain, so the next pair's bases may land under an unpack still reading: the products are
+/// **wrong**, and only their time means anything (how much of a K-tile pair the drain costs).
+/// Process-wide, and set before any product's programs are built (the program caches do not key
+/// on it).
+static PROBE_NO_DRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A probe only (`silicon_probe_pair_cost`): each unpacker's `Throttle_mode` in a product's
+/// `Src` configuration, unpacker 0 (`B`, into `SrcA`) in the low byte and unpacker 1 (`A`, into
+/// `SrcB`) in the next; 0 (the default) is x1, 16 bytes a cycle from L1, and 1 and 2 ask for x2
+/// and x4 (Wormhole's `UNPACR_Regular.md`, "Performance"; not documented for Blackhole).
+/// Process-wide, set before any product's programs are built.
+static PROBE_THROTTLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[doc(hidden)]
+pub fn probe_throttle(unpacker0: u32, unpacker1: u32) {
+    PROBE_THROTTLE.store(
+        unpacker0 | unpacker1 << 8,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[doc(hidden)]
+pub fn probe_no_drain(on: bool) {
+    PROBE_NO_DRAIN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Point both unpackers at a new pair of tile images, between `UNPACR`s.
@@ -548,7 +580,18 @@ pub fn matmul_roles(
     out_fmt: u32,
     fidelity: Fidelity,
 ) -> [Vec<Instruction>; 3] {
-    let [unpack, math, pack] = matmul_items(outputs, sems, in_fmt, out_fmt, fidelity);
+    matmul_roles_with(outputs, sems, SrcFormats::same(in_fmt, out_fmt), fidelity)
+}
+
+/// [`matmul_roles`] with each operand in its own format ([`SrcFormats`]).
+pub fn matmul_roles_with(
+    outputs: &[OutputTile],
+    sems: MatmulSemaphores,
+    fmts: SrcFormats,
+    fidelity: Fidelity,
+) -> [Vec<Instruction>; 3] {
+    let [unpack, math, pack] =
+        matmul_items_reloading(outputs, sems, fmts, fidelity, None, false, LiveRows::All);
     // `REPLAY` alone for now: a kernel step does not carry a MOP
     // configuration to the roles' mailboxes yet (X2b).
     let lower = |items: &[Item]| crate::loops::lower_with(items, false).words;
@@ -573,16 +616,29 @@ pub fn matmul_kernel(
     b_transposed: bool,
     live: LiveRows,
 ) -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]) {
-    let [unpack, math, pack] = matmul_items_reloading(
+    matmul_kernel_with(
         outputs,
         sems,
-        in_fmt,
-        out_fmt,
+        SrcFormats::same(in_fmt, out_fmt),
         fidelity,
-        None,
+        allow_mop,
         b_transposed,
         live,
-    );
+    )
+}
+
+/// [`matmul_kernel`] with each operand in its own format ([`SrcFormats`]).
+pub fn matmul_kernel_with(
+    outputs: &[OutputTile],
+    sems: MatmulSemaphores,
+    fmts: SrcFormats,
+    fidelity: Fidelity,
+    allow_mop: bool,
+    b_transposed: bool,
+    live: LiveRows,
+) -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]) {
+    let [unpack, math, pack] =
+        matmul_items_reloading(outputs, sems, fmts, fidelity, None, b_transposed, live);
     // With `allow_mop`, a `MOP` on the math role only: on silicon (row AE) one
     // on the unpack or pack role made MNIST inference slower (0.487 -> 0.500,
     // 0.528 ms a batch), and the math role's is no faster end to end on the
@@ -1029,12 +1085,10 @@ pub(crate) fn block_stream_kernel(
     b_transposed: bool,
     live: LiveRows,
 ) -> [Vec<Instruction>; 3] {
-    let (in_fmt, out_fmt) = route.formats();
     let items = matmul_items_continuing(
         &layout.outputs,
         layout.sems,
-        in_fmt,
-        out_fmt,
+        route.src_formats(),
         fidelity,
         priors.map(|priors| Continuation {
             priors,
@@ -1078,7 +1132,6 @@ pub(crate) fn block_stream_kernel_looped(
     use crate::code::Loop;
     use crate::datapath::{pack_dest_units, tile_base_units as units};
     use tt_isa::dm::{TILE_DATA, TILE_SLOT};
-    let (in_fmt, out_fmt) = route.formats();
     let h = c % 2;
     let continuing = c > 0;
     let (a_at, b_at) = (layout.a_at[h], layout.b_at[h]);
@@ -1091,7 +1144,13 @@ pub(crate) fn block_stream_kernel_looped(
         words,
         ub,
         pair_math,
-    } = pair_code((a_at, b_at), in_fmt, out_fmt, fidelity, b_transposed, live);
+    } = pair_code(
+        (a_at, b_at),
+        route.src_formats(),
+        fidelity,
+        b_transposed,
+        live,
+    );
 
     // Unpack: the strides `gpr_step` adds, and each stepped GPR a step before its first use (the
     // blocks add first).
@@ -1318,12 +1377,10 @@ pub(crate) fn k_block_kernel(
     b_transposed: bool,
     live: LiveRows,
 ) -> [Vec<Instruction>; 3] {
-    let (in_fmt, out_fmt) = route.formats();
     let items = matmul_items_reloading(
         &layout.outputs,
         layout.sems,
-        in_fmt,
-        out_fmt,
+        route.src_formats(),
         fidelity,
         reload,
         b_transposed,
@@ -1359,8 +1416,7 @@ pub fn matmul_items(
     matmul_items_reloading(
         outputs,
         sems,
-        in_fmt,
-        out_fmt,
+        SrcFormats::same(in_fmt, out_fmt),
         fidelity,
         None,
         false,
@@ -1379,8 +1435,7 @@ pub fn matmul_items(
 pub(crate) fn matmul_items_reloading(
     outputs: &[OutputTile],
     sems: MatmulSemaphores,
-    in_fmt: L1Format,
-    out_fmt: u32,
+    fmts: SrcFormats,
     fidelity: Fidelity,
     reload: Option<Reload>,
     b_transposed: bool,
@@ -1397,8 +1452,7 @@ pub(crate) fn matmul_items_reloading(
     matmul_items_continuing(
         outputs,
         sems,
-        in_fmt,
-        out_fmt,
+        fmts,
         fidelity,
         reload.zip(priors.as_ref()).map(|(r, p)| Continuation {
             priors: p,
@@ -1434,24 +1488,42 @@ struct PairCode {
 /// until a retarget moves them).
 fn pair_code(
     (a0, b0): (u64, u64),
-    in_fmt: L1Format,
-    out_fmt: u32,
+    fmts: SrcFormats,
     fidelity: Fidelity,
     b_transposed: bool,
     live: LiveRows,
 ) -> PairCode {
     let mut prelude = src_thread_config();
     let mut words = ConfigWords::new();
-    let descriptor = tile_descriptor(in_fmt);
-    unpack_src_config(&mut words, Unpacker::SrcA, descriptor, b0, out_fmt);
+    unpack_src_config(
+        &mut words,
+        Unpacker::SrcA,
+        tile_descriptor(fmts.b),
+        b0,
+        fmts.b_out,
+    );
     if b_transposed {
         tt_isa::unpacker::stage_transpose(&mut words, false).expect("a Src unpack");
     }
-    unpack_src_config(&mut words, Unpacker::SrcB, descriptor, a0, out_fmt);
+    unpack_src_config(
+        &mut words,
+        Unpacker::SrcB,
+        tile_descriptor(fmts.a),
+        a0,
+        fmts.a_out,
+    );
     words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
     words
         .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 0)
         .unwrap();
+    let throttle = PROBE_THROTTLE.load(std::sync::atomic::Ordering::Relaxed);
+    if throttle != 0 {
+        words
+            .set(thcon::THCON_SEC0_REG2_Throttle_mode, throttle & 0xff)
+            .unwrap()
+            .set(thcon::THCON_SEC1_REG2_Throttle_mode, throttle >> 8)
+            .unwrap();
+    }
     prelude.extend(config_program(&words));
     for u in [Unpacker::SrcA, Unpacker::SrcB] {
         prelude.push(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1));
@@ -1571,8 +1643,7 @@ fn pair_code(
 pub(crate) fn matmul_items_continuing(
     outputs: &[OutputTile],
     sems: MatmulSemaphores,
-    in_fmt: L1Format,
-    out_fmt: u32,
+    fmts: SrcFormats,
     fidelity: Fidelity,
     reload: Option<Continuation<'_>>,
     b_transposed: bool,
@@ -1595,7 +1666,7 @@ pub(crate) fn matmul_items_continuing(
         words,
         ub,
         pair_math,
-    } = pair_code((a0, b0), in_fmt, out_fmt, fidelity, b_transposed, live);
+    } = pair_code((a0, b0), fmts, fidelity, b_transposed, live);
     fn i(v: impl IntoIterator<Item = Instruction>) -> impl Iterator<Item = Item> {
         v.into_iter().map(Item::I)
     }
@@ -2415,6 +2486,17 @@ pub fn stage_matmul(
     n: usize,
     in_fmt: L1Format,
 ) -> Result<StagedMatmul, crate::runtime::RunError> {
+    stage_matmul_with(a, b, [m, k, n], (in_fmt, in_fmt))
+}
+
+/// [`stage_matmul`] with `A` tiled in `formats.0` and `B` in `formats.1`, each `B` tile at the
+/// stride of an `A` one (`formats.1`'s image no larger), as [`plan_layout`] places them.
+pub fn stage_matmul_with(
+    a: &[f32],
+    b: &[f32],
+    [m, k, n]: [usize; 3],
+    (a_fmt, b_fmt): (L1Format, L1Format),
+) -> Result<StagedMatmul, crate::runtime::RunError> {
     let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
     let Layout {
         b_at,
@@ -2422,12 +2504,24 @@ pub fn stage_matmul(
         a_at: _,
         sems,
         init,
-    } = plan_layout(tiles, in_fmt)?;
-    let (ta, la) = tilize_f32(a, m, k, in_fmt);
-    let (tb, lb) = tilize_f32(b, k, n, in_fmt);
+    } = plan_layout(tiles, a_fmt)?;
+    let (ta, la) = tilize_f32(a, m, k, a_fmt);
+    let (mut tb, lb) = tilize_f32(b, k, n, b_fmt);
     assert_eq!(la.tiles_per_matrix(), tiles[0] * tiles[1]);
     assert_eq!(lb.tiles_per_matrix(), tiles[1] * tiles[2]);
-    assert_eq!(la.image().total_bytes() as u64, tile_image_bytes(in_fmt));
+    assert_eq!(la.image().total_bytes() as u64, tile_image_bytes(a_fmt));
+    let (img_a, img_b) = (
+        tile_image_bytes(a_fmt) as usize,
+        tile_image_bytes(b_fmt) as usize,
+    );
+    assert!(img_b <= img_a, "B's tile image fits A's stride");
+    if img_b < img_a {
+        let mut spread = vec![0u8; tb.len() / img_b * img_a];
+        for (t, image) in tb.chunks_exact(img_b).enumerate() {
+            spread[t * img_a..t * img_a + img_b].copy_from_slice(image);
+        }
+        tb = spread;
+    }
     debug_assert_eq!(b_at, (MATMUL_STAGE + ta.len() as u64).next_multiple_of(16));
     Ok(StagedMatmul {
         m,
@@ -2453,6 +2547,34 @@ pub enum SrcRoute {
     Bf16FromBf16,
     /// Packed block-float operands moved directly to Src.
     Bfp(crate::bfp::BfpFormat),
+    /// `A` as [`SrcRoute::Tf32FromFp32`]; `B` BF16 in L1 (a weight stored in half the bytes),
+    /// moved as is ([`BF16_CODE`]; BF16 in with TF32 out is undefined, which ttsim refuses). A
+    /// BF16 value in `Src` is a TF32 one whose low three mantissa bits are clear, and the product
+    /// is [`SrcRoute::Tf32FromFp32`]'s over the same values bit for bit, specials and every
+    /// fidelity included (gate `step232`; `docs/plans/bf16-weight-storage.md`).
+    Tf32WithBf16B,
+}
+
+/// The L1 format and `OutDataFormat` of each operand of a product: `A` (in0, into `SrcB`) and
+/// `B` (in1, into `SrcA`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct SrcFormats {
+    pub a: L1Format,
+    pub a_out: u32,
+    pub b: L1Format,
+    pub b_out: u32,
+}
+
+impl SrcFormats {
+    /// Both operands in `in_fmt`, unpacked under `out`.
+    pub const fn same(in_fmt: L1Format, out: u32) -> Self {
+        SrcFormats {
+            a: in_fmt,
+            a_out: out,
+            b: in_fmt,
+            b_out: out,
+        }
+    }
 }
 
 impl SrcRoute {
@@ -2470,7 +2592,30 @@ impl SrcRoute {
                     crate::bfp::BfpFormat::Bfp2 => 15,
                 },
             ),
+            SrcRoute::Tf32WithBf16B => (L1Format::Fp32, TF32_CODE),
         }
+    }
+
+    /// Each operand's L1 format and `OutDataFormat`. [`SrcRoute::formats`] is `A`'s, and the
+    /// slot size every L1 plan uses (an FP32 image holds a BF16 one).
+    pub const fn src_formats(self) -> SrcFormats {
+        match self {
+            SrcRoute::Tf32WithBf16B => SrcFormats {
+                a: L1Format::Fp32,
+                a_out: TF32_CODE,
+                b: L1Format::Bf16,
+                b_out: BF16_CODE,
+            },
+            _ => {
+                let (in_fmt, out) = self.formats();
+                SrcFormats::same(in_fmt, out)
+            }
+        }
+    }
+
+    /// Whether `B` is BF16 in L1 while `A` is FP32 ([`SrcRoute::Tf32WithBf16B`]).
+    pub const fn bf16_b(self) -> bool {
+        matches!(self, SrcRoute::Tf32WithBf16B)
     }
 }
 
@@ -2514,8 +2659,8 @@ pub fn matmul_with(
     ) -> Result<crate::runtime::Outcome, crate::runtime::RunError>,
 ) -> Result<Vec<f32>, crate::runtime::RunError> {
     use crate::runtime::{Kernel, Schedule};
-    let (in_fmt, out_fmt) = route.formats();
-    let staged = stage_matmul(a, b, m, k, n, in_fmt)?;
+    let fmts = route.src_formats();
+    let staged = stage_matmul_with(a, b, [m, k, n], (fmts.a, fmts.b))?;
     let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
     let roles = programs(
         (tiles, Staging::Host),
@@ -2523,7 +2668,7 @@ pub fn matmul_with(
         fidelity,
         staged.sems,
         LiveRows::All,
-        || matmul_roles(&staged.outputs, staged.sems, in_fmt, out_fmt, fidelity),
+        || matmul_roles_with(&staged.outputs, staged.sems, fmts, fidelity),
     );
     let [unpack, math, pack] = &*roles;
     let stage = [
@@ -2565,7 +2710,7 @@ pub fn chunk_fits_in(
     fidelity: Fidelity,
     staging: Staging,
 ) -> bool {
-    let (in_fmt, out_fmt) = route.formats();
+    let in_fmt = route.formats().0;
     if staging != Staging::Host && !matches!(in_fmt, L1Format::Fp32 | L1Format::Bf16) {
         return false;
     }
@@ -2578,7 +2723,7 @@ pub fn chunk_fits_in(
         fidelity,
         layout.sems,
         LiveRows::All,
-        || matmul_roles(&layout.outputs, layout.sems, in_fmt, out_fmt, fidelity),
+        || matmul_roles_with(&layout.outputs, layout.sems, route.src_formats(), fidelity),
     );
     roles
         .iter()
@@ -2898,8 +3043,7 @@ mod tests {
             let [_, _, pack] = matmul_items_reloading(
                 &layout.outputs,
                 layout.sems,
-                L1Format::Fp32,
-                0,
+                SrcFormats::same(L1Format::Fp32, 0),
                 Fidelity::HiFi4,
                 None,
                 false,

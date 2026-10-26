@@ -93,10 +93,31 @@ has 64 x 64 output tiles: 8x8 blocks are 64 jobs on 120 units).
     and `releasing_a_stale_trace_leaves_a_newer_traces_programs_held` see no program-cache evictions.
   - The model (0.4 us a pair, 0.15 an output's reload, 2 a chunk, GDDR's useful rate 320 GB/s) ranks shapes; it is not
     exact (fixed blocks measured within ~10-25% of it). A sweep of a product's shapes is `TT_MATMUL_BLOCK=mb,kq,nb`.
+- [x] **P6. Batched products as blocks** (2026-10-26, card 0): `matmul_dram_batched_limited` takes the blocked path a
+  head at a time where `block_stream_plan` beats its own plan on the units a head gets; attention's `P V` at a chunk of
+  512 over 8,192 positions read `P` twice and `V` ~16 times before. Bit for bit (`step229`
+  `batched_products_in_blocks_are_the_other_paths_bit_for_bit`, ttsim and card 0, chunks-reversed control). The 1.7B's
+  prefill of 7,992 tokens at chunks of 512 **8.42 -> 6.62 s** (`1792980549`, `1792992817`;
+  [log](../learnings/performance-log.md#attentions-batched-products-as-2-d-blocks-2026-10-26-card-0)).
 - [ ] **P4. Compute a pair** (the bound now): what makes a K-tile pair ~540-810 cycles against HiFi4's 64 `MVMUL`
   cycles -- the twelve face unpacks of two F32 tiles a pair, the bank handoffs between unpack and math, the pushes --
   measured with profile stamps; then `SrcB` reuse of an `A` face across a row of outputs in `Dst` (G4 subblocks).
   Each output's `K` chain stays in order.
+  - [x] **Measured** (2026-10-26, `silicon_probe_pair_cost`, card 1, runs `1792996556`, `1792996863`; every product
+    checked against exact integer arithmetic; [log](../learnings/performance-log.md#where-a-k-tile-pair-goes-2026-10-26-card-1)):
+    - **Not the Matrix Unit for an F32 `B`:** HiFi4 and LoFi run alike (`[1024,8192]@[8192,2048]` 14.95 / 14.57
+      TFLOPS), so four phases cost what one does.
+    - **Not the drain** in `gpr_step` (14.98 without it), **not the unpackers' fetch speed** (`Throttle_mode` x2 and
+      x4 change nothing on Blackhole, results exact).
+    - **`B`'s unpacks bind:** stored BF16, half the bytes, the same product is 15.40 at HiFi4 and **18.18 at LoFi**
+      (`[1024,2048]@[2048,8192]`: 16.02 / **21.55**). Each pair unpacks `B`'s four faces twice (once per `fi`).
+    - **Then the `MVMUL`s:** with `B` cheaper, HiFi4's 64 a pair show at ~10 cycles each, its phases back to back on
+      the same `Dst` rows.
+  - [ ] **Next, the two orders that would lift it** (both bit for bit, each `Dst` row's adds unchanged), neither built:
+    each `B` face unpacked once a pair (both of `A`'s faces for a `k'` held in `SrcB`, rows 0-15 and 16-31), and the
+    phases interleaved over `Dst` row groups (halves or `fj`) so no `MVMUL` waits on the last. Both need `Src` row
+    addressing that Blackhole's pages do not document (`SrcB` past row 16 only by a flat unpack of contiguous faces,
+    `fpu.rs`); probe it on ttsim and card 0 first.
 - [ ] **P5. Step 2: each operand out of GDDR about once** (multicast along the grid's rows and columns, or strips held
   by a few units and pulled): needs a cross-unit ready/free credit, which does not exist. Worth it once P4 makes the
   products read-bound again.

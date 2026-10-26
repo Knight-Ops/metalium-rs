@@ -577,7 +577,7 @@ enum Key {
 /// A backend whose steps a [`TracedGenerator`] captures: `TtBackend`, and `burn_tt::Tt` (burn-fusion
 /// over it), whose tensors resolve to the device's own. Resolving inside a capture runs what the
 /// fusion stream holds, so the trace records it.
-pub trait TracedBackend: Backend<Device = TtDevice> {
+pub trait TracedBackend: Backend<Device = TtDevice> + burn_tt::storage::StorageBackend {
     /// The device tensor of a float primitive.
     fn float_native(t: Self::FloatTensorPrimitive) -> TtTensor;
     /// The device tensor of an int primitive.

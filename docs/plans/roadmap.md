@@ -489,6 +489,12 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         ms, `1792788575`, `1792788725`) and cost 0.27 ms at shorter steps, below the probe's stop rule; parked. Today's
         job does not fit L1 past 512 positions (the composition runs there); halves fit to 1024
         ([log](../learnings/performance-log.md#flash-decodes-probe-a-heads-positions-in-two-halves-2026-10-23-card-0)).
+        **BF16 weight storage** (2026-10-26, decided by the user once the F32 levers were spent;
+        [bf16-weight-storage.md](bf16-weight-storage.md), gates `step232`-`step234`): every weight but the embedding
+        table stored BF16 and read as BF16 by each product, **bit for bit the F32 step** (the checkpoint is BF16 widened
+        at load): a 1.7B step **16.80 / 17.19 -> 12.95 / 13.35 / 14.13 ms** at 32 / 128 / 256 tokens (`1792990193`,
+        `1792989603`), below F32's ~14.3 ms floor. Opt-in for now (`TT_WEIGHT_STORAGE=bf16`, `Llama::with_bf16_weights`).
+        The weights now take ~7.3 ms of it; next, the ~5.6 ms of small ops and per-op cost they no longer hide (A5).
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.
@@ -595,7 +601,10 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
             pass that makes its input (`softmax::Mode::Written`, staged links; `TT_SOFTMAX_ROWS=0` off, `1` every row).
           7,992 tokens **12.06 -> 10.92 s** at chunks of 64, **9.84 -> 8.42 s** at 512 (`1792980190`, `1792980549`);
           short context, ViT-Tiny and ResNet-18 unchanged.
-        - **Next for long prompts:** attention's `pv` (27% of a chunk of 512: 2.2 GB a layer at 229 GB/s, its `P` read twice and
+        - **Attention's batched products as 2-D blocks** (2026-10-26, card 0, prefill-operand-reuse P6): `P V` and `Q K^T`
+          a head at a time on the K-streamed blocks, bit for bit (`step229`): 7,992 tokens at chunks of 512 **8.42 -> 6.62 s**
+          (`1792992817`), 1,000 tokens 386 -> 375 ms.
+        - **Next for long prompts:** ~~attention's `pv`~~ (done above; it was 27% of a chunk of 512: 2.2 GB a layer at 229 GB/s, its `P` read twice and
           `V` ~16 times; profile `1792968733`), then the passes' own limits (the mask read once a head; 64 jobs at chunks of 64), then the
           products' pair cost (P4).
       - **Before (2026-10-17):** a prefill-shaped product reached 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,

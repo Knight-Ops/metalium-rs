@@ -12,6 +12,9 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Where a K-tile pair goes](#where-a-k-tile-pair-goes-2026-10-26-card-1) | 2026-10-26 | a blocked prefill product's pair is bound by `B`'s unpacks (each face twice a pair), not the Matrix Unit (HiFi4 = LoFi at ~15 TFLOPS with an F32 `B`), the drain or the unpackers' speed setting; a BF16 `B` lifts it to 16 (HiFi4) and 21.6 (LoFi) |
+| [Attention's batched products as 2-D blocks](#attentions-batched-products-as-2-d-blocks-2026-10-26-card-0) | 2026-10-26 | attention's `P V` and `Q K^T` a head at a time as K-streamed 2-D blocks, bit for bit: the 1.7B's prefill of 7,992 tokens at chunks of 512 **8.42 -> 6.62 s**, 1,000 tokens 386 -> 375 ms |
+| [BF16 weight storage: half the bytes a decode step reads](#bf16-weight-storage-half-the-bytes-a-decode-step-reads-2026-10-26-card-0) | 2026-10-26 | every 1.7B weight but the embedding table stored BF16, read as BF16 by each product, bit for bit the F32 step: decode **16.80 -> 12.95 ms** at a 32-token prompt (13.35 / 14.13 at 128 / 256), first token 40.6 -> 37.2 ms; found an F32 traced-generation token mismatch at 256 tokens that predates it |
 | [The long-prompt softmax: a column read once a run, the statistics in the passes that make their input](#the-long-prompt-softmax-a-column-read-once-a-run-the-statistics-in-the-passes-that-make-their-input-2026-10-26-card-0) | 2026-10-26 | 1.7B prefill of 7,992 tokens at 8,192 positions **12.06 -> 10.92 s** at chunks of 64, **9.84 -> 8.42 s** at 512; `SUB_EXP` and `DIV` read their column a tile and were data-bound at ~290 GB/s; the chunked `Max` and `Sum` were full passes on 64 units; nothing else moved |
 | [Fused `.ttinsn` push from the host, the default](#fused-ttinsn-push-from-the-host-the-default-2026-10-25-card-0) | 2026-10-25 | the math role's long programs as host-made, host-checked fused code in the program cache; the profile mode's push totals show nothing in the 1.7B pushing at the runner's rate after the staging (`silu_mul` 5.6, RMSNorm 7.3 cycles a word); bit for bit everywhere; the 1.7B's prefill 1.6-3.9% faster, decode 0.3-1.7%, ViT-Tiny 7.2%, ResNet-18 1.1%; on by default |
 | [The long-context softmax: `SUB_EXP` and `DIV` push-bound, their row loops staged to replay](#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0) | 2026-10-25 | at 8,192 positions the softmax is 48% of a 64-token chunk's replay and its `SUB_EXP` and `DIV` push-bound (bodies past the replay buffer); split into replayed row loops, bit for bit: the 1.7B's prefill of 7,992 tokens **15.24 -> 12.28 s** (chunks of 64), **12.58 -> 10.00 s** (512); the softmax as one streamed op per tile row measured slower, opt-in (`TT_SOFTMAX_ROWS=1`); the `.ttinsn` trigger fired |
@@ -363,6 +366,86 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Where a K-tile pair goes (2026-10-26, card 1)
+
+[prefill-operand-reuse.md](../plans/prefill-operand-reuse.md) P4. `silicon_probe_pair_cost` (`cargo xtask bench --filter
+silicon_probe_pair_cost`): a blocked product traced on every tile, 2 warm replays and the median of 7, each variant's
+product checked against exact integer arithmetic (but the no-drain variant's). Runs `1792996556`, `1792996863`, card 1.
+TFLOPS:
+
+| Variant | `[1024,2048]@[2048,8192]` HiFi4 / LoFi | `[1024,8192]@[8192,2048]` HiFi4 / LoFi |
+|---|--:|--:|
+| `B` FP32 | 15.85 / 15.06 | 14.95 / 14.57 |
+| `B` FP32, no drain (wrong results) | 15.83 / 14.96 | 14.98 / 14.83 |
+| `B` FP32, unpacker 0 x4 (`Throttle_mode` 2) | 15.85 / 14.81 | 14.98 / 14.56 |
+| `B` FP32, both x2 | 15.88 / 14.73 | 15.00 / 14.65 |
+| `B` BF16 | 16.02 / **21.55** | 15.40 / **18.18** |
+| `B` BF16, unpacker 0 x2 | 16.04 / 21.65 | 15.35 / -- |
+
+- An F32 `B`'s pair costs the same at one phase as at four: the Matrix Unit is not what binds it. Neither is the
+  drain before each pair's base write, nor the unpackers' fetch speed (the throttle field changes nothing here).
+- What moves it is `B`'s unpacks: the same product with `B` stored BF16 (half the bytes; each pair unpacks `B`'s four
+  faces twice) runs 3-7% faster at HiFi4 and 21-43% faster at LoFi.
+- With `B` cheaper, HiFi4's 64 `MVMUL`s a pair show: ~10 cycles each, the four phases of a half back to back on the same
+  `Dst` rows.
+- So a prefill product with stored BF16 weights is ~1.07x at HiFi4 (bit for bit) and ~1.35x at LoFi (opt-in), and the
+  structural fixes are each `B` face once a pair and phases interleaved over row groups (P4, not built).
+
+## Attention's batched products as 2-D blocks (2026-10-26, card 0)
+
+[prefill-operand-reuse.md](../plans/prefill-operand-reuse.md) P6. A batched product (`Session::matmul_dram_batched`:
+attention's `P V` and `Q K^T`, a head an item) now takes the K-streamed 2-D blocks a head at a time where the model
+beats its old plan on the units a head gets (`tensor::matmul_dram_batched_limited`, `TT_MATMUL_BLOCK` as for the 2-D
+products). At a chunk of 512 over 8,192 positions a head's `P V` is `[512, 8192] @ [8192, 64]`: one output tile a job
+before (`push_k_jobs`), `P` read once an output column and `V` once an output row (16 times), every partial through
+GDDR; now a few blocks a head, each operand strip read once a block, the partials in L1. Bit for bit (`step229`
+`batched_products_in_blocks_are_the_other_paths_bit_for_bit`, ttsim and card 0, with the chunks-reversed control).
+
+`traced_generation_stream_ceiling`, SmolLM2-1.7B-Instruct, `TT_TILES=all`, `TT_GEN_MAX_LEN=8192`, `TT_GEN_PROMPTS=1000,7992`,
+`TT_GEN_NEW=4`, `TT_GEN_SAMPLES=3`, `TT_GEN_CHUNKS=512`, F32 weights, release, card 0:
+
+| | Before (`1792980549`) | Batched blocks (`1792992817`) |
+|---|--:|--:|
+| Prefill, 1,000 tokens | 386 ms | **375** (2,670 tokens/s) |
+| Prefill, 7,992 tokens | 8.42 s | **6.62** (1,208 tokens/s) |
+| Decode step after 7,992 | 52.6 ms | 52.5 |
+| First build | 893 s | 569 |
+
+## BF16 weight storage: half the bytes a decode step reads (2026-10-26, card 0)
+
+[bf16-weight-storage.md](../plans/bf16-weight-storage.md). Every 1.7B weight but the embedding table stored BF16
+(`Llama::with_bf16_weights`, `TT_WEIGHT_STORAGE=bf16`), read by each product as its `B` from BF16 slots
+(`record::GATHER_B_BF16`) and unpacked as BF16 (`SrcRoute::Tf32WithBf16B`): bit for bit the F32 step, since the
+checkpoint is BF16 widened at load (gates `step232`-`step234`; SmolLM2-135M traced, all 30 layers, logits equal bit for
+bit, `1792988204`).
+
+`traced_generation`, `TT_GEN_MODEL=smollm2-1.7b-instruct`, `TT_TILES=all`, 512-position cache, release, card 0, 2 warmups
+and 9 samples, the run's tokens checked against the logits path; burn-flex 1 sample (`TT_GEN_FLEX_SAMPLES=1`):
+
+| | 32-token prompt | 128 | 256 | Run |
+|---|--:|--:|--:|---|
+| Decode step, F32 weights | 16.80 ms | 17.19 | (the check failed, below) | `1792990193` |
+| Decode step, **BF16 weights** | **12.95 ms** | **13.35** | **14.13** | `1792989603` |
+| First token, F32 / BF16 | 40.6 / **37.2** ms | 56.1 / **48.4** | -- / **83.4** | |
+| Weight bandwidth, BF16 (3.43 GB a step) | 264 GB/s | 256 | 242 | |
+| burn-flex decode step | 301 ms | 317 | 333 | `1792988644` |
+
+- **23% off a decode step** (16.80 -> 12.95 ms at 32 tokens, 77 tokens/s), below F32's whole-step floor (~14.3 ms).
+  Half the weight bytes did not halve the step: the weights now take ~7.3 ms at 469 GB/s, and the ~5.6 ms besides is
+  the small ops and each op's fixed cost, which the weight stream used to hide. That is the next share (A5, and
+  decode-to-bandwidth Phase 7).
+- The stream-ceiling bench (BF16) agrees: 12.91 / 14.09 ms at 32 / 256 tokens.
+- **Found and fixed, not from this work:** with F32 weights, the 256-token prompt's timed runs (`generate_tokens`)
+  chose other tokens than its logits path (`generate`) from the second token on, every run (`1792990193`,
+  `1792990624`), and the same on the committed `681a1fb` (`1792991297`, a worktree). `TT_COL_ONCE=0`,
+  `TT_SOFTMAX_ROWS=0` and `TT_RESIDENCY=0` still failed (`1792991795`, `1792992204`, `1792993266`); `TT_BUSY_PREFETCH=0`
+  passed (`1792992632`, card 1). Cause: decode attention's job (`attention::build_kernels`) laid its slots from `DATA`'s
+  base but recorded only its inner products' and reductions' layouts as the op's L1 top, so a busy unit's weight
+  prefetch, which lands above the tops the ops before its product recorded, read the next weights over attention's `K`
+  and `V` slots at `Step(512)`. The job now records its slots' reach (gate `step209`
+  `a_captured_job_records_the_l1_its_slots_reach`, watched failing: `0x28200` recorded against `0x34500` reached at 64
+  positions). `681a1fb` with the fix passes, 16.77 / 17.15 / 18.04 ms (`1792993869`, card 1).
 
 ## The long-prompt softmax: a column read once a run, the statistics in the passes that make their input (2026-10-26, card 0)
 

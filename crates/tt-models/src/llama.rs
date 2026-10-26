@@ -530,6 +530,20 @@ impl<B: Backend> Llama<B> {
         self
     }
 
+    /// The same model with a tied output head made a projection of its own: the embedding table,
+    /// transposed, as `lm_head`'s weight (the same values; a lookup still reads the table). A
+    /// model whose head is its own already is returned as it is. What lets the head be stored in
+    /// another format than the table ([`crate::quant::Plan::bf16_weights`]).
+    pub fn untied(mut self) -> Self {
+        if self.lm_head.is_none() {
+            self.lm_head = Some(Linear {
+                weight: Param::from_tensor(self.embed_tokens.weight.val().transpose()),
+                bias: None,
+            });
+        }
+        self
+    }
+
     /// A pretrained Llama-architecture checkpoint (`cargo xtask fetch-weights --model <weights>`)
     /// whose shape `config` gives, keeping its first `config.layers` layers, computing in
     /// `precision`. Every tensor the kept layers need must be in the file, and the file must hold
@@ -989,5 +1003,21 @@ impl<B: Backend> Llama<B> {
             out.step(|| self.forward(ids(&[token], device), &mut cache, dtype));
         }
         out
+    }
+}
+
+impl<B: burn_tt::storage::StorageBackend> Llama<B> {
+    /// Every weight but the embedding table stored BF16, the output head untied first
+    /// ([`Llama::untied`], [`crate::quant::Plan::bf16_weights`]): half the bytes a decode step
+    /// reads, and for a BF16 checkpoint widened to F32 ([`Precision::F32`]) the same logits **bit
+    /// for bit**, since BF16 storage holds those values exactly and burn-tt multiplies them as it
+    /// multiplies F32 (`docs/plans/bf16-weight-storage.md`). Apply after [`Llama::fused`], so the
+    /// fused matrices are the ones stored.
+    pub fn with_bf16_weights(self) -> Self {
+        crate::quant::apply(
+            self.untied(),
+            &crate::quant::Plan::bf16_weights(),
+            &crate::quant::Native,
+        )
     }
 }

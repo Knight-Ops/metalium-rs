@@ -1,5 +1,10 @@
 //! Per-tensor physical storage, separate from the logical F32 dtype.
 //!
+//! [`StorageFormat::Bf16`] is a weight in half the bytes: a product reads it as its `B` directly
+//! (bit for bit the product of its values in F32, `tt_kernels::matmul::SrcRoute::Tf32WithBf16B`),
+//! and every other op widens it first. Storing rounds ties-even, so it is exact for BF16-valued
+//! data (a BF16 checkpoint widened to F32).
+//!
 //! Casts return a fresh resident allocation and use identity backward (a
 //! straight-through approximation). Arithmetic widens on device. Unary/scalar
 //! results keep storage; binary results use the higher input precision;
@@ -22,13 +27,14 @@ pub enum StorageFormat {
     Bfp2,
     Bfp4,
     Bfp8,
+    Bf16,
     #[default]
     F32,
 }
 impl StorageFormat {
     fn packed(self) -> Option<BfpFormat> {
         match self {
-            Self::F32 => None,
+            Self::F32 | Self::Bf16 => None,
             Self::Bfp8 => Some(BfpFormat::Bfp8),
             Self::Bfp4 => Some(BfpFormat::Bfp4),
             Self::Bfp2 => Some(BfpFormat::Bfp2),
@@ -56,15 +62,30 @@ impl TtTensor {
         };
         let src = input.to_dram();
         let dims = [src.buffer.rows, src.buffer.cols];
-        let (id, [rows, cols]) =
-            if input.storage_format() == StorageFormat::F32 && format == StorageFormat::F32 {
-                let sources = (0..dims[0] * dims[1])
-                    .map(|i| [i / dims[1], i % dims[1]])
-                    .collect();
-                crate::server::repack(input.device, src.buffer.id, sources, dims)
-            } else {
-                crate::server::cast_bfp(input.device, src.buffer.id, dims, format.packed())
-            };
+        let from = input.storage_format();
+        // A transposed view stored BF16 is its transpose made plain first: a product reads a
+        // stored weight as it lies (the tied output head, `x @ table^T`).
+        let plain = (format == StorageFormat::Bf16 && src.transposed)
+            .then(|| crate::ops::plain_dram(&input));
+        let (src, dims) = match &plain {
+            Some(p) => (p, [p.buffer.rows, p.buffer.cols]),
+            None => (src, dims),
+        };
+        let (id, [rows, cols]) = if from == StorageFormat::F32 && format == StorageFormat::F32 {
+            let sources = (0..dims[0] * dims[1])
+                .map(|i| [i / dims[1], i % dims[1]])
+                .collect();
+            crate::server::repack(input.device, src.buffer.id, sources, dims)
+        } else if format == StorageFormat::Bf16 || from == StorageFormat::Bf16 {
+            crate::server::cast_bf16_storage(
+                input.device,
+                src.buffer.id,
+                dims,
+                format == StorageFormat::Bf16,
+            )
+        } else {
+            crate::server::cast_bfp(input.device, src.buffer.id, dims, format.packed())
+        };
         let dram = DramRef {
             buffer: Arc::new(Buffer {
                 id,
@@ -75,7 +96,7 @@ impl TtTensor {
                 storage: format,
                 plain: Default::default(),
             }),
-            transposed: src.transposed,
+            transposed: src.transposed && plain.is_none(),
             generation: 0,
         };
         Self::on_device(dram, input.shape(), DType::F32, input.device)
