@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The long-prompt softmax: a column read once a run, the statistics in the passes that make their input](#the-long-prompt-softmax-a-column-read-once-a-run-the-statistics-in-the-passes-that-make-their-input-2026-10-26-card-0) | 2026-10-26 | 1.7B prefill of 7,992 tokens at 8,192 positions **12.06 -> 10.92 s** at chunks of 64, **9.84 -> 8.42 s** at 512; `SUB_EXP` and `DIV` read their column a tile and were data-bound at ~290 GB/s; the chunked `Max` and `Sum` were full passes on 64 units; nothing else moved |
 | [Fused `.ttinsn` push from the host, the default](#fused-ttinsn-push-from-the-host-the-default-2026-10-25-card-0) | 2026-10-25 | the math role's long programs as host-made, host-checked fused code in the program cache; the profile mode's push totals show nothing in the 1.7B pushing at the runner's rate after the staging (`silu_mul` 5.6, RMSNorm 7.3 cycles a word); bit for bit everywhere; the 1.7B's prefill 1.6-3.9% faster, decode 0.3-1.7%, ViT-Tiny 7.2%, ResNet-18 1.1%; on by default |
 | [The long-context softmax: `SUB_EXP` and `DIV` push-bound, their row loops staged to replay](#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0) | 2026-10-25 | at 8,192 positions the softmax is 48% of a 64-token chunk's replay and its `SUB_EXP` and `DIV` push-bound (bodies past the replay buffer); split into replayed row loops, bit for bit: the 1.7B's prefill of 7,992 tokens **15.24 -> 12.28 s** (chunks of 64), **12.58 -> 10.00 s** (512); the softmax as one streamed op per tile row measured slower, opt-in (`TT_SOFTMAX_ROWS=1`); the `.ttinsn` trigger fired |
 | [Residency plans over reused GDDR](#residency-plans-over-reused-gddr-2026-10-24-card-0) | 2026-10-24 | G2: chunk captures reuse their GDDR and keep their L1 residency plans; prefill 1.2-2.1% faster at reuse's free GDDR, the first build 2.4-6.6x longer |
@@ -362,6 +363,67 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The long-prompt softmax: a column read once a run, the statistics in the passes that make their input (2026-10-26, card 0)
+
+Roadmap Track 1, "Next for long prompts: the data passes"; plan: [long-context.md](../plans/long-context.md), 1.H.
+All runs: SmolLM2-1.7B-Instruct, `traced_generation_stream_ceiling`, `TT_TILES=all`, `TT_GEN_MAX_LEN=8192`,
+`TT_GEN_PROMPTS=1000,7992`, `TT_GEN_NEW=4`, `TT_GEN_SAMPLES=3`, release, card 0.
+
+**Where a long chunk's softmax went** (profile mode, `.ttinsn` on, before this work; a layer, unit 0's spans):
+
+| Op | Chunk of 64 (`1792967661`) | Chunk of 512 (`1792968733`) | Kernel / data, chunk of 64 |
+|---|--:|--:|--:|
+| `SCALE_MASK_FILL` (block mask) | 475 us, 428 GB/s | 3,749 us, 434 GB/s | 12 / 417 us |
+| `Max`, chunked (64 / 120 units) | 221 us, 346 GB/s | 1,764 us | |
+| `CLAMP_MIN` | 10 us | 18 us | |
+| `SUB_EXP` (column broadcast) | **673 us, 302 GB/s** | 5,128 us, 317 GB/s | 85 / 551 us |
+| `Sum`, chunked | 208 us, 367 GB/s | 1,684 us | |
+| `CLAMP_MIN` | 10 us | 17 us | |
+| `DIV` (column broadcast) | **718 us, 283 GB/s** | 5,294 us, 307 GB/s | 103 / 583 us |
+
+The scale and softmax were 55.4 of a 125.9 ms chunk-of-64 replay (44%) and 141 of 286 ms at 512 (49%; `attention/pv`
+77 ms more).
+- **`SUB_EXP` and `DIV` were data-bound, not compute-bound** (data 551 / 583 us against kernels 85 / 103). They moved
+  `SCALE_MASK_FILL`'s bytes ~30% slower. Half their reads were the `[rows, 1]` column, read once an output tile
+  (`READ_RUN_COL_AS_IT_LIES`): 64 small tiles read by 120 units.
+- **The maximum and sum were full passes.** At 256 tiles a row is past one reduction run (219), so each streamed
+  through GDDR in 16-tile continuations, one job a tile row (64 units at `c` = 64), with its clamp as an op of its own.
+
+**What was built** (bit for bit; gates in [long-context.md](../plans/long-context.md) 1.H):
+1. **A column read once a run** (`tensor::row_runs`, `TT_COL_ONCE=0` turns it off): a column broadcast's runs each
+   keep to one tile row and read that row's one tile of `B` once into one slot (`kernel::Layout::b_once`). They are
+   taken where a model of the busiest unit's transfers says they are cheaper than the runs they replace.
+2. **The statistics in the passes that make their input** (`softmax::Mode::Written`, the default for
+   `Session::softmax_rows`; burn-tt routes attention's softmax there on rows past one reduction run,
+   `TT_SOFTMAX_ROWS=0` off, `1` on every row). One job a tile row in three passes:
+   - pass 1: `SCALE_MASK_FILL` writing `s`, with the maximum;
+   - pass 2: staged `SUB_EXP` writing `e` over `s`, with the sum;
+   - pass 3: a staged `DIV` by the sum.
+   The statistics are folded and clamped in L1, so no `CLAMP_MIN` op and no chunked reduction remain. The first
+   `softmax_rows` (2026-10-25, slower) computed `SUB_EXP` twice and ran unstaged bodies (`Mode::Recompute`, kept).
+
+**Measured** (medians, outputs validated by the bench):
+
+| 1.7B prefill at 8,192 positions | Both off (`1792978171`, `1792978574`) | Column once, first rule (`1792976632`, `1792977031`) | Both, first rule (`1792975239`, `1792975910`) | **Both, costed rule** (`1792980190`, `1792980549`) |
+|---|--:|--:|--:|--:|
+| 1,000 tokens, chunks of 64 | 746.3 ms | 808.3 | 808.9 | **744.5** |
+| 7,992 tokens, chunks of 64 | 12,062 ms | 11,584 | 11,407 | **10,925** (-9.4%) |
+| 1,000 tokens, chunks of 512 | 399.4 ms | 394.1 | 393.9 | **386.2** (2,589 tokens/s) |
+| 7,992 tokens, chunks of 512 | 9,840 ms | 9,197 | 8,464 | **8,421** (949 tokens/s, -14.4%) |
+| Decode step after 7,992 tokens (64 / 512) | 53.32 / 53.25 ms | 55.91 / 55.94 | 55.93 / 55.88 | **52.56 / 52.59** |
+
+- **The first rule cut every long-enough column op by rows at the fewest runs.** It ignored what the runs it replaced
+  spread over: RMSNorm's division of a `[64, 2048]` chunk went from 120 units to 4, and a decode row's ops lost units
+  the same way. That cost 8% at 1,000 tokens and 5% on the long-context decode step. Costing both run lists against
+  the busiest unit (`row_runs`' `old`) keeps those spreads and recovers both.
+- **Unchanged** (against the 2026-10-25 rows): the 512-position bench, prefill 40.62 / 166.64 ms and decode 16.80 /
+  17.99 ms at 32 / 256 tokens (`1792981276`); ViT-Tiny traced 8.33 ms (`1792981450`); ResNet-18 traced 13.73 ms
+  (`1792981455`).
+- **Gates with the costed rule** (card 0): `--smoke` 1,213 of 1,213 (`1792981502`); `step188` (the native context:
+  burn-flex's tokens, traced 12.31 s for the prompt and 8 tokens) and `step224` (`1792983113`).
+- **Not done:** the mask is still read once a head (32 x 2 MB a layer at `c` = 64) in pass 1, and pass 2's in-order
+  sum keeps one job a tile row, so a chunk of 64 runs the passes on 64 units (long-context.md 1.H, "left").
 
 ## Fused `.ttinsn` push from the host, the default (2026-10-25, card 0)
 

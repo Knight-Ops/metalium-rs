@@ -766,6 +766,8 @@ pub struct Session<T: Transport> {
     prefetch_second_job: bool,
     /// [`Session::set_balanced_deal`].
     balanced_deal: bool,
+    /// [`Session::set_softmax_mode`].
+    softmax_mode: crate::softmax::Mode,
     /// [`Session::set_block_stream`].
     block_stream: tensor::BlockStream,
     /// [`Session::set_stream_prefetch_units`].
@@ -2557,6 +2559,7 @@ impl<T: Transport> Session<T> {
             stream_prefetch: std::env::var("TT_STREAM_PREFETCH").map_or(true, |v| v != "0"),
             prefetch_second_job: std::env::var("TT_PREFETCH_SECOND").is_ok_and(|v| v == "1"),
             balanced_deal: std::env::var("TT_BALANCED_DEAL").is_ok_and(|v| v == "1"),
+            softmax_mode: crate::softmax::Mode::default(),
             // `TT_MATMUL_BLOCK=off|auto|mb,kq,nb` (`docs/plans/prefill-operand-reuse.md`).
             block_stream: tensor::BlockStream::from_env(),
             // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
@@ -7459,9 +7462,20 @@ impl<T: Transport> Session<T> {
         scale: f32,
     ) -> Result<DramTensor, TensorError> {
         let units = self.spread_for(tiles_of(x)).min(x.rows / 32).max(1);
+        let mode = self.softmax_mode;
         let alloc = &mut self.dram_state()?.alloc;
-        let work = crate::softmax::softmax_rows(alloc, x, mask, scale)?;
+        let work = crate::softmax::softmax_rows(alloc, x, mask, scale, mode)?;
         self.execute_on(work, units, RESET_BUDGET)
+    }
+
+    /// How [`Session::softmax_rows`]' passes reach the output (`crate::softmax::Mode`): `SUB_EXP`
+    /// written once and divided ([`Mode::Written`], the default), or computed twice and never
+    /// written ([`Mode::Recompute`], as first built). The same bits either way.
+    ///
+    /// [`Mode::Written`]: crate::softmax::Mode::Written
+    /// [`Mode::Recompute`]: crate::softmax::Mode::Recompute
+    pub fn set_softmax_mode(&mut self, mode: crate::softmax::Mode) {
+        self.softmax_mode = mode;
     }
 
     /// Each row's `sqrt(mean(a a) + eps)` over its columns, `[rows, 1]`: RMSNorm's statistic,

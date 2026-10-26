@@ -585,8 +585,19 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         - **Fused `.ttinsn` push** (2026-10-25, Track 2, [log](../learnings/performance-log.md#fused-ttinsn-push-from-the-host-the-default-2026-10-25-card-0)): measured with the profile mode's new push totals,
           nothing in the 1.7B pushes at the runner's rate after the staging; fused code, now the default, takes 7,992
           tokens **12.27 -> 12.06 s** at chunks of 64 and **10.00 -> 9.84 s** at 512 (`1792962530`).
-        - **Next for long prompts:** the data passes (`SCALE_MASK_FILL` 475 us, the chunked `Max` and `Sum` ~220 us each a
-          layer), each computed once over every unit.
+        - **The data passes** (2026-10-26, card 0, [long-context.md](long-context.md) 1.H,
+          [log](../learnings/performance-log.md#the-long-prompt-softmax-a-column-read-once-a-run-the-statistics-in-the-passes-that-make-their-input-2026-10-26-card-0)).
+          Profiled first (`1792967661`): `SUB_EXP` and `DIV` were data-bound at ~290 GB/s, half their reads a column read
+          once a tile; the maximum and sum were full chunked passes on 64 units. Two changes, both bit for bit:
+          - a column broadcast's runs keep to tile rows and read their `B` tile once (`tensor::row_runs`, costed against
+            the runs they replace; `TT_COL_ONCE=0` off);
+          - attention's softmax on rows past one reduction run as three streamed passes, each statistic computed in the
+            pass that makes its input (`softmax::Mode::Written`, staged links; `TT_SOFTMAX_ROWS=0` off, `1` every row).
+          7,992 tokens **12.06 -> 10.92 s** at chunks of 64, **9.84 -> 8.42 s** at 512 (`1792980190`, `1792980549`);
+          short context, ViT-Tiny and ResNet-18 unchanged.
+        - **Next for long prompts:** attention's `pv` (27% of a chunk of 512: 2.2 GB a layer at 229 GB/s, its `P` read twice and
+          `V` ~16 times; profile `1792968733`), then the passes' own limits (the mask read once a head; 64 jobs at chunks of 64), then the
+          products' pair cost (P4).
       - **Before (2026-10-17):** a prefill-shaped product reached 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,
         `1792258604`). It is bound by GDDR because each unit gathers its own tiles: `B` is read `m / 32` times, `A`
         once per two-column block, up to once a unit. The largest product reads 3.2 GB for 77 MB.
@@ -626,7 +637,8 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   on by default for chunk captures, `TT_CHUNK_REUSE=0` turns it off): 2.10 -> 17.78 GB free after the 1.7B's build, and chunks of 512
   capture at 8,192 (7,992 tokens in 16.9 s). Since G2 those captures keep their L1 residency plans over the reused slots (1.2-2.1% faster prefill
   at the same free GDDR; the first build longer, 893 s at chunks of 512), and since `SUB_EXP` and `DIV` replay (2026-10-25) 7,992 tokens
-  take **12.28 / 10.00 s** at chunks of 64 / 512 (were 15.24 / 12.58). **A long prefill uses 1.1-1.7% of the card's compute**: the products
+  take 12.28 / 10.00 s at chunks of 64 / 512 (were 15.24 / 12.58); with the fused push and the softmax's data passes (1.H, 2026-10-26)
+  **10.92 / 8.42 s**. **A long prefill uses 1.1-1.7% of the card's compute**: the products
   plateau at ~5 TFLOPS, GDDR-bound, whatever the chunk size (Track 1, "Prefill products that reuse their operands").
   Left: the BF16 cache, past 32K. Flash-decode's oracle is parked on the Matrix Unit model not being bit for bit on full-mantissa
   operands. Found before: SmolLM2-1.7B's native context is 8,192; the cached Qwen3.6-35B-A3B and Qwen3.8-27B are 262,144.

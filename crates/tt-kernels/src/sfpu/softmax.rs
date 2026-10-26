@@ -117,6 +117,39 @@ pub fn sub_exp_div() -> crate::code::Code {
     p.finish_code()
 }
 
+/// The `Dst` rows a streamed pass's staged link hands its registers on through: clear of the
+/// operands, the result, the accumulator at `OUT_ROW` and the statistics at [`MAX_ROW`] and
+/// [`SUM_ROW`] (the default stage rows' third is [`MAX_ROW`]'s).
+const STAGES: [u32; 3] = [C_ROW, super::kernel::SPILL_ROW, 448];
+
+/// `kind`'s staged program (`ops::staged_at`: row loops short enough to replay, bit for bit its
+/// body) over `a_at` and `b_at` into `out_at`, or its one-loop link where it has no staged form.
+fn link(kind: u32, [a_at, b_at, out_at]: [u32; 3]) -> crate::code::Code {
+    super::ops::staged_at(kind, [a_at, b_at, out_at], STAGES).unwrap_or_else(|| {
+        let mut p = Program::new();
+        p.for_each_row_group(64, |p, o| {
+            chain_link(p, kind, [0.0; 2], a_at + o, b_at + o, out_at + o)
+        });
+        p.finish_code()
+    })
+}
+
+/// Pass 2 when `e` is written ([`crate::softmax::Mode::Written`]), one tile: `s` at `A_ROW`;
+/// `e = SUB_EXP(s, max)` stored at `B_ROW` (the packer writes it out), then its sum accumulated
+/// at `OUT_ROW`, a row loop of its own after `SUB_EXP`'s staged ones. The maximum is at
+/// [`MAX_ROW`], broadcast ([`statistics`]).
+pub fn sub_exp_sum_out(first: bool) -> crate::code::Code {
+    let mut p = Program::new();
+    p.for_each_row_group(64, |p, o| accumulate(p, ReduceOp::Sum, first, B_ROW, o));
+    link(kind_sfpu::SUB_EXP, [A_ROW, MAX_ROW, B_ROW]).then(p.finish_code())
+}
+
+/// Pass 3 when `e` is written, one tile: `e` at `A_ROW`; `DIV(e, sum)` at `OUT_ROW`, staged. The
+/// sum is at [`SUM_ROW`], broadcast.
+pub fn div_by_sum() -> crate::code::Code {
+    link(kind_sfpu::DIV, [A_ROW, SUM_ROW, OUT_ROW])
+}
+
 /// A kernel's first math: each statistic tile, as unpacked at its row, with its column 0
 /// broadcast across every column (what `SUB_EXP` and `DIV` do to their column operand).
 pub fn statistics(rows: &[u32]) -> Vec<Instruction> {
@@ -150,6 +183,32 @@ pub fn reference(
     scale: f32,
     chunk: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    reference_in(x, mask, rows, cols, scale, chunk, false)
+}
+
+/// [`reference`] for the passes that write `e` ([`crate::softmax::Mode::Written`]): pass 2 is
+/// [`sub_exp_sum_out`], pass 3 [`div_by_sum`] over the `e` pass 2 wrote. The same programs, run by
+/// the interpreter.
+pub fn reference_written(
+    x: &[f32],
+    mask: &[u32],
+    rows: usize,
+    cols: usize,
+    scale: f32,
+    chunk: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    reference_in(x, mask, rows, cols, scale, chunk, true)
+}
+
+fn reference_in(
+    x: &[f32],
+    mask: &[u32],
+    rows: usize,
+    cols: usize,
+    scale: f32,
+    chunk: usize,
+    written: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     use super::interp::Vector;
     use tt_isa::dm::face_index;
     assert!(rows % 32 == 0 && cols % 32 == 0 && chunk > 0);
@@ -172,6 +231,7 @@ pub fn reference(
     };
     let code = |c: crate::code::Code| c.expand();
     let (mut s, mut p) = (vec![0.0; rows * cols], vec![0.0; rows * cols]);
+    let mut e_out = vec![0.0; rows * cols];
     let (mut max, mut sum) = (vec![0.0; rows], vec![0.0; rows]);
     let column0 = |t: &[u32], i: usize, into: &mut [f32]| {
         for r in 0..32 {
@@ -223,6 +283,25 @@ pub fn reference(
         );
         column0(&m, i, &mut max);
         let s_tile = |j: usize| tile(&|k| s[k].to_bits(), i, j);
+        if written {
+            let e = pass(
+                &[(MAX_ROW, m)],
+                &|v, j| v.put_tile(A_ROW as usize, &s_tile(j)),
+                &|first| code(sub_exp_sum_out(first)),
+                &mut |v, j| put(&mut e_out, &v.tile(B_ROW as usize), i, j),
+                Some(finish(ReduceOp::Sum)),
+            );
+            column0(&e, i, &mut sum);
+            let e_tile = |j: usize| tile(&|k| e_out[k].to_bits(), i, j);
+            pass(
+                &[(SUM_ROW, e)],
+                &|v, j| v.put_tile(A_ROW as usize, &e_tile(j)),
+                &|_| code(div_by_sum()),
+                &mut |v, j| put(&mut p, &v.tile(OUT_ROW as usize), i, j),
+                None,
+            );
+            continue;
+        }
         let e = pass(
             &[(MAX_ROW, m.clone())],
             &|v, j| v.put_tile(A_ROW as usize, &s_tile(j)),
@@ -337,6 +416,46 @@ mod tests {
                 assert_eq!(bits(&fused.1), bits(&composed.1), "max, {rows}x{cols}");
                 assert_eq!(bits(&fused.2), bits(&composed.2), "sum, {rows}x{cols}");
                 assert_eq!(bits(&fused.3), bits(&composed.3), "p, {rows}x{cols}");
+            }
+        }
+    }
+
+    /// The passes that write `e` (staged `SUB_EXP` with the sum, then a staged `DIV` by it) are
+    /// the composition bit for bit, `e` included.
+    #[test]
+    fn the_written_passes_are_the_composition_bit_for_bit() {
+        for (rows, cols, chunk) in [(32, 64, 1), (64, 160, 2), (32, 288, 3), (32, 256, 16)] {
+            let (x, mask) = operands(rows, cols, 0x1357 + cols as u32);
+            for scale in [0.125, 1.0 / 8f32.sqrt(), -0.5] {
+                let fused = reference_written(&x, &mask, rows, cols, scale, chunk);
+                let composed = composition(&x, &mask, rows, cols, scale);
+                assert_eq!(bits(&fused.0), bits(&composed.0), "s, {rows}x{cols}");
+                assert_eq!(bits(&fused.1), bits(&composed.1), "max, {rows}x{cols}");
+                assert_eq!(bits(&fused.2), bits(&composed.2), "sum, {rows}x{cols}");
+                assert_eq!(bits(&fused.3), bits(&composed.3), "p, {rows}x{cols}");
+            }
+        }
+    }
+
+    /// The written passes' links are the staged programs (each stage a replayed row loop), not
+    /// the one-loop bodies the recomputing passes run.
+    #[test]
+    fn the_written_passes_are_staged() {
+        let staged = |kind, rows| {
+            super::super::ops::staged_at(kind, rows, STAGES)
+                .unwrap()
+                .ins
+        };
+        let sub_exp = staged(kind_sfpu::SUB_EXP, [A_ROW, MAX_ROW, B_ROW]);
+        assert_eq!(sub_exp_sum_out(true).ins[..sub_exp.len()], sub_exp[..]);
+        assert_eq!(
+            div_by_sum().ins,
+            staged(kind_sfpu::DIV, [A_ROW, SUM_ROW, OUT_ROW])
+        );
+        // Clear of what the pass keeps: the statistics and the accumulator.
+        for r in STAGES {
+            for kept in [OUT_ROW, MAX_ROW, SUM_ROW, A_ROW, B_ROW] {
+                assert!(r + 64 <= kept || kept + 64 <= r, "stage row {r} and {kept}");
             }
         }
     }

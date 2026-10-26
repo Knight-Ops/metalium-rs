@@ -147,3 +147,49 @@ fn a_column_broadcast_in_the_sfpu_is_the_expanded_operand_s_result() {
         }
     });
 }
+
+/// Rows long enough to hold a run (`tensor::row_runs`): each run keeps to one tile row and reads
+/// that row's one tile of the column once, held in one slot for the run (`b_once`), instead of
+/// once a tile (the long-context softmax's `SUB_EXP` and division, `docs/plans/long-context.md`,
+/// "Long-prompt softmax passes"). The same bits as the specification model over the expanded
+/// column, and as the runs that read it a tile (`tensor::set_col_once(false)`), with L1 and `Dst`
+/// primed with NaN first. Watched failing (ttsim): the run's tile of `B` read from the next row.
+#[test]
+fn a_long_row_reads_its_column_tile_once_with_the_same_bits() {
+    let kinds = [kind::SUB, kind_sfpu::DIV, kind_sfpu::SUB_EXP];
+    with_session(|s| {
+        for (rows, cols) in [(45usize, 32 * 90usize), (96, 32 * 120 + 7)] {
+            for kind in kinds {
+                let label = format!("{kind:#x} [{rows}, {cols}] with [{rows}, 1]");
+                let x = floats((rows * 1_000 + cols) as u64 + kind as u64, rows * cols);
+                let (b, col) = nan_padded_column(s, &floats(kind as u64 + 29, rows));
+                let expanded: Vec<f32> = (0..rows * cols).map(|i| col[i / cols]).collect();
+                let want = ops::reference(kind, 0.0, &x, Some(&expanded), rows, cols);
+                let a = s.upload(&x, rows, cols).unwrap();
+                let nan = s.upload(&vec![f32::NAN; rows * cols], rows, cols).unwrap();
+                let nan_b = s.upload(&vec![f32::NAN; rows], rows, 1).unwrap();
+                for once in [true, false] {
+                    let was = tt_kernels::tensor::set_col_once(once);
+                    let primed = s.eltwise(op(kind), &nan, Some(&nan_b)).unwrap();
+                    let got = s.eltwise(op(kind), &a, Some(&b)).unwrap();
+                    tt_kernels::tensor::set_col_once(was);
+                    let got_v = s.download(&got).unwrap();
+                    for (i, (g, w)) in got_v.iter().zip(&want).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "{label}, once {once}: datum ({}, {}): {g} for {w}",
+                            i / cols,
+                            i % cols
+                        );
+                    }
+                    s.free(primed).unwrap();
+                    s.free(got).unwrap();
+                }
+                for t in [a, b, nan, nan_b] {
+                    s.free(t).unwrap();
+                }
+            }
+        }
+    });
+}

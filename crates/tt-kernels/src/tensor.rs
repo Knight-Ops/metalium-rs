@@ -3854,6 +3854,78 @@ fn half_of(j: usize, units: usize) -> u8 {
     ((j / units.max(1)) % 2) as u8
 }
 
+/// Whether a column broadcast runs by tile rows ([`row_runs`]); on unless `TT_COL_ONCE=0`.
+static COL_ONCE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| {
+        std::sync::atomic::AtomicBool::new(std::env::var("TT_COL_ONCE").map_or(true, |v| v != "0"))
+    });
+
+/// Set whether a column broadcast's runs keep to tile rows and read their `B` tile once
+/// ([`row_runs`]); returns what it was. A gate's negative control and a benchmark's comparison.
+pub fn set_col_once(on: bool) -> bool {
+    COL_ONCE.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A run's fixed cost (its lists, the kernel's start and the handshakes) in tile transfers, which
+/// [`row_runs`] weighs against the tiles a busiest unit moves.
+const RUN_FIXED_TRANSFERS: usize = 4;
+
+/// The runs of a column broadcast (`B` a `[rows, 1]` column) over `rt x ct` tiles, each inside
+/// one tile row, so a run reads its row's one tile of `B` once (`kernel::Layout::b_once`), not
+/// once an output tile: on a long softmax row that read was half the op's bytes, 120 units
+/// reading 64 small tiles (`docs/plans/long-context.md`, "Long-prompt softmax passes"). Each row
+/// is cut in `s` runs of at most `max` tiles, as even as integer division allows. The runs are
+/// dealt `j % units`, so an op takes as long as its busiest unit: a run there costs two
+/// transfers a tile (`A` in, the result out) and one for its `B`, against three a tile for
+/// `old`'s runs (the ones it would replace), each with [`RUN_FIXED_TRANSFERS`]. `s` is the
+/// cheapest from `ct.div_ceil(max)` up to twice that where pipelined (each run at least
+/// [`MIN_PIPELINED_RUN`] tiles and two a unit), or up to one tile a run otherwise. `None` unless
+/// that is cheaper than `old`: a decode row or a short chunk's rows keep their spread over the
+/// units (cut by rows, one unit's share of a short row would be a whole one).
+pub fn row_runs(
+    rt: usize,
+    ct: usize,
+    units: usize,
+    max: usize,
+    pipelined: bool,
+    old: &[std::ops::Range<usize>],
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let units = units.max(1);
+    if max == 0 || rt == 0 || ct == 0 || (pipelined && ct < MIN_PIPELINED_RUN) {
+        return None;
+    }
+    let least = ct.div_ceil(max);
+    let most = if pipelined {
+        (2 * least).min(ct / MIN_PIPELINED_RUN)
+    } else {
+        ct
+    };
+    let busiest = |runs: usize, longest: usize, per_tile: usize, extra: usize| {
+        runs.div_ceil(units) * (longest * per_tile + extra + RUN_FIXED_TRANSFERS)
+    };
+    let now = busiest(old.len(), old.iter().map(|r| r.len()).max()?, 3, 0);
+    let (cost, s) = (least..=most)
+        .filter(|&s| !pipelined || rt * s >= 2 * units)
+        // On a tie, more units reading (up to one run each), then fewer runs.
+        .map(|s| {
+            (
+                busiest(rt * s, ct.div_ceil(s), 2, 1),
+                std::cmp::Reverse((rt * s).min(units)),
+                s,
+            )
+        })
+        .min()
+        .map(|(cost, _, s)| (cost, s))?;
+    if cost >= now {
+        return None;
+    }
+    Some(
+        (0..rt)
+            .flat_map(|i| (0..s).map(move |p| i * ct + p * ct / s..i * ct + (p + 1) * ct / s))
+            .collect(),
+    )
+}
+
 /// `slots` tile slots of scratch for the mover's own use, planned in the data
 /// arena (`crate::l1`): where an element-wise run or a column sum stages its
 /// tiles.
@@ -4177,18 +4249,35 @@ pub fn sfpu_eltwise_blocks(
         overlap,
     );
     let pipelined = piped.is_some();
-    let all = piped.unwrap_or_else(|| runs(rt * ct, units, sfpu_group(op, bcast, operands, false)));
+    let plain =
+        piped.unwrap_or_else(|| runs(rt * ct, units, sfpu_group(op, bcast, operands, false)));
+    // A column's runs inside one tile row each read its one `B` tile once, where that is cheaper.
+    let by_rows = (bcast == Broadcast::Col && COL_ONCE.load(std::sync::atomic::Ordering::Relaxed))
+        .then(|| {
+            row_runs(
+                rt,
+                ct,
+                units,
+                sfpu_group(op, bcast, operands, pipelined),
+                pipelined,
+                &plain,
+            )
+        })
+        .flatten();
+    let b_once = by_rows.is_some();
+    let all = by_rows.unwrap_or(plain);
     let mut jobs = Vec::new();
     for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
         let half = pipelined.then(|| half_of(j, units));
-        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len, half, rows) {
-            Ok(p) => p,
-            Err(e) => {
-                alloc.free(&out.placement);
-                return Err(e);
-            }
-        };
+        let (layout, roles, loops) =
+            match sfpu_programs(op, bcast, operands, len, half, rows, b_once) {
+                Ok(p) => p,
+                Err(e) => {
+                    alloc.free(&out.placement);
+                    return Err(e);
+                }
+            };
         let read = |x: &TensorRef, at: u64, flags: u32| {
             [
                 [
@@ -4219,6 +4308,22 @@ pub fn sfpu_eltwise_blocks(
                 for h in block_reads(run.start, len, b.grid()[0] * ct, b_at, ct) {
                     gather.extend([h, rb.encode()[0], rb.encode()[1]]);
                 }
+            } else if layout.b_once {
+                // The run's row's one tile of `B`, into its one slot.
+                gather.extend([
+                    [
+                        record::READ_RUN,
+                        run.start as u32,
+                        1,
+                        b_at as u32,
+                        flags,
+                        ct as u32,
+                        0,
+                        0,
+                    ],
+                    rb.encode()[0],
+                    rb.encode()[1],
+                ]);
             } else {
                 gather.extend(read(rb, b_at, flags));
             }
@@ -4652,7 +4757,9 @@ fn measure_sfpu_group(
 
 /// One run's layout and role programs, memoised by op, scalar, length and
 /// `half` (the half of the arena a pipelined run is staged in; `None` for the
-/// whole arena).
+/// whole arena); `b_once`: a column's one tile of `B` held for the whole run
+/// ([`row_runs`]).
+#[allow(clippy::too_many_arguments)]
 fn sfpu_programs(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
@@ -4660,6 +4767,7 @@ fn sfpu_programs(
     len: usize,
     half: Option<u8>,
     rows: u32,
+    b_once: bool,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -4671,6 +4779,7 @@ fn sfpu_programs(
         usize,
         Option<u8>,
         u32,
+        bool,
         u64,
     );
     type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
@@ -4684,6 +4793,7 @@ fn sfpu_programs(
         len,
         half,
         rows,
+        b_once,
         crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
@@ -4715,6 +4825,8 @@ fn sfpu_programs(
             .map(|l| l.shifted(h as u64 * crate::matmul::half())),
     }
     .map_err(|e| TensorError::Shape(e.to_string()))?;
+    // `B` held once uses the first of its planned slots.
+    let layout = crate::sfpu::kernel::Layout { b_once, ..layout };
     let (_, math) = crate::sfpu::ops::code_for_rows(op.kind, [op.scalar, op.scalar2], bcast, rows)
         .expect("checked by the caller");
     let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
@@ -7040,9 +7152,10 @@ pub mod stats {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_repeats, blocks, broadcast_of, metadata, reference, runs, sfpu_eltwise, DramAlloc,
-        DramTensor, Elem, Eltwise, Job, MatmulPadding, OpPadding, Overlap, Pad, PadNeed, Step,
-        SumRows, TransferBatch, TILE_SLOT, TRANSFER_SIDE_MAX,
+        block_repeats, blocks, broadcast_of, metadata, pipelined_runs, reference, row_runs, runs,
+        set_col_once, sfpu_eltwise, DramAlloc, DramTensor, Elem, Eltwise, Job, MatmulPadding,
+        OpPadding, Overlap, Pad, PadNeed, Step, SumRows, TransferBatch, TILE_SLOT,
+        TRANSFER_SIDE_MAX,
     };
     use crate::kind;
 
@@ -7165,6 +7278,151 @@ mod tests {
             }
         }
         assert!(checked > 100, "{checked}");
+    }
+
+    /// [`row_runs`] cover every tile once, in order, each run inside one tile row and at most
+    /// `max` tiles, two a unit where pipelined; never spread over fewer units than the runs they
+    /// replace when those were one a unit; and give way where a row is shorter than a pipelined
+    /// run or the runs could not give every unit two.
+    #[test]
+    fn row_runs_keep_to_tile_rows() {
+        let piped = |rt: usize, ct: usize, units: usize, max: usize| {
+            pipelined_runs(rt * ct, 1, units, max, Overlap::Captured).unwrap()
+        };
+        for (rt, ct, units, max, pipelined) in [
+            (64, 256, 120, 36, true),
+            (512, 256, 120, 36, true),
+            (64, 256, 120, 64, false),
+            (3, 80, 5, 20, true),
+            (1, 300, 1, 64, false),
+            (1, 256, 120, 64, false),
+            (7, 41, 3, 14, true),
+        ] {
+            let old = if pipelined {
+                piped(rt, ct, units, max)
+            } else {
+                runs(rt * ct, units, max)
+            };
+            let r = row_runs(rt, ct, units, max, pipelined, &old)
+                .unwrap_or_else(|| panic!("[{rt}, {ct}] on {units}: no row runs"));
+            let mut next = 0;
+            for run in &r {
+                assert_eq!(run.start, next, "[{rt}, {ct}]: contiguous");
+                assert!(!run.is_empty() && run.len() <= max, "[{rt}, {ct}]: {run:?}");
+                assert_eq!(
+                    run.start / ct,
+                    (run.end - 1) / ct,
+                    "[{rt}, {ct}]: {run:?} in one row"
+                );
+                next = run.end;
+            }
+            assert_eq!(next, rt * ct);
+            if pipelined {
+                assert!(
+                    r.len() >= 2 * units,
+                    "[{rt}, {ct}]: {} runs on {units}",
+                    r.len()
+                );
+            }
+            assert!(
+                r.len() >= old.len().min(units),
+                "[{rt}, {ct}]: {} runs where {} were",
+                r.len(),
+                old.len()
+            );
+        }
+        // A chunk's RMSNorm division (`[64, 2048]` by `[64, 1]`): cut by rows at the fewest runs,
+        // four units took 32 tiles each where 120 took one or two (the first rule; the 1.7B's
+        // prefill at 1,000 tokens 8% slower). Costed, it keeps every unit.
+        let r = row_runs(2, 64, 120, 64, false, &runs(128, 120, 64)).unwrap();
+        assert!(r.len() >= 120, "{} runs", r.len());
+        assert_eq!(
+            row_runs(512, 8, 120, 36, true, &piped(512, 8, 120, 36)),
+            None,
+            "a row shorter than a pipelined run"
+        );
+        assert_eq!(
+            row_runs(2, 256, 120, 36, true, &runs(512, 120, 12)),
+            None,
+            "too few runs for every unit"
+        );
+    }
+
+    /// A column broadcast (`B` `[rows, 1]`) whose rows hold a run each reads, a run, `A`'s tiles
+    /// inside one tile row and that row's one tile of `B`, once, into one slot; switched off
+    /// ([`set_col_once`]), `B`'s tile beside every tile of `A` as before.
+    #[test]
+    fn a_column_broadcast_reads_its_row_s_tile_once_a_run() {
+        let op = Eltwise {
+            kind: crate::sfpu::ops::kind_sfpu::DIV,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let (rows, cols) = (96, 32 * 80);
+        let a = DramTensor::alloc_elem(&mut alloc, rows, cols, Elem::F32).unwrap();
+        let b = DramTensor::alloc_elem(&mut alloc, rows, 1, Elem::F32).unwrap();
+        let ct = a.grid()[1];
+        let b_ref = b.tensor_ref().encode();
+        let tile_of = |e: &[[u32; 8]]| {
+            let mut out = Vec::new();
+            expanded(e, &mut out);
+            out.into_iter().map(|e| e.unwrap()).collect::<Vec<_>>()
+        };
+        for (units, overlap) in [
+            (1, Overlap::Off),
+            (5, Overlap::Captured),
+            (4, Overlap::Fresh),
+        ] {
+            let work = sfpu_eltwise(&mut alloc, op, &a, Some(&b), None, units, overlap, None)
+                .unwrap()
+                .unwrap();
+            for job in &work.jobs {
+                let Step::List { entries, .. } = &job[0] else {
+                    panic!("a job begins with its gather")
+                };
+                let (first, count) = (entries[0][1] as usize, entries[0][2] as usize);
+                assert_eq!(first / ct, (first + count - 1) / ct, "a run inside one row");
+                assert_eq!(entries[3][2], 1, "one tile of B a run");
+                let reads = tile_of(&entries[3..6]);
+                assert_eq!(reads.len(), 1);
+                let want = tile_of(&[
+                    [record::READ_RUN, (first / ct) as u32, 1, 0, 0, 1, 0, 0],
+                    b_ref[0],
+                    b_ref[1],
+                ]);
+                assert_eq!(
+                    (reads[0][1], reads[0][3]),
+                    (want[0][1], want[0][3]),
+                    "row {}'s tile",
+                    first / ct
+                );
+            }
+            alloc.free(&work.out.placement);
+        }
+        let was = set_col_once(false);
+        let work = sfpu_eltwise(
+            &mut alloc,
+            op,
+            &a,
+            Some(&b),
+            None,
+            5,
+            Overlap::Captured,
+            None,
+        );
+        set_col_once(was);
+        let work = work.unwrap().unwrap();
+        for job in &work.jobs {
+            let Step::List { entries, .. } = &job[0] else {
+                panic!("a job begins with its gather")
+            };
+            assert_eq!(
+                entries[3][2], entries[0][2],
+                "off: B's tile beside every tile of A"
+            );
+        }
+        alloc.free(&work.out.placement);
     }
 
     /// A [`Broadcast::Block`] op reads, beside each of `A`'s tiles `(i, j)`, `B`'s tile

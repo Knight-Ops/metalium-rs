@@ -53,6 +53,10 @@ pub enum Pass {
     Sum,
     /// `DIV(SUB_EXP(s, max), sum)` out.
     Out,
+    /// `e = SUB_EXP(s, max)` out, over `s`, and its row sum ([`Mode::Written`]).
+    SumOut,
+    /// `DIV(e, sum)` out, over `e` ([`Mode::Written`]).
+    Div,
 }
 
 impl Pass {
@@ -60,14 +64,45 @@ impl Pass {
     fn statistic(self) -> Option<ReduceOp> {
         match self {
             Pass::Max => Some(ReduceOp::Max),
-            Pass::Sum => Some(ReduceOp::Sum),
-            Pass::Out => None,
+            Pass::Sum | Pass::SumOut => Some(ReduceOp::Sum),
+            Pass::Out | Pass::Div => None,
         }
     }
 
-    /// Whether the packer writes a tile out per tile in: `s`, or the output.
+    /// Whether the packer writes a tile out per tile in: `s`, `e`, or the output.
     fn writes_tiles(self) -> bool {
         self != Pass::Sum
+    }
+
+    /// The `Dst` row the packer writes a tile out from.
+    fn out_row(self) -> u32 {
+        match self {
+            Pass::Max => C_ROW,
+            Pass::SumOut => B_ROW,
+            Pass::Sum | Pass::Out | Pass::Div => OUT_ROW,
+        }
+    }
+}
+
+/// How a job's passes reach the output.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Mode {
+    /// `SUB_EXP` computed twice, its result never written: [`Pass::Max`], [`Pass::Sum`],
+    /// [`Pass::Out`] (the scores written twice, read three times).
+    Recompute,
+    /// `SUB_EXP` computed once and written over `s`, then divided: [`Pass::Max`],
+    /// [`Pass::SumOut`], [`Pass::Div`] (written three times, read three times), each link the
+    /// kind's staged program, so it replays (`sfpu::ops::staged_at`).
+    #[default]
+    Written,
+}
+
+impl Mode {
+    fn passes(self) -> [Pass; 3] {
+        match self {
+            Mode::Recompute => [Pass::Max, Pass::Sum, Pass::Out],
+            Mode::Written => [Pass::Max, Pass::SumOut, Pass::Div],
+        }
     }
 }
 
@@ -193,8 +228,9 @@ pub fn roles(
     // a later chunk continues from.
     let mut once: Vec<(u64, u32)> = match pass {
         Pass::Max => vec![],
-        Pass::Sum => vec![(l.max, MAX_ROW)],
+        Pass::Sum | Pass::SumOut => vec![(l.max, MAX_ROW)],
         Pass::Out => vec![(l.max, MAX_ROW), (l.sum, SUM_ROW)],
+        Pass::Div => vec![(l.sum, SUM_ROW)],
     };
     let stats: Vec<u32> = once.iter().map(|&(_, r)| r).collect();
     if pass.statistic().is_some() && !first {
@@ -238,6 +274,8 @@ pub fn roles(
             Pass::Max => math::scale_mask_max(scale, first_tile),
             Pass::Sum => math::sub_exp_sum(first_tile),
             Pass::Out => math::sub_exp_div(),
+            Pass::SumOut => math::sub_exp_sum_out(first_tile),
+            Pass::Div => math::div_by_sum(),
         }
     };
     let tile = |m: &mut Vec<Instruction>, loops: &mut Vec<Loop>, code: &Code| {
@@ -288,8 +326,11 @@ pub fn roles(
         );
         let block = pack.len();
         pack.extend(sync::take(s.computed, Before::PACKER));
-        let row = if pass == Pass::Max { C_ROW } else { OUT_ROW };
-        pack.extend(pack_tile_from_dst_gpr(OUT_GPR, Some(PACK_STRIDE_GPR), row));
+        pack.extend(pack_tile_from_dst_gpr(
+            OUT_GPR,
+            Some(PACK_STRIDE_GPR),
+            pass.out_row(),
+        ));
         pack.extend(sync::post_after(Unit::Packer, s.free));
         repeat(&mut pack_loops, block, pack.len(), tiles);
     }
@@ -372,6 +413,7 @@ pub fn softmax_rows(
     x: &DramTensor,
     mask: &DramTensor,
     scale: f32,
+    mode: Mode,
 ) -> Result<Work> {
     if !fits(x, mask) {
         return Err(shape_error(format!(
@@ -407,7 +449,7 @@ pub fn softmax_rows(
         let mut steps = Vec::with_capacity(9 * chunks);
         // Each pass starts in the half the last ended in: a new packet (module documentation).
         let mut h = 0;
-        for pass in [Pass::Max, Pass::Sum, Pass::Out] {
+        for pass in mode.passes() {
             for c in 0..chunks {
                 if c > 0 {
                     h ^= 1;
@@ -420,7 +462,7 @@ pub fn softmax_rows(
                         gather.extend(read(i * ct + j0, n, l.x[h], &xr));
                         gather.extend(read((i % mrt) * ct + j0, n, l.mask[h], &mr));
                     }
-                    Pass::Sum | Pass::Out => gather.extend(read(i * ct + j0, n, l.x[h], &or)),
+                    _ => gather.extend(read(i * ct + j0, n, l.x[h], &or)),
                 }
                 let scatter = if pass.writes_tiles() {
                     vec![
@@ -480,7 +522,7 @@ mod tests {
     #[test]
     fn programs_do_not_grow_with_the_chunk() {
         let l = plan(MAX_KQ).unwrap();
-        for pass in [Pass::Max, Pass::Sum, Pass::Out] {
+        for pass in [Pass::Max, Pass::Sum, Pass::Out, Pass::SumOut, Pass::Div] {
             for ends in [[true, false], [false, false], [false, true], [true, true]] {
                 let lens = |n: usize| roles(&l, pass, 1, n, ends, 0.125).0.map(|r| r.len());
                 assert_eq!(lens(3), lens(MAX_KQ), "{pass:?} {ends:?}");

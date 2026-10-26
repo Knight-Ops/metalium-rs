@@ -2689,10 +2689,21 @@ pub fn is_staged(kind: u32) -> bool {
 }
 
 fn staged(kind: u32) -> Option<crate::code::Code> {
+    staged_at(kind, [A_ROW, B_ROW, OUT_ROW], STAGE_ROWS)
+}
+
+/// [`staged`] with its operands at `a_at` and `b_at`, its result stored at `out_at`, and its
+/// registers handed on through `stages` (each a row group's 64 rows, clear of the other three):
+/// a link of a streamed chain (`super::softmax`), where the default rows hold its statistics.
+pub(crate) fn staged_at(
+    kind: u32,
+    [a_at, b_at, out_at]: [u32; 3],
+    stages: [u32; 3],
+) -> Option<crate::code::Code> {
     if super::row_limit() < 32 {
         return None;
     }
-    let (rx, ry, rz) = (STAGE_ROWS[0], STAGE_ROWS[1], STAGE_ROWS[2]);
+    let (rx, ry, rz) = (stages[0], stages[1], stages[2]);
     let (i32_, f32_) = (Format::Int32, Format::Fp32);
     use LReg as R;
     let mut p = Program::new();
@@ -2701,8 +2712,8 @@ fn staged(kind: u32) -> Option<crate::code::Code> {
         kind_sfpu::SUB_EXP => {
             let [k, magic, t, nf, r, c] = exp_registers(R::L2, R::L7);
             p.for_each_row_group(64, |p, o| {
-                p.load(R::L0, f32_, A_ROW + o);
-                p.load(R::L1, f32_, B_ROW + o);
+                p.load(R::L0, f32_, a_at + o);
+                p.load(R::L1, f32_, b_at + o);
                 p.sub(R::L0, R::L1, R::L2);
                 exp_reduce(p, R::L2, [k, magic, t, nf, r]);
                 p.store(R::L2, i32_, rx + o);
@@ -2720,7 +2731,7 @@ fn staged(kind: u32) -> Option<crate::code::Code> {
                 p.load(R::L2, i32_, rx + o);
                 p.load(R::L7, i32_, rz + o);
                 exp_range(p, R::L2, R::L7, [k, t]);
-                p.store(R::L7, f32_, OUT_ROW + o);
+                p.store(R::L7, f32_, out_at + o);
             });
         }
         // `scale_large_divisor`, `recip`'s steps, its specials, then `divide`, as
@@ -2729,8 +2740,8 @@ fn staged(kind: u32) -> Option<crate::code::Code> {
         kind_sfpu::DIV => {
             binary_constants(&mut p, kind, [0.0; 2]);
             p.for_each_row_group(64, |p, o| {
-                p.load(R::L0, f32_, A_ROW + o);
-                p.load(R::L1, f32_, B_ROW + o);
+                p.load(R::L0, f32_, a_at + o);
+                p.load(R::L1, f32_, b_at + o);
                 scale_large_divisor(p, R::L0, R::L1, R::L3, R::L4);
                 p.store(R::L0, i32_, rx + o);
                 p.store(R::L1, i32_, ry + o);
@@ -2751,7 +2762,7 @@ fn staged(kind: u32) -> Option<crate::code::Code> {
                 p.load(R::L1, i32_, ry + o);
                 p.load(R::L2, i32_, rz + o);
                 divide(p, R::L0, R::L1, R::L2, R::L5, R::L3, R::L4, R::L7);
-                p.store(R::L5, f32_, OUT_ROW + o);
+                p.store(R::L5, f32_, out_at + o);
             });
         }
         _ => return None,

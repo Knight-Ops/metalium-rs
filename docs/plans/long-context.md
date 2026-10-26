@@ -6,7 +6,8 @@ of 1,000 / 7,992 tokens at 8,192 positions 4.69 / 36.63 -> 1.24 / 18.33 s, bit f
 context (1.G, GDDR reuse in a capture), the BF16 cache, and contexts past 32K. Part 2 (split flash-decode) parked by
 decision (user, 2026-10-23).** Since (2026-10-25): attention's `SUB_EXP` and `DIV` replay instead of being pushed word by word, and a
 prefill of 7,992 tokens takes 12.28 / 10.00 s at chunks of 64 / 512 (was 15.24 / 12.58; roadmap, "The long-context
-softmax"). Roadmap Track 1, "Long context".
+softmax"). Since (2026-10-26, 1.H): a column operand read once a run and the softmax's statistics computed in the passes that
+make their input: 7,992 tokens in **10.92 / 8.42 s** at chunks of 64 / 512. Roadmap Track 1, "Long context".
 SmolLM2-1.7B's native context is 8,192.
 
 **Where it stopped:**
@@ -234,6 +235,46 @@ Part 2's unsplit baseline and fallback.
     pass every build, refused its plan and captured plainly again.
   - [ ] Larger default chunks at long context (`TT_GEN_CHUNKS` 128-512 at 8,192 fit now); worth little until the
     products reuse their operands (1.22x / 1.09x at 512).
+
+- [x] **1.H Long-prompt softmax passes** (2026-10-26, card 0; roadmap "Next for long prompts: the data passes";
+  [log](../learnings/performance-log.md#the-long-prompt-softmax-a-column-read-once-a-run-the-statistics-in-the-passes-that-make-their-input-2026-10-26-card-0)).
+  The profile (`1792967661`, chunk of 64 at 8,192) had the scale and softmax at 44% of a replay:
+  - `SUB_EXP` and `DIV` were data-bound at ~290 GB/s, half their reads the `[rows, 1]` column read once a tile;
+  - the maximum and sum were full passes, chunked past one run's 219 tiles on 64 units, each with a `CLAMP_MIN` op.
+  - [x] H0, the anchor: `step31_reduce` `chunked_reductions_are_the_programs`. Lines of 230 and 240 tiles, both axes,
+    specials; equal to `sfpu::reduce::reference` bit for bit; the sum folded a chunk at a time differs (control);
+    **watched failing** with the carried accumulator dropped. Now in `--smoke`.
+  - [x] H1, a column read once a run (`tensor::row_runs`, `TT_COL_ONCE=0` off, `set_col_once`): a column broadcast's
+    runs keep to tile rows and read their row's `B` tile once into one slot (`b_once`). They are taken only where a
+    model of the busiest unit's transfers (two a tile and one for `B`, against three a tile) beats the runs they
+    replace. Gates:
+    - host: `row_runs_keep_to_tile_rows`, `a_column_broadcast_reads_its_row_s_tile_once_a_run` (off: `B` a tile);
+    - `step206` `a_long_row_reads_its_column_tile_once_with_the_same_bits`: `SUB`, `DIV`, `SUB_EXP` over rows of 90 and
+      121 tiles, equal to the expanded-operand model and to the old runs; **watched failing** with the next row's tile
+      read.
+    - The first rule (fewest runs) cost RMSNorm's chunk division and decode rows their spread (8% at 1,000 tokens, 5%
+      on the long decode step); costed, both recovered.
+  - [x] H2, the statistics in the passes that make their input (`softmax::Mode::Written`, `Session::set_softmax_mode`):
+    - passes: `SCALE_MASK_FILL` with the maximum, staged `SUB_EXP` writing `e` with the sum, staged `DIV` by the sum
+      (`sfpu::softmax::{sub_exp_sum_out, div_by_sum}`, `ops::staged_at` with stage rows clear of the statistics);
+    - burn-tt routes attention there on rows past one reduction run (`TT_SOFTMAX_ROWS` unset: auto; `1` every row,
+      `0` never).
+    - Unit gates: `the_written_passes_are_the_composition_bit_for_bit`, `the_written_passes_are_staged`.
+    - `step230`: both modes against their models and against the six ops, a row of 230 tiles with a repeated mask
+      included; **watched failing** with the sum taken from `s`.
+  - Card 0, all passing:
+    - with the first rule: `step31`, `step183`, `step185`, `step187`, `step206`, `step209`, `step227`, `step230`,
+      `step224`, `step188` (`1792970468`, `1792972687`);
+    - with the costed rule: `--smoke` 1,213 of 1,213 (`1792981502`), `step188` and `step224` (`1792983113`). The native
+      context gave burn-flex's tokens, 0.166 on 33.7, traced 12.31 s.
+  - Also passing: `step12_mnist` (ttsim); conformance on ttsim, 2,973 of 3,025 with the 52 listed.
+  - Measured: 7,992 tokens 12.06 -> **10.92 s** at chunks of 64 and 9.84 -> **8.42 s** at 512; 1,000 tokens 746 -> 745 and
+    399 -> 386 ms; the long decode step 53.3 -> 52.6 ms; short context, ViT-Tiny and ResNet-18 unchanged.
+  - Left, on numbers:
+    - pass 1 still reads the mask once a head (32 x 2 MB a layer at `c` = 64);
+    - pass 2's in-order sum keeps one job a tile row, so a chunk of 64 runs the passes on 64 of 120 units (the maximum
+      alone could split a row over units: exact in any order, once signed zeros and NaN payloads are shown to agree);
+    - attention's `pv` is now the largest part of a chunk of 512 (77 of 286 ms before this work).
 
 ## Part 2: flash-decode past the fit limit
 

@@ -14,13 +14,22 @@
 //! - **Specials:** NaNs of both signs, infinities, `f32::MAX`, subnormals, scores of +-300 and rows
 //!   wholly masked (their output is `0 / MIN_POSITIVE`-clamped exactly as the composition's).
 //! - **Refusals** name the shape.
+//! - **Both modes** (`softmax::Mode`): `Written` (the default: `SUB_EXP` computed once, written over
+//!   `s`, then a staged `DIV` by the sum; `sfpu::softmax::reference_written`) and `Recompute` (as
+//!   first built), each against its model and both against the composition, including rows longer
+//!   than one reduction run (`per` > 219 tiles, where the composition's maximum and sum stream
+//!   through GDDR in continuations and take their clamp as an op of its own): the rows burn-tt
+//!   routes here by default (`docs/plans/long-context.md`, "Long-prompt softmax passes").
 //!
 //! Watched failing: the pass-1 accumulate reading the wrong column half (unit gate), and on the
-//! card with the accumulator carried between chunks dropped (the second chunk starting fresh).
+//! card with the accumulator carried between chunks dropped (the second chunk starting fresh);
+//! in `Written` mode, the sum accumulated from `s` instead of the `e` it writes (ttsim: the
+//! composition's bits differ; the model, running the same programs, cannot see it).
 
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::sfpu::ops::kind_sfpu;
 use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+use tt_kernels::softmax::Mode;
 use tt_kernels::tensor::{Elem, Eltwise};
 use tt_ttsim::fork_scope;
 
@@ -98,10 +107,6 @@ fn mask(rows: usize, cols: usize) -> Vec<u32> {
         .collect()
 }
 
-fn bits(v: &[f32]) -> Vec<u32> {
-    v.iter().map(|x| x.to_bits()).collect()
-}
-
 fn mismatches(a: &[f32], b: &[f32]) -> usize {
     a.iter()
         .zip(b)
@@ -123,15 +128,23 @@ fn softmax_rows_are_the_model_bit_for_bit() {
             let full: Vec<u32> = (0..rows * cols).map(|k| m[k % (mrows * cols)]).collect();
             let xt = s.upload(&x, rows, cols).unwrap();
             let mt = s.upload_bits(&m, mrows, cols, Elem::Bool).unwrap();
-            for scale in [0.125f32, -0.5] {
+            for (scale, mode) in [
+                (0.125f32, Mode::Written),
+                (-0.5, Mode::Written),
+                (0.125, Mode::Recompute),
+            ] {
+                s.set_softmax_mode(mode);
                 let got = s.softmax_rows(&xt, &mt, scale).unwrap();
                 let got_v = s.download(&got).unwrap();
-                let (_, _, _, want) =
-                    tt_kernels::sfpu::softmax::reference(&x, &full, rows, cols, scale, 32);
+                let model = match mode {
+                    Mode::Written => tt_kernels::sfpu::softmax::reference_written,
+                    Mode::Recompute => tt_kernels::sfpu::softmax::reference,
+                };
+                let (_, _, _, want) = model(&x, &full, rows, cols, scale, 32);
                 assert_eq!(
                     mismatches(&got_v, &want),
                     0,
-                    "[{rows}, {cols}], mask rows {mrows}, scale {scale}"
+                    "[{rows}, {cols}], mask rows {mrows}, scale {scale}, {mode:?}"
                 );
                 // A wholly masked row is the composition's `0 / MIN_POSITIVE`: zeros.
                 assert!(got_v[3 * cols..4 * cols].iter().all(|v| v.to_bits() == 0));
@@ -151,40 +164,85 @@ fn op(kind: u32, scalar: f32, scalar2: f32) -> Eltwise {
     }
 }
 
+/// The six ops burn-tt's attention composes, as it runs them: a clamped reduction in one pass
+/// where the row fits one run, else the reduction (in continuations) and the clamp as an op.
+fn composition<T: tt_device::Transport>(
+    s: &mut Session<T>,
+    xt: &tt_kernels::tensor::DramTensor,
+    mt: &tt_kernels::tensor::DramTensor,
+    scale: f32,
+) -> Vec<f32> {
+    let [rows, cols] = [xt.rows, xt.cols];
+    let sm = s
+        .eltwise(
+            op(kind_sfpu::SCALE_MASK_FILL, scale, f32::NEG_INFINITY),
+            xt,
+            Some(mt),
+        )
+        .unwrap();
+    let stat = |s: &mut Session<T>, a: &tt_kernels::tensor::DramTensor, r: ReduceOp, min: f32| {
+        let then = Some((kind_sfpu::CLAMP_MIN, min.to_bits()));
+        if tt_kernels::tensor::reduce_then_fits(r, Axis::Cols, [rows, cols], then) {
+            s.reduce_then(a, r, Axis::Cols, then).unwrap()
+        } else {
+            let raw = s.reduce(a, r, Axis::Cols).unwrap();
+            let c = s
+                .eltwise(op(kind_sfpu::CLAMP_MIN, min, 0.0), &raw, None)
+                .unwrap();
+            s.free(raw).unwrap();
+            c
+        }
+    };
+    let max = stat(s, &sm, ReduceOp::Max, -f32::MAX);
+    let e = s
+        .eltwise(op(kind_sfpu::SUB_EXP, 0.0, 0.0), &sm, Some(&max))
+        .unwrap();
+    let sum = stat(s, &e, ReduceOp::Sum, f32::MIN_POSITIVE);
+    let p = s
+        .eltwise(op(kind_sfpu::DIV, 0.0, 0.0), &e, Some(&sum))
+        .unwrap();
+    let out = s.download(&p).unwrap();
+    for t in [sm, max, e, sum, p] {
+        s.free(t).unwrap();
+    }
+    out
+}
+
 #[test]
 fn softmax_rows_are_the_composition_on_the_card() {
     with_session(|s| {
-        let (rows, cols) = (64, 1152);
-        let x = scores(rows, cols, 5);
-        let m = mask(rows, cols);
-        let xt = s.upload(&x, rows, cols).unwrap();
-        let mt = s.upload_bits(&m, rows, cols, Elem::Bool).unwrap();
-        let scale = 0.125;
-        let fused = s.softmax_rows(&xt, &mt, scale).unwrap();
-        let sm = s
-            .eltwise(
-                op(kind_sfpu::SCALE_MASK_FILL, scale, f32::NEG_INFINITY),
-                &xt,
-                Some(&mt),
-            )
-            .unwrap();
-        let clamp = |min: f32| Some((kind_sfpu::CLAMP_MIN, min.to_bits()));
-        let max = s
-            .reduce_then(&sm, ReduceOp::Max, Axis::Cols, clamp(-f32::MAX))
-            .unwrap();
-        let e = s
-            .eltwise(op(kind_sfpu::SUB_EXP, 0.0, 0.0), &sm, Some(&max))
-            .unwrap();
-        let sum = s
-            .reduce_then(&e, ReduceOp::Sum, Axis::Cols, clamp(f32::MIN_POSITIVE))
-            .unwrap();
-        let p = s
-            .eltwise(op(kind_sfpu::DIV, 0.0, 0.0), &e, Some(&sum))
-            .unwrap();
-        let (f, c) = (s.download(&fused).unwrap(), s.download(&p).unwrap());
-        assert_eq!(bits(&f), bits(&c));
-        for t in [fused, sm, max, e, sum, p, xt, mt] {
-            s.free(t).unwrap();
+        // A row of one run, and one of 230 tiles past it with a mask repeated down the rows.
+        for (rows, cols, mrows) in [(64, 1152, 64), (64, 32 * 230, 32)] {
+            assert_eq!(
+                tt_kernels::tensor::reduce_then_fits(
+                    ReduceOp::Max,
+                    Axis::Cols,
+                    [rows, cols],
+                    Some((kind_sfpu::CLAMP_MIN, (-f32::MAX).to_bits()))
+                ),
+                cols == 1152,
+                "[{rows}, {cols}]: the composition's reductions in one pass or in continuations"
+            );
+            let x = scores(rows, cols, 5 + cols as u64);
+            let m = mask(mrows, cols);
+            let xt = s.upload(&x, rows, cols).unwrap();
+            let mt = s.upload_bits(&m, mrows, cols, Elem::Bool).unwrap();
+            let scale = 0.125;
+            let c = composition(s, &xt, &mt, scale);
+            for mode in [Mode::Written, Mode::Recompute] {
+                s.set_softmax_mode(mode);
+                let fused = s.softmax_rows(&xt, &mt, scale).unwrap();
+                let f = s.download(&fused).unwrap();
+                assert_eq!(
+                    mismatches(&f, &c),
+                    0,
+                    "[{rows}, {cols}], mask rows {mrows}, {mode:?}"
+                );
+                s.free(fused).unwrap();
+            }
+            for t in [xt, mt] {
+                s.free(t).unwrap();
+            }
         }
     });
 }

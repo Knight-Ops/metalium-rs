@@ -112,6 +112,8 @@ pub const SMOKE: &[&str] = &[
     "step172_encoded_reads::",
     "step173_mover_differential::",
     "step19_eltwise::",
+    // Reductions, a line past one run's 219 tiles included (the continuations).
+    "step31_reduce::",
     "step27_burn_eltwise::",
     "step32_burn_softmax::",
     "step35_burn_rank_n::",

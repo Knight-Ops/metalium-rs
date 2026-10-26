@@ -3840,21 +3840,43 @@ pub fn set_attention_rows(on: bool) {
     ATTENTION_ROWS.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Whether attention's scale, mask and softmax run as one op over each row of the scores
-/// (`module::softmax_rows`, `Session::softmax_rows`); off unless asked for (`TT_SOFTMAX_ROWS=1`):
-/// a job a tile row takes `SUB_EXP` twice and fewer units than the composition, which is
-/// compute-bound there, so it measured slower (1.7B prefill at 8,192 positions, card 0).
-static SOFTMAX_ROWS: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+/// When attention's scale, mask and softmax run as one op over each row of the scores
+/// (`module::softmax_rows`, `Session::softmax_rows`): [`SOFTMAX_ROWS_AUTO`] by default, on rows
+/// too long for one reduction run, where the composition's maximum and sum each stream the row
+/// through GDDR again on a unit a tile row (`tensor::reduce_chunked`); `TT_SOFTMAX_ROWS=1` on
+/// every row it takes, `0` never. On short rows the composition's own reductions read each row
+/// once on every unit, and the one op measured slower there (`docs/plans/long-context.md`,
+/// "Long-prompt softmax passes").
+static SOFTMAX_ROWS: std::sync::LazyLock<std::sync::atomic::AtomicU8> =
     std::sync::LazyLock::new(|| {
-        std::sync::atomic::AtomicBool::new(std::env::var("TT_SOFTMAX_ROWS").is_ok_and(|v| v == "1"))
+        std::sync::atomic::AtomicU8::new(match std::env::var("TT_SOFTMAX_ROWS").as_deref() {
+            Ok("1") => SOFTMAX_ROWS_ON,
+            Ok("0") => SOFTMAX_ROWS_OFF,
+            _ => SOFTMAX_ROWS_AUTO,
+        })
     });
+const SOFTMAX_ROWS_OFF: u8 = 0;
+const SOFTMAX_ROWS_ON: u8 = 1;
+const SOFTMAX_ROWS_AUTO: u8 = 2;
 
-/// Turn off (or back on) attention's softmax as one op, process-wide: off, the scale and mask,
-/// the maximum, `SUB_EXP`, the sum and `DIV` run as their own ops. For gates' and benches'
-/// comparisons. Dev-facing.
+/// Turn attention's softmax as one op on for every row it takes (`true`) or off (`false`),
+/// process-wide: off, the scale and mask, the maximum, `SUB_EXP`, the sum and `DIV` run as their
+/// own ops. For gates' and benches' comparisons; [`set_softmax_rows_auto`] restores the default.
+/// Dev-facing.
 #[doc(hidden)]
 pub fn set_softmax_rows(on: bool) {
-    SOFTMAX_ROWS.store(on, std::sync::atomic::Ordering::SeqCst);
+    let v = if on {
+        SOFTMAX_ROWS_ON
+    } else {
+        SOFTMAX_ROWS_OFF
+    };
+    SOFTMAX_ROWS.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Attention's softmax as one op on long rows only, the default ([`SOFTMAX_ROWS`]). Dev-facing.
+#[doc(hidden)]
+pub fn set_softmax_rows_auto() {
+    SOFTMAX_ROWS.store(SOFTMAX_ROWS_AUTO, std::sync::atomic::Ordering::SeqCst);
 }
 pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
@@ -4179,7 +4201,8 @@ pub mod module {
     /// scores and a `Bool` mask, whole tiles, SFPU element-wise ops (not the matrix mode).
     fn softmax_rows(scores: &TtTensor, mask: &TtTensor, scale: f64) -> Option<TtTensor> {
         let device = scores.device;
-        if !SOFTMAX_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+        let when = SOFTMAX_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        if when == SOFTMAX_ROWS_OFF
             || !scores.is_storable()
             || !mask.is_storable()
             || scores.elem() != Some(Elem::F32)
@@ -4202,6 +4225,18 @@ pub mod module {
             || xc != yc
             || [xr, xc, yr].iter().any(|d| d % 32 != 0 || *d == 0)
             || xr % yr != 0
+        {
+            return None;
+        }
+        // Auto: only where the composition's clamped reductions would not run as one pass.
+        let clamp = (kind_sfpu::CLAMP_MIN, (-f32::MAX).to_bits());
+        if when == SOFTMAX_ROWS_AUTO
+            && tt_kernels::tensor::reduce_then_fits(
+                tt_kernels::sfpu::reduce::ReduceOp::Max,
+                tt_kernels::sfpu::reduce::Axis::Cols,
+                [xr, xc],
+                Some(clamp),
+            )
         {
             return None;
         }
