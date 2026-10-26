@@ -136,12 +136,28 @@ fn run_orders(
                     Skip::All => ", no gathers",
                 }
             );
-            for (what, b, fidelity) in [
-                ("HiFi4, B FP32", &b, Fidelity::HiFi4),
-                ("LoFi, B FP32", &b, Fidelity::Lo),
-                ("HiFi4, B BF16", &bb, Fidelity::HiFi4),
-                ("LoFi, B BF16", &bb, Fidelity::Lo),
-            ] {
+            // `TT_PAIR_FIDELITIES` (`lo,hifi2,hifi3,hifi4`; default LoFi and HiFi4).
+            let fidelities: Vec<(&str, Fidelity)> = std::env::var("TT_PAIR_FIDELITIES")
+                .map_or(vec![("HiFi4", Fidelity::HiFi4), ("LoFi", Fidelity::Lo)], |v| {
+                    v.split(',')
+                        .map(|f| match f.trim() {
+                            "lo" => ("LoFi", Fidelity::Lo),
+                            "hifi2" => ("HiFi2", Fidelity::HiFi2),
+                            "hifi3" => ("HiFi3", Fidelity::HiFi3),
+                            "hifi4" => ("HiFi4", Fidelity::HiFi4),
+                            other => panic!("TT_PAIR_FIDELITIES: {other}"),
+                        })
+                        .collect()
+                });
+            let cases: Vec<(String, &DramTensor, Fidelity)> = [("FP32", &b), ("BF16", &bb)]
+                .into_iter()
+                .flat_map(|(format, b)| {
+                    fidelities
+                        .iter()
+                        .map(move |&(name, f)| (format!("{name}, B {format}"), b, f))
+                })
+                .collect();
+            for (what, b, fidelity) in cases {
                 let (us, out) = replay_us(&mut s, &a, b, fidelity);
                 let tflops = flops / us / 1e6;
                 if !no_drain && skip == Skip::Nothing {

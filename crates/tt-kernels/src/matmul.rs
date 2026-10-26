@@ -1521,9 +1521,10 @@ pub enum PairOrder {
     /// The same unpacks, each `SrcB` half's phases interleaved with the other half's: two
     /// blocks between a block's `MVMUL`s rather than none.
     PhasesOuter,
-    /// [`PairOrder::PhasesOuter`] where `B` is BF16 in L1, else [`PairOrder::Faces`]: measured
-    /// faster each way (card 1, `silicon_probe_pair_cost`, 2026-10-26: with an F32 `B` the phases
-    /// outer are ~12% slower at HiFi4, with a BF16 `B` up to 24% faster).
+    /// [`PairOrder::Tiles`] for the routes its probes covered on silicon (`A` FP32 through TF32,
+    /// `B` FP32 through TF32 or BF16 through BF16), else [`PairOrder::Faces`]. The tiles kernel is
+    /// ~1.4-1.9x the faces kernel alone, and the 1.7B's prefill 7-14% faster (card 1,
+    /// `docs/plans/prefill-operand-reuse.md` P4).
     Auto,
     /// `B`'s whole tile in `SrcA` rows 0-63 (one 1,024-datum unpack, each face once a pair),
     /// `A`'s faces one at a time in `SrcB`: five unpacks a pair, four `Dst` blocks between a
@@ -1562,8 +1563,16 @@ impl PairOrder {
     /// The order a product of `fmts` takes.
     fn resolve(self, fmts: SrcFormats) -> PairOrder {
         match self {
-            PairOrder::Auto if fmts.b == L1Format::Bf16 => PairOrder::PhasesOuter,
-            PairOrder::Auto => PairOrder::Faces,
+            PairOrder::Auto => {
+                let a = fmts.a == L1Format::Fp32 && fmts.a_out == TF32_CODE;
+                let b = (fmts.b == L1Format::Fp32 && fmts.b_out == TF32_CODE)
+                    || (fmts.b == L1Format::Bf16 && fmts.b_out == BF16_CODE);
+                if a && b {
+                    PairOrder::Tiles
+                } else {
+                    PairOrder::Faces
+                }
+            }
             o => o,
         }
     }

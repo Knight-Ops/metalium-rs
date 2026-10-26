@@ -644,7 +644,7 @@ mod tests {
                 let faces = math(PairOrder::Faces);
                 for order in ORDERS {
                     let same = math(order) == faces;
-                    let alike = matches!(order, PairOrder::Faces | PairOrder::Auto)
+                    let alike = order == PairOrder::Faces
                         || order == PairOrder::PhasesOuter
                             && (fidelity == Fidelity::Lo || live == LiveRows::Eight);
                     assert_eq!(same, alike, "{order:?}, {fidelity:?}, {live:?}");
@@ -675,6 +675,70 @@ mod tests {
                             "{order:?}, {fidelity:?}, {route:?}, chunk {c}: {:?}",
                             math.fused().err()
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// What `silicon_probe_pair_cost`'s products' math roles push and whether they take the fused
+    /// form (`session::fused_form`: a fused form, `tt_isa::ttinsn::validate`, and at least
+    /// `FUSE_MIN_WORDS` pushed), for each order, `B` format and fidelity: printed (`--nocapture`).
+    #[test]
+    #[ignore = "a report: cargo test -p tt-kernels --lib fused_forms_of_the_pair_cost_products -- --ignored --nocapture"]
+    fn fused_forms_of_the_pair_cost_products() {
+        use crate::tensor::{block_stream_choice, BlockStream};
+        for tiles in [[32usize, 64, 256], [32, 256, 64]] {
+            for route in ROUTES {
+                let shape = block_stream_choice(
+                    BlockStream::Auto,
+                    tiles,
+                    120,
+                    f64::INFINITY,
+                    route,
+                    Fidelity::HiFi4,
+                )
+                .expect("blocked");
+                for order in ORDERS {
+                    ORDER_HERE.set(Some(order));
+                    for fidelity in [Fidelity::Lo, Fidelity::HiFi4] {
+                        let layout = block_stream_layout(shape.tiles, route.b_slot()).unwrap();
+                        let mut line = format!(
+                            "{tiles:?} {route:?} {:?} {order:?} {fidelity:?}:",
+                            shape.tiles
+                        );
+                        for c in [0, 1] {
+                            let (code, loops) = block_stream_kernel_looped(
+                                &layout,
+                                c,
+                                shape.tiles,
+                                route,
+                                fidelity,
+                                false,
+                                LiveRows::All,
+                            )
+                            .expect("fits");
+                            let math = crate::code::Code {
+                                ins: code[1].clone(),
+                                loops: loops[1].clone(),
+                            };
+                            let fused = math.fused().ok();
+                            let pushed = fused
+                                .as_ref()
+                                .and_then(|f| tt_isa::ttinsn::validate(f).ok());
+                            line += &format!(
+                                " chunk {c}: {} words pushed, {} stored, fused {}",
+                                math.expand().len(),
+                                math.ins.len(),
+                                match pushed {
+                                    Some(p) if p >= crate::session::FUSE_MIN_WORDS as u64 =>
+                                        "yes".to_string(),
+                                    Some(p) => format!("no (pushes {p} < FUSE_MIN_WORDS)"),
+                                    None => "no (no fused form)".to_string(),
+                                }
+                            );
+                        }
+                        println!("{line}");
                     }
                 }
             }
@@ -776,7 +840,11 @@ mod tests {
                 LiveRows::All,
             ));
             assert_eq!(interpret(&u, &m), want);
-            if order.whole().is_none() {
+            if order
+                .resolve(SrcRoute::Tf32FromFp32.src_formats())
+                .whole()
+                .is_none()
+            {
                 // The k'-reversed program computes every block's terms, in another order.
                 let reversed = interpret(&k_reversed(&u, b_transposed), &m);
                 assert_ne!(reversed, want, "k' reversed");
