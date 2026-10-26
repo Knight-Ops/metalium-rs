@@ -459,6 +459,28 @@ pub fn probe_throttle(unpacker0: u32, unpacker1: u32) {
     );
 }
 
+/// A probe only (`probe_pair_src_rows`): set unpacker 0's `REG1_ovrd_default_throttle_mode`, which
+/// Wormhole's `UNPACR_Regular.md` says Blackhole's unpacker 0 needs for its `Throttle_mode` to count
+/// (else x4, x8 for 8-bit data). The bit shares `Config` word 70 with packer 0's own
+/// configuration (`THCON_SEC0_REG1`), so the pack role writes it with the rest of that word
+/// ([`with_throttle_override`]): an unpack-side write would clear the packer's formats. Unpacker 1's
+/// (word 118) ttsim refuses. Process-wide, set before any product's programs are built.
+static PROBE_THROTTLE_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn probe_throttle_override(on: bool) {
+    PROBE_THROTTLE_OVERRIDE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The packer's configuration `pw` with [`PROBE_THROTTLE_OVERRIDE`]'s bit when it is on.
+fn with_throttle_override(pw: &mut ConfigWords) {
+    if PROBE_THROTTLE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        pw.set(thcon::THCON_SEC0_REG1_ovrd_default_throttle_mode, 1)
+            .unwrap();
+    }
+}
+
 #[doc(hidden)]
 pub fn probe_no_drain(on: bool) {
     PROBE_NO_DRAIN.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -1131,6 +1153,8 @@ pub(crate) fn block_stream_kernel_looped(
         words,
         ub,
         pair_math,
+        math_mods,
+        adc,
     } = pair_code(
         (a_at, b_at),
         route.src_formats(),
@@ -1182,9 +1206,7 @@ pub(crate) fn block_stream_kernel_looped(
         unpack.extend(src_thread_config());
         unpack.extend(crate::datapath::clear_unpacker0_adcs());
         unpack.extend(config_program(&words));
-        for u in [Unpacker::SrcA, Unpacker::SrcB] {
-            unpack.push(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1));
-        }
+        unpack.extend(adc.iter().copied());
     }
     // This output's first pair: `A`'s row and `B`'s column, as `gpr_retarget` sets them.
     unpack.push(encode::adddmareg(B_COL_GPR, B_SLOT_GPR, B_COL_GPR).unwrap());
@@ -1217,6 +1239,7 @@ pub(crate) fn block_stream_kernel_looped(
 
     // Math: the same words every output.
     let mut math = math_prelude();
+    math.extend(math_mods);
     let block = math.len() as u32;
     math.extend(sync::take(layout.sems.free, Before::MATRIX));
     math.push(encode::zeroacc(3, 0, 0, 0).unwrap());
@@ -1240,6 +1263,7 @@ pub(crate) fn block_stream_kernel_looped(
     let out0 = layout.out_slot(h, cols, 0, 0) + TILE_DATA;
     let mut pw = ConfigWords::new();
     crate::datapath::pack_config(&mut pw, out0);
+    with_throttle_override(&mut pw);
     let mut pack = config_program(&pw);
     set(&mut pack, SLOT_GPR, slot);
     set(&mut pack, OUT_GPR, pack_dest_units(out0) - slot);
@@ -1320,6 +1344,7 @@ pub(crate) fn block_stream_programs(
         u64,
         MatmulSemaphores,
         bool,
+        PairOrder,
     );
     static CACHE: OnceLock<Mutex<HashMap<Key, SharedLoopedRoles>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
@@ -1336,6 +1361,7 @@ pub(crate) fn block_stream_programs(
         crate::l1::arena().end,
         layout.sems,
         looped,
+        pair_order(),
     );
     if let Some(v) = cache.lock().unwrap().get(&key) {
         return v.clone();
@@ -1475,6 +1501,150 @@ struct PairCode {
     words: ConfigWords,
     ub: Vec<Instruction>,
     pair_math: Vec<Item>,
+    /// The math role's address modifiers the order needs beyond [`math_prelude`]'s, written
+    /// after it.
+    math_mods: Vec<Instruction>,
+    /// The unpackers' `X` ranges (and `Z` where an operand is unpacked whole), in the prelude
+    /// and again after a reload's `UnpackToDst`.
+    adc: Vec<Instruction>,
+}
+
+/// The order a K-tile pair's `MVMUL`s take (`docs/plans/prefill-operand-reuse.md` P4). Every
+/// order gives each `Dst` 8x16 block the same terms in the same order -- `k'`, then the phases
+/// -- so every order's products are the same bits ([`order`]'s checker holds each to
+/// [`order::canonical`]); they differ in how close together the `MVMUL`s on one block come
+/// (`Dst.md`: a block written is not read again for four cycles) and in the unpacks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PairOrder {
+    /// A block's phases back to back, a face at a time: twelve face unpacks a pair.
+    Faces,
+    /// The same unpacks, each `SrcB` half's phases interleaved with the other half's: two
+    /// blocks between a block's `MVMUL`s rather than none.
+    PhasesOuter,
+    /// [`PairOrder::Tiles`] for the routes its probes covered on silicon (`A` FP32 through TF32,
+    /// `B` FP32 through TF32 or BF16 through BF16), else [`PairOrder::Faces`]. The tiles kernel is
+    /// ~1.4-1.9x the faces kernel alone, and the 1.7B's prefill 7-14% faster (card 1,
+    /// `docs/plans/prefill-operand-reuse.md` P4).
+    Auto,
+    /// `B`'s whole tile in `SrcA` rows 0-63 (one 1,024-datum unpack, each face once a pair),
+    /// `A`'s faces one at a time in `SrcB`: five unpacks a pair, four `Dst` blocks between a
+    /// block's `MVMUL`s, phases outer. A probe until silicon licenses `SrcA` past row 16
+    /// (`docs/plans/prefill-operand-reuse.md` P4, B3).
+    SrcAWhole,
+    /// `A`'s whole tile in `SrcB` rows 0-63 (or its first face row in 0-31), `B`'s faces one at
+    /// a time in `SrcA`: five unpacks a pair. A probe, as [`PairOrder::SrcAWhole`].
+    SrcBWhole,
+    /// Both tiles whole, `B`'s in `SrcA` and `A`'s in `SrcB`: two unpacks a pair, every `Dst`
+    /// block of the output between a block's `MVMUL`s. A probe, as [`PairOrder::SrcAWhole`].
+    Tiles,
+}
+
+impl PairOrder {
+    /// Every order, the faces order first.
+    pub const ALL: [PairOrder; 6] = [
+        PairOrder::Faces,
+        PairOrder::PhasesOuter,
+        PairOrder::Auto,
+        PairOrder::SrcAWhole,
+        PairOrder::SrcBWhole,
+        PairOrder::Tiles,
+    ];
+
+    /// Which operands an order holds whole: `(B in SrcA, A in SrcB)`.
+    fn whole(self) -> Option<(bool, bool)> {
+        match self {
+            PairOrder::SrcAWhole => Some((true, false)),
+            PairOrder::SrcBWhole => Some((false, true)),
+            PairOrder::Tiles => Some((true, true)),
+            _ => None,
+        }
+    }
+
+    /// The order a product of `fmts` takes.
+    fn resolve(self, fmts: SrcFormats) -> PairOrder {
+        match self {
+            PairOrder::Auto => {
+                let a = fmts.a == L1Format::Fp32 && fmts.a_out == TF32_CODE;
+                let b = (fmts.b == L1Format::Fp32 && fmts.b_out == TF32_CODE)
+                    || (fmts.b == L1Format::Bf16 && fmts.b_out == BF16_CODE);
+                if a && b {
+                    PairOrder::Tiles
+                } else {
+                    PairOrder::Faces
+                }
+            }
+            o => o,
+        }
+    }
+}
+
+static PAIR_ORDER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// The pair order products are built with: [`set_pair_order`]'s, else `TT_PAIR_ORDER`
+/// (`faces`, `phases`, `auto`, and the probes `srca`, `srcb`, `tiles`), else [`PairOrder::Auto`].
+pub fn pair_order() -> PairOrder {
+    use std::sync::atomic::Ordering::Relaxed;
+    #[cfg(test)]
+    if let Some(o) = ORDER_HERE.get() {
+        return o;
+    }
+    let decode = |v: u8| match v {
+        0 => Some(PairOrder::Faces),
+        1 => Some(PairOrder::PhasesOuter),
+        2 => Some(PairOrder::Auto),
+        3 => Some(PairOrder::SrcAWhole),
+        4 => Some(PairOrder::SrcBWhole),
+        5 => Some(PairOrder::Tiles),
+        _ => None,
+    };
+    if let Some(o) = decode(PAIR_ORDER.load(Relaxed)) {
+        return o;
+    }
+    let o = match std::env::var("TT_PAIR_ORDER").as_deref() {
+        Ok("faces") => PairOrder::Faces,
+        Ok("phases") => PairOrder::PhasesOuter,
+        Ok("auto") | Err(_) => PairOrder::Auto,
+        Ok("srca") => PairOrder::SrcAWhole,
+        Ok("srcb") => PairOrder::SrcBWhole,
+        Ok("tiles") => PairOrder::Tiles,
+        Ok(other) => panic!("TT_PAIR_ORDER={other}: faces, phases, auto, srca, srcb or tiles"),
+    };
+    set_pair_order(o);
+    o
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A host test's own order, on its own thread: tests run side by side in one process.
+    pub(crate) static ORDER_HERE: std::cell::Cell<Option<PairOrder>> = const { std::cell::Cell::new(None) };
+}
+
+/// Build every product's pairs in `order`, process-wide. The program caches key on it.
+pub fn set_pair_order(order: PairOrder) {
+    let v = match order {
+        PairOrder::Faces => 0,
+        PairOrder::PhasesOuter => 1,
+        PairOrder::Auto => 2,
+        PairOrder::SrcAWhole => 3,
+        PairOrder::SrcBWhole => 4,
+        PairOrder::Tiles => 5,
+    };
+    PAIR_ORDER.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Address modifiers of [`PairOrder::PhasesOuter`], beside [`math_prelude`]'s: the next `SrcB`
+/// half at the same phase, and back to the first half at the next phase.
+pub const MATH_AM_NEXT_HALF: u32 = 5;
+pub const MATH_AM_NEXT_PHASE: u32 = 6;
+
+fn phases_outer_mods() -> Vec<Instruction> {
+    use thread::*;
+    vec![
+        crate::datapath::thread_entry(ADDR_MOD_AB_SEC5_SrcBIncr, 8),
+        crate::datapath::thread_entry(ADDR_MOD_DST_SEC5_DestIncr, 0),
+        crate::datapath::thread_entry(ADDR_MOD_AB_SEC6_SrcBClear, 1),
+        crate::datapath::thread_entry(ADDR_MOD_DST_SEC6_FidelityIncr, 1),
+    ]
 }
 
 /// [`PairCode`] for a product whose first pair is `(a0, b0)` (the bases its configuration names
@@ -1518,9 +1688,14 @@ fn pair_code(
             .unwrap();
     }
     prelude.extend(config_program(&words));
-    for u in [Unpacker::SrcA, Unpacker::SrcB] {
-        prelude.push(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1));
+    let order = pair_order().resolve(fmts);
+    if let Some(whole) = order.whole() {
+        return whole_pair_code(prelude, words, whole, fidelity, b_transposed, live);
     }
+    let adc: Vec<Instruction> = [Unpacker::SrcA, Unpacker::SrcB]
+        .map(|u| crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1))
+        .to_vec();
+    prelude.extend(adc.iter().copied());
     let base = encode::UnpacrRegular::ZERO.multi_context_mode(1);
     let phases = fidelity.phases();
     let (face_rows, halves) = (live.face_rows(), live.halves());
@@ -1532,7 +1707,23 @@ fn pair_code(
     // `SrcB` half it computes, every phase -- all but its last `MVMUL`, which
     // the caller issues at `dst + 8 (halves - 1)` with the group's flips and
     // its end.
+    // With the phases outer, a group's `MVMUL`s alternate between its two halves (with one
+    // phase or one half there is nothing to interleave).
+    let outer = order == PairOrder::PhasesOuter && halves == 2 && phases > 1;
     let group = |out: &mut Vec<Instruction>, dst: u32, mut loaded: Banks<Loaded, Loaded>| {
+        if outer {
+            for phase in 0..phases {
+                let (i, next) = loaded.mvmul(mv(dst, MATH_AM_NEXT_HALF)).unwrap();
+                out.push(i);
+                loaded = next;
+                if phase + 1 < phases {
+                    let (i, next) = loaded.mvmul(mv(dst + 8, MATH_AM_NEXT_PHASE)).unwrap();
+                    out.push(i);
+                    loaded = next;
+                }
+            }
+            return loaded;
+        }
         for half in 0..halves {
             let last = if half + 1 < halves {
                 phases
@@ -1625,6 +1816,344 @@ fn pair_code(
         words,
         ub,
         pair_math,
+        math_mods: if outer {
+            phases_outer_mods()
+        } else {
+            Vec::new()
+        },
+        adc,
+    }
+}
+
+/// One address modifier entry, written whole (`RWCs.md`, `ApplyAddrMod`): each `Src` RWC
+/// incremented, or its carry register incremented and copied to it (`cr`), or both cleared; `Dst`
+/// likewise; the fidelity phase incremented or cleared.
+#[derive(Clone, Copy, Default)]
+struct AddrMod {
+    a: (u16, bool, bool),
+    b: (u16, bool, bool),
+    d: (u16, bool),
+    f: (u16, bool),
+}
+
+impl AddrMod {
+    /// Entry `entry`'s two `ThreadConfig` words, every field named.
+    fn words(self, entry: u32) -> [Instruction; 2] {
+        use tt_isa::backend::ThreadConfigEntry as E;
+        let field = |name: String| {
+            tt_isa::cfg::generated::ALL_THREAD_CONFIG_FIELDS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("no {name}"))
+                .1
+        };
+        let ab = |f: &str| field(format!("ADDR_MOD_AB_SEC{entry}_{f}"));
+        let ds = |f: &str| field(format!("ADDR_MOD_DST_SEC{entry}_{f}"));
+        let set = |e: E, f, v: u16| e.set(f, v).expect("the field holds it");
+        let mut w = E::zeroed(ab("SrcAIncr").addr32());
+        for (f, v) in [
+            ("SrcAIncr", self.a.0),
+            ("SrcACR", u16::from(self.a.1)),
+            ("SrcAClear", u16::from(self.a.2)),
+            ("SrcBIncr", self.b.0),
+            ("SrcBCR", u16::from(self.b.1)),
+            ("SrcBClear", u16::from(self.b.2)),
+        ] {
+            w = set(w, ab(f), v);
+        }
+        let mut d = E::zeroed(ds("DestIncr").addr32());
+        for (f, v) in [
+            ("DestIncr", self.d.0),
+            ("DestCR", u16::from(self.d.1)),
+            ("FidelityIncr", self.f.0),
+            ("FidelityClear", u16::from(self.f.1)),
+        ] {
+            d = set(d, ds(f), v);
+        }
+        [w.encode().unwrap(), d.encode().unwrap()]
+    }
+}
+
+/// [`PairCode`] for an order that holds an operand's tile whole in its `Src` ([`PairOrder::whole`]:
+/// `B` in `SrcA`, `A` in `SrcB`), its rows reached through the RWCs: one unpack of the whole tile
+/// (1,024 datums; `A`'s first face row alone, 512, where only `fi` 0 is live), and each `MVMUL`'s
+/// `Src` rows stepped by address modifiers 1-5 written whole (`math_mods`). Every block takes `k'`,
+/// then the phases, as [`order::canonical`] says; the phases are outer to the blocks.
+fn whole_pair_code(
+    mut prelude: Vec<Instruction>,
+    words: ConfigWords,
+    (a_whole, b_whole): (bool, bool),
+    fidelity: Fidelity,
+    b_transposed: bool,
+    live: LiveRows,
+) -> PairCode {
+    let base = encode::UnpacrRegular::ZERO.multi_context_mode(1);
+    let phases = fidelity.phases();
+    let (n_fi, n_h) = (live.face_rows(), live.halves());
+    // `B`'s face `(k, fj)` sits at `SrcA` row 16 z, z its slot's face; `A`'s `(fi, k)` at `SrcB`
+    // row 16 (2 fi + k).
+    let b_face = |k: u32, fj: u32| if b_transposed { 2 * fj + k } else { 2 * k + fj };
+    let (da_fj, da_k) = (16 * b_face(0, 1), 16 * b_face(1, 0));
+    let zw = |u: Unpacker, face: u32| {
+        let z = encode::Setadczw::ZERO.z0(1).z0_val(face);
+        match u {
+            Unpacker::SrcA => z.u0(1),
+            Unpacker::SrcB => z.u1(1),
+        }
+        .encode()
+        .unwrap()
+    };
+    let mut adc = Vec::new();
+    for (u, whole, datums) in [
+        (Unpacker::SrcA, a_whole, 4 * FACE_DATUMS),
+        (Unpacker::SrcB, b_whole, 2 * n_fi * FACE_DATUMS),
+    ] {
+        if whole {
+            adc.push(crate::datapath::set_adc_x(u, 0, datums - 1));
+            adc.push(zw(u, 0));
+        } else {
+            adc.push(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1));
+        }
+    }
+    prelude.extend(adc.iter().copied());
+    let mv = |row: u32, am: u32| encode::Mvmul::ZERO.dst_row(row).addr_mod(am);
+    let none = AddrMod::default();
+    // Address modifiers 1-5, by name.
+    let (m_h, m_fi, m_fj, m_ph, m_k) = (1, 2, 3, 4, 5);
+    let mut mods = [none; 6];
+    let mut ub = Vec::new();
+    let mut unit = Vec::new();
+    let reset = encode::Setrwc::ZERO
+        .src_a(1)
+        .src_a_val(0)
+        .src_b(1)
+        .src_b_val(0)
+        .dst(1)
+        .dst_val(0)
+        .fidelity(1)
+        .encode()
+        .unwrap();
+    let (repeats, release) = match (a_whole, b_whole) {
+        (true, true) => {
+            // Per `k'` (the unit, twice): phase, `fj`, `fi`, half.
+            mods[m_h as usize] = AddrMod {
+                b: (8, false, false),
+                ..none
+            };
+            mods[m_fi as usize] = AddrMod {
+                b: (24, false, false),
+                ..none
+            };
+            mods[m_fj as usize] = AddrMod {
+                a: (da_fj as u16, false, false),
+                b: (0, true, false),
+                ..none
+            };
+            mods[m_ph as usize] = AddrMod {
+                a: (0, true, false),
+                b: (0, true, false),
+                f: (1, false),
+                ..none
+            };
+            mods[m_k as usize] = AddrMod {
+                a: (da_k as u16, true, false),
+                b: (16, true, false),
+                f: (0, true),
+                ..none
+            };
+            let (u, banks) = Banks::after_reset().unpack_b(base).unwrap();
+            ub.push(u);
+            let (u, mut loaded) = banks.unpack_a(base).unwrap();
+            ub.push(u);
+            for p in 0..phases {
+                for fj in 0..2 {
+                    for fi in 0..n_fi {
+                        for h in 0..n_h {
+                            let am = if h + 1 < n_h {
+                                m_h
+                            } else if fi + 1 < n_fi {
+                                m_fi
+                            } else if fj == 0 {
+                                m_fj
+                            } else if p + 1 < phases {
+                                m_ph
+                            } else {
+                                m_k
+                            };
+                            let (i, next) =
+                                loaded.mvmul(mv(16 * (2 * fi + fj) + 8 * h, am)).unwrap();
+                            unit.push(i);
+                            loaded = next;
+                        }
+                    }
+                }
+            }
+            (2, loaded.release_both().unwrap().0)
+        }
+        (true, false) => {
+            // Per `fi` (the unit): `k'` (a group, `A`'s face), phase, `fj`, half; `Dst` on 32
+            // rows an `fi`.
+            mods[m_h as usize] = AddrMod {
+                b: (8, false, false),
+                ..none
+            };
+            mods[m_fj as usize] = AddrMod {
+                a: (da_fj as u16, false, false),
+                b: (0, false, true),
+                ..none
+            };
+            mods[m_ph as usize] = AddrMod {
+                a: (0, true, false),
+                b: (0, false, true),
+                f: (1, false),
+                ..none
+            };
+            mods[m_k as usize] = AddrMod {
+                a: (da_k as u16, true, false),
+                b: (0, false, true),
+                f: (0, true),
+                ..none
+            };
+            mods[m_fi as usize] = AddrMod {
+                a: (0, false, true),
+                b: (0, false, true),
+                d: (32, false),
+                f: (0, true),
+            };
+            let (u, mut held) = Banks::after_reset().unpack_a(base).unwrap();
+            ub.push(u);
+            for fi in 0..n_fi {
+                for k in 0..2 {
+                    ub.push(zw(Unpacker::SrcB, 2 * fi + k));
+                    let (u, mut loaded) = held.unpack_b(base).unwrap();
+                    ub.push(u);
+                    let mut group = Vec::new();
+                    let mut last = None;
+                    for p in 0..phases {
+                        for fj in 0..2 {
+                            for h in 0..n_h {
+                                let am = if h + 1 < n_h {
+                                    m_h
+                                } else if fj == 0 {
+                                    m_fj
+                                } else if p + 1 < phases {
+                                    m_ph
+                                } else if k == 0 {
+                                    m_k
+                                } else {
+                                    m_fi
+                                };
+                                let row = 16 * fj + 8 * h;
+                                if p + 1 == phases && fj == 1 && h + 1 == n_h {
+                                    last = Some(mv(row, am));
+                                } else {
+                                    let (i, next) = loaded.mvmul(mv(row, am)).unwrap();
+                                    group.push(i);
+                                    loaded = next;
+                                }
+                            }
+                        }
+                    }
+                    let (i, next) = loaded.mvmul_release_b(last.unwrap()).unwrap();
+                    group.push(i);
+                    held = next;
+                    if fi == 0 {
+                        unit.extend(group);
+                    }
+                }
+            }
+            (n_fi, held.release_a().unwrap().0)
+        }
+        (false, true) => {
+            // Per `k'` (the unit, twice): `fj` (a group, `B`'s face), phase, `fi`, half; `Dst` on
+            // 16 rows for `fj` 1.
+            mods[m_h as usize] = AddrMod {
+                b: (8, false, false),
+                ..none
+            };
+            mods[m_fi as usize] = AddrMod {
+                b: (24, false, false),
+                ..none
+            };
+            mods[m_ph as usize] = AddrMod {
+                b: (0, true, false),
+                f: (1, false),
+                ..none
+            };
+            mods[m_fj as usize] = AddrMod {
+                b: (0, true, false),
+                d: (16, false),
+                f: (0, true),
+                ..none
+            };
+            mods[m_k as usize] = AddrMod {
+                b: (16, true, false),
+                d: (0, true),
+                f: (0, true),
+                ..none
+            };
+            let (u, mut held) = Banks::after_reset().unpack_b(base).unwrap();
+            ub.push(u);
+            for k in 0..2 {
+                for fj in 0..2 {
+                    ub.push(zw(Unpacker::SrcA, b_face(k, fj)));
+                    let (u, mut loaded) = held.unpack_a(base).unwrap();
+                    ub.push(u);
+                    let mut group = Vec::new();
+                    let mut last = None;
+                    for p in 0..phases {
+                        for fi in 0..n_fi {
+                            for h in 0..n_h {
+                                let am = if h + 1 < n_h {
+                                    m_h
+                                } else if fi + 1 < n_fi {
+                                    m_fi
+                                } else if p + 1 < phases {
+                                    m_ph
+                                } else if fj == 0 {
+                                    m_fj
+                                } else {
+                                    m_k
+                                };
+                                let row = 32 * fi + 8 * h;
+                                if p + 1 == phases && fi + 1 == n_fi && h + 1 == n_h {
+                                    last = Some(mv(row, am));
+                                } else {
+                                    let (i, next) = loaded.mvmul(mv(row, am)).unwrap();
+                                    group.push(i);
+                                    loaded = next;
+                                }
+                            }
+                        }
+                    }
+                    let (i, next) = loaded.mvmul_release_a(last.unwrap()).unwrap();
+                    group.push(i);
+                    held = next;
+                    if k == 0 {
+                        unit.extend(group);
+                    }
+                }
+            }
+            (2, held.release_b().unwrap().0)
+        }
+        (false, false) => unreachable!("an order with nothing whole has its faces"),
+    };
+    let math_mods = (1..6u32).flat_map(|e| mods[e as usize].words(e)).collect();
+    let pair_math = vec![
+        Item::I(reset),
+        Item::Repeat {
+            times: repeats,
+            body: unit.into_iter().map(Item::I).collect(),
+        },
+        Item::I(release),
+    ];
+    PairCode {
+        prelude,
+        words,
+        ub,
+        pair_math,
+        math_mods,
+        adc,
     }
 }
 
@@ -1659,12 +2188,14 @@ pub(crate) fn matmul_items_continuing(
         words,
         ub,
         pair_math,
+        math_mods,
+        adc,
     } = pair_code((a0, b0), fmts, fidelity, b_transposed, live);
     fn i(v: impl IntoIterator<Item = Instruction>) -> impl Iterator<Item = Item> {
         v.into_iter().map(Item::I)
     }
     let mut unpack: Vec<Item> = i(prelude).collect();
-    let mut math: Vec<Item> = i(math_prelude()).collect();
+    let mut math: Vec<Item> = i(math_prelude()).chain(i(math_mods)).collect();
     let mut pack: Vec<Item> = Vec::new();
     let mut current = (a0, b0);
     for (o, output) in outputs.iter().enumerate() {
@@ -1694,9 +2225,7 @@ pub(crate) fn matmul_items_continuing(
             unpack.extend(i(src_thread_config()));
             unpack.extend(i(crate::datapath::clear_unpacker0_adcs()));
             unpack.extend(i(config_program(&words)));
-            for u in [Unpacker::SrcA, Unpacker::SrcB] {
-                unpack.push(Item::I(crate::datapath::set_adc_x(u, 0, FACE_DATUMS - 1)));
-            }
+            unpack.extend(i(adc.iter().copied()));
             current = (u64::MAX, u64::MAX);
         } else {
             math.push(Item::I(encode::zeroacc(3, 0, 0, 0).unwrap()));
@@ -1760,6 +2289,7 @@ pub(crate) fn matmul_items_continuing(
         let mut pw = ConfigWords::new();
         if pack.is_empty() {
             crate::datapath::pack_config(&mut pw, output.out);
+            with_throttle_override(&mut pw);
         } else {
             pw.set(
                 tt_isa::cfg::generated::thcon::THCON_SEC0_REG1_L1_Dest_addr,
@@ -2851,11 +3381,20 @@ pub(crate) fn programs(
         MatmulSemaphores,
         LiveRows,
         u64,
+        PairOrder,
     );
     type Roles = Arc<[Vec<Instruction>; 3]>;
     static CACHE: OnceLock<Mutex<HashMap<Key, Roles>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (tiles, route, fidelity, sems, live, crate::l1::arena().end);
+    let key = (
+        tiles,
+        route,
+        fidelity,
+        sems,
+        live,
+        crate::l1::arena().end,
+        pair_order(),
+    );
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
     }
@@ -2897,6 +3436,7 @@ pub(crate) fn kernel_programs(
         LiveRows,
         u64,
         u64,
+        PairOrder,
     );
     type Value = (Arc<[Vec<Instruction>; 3]>, [Option<MopConfig>; 3]);
     static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
@@ -2914,6 +3454,7 @@ pub(crate) fn kernel_programs(
         // `crate::l1::ring_end`.
         crate::l1::arena().end,
         crate::l1::ring_end(),
+        pair_order(),
     );
     if let Some(p) = cache.lock().unwrap().get(&key) {
         return p.clone();
@@ -3146,6 +3687,10 @@ where
     }
     Ok(c)
 }
+
+#[cfg(test)]
+#[path = "matmul_order.rs"]
+pub(crate) mod order;
 
 #[cfg(test)]
 mod tests {

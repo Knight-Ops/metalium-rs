@@ -588,6 +588,13 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         pair (P4). The 1.7B's prefill at 8,192 positions with chunks of 512: 1,000 / 4,000 / 7,992 tokens
         **1.24 / 6.81 / 18.33 -> 0.48 / 3.70 / 12.59 s** (`1792858000`). Next: the pair's cost (P4), then each operand out
         of GDDR once (Step 2).
+      - [x] **The pair's cost, P4** (2026-10-26, card 1,
+        [log](../learnings/performance-log.md#a-k-tile-pairs-order-each-tile-whole-in-its-src-2026-10-26-card-1)): each
+        operand's tile whole in its `Src` (one 1,024-datum unpack, rows 0-63 through the RWCs; probed on ttsim and card 1
+        alone), two unpacks a pair instead of twelve, bit for bit (a host checker of each `Dst` block's accumulation
+        order, `matmul::order`; `step229`). The kernel 1.5-1.9x; the products are now bound by their gathers (the unpacks
+        never bound them). `BLOCK_PAIR_US` re-fitted 0.4 -> 0.2. The 1.7B's prefill (BF16 weights, card 1, chunks of
+        512): 1,000 / 7,992 tokens **346.8 / 6,386 -> 283.8 / 5,984 ms**. Next: Step 2 (P5), the gathers.
       - [x] **The long-context softmax** (2026-10-25, card 0,
         [log](../learnings/performance-log.md#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0)).
         - **Measured first** (profile `1792900837`): at 8,192 positions the softmax is 48% of a 64-token chunk's
@@ -618,7 +625,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
           (`1792992817`), 1,000 tokens 386 -> 375 ms.
         - **Next for long prompts:** ~~attention's `pv`~~ (done above; it was 27% of a chunk of 512: 2.2 GB a layer at 229 GB/s, its `P` read twice and
           `V` ~16 times; profile `1792968733`), then the passes' own limits (the mask read once a head; 64 jobs at chunks of 64), then the
-          products' pair cost (P4).
+          ~~products' pair cost (P4)~~ (done, above), then the products' gathers (P5).
       - **Before (2026-10-17):** a prefill-shaped product reached 2.0-4.2 TFLOPS against ~166 at HiFi4 (`matmul_throughput`,
         `1792258604`). It is bound by GDDR because each unit gathers its own tiles: `B` is read `m / 32` times, `A`
         once per two-column block, up to once a unit. The largest product reads 3.2 GB for 77 MB.

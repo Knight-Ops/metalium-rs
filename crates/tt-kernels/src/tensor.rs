@@ -1517,6 +1517,20 @@ pub fn probe_skip_a_reads(on: bool) {
     PROBE_SKIP_A.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// A development probe (`docs/plans/prefill-operand-reuse.md` P4, `silicon_probe_pair_cost`): a
+/// blocked product's chunks gather nothing (a `WAIT` stands in), so its kernels compute on whatever
+/// the slots hold. What is left is the kernels and their handshakes. **The products are wrong**;
+/// only their time means anything.
+static PROBE_SKIP_BLOCK_GATHERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BLOCK_GATHERS`] on or off, process-wide. Dev-facing: a timing bound, never a
+/// result.
+#[doc(hidden)]
+pub fn probe_skip_block_gathers(on: bool) {
+    PROBE_SKIP_BLOCK_GATHERS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn probing_skip_a() -> bool {
     PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -3213,7 +3227,11 @@ impl BlockPlan {
 /// `1792857249`-`1792857286`, ~3-5 us a chunk of 24 outputs; blocks of 24-64 outputs, 0.4-0.6 us a
 /// pair at HiFi4). The card's rate is what a product reading under its compute reached: shapes
 /// that asked ~400 GB/s ran slower than their compute, none of the fast ones read more than ~315.
-const BLOCK_PAIR_US: f64 = 0.4;
+/// The pair re-fitted for the tiles order (`matmul::PairOrder::Tiles`, P4, card 1): its kernel alone,
+/// gathers left out, runs a pair in ~0.14-0.23 us at HiFi4 (`silicon_probe_pair_cost::without_gathers`,
+/// `1793037314`); at 0.4 the model kept blocks that read more than they need (`down` at 1,024 rows:
+/// `[4, 4, 6]` 18.5 TFLOPS with a BF16 `B`, the re-fitted model's `[6, 4, 6]` 22.2, `1793039350`-`1793039358`).
+const BLOCK_PAIR_US: f64 = 0.2;
 const BLOCK_OUTPUT_US: f64 = 0.15;
 const BLOCK_BATCH_US: f64 = 2.0;
 const CARD_READ_BYTES_PER_US: f64 = 320_000.0;
@@ -3559,6 +3577,12 @@ fn push_block_stream_jobs(
                     ],
                     false,
                 );
+                let gather = if PROBE_SKIP_BLOCK_GATHERS.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    vec![[tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]]
+                } else {
+                    gather
+                };
                 let (roles, loops) = matmul::block_stream_programs(
                     layout,
                     c,

@@ -1116,6 +1116,44 @@ only `X`, so every widening after any product read the wrong datums (on ttsim an
 elements shifted by whole faces). It now clears the counters first, as the narrowing always did. Any kernel that
 unpacks after another must set every counter it relies on.
 
+## A whole tile in each `Src`, rows reached through the RWCs (2026-10-26, ttsim and card 1)
+
+Probes `probe_pair_src_rows` (each alone on one unit; card 1 `1793037041`, `1793037048`, `1793037050`,
+`1793037053`; ttsim first), and the product gates after them (`step229` `pair_orders_are_the_faces_order_bit_for_bit`,
+card 1 `1793037349`): exact against host integer sums and bit for bit the face-at-a-time product, at one to four
+phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a tile's rows.
+- **One `UNPACR` of 1,024 datums fills `SrcA` rows 0-63** (`SETADCXX` `X1` 1023 from `Z` 0, `SrcA` row 0 at
+  `Dest_cntx0` 64, `SetOvrdWithAddr` set; Wormhole's `UNPACR_Regular.md` says `Row &= 63` on Blackhole). With
+  `Haloize_mode` each 16-row face is transposed in place.
+- **Unpacker 1 fills `SrcB` rows 0-63** the same way (512 datums for rows 0-31).
+- **`MVMUL` reads `SrcA` at `RWCs.SrcA` 16, 32 and 48 and `SrcB` at 8 to 56**, the RWCs moved only by address
+  modifiers: plain increments, the carry form (`SrcACR`/`SrcBCR`: `Cr += Incr`, the RWC to it) and clears, as `RWCs.md`
+  `ApplyAddrMod` says. A tile pair is then two unpacks (`matmul::PairOrder::Tiles`), not twelve.
+- **The pair is not bound by its unpacks.** Two unpacks a pair instead of twelve barely moves a blocked product
+  while it gathers its operands (`silicon_probe_pair_cost::pair_orders`); with the gathers left out
+  (`without_gathers`, `1793037314`) the tiles kernel runs **23.7-28.8 TFLOPS against the faces kernel's 15.4-15.9**
+  (F32 `B`, HiFi4), at LoFi alike. So the kernel was half the products' time, and its unpack count was not what bound it.
+- **Phases outer is slower with an F32 `B` only while the product gathers.** Interleaving each `SrcB` half's phases
+  with the other half's (`PairOrder::PhasesOuter`, the same unpacks and the same release points: each bank is handed
+  back by the same `MVMUL` of the group as in the faces order): with its gathers, HiFi4 15.3 -> 13.7 and 14.9 -> 13.2
+  TFLOPS with an F32 `B`, 17.5 -> 18.1 and 15.3 -> 18.9 with a BF16 `B` (`1793036200`, `1793036219`-`1793036229`,
+  `1793038281`). What it is not, and what it is:
+  - **Not the fused form.** Every (order, `B` format, fidelity) measured takes T1's fused `.ttinsn` form (host report
+    `matmul::order` `fused_forms_of_the_pair_cost_products`: 638-3,840 words pushed, all past `FUSE_MIN_WORDS`), and
+    with `TT_TTINSN=0` the gap is the same (13.72 / 13.17 against 15.22 / 14.89, `1793038277`).
+  - **Not the kernel.** With the gathers left out (`without_gathers`, `1793038270`) the phases outer are faster for
+    both formats: F32 `B` HiFi4 15.96 -> 19.92 and 15.50 -> 21.34, BF16 17.75 -> 23.41 and 15.51 -> 21.72; equal at
+    LoFi (the same program), and HiFi2 21.40 -> 21.60, 23.80 -> 25.43.
+  - **It is the kernel against its gathers.** With them, an F32 `B` product sits at ~14.5-15.3 TFLOPS whatever the
+    kernel, and a faster kernel can be slower: the faces order's own LoFi (14.78 / 14.52) and HiFi2 (14.38 / 14.00) run
+    below its HiFi4 (15.26 / 14.90) there, as the phases outer do. A kernel that unpacks sooner contends with the mover
+    writing the next chunk into L1 (or returns its banks at worse moments for it); a BF16 `B` halves the bytes both
+    move, and the faster kernel wins. Which of the two (L1 contention or bank timing) is not isolated.
+
+- **`REG1_ovrd_default_throttle_mode` shares `Config` word 70 with packer 0** (`THCON_SEC0_REG1`): set from the
+  unpack role with `ConfigWords` it would clear the packer's formats, so the probe has the pack role write it.
+  Unpacker 1's (word 118) ttsim refuses (divergence row 105). Products exact at x1 and x2 with it set.
+
 ## An op's recorded L1 top must cover everything it lays out (2026-10-26, card 0 and 1)
 
 Busy prefetch places a unit's next weight ring above the highest `l1_top` the ops since the last product recorded

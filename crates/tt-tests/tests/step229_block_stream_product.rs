@@ -251,6 +251,88 @@ fn blocked_products_are_exact_where_the_arithmetic_is() {
     });
 }
 
+/// Every pair order (`matmul::PairOrder`, `docs/plans/prefill-operand-reuse.md` P4) is the faces
+/// order bit for bit: blocked and on the other paths, `A` or `B` transposed, `B` stored BF16, one
+/// to four fidelity phases, products of one row and of sixteen (`LiveRows`), the special values;
+/// and exact against host integer sums. The host checker (`matmul::order`) holds each order's
+/// streams to the canonical accumulation order; this holds the hardware to them.
+#[test]
+fn pair_orders_are_the_faces_order_bit_for_bit() {
+    use tt_kernels::matmul::{set_pair_order, PairOrder};
+    with_session(2, |s| {
+        let (m, k, n) = (100, 200, 130);
+        let av = specials(m * k, 4);
+        let bv = specials(k * n, 17);
+        let (a, at_) = (s.upload(&av, m, k).unwrap(), s.upload(&av, k, m).unwrap());
+        let (b, bt_) = (s.upload(&bv, k, n).unwrap(), s.upload(&bv, n, k).unwrap());
+        // Stored BF16 from its bits: ttsim cannot narrow on the card (divergence "BF16 late narrowing").
+        let bits: Vec<u16> = bv.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+        let b16 = s.upload_bf16_weight(&bits, k, n).unwrap();
+        let one = s.upload(&av[..k], 1, k).unwrap();
+        let sixteen = s.upload(&av[..16 * k], 16, k).unwrap();
+        let cases: [(&str, &_, bool, &_, bool); 6] = [
+            ("A B", &a, false, &b, false),
+            ("A B^T", &a, false, &bt_, true),
+            ("A^T B", &at_, true, &b, false),
+            ("A B16", &a, false, &b16, false),
+            ("one row", &one, false, &b, false),
+            ("sixteen rows", &sixteen, false, &b, false),
+        ];
+        for fidelity in [Fidelity::Lo, Fidelity::HiFi2, Fidelity::HiFi4] {
+            for mode in [
+                BlockStream::Off,
+                BlockStream::Fixed([4, 3, 5]),
+                BlockStream::Fixed([1, 4, 3]),
+            ] {
+                s.set_block_stream(mode);
+                for (what, x, xt, y, yt) in cases {
+                    if mode != BlockStream::Off && x.rows < 64 {
+                        continue;
+                    }
+                    set_pair_order(PairOrder::Faces);
+                    let want = product(s, x, xt, y, yt, fidelity);
+                    for order in PairOrder::ALL {
+                        set_pair_order(order);
+                        same(
+                            &product(s, x, xt, y, yt, fidelity),
+                            &want,
+                            &format!("{order:?}, {what}, {mode:?}, {fidelity:?}"),
+                        );
+                    }
+                }
+            }
+        }
+        s.set_block_stream(BlockStream::Off);
+        for t in [a, at_, b, bt_, b16, one, sixteen] {
+            s.free(t).unwrap();
+        }
+        // Exact: small integers, every product and sum exact in TF32 and F32.
+        let (m, k, n) = (70, 160, 96);
+        let av: Vec<f32> = (0..m * k).map(|i| ((i * 7) % 13) as f32 - 6.0).collect();
+        let bv: Vec<f32> = (0..k * n).map(|i| ((i * 5) % 11) as f32 - 5.0).collect();
+        let want: Vec<f32> = (0..m * n)
+            .map(|o| (0..k).map(|q| av[o / n * k + q] * bv[q * n + o % n]).sum())
+            .collect();
+        let a = s.upload(&av, m, k).unwrap();
+        let b = s.upload(&bv, k, n).unwrap();
+        for order in PairOrder::ALL {
+            set_pair_order(order);
+            for mode in [BlockStream::Off, BlockStream::Fixed([2, 2, 2])] {
+                s.set_block_stream(mode);
+                same(
+                    &product(s, &a, false, &b, false, Fidelity::HiFi4),
+                    &want,
+                    &format!("{order:?}, {mode:?}: exact"),
+                );
+            }
+        }
+        set_pair_order(PairOrder::Faces);
+        s.set_block_stream(BlockStream::Off);
+        s.free(a).unwrap();
+        s.free(b).unwrap();
+    });
+}
+
 #[test]
 fn the_planners_blocks_over_more_units_are_the_other_paths_bit_for_bit() {
     // `auto`'s own shapes on three and four units (rounds that do not divide evenly, a unit

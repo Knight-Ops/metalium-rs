@@ -15,6 +15,7 @@ The chronology is the [Change log](#change-log).
 | [Compact BF16 slots, and where a BF16 decode step goes](#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1) | 2026-10-26 | a 1.7B BF16 step is products 8.37 ms + 283 small ops 2.98 (weights free 6.26 ms); compact BF16 `B` slots in L1, bit for bit, 11.78 -> 11.68 ms; more read ahead (`ring`, `wide`) does not shorten a product; `fast-reads` 11.74 -> **11.54 ms** (card 1), all of it the weight stream, nothing for small ops |
 | [tt-metal's adjacent-core DRAM read gate on our mover](#tt-metals-adjacent-core-dram-read-gate-on-our-mover-2026-10-26-card-1) | 2026-10-26 | `gddr_adjacent_banks`: eight readers, one a channel, each on the tile beside its channel's NoC #0 endpoint, as tt-metal's Blackhole CI gate (490-512 GB/s): **507.7-508.3 GB/s** with a `fast-reads` image and tt-metal's 16 KiB packets as entries, **511.2** with 128 KiB entries (99.8% of 512), **496** the FF1 shape; the safe image 414 with packet entries (a safe entry costs ~359 cycles) and 511 with long ones |
 | [Re-tuned for BF16 weights](#re-tuned-for-bf16-weights-2026-10-26-card-0) | 2026-10-26 | a BF16 weight stream on 96 units (64 for F32) at 3 reads in flight (2 for F32): the 1.7B's BF16 decode step 12.89 -> **11.72 ms** at a 32-token prompt |
+| [A K-tile pair's order: each tile whole in its `Src`](#a-k-tile-pairs-order-each-tile-whole-in-its-src-2026-10-26-card-1) | 2026-10-26 | `B`'s tile whole in `SrcA` and `A`'s in `SrcB` (two unpacks a pair, rows reached through the RWCs), bit for bit, the default: its kernel 1.5-1.9x the faces kernel, and the products then bound by their gathers; the 1.7B's prefill of 1,000 / 7,992 tokens 346.8 / 6,386 -> **283.8 / 5,984 ms** (card 1); the unpacks never bound the pair |
 | [Where a K-tile pair goes](#where-a-k-tile-pair-goes-2026-10-26-card-1) | 2026-10-26 | a blocked prefill product's pair is bound by `B`'s unpacks (each face twice a pair), not the Matrix Unit (HiFi4 = LoFi at ~15 TFLOPS with an F32 `B`), the drain or the unpackers' speed setting; a BF16 `B` lifts it to 16 (HiFi4) and 21.6 (LoFi) |
 | [Attention's batched products as 2-D blocks](#attentions-batched-products-as-2-d-blocks-2026-10-26-card-0) | 2026-10-26 | attention's `P V` and `Q K^T` a head at a time as K-streamed 2-D blocks, bit for bit: the 1.7B's prefill of 7,992 tokens at chunks of 512 **8.42 -> 6.62 s**, 1,000 tokens 386 -> 375 ms |
 | [BF16 weight storage: half the bytes a decode step reads](#bf16-weight-storage-half-the-bytes-a-decode-step-reads-2026-10-26-card-0) | 2026-10-26 | every 1.7B weight but the embedding table stored BF16, read as BF16 by each product, bit for bit the F32 step: decode **16.80 -> 12.95 ms** at a 32-token prompt (13.35 / 14.13 at 128 / 256), first token 40.6 -> 37.2 ms; found an F32 traced-generation token mismatch at 256 tokens that predates it |
@@ -527,6 +528,59 @@ weights stored BF16, `TT_TILES=all`, 512-position cache, release, card 0; decode
 - **A cap of 3 for a BF16 stream only** (`dm::STREAM_CAP`'s high half, `STREAM_CAP_BF16_DEFAULT`, `TT_STREAM_CAP_BF16`):
   it helps BF16 and costs F32 0.33 ms, so the mover takes the cap by the record's `GATHER_B_BF16`.
 
+## A K-tile pair's order: each tile whole in its `Src` (2026-10-26, card 1)
+
+[prefill-operand-reuse.md](../plans/prefill-operand-reuse.md) P4. `matmul::PairOrder` (`TT_PAIR_ORDER`): the faces
+order (twelve face unpacks a pair, a block's phases back to back), the phases outer (the same unpacks, each `SrcB`
+half's phases interleaved with the other's), and an operand's whole tile in its `Src` (1,024 datums, rows 0-63, the
+`MVMUL`s' rows stepped by address modifiers): `B` in `SrcA` (five unpacks), `A` in `SrcB` (five), both (`Tiles`, two).
+Every order is the faces order bit for bit (`matmul::order`'s checker; `step229` `pair_orders_are_the_faces_order_bit_for_bit`,
+ttsim and card 1 `1793037349`; `probe_pair_src_rows`, exact). `silicon_probe_pair_cost` (traced on every tile, 2 warm
+replays, median of 7, each product exact against integer sums), TFLOPS at HiFi4, `[1024,2048]@[2048,8192]` /
+`[1024,8192]@[8192,2048]`, card 1:
+
+| Order | `B` FP32 | `B` BF16 | `B` FP32, no gathers | `B` BF16, no gathers |
+|---|--:|--:|--:|--:|
+| Faces (before) | 15.27 / 14.92 (`1793035122`) | 17.63 / 15.32 | 15.94 / 15.41 (`1793037314`) | 17.75 / 15.46 |
+| Phases outer | 13.72 / 13.22 (`1793038281`) | 18.06 / 18.92 | 19.92 / 21.34 (`1793038270`) | 23.41 / 21.72 |
+| `B` whole in `SrcA` | 14.89 / 14.48 (`1793037452`) | 19.06 / 17.84 | | |
+| `A` whole in `SrcB` | 14.93 / 14.26 (`1793037083`) | 18.59 / 17.35 | | |
+| **Both whole (`Tiles`)** | **15.95 / 14.91** (`1793037452`) | **19.58 / 18.31** | **23.66 / 28.76** (`1793037314`) | **29.14 / 28.81** |
+
+- **The unpacks did not bind the pair.** Two unpacks a pair instead of twelve hardly move a product that gathers its
+  operands; with the gathers left out (`tensor::probe_skip_block_gathers`, the products wrong, `without_gathers`) the
+  tiles kernel runs **1.5-1.9x** the faces kernel, at LoFi alike (23.7 / 29.8). So the faces kernel was the bound
+  (~0.4 us a pair) and it no longer is: the tiles kernel runs a pair in ~0.14-0.23 us, and a blocked product is now bound
+  by its gathers (`down` reads 906 MB at ~394 GB/s).
+- **The phases outer** win in the kernel for both formats, and lose with an F32 `B` while gathering: not the fused
+  form (every case fused; the same with `TT_TTINSN=0`, `1793038277`), and a faster kernel loses there in the faces order
+  too (its LoFi and HiFi2 below its HiFi4); the kernel against its gathers
+  ([notes](silicon-operating-notes.md#a-whole-tile-in-each-src-rows-reached-through-the-rwcs-2026-10-26-ttsim-and-card-1)).
+- **The block model re-fitted** (`BLOCK_PAIR_US` 0.4 -> 0.2): blocks that read less now pay. `down` at 1,024 rows, tiles,
+  HiFi4, F32 / BF16 `B` (`1793039350`-`1793039358`): `[4, 4, 6]` (the old model's) 15.06 / 18.48, `[6, 4, 6]` 16.96 /
+  **22.23**, `[8, 4, 6]` 18.38 / 18.48, `[6, 4, 8]` 18.42 / 18.58. `gate|up`'s `[8, 2, 9]` is at L1's limit.
+- `matmul_throughput` (F32 through Burn, every tile, card 1): `[512,2048]@[2048,2048]` 4.32 -> 4.61, `@[2048,8192]`
+  11.34 -> 11.26, `[512,8192]@[8192,2048]` 7.59 -> 8.04, `[1024,2048]@[2048,8192]` 14.71 -> 14.88, `[1024,8192]@[8192,2048]`
+  9.49 -> 9.31 TFLOPS (`1793035145` -> `1793039140`, tiles, the old block model): gather-bound, as above.
+
+`traced_generation_stream_ceiling`, SmolLM2-1.7B-Instruct, BF16 weights (the default), `TT_TILES=all`,
+`TT_GEN_MAX_LEN=8192`, `TT_GEN_PROMPTS=1000,7992`, `TT_GEN_NEW=4`, `TT_GEN_SAMPLES=3`, `TT_GEN_CHUNKS=512`, release, card 1:
+
+| | Faces (`1793035166`) | Tiles (`1793037497`) | Tiles, model re-fitted (`1793039593`) |
+|---|--:|--:|--:|
+| Prefill, 1,000 tokens | 346.8 ms | 298.4 | **283.8** |
+| Prefill, 7,992 tokens | 6,386 ms | 5,937 | 5,984 |
+| Decode step after 1,000 / 7,992 | 19.90 / 47.60 ms | 19.64 / 47.09 | 19.58 / 47.11 |
+
+- The tiles order takes 14% off 1,000 tokens and 7% off 7,992; the re-fitted model another 5% off 1,000 and 0.8% back
+  on 7,992 (a fit of 0.3 lands between at 1,000 and worst at 7,992: 295.2 / 6,054 ms, `1793040522`): the long prompt's attention products are
+  the open question for the model. Decode after a prompt is unchanged (its one-row products are weight-bound).
+- Gates, card 1: the tiles default `1793038975` (69 of 70: the matmul steps, `step229`, `step231`-`step233`, ResNet-18,
+  ViT-Tiny, `step187`), with the re-fit `1793041458` (43 of 43, `step188` against burn-flex at 8,192 positions included);
+  ttsim: the same matmul steps, `probe_pair_src_rows` and `step12_mnist` (`e2e`, goldens hold).
+- `step10_matmul_tile::the_timestamper_shows_the_roles_overlap` fails on card 1 in the faces order too, whose programs
+  are word for word the ones before this work: not from it (thread 0's second timestamp event missing).
+
 ## Where a K-tile pair goes (2026-10-26, card 1)
 
 [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md) P4. `silicon_probe_pair_cost` (`cargo xtask bench --filter
@@ -551,6 +605,9 @@ TFLOPS:
   `Dst` rows.
 - So a prefill product with stored BF16 weights is ~1.07x at HiFi4 (bit for bit) and ~1.35x at LoFi (opt-in), and the
   structural fixes are each `B` face once a pair and phases interleaved over row groups (P4, not built).
+- **Refuted the same day** ([above](#a-k-tile-pairs-order-each-tile-whole-in-its-src-2026-10-26-card-1)): the unpacks
+  did not bind. Two unpacks a pair instead of twelve leave these products where they are; a BF16 `B` helps by halving
+  what the gathers move. The faces kernel was ~half of a product's time, and its bound was not the unpacks' count.
 
 ## Attention's batched products as 2-D blocks (2026-10-26, card 0)
 

@@ -78,8 +78,32 @@ fn replay_us(
 }
 
 fn run(no_drain: bool, throttle: [u32; 2]) {
+    run_orders(no_drain, throttle, &[None]);
+}
+
+/// The gathers a probe leaves out: `A`'s (`tensor::probe_skip_a_reads`) or every one
+/// (`tensor::probe_skip_block_gathers`). The products are then wrong and go unchecked.
+#[derive(Clone, Copy, PartialEq)]
+enum Skip {
+    Nothing,
+    A,
+    All,
+}
+
+static SKIP: std::sync::Mutex<Skip> = std::sync::Mutex::new(Skip::Nothing);
+
+/// [`run`] under each pair order (`matmul::PairOrder`; `None` the default), in one session: the
+/// program caches key on the order.
+fn run_orders(
+    no_drain: bool,
+    throttle: [u32; 2],
+    orders: &[Option<tt_kernels::matmul::PairOrder>],
+) {
     tt_kernels::matmul::probe_no_drain(no_drain);
     tt_kernels::matmul::probe_throttle(throttle[0], throttle[1]);
+    let skip = *SKIP.lock().unwrap();
+    tt_kernels::tensor::probe_skip_a_reads(skip == Skip::A);
+    tt_kernels::tensor::probe_skip_block_gathers(skip == Skip::All);
     tt_ttsim::fork_scope(|| {
         let mut s = Session::open_card(
             tt_tests::backend::device_index(),
@@ -96,21 +120,47 @@ fn run(no_drain: bool, throttle: [u32; 2]) {
             let b = s.upload(&bv, k, n).unwrap();
             let bb = s.store_bf16(&b).unwrap();
             let flops = 2.0 * (m * k * n) as f64;
+            for &order in orders {
+            if let Some(order) = order {
+                tt_kernels::matmul::set_pair_order(order);
+            }
             let drain = format!(
-                "{}, throttle {}/{}",
+                "{}, throttle {}/{}{}{}",
                 if no_drain { "no drain" } else { "drained" },
                 throttle[0],
-                throttle[1]
+                throttle[1],
+                order.map_or(String::new(), |o| format!(", {o:?}")),
+                match skip {
+                    Skip::Nothing => "",
+                    Skip::A => ", no A gathers",
+                    Skip::All => ", no gathers",
+                }
             );
-            for (what, b, fidelity) in [
-                ("HiFi4, B FP32", &b, Fidelity::HiFi4),
-                ("LoFi, B FP32", &b, Fidelity::Lo),
-                ("HiFi4, B BF16", &bb, Fidelity::HiFi4),
-                ("LoFi, B BF16", &bb, Fidelity::Lo),
-            ] {
+            // `TT_PAIR_FIDELITIES` (`lo,hifi2,hifi3,hifi4`; default LoFi and HiFi4).
+            let fidelities: Vec<(&str, Fidelity)> = std::env::var("TT_PAIR_FIDELITIES")
+                .map_or(vec![("HiFi4", Fidelity::HiFi4), ("LoFi", Fidelity::Lo)], |v| {
+                    v.split(',')
+                        .map(|f| match f.trim() {
+                            "lo" => ("LoFi", Fidelity::Lo),
+                            "hifi2" => ("HiFi2", Fidelity::HiFi2),
+                            "hifi3" => ("HiFi3", Fidelity::HiFi3),
+                            "hifi4" => ("HiFi4", Fidelity::HiFi4),
+                            other => panic!("TT_PAIR_FIDELITIES: {other}"),
+                        })
+                        .collect()
+                });
+            let cases: Vec<(String, &DramTensor, Fidelity)> = [("FP32", &b), ("BF16", &bb)]
+                .into_iter()
+                .flat_map(|(format, b)| {
+                    fidelities
+                        .iter()
+                        .map(move |&(name, f)| (format!("{name}, B {format}"), b, f))
+                })
+                .collect();
+            for (what, b, fidelity) in cases {
                 let (us, out) = replay_us(&mut s, &a, b, fidelity);
                 let tflops = flops / us / 1e6;
-                if !no_drain {
+                if !no_drain && skip == Skip::Nothing {
                     for i in (0..m).step_by(97).chain([m - 1]) {
                         for j in (0..n).step_by(101).chain([n - 1]) {
                             let exact: f32 = (0..k).map(|q| av[i * k + q] * bv[q * n + j]).sum();
@@ -124,6 +174,7 @@ fn run(no_drain: bool, throttle: [u32; 2]) {
                 println!(
                     "BENCH {{\"kind\":\"result\",\"key\":\"pair cost [{m},{k}]@[{k},{n}] {what}, {drain}\",\"unit\":\"TFLOPS\",\"timed\":\"host\",\"median\":{tflops},\"p10\":{tflops},\"p90\":{tflops},\"n\":7}}"
                 );
+            }
             }
             for t in [a, b, bb] {
                 s.free(t).unwrap();
@@ -161,4 +212,41 @@ fn pair_cost_unpacker0_x4() {
 #[ignore = "a probe: cargo xtask bench --filter silicon_probe_pair_cost"]
 fn pair_cost_both_x2() {
     run(false, [1, 1]);
+}
+
+/// Every pair order (`TT_PAIR_ORDERS`, comma-separated `faces,phases,auto,srca,srcb,tiles`; all by
+/// default), each product exact.
+#[test]
+#[ignore = "a probe: cargo xtask bench --filter silicon_probe_pair_cost::pair_orders"]
+fn pair_orders() {
+    use tt_kernels::matmul::PairOrder;
+    let orders: Vec<Option<PairOrder>> = match std::env::var("TT_PAIR_ORDERS") {
+        Err(_) => PairOrder::ALL.iter().copied().map(Some).collect(),
+        Ok(v) => v
+            .split(',')
+            .map(|o| {
+                Some(match o.trim() {
+                    "faces" => PairOrder::Faces,
+                    "phases" => PairOrder::PhasesOuter,
+                    "auto" => PairOrder::Auto,
+                    "srca" => PairOrder::SrcAWhole,
+                    "srcb" => PairOrder::SrcBWhole,
+                    "tiles" => PairOrder::Tiles,
+                    other => panic!("TT_PAIR_ORDERS: {other}"),
+                })
+            })
+            .collect(),
+    };
+    run_orders(false, [0, 0], &orders);
+}
+
+/// [`pair_orders`] with `A`'s gathers left out, then every gather (`TT_PAIR_ORDERS` as there):
+/// what of a pair is the kernel's, and what the mover's. The products are wrong.
+#[test]
+#[ignore = "a probe: cargo xtask bench --filter silicon_probe_pair_cost::without_gathers"]
+fn without_gathers() {
+    for skip in [Skip::A, Skip::All] {
+        *SKIP.lock().unwrap() = skip;
+        pair_orders();
+    }
 }
