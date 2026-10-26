@@ -779,7 +779,9 @@ fn a_sixteen_page_ring_runs_without_sync_unit_counters() {
 #[test]
 fn a_streaming_trace_holds_its_bodies_under_cache_pressure() {
     with_tiles(1, |session| {
-        session.limit_program_cache(24 * 1024).unwrap();
+        // Under half of what the ops below upload (about 20 KB since the programs shrank, when
+        // 24 KiB stopped evicting anything): the pressure the assertion below needs.
+        session.limit_program_cache(8 * 1024).unwrap();
         session.set_pipeline(true);
         let input = session.upload(&values(128 * 128, 37), 128, 128).unwrap();
         session.begin_trace().unwrap();
@@ -851,7 +853,9 @@ fn a_failed_stream_role_invalidates_traces_and_recovers() {
 fn releasing_a_stale_trace_leaves_a_newer_traces_programs_held() {
     use tt_device::tlb::WindowKind;
     with_tiles(1, |session| {
-        session.limit_program_cache(24 * 1024).unwrap();
+        // Under half of what the ops below upload (about 20 KB since the programs shrank, when
+        // 24 KiB stopped evicting anything): the pressure the assertion below needs.
+        session.limit_program_cache(8 * 1024).unwrap();
         session.set_pipeline(true);
         let first_data = values(128 * 128, 41);
         let first_input = session.upload(&first_data, 128, 128).unwrap();
