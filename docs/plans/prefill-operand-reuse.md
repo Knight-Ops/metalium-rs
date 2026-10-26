@@ -5,7 +5,8 @@ paths (`step229`, ttsim and card 0; the model gates and the smoke set on card 0 
 (`gate|up` 5.21 -> 18.23 TFLOPS at `m` = 2,048) and 1.4-1.5x at `m` = 64; its prefill at 8,192 positions, chunks of 512,
 takes **0.48 / 3.70 / 12.59 s** for 1,000 / 4,000 / 7,992 tokens (1.24 / 6.81 / 18.33 before)
 ([log](../learnings/performance-log.md#prefill-products-that-reuse-their-operands-2026-10-24-card-0)). The products
-are now bound by the kernel's compute, ~0.4-0.6 us a K-tile pair. Open: P4 (the pair) and P5 (Step 2). For long
+were then bound by the kernel's compute, ~0.4-0.6 us a K-tile pair; P4 (2026-10-26) took the kernel to ~0.14-0.23 us a
+pair (each tile whole in its `Src`), and they are now bound by their gathers. Open: P5 (Step 2). For long
 prompts the next lever was outside this plan: at 7,992 tokens a prefill is mostly attention over the prefix. Its
 softmax's `SUB_EXP` and `DIV` turned out push-bound and now replay (2026-10-25: 12.58 -> 10.00 s at chunks of 512;
 roadmap, "The long-context softmax"). Roadmap Track 1, "The roofline", "Prefill products that reuse their operands".
@@ -99,7 +100,7 @@ has 64 x 64 output tiles: 8x8 blocks are 64 jobs on 120 units).
   `batched_products_in_blocks_are_the_other_paths_bit_for_bit`, ttsim and card 0, chunks-reversed control). The 1.7B's
   prefill of 7,992 tokens at chunks of 512 **8.42 -> 6.62 s** (`1792980549`, `1792992817`;
   [log](../learnings/performance-log.md#attentions-batched-products-as-2-d-blocks-2026-10-26-card-0)).
-- [ ] **P4. Compute a pair** (the bound now): what makes a K-tile pair ~540-810 cycles against HiFi4's 64 `MVMUL`
+- [x] **P4. Compute a pair** (done 2026-10-26, the tiles order below; the bound it was): what makes a K-tile pair ~540-810 cycles against HiFi4's 64 `MVMUL`
   cycles -- the twelve face unpacks of two F32 tiles a pair, the bank handoffs between unpack and math, the pushes --
   measured with profile stamps; then `SrcB` reuse of an `A` face across a row of outputs in `Dst` (G4 subblocks).
   Each output's `K` chain stays in order.
@@ -113,11 +114,32 @@ has 64 x 64 output tiles: 8x8 blocks are 64 jobs on 120 units).
       (`[1024,2048]@[2048,8192]`: 16.02 / **21.55**). Each pair unpacks `B`'s four faces twice (once per `fi`).
     - **Then the `MVMUL`s:** with `B` cheaper, HiFi4's 64 a pair show at ~10 cycles each, its phases back to back on
       the same `Dst` rows.
-  - [ ] **Next, the two orders that would lift it** (both bit for bit, each `Dst` row's adds unchanged), neither built:
-    each `B` face unpacked once a pair (both of `A`'s faces for a `k'` held in `SrcB`, rows 0-15 and 16-31), and the
-    phases interleaved over `Dst` row groups (halves or `fj`) so no `MVMUL` waits on the last. Both need `Src` row
-    addressing that Blackhole's pages do not document (`SrcB` past row 16 only by a flat unpack of contiguous faces,
-    `fpu.rs`); probe it on ttsim and card 0 first.
+  - [x] **The orders, built** (2026-10-26, card 1; [log](../learnings/performance-log.md#a-k-tile-pairs-order-each-tile-whole-in-its-src-2026-10-26-card-1)).
+    `matmul::PairOrder` (`TT_PAIR_ORDER`, the program caches key on it):
+    - **B1, the oracle:** `matmul::order` interprets a kernel's unpack and math streams (`Src` writes and bank
+      handovers, RWCs, Blackhole's eight address modifiers, the phase) and yields each `Dst` block's terms in order;
+      `canonical` states the order from first principles. Every kernel matches it; `k'` reversed, two phases swapped and
+      a lost `SrcB` step are each seen. Independent of `pair_code`'s own words.
+    - **B2, phases outer** (`phases`, the same unpacks): faster in the kernel for both formats, but with its gathers ~12%
+      slower with an F32 `B` (15.3 -> 13.7 TFLOPS) and up to 24% faster with a BF16 one; not the fused form; opt-in
+      ([notes](../learnings/silicon-operating-notes.md#a-whole-tile-in-each-src-rows-reached-through-the-rwcs-2026-10-26-ttsim-and-card-1)).
+    - **B3, the addressing** (`probe_pair_src_rows`, ttsim then card 1, each alone, exact): one 1,024-datum unpack fills
+      `SrcA` or `SrcB` rows 0-63; `MVMUL` reads them at RWC rows 16-56, stepped by `SrcACR`/`SrcBCR` address modifiers.
+      Unpacker 0's throttle override is `Config` word 70, packer 0's (written by the pack role); unpacker 1's ttsim refuses.
+    - **B4, both tiles whole** (`Tiles`, the default for `A` FP32 and `B` FP32 or BF16; `faces` the old order): two
+      unpacks a pair, each `B` face once, every `Dst` block of the output between a block's `MVMUL`s. Bit for bit
+      (`step229` `pair_orders_are_the_faces_order_bit_for_bit`, ttsim and card 1). The kernel alone (gathers left out,
+      `tensor::probe_skip_block_gathers`) runs **1.5-1.9x** the faces kernel (F32 `B` 15.9 / 15.4 -> 23.7 / 28.8
+      TFLOPS); with its gathers a product moves less (15.3 -> 15.95, BF16 17.6 -> 19.6), because it is then bound by
+      them: the unpacks never bound the pair.
+    - **B5:** `BLOCK_PAIR_US` 0.4 -> 0.2 (the tiles kernel's ~0.14-0.23 us a pair): `down`'s blocks read less (BF16 `B`
+      18.5 -> 22.2 TFLOPS at 1,024 rows). The 1.7B's prefill at 8,192 positions, chunks of 512, BF16 weights, card 1:
+      **346.8 / 6,386 -> 283.8 / 5,984 ms** for 1,000 / 7,992 tokens (`1793035166`, `1793039593`; tiles alone 298.4 /
+      5,937, `1793037497`). With the re-fit, card 1 `1793041458`: ResNet-18, ViT-Tiny, `step187` (10), `step188` (the 1.7B against burn-flex, 8,192 positions included), `step229`, `step205`, `step20`, `step184`, 43 of 43.
+  - [ ] **Next:** the gathers. With the tiles kernel a blocked product reads at ~240-394 GB/s and computes in ~60% of
+    its time: P5 (each operand out of GDDR about once), the model's choice for the long prompt's attention products
+    (the re-fit gives back 0.8% at 7,992 tokens), and whether the kernel's L1 reads slow the mover's writes (the phases
+    outer, LoFi and HiFi2 all lose against their gathers with an F32 `B`).
 - [ ] ~~**P7. An opt-in lower fidelity for prefill**~~ (asked for 2026-10-26; **not built**, on the arithmetic): `LoFi` keeps
   `A`'s 7 significant bits and `B`'s 5 (`MVMUL`'s phase 0, step158), about 2^-4.5 of each product, against TF32's
   ~2^-11; `HiFi2` still cuts one operand to 7 bits (~2^-7). And it pays only where `B`'s unpacks no longer bind: with
@@ -125,4 +147,4 @@ has 64 x 64 output tiles: 8x8 blocks are 64 jobs on 120 units).
   The faster pair is the structural one in P4, which keeps every bit.
 - [ ] **P5. Step 2: each operand out of GDDR about once** (multicast along the grid's rows and columns, or strips held
   by a few units and pulled): needs a cross-unit ready/free credit, which does not exist. Worth it once P4 makes the
-  products read-bound again.
+  products read-bound again: they are (2026-10-26, P4).
