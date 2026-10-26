@@ -394,11 +394,14 @@ pub fn check(
             _ => {}
         }
 
-        // A take's wait must hold the first data consumer after it.
+        // A take's wait must hold the first data consumer after it. `SFPNOP` is
+        // padding (see `issues_to`), not a consumer: the separator after a
+        // `WRCFG` reads nothing that was handed over, so the `PACR` after it is.
         if matches!(
             class,
             Class::Unpack | Class::Pack | Class::Matrix | Class::Sfpu
-        ) {
+        ) && name != "SFPNOP"
+        {
             if let Some(mask) = armed_take.take() {
                 if mask & held == 0 {
                     flag(Kind::TakeNotHeld, None);
@@ -556,5 +559,33 @@ mod tests {
         assert!(misses(&weak, false)
             .iter()
             .any(|f| f.kind == Kind::PublishBeforeDrain));
+    }
+
+    /// The pack roles' `SFPNOP` separator between a take and its `PACR` is not
+    /// the consumer the take must hold: the `PACR` is, held or not.
+    #[test]
+    fn a_take_is_judged_at_its_consumer_past_an_sfpnop() {
+        let s = Semaphore::new(2).unwrap();
+        let pacr = crate::isa::generated::encode::Pacr::ZERO.encode().unwrap();
+        let take = |before| {
+            std::vec![
+                sync::wait_nonzero(s, before),
+                sync::get(s),
+                crate::sfpu::nop(),
+                pacr,
+            ]
+        };
+        let taken = |f: &[Finding]| -> Vec<&'static str> {
+            f.iter()
+                .filter(|f| f.kind == Kind::TakeNotHeld)
+                .map(|f| f.consumer)
+                .collect()
+        };
+        assert!(taken(&misses(&take(backend::Before::PACKER), false)).is_empty());
+        // Control: a take that holds only the unpackers misses the `PACR`.
+        assert_eq!(
+            taken(&misses(&take(backend::Before::UNPACKER), false)),
+            ["PACR"]
+        );
     }
 }

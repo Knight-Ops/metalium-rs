@@ -468,18 +468,18 @@ fn the_unmodified_sfpu_kernel_passes_and_each_removed_wait_is_flagged() {
     );
 
     // 3. The packer's config rewrite must land before the PACR: drop the
-    // `STALLWAIT(PACKER | CONFIG, CONFIG_BUSY)` of `pack_tile_from_dst` alone
-    // leaves the scheduling `NOP` (the documented separation), which suffices;
-    // dropping the wait and the `NOP` both is the miss.
+    // `STALLWAIT(PACKER | CONFIG, CONFIG_BUSY)` of `pack_tile_from_dst_gpr` alone
+    // leaves the separating `SFPNOP` (the documented separation, one instruction),
+    // which suffices; dropping the wait and the `SFPNOP` both is the miss.
     let wait = |i: &Instruction| is_wait(i, block::PACKER | block::CONFIG, cond::CONFIG_BUSY);
     let m = remove_first(&pack, wait);
     assert!(
         misses(&m).is_empty(),
-        "the NOP alone is the documented rule"
+        "the SFPNOP alone is the documented rule"
     );
     let at = pack.iter().position(wait).unwrap();
-    assert_eq!(pack[at - 1].def().mnemonic(), "NOP");
-    // Everything between the last `WRCFG` and the first `PACR` (the `NOP`, the
+    assert_eq!(pack[at - 1].def().mnemonic(), "SFPNOP");
+    // Everything between the last `WRCFG` and the first `PACR` (the `SFPNOP`, the
     // wait, `SETC16`s and ADC setup, all of which also separate them) goes, so
     // the `PACR` follows the write directly.
     let first_pacr = at
