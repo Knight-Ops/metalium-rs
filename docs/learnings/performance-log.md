@@ -425,7 +425,10 @@ units, and the 2.1-2.5 ms is its slowest unit's work.
 
 The capture's own run keeps every barrier; a replay's ops between two kept barriers are one op of the trace (the
 profile names it with all their labels). The 1.7B gains less: fewer barriers go, and at 256 tokens its weights bound
-the step.
+the step. **The analysis costs build time:** the traced generation's build 60.5 -> 54.7 s on the 135M and 112 -> 134 s
+on the 1.7B (`1793044749`, `1793044901`; the decode steps 7.01 / 7.57 / 8.26 and 11.61 / 12.11 / 12.92 there). A first
+version that expanded a row select or scatter for every row its index could name (49,152 for the embedding) took
+the 1.7B's to 251 s; two rows a tile row give the same extents (unit test).
 
 **Following an operand's runs** (`TT_FOLLOW_RUNS=1`, opt-in): `x gamma` on RMSNorm's 32 units makes 49 more of the
 1.7B's barriers unneeded (131), and the step 11.63 / 12.11 / 12.93 ms (`1793040730`): the scale on half the units costs

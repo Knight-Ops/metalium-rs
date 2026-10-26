@@ -165,12 +165,14 @@ fn accesses(entries: &[[u32; 8]], units: &[(u8, u8)], out: &mut Vec<Access>) {
 }
 
 /// A record whose rows come from indices in L1: every row its index could name, as one range a
-/// channel (from its lowest byte to its highest).
+/// channel (from its lowest byte to its highest). A row's bytes lie between its tile row's first
+/// and last rows', so those two a tile row are enough to find each channel's extent.
 fn indexed(rec: &[[u32; 8]], out: &mut Vec<Access>) {
-    let bound = rec[0][3];
+    let bound = rec[0][3].max(1);
     let mut extent: BTreeMap<u8, (u64, u64, bool)> = BTreeMap::new();
     let mut ok = true;
-    for v in 0..bound.max(1) {
+    let rows = (0..bound.div_ceil(32)).flat_map(|r| [32 * r, (32 * r + 31).min(bound - 1)]);
+    for v in rows {
         let mut emit = |w: [u32; 8]| {
             if matches!(w[0], op::READ | op::WRITE) {
                 let (lo, hi) = (u64::from(w[3]), u64::from(w[3]) + u64::from(w[5]));
@@ -472,7 +474,8 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
                         hi,
                         write,
                     } => {
-                        if write && matches!(space, Space::Gddr(_)) {
+                        if write && matches!(space, Space::Gddr(_)) && !gddr_readers_all.is_empty()
+                        {
                             add(&mut d, &gddr_readers_all.clone());
                         }
                         memory.touch(space, lo..hi, write, (u, k32), &mut d, false);
@@ -1155,6 +1158,59 @@ mod tests {
             ),
             [Unneeded, Full]
         );
+    }
+
+    #[test]
+    fn an_indexed_record_s_extent_is_every_row_s() {
+        // A table of 1,000 rows over 3 channels, 5 tile columns; a select and a scatter of
+        // columns 1..4: the extents from each tile row's first and last rows equal every row's.
+        let table = record::TensorRef {
+            n: 3,
+            channels: [0, 2, 5, 0, 0, 0, 0, 0],
+            base: [0x10_0000, 0x20_0000, 0x30_0000, 0, 0, 0, 0, 0],
+            first: 0,
+            ct: 5,
+        }
+        .encode();
+        for head in [record::SELECT_ROWS, record::SCATTER_ROWS] {
+            let rec = [
+                [head, 0x2_0000, 3, 1000, 1, 3, 0x3_0000, 0],
+                table[0],
+                table[1],
+            ];
+            let mut every: BTreeMap<u8, (u64, u64)> = BTreeMap::new();
+            for v in 0..1000 {
+                let mut emit = |w: [u32; 8]| {
+                    let (lo, hi) = (u64::from(w[3]), u64::from(w[3] + w[5]));
+                    let e = every.entry(w[1] as u8).or_insert((lo, hi));
+                    *e = (e.0.min(lo), e.1.max(hi));
+                    Ok(())
+                };
+                let r = match head {
+                    record::SELECT_ROWS => record::expand_reads(&rec, |_| v, &mut emit),
+                    _ => record::expand_writes(&rec, |_| v, &mut emit),
+                };
+                r.unwrap();
+            }
+            let mut out = Vec::new();
+            indexed(&rec, &mut out);
+            let sampled: BTreeMap<u8, (u64, u64)> = out
+                .iter()
+                .map(|a| match *a {
+                    Access::Range {
+                        space: Space::Gddr(c),
+                        lo,
+                        hi,
+                        write,
+                    } => {
+                        assert_eq!(write, head == record::SCATTER_ROWS);
+                        (c, (lo, hi))
+                    }
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(sampled, every, "{head:#x}");
+        }
     }
 
     /// Each unit's barrier entries: `(target, wait, stands for)`.
