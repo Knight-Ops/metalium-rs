@@ -3148,6 +3148,10 @@ where
 }
 
 #[cfg(test)]
+#[path = "matmul_order.rs"]
+pub(crate) mod order;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
