@@ -334,6 +334,8 @@ pub const SMOKE: &[&str] = &[
     // An embedding's gradient at resident indices, three ops an index in index order, where the
     // mask loop took ~20 (the tt-mnist transformer 92 -> 26 ms/step).
     "step236_select_add_rows::",
+    // A gather and a scatter-add of one index a row (cross-entropy's), 2 and 6 jobs where 8 and 18.
+    "step237_column_picks::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",
@@ -534,6 +536,9 @@ pub const BENCH: &[&str] = &[
     "silicon_bench_eth::",
     "silicon_perf::pcie_l1",
     "silicon_perf::pcie_dram",
+    // `tt-mnist`'s training as the binary runs it (MNIST at both sizes, the transformer), beside
+    // burn-flex: the scoreboard's rows went stale for three weeks without it.
+    "bench_training::",
 ];
 
 pub const BENCH_USAGE: &str = "\
@@ -755,8 +760,9 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
 }
 
 /// The cargo selection for the silicon test binaries: `tt-tests` with its `silicon`
-/// feature (and any experiment features the caller asked for), and the Burn
-/// conformance suite built for silicon too, whose smoke subset `SMOKE` lists.
+/// feature (and any experiment features the caller asked for), the Burn
+/// conformance suite built for silicon too, whose smoke subset `SMOKE` lists, and
+/// `tt-mnist`'s benchmarks.
 fn select(features: &[String]) -> Vec<String> {
     let features: Vec<String> = std::iter::once("silicon".to_string())
         .chain(features.iter().cloned())
@@ -768,6 +774,10 @@ fn select(features: &[String]) -> Vec<String> {
         "tt-tests".into(),
         "-p".into(),
         "burn-tt-conformance".into(),
+        // Its training benchmarks (`crates/tt-mnist/tests/bench_training.rs`, ignored: run by
+        // `cargo xtask bench`), which run the `tt-mnist` binary cargo builds beside them.
+        "-p".into(),
+        "tt-mnist".into(),
         "--features".into(),
         features.join(","),
     ]

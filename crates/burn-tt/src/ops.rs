@@ -830,7 +830,118 @@ fn mask_fill_native(op: &str, kind: u32, bits: u32, tensor: TtTensor, mask: TtTe
 
 /// General raw resident gather. Static staging covers every legal source;
 /// B reads bounded I32 indices and rejects the domain before indexed copying.
+/// `tensor`'s element at `indices` along its last dimension, one index a row (`indices` is
+/// `tensor`'s shape with a last dimension of 1): every row's pick in one op on the card
+/// (`Session::pick_columns`), raw datums, the indices resident; an index outside the row is the
+/// mover's `DOMAIN`. Cross-entropy's pick of each row's target. `None` for what it does not take
+/// (another dimension or index shape, packed storage): the caller stages the gather.
+fn pick_columns_native(tensor: &TtTensor, indices: &TtTensor) -> Option<TtTensor> {
+    let shape = tensor.shape().to_vec();
+    let (&cols, lead) = shape.split_last()?;
+    let rows: usize = lead.iter().product();
+    let mut picked = shape.clone();
+    *picked.last_mut()? = 1;
+    if indices.shape().to_vec() != picked
+        || indices.dtype() != DType::I32
+        || tensor.elem().is_none()
+        || tensor.device != indices.device
+        || rows == 0
+        || cols == 0
+        || !tensor.is_storable()
+        || !crate::server::supports_dram(tensor.device)
+    {
+        return None;
+    }
+    let (table, index) = (plain_dram(tensor), plain_dram(indices));
+    let words = |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
+    if !words(&table)
+        || !words(&index)
+        || [table.buffer.rows, table.buffer.cols] != [rows, cols]
+        || [index.buffer.rows, index.buffer.cols] != [rows, 1]
+    {
+        return None;
+    }
+    let (id, dims) = crate::server::pick_columns(tensor.device, table.buffer.id, index.buffer.id);
+    Some(device_result_shaped(
+        tensor.device,
+        id,
+        dims,
+        picked.into(),
+        tensor.dtype(),
+    ))
+}
+
+/// `tensor` with `value` added at `indices` along its last dimension, one index a row (`indices`
+/// and `value` are `tensor`'s shape with a last dimension of 1): F32, a few ops whatever the rows
+/// -- `where(column == index, tensor + value, tensor)` over the row's column numbers (geometry
+/// kept for the attachment) -- after the indices' pick, whose `DOMAIN` refuses one outside the
+/// row. Bit for bit Flex's loop: one addition at the indexed element, every other datum moved
+/// as it was. Cross-entropy's gradient. `None` for what it does not take: the caller loops.
+fn scatter_add_columns_native(
+    tensor: &TtTensor,
+    indices: &TtTensor,
+    value: &TtTensor,
+) -> Option<TtTensor> {
+    let shape = tensor.shape().to_vec();
+    let (&cols, lead) = shape.split_last()?;
+    let rows: usize = lead.iter().product();
+    if tensor.dtype() != DType::F32
+        || value.dtype() != DType::F32
+        || value.shape() != indices.shape()
+        || tensor.storage_format() != crate::storage::StorageFormat::F32
+        || value.storage_format() != crate::storage::StorageFormat::F32
+        || matches!(
+            crate::server::elementwise_mode(tensor.device),
+            crate::ElementwiseMode::Matrix { .. }
+        )
+    {
+        return None;
+    }
+    // The indices checked against the row: the pick's `DOMAIN` (its result is not needed).
+    pick_columns_native(tensor, indices)?;
+    let device = tensor.device;
+    let columns = nhwc::cached_metadata(
+        device,
+        "scatter-add columns",
+        vec![rows, cols],
+        [rows, cols],
+        burn_backend::Shape::new([rows, cols]),
+        DType::I32,
+        || (0..rows * cols).map(|i| (i % cols) as u32).collect(),
+    );
+    // `[rows, c]` as it is, or reshaped by the backend's own op (a view's too).
+    let flat = |t: &TtTensor, c: usize| {
+        if t.shape().to_vec() == [rows, c] {
+            t.clone()
+        } else {
+            <TtBackend as burn_backend::ops::FloatTensorOps<TtBackend>>::float_reshape(
+                t.clone(),
+                vec![rows, c].into(),
+            )
+        }
+    };
+    let (t, index, v) = (flat(tensor, cols), flat(indices, 1), flat(value, 1));
+    let mask =
+        device_eltwise_ungated(kind_sfpu::INT_EQ, 0.0, &columns, Some(&index)).or_else(|| {
+            let index = expanded(&index, [rows, cols].into(), "scatter-add indices");
+            device_eltwise_ungated(kind_sfpu::INT_EQ, 0.0, &columns, Some(&index))
+        })?;
+    let sum = float::float_add(t.clone(), v);
+    let out = float::float_mask_where(t, mask, sum);
+    if out.shape().to_vec() == shape {
+        return Some(out);
+    }
+    Some(<TtBackend as burn_backend::ops::FloatTensorOps<
+        TtBackend,
+    >>::float_reshape(out, shape.into()))
+}
+
 fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
+    if dim + 1 == tensor.shape().num_dims() {
+        if let Some(picked) = pick_columns_native(&tensor, &indices) {
+            return picked;
+        }
+    }
     let shape = tensor.shape().to_vec();
     let output = indices.shape().to_vec();
     assert!(
@@ -956,6 +1067,11 @@ fn scatter_add_native(
     value: TtTensor,
 ) -> TtTensor {
     assert_eq!(tensor.dtype(), value.dtype());
+    if dim + 1 == tensor.shape().num_dims() {
+        if let Some(sum) = scatter_add_columns_native(&tensor, &indices, &value) {
+            return sum;
+        }
+    }
     let dtype = tensor.dtype();
     let stored = matches!(dtype, DType::I32 | DType::Bool(_));
     if !stored {

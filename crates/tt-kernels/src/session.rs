@@ -7147,6 +7147,50 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// `input[r, indices[r]]` for every row `r` of `input` (`[rows, cols]`, 32-bit datums;
+    /// `indices` `[rows, 1]` I32), `[rows, 1]`, as one op: each tile row's picks by the mover
+    /// (`op::INDEX_PICK`) from the resident indices, raw datums, no host index. An index outside
+    /// `0..cols` stops the mover with `DOMAIN`. A gather of one index a row along the last
+    /// dimension (cross-entropy's pick of each row's target).
+    pub fn pick_columns(
+        &mut self,
+        input: &DramTensor,
+        indices: &DramTensor,
+    ) -> Result<DramTensor, TensorError> {
+        indices.expect("resident column picks", tensor::Elem::I32)?;
+        if [indices.rows, indices.cols] != [input.rows, 1] || input.rows == 0 || input.cols == 0 {
+            return Err(TensorError::Shape(format!(
+                "column picks of [{}, {}] by [{}, {}] indices",
+                input.rows, input.cols, indices.rows, indices.cols
+            )));
+        }
+        let out = DramTensor::alloc_elem(&mut self.dram_state()?.alloc, input.rows, 1, input.elem)?;
+        let mut jobs = Vec::new();
+        let made = (0..input.rows).step_by(32).try_for_each(|first| {
+            let rows = 32.min(input.rows - first);
+            let (iv, xv, ov) = (
+                input.rows_view(first, rows)?,
+                indices.rows_view(first, rows)?,
+                out.rows_view(first, rows)?,
+            );
+            jobs.extend(crate::index::jobs(
+                &iv.placement,
+                &xv,
+                &ov.placement,
+                [rows, input.cols],
+                4,
+            )?);
+            Ok::<_, TensorError>(())
+        });
+        let units = self.spread_for(jobs.len());
+        if let Err(error) = made.and_then(|()| self.submit_jobs_on(jobs, units, RESET_BUDGET)) {
+            self.dram_state()?.alloc.free(&out.placement);
+            return Err(error);
+        }
+        out.set_pad(tensor::Pad::Zero);
+        Ok(out)
+    }
+
     /// Raw resident selection from a matrix with at most 32 logical rows.
     pub fn gather_indexed(
         &mut self,

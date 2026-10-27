@@ -655,6 +655,13 @@ fn sim_factory(
             self.buffers
                 .gather_rows(&mut self.session, sources, rows, cols)
         }
+        fn pick_columns(
+            &mut self,
+            input: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.pick_columns(&mut self.session, input, indices)
+        }
         fn select_add_rows(
             &mut self,
             t: burn_tt::BufferId,

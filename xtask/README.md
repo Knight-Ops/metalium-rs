@@ -63,6 +63,9 @@ by default the `BENCH` selection in `src/silicon.rs`:
 - `silicon_eth_clock`: E1's cycle counter, gated alone.
 - `silicon_bench_eth`: one link, both links, both directions.
 - `silicon_perf::pcie_*`.
+- `bench_training` (`crates/tt-mnist/tests`): the `tt-mnist` binary's training as a user runs it (MNIST
+  784-128-10 and 784-512-256-10, the transformer), three runs each, beside burn-flex, each run's accuracy
+  and loss checked: the scoreboard's tt-mnist rows.
 
 Every other `silicon` option applies; `--filter` replaces the default selection.
 The ignored BFP release benchmark is selected explicitly with

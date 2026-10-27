@@ -23,13 +23,15 @@ linking to its evidence and to the detailed plan. Closed work lives in
   ([log](../learnings/performance-log.md#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0));
   BF16 tables still take the staged path.
   The MNIST MLP, CNN and TinyTransformer still train from scratch in `tt-mnist`.
-- **Performance: behind the CPU unless traced.** Untraced training is 1.8x (MNIST, 3.4 ms/step against 1.9) and
-  2.9x (the transformer, 10.9 against 3.7) slower than burn-flex on 2026-10-27
+- **Performance: behind the CPU unless traced.** Untraced training is 1.5x (MNIST, 2.88 ms/step against 1.94) and
+  2.1x (the transformer, 8.21 against 3.83) slower than burn-flex on 2026-10-27 (`cargo xtask bench --filter
+  bench_training`, now in the default bench)
   ([scoreboard](../learnings/performance-scoreboard.md)). The old 1.4 / 8.8 rows were 2026-10-04 numbers, MNIST on a model
   5.3x smaller; the transformer's 9.2 -> 92 ms/step was bisected to `c4255c7` and `6d979e7` (the embedding's gradient at
-  ~20 ops an index, now one op: 10.9; [log](../learnings/performance-log.md#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1)).
-  Left: MNIST at the old model size is 2.0 ms/step against 1.4 on `3344db6` (not bisected), and ResNet-18's untraced
-  forward ~11% slower than recorded. Traced MNIST inference already beats the CPU, and traced, the three
+  ~20 ops an index, now one op) and to `c4255c7`'s resident index compositions (cross-entropy's gather and scatter-add,
+  now one and a few ops): MNIST 784-128-10 back to 1.39 ms/step (1.4 on `3344db6`), the transformer 8.21 (9.2 there;
+  [log](../learnings/performance-log.md#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1)).
+  Left: ResNet-18's untraced forward ~11% slower than recorded. Traced MNIST inference already beats the CPU, and traced, the three
   models match or beat burn-flex on every tile: the SmolLM2 decode step 26.46 ms against 26.42,
   ViT-Tiny 11.6 ms against 112, ResNet-18 17.2 against 164 (2026-10-15, Track 2 item 6,
   [replay-fixed-cost.md](replay-fixed-cost.md)). A whole traced generation (ids in, logits out, any

@@ -12,7 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
-| [The tt-mnist regression found, and RMSNorm's scale in its op](#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1) | 2026-10-27 | the scoreboard's MNIST and transformer rows were 2026-10-03/04 numbers, MNIST since on a 5.3x larger model; the transformer's 9.2 -> 92 ms/step bisected to `c4255c7` (9.2 -> 22.6) and `6d979e7` (-> 329: the embedding gradient's ~20 ops an index); that gradient as one op, **92.5 -> 10.9 ms/step**, the same losses; RMSNorm's scale inside the norm's op, a 1.7B step **11.31 -> 11.18 ms**; a residual sum and its norm as one op, bit for bit but slower (11.18 -> 11.26), opt-in; a ragged RMS statistic of 18-31 rows at 2048 columns hung (its unrolled programs past a program slot), fixed |
+| [The tt-mnist regression found, and RMSNorm's scale in its op](#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1) | 2026-10-27 | the scoreboard's MNIST and transformer rows were 2026-10-03/04 numbers, MNIST since on a 5.3x larger model; the transformer's 9.2 -> 92 ms/step bisected to `c4255c7` (9.2 -> 22.6) and `6d979e7` (-> 329: the embedding gradient's ~20 ops an index); that gradient as one op, **92.5 -> 10.9 ms/step**, the same losses; cross-entropy's gather and scatter-add as one and a few ops: MNIST 784-128-10 **2.0 -> 1.39 ms/step** (`3344db6` 1.4), the transformer **-> 8.21** (`3344db6` 9.2); tt-mnist in `cargo xtask bench`; RMSNorm's scale inside the norm's op, a 1.7B step **11.31 -> 11.18 ms**; a residual sum and its norm as one op, bit for bit but slower (11.18 -> 11.26), opt-in; a ragged RMS statistic of 18-31 rows at 2048 columns hung (its unrolled programs past a program slot), fixed |
 | [The decode and prefill streams merged](#the-decode-and-prefill-streams-merged-2026-10-27-card-0) | 2026-10-27 | the barriers pruned (S5) and each K-tile pair's tiles whole in their `Src` (P4) together, card 0: 135M **6.92 / 7.47 / 8.14 ms**, 1.7B **11.32 / 11.84 / 12.64**, the 1.7B prefill 283.7 / 5,983 ms at 1,000 / 7,992 tokens; every gate, conformance and the MNIST goldens hold; eight failing or hanging tests that predate both fixed |
 | [Which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0) | 2026-10-26 | a small op is 9.8 us on unit 0 (135M; 11.6 on the 1.7B), ~3 of it its barrier; 194 of the 135M step's 591 barriers (82 of the 1.7B's 403) order nothing the data needs, and a capture drops them: 135M **7.35 -> 6.97 ms**, 1.7B 11.76 -> **11.59**; sparse waits after products would save 0.03-0.07 ms (the barrier time there is the slowest unit's work); one launch for back-to-back ops ~0.12 ms at best |
 | [Compact BF16 slots, and where a BF16 decode step goes](#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1) | 2026-10-26 | a 1.7B BF16 step is products 8.37 ms + 283 small ops 2.98 (weights free 6.26 ms); compact BF16 `B` slots in L1, bit for bit, 11.78 -> 11.68 ms; more read ahead (`ring`, `wide`) does not shorten a product; `fast-reads` 11.74 -> **11.54 ms** (card 1), all of it the weight stream, nothing for small ops |
@@ -416,6 +416,17 @@ against 184,057 in 200 steps); by Burn op, cross-entropy's `float_gather` is 8 j
 scoreboard's tt-mnist rows were carried forward unmeasured from 2026-10-04, and the decode and prefill work since runs
 traced, where the host's per-op cost does not appear. The lever: a gather and a scatter-add of one index a row (the
 cross-entropy shape) as one op each, and geometry kept per attachment rather than rebuilt a call.
+
+**Fixed** (gate `step237`, ttsim and card 0 `1793128441`): a gather of one index a row along the last dimension is one
+op, `Session::pick_columns` (the mover's `INDEX_PICK` over every tile row; `DOMAIN` for an index outside the row), 2 jobs
+a call where 8; the matching scatter-add is `where(column == index, x + v, x)` over column numbers kept for the attachment
+(`nhwc::cached_metadata`), after the pick as its domain check, 6 jobs where 18 and no broadcast copies. Bit for bit the
+host's indexing, the indexed datum the element-wise `ADD`'s (subnormals flushed, as the old loop's add); watched failing
+with the column numbers shifted and with the select's operands swapped. Card 1, `cargo xtask bench --filter
+bench_training` (`1793128372`, three runs each, accuracy and losses checked): MNIST 784-128-10 **2.0 -> 1.387 ms/step**
+(`3344db6`: 1.4; burn-flex 0.473), 784-512-256-10 **3.4 -> 2.882** (burn-flex 1.942), the transformer **10.9 -> 8.210**
+(`3344db6`: 9.2; burn-flex 3.830). `tt-mnist`'s training is now in `cargo xtask bench`'s default selection
+(`crates/tt-mnist/tests/bench_training.rs`).
 
 **The other host rows** (card 1, `silicon_bench_models`, every tile): ViT-Tiny untraced at `work:64:4` 116.2 ms (the
 scoreboard's 129.1 of 2026-10-15), traced 7.89 (8.32); ResNet-18 untraced at `work:64:4` **145.9 ms against 131.1** on

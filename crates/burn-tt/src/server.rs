@@ -336,6 +336,15 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// `input[r, indices[r]]` for each row, `[rows, 1]`, the indices resident `[rows, 1]` I32
+    /// (`Session::pick_columns`).
+    fn pick_columns(
+        &mut self,
+        _input: BufferId,
+        _indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// `t` with `value`'s rows added to the rows the resident `[1, n]` I32 `indices` name, in
     /// order (`Session::select_add_rows`): an embedding's gradient, no index read by the host.
     fn select_add_rows(
@@ -1469,6 +1478,17 @@ impl DramBuffers {
             .collect::<Result<Vec<_>, _>>()?;
         let refs: Vec<_> = ts.iter().collect();
         let c = s.gather_rows(&refs, rows, cols).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn pick_columns<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (ti, tx) = (self.get(input)?.clone(), self.get(indices)?.clone());
+        let c = s.pick_columns(&ti, &tx).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -3531,6 +3551,22 @@ pub(crate) fn add_rms_norm(
     )
 }
 
+/// Each row's element at its resident index on the device, without waiting: `[rows, 1]`.
+pub(crate) fn pick_columns(
+    device: TtDevice,
+    input: BufferId,
+    indices: BufferId,
+) -> (BufferId, [usize; 2]) {
+    let rows = dims_of(input)[0];
+    submit(
+        "pick_columns",
+        device,
+        [rows, 1],
+        || "a pick of one column a row".into(),
+        move |engine, ids| engine.pick_columns(ids.get(input)?, ids.get(indices)?),
+    )
+}
+
 /// Rows added at resident indices on the device, in order, without waiting: `t`'s shape.
 pub(crate) fn select_add_rows(
     device: TtDevice,
@@ -4216,6 +4252,14 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.select_add_rows(&mut self.session, t, indices, value)
+    }
+    fn pick_columns(
+        &mut self,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.pick_columns(&mut self.session, input, indices)
     }
     fn assign_rows(
         &mut self,
@@ -5249,6 +5293,14 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.select_add_rows(self.fabric.chips[0].session(), t, indices, value)
+    }
+    fn pick_columns(
+        &mut self,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.pick_columns(self.fabric.chips[0].session(), input, indices)
     }
     fn assign_rows(
         &mut self,
