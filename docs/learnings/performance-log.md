@@ -401,6 +401,22 @@ ms/step since `3344db6`, not bisected (it has no embedding; `c4255c7`'s step is 
   At HEAD (`TT_HOST_TIMES=1`): 57,187 ops queued in 20 steps, ~2,860 a step, ~23 us each to enqueue (~10 PCIe reads a
   list), 90% of them the gradient's; 60 ms a step of "outside calls" was the caller waiting on that queue.
 
+**What `c4255c7` changed, and MNIST's 1.4 -> 2.0 ms/step** (bisected the same way, `--hidden 128`, card 1: `0d6ba52` 1.4,
+`c4255c7` 2.3; today 1.9-2.0). Split by crate on `0d6ba52`: with `c4255c7`'s `tt-isa`, `tt-firmware` and `tt-kernels`
+MNIST stays 1.4 and the transformer 9.3, so the cost is burn-tt's. The op calls are the same; the lists are not (a
+temporary count of submitted lists by name, 200 MNIST steps): 12,048 lists and 184,057 entries on the fast build,
+12,748 and **562,887** on `c4255c7`, of which `resident metadata` 1,110 lists and 381,700 entries, and 410 fewer host
+uploads. `c4255c7` and `6d979e7` moved index operations off indices the host held (an uploaded label or token tensor
+read back as host data) onto the card, as the backend's no-host-fallback rule asks, but as generic compositions:
+geometry built by the mover from immediates (`Session::metadata`, ~344 entries a list) each call, and gathers and
+scatter-adds as staged repacks and mask loops. At HEAD a 128-hidden MNIST step still runs 16 `native repack`, 5
+`row gather`, 4 `resident indexed copies` and 2.5 `resident metadata` lists the fast build did not (588,488 entries
+against 184,057 in 200 steps); by Burn op, cross-entropy's `float_gather` is 8 jobs a step, its gradient's
+`float_scatter_add` 18 and their `broadcast/expand` 9, about 35 jobs where ~2 were. No benchmark row caught it: the
+scoreboard's tt-mnist rows were carried forward unmeasured from 2026-10-04, and the decode and prefill work since runs
+traced, where the host's per-op cost does not appear. The lever: a gather and a scatter-add of one index a row (the
+cross-entropy shape) as one op each, and geometry kept per attachment rather than rebuilt a call.
+
 **The other host rows** (card 1, `silicon_bench_models`, every tile): ViT-Tiny untraced at `work:64:4` 116.2 ms (the
 scoreboard's 129.1 of 2026-10-15), traced 7.89 (8.32); ResNet-18 untraced at `work:64:4` **145.9 ms against 131.1** on
 2026-10-14 (spread `all` 232.4 against 203.8), traced 12.90 (13.74); burn-flex 106.0-107.1 and 154.3-156.8 (`1793119700`,
