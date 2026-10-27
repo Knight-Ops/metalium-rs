@@ -336,6 +336,16 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// `t` with `value`'s rows added to the rows the resident `[1, n]` I32 `indices` name, in
+    /// order (`Session::select_add_rows`): an embedding's gradient, no index read by the host.
+    fn select_add_rows(
+        &mut self,
+        _t: BufferId,
+        _indices: BufferId,
+        _value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// A copy of `t` with `value`'s row `s` at row `d` for each `(d, s)`
     /// (`Session::assign_rows`): a `slice_assign` of whole rows.
     fn assign_rows(
@@ -407,8 +417,24 @@ pub trait Engine {
         Err(unsupported())
     }
     /// `a / sqrt(mean(a a) + eps)` over each row, left on the device
-    /// (`tt_kernels::session::Session::rms_norm`).
-    fn rms_norm(&mut self, _a: BufferId, _eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+    /// (`tt_kernels::session::Session::rms_norm`), times `gamma` (`[1, cols]`) if given.
+    fn rms_norm(
+        &mut self,
+        _a: BufferId,
+        _gamma: Option<BufferId>,
+        _eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// `s = a + b` and `s`'s RMSNorm times `gamma` if given, `(s, norm)`, left on the device
+    /// (`tt_kernels::session::Session::add_rms_norm`).
+    fn add_rms_norm(
+        &mut self,
+        _a: BufferId,
+        _b: BufferId,
+        _gamma: Option<BufferId>,
+        _eps: f32,
+    ) -> Result<[(BufferId, [usize; 2]); 2], TtError> {
         Err(unsupported())
     }
     /// The index of a `[1, cols]` row's largest element, `[1, 1]` I32, left on the device
@@ -1446,6 +1472,22 @@ impl DramBuffers {
         Ok(self.insert(c))
     }
 
+    pub fn select_add_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        t: BufferId,
+        indices: BufferId,
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (tt, ti, tv) = (
+            self.get(t)?.clone(),
+            self.get(indices)?.clone(),
+            self.get(value)?.clone(),
+        );
+        let c = s.select_add_rows(&tt, &ti, &tv).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
     pub fn rows_add<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1834,11 +1876,35 @@ impl DramBuffers {
         &mut self,
         s: &mut Session<T>,
         a: BufferId,
+        gamma: Option<BufferId>,
         eps: f32,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
-        let c = s.rms_norm(&ta, eps).map_err(TtError::from)?;
+        let tg = match gamma {
+            Some(g) => Some(self.get(g)?.clone()),
+            None => None,
+        };
+        let c = s.rms_norm(&ta, tg.as_ref(), eps).map_err(TtError::from)?;
         Ok(self.insert(c))
+    }
+
+    pub fn add_rms_norm<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        b: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<[(BufferId, [usize; 2]); 2], TtError> {
+        let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
+        let tg = match gamma {
+            Some(g) => Some(self.get(g)?.clone()),
+            None => None,
+        };
+        let (sum, out) = s
+            .add_rms_norm(&ta, &tb, tg.as_ref(), eps)
+            .map_err(TtError::from)?;
+        Ok([self.insert(sum), self.insert(out)])
     }
 
     pub fn argmax_row<T: tt_device::Transport>(
@@ -2677,6 +2743,59 @@ fn submit(
     (id, dims)
 }
 
+/// [`submit`] for an op that makes two buffers: both named now, `dims` their shapes; a failure
+/// fails both.
+fn submit_pair(
+    kind: &'static str,
+    device: TtDevice,
+    dims: [[usize; 2]; 2],
+    what: impl FnOnce() -> String + Send + 'static,
+    op: impl FnOnce(&mut dyn Engine, &Ids) -> Result<[(BufferId, [usize; 2]); 2], TtError>
+        + Send
+        + 'static,
+) -> [(BufferId, [usize; 2]); 2] {
+    let ids = dims.map(name);
+    crate::traffic::timed(kind, || {
+        send(
+            device,
+            Box::new(move |engine, map| {
+                let made = op(engine, map).and_then(|made| {
+                    if made.iter().zip(&dims).all(|((_, got), want)| got == want) {
+                        Ok(made.map(|(e, _)| e))
+                    } else {
+                        for (e, _) in made {
+                            engine.free(e);
+                        }
+                        Err(TtError::Device(format!(
+                            "made {:?} where {dims:?} was expected",
+                            made.map(|(_, got)| got)
+                        )))
+                    }
+                });
+                match made {
+                    Ok(made) => {
+                        for (id, e) in ids.into_iter().zip(made) {
+                            map.map.insert(id, Ok(e));
+                        }
+                    }
+                    Err(e) => {
+                        let why = Arc::new(TtError::Op {
+                            what: what(),
+                            device,
+                            cause: Arc::new(e),
+                        });
+                        map.failed.get_or_insert_with(|| why.clone());
+                        for id in ids {
+                            map.map.insert(id, Err(why.clone()));
+                        }
+                    }
+                }
+            }),
+        )
+    });
+    [(ids[0], dims[0]), (ids[1], dims[1])]
+}
+
 /// `A[m, k] @ B[k, n]` on `device`, panicking on a device error.
 pub(crate) fn matmul(device: TtDevice, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Vec<f32> {
     crate::report::staged(mkn);
@@ -3212,13 +3331,24 @@ pub(crate) fn softmax_rows(
 }
 
 /// `a / sqrt(mean(a a) + eps)` over each row on the device, without waiting.
-pub(crate) fn rms_norm(device: TtDevice, a: BufferId, eps: f32) -> (BufferId, [usize; 2]) {
+pub(crate) fn rms_norm(
+    device: TtDevice,
+    a: BufferId,
+    gamma: Option<BufferId>,
+    eps: f32,
+) -> (BufferId, [usize; 2]) {
     submit(
         "rms_norm",
         device,
         dims_of(a),
-        move || format!("eps {eps:e}"),
-        move |engine, ids| engine.rms_norm(ids.get(a)?, eps),
+        move || format!("eps {eps:e}, scaled {}", gamma.is_some()),
+        move |engine, ids| {
+            let gamma = match gamma {
+                Some(g) => Some(ids.get(g)?),
+                None => None,
+            };
+            engine.rms_norm(ids.get(a)?, gamma, eps)
+        },
     )
 }
 
@@ -3374,6 +3504,46 @@ pub(crate) fn gather_rows(
                 .collect::<Result<Vec<_>, _>>()?;
             engine.gather_rows(&sources, &rows, cols)
         },
+    )
+}
+
+/// A residual sum and its RMSNorm on the device, `(s, norm)`, without waiting: both `a`'s shape.
+pub(crate) fn add_rms_norm(
+    device: TtDevice,
+    a: BufferId,
+    b: BufferId,
+    gamma: Option<BufferId>,
+    eps: f32,
+) -> [(BufferId, [usize; 2]); 2] {
+    let dims = dims_of(a);
+    submit_pair(
+        "add_rms_norm",
+        device,
+        [dims, dims],
+        move || format!("eps {eps:e}, scaled {}", gamma.is_some()),
+        move |engine, ids| {
+            let gamma = match gamma {
+                Some(g) => Some(ids.get(g)?),
+                None => None,
+            };
+            engine.add_rms_norm(ids.get(a)?, ids.get(b)?, gamma, eps)
+        },
+    )
+}
+
+/// Rows added at resident indices on the device, in order, without waiting: `t`'s shape.
+pub(crate) fn select_add_rows(
+    device: TtDevice,
+    t: BufferId,
+    indices: BufferId,
+    value: BufferId,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "select_add_rows",
+        device,
+        dims_of(t),
+        || "rows added at resident indices".into(),
+        move |engine, ids| engine.select_add_rows(ids.get(t)?, ids.get(indices)?, ids.get(value)?),
     )
 }
 
@@ -3843,9 +4013,24 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.softmax_rows(&mut self.session, x, mask, scale)
     }
-    fn rms_norm(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+    fn rms_norm(
+        &mut self,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
-        bufs.rms_norm(&mut self.session, a, eps)
+        bufs.rms_norm(&mut self.session, a, gamma, eps)
+    }
+    fn add_rms_norm(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<[(BufferId, [usize; 2]); 2], TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.add_rms_norm(&mut self.session, a, b, gamma, eps)
     }
     fn argmax_row(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
@@ -4022,6 +4207,15 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.rows_add(&mut self.session, t, indices, value)
+    }
+    fn select_add_rows(
+        &mut self,
+        t: BufferId,
+        indices: BufferId,
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.select_add_rows(&mut self.session, t, indices, value)
     }
     fn assign_rows(
         &mut self,
@@ -4848,9 +5042,24 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         let bufs = &mut self.buffers;
         bufs.softmax_rows(self.fabric.chips[0].session(), x, mask, scale)
     }
-    fn rms_norm(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+    fn rms_norm(
+        &mut self,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
-        bufs.rms_norm(self.fabric.chips[0].session(), a, eps)
+        bufs.rms_norm(self.fabric.chips[0].session(), a, gamma, eps)
+    }
+    fn add_rms_norm(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<[(BufferId, [usize; 2]); 2], TtError> {
+        let bufs = &mut self.buffers;
+        bufs.add_rms_norm(self.fabric.chips[0].session(), a, b, gamma, eps)
     }
     fn argmax_row(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
@@ -5031,6 +5240,15 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.rows_add(self.fabric.chips[0].session(), t, indices, value)
+    }
+    fn select_add_rows(
+        &mut self,
+        t: BufferId,
+        indices: BufferId,
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.select_add_rows(self.fabric.chips[0].session(), t, indices, value)
     }
     fn assign_rows(
         &mut self,

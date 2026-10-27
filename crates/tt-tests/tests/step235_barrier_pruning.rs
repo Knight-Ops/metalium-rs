@@ -366,7 +366,7 @@ fn a_norm_s_scale_follows_its_runs_and_its_barrier_goes() {
         let w = s.upload(&bits(k * 64, 4), k, 64).unwrap();
         let step = |s: &mut Session<_>| {
             let y = s.eltwise(add, &x, Some(&dz)).unwrap();
-            let n = s.rms_norm(&y, 1e-5).unwrap();
+            let n = s.rms_norm(&y, None, 1e-5).unwrap();
             let g = ew(s, kind::MUL, &n, &gamma);
             let p = mm(s, &g, &w);
             (p, vec![y, n, g])

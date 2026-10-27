@@ -112,7 +112,7 @@ fn step<T: tt_device::Transport>(
 ) -> DramTensor {
     use tt_kernels::kind;
     let h = s.eltwise(op(kind::ADD), x, Some(a)).unwrap();
-    let n = s.rms_norm(&h, EPS).unwrap();
+    let n = s.rms_norm(&h, None, EPS).unwrap();
     let g = s.eltwise(op(kind::MUL), &n, Some(gamma)).unwrap();
     let out = s.eltwise(op(kind::ADD), &g, Some(&h)).unwrap();
     for t in [h, n, g] {
@@ -795,7 +795,7 @@ fn a_cached_plan_is_applied_once_and_forgotten_for_another_graph() {
         let rewired = |s: &mut Session<_>| {
             use tt_kernels::kind;
             let h = s.eltwise(op(kind::ADD), &x, Some(&a)).unwrap();
-            let n = s.rms_norm(&h, EPS).unwrap();
+            let n = s.rms_norm(&h, None, EPS).unwrap();
             let g = s.eltwise(op(kind::MUL), &n, Some(&gamma)).unwrap();
             let out = s.eltwise(op(kind::ADD), &g, Some(&n)).unwrap();
             for t in [h, n, g] {

@@ -72,7 +72,7 @@ fn row_limited_statistic_is_the_models_bit_for_bit_over_primed_l1() {
         let eps = 1e-5f32;
         for cols in [2048, 576, 70] {
             let nan = s.upload(&vec![f32::NAN; 32 * cols], 32, cols).unwrap();
-            for rows in [1, 2, 5, 16, 17, 33, 48] {
+            for rows in [1, 2, 5, 16, 17, 24, 33, 48, 62, 63] {
                 let label = format!("[{rows}, {cols}]");
                 let x = floats((rows * 10_000 + cols) as u64, rows * cols);
                 let want = norm::reference(&x, rows, cols, eps);

@@ -475,9 +475,20 @@ fn sim_factory(
         fn rms_norm(
             &mut self,
             a: burn_tt::BufferId,
+            gamma: Option<burn_tt::BufferId>,
             eps: f32,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
-            self.buffers.rms_norm(&mut self.session, a, eps)
+            self.buffers.rms_norm(&mut self.session, a, gamma, eps)
+        }
+        fn add_rms_norm(
+            &mut self,
+            a: burn_tt::BufferId,
+            b: burn_tt::BufferId,
+            gamma: Option<burn_tt::BufferId>,
+            eps: f32,
+        ) -> Result<[(burn_tt::BufferId, [usize; 2]); 2], TtError> {
+            self.buffers
+                .add_rms_norm(&mut self.session, a, b, gamma, eps)
         }
         fn argmax_row(
             &mut self,
@@ -643,6 +654,15 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers
                 .gather_rows(&mut self.session, sources, rows, cols)
+        }
+        fn select_add_rows(
+            &mut self,
+            t: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+            value: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers
+                .select_add_rows(&mut self.session, t, indices, value)
         }
         fn rows_add(
             &mut self,

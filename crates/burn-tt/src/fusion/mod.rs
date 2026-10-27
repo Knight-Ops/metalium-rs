@@ -211,6 +211,38 @@ fn execute_chain(
                 TtBackend::float_add(first, TtBackend::float_mul(c.clone(), d.clone()))
             })
         }
+        // One op where both rows keep their packed rows (`Session::add_rms_norm`), else the
+        // `ADD` and the norm: the sum is registered as the match's kept result.
+        ChainKind::AddRmsNorm | ChainKind::AddRmsNormScaled => {
+            let (a, b) = (&inputs[0], &inputs[1]);
+            let gamma = inputs.get(2);
+            let eps = bound[0] as f32;
+            let fused = {
+                let _op = crate::report::enter(m.kind.name(), true);
+                crate::ops::norm::add_rms_norm_native(a, b, gamma, eps)
+            };
+            let (sum, normed) = fused.unwrap_or_else(|| {
+                let sum = TtBackend::float_add(a.clone(), b.clone());
+                let normed = match gamma {
+                    Some(g) => crate::ops::norm::rms_norm_tt(sum.clone(), g.clone(), eps),
+                    None => crate::ops::float::float_rms_norm(&sum, eps).unwrap_or_else(|| {
+                        use burn_backend::TensorMetadata;
+                        let last = sum.shape().num_dims() - 1;
+                        let squares = TtBackend::float_mul(sum.clone(), sum.clone());
+                        let mean = TtBackend::float_mean_dim(squares, last);
+                        let shifted = TtBackend::float_add_scalar(mean, (eps as f64).into());
+                        let rms = TtBackend::float_sqrt(shifted);
+                        TtBackend::float_div(sum.clone(), rms)
+                    }),
+                };
+                (sum, normed)
+            });
+            let kept = global(context, &m.kept[0]);
+            context
+                .handles
+                .register_float_tensor::<TtBackend>(&kept.id, sum);
+            normed
+        }
         ChainKind::RmsNorm => {
             let x = &inputs[0];
             let eps = bound[0];
@@ -395,6 +427,8 @@ impl FusionRuntime for TtFusionRuntime {
             Box::new(ChainFuser::new(&chain::SILU_MUL)),
             Box::new(ChainFuser::new(&chain::RMS_NORM)),
             Box::new(ChainFuser::new(&chain::MUL_ADD)),
+            Box::new(ChainFuser::new(&chain::ADD_RMS_NORM)),
+            Box::new(ChainFuser::new(&chain::ADD_RMS_NORM_SCALED)),
         ]
     }
 }

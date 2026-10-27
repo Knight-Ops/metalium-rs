@@ -215,6 +215,8 @@ fn a_decoder_on_tt_captures_and_replays_as_eagerly() {
 #[test]
 fn tt_and_tt_backend_compared() {
     with_device(Config::default(), |d| {
+        // A residual sum and its norm through the merged call (opt-in), compared bit for bit.
+        burn_tt::set_add_rms_norm(true);
         for (what, config) in configs() {
             let reference = Llama::<TtBackend>::new(&config, &d);
             let native = traced_run(&reference, &format!("TtBackend, {what}"), &d);
@@ -227,24 +229,27 @@ fn tt_and_tt_backend_compared() {
                 assert_eq!(calls(&native, op), 0, "{what}: TtBackend ran {op}");
                 assert_eq!(calls(&on_tt, op), 0, "{what}: Tt ran {op}");
             }
-            // Each SiLU and its `* up` one fused op on `Tt`, and each RMSNorm (Llama's only
-            // `mean_dim`) one up to its scale.
+            // Each SiLU and its `* up` one fused op on `Tt`, and each RMSNorm one op with its
+            // scale on both (`burn_tt::rms_norm`, a custom operation in `Tt`'s stream): no
+            // `mean_dim` and no product by the scale on either. On `Tt` a norm after a residual
+            // sum is matched with the sum (`tt_add_rms_norm_scaled`).
             assert_eq!(
                 (calls(&on_tt, "tt_silu_mul"), calls(&on_tt, "sigmoid")),
                 (calls(&native, "sigmoid"), 0),
                 "{what}: every silu(gate) * up fused"
             );
+            assert!(calls(&native, "rms_norm") > 0, "{what}: TtBackend's norms");
             assert!(
-                calls(&native, "float_mean_dim") > 0,
-                "{what}: TtBackend's norms"
+                calls(&on_tt, "tt_add_rms_norm_scaled") > 0,
+                "{what}: residual sums matched with their norms"
             );
             assert_eq!(
                 (
-                    calls(&on_tt, "tt_rms_norm"),
-                    calls(&on_tt, "float_mean_dim")
+                    calls(&on_tt, "float_mean_dim"),
+                    calls(&native, "float_mean_dim")
                 ),
-                (calls(&native, "float_mean_dim"), 0),
-                "{what}: every RMSNorm fused"
+                (0, 0),
+                "{what}: every RMSNorm one op with its scale"
             );
             // Each RoPE application is one native op on both backends where its halves are whole
             // tiles (`head_dim` 64; `burn_tt::rope`, a custom operation in `Tt`'s stream), else

@@ -579,10 +579,16 @@ the host ~0.8).
   more than they save). Isolated 19.8 -> 14.4 us a norm; in the step ~36 -> ~30. With 6b: 1.7B 22.78 / 23.26 / 23.98 ->
   **22.24 / 22.70 / 23.43 ms** (`1792432143`). Less than the ~1 ms estimated: inside the step a small op costs about
   twice its isolated time (the prefetch reading beside it).
-- [ ] `x / stat * gamma`: burn-fusion puts `gamma`'s `Reshape` in a block of its own, so the product by it is a separate op
-  no fuser of the norm's block sees. Needs a decision: a deferred result in burn-tt (risky: much of it tells a device
-  tensor by its materialised buffer), a change to burn-fusion's blocks, or model code.
-- [ ] The residual `Add` with the next norm (the statistic needs the whole sum on each unit: products write no twin).
+- [x] `x / stat * gamma` (2026-10-27, decided: model code calls a custom op, as RoPE does): `burn_tt::rms_norm(x, gamma,
+  eps)`, on a decode row the scale multiplied inside `rms_divide`'s job, bit for bit (gates `step210`, `step195`); every
+  Llama norm calls it. 1.7B 11.31 / 12.63 -> **11.18 / 12.58 ms** at 32 / 256 tokens (card 0, `1793114447`, `1793114653`).
+- [x] The residual `Add` with the next norm (2026-10-27, built, **opt-in**: slower). A fuser (`ADD_RMS_NORM`,
+  `ADD_RMS_NORM_SCALED`: the `Add`, then Burn's composition or the norm's custom op, the sum kept as a second output);
+  one-row products now write their packed twin, so every unit adds the two packed rows for the statistic
+  (`Session::add_rms_norm`). Bit for bit (gates `step210`, `step195`, card 0 `1793121892`), but a 1.7B step 11.18 ->
+  **11.26 ms** (`1793122290`, `1793122494`): the merged job's five kernels on the norm's 32 units cost more than the
+  barrier it removes. `TT_ADD_RMS_NORM=1` turns it on. The estimate (~0.12 ms at A1's ~2.5 us a removed op) assumed
+  the merged op cost no more than one of the two.
 - [x] **The token on the card** (2026-10-19): a row's argmax as one native op (`Session::argmax_row`, gate `step211`), the
   greedy token every trace's second output, read back alone (`TracedGenerator::generate_tokens`; gate `step212`). The
   greedy rule is now `torch.argmax`'s (the first maximum) on the host and the card. ~0.34 ms a 1.7B step.

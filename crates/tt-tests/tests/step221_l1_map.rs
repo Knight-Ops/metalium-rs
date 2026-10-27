@@ -122,7 +122,7 @@ fn layer<T: tt_device::Transport>(
 ) -> DramTensor {
     use tt_kernels::kind;
     let h = s.eltwise(op(kind::ADD), x, Some(a)).unwrap();
-    let n = s.rms_norm(&h, EPS).unwrap();
+    let n = s.rms_norm(&h, None, EPS).unwrap();
     let g = s.eltwise(op(kind::MUL), &n, Some(gamma)).unwrap();
     let r = s.eltwise(op(kind::ADD), &g, Some(&h)).unwrap();
     let out = s

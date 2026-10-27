@@ -1051,8 +1051,68 @@ fn scatter_add_native(
     cast_native(mapped_native(&[&current], sources, shape), dtype)
 }
 
+/// `tensor` with `value`'s rows added to the rows `indices` name, in order, the indices resident
+/// (`Session::select_add_rows`: three ops an index, where the mask loop of
+/// [`scatter_add_native`] takes about twenty): an embedding's gradient. `None` for what it does
+/// not take (the caller runs the loop): other than a rank-2 F32 table along dim 0 with 1-D I32
+/// indices, packed storage, the matrix element-wise mode.
+fn select_add_rows_native(
+    tensor: &TtTensor,
+    indices: &TtTensor,
+    value: &TtTensor,
+) -> Option<TtTensor> {
+    let n = indices.shape().num_elements();
+    if tensor.shape().num_dims() != 2
+        || tensor.dtype() != DType::F32
+        || value.dtype() != DType::F32
+        || indices.dtype() != DType::I32
+        || indices.shape().num_dims() != 1
+        || value.shape().to_vec() != [n, tensor.shape()[1]]
+        || tensor.device != indices.device
+        || tensor.device != value.device
+        || !crate::server::supports_dram(tensor.device)
+        || matches!(
+            crate::server::elementwise_mode(tensor.device),
+            crate::ElementwiseMode::Matrix { .. }
+        )
+    {
+        return None;
+    }
+    let [rows, cols] = tensor.stored()?;
+    let (table, index, rows_in) = (plain_dram(tensor), plain_dram(indices), plain_dram(value));
+    let f32_storage =
+        |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
+    if !f32_storage(&table)
+        || !f32_storage(&index)
+        || !f32_storage(&rows_in)
+        || [table.buffer.rows, table.buffer.cols] != [rows, cols]
+        || [index.buffer.rows, index.buffer.cols] != [1, n]
+        || [rows_in.buffer.rows, rows_in.buffer.cols] != [n, cols]
+    {
+        return None;
+    }
+    let (id, dims) = crate::server::select_add_rows(
+        tensor.device,
+        table.buffer.id,
+        index.buffer.id,
+        rows_in.buffer.id,
+    );
+    Some(device_result_shaped(
+        tensor.device,
+        id,
+        dims,
+        vec![rows, cols].into(),
+        DType::F32,
+    ))
+}
+
 fn select_add_native(tensor: TtTensor, dim: usize, indices: TtTensor, value: TtTensor) -> TtTensor {
     assert!(indices.shape().num_dims() == 1 && dim < value.shape().num_dims());
+    if dim == 0 {
+        if let Some(sum) = select_add_rows_native(&tensor, &indices, &value) {
+            return sum;
+        }
+    }
     let shape = value.shape().to_vec();
     assert_eq!(shape[dim], indices.shape().num_elements());
     let mut index_shape = vec![1; shape.len()];
@@ -2257,7 +2317,7 @@ pub mod float {
         // The statistic and the division as one op where the session can
         // (`Session::rms_norm`), else the two: bit for bit either way.
         let d = plain_dram(x);
-        let (id, dims) = crate::server::rms_norm(x.device, d.buffer.id, eps);
+        let (id, dims) = crate::server::rms_norm(x.device, d.buffer.id, None, eps);
         Some(device_result_shaped(
             x.device,
             id,
@@ -3929,6 +3989,7 @@ pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
 mod interpolate;
 mod nhwc;
+pub(crate) mod norm;
 mod pool;
 mod region;
 pub(crate) mod rope;

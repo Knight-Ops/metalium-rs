@@ -331,6 +331,9 @@ pub const SMOKE: &[&str] = &[
     // (roadmap Track 1, "The long-context softmax"; opt-in in burn-tt).
     "step230_softmax_rows::",
     "step231_ttinsn_push::",
+    // An embedding's gradient at resident indices, three ops an index in index order, where the
+    // mask loop took ~20 (the tt-mnist transformer 92 -> 26 ms/step).
+    "step236_select_add_rows::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

@@ -191,3 +191,135 @@ fn near_misses_run_as_their_operations() {
         assert_eq!(burn_tt::fused_count("tt_rms_norm"), 3, "no control fuses");
     });
 }
+
+/// `burn_tt::rms_norm` (decode-to-bandwidth Phase 7): Burn's `RmsNorm` with its scale as one op,
+/// called by a model where burn-fusion's blocks keep the scale from the fuser. Bit for bit the
+/// module on `TtBackend`, on `TtBackend` and on `Tt`, at a decode row of SmolLM2's widths, several
+/// rows and rank 3, over specials; a single row is the native call and runs no `float_mul`, more
+/// rows the norm's op and the product. A BF16 input is declined (the module casts its statistic). Negative control: a
+/// gamma of ones gives other bits.
+#[test]
+fn the_scaled_norm_is_one_op_and_the_module_bit_for_bit() {
+    fn module<B: Backend<Device = TtDevice>>(
+        gamma: &[f32],
+        x: &[f32],
+        shape: [usize; 3],
+        d: &TtDevice,
+    ) -> Vec<u32> {
+        let mut m = RmsNormConfig::new(gamma.len())
+            .with_epsilon(1e-5)
+            .init::<B>(d);
+        m.gamma = m.gamma.map(|_| tensor(gamma, [gamma.len()], d));
+        bits(m.forward(tensor::<B, 3>(x, shape, d)))
+    }
+    fn scaled<B: Backend<Device = TtDevice>>(
+        gamma: &[f32],
+        x: &[f32],
+        shape: [usize; 3],
+        d: &TtDevice,
+    ) -> Vec<u32> {
+        let g = tensor::<B, 1>(gamma, [gamma.len()], d);
+        bits(burn_tt::rms_norm(&tensor::<B, 3>(x, shape, d), &g, 1e-5).expect("taken"))
+    }
+    with_device(Config::default(), |d| {
+        for (shape, specials, native) in [
+            ([1, 1, 2048], false, true),
+            ([1, 1, 576], true, true),
+            ([1, 5, 576], true, false),
+            ([2, 17, 96], true, false),
+        ] {
+            let width = shape[2];
+            let n = shape.iter().product();
+            let (gamma, x) = (values(width, 7, specials), values(n, n as u32, specials));
+            let want = module::<TtBackend>(&gamma, &x, shape, &d);
+            let before = burn_tt::rms_norm_count();
+            let (got, ops) = reported(|| scaled::<TtBackend>(&gamma, &x, shape, &d));
+            assert_bits(&format!("TtBackend {shape:?}"), &got, &want);
+            if native {
+                assert_eq!(burn_tt::rms_norm_count(), before + 1, "{shape:?}: native");
+                if shape[1] == 1 {
+                    let calls = |op: &str| ops.get(op).map_or(0, |s| s.0);
+                    assert_eq!(calls("float_mul"), 0, "{shape:?}: the scale inside the op");
+                }
+            }
+            assert_bits(
+                &format!("Tt {shape:?}"),
+                &scaled::<Tt>(&gamma, &x, shape, &d),
+                &want,
+            );
+            // On a row without specials (a NaN's row is NaN whatever the scale).
+            let (ones, plain) = (vec![1.0f32; width], values(n, n as u32, false));
+            assert_ne!(
+                scaled::<TtBackend>(&ones, &plain, shape, &d),
+                scaled::<TtBackend>(&gamma, &plain, shape, &d),
+                "{shape:?}: the scale reaches the outputs"
+            );
+        }
+        let x = tensor::<TtBackend, 3>(&values(64, 1, false), [1, 1, 64], &d)
+            .cast(burn::tensor::DType::BF16);
+        let g = tensor::<TtBackend, 1>(&values(64, 2, false), [64], &d);
+        assert!(burn_tt::rms_norm(&x, &g, 1e-5).is_none(), "BF16 declined");
+    });
+}
+
+/// A residual sum and the norm after it on `Tt` (decode-to-bandwidth Phase 7): `s = x + h W`
+/// then `burn_tt::rms_norm(s)`, and `s` then Burn's composition up to the scale, at decode rows of
+/// 2048 and 576 (the second below the packed rows' width: the two ops). Each matches its chain
+/// (`tt_add_rms_norm_scaled`, `tt_add_rms_norm`), the sum is read afterwards, and both the sum and
+/// the norm are `TtBackend`'s bit for bit, through the native call (one op at 2048, where `x`
+/// (an element-wise result) and `h W` (a one-row product's) keep packed rows; the session's two
+/// at 576). Control: the norm of `x` alone differs.
+#[test]
+fn a_residual_sum_and_its_norm_are_one_op_on_tt() {
+    fn run<B: Backend<Device = TtDevice>>(
+        width: usize,
+        scaled: bool,
+        specials: bool,
+        d: &TtDevice,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let x = tensor::<B, 3>(&values(width, 3, specials), [1, 1, width], d).mul_scalar(1.0);
+        let h = tensor::<B, 3>(&values(64, 5, false), [1, 1, 64], d);
+        let w = tensor::<B, 2>(&values(64 * width, 7, false), [64, width], d);
+        let gamma = tensor::<B, 1>(&values(width, 9, false), [width], d);
+        let s = x + h.matmul(w.unsqueeze());
+        let n = if scaled {
+            burn_tt::rms_norm(&s, &gamma, 1e-5).expect("taken")
+        } else {
+            normalise(s.clone(), 1e-5)
+        };
+        (bits(n), bits(s))
+    }
+    with_device(Config::default(), |d| {
+        // Opt-in (slower on silicon): on for this gate, whose process is its own fork.
+        burn_tt::set_add_rms_norm(true);
+        for (width, scaled, specials) in [2048, 576]
+            .into_iter()
+            .flat_map(|w| [(w, true), (w, false)])
+            .flat_map(|(w, s)| [(w, s, true), (w, s, false)])
+        {
+            {
+                let what = format!("width {width}, scaled {scaled}, specials {specials}");
+                let want = run::<TtBackend>(width, scaled, specials, &d);
+                burn_tt::reset_fusion_counters();
+                let before = burn_tt::add_rms_norm_count();
+                let got = run::<Tt>(width, scaled, specials, &d);
+                assert_bits(&format!("{what}: the norm"), &got.0, &want.0);
+                assert_bits(&format!("{what}: the sum"), &got.1, &want.1);
+                let chain = if scaled {
+                    "tt_add_rms_norm_scaled"
+                } else {
+                    "tt_add_rms_norm"
+                };
+                assert_eq!(burn_tt::fused_count(chain), 1, "{what}: {chain} matched");
+                assert_eq!(
+                    burn_tt::add_rms_norm_count() - before,
+                    1,
+                    "{what}: the native call"
+                );
+            }
+        }
+        let x = tensor::<Tt, 3>(&values(2048, 3, false), [1, 1, 2048], &d).mul_scalar(1.0);
+        let (alone, _) = run::<Tt>(2048, false, false, &d);
+        assert_ne!(bits(normalise(x, 1e-5)), alone, "the sum reaches the norm");
+    });
+}

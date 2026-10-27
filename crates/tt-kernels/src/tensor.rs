@@ -4224,6 +4224,62 @@ pub fn sfpu_eltwise(
     )
 }
 
+/// A product's jobs (`c` one tile row, `[1, n]`) also writing `c`'s packed twin
+/// ([`packed_twin_writes`]): after each list's [`record::SCATTER`] of `c`'s one tile row from
+/// slots a tile apart, the writes of those tiles' data rows, on the same writer from the same
+/// slots. Only if those scatters cover every one of `c`'s tile columns; `false`, and the jobs
+/// untouched, otherwise (the twin is then not `c`'s).
+pub(crate) fn twin_one_row_scatters(jobs: &mut [Job], c: &DramTensor, twin: &DramTensor) -> bool {
+    let enc = c.tensor_ref().encode();
+    let nt = c.grid()[1];
+    // `c`'s one-row scatters in `entries`: (index, slot of the first tile, first column, columns).
+    let scatters = |entries: &[[u32; 8]]| -> Vec<(usize, u64, usize, usize)> {
+        (0..entries.len())
+            .filter(|&i| {
+                entries[i][0] == record::SCATTER
+                    && entries.get(i + 1) == Some(&enc[0])
+                    && entries.get(i + 2) == Some(&enc[1])
+            })
+            .filter_map(|i| {
+                let [_, at, stride, i0, rows, j0, cols, _] = entries[i].map(|w| w as usize);
+                (i0 == 0
+                    && rows == 1
+                    && stride as u64 == TILE_SLOT
+                    && at as u64 >= TILE_DATA
+                    && j0 + cols <= nt)
+                    .then_some((i, at as u64, j0, cols))
+            })
+            .collect()
+    };
+    let mut covered = vec![false; nt];
+    for job in jobs.iter() {
+        for step in job {
+            if let Step::List { entries, .. } = step {
+                for (_, _, j0, cols) in scatters(entries) {
+                    covered[j0..j0 + cols].iter_mut().for_each(|c| *c = true);
+                }
+            }
+        }
+    }
+    if !covered.iter().all(|&c| c) {
+        return false;
+    }
+    for job in jobs.iter_mut() {
+        for step in job.iter_mut() {
+            let Step::List { entries, .. } = step else {
+                continue;
+            };
+            // From the last, so the earlier indices stay put.
+            // A product's `out_at` is its first output's datums, a slot's `TILE_DATA` in.
+            for (i, at, j0, cols) in scatters(entries).into_iter().rev() {
+                let writes = packed_twin_writes(twin, j0, cols, at - TILE_DATA);
+                entries.splice(i + 3..i + 3, writes);
+            }
+        }
+    }
+    true
+}
+
 /// The writes that put one-row tiles' data rows, packed, into `twin` (`[K / 32, 32]`, as
 /// [`pack_row`] lays them out): output tiles `first..first + count`, each in the slot after the
 /// last from `at` with its data in row 0, two 64-byte face-row writes a tile on the writer.
@@ -5147,9 +5203,24 @@ pub fn sfpu_rms(alloc: &mut DramAlloc, a: &DramTensor, eps: f32) -> Result<Work>
         Arc::new(reduce::roles(&layout, &squares, &fin))
     };
     let whole = (a.rows >= 32).then(|| roles_for(32));
+    // Unrolled over the row groups a ragged tile row occupies, its programs can outgrow a
+    // program slot (2048 columns at 18 to 31 rows; the mover refuses the kernel with
+    // `PROGRAM`): there the whole tile row's, which compute each row the same way.
+    let fits = |roles: &[Vec<_>; 3]| {
+        roles
+            .iter()
+            .all(|p| p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize)
+    };
     let last = match a.rows % 32 {
         0 => whole.clone().expect("a whole tile row"),
-        r => roles_for(r),
+        r => {
+            let limited = roles_for(r);
+            if fits(&limited) {
+                limited
+            } else {
+                whole.clone().unwrap_or_else(|| roles_for(32))
+            }
+        }
     };
     let out = DramTensor::alloc_elem(alloc, a.rows, 1, Elem::F32)?;
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
@@ -5301,16 +5372,427 @@ pub(crate) fn share_semaphore_init(job: &mut Job) {
     }
 }
 
+/// `out`'s rows plus `values`' rows at the rows `indices` name, in index order, written over
+/// `out` in place: Burn's `select_add` along rows (an embedding's gradient), the indices resident
+/// (`[n, 1]` I32) and never read by the host. One job a group of `out`'s tile columns (no two
+/// jobs touch one byte), and in it one block an index: the index's tile read, `SELECT_ROWS` of
+/// `out`'s row `indices[j]` and of `values`' row `j` (`positions`, `[n, 1]` I32, holds `j`), an
+/// `ADD` of the two (`kind::ADD`, the row's tiles), and `SCATTER_ROWS` of the sum back to row
+/// `indices[j]`. Both records' slots are unknown to the region's footprint check, so each
+/// block's gather waits for the block before to be written out and released
+/// (`RELEASED`, `Release::Written`) and a row repeated reads the sum the last one wrote: each row's
+/// additions are made in index order, bit for bit Flex's loop. An index outside `out`'s rows is
+/// the select's `DOMAIN`.
+pub(crate) fn select_add_rows_jobs(
+    out: &DramTensor,
+    indices: &DramTensor,
+    positions: &DramTensor,
+    values: &DramTensor,
+    units: usize,
+) -> Result<Vec<Job>> {
+    use crate::sfpu::kernel::{self as sk, Operands};
+    use crate::sfpu::ops::{code_for_rows, Broadcast};
+    use tt_isa::dm::op;
+    let n = indices.rows;
+    out.expect("a select-add's table", Elem::F32)?;
+    values.expect("a select-add's values", Elem::F32)?;
+    indices.expect("a select-add's indices", Elem::I32)?;
+    positions.expect("a select-add's positions", Elem::I32)?;
+    if n == 0
+        || indices.cols != 1
+        || (positions.rows, positions.cols) != (n, 1)
+        || (values.rows, values.cols) != (n, out.cols)
+        || out.rows == 0
+        || out.rows > i32::MAX as usize
+        || !out.placement.owned()
+    {
+        return Err(TensorError::Shape(format!(
+            "a select-add of [{n}, {}] indices and [{}, {}] values into an owned [{}, {}] table",
+            indices.cols, values.rows, values.cols, out.rows, out.cols
+        )));
+    }
+    let ct = out.grid()[1];
+    // A block's slots: the index and position tiles, then a group's columns of `out`'s row,
+    // `values`' row and their sum.
+    let room = ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(2) / 3;
+    let width = ct
+        .div_ceil(units.max(1))
+        .clamp(1, room.min(SELECT_ADD_TILES));
+    let base = tt_isa::l1::DATA.base;
+    let (idx_at, pos_at) = (base, base + TILE_SLOT);
+    let slots = width as u64 * TILE_SLOT;
+    let [a_at, b_at, o_at] = [0, 1, 2].map(|k| base + 2 * TILE_SLOT + k * slots);
+    if !tt_isa::l1::DATA.contains(base, 2 * TILE_SLOT + 3 * slots) {
+        return Err(TensorError::Shape(
+            "a select-add's slots are outside the data arena".into(),
+        ));
+    }
+    crate::l1::note_planned_top(o_at + slots);
+    let (_, add) = code_for_rows(
+        crate::kind::ADD,
+        [0.0, 0.0],
+        Broadcast::None,
+        eltwise_rows(crate::kind::ADD, 1),
+    )
+    .ok_or_else(|| TensorError::Shape("no ADD program".into()))?;
+    let (out_ref, values_ref) = (out.tensor_ref().encode(), values.tensor_ref().encode());
+    let read_tile = |range: tt_isa::dram::DramRange, at: u64, port: u32| {
+        [
+            op::READ,
+            range.channel().index() as u32,
+            port % tt_isa::dram::PORTS as u32,
+            range.offset() as u32,
+            at as u32,
+            range.len() as u32,
+            0,
+            0,
+        ]
+    };
+    let mut jobs = Vec::new();
+    for g in 0..ct.div_ceil(width) {
+        let (j0, j1) = (g * width, ((g + 1) * width).min(ct));
+        let cols = j1 - j0;
+        let planned = sk::plan_layout(cols, Operands::Binary)
+            .map_err(|e| TensorError::Shape(e.to_string()))?;
+        let layout = sk::Layout {
+            tiles: cols,
+            a_at,
+            b_at: Some(b_at),
+            b_once: false,
+            c_at: None,
+            out_at: o_at,
+            sems: planned.sems,
+            init: planned.init,
+        };
+        let (roles, loops) = sk::roles_code(&layout, Operands::Binary, &add);
+        let (roles, loops) = (Arc::new(roles), Arc::new(loops));
+        let mut job = Vec::new();
+        for j in 0..n {
+            // Index `j` is row `q` of its tile: the records read it at `(0, 0)` of the slot that
+            // row starts.
+            let q = (j % 32) as u64;
+            let row = (q / 16 * 512 + q % 16 * 16) * 4;
+            let mut gather = vec![
+                read_tile(indices.tile(j / 32, 0), idx_at, 0),
+                read_tile(positions.tile(j / 32, 0), pos_at, 1),
+                [
+                    record::SELECT_ROWS,
+                    (idx_at + row) as u32,
+                    1,
+                    out.rows as u32,
+                    j0 as u32,
+                    cols as u32,
+                    a_at as u32,
+                    0,
+                ],
+            ];
+            gather.extend(out_ref);
+            gather.push([
+                record::SELECT_ROWS,
+                (pos_at + row) as u32,
+                1,
+                n as u32,
+                j0 as u32,
+                cols as u32,
+                b_at as u32,
+                0,
+            ]);
+            gather.extend(values_ref);
+            let mut scatter = vec![[
+                record::SCATTER_ROWS,
+                (idx_at + row) as u32,
+                1,
+                out.rows as u32,
+                j0 as u32,
+                cols as u32,
+                o_at as u32,
+                0,
+            ]];
+            scatter.extend(out_ref);
+            job.extend([
+                Step::List {
+                    what: "select-add gather",
+                    entries: gather,
+                },
+                Step::Kernel {
+                    roles: roles.clone(),
+                    init: layout.init.clone(),
+                    mop: Box::new([None; 3]),
+                    loops: loops.clone(),
+                    half: None,
+                },
+                Step::List {
+                    what: "select-add scatter",
+                    entries: scatter,
+                },
+            ]);
+        }
+        jobs.push(job);
+    }
+    Ok(jobs)
+}
+
+/// The most tile columns one [`select_add_rows_jobs`] job takes: as a row select's group.
+const SELECT_ADD_TILES: usize = 24;
+
+/// `s = a + b` and `s / sqrt(mean(s s) + eps)` (times `gamma`, `[1, K]`, if given) for decode
+/// rows `a` and `b` (`[1, K]`) whose packed rows are `pa` and `pb` ([`pack_row`]): a residual
+/// sum and the norm after it, as one op. Each job adds the packed rows (the sum's packed row,
+/// `kind::ADD` over the same datums), takes the statistic from it ([`sfpu_rms_packed`]'s
+/// kernel), then adds its run of `a`'s and `b`'s tiles, divides them by the statistic and scales
+/// them: bit for bit the `ADD`, then [`rms_divide`]. Returns the norm (`Work::out`) and the sum;
+/// `twins`, if given, receive their packed rows (the sum's first).
+#[allow(clippy::too_many_arguments)]
+pub fn add_rms_divide(
+    alloc: &mut DramAlloc,
+    [a, b]: [&DramTensor; 2],
+    [pa, pb]: [&DramTensor; 2],
+    gamma: Option<&DramTensor>,
+    eps: f32,
+    units: usize,
+    twins: [Option<&DramTensor>; 2],
+) -> Result<(Work, DramTensor)> {
+    use crate::sfpu::kernel::{self as sk, Operands};
+    use crate::sfpu::ops::{code_for_rows, kind_sfpu, Broadcast};
+    use crate::sfpu::{norm, reduce};
+    let cols = a.cols;
+    for (x, p) in [(a, pa), (b, pb)] {
+        x.expect("a residual sum's operand", Elem::F32)?;
+        p.expect("a residual sum's packed operand", Elem::F32)?;
+        if x.rows != 1 || x.cols != cols || cols % 32 != 0 || (p.rows, p.cols) != (cols / 32, 32) {
+            return Err(TensorError::Shape(format!(
+                "a residual norm of [{}, {}] packed as [{}, {}], with a row of {cols}",
+                x.rows, x.cols, p.rows, p.cols
+            )));
+        }
+    }
+    if let Some(g) = gamma {
+        g.expect("an RMS norm's scale", Elem::F32)?;
+        if (g.rows, g.cols) != (1, cols) {
+            return Err(TensorError::Shape(format!(
+                "an RMS norm of [1, {cols}] scaled by [{}, {}]",
+                g.rows, g.cols
+            )));
+        }
+    }
+    let [pt, _] = pa.grid();
+    let ct = a.grid()[1];
+    let div = Eltwise {
+        kind: kind_sfpu::DIV,
+        scalar: 0.0,
+        scalar2: 0.0,
+    };
+    // A job's slots: the packed `a`, `b` and sum, the statistic; then a run's tiles of `a`, `b`,
+    // the sum and the quotient, and with a scale of `gamma` and the product.
+    let per_tile = if gamma.is_some() { 6 } else { 4 };
+    let by_slots =
+        ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(3 * pt + 1) / per_tile;
+    let group = sfpu_group(div, Broadcast::Col, Operands::ColBroadcast, false).min(by_slots);
+    if group == 0 {
+        return Err(TensorError::Shape(format!(
+            "a residual norm's packed rows of {pt} tiles leave no slots"
+        )));
+    }
+    let base = tt_isa::l1::DATA.base;
+    let packed_slots = pt as u64 * TILE_SLOT;
+    let [pa_at, pb_at, ps_at] = [0, 1, 2].map(|k| base + k * packed_slots);
+    let stat_layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let stat_layout = reduce::Layout {
+        in_at: ps_at,
+        out_at: ps_at + packed_slots,
+        ..stat_layout
+    };
+    let a_at = stat_layout.out_at + TILE_SLOT;
+    let (squares, fin) = norm::math_packed(cols, eps);
+    let stat_roles = Arc::new(reduce::roles(&stat_layout, &squares, &fin));
+    let program = |kind: u32, bcast: Broadcast, rows: u32| {
+        code_for_rows(kind, [0.0, 0.0], bcast, rows)
+            .map(|(_, code)| code)
+            .ok_or_else(|| TensorError::Shape(format!("no program for kind {kind:#x}")))
+    };
+    // The packed rows' sum over every row they hold; a run's over its tiles' one row, as the
+    // element-wise `ADD` of two decode rows runs.
+    let add_packed = program(crate::kind::ADD, Broadcast::None, 32)?;
+    let add = program(
+        crate::kind::ADD,
+        Broadcast::None,
+        eltwise_rows(crate::kind::ADD, 1),
+    )?;
+    let divide = program(div.kind, Broadcast::Col, eltwise_rows(div.kind, 1))?;
+    let scale = match gamma {
+        Some(_) => Some(program(
+            crate::kind::MUL,
+            Broadcast::None,
+            eltwise_rows(crate::kind::MUL, 1),
+        )?),
+        None => None,
+    };
+    let binary = |tiles: usize, a_at: u64, b_at: u64, out_at: u64| -> Result<sk::Layout> {
+        let planned = sk::plan_layout(tiles, Operands::Binary)
+            .map_err(|e| TensorError::Shape(e.to_string()))?;
+        Ok(sk::Layout {
+            tiles,
+            a_at,
+            b_at: Some(b_at),
+            b_once: false,
+            c_at: None,
+            out_at,
+            sems: planned.sems,
+            init: planned.init,
+        })
+    };
+    let kernel = |layout: &sk::Layout, operands: Operands, code: &crate::code::Code| {
+        let (roles, loops) = sk::roles_code(layout, operands, code);
+        Step::Kernel {
+            roles: Arc::new(roles),
+            init: layout.init.clone(),
+            mop: Box::new([None; 3]),
+            loops: Arc::new(loops),
+            half: None,
+        }
+    };
+    let packed_sum = kernel(
+        &binary(pt, pa_at, pb_at, ps_at)?,
+        Operands::Binary,
+        &add_packed,
+    );
+    let out = DramTensor::alloc(alloc, 1, cols)?;
+    let sum = match DramTensor::alloc(alloc, 1, cols) {
+        Ok(sum) => sum,
+        Err(e) => {
+            alloc.free(&out.placement);
+            return Err(e);
+        }
+    };
+    let refs = [pa, pb, a, b].map(|x| x.tensor_ref());
+    let (rs, ro, rg) = (
+        sum.tensor_ref(),
+        out.tensor_ref(),
+        gamma.map(|g| g.tensor_ref()),
+    );
+    let read = |x: &TensorRef, start: usize, n: usize, at: u64, grid_ct: usize| {
+        [
+            [
+                record::READ_RUN,
+                start as u32,
+                n as u32,
+                at as u32,
+                0,
+                grid_ct as u32,
+                0,
+                0,
+            ],
+            x.encode()[0],
+            x.encode()[1],
+        ]
+    };
+    let write = |x: &TensorRef, start: usize, n: usize, at: u64| {
+        [
+            [
+                record::WRITE_RUN,
+                start as u32,
+                n as u32,
+                at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            x.encode()[0],
+            x.encode()[1],
+        ]
+    };
+    let empty = |what: &'static str| Step::List {
+        what,
+        entries: Vec::new(),
+    };
+    let mut jobs = Vec::new();
+    for run in runs(ct, units, group) {
+        let len = run.len();
+        let slots = len as u64 * TILE_SLOT;
+        let [b_at, s_at, q_at, g_at, p_at] = [1, 2, 3, 4, 5].map(|k| a_at + k * slots);
+        let run_sum = binary(len, a_at, b_at, s_at)?;
+        let planned = sk::plan_layout(len, Operands::ColBroadcast)
+            .map_err(|e| TensorError::Shape(e.to_string()))?;
+        let quotient = sk::Layout {
+            tiles: len,
+            a_at: s_at,
+            b_at: Some(stat_layout.out_at),
+            b_once: true,
+            c_at: None,
+            out_at: q_at,
+            sems: planned.sems,
+            init: planned.init,
+        };
+        let result_at = if scale.is_some() { p_at } else { q_at };
+        crate::l1::note_planned_top(result_at + slots);
+        let mut gather = read(&refs[0], 0, pt, pa_at, 1).to_vec();
+        gather.extend(read(&refs[1], 0, pt, pb_at, 1));
+        gather.extend(read(&refs[2], run.start, len, a_at, ct));
+        gather.extend(read(&refs[3], run.start, len, b_at, ct));
+        if let Some(rg) = &rg {
+            gather.extend(read(rg, run.start, len, g_at, ct));
+        }
+        let mut scatter = write(&rs, run.start, len, s_at).to_vec();
+        if let Some(twin) = twins[0] {
+            scatter.extend(packed_twin_writes(twin, run.start, len, s_at));
+        }
+        scatter.extend(write(&ro, run.start, len, result_at));
+        if let Some(twin) = twins[1] {
+            scatter.extend(packed_twin_writes(twin, run.start, len, result_at));
+        }
+        let mut job = vec![
+            Step::List {
+                what: "residual norm gather",
+                entries: gather,
+            },
+            packed_sum.clone(),
+            empty("residual norm packed sum"),
+            empty("residual norm statistic in"),
+            Step::Kernel {
+                roles: stat_roles.clone(),
+                init: stat_layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Default::default(),
+                half: None,
+            },
+            empty("residual norm statistic"),
+            empty("residual norm sum in"),
+            kernel(&run_sum, Operands::Binary, &add),
+            empty("residual norm sum"),
+            empty("residual norm divide in"),
+            kernel(&quotient, Operands::ColBroadcast, &divide),
+        ];
+        if let Some(mul) = &scale {
+            job.extend([
+                empty("residual norm quotient"),
+                empty("residual norm scale in"),
+                kernel(&binary(len, q_at, g_at, p_at)?, Operands::Binary, mul),
+            ]);
+        }
+        job.push(Step::List {
+            what: "residual norm scatter",
+            entries: scatter,
+        });
+        jobs.push(job);
+        share_semaphore_init(jobs.last_mut().expect("just pushed"));
+    }
+    Ok((Work { out, jobs }, sum))
+}
+
 /// `a / sqrt(mean(a a) + eps)` for a decode row `a` (`[1, K]`) whose packed row (`[K / 32, 32]`,
 /// [`pack_row`]) is `packed`: RMSNorm up to its scale, as one op. Each job takes a run of `a`'s
 /// tiles and computes the statistic itself from `packed` ([`sfpu_rms_packed`]'s kernel), then
 /// divides its tiles by it (`kind_sfpu::DIV`, the column broadcast, one row): bit for bit the
 /// statistic op and the `DIV` after it, with no barrier between them and no unit waiting on one
-/// that computed the statistic alone. `twin`, if given, receives the result's packed row.
+/// that computed the statistic alone. With `gamma` (`[1, K]`), each job then multiplies its tiles
+/// by `gamma`'s (`kind::MUL`, the element-wise op's program): bit for bit the norm, then the
+/// product by its scale. `twin`, if given, receives the result's packed row.
 pub fn rms_divide(
     alloc: &mut DramAlloc,
     a: &DramTensor,
     packed: &DramTensor,
+    gamma: Option<&DramTensor>,
     eps: f32,
     units: usize,
     twin: Option<&DramTensor>,
@@ -5327,6 +5809,15 @@ pub fn rms_divide(
             a.rows, packed.rows, packed.cols
         )));
     }
+    if let Some(g) = gamma {
+        g.expect("an RMS norm's scale", Elem::F32)?;
+        if (g.rows, g.cols) != (1, cols) {
+            return Err(TensorError::Shape(format!(
+                "an RMS norm of [1, {cols}] scaled by [{}, {}]",
+                g.rows, g.cols
+            )));
+        }
+    }
     let [pt, _] = packed.grid();
     let ct = a.grid()[1];
     let div = Eltwise {
@@ -5334,8 +5825,11 @@ pub fn rms_divide(
         scalar: 0.0,
         scalar2: 0.0,
     };
-    // A run's slots: the packed row, the statistic, its tiles of `a` and of the result.
-    let by_slots = ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(pt + 1) / 2;
+    // A run's slots: the packed row, the statistic, its tiles of `a` and of the quotient, and
+    // with a scale its tiles of `gamma` and of the product.
+    let per_tile = if gamma.is_some() { 4 } else { 2 };
+    let by_slots =
+        ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(pt + 1) / per_tile;
     let group = sfpu_group(div, Broadcast::Col, Operands::ColBroadcast, false).min(by_slots);
     if group == 0 {
         return Err(TensorError::Shape(format!(
@@ -5358,8 +5852,22 @@ pub fn rms_divide(
         eltwise_rows(div.kind, 1),
     )
     .ok_or_else(|| TensorError::Shape("no column-broadcast DIV program".into()))?;
+    let scale = match gamma {
+        Some(_) => Some(
+            code_for_rows(
+                crate::kind::MUL,
+                [0.0, 0.0],
+                Broadcast::None,
+                eltwise_rows(crate::kind::MUL, 1),
+            )
+            .ok_or_else(|| TensorError::Shape("no MUL program".into()))?
+            .1,
+        ),
+        None => None,
+    };
     let out = DramTensor::alloc(alloc, 1, cols)?;
     let (rp, ra, ro) = (packed.tensor_ref(), a.tensor_ref(), out.tensor_ref());
+    let rg = gamma.map(|g| g.tensor_ref());
     let mut jobs = Vec::new();
     for run in runs(ct, units, group) {
         let len = run.len();
@@ -5375,7 +5883,32 @@ pub fn rms_divide(
             sems: planned.sems,
             init: planned.init,
         };
-        crate::l1::note_planned_top(layout.out_at + len as u64 * TILE_SLOT);
+        // The product by the scale: `gamma`'s tiles after the quotient's, the product's after
+        // those.
+        let slots = len as u64 * TILE_SLOT;
+        let scaled = match &scale {
+            Some(mul) => {
+                let planned = sk::plan_layout(len, Operands::Binary)
+                    .map_err(|e| TensorError::Shape(e.to_string()))?;
+                let product = sk::Layout {
+                    tiles: len,
+                    a_at: layout.out_at,
+                    b_at: Some(layout.out_at + slots),
+                    b_once: false,
+                    c_at: None,
+                    out_at: layout.out_at + 2 * slots,
+                    sems: planned.sems,
+                    init: planned.init,
+                };
+                let (roles, loops) = sk::roles_code(&product, Operands::Binary, mul);
+                Some((product, roles, loops))
+            }
+            None => None,
+        };
+        let result_at = scaled
+            .as_ref()
+            .map_or(layout.out_at, |(product, _, _)| product.out_at);
+        crate::l1::note_planned_top(result_at + slots);
         let (roles, loops) = sk::roles_code(&layout, Operands::ColBroadcast, &code);
         let read = |x: &TensorRef, start: usize, n: usize, at: u64, grid_ct: usize| {
             [
@@ -5395,12 +5928,16 @@ pub fn rms_divide(
         };
         let mut gather = read(&rp, 0, pt, stat_layout.in_at, 1).to_vec();
         gather.extend(read(&ra, run.start, len, a_at, ct));
+        if let (Some(rg), Some((product, _, _))) = (&rg, &scaled) {
+            let g_at = product.b_at.expect("a binary layout");
+            gather.extend(read(rg, run.start, len, g_at, ct));
+        }
         let mut scatter = vec![
             [
                 record::WRITE_RUN,
                 run.start as u32,
                 len as u32,
-                layout.out_at as u32,
+                result_at as u32,
                 0,
                 0,
                 0,
@@ -5410,9 +5947,9 @@ pub fn rms_divide(
             ro.encode()[1],
         ];
         if let Some(twin) = twin {
-            scatter.extend(packed_twin_writes(twin, run.start, len, layout.out_at));
+            scatter.extend(packed_twin_writes(twin, run.start, len, result_at));
         }
-        jobs.push(vec![
+        let mut job = vec![
             Step::List {
                 what: "rms divide gather",
                 entries: gather,
@@ -5439,11 +5976,31 @@ pub fn rms_divide(
                 loops: Arc::new(loops),
                 half: None,
             },
-            Step::List {
-                what: "rms divide scatter",
-                entries: scatter,
-            },
-        ]);
+        ];
+        if let Some((product, roles, loops)) = scaled {
+            job.extend([
+                Step::List {
+                    what: "rms divide quotient",
+                    entries: Vec::new(),
+                },
+                Step::List {
+                    what: "rms divide scale",
+                    entries: Vec::new(),
+                },
+                Step::Kernel {
+                    roles: Arc::new(roles),
+                    init: product.init,
+                    mop: Box::new([None; 3]),
+                    loops: Arc::new(loops),
+                    half: None,
+                },
+            ]);
+        }
+        job.push(Step::List {
+            what: "rms divide scatter",
+            entries: scatter,
+        });
+        jobs.push(job);
         share_semaphore_init(jobs.last_mut().expect("just pushed"));
     }
     Ok(Work { out, jobs })

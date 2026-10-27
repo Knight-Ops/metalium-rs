@@ -1204,3 +1204,27 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod row_limited_lengths {
+    use super::*;
+
+    /// A row-limited reduction over up to 32 tiles (what `attention::fits` lets a decode head's
+    /// scores reach) fits a program slot at every row count: unrolled over row groups, its
+    /// programs outgrow one past that (64 tiles at 17 to 31 rows, which `tensor::sfpu_rms` runs
+    /// as whole tile rows instead).
+    #[test]
+    fn row_limited_reductions_over_32_tiles_fit_a_program_slot() {
+        let over = |nt: usize, rows: u32| {
+            let layout = plan_layout(1, nt).unwrap();
+            let (inputs, fin) = math_programs_rows(ReduceOp::Max, nt, 32, rows);
+            roles(&layout, &inputs, &fin)
+                .iter()
+                .any(|p| p.len() > tt_isa::mailbox::PROGRAM_MAX as usize)
+        };
+        for rows in 1..=32 {
+            assert!(!over(32, rows), "32 tiles at {rows} rows");
+        }
+        assert!(over(64, 24), "the control: 64 tiles at 24 rows");
+    }
+}

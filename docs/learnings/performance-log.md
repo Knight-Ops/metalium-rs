@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The tt-mnist regression found, and RMSNorm's scale in its op](#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1) | 2026-10-27 | the scoreboard's MNIST and transformer rows were 2026-10-03/04 numbers, MNIST since on a 5.3x larger model; the transformer's 9.2 -> 92 ms/step bisected to `c4255c7` (9.2 -> 22.6) and `6d979e7` (-> 329: the embedding gradient's ~20 ops an index); that gradient as one op, **92.5 -> 10.9 ms/step**, the same losses; RMSNorm's scale inside the norm's op, a 1.7B step **11.31 -> 11.18 ms**; a residual sum and its norm as one op, bit for bit but slower (11.18 -> 11.26), opt-in; a ragged RMS statistic of 18-31 rows at 2048 columns hung (its unrolled programs past a program slot), fixed |
 | [The decode and prefill streams merged](#the-decode-and-prefill-streams-merged-2026-10-27-card-0) | 2026-10-27 | the barriers pruned (S5) and each K-tile pair's tiles whole in their `Src` (P4) together, card 0: 135M **6.92 / 7.47 / 8.14 ms**, 1.7B **11.32 / 11.84 / 12.64**, the 1.7B prefill 283.7 / 5,983 ms at 1,000 / 7,992 tokens; every gate, conformance and the MNIST goldens hold; eight failing or hanging tests that predate both fixed |
 | [Which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0) | 2026-10-26 | a small op is 9.8 us on unit 0 (135M; 11.6 on the 1.7B), ~3 of it its barrier; 194 of the 135M step's 591 barriers (82 of the 1.7B's 403) order nothing the data needs, and a capture drops them: 135M **7.35 -> 6.97 ms**, 1.7B 11.76 -> **11.59**; sparse waits after products would save 0.03-0.07 ms (the barrier time there is the slowest unit's work); one launch for back-to-back ops ~0.12 ms at best |
 | [Compact BF16 slots, and where a BF16 decode step goes](#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1) | 2026-10-26 | a 1.7B BF16 step is products 8.37 ms + 283 small ops 2.98 (weights free 6.26 ms); compact BF16 `B` slots in L1, bit for bit, 11.78 -> 11.68 ms; more read ahead (`ring`, `wide`) does not shorten a product; `fast-reads` 11.74 -> **11.54 ms** (card 1), all of it the weight stream, nothing for small ops |
@@ -372,6 +373,85 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The tt-mnist regression found, and RMSNorm's scale in its op (2026-10-27, cards 0 and 1)
+
+**The scoreboard's tt-mnist rows were wrong twice over.** Its MNIST 1.4 and transformer 8.8 ms/step (burn-flex 0.5 and
+4.35) were measured on 2026-10-03/04 (`3c7756b`, last re-measured at `3344db6`: 1.3 and 8.74) and carried into the
+2026-10-10 layout (`7495436`) unmeasured. Since `d47cfab` (2026-10-04) `tt-mnist`'s default MNIST model is 784-512-256-10,
+5.3x the parameters of the 784-128-10 those rows measured: that is burn-flex's 0.5 -> 1.9 ms. The earlier "old commit is
+slow too" check ran `7495436` at every tile, not one.
+
+**Like for like** (card 1, release, one tile, `tt-mnist --card 1`, three runs each):
+
+| | `3344db6` (2026-10-04) | HEAD before | **HEAD after** | burn-flex |
+|---|--:|--:|--:|--:|
+| MNIST, `--hidden 128` (937 steps) | 1.4 ms/step | 1.9-2.0 | 2.0 (no embedding: unchanged) | 0.5 |
+| MNIST, the default 512,256 | | 3.4-3.5 | | 1.8-1.9 |
+| transformer (50 steps) | 9.1-9.2 | 92.5 | **10.88-10.94** (25.85-25.94 at three ops an index) | 3.7-3.8 |
+
+The host is unchanged: `3344db6` built and run today gives its old numbers. MNIST at `--hidden 128` is still 1.4 -> 2.0
+ms/step since `3344db6`, not bisected (it has no embedding; `c4255c7`'s step is the candidate).
+
+**The bisect** (`3344db6..7f18dde`, the transformer under 20 ms/step good, card 1): two steps.
+- **`c4255c7`** (2026-10-05, "More tests + work on BF16 typing"): 9.2 -> 22.6 ms/step with the same caller-side calls,
+  the step's download wait 8.1 -> 21.1 ms. Not located: at HEAD it is not visible (the profile below).
+- **`6d979e7`** (2026-10-06): -> 329 ms/step. `float_select_add` (`nn::Embedding`'s gradient) stopped downloading its
+  indices (the `rows_add` route) and ran `scatter_add_native`'s mask loop: ~20 device ops an index, 128 indices a step.
+  At HEAD (`TT_HOST_TIMES=1`): 57,187 ops queued in 20 steps, ~2,860 a step, ~23 us each to enqueue (~10 PCIe reads a
+  list), 90% of them the gradient's; 60 ms a step of "outside calls" was the caller waiting on that queue.
+
+**The other host rows** (card 1, `silicon_bench_models`, every tile): ViT-Tiny untraced at `work:64:4` 116.2 ms (the
+scoreboard's 129.1 of 2026-10-15), traced 7.89 (8.32); ResNet-18 untraced at `work:64:4` **145.9 ms against 131.1** on
+2026-10-14 (spread `all` 232.4 against 203.8), traced 12.90 (13.74); burn-flex 106.0-107.1 and 154.3-156.8 (`1793119700`,
+`1793119618`). ResNet-18's untraced forward is ~11-14% slower than recorded, still under burn-flex; not bisected.
+
+**The gradient at resident indices** (`Session::select_add_rows`, gate `step236`). First as three ops an index (a row
+select of the sum so far, an `ADD`, a row scatter back; ttsim and card 0 `1793112997`): the transformer **92.5 -> 25.9
+ms/step**, its losses unchanged (card 4.4355 -> 3.4883 both); profiled (`TT_PROFILE`, card 1), the gradient was still
+~16.7 ms of the ~26 (390 ops a step at ~43 us, data-bound), everything else ~5.9 ms of device time. Then **as one op**
+(`tensor::select_add_rows_jobs`, no firmware change): a job a group of tile columns (no two units touch one byte), and in
+it a block an index: the index's tile read, `SELECT_ROWS` of the table's row and of the value's row (a metadata column of
+positions), a one-row `ADD`, `SCATTER_ROWS` of the sum back. Neither record's L1 footprint is known to the region's
+check, so each block's gather waits for the last block to be written out and released (`RELEASED`, `Written`: NC pops
+its credit only after its writes are acknowledged), and across a region's groups B waits for NC's `DONE`: a repeated
+row reads the sum the last block wrote. Bit for bit the host's sequential `+=` and `Session::rows_add` over specials;
+100 indices naming one row on card 0 (the longest read-after-write chain); watched failing with the blocks reversed.
+Card 0 `1793123374`. The transformer **25.9 -> 10.9 ms/step** (card 1, three runs 10.88-10.94; `3344db6` 9.2), the same
+losses.
+
+**RMSNorm's scale in the norm's op** (decode-to-bandwidth Phase 7; `burn_tt::rms_norm`, gates `step210`, `step195`).
+Burn's `RmsNorm` multiplies by `gamma.unsqueeze()`, a `Reshape` burn-fusion puts in a block of its own, so the product by
+the scale was an op after every norm. `Session::rms_norm` takes the scale: on a decode row `rms_divide` multiplies its
+tiles by it (`kind::MUL`) inside the same job, bit for bit the two ops; tt-models' Llama calls it for every norm
+(`TT_RMS_NORM_SCALED=0` declines it). A 1.7B step (card 0, BF16 weights, `traced_generation_stream_ceiling`):
+**11.307 / 12.628 -> 11.183 / 12.576 ms** at 32 / 256 tokens (`1793114447` off, `1793114653` on).
+
+**A residual sum and its norm as one op: bit for bit, slower, opt-in** (decode-to-bandwidth Phase 7;
+`Session::add_rms_norm`, `tensor::add_rms_divide`; the fuser's `ADD_RMS_NORM` and `ADD_RMS_NORM_SCALED` chains, a chain's
+kept second output, `burn_tt::set_add_rms_norm` / `TT_ADD_RMS_NORM=1`). Every unit needs the whole sum for the
+statistic, so a one-row product now writes its output's packed twin too (`tensor::twin_one_row_scatters`, after each
+`SCATTER` of the output's tile row, all or nothing), as element-wise results do; the merged job adds the two packed rows,
+takes the statistic, then adds, divides and scales its own tiles. Gates `step210` (bit for bit the `ADD` and the norm at
+`K` 1024-4096 with and without the scale, a product's twin as `b`, a capture replayed; watched failing with `b`'s
+packed row read as `a`'s), `step195` (both chains on `Tt`, the sum kept and read after; watched failing with the norm
+registered as the sum), `step193`; card 0 `1793121892` (86 of 86 with it on, the 1.7B's traced-equals-eager and Flex
+agreement included). Found on the way: a product's `SCATTER` `out_at` is its datums, a slot's `TILE_DATA` in. Measured
+(card 0, `traced_generation_stream_ceiling`): a 1.7B step **11.18 / 12.59 -> 11.26 / 12.73 ms** at 32 / 256 tokens
+(`1793122290` off, `1793122494` on), the 135M **6.86 -> 6.94** (`1793122699`, `1793122749`). The merged job's five
+kernels on the norm's 32 units cost more than the barrier between the `ADD` (64 units) and the norm. Off by default; the
+products' twins stay (the "off" step equals the step before them, 11.18 ms). With RMSNorm's scale (removing 49 ops for
+0.124 ms) this measures a removed small op at ~2.5 us inside the step: most of a small op's span is under the weight
+stream, so fewer ops is not the lever the op count suggested.
+
+**Found on the way, and fixed: a ragged RMS statistic hung.** `step188`'s eager growing-cache generation over a 62-token
+prompt hung tile (1, 2) (a list that never finished, the mover's last op `SELECT_ROWS`) once the norm's fallback took
+`float_rms_norm` for the prompt's rows. `Session::rms_norm` of `[62, 2048]` on every tile hung; 32 and 40 rows did not.
+The statistic runs a ragged last tile row's programs over its row groups only, unrolled: at 2048 columns and 18 to 31
+rows they outgrow a program slot (ttsim: `PROGRAM`, code 8). `tensor::sfpu_rms` now takes the whole tile row's programs
+where the row-limited ones do not fit (each row computed the same way); `step196` covers 24, 62 and 63 rows (watched
+failing on ttsim before), and a unit test holds attention's row-limited reductions (up to 32 tiles) inside a slot. Card 0
+`1793118651`: `step188`'s traced-equals-eager, `step196`.
 
 ## The decode and prefill streams merged (2026-10-27, card 0)
 

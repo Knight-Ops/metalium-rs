@@ -146,6 +146,12 @@ fn rms_norm<B: Backend>(cfg: &LlamaConfig, device: &B::Device) -> RmsNorm<B> {
         .init(device)
 }
 
+/// `norm.forward(x)`: on the card one op with its scale where it can be (`burn_tt::rms_norm`, bit
+/// for bit the module), else the module.
+fn normed<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) -> Tensor<B, D> {
+    burn_tt::rms_norm(&x, &norm.gamma.val(), norm.epsilon).unwrap_or_else(|| norm.forward(x))
+}
+
 #[derive(Module, Debug)]
 pub struct SelfAttn<B: Backend> {
     q_proj: Linear<B>,
@@ -303,7 +309,7 @@ impl<B: Backend> Layer<B> {
         };
         let (kv_heads, head_dim, groups) = (cfg.kv_heads, cfg.head_dim, cfg.groups());
         let [n, t, _] = x.dims();
-        let h = self.input_layernorm.forward(x.clone());
+        let h = normed(&self.input_layernorm, x.clone());
         let a = &self.self_attn;
         let heads =
             |p: Tensor<B, 3>, count: usize| p.reshape([n, t, count, head_dim]).swap_dims(1, 2);
@@ -378,7 +384,7 @@ impl<B: Backend> Layer<B> {
         );
         let x = x + project(context, &a.o_proj);
 
-        let h = self.post_attention_layernorm.forward(x.clone());
+        let h = normed(&self.post_attention_layernorm, x.clone());
         let m = &self.mlp;
         let [gate, up] = match &m.gate_up {
             Some(gate_up) => project_split(h, gate_up, [cfg.ff, cfg.ff]),
@@ -818,9 +824,7 @@ impl<B: Backend> Llama<B> {
         let (write, own) = cache.kv.chunk_write_within(start, c, len);
         let rope = cache.rope.at(own.clamp_max(max_len as i64 - 1));
         let (x, state) = self.layers_fixed(x, &rope, cache, &write);
-        let row = self
-            .norm
-            .forward(x)
+        let row = normed(&self.norm, x)
             .reshape([c, hidden])
             .select(0, last)
             .reshape([1, hidden]);
@@ -857,9 +861,7 @@ impl<B: Backend> Llama<B> {
     /// The logits `[1, vocab]` of the last of `t` positions of `x`.
     fn head(&self, x: Tensor<B, 3>, t: usize) -> Tensor<B, 2> {
         let hidden = self.config.hidden;
-        let last = self
-            .norm
-            .forward(x)
+        let last = normed(&self.norm, x)
             .slice([0..1, t - 1..t, 0..hidden])
             .reshape([1, hidden]);
         self.project_out(last)

@@ -7473,6 +7473,49 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// `t` with `value`'s row `i` added to its row `indices[i]`, for every `i` in order, the
+    /// indices resident (`[1, n]` I32): Burn's `select_add` along rows, an embedding's gradient,
+    /// with no index read by the host. One op ([`tensor::select_add_rows_jobs`]) over a copy of
+    /// `t`: each unit takes a group of its tile columns and, index by index, selects the row,
+    /// adds the value's row and writes the sum back, each read after the last write, so a row
+    /// named twice takes its additions in index order (Flex's loop, bit for bit). The indices
+    /// are first laid out as a column (a repack). An index outside `t`'s rows is the row
+    /// select's `DOMAIN` error.
+    pub fn select_add_rows(
+        &mut self,
+        t: &DramTensor,
+        indices: &DramTensor,
+        value: &DramTensor,
+    ) -> Result<DramTensor, TensorError> {
+        indices.expect("resident select-add indices", tensor::Elem::I32)?;
+        let n = indices.cols;
+        if indices.rows != 1 || value.rows != n || value.cols != t.cols || value.elem != t.elem {
+            return Err(TensorError::Shape(format!(
+                "[{}, {n}] indices and a [{}, {}] value for a [{}, {}] tensor",
+                indices.rows, value.rows, value.cols, t.rows, t.cols
+            )));
+        }
+        let out = self.copy(t)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        let at: Vec<[usize; 2]> = (0..n).map(|j| [0, j]).collect();
+        let column = self.repack(indices, &at, [n, 1])?;
+        let bits: Vec<u32> = (0..n as u32).collect();
+        let positions = self.metadata(&bits, [n, 1], tensor::Elem::I32)?;
+        let units = self.spread_for(t.grid()[1]);
+        let done = tensor::select_add_rows_jobs(&out, &column, &positions, value, units)
+            .and_then(|jobs| self.submit_jobs_on(jobs, units, RESET_BUDGET));
+        self.free(column)?;
+        self.free(positions)?;
+        if let Err(e) = done {
+            self.free(out)?;
+            return Err(e);
+        }
+        // Rows written whole: the copy's padding as it was.
+        Ok(out)
+    }
+
     /// `t` with `value`'s row `i` added to its row `indices[i]`, for every `i`
     /// in order -- Burn's `select_add` along rows, an embedding's gradient --
     /// on the card, in a new tensor. Only the rows the indices touch are
@@ -7665,12 +7708,117 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// `s = a + b` (`kind::ADD`) and [`Session::rms_norm`] of `s` with `gamma`: a residual sum
+    /// and the norm after it, `(s, norm)`. For decode rows whose packed rows are kept (twins: an
+    /// element-wise op's, a one-row product's, this op's own) one op ([`tensor::add_rms_divide`]):
+    /// every unit adds the packed rows for the statistic and its own tiles for the rest, so the
+    /// sum and the norm take one barrier, not two. Bit for bit the `ADD` and the norm, which run
+    /// as two ops elsewhere.
+    pub fn add_rms_norm(
+        &mut self,
+        a: &DramTensor,
+        b: &DramTensor,
+        gamma: Option<&DramTensor>,
+        eps: f32,
+    ) -> Result<(DramTensor, DramTensor), TensorError> {
+        let add = tensor::Eltwise {
+            kind: crate::kind::ADD,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let exact = |kind: u32| {
+            let op = tensor::Eltwise {
+                kind,
+                scalar: 0.0,
+                scalar2: 0.0,
+            };
+            op.in_mode(self.math).kind == kind
+        };
+        let kt = a.cols / 32;
+        let packed = match (self.packed_twin(a), self.packed_twin(b)) {
+            (Some(pa), Some(pb)) => Some((pa.clone(), pb.clone())),
+            _ => None,
+        };
+        let fused = self.rms_divide
+            && self.packed_rms
+            && a.rows == 1
+            && (b.rows, b.cols) == (a.rows, a.cols)
+            && a.cols % 32 == 0
+            && kt >= PACKED_A_K_TILES
+            && a.elem == tensor::Elem::F32
+            && b.elem == tensor::Elem::F32
+            && [
+                crate::sfpu::ops::kind_sfpu::DIV,
+                crate::kind::ADD,
+                crate::kind::MUL,
+            ]
+            .into_iter()
+            .all(exact);
+        let Some((pa, pb)) = packed.filter(|_| fused) else {
+            let sum = self.eltwise(add, a, Some(b))?;
+            return match self.rms_norm(&sum, gamma, eps) {
+                Ok(out) => Ok((sum, out)),
+                Err(e) => {
+                    self.free(sum)?;
+                    Err(e)
+                }
+            };
+        };
+        let units = self
+            .spread_for(tiles_of(a))
+            .min(kt.div_ceil(RMS_DIVIDE_TILES))
+            .max(1);
+        let sum_twin = self.new_twin(1, a.cols, tensor::Elem::F32)?;
+        let out_twin = self.new_twin(1, a.cols, tensor::Elem::F32)?;
+        let made = self.dram_state().and_then(|d| {
+            tensor::add_rms_divide(
+                &mut d.alloc,
+                [a, b],
+                [&pa, &pb],
+                gamma,
+                eps,
+                units,
+                [sum_twin.as_ref(), out_twin.as_ref()],
+            )
+        });
+        let (out, sum) = match made {
+            Ok((work, sum)) => (self.execute_on(work, units, RESET_BUDGET), Ok(sum)),
+            Err(e) => (Err(e), Err(TensorError::Shape("no residual norm".into()))),
+        };
+        self.keep_twin(&out, out_twin)?;
+        self.keep_twin(&sum, sum_twin)?;
+        let (out, sum) = match (out, sum) {
+            (Ok(out), Ok(sum)) => (out, sum),
+            (Err(e), sum) => {
+                if let Ok(sum) = sum {
+                    self.free(sum)?;
+                }
+                return Err(e);
+            }
+            (Ok(out), Err(e)) => {
+                self.free(out)?;
+                return Err(e);
+            }
+        };
+        self.last_runs = Some((out.placement.clone(), tiles_of(&out), units));
+        sum.set_pad(tensor::Pad::Undefined);
+        out.set_pad(tensor::Pad::Undefined);
+        Ok((sum, out))
+    }
+
     /// `a / sqrt(mean(a a) + eps)` over each row, RMSNorm up to its scale: bit for bit
     /// [`Session::rms`] then `kind_sfpu::DIV` by its column. A decode row with a packed row
     /// ([`Session::set_packed_rms`]) runs as one op ([`tensor::rms_divide`]): every unit computes
     /// the statistic from the packed row and divides its own tiles, so no unit waits on one that
-    /// computed the statistic alone ([`Session::set_rms_divide`] turns it off).
-    pub fn rms_norm(&mut self, a: &DramTensor, eps: f32) -> Result<DramTensor, TensorError> {
+    /// computed the statistic alone ([`Session::set_rms_divide`] turns it off). With `gamma`
+    /// (`[1, cols]`), the result is then multiplied by it, a row broadcast down `a`'s rows: bit for
+    /// bit the norm then `kind::MUL` by `gamma`, inside the same op on a decode row.
+    pub fn rms_norm(
+        &mut self,
+        a: &DramTensor,
+        gamma: Option<&DramTensor>,
+        eps: f32,
+    ) -> Result<DramTensor, TensorError> {
         let div = tensor::Eltwise {
             kind: crate::sfpu::ops::kind_sfpu::DIV,
             scalar: 0.0,
@@ -7688,7 +7836,18 @@ impl<T: Transport> Session<T> {
             let stat = self.rms(a, eps)?;
             let out = self.eltwise(div, a, Some(&stat));
             self.free(stat)?;
-            return out;
+            let Some(gamma) = gamma else {
+                return out;
+            };
+            let out = out?;
+            let mul = tensor::Eltwise {
+                kind: crate::kind::MUL,
+                scalar: 0.0,
+                scalar2: 0.0,
+            };
+            let scaled = self.eltwise(mul, &out, Some(gamma));
+            self.free(out)?;
+            return scaled;
         }
         let (packed, made) = match self.packed_twin(a).cloned() {
             Some(twin) => (twin, false),
@@ -7706,9 +7865,9 @@ impl<T: Transport> Session<T> {
             .min(kt.div_ceil(RMS_DIVIDE_TILES))
             .max(1);
         let twin = self.new_twin(a.rows, a.cols, tensor::Elem::F32)?;
-        let work = self
-            .dram_state()
-            .and_then(|d| tensor::rms_divide(&mut d.alloc, a, &packed, eps, units, twin.as_ref()));
+        let work = self.dram_state().and_then(|d| {
+            tensor::rms_divide(&mut d.alloc, a, &packed, gamma, eps, units, twin.as_ref())
+        });
         let out = match work {
             Ok(work) => self.execute_on(work, units, RESET_BUDGET),
             Err(e) => Err(e),
@@ -8076,6 +8235,15 @@ impl<T: Transport> Session<T> {
         let second_job = self.prefetch_second_job;
         let balanced_deal = self.balanced_deal;
         let block_stream = self.block_stream;
+        // A one-row output over a long `n` also writes its row packed, as an element-wise op's
+        // does ([`Session::set_packed_twins`]): the norm after a residual sum reads it.
+        let n = if b_transposed { b.rows } else { b.cols };
+        let out_twin = if m == 1 && n % 32 == 0 {
+            self.new_twin(1, n, tensor::Elem::F32)?
+        } else {
+            None
+        };
+        let mut twinned = false;
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -8109,7 +8277,10 @@ impl<T: Transport> Session<T> {
                     &busy,
                 )
             })
-            .and_then(|(work, dealt, handoff)| {
+            .and_then(|(mut work, dealt, handoff)| {
+                if let (Some(twin), None) = (&out_twin, &handoff) {
+                    twinned = tensor::twin_one_row_scatters(&mut work.jobs, &work.out, twin);
+                }
                 self.prefetch_anchor = match dealt {
                     Some(_) => anchors,
                     None => Vec::new(),
@@ -8162,6 +8333,14 @@ impl<T: Transport> Session<T> {
                 c.weight_units = units;
             }
         }
+        let out_twin = match (out_twin, twinned) {
+            (Some(twin), false) => {
+                self.free(twin)?;
+                None
+            }
+            (twin, _) => twin,
+        };
+        self.keep_twin(&out, out_twin)?;
         for c in [ca, cb, packed].into_iter().flatten() {
             self.free(c)?;
         }

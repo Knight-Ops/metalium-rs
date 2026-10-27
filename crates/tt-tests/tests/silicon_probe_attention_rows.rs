@@ -237,7 +237,7 @@ fn rms_norm_one_op_against_two() {
             s.set_rms_divide(fused);
             for units in [8usize, 16, 32, 64] {
                 s.set_spread(tt_kernels::session::Spread::Fixed(units));
-                let (us, out) = op_us(&mut s, |s| s.rms_norm(&x, 1e-5).unwrap());
+                let (us, out) = op_us(&mut s, |s| s.rms_norm(&x, None, 1e-5).unwrap());
                 s.free(out).unwrap();
                 println!("MEASURE rms-norm K {k} on {units} units, one op {fused}: {us:.1} us");
             }

@@ -250,7 +250,14 @@ flowchart TD
   - **Measured:** a single-kernel version that also divided cost 640 us a norm on silicon. `DIV`'s instructions are
     pushed one by one, all on one unit. A reduce-map whose map is long must spread its map over the units.
   - **The scale is not in it:** its `Reshape` is a block of its own in burn-fusion, and the product joins neither
-    (observed).
+    (observed). Since 2026-10-27 a model calls `burn_tt::rms_norm(x, gamma, eps)` (a custom operation, as RoPE's), which
+    multiplies by the scale inside the norm's job on a decode row (`step195`, `step210`).
+  - **A residual sum and its norm** (2026-10-27, opt-in, `TT_ADD_RMS_NORM=1`): chains `ADD_RMS_NORM` (an `Add`, then the
+    composition above) and `ADD_RMS_NORM_SCALED` (an `Add`, then `burn_tt::rms_norm`'s custom operation, matched by the
+    chain's `ScaledNorm` step, `eps` from its id). The first chains with **a second output**: a `Pattern`'s `keep` names
+    steps whose results outlive the match (here the sum, the next residual's input), registered beside the result
+    (`ChainMatch::kept`). Bit for bit; slower on silicon, so off ([decode-to-bandwidth.md](decode-to-bandwidth.md)
+    Phase 7).
   - **Limit:** rows of up to 128 tiles (4096 columns); longer rows run the separate ops.
   - **Row-limited** (2026-10-16): a tile row of fewer than 32 rows runs only the row groups they occupy
     (`sfpu::reduce::row_offsets`); a decode row's kernel 14.95 -> 5.58 us (`step196`, decode-small-ops.md S3).

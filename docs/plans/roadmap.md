@@ -24,9 +24,12 @@ linking to its evidence and to the detailed plan. Closed work lives in
   BF16 tables still take the staged path.
   The MNIST MLP, CNN and TinyTransformer still train from scratch in `tt-mnist`.
 - **Performance: behind the CPU unless traced.** Untraced training is 1.8x (MNIST, 3.4 ms/step against 1.9) and
-  25x (the transformer, 92 against 3.7) slower than burn-flex on 2026-10-27
-  ([scoreboard](../learnings/performance-scoreboard.md); the transformer was 8.8 on 2026-10-10, an order of magnitude
-  the log records as unexplained); the cost is host-side submission, not the device. Traced MNIST inference already beats the CPU, and traced, the three
+  2.9x (the transformer, 10.9 against 3.7) slower than burn-flex on 2026-10-27
+  ([scoreboard](../learnings/performance-scoreboard.md)). The old 1.4 / 8.8 rows were 2026-10-04 numbers, MNIST on a model
+  5.3x smaller; the transformer's 9.2 -> 92 ms/step was bisected to `c4255c7` and `6d979e7` (the embedding's gradient at
+  ~20 ops an index, now one op: 10.9; [log](../learnings/performance-log.md#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1)).
+  Left: MNIST at the old model size is 2.0 ms/step against 1.4 on `3344db6` (not bisected), and ResNet-18's untraced
+  forward ~11% slower than recorded. Traced MNIST inference already beats the CPU, and traced, the three
   models match or beat burn-flex on every tile: the SmolLM2 decode step 26.46 ms against 26.42,
   ViT-Tiny 11.6 ms against 112, ResNet-18 17.2 against 164 (2026-10-15, Track 2 item 6,
   [replay-fixed-cost.md](replay-fixed-cost.md)). A whole traced generation (ids in, logits out, any
@@ -514,6 +517,11 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         would save 0.03-0.07 ms), so A2 (sparse waits) and A3 (one launch for back-to-back ops, ~0.12 ms at best) are
         not built. **Merged with P4** (2026-10-27, card 0, [log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0)): 135M **6.92 / 7.47 / 8.14 ms**,
         1.7B **11.32 / 11.84 / 12.64** (burn-flex 26.5 / 29.1 / 30.5 and 298 / 318 / 336).
+        **RMSNorm's scale in the norm's op** (2026-10-27, card 0, Phase 7, `burn_tt::rms_norm`, gates `step210`, `step195`):
+        1.7B **11.18 / 12.58 ms** at 32 / 256 tokens (11.31 / 12.63 without, `1793114653`, `1793114447`). On the way, a ragged
+        RMS statistic of 18-31 rows at 2048 columns hung the card (its unrolled programs past a program slot): fixed, `step196`.
+        **A residual sum and its norm as one op** (same day, gates `step210`, `step195`): bit for bit, but slower (11.18 ->
+        11.26 ms, `1793122494`), so opt-in (`TT_ADD_RMS_NORM=1`); a removed small op is worth ~2.5 us inside the step.
         **Found and fixed on the way:** decode attention's job recorded too low an L1 top, so busy prefetch read the next
         weights over its `K` and `V` at `Step(512)` (a 1.7B traced generation chose other tokens at a 256-token prompt;
         gate `step209`).

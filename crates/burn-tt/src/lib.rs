@@ -55,6 +55,8 @@ mod views;
 pub use error::TtError;
 pub use matmul_mode::{accurate_matmul, exact_matmul, with_matmul_mode, MatmulMode};
 #[doc(hidden)]
+pub use ops::norm::{add_rms_norm_count, rms_norm, rms_norm_count, set_add_rms_norm};
+#[doc(hidden)]
 pub use ops::rope::{rope, rope_count};
 pub use ops::{
     set_accurate_matmul_slicing, set_argmax_row, set_attention_rows,

@@ -17,6 +17,8 @@ use burn_ir::{
     BaseOperationIr, BinaryOpIr, CastOpIr, FloatOperationIr, NumericOperationIr, OperationIr,
     ReduceDimOpIr, ScalarIr, ScalarOpIr, TensorId, TensorIr, TensorStatus, UnaryOpIr,
 };
+
+use crate::ops::norm::{fused_eps, FUSED_ID};
 use serde::{Deserialize, Serialize};
 
 use super::TtOptimization;
@@ -59,6 +61,9 @@ pub(crate) enum Step {
     Mul(Arg, Arg),
     Add(Arg, Arg),
     Div(Arg, Arg),
+    /// `burn_tt::rms_norm`'s custom operation (`x`, `gamma`): RMSNorm with its scale, `eps`
+    /// bound from the operation's id.
+    ScaledNorm(Arg, Arg),
 }
 
 /// What a complete match computes.
@@ -74,6 +79,11 @@ pub enum ChainKind {
     RmsNorm,
     /// `a b + c d`, both products dying in the sum (RoPE's `x cos + rotate(x) sin`).
     MulAdd,
+    /// `s = a + b` and Burn's `RmsNorm` of `s` up to its scale, `s` kept: a residual sum and the
+    /// norm after it.
+    AddRmsNorm,
+    /// `s = a + b` and `burn_tt::rms_norm(s, gamma)`, `s` kept.
+    AddRmsNormScaled,
 }
 
 impl ChainKind {
@@ -85,6 +95,8 @@ impl ChainKind {
             ChainKind::SiluMul => "tt_silu_mul",
             ChainKind::RmsNorm => "tt_rms_norm",
             ChainKind::MulAdd => "tt_mul_add",
+            ChainKind::AddRmsNorm => "tt_add_rms_norm",
+            ChainKind::AddRmsNormScaled => "tt_add_rms_norm_scaled",
         }
     }
 }
@@ -95,6 +107,9 @@ pub(crate) struct Pattern {
     pub steps: &'static [Step],
     /// `(steps matched, what the match is)`, shortest first.
     pub ends: &'static [(usize, ChainKind)],
+    /// Steps whose results may be read after the match: registered with its result
+    /// ([`ChainMatch::kept`]). Every other tensor it makes must die inside it.
+    pub keep: &'static [usize],
 }
 
 /// Burn's default `sigmoid` (`burn-backend` `ActivationOps::sigmoid`), which burn-fusion 0.21 does
@@ -119,6 +134,7 @@ pub(crate) const SILU_MUL: Pattern = Pattern {
         (9, ChainKind::Silu),
         (10, ChainKind::SiluMul),
     ],
+    keep: &[],
 };
 
 /// Burn's `RmsNorm::forward` (`burn-nn` `norm/rms.rs`) on F32, up to its scale: `x.cast(F32)` and
@@ -135,6 +151,7 @@ pub(crate) const RMS_NORM: Pattern = Pattern {
         Step::Div(Arg::Input(0), Arg::Chain),
     ],
     ends: &[(5, ChainKind::RmsNorm)],
+    keep: &[],
 };
 
 /// `a b + c d`, each product read only by the sum: RoPE's `x cos + cat(x2, x1) sin`, which
@@ -148,6 +165,34 @@ pub(crate) const MUL_ADD: Pattern = Pattern {
         Step::Add(Arg::Step(0), Arg::Chain),
     ],
     ends: &[(3, ChainKind::MulAdd)],
+    keep: &[],
+};
+
+/// A residual sum and Burn's `RmsNorm` of it up to its scale ([`RMS_NORM`] reading the sum),
+/// the sum kept for the next residual: one op (`Session::add_rms_norm`) where the sum and the
+/// norm were two. Any pre-norm model's `x + f(x)` then norm.
+pub(crate) const ADD_RMS_NORM: Pattern = Pattern {
+    steps: &[
+        Step::Add(Arg::Input(0), Arg::Input(1)),
+        Step::Mul(Arg::Chain, Arg::Chain),
+        Step::MeanLast,
+        Step::AddScalar(Expect::Bind),
+        Step::Sqrt,
+        Step::Div(Arg::Step(0), Arg::Chain),
+    ],
+    ends: &[(6, ChainKind::AddRmsNorm)],
+    keep: &[0],
+};
+
+/// A residual sum and `burn_tt::rms_norm` of it (the norm with its scale, a model's call), the
+/// sum kept.
+pub(crate) const ADD_RMS_NORM_SCALED: Pattern = Pattern {
+    steps: &[
+        Step::Add(Arg::Input(0), Arg::Input(1)),
+        Step::ScaledNorm(Arg::Chain, Arg::Input(2)),
+    ],
+    ends: &[(2, ChainKind::AddRmsNormScaled)],
+    keep: &[0],
 };
 
 /// Most operations a block may hold before a chain begins. burn-fusion groups an operation
@@ -186,6 +231,8 @@ pub struct ChainMatch {
     /// Each input as last read inside the match (its status says whether the match consumes it).
     pub inputs: Vec<TensorIr>,
     pub out: TensorIr,
+    /// The results of the pattern's [`Pattern::keep`] steps, read after the match.
+    pub kept: Vec<TensorIr>,
     pub scalars: Vec<(ScalarRef, Expect)>,
     /// Positions of the `Drop`s inside the match, run after the result is registered.
     pub drops: Vec<usize>,
@@ -229,8 +276,10 @@ struct Progress {
     chain: Option<TensorIr>,
     /// Each input as last read.
     inputs: Vec<TensorIr>,
-    /// The tensors the chain made, and whether each has died inside it.
+    /// The tensors the chain made, a step each, and whether each has died inside it.
     made: Vec<(TensorId, bool)>,
+    /// The same tensors as made.
+    outs: Vec<TensorIr>,
     scalars: Vec<(ScalarRef, Expect)>,
     drops: Vec<usize>,
     /// Operations taken before the chain's first step ([`MAX_LEAD`]).
@@ -361,9 +410,24 @@ impl ChainFuser {
                 }
                 out
             }
+            (Step::ScaledNorm(x, gamma), OperationIr::Custom(desc))
+                if desc.id.starts_with(FUSED_ID)
+                    && desc.inputs.len() == 2
+                    && desc.outputs.len() == 1 =>
+            {
+                let Some(eps) = fused_eps(&desc.id) else {
+                    return false;
+                };
+                if !p.read(x, &desc.inputs[0]) || !p.read(gamma, &desc.inputs[1]) {
+                    return false;
+                }
+                p.scalars.push((ScalarRef::Value(eps as f64), Expect::Bind));
+                &desc.outputs[0]
+            }
             _ => return false,
         };
         p.made.push((out.id, false));
+        p.outs.push(out.clone());
         p.chain = Some(out.clone());
         p.steps += 1;
         p.ops += 1;
@@ -378,13 +442,19 @@ impl ChainFuser {
             return;
         };
         let Some(out) = &p.chain else { return };
-        if p.made.iter().any(|(id, dead)| *id != out.id && !dead) {
+        let keep = self.pattern.keep;
+        if p.made
+            .iter()
+            .enumerate()
+            .any(|(k, (id, dead))| *id != out.id && !dead && !keep.contains(&k))
+        {
             return;
         }
         self.best = Some(ChainMatch {
             kind,
             inputs: p.inputs.clone(),
             out: out.clone(),
+            kept: keep.iter().map(|&k| p.outs[k].clone()).collect(),
             scalars: p.scalars.clone(),
             drops: p.drops.clone(),
             lead: p.lead,
