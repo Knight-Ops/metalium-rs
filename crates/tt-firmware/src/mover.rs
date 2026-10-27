@@ -133,6 +133,7 @@ fn pump_reads(c: &mut record::PrefetchCursor, most: u32, all: bool) -> bool {
         let e = match c.next() {
             None => {
                 *pump_slot() = None;
+                read_mark(in_window());
                 return issued_any;
             }
             Some(Ok(e)) => e,
@@ -767,6 +768,64 @@ fn trace(on: bool, event: u32, detail: u32) {
     }
 }
 
+/// What [`noc::read_bytes`] had counted at RISCV B's last `READ_BYTES` mark ([`read_mark`]),
+/// less what did not fit the mark's detail. In local data RAM, set before the first list.
+#[link_section = ".local"]
+static mut READ_MARKED: u32 = 0;
+
+/// RISCV B's `READ_BYTES` mark (`tt_isa::mailbox::trace::READ_BYTES`): the GDDR bytes it issued
+/// since its last mark, stamped when `stamp`. Taken whenever a list is traced, stamped or not, so a
+/// stamped mark counts from the mark before it, which the host times by that mark's stamp or, if it
+/// was not stamped, leaves out. Nothing on NC; compiled out in an image without stamps.
+#[inline(always)]
+fn read_mark(stamp: bool) {
+    if STAMPS && !IS_NC {
+        read_mark_now(stamp);
+    }
+}
+
+/// [`read_mark`]'s work: cold, so the code it adds stays out of the paths a read runs (marks in
+/// the list loop cost tile-sized plain reads ~4%, `gddr_readers_by_channel`).
+#[cold]
+#[inline(never)]
+fn read_mark_now(stamp: bool) {
+    use tt_isa::mailbox::trace as ev;
+    if trace_mode() != 0 {
+        // SAFETY: as `pump_slot`.
+        let marked = unsafe { READ_MARKED };
+        let units = (noc::read_bytes().wrapping_sub(marked) >> ev::READ_UNIT_SHIFT).min(ev::DETAIL_MAX);
+        // SAFETY: as above.
+        unsafe { READ_MARKED = marked.wrapping_add(units << ev::READ_UNIT_SHIFT) };
+        trace(stamp, ev::READ_BYTES, units);
+    }
+}
+
+/// A `BARRIER` entry's `READ_BYTES` mark, at its arrival and at its release ([`read_mark`]),
+/// stamped when the barrier meets the window. Here rather than in the list loop, which every entry
+/// runs: a check there cost tile-sized plain reads ~4% (`gddr_readers_by_channel`).
+#[cold]
+#[inline(never)]
+fn barrier_mark(head: [u32; 8]) {
+    if STAMPS && trace_mode() != 0 {
+        read_mark(barrier_meets_window(head));
+    }
+}
+
+/// Whether a `BARRIER` entry `head` (a wait-only one standing for several of the trace's
+/// barriers, `dm::BARRIER_STANDS_FOR`) meets the stamped window: its `READ_BYTES` marks are
+/// stamped then, so a unit that waits across the window's start still times what its prefetch
+/// issued while it waited.
+fn barrier_meets_window(head: [u32; 8]) -> bool {
+    let (lo, hi) = unsafe { TRACE_WINDOW };
+    let b = unsafe { TRACE_BARRIERS };
+    let n = if head[4] == 1 {
+        head[dm::BARRIER_STANDS_FOR]
+    } else {
+        1
+    };
+    hi == 0 || (b < hi && b.wrapping_add(n) > lo)
+}
+
 /// `dm::op::BARRIER`: one NoC atomic increment of the coordinator's counter
 /// (unless `arrive` is false, the wait-only form), then a wait until it reaches
 /// `target`. Polling (`release` false): NoC reads of the counter. Released: the
@@ -1181,10 +1240,12 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             release,
         } => {
             reader_only()?;
+            barrier_mark(w);
             // Everything this unit moved before it has landed.
             noc::wait(TXN);
             publish();
             barrier(me, target, x, y, arrive, release)?;
+            barrier_mark(w);
         }
         Entry::Poke { address, value } => {
             reader_only()?;
@@ -1619,6 +1680,9 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
         }
     }
     trace(outer, ev::LIST_BEGIN, count);
+    if outer {
+        read_mark(true);
+    }
     let result = (|| {
         let at = |i: u64| entry_at(base + i * dm::ENTRY_BYTES);
         let mut i = 0u64;
@@ -1752,6 +1816,7 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
             // `B` alone: queued for the waits ahead, one prefetch at a time.
             if let Some(c) = record::PrefetchCursor::new(&rec[..n])? {
                 pump_finish()?;
+                read_mark(in_window());
                 *pump_slot() = Some(c);
                 // SAFETY: as `pump_slot`.
                 unsafe { PUMP_AT = (me, usable) };
@@ -2124,7 +2189,10 @@ pub extern "Rust" fn firmware_main() -> ! {
     set_read_txn(TXN);
     *pump_slot() = None;
     // SAFETY: as `pump_slot`.
-    unsafe { PUMP_ERROR = 0 };
+    unsafe {
+        PUMP_ERROR = 0;
+        READ_MARKED = noc::read_bytes();
+    }
     let mut stalls = noc::stalls();
     loop {
         beat = beat.wrapping_add(1);

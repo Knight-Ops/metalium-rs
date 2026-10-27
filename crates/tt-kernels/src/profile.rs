@@ -63,6 +63,8 @@ pub enum Event {
     /// After a kernel's `ROLES_DONE`: the math role's totals for it, `amount`
     /// a multiple of 64.
     RolePush { what: RoleTotal, amount: u64 },
+    /// RISCV B's GDDR read bytes issued since its last such mark (`tt_isa::mailbox::trace::READ_BYTES`).
+    ReadBytes { bytes: u64 },
     /// Anything else: a token no firmware of this build writes.
     Unknown(u32),
 }
@@ -111,6 +113,9 @@ impl Event {
                     _ => RoleTotal::Words,
                 },
                 amount: (detail as u64) << ev::PUSH_UNIT_SHIFT,
+            },
+            (ev::MOVER, ev::READ_BYTES) => Event::ReadBytes {
+                bytes: (detail as u64) << ev::READ_UNIT_SHIFT,
             },
             (ev::MOVER, ev::KICK | ev::ROLES_DONE) => Event::Kick {
                 done: event == ev::ROLES_DONE,
@@ -302,7 +307,7 @@ impl UnitProfile {
                     end: e.cycles,
                 }),
                 // Totals, not moments: the profile mode attributes them.
-                Event::RolePush { .. } => {}
+                Event::RolePush { .. } | Event::ReadBytes { .. } => {}
                 Event::Role {
                     thread,
                     what: RoleEvent::Woke,

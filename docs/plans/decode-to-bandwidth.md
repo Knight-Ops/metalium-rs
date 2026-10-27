@@ -1125,6 +1125,43 @@ half-size tiles (A5).
     12.64 ms**, 135M **6.92 / 7.47 / 8.14**
     ([log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0)).
 
+### Phase 10. The weight stream's rate inside the products: F27, bank-local reads (2026-10-27, stopped)
+
+Inside their own spans a 1.7B BF16 step's products read ~230-300 GB/s (`gate|up` 293, `down` 233), against 511 for one
+tile beside each channel (tt-metal's adjacent gate, mirrored). F27 of
+[tt-metal-comparison.md](../learnings/tt-metal-comparison.md) asked whether reading each channel from the tiles beside it
+would close that. Measured first, with the decision rules set before each run
+([log](../learnings/performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)).
+
+- [x] **A0, the meter:** each op's reads by channel and NoC #0 endpoint (`OpBytes::endpoint`, `channels.tsv`, a table in
+  `summary.md`). Profile `1793130462`: the products read every channel evenly (busiest 1.00 of an even share); one endpoint
+  a channel takes 1.33-1.35x (the rotation maps NoC #1's port to CMFW's). Channel imbalance is not the gap.
+- [x] **A1, the adjacent gate at 1-8 readers a channel and decode's entry size** (`gddr_readers_by_channel`, `1793131300`
+  safe, `1793131553` `fast-reads`): at 2,112-byte entries a tile reads ~6.5 GB/s (safe) or ~20-35 (fast) whichever
+  channel; 8 readers a channel 425 / 466 GB/s, today's deal on 64 units 424 / 466 (96 units 449 / 491); 16 KiB entries
+  at 2+ readers a channel 509-511. **Rule:** A2 needed 8 a channel >= 465 *and* the deal <= 430: **fails** in both images.
+- [ ] ~~**A2, a channel deal**~~: not built (A1).
+- [ ] ~~**A3, column-contiguous channel shards** (long entries)~~: not built. Its precondition, that a unit's read rate
+  binds a product, was checked with the `fast-reads` image (reads ~5x cheaper, profile `1793131649`): `down` 120.8 ->
+  114.9 us, `gate|up` 125.4 -> 120.1, the step 10.82 -> 10.60 ms. A `down` unit moves its span's bytes at ~5.6 GB/s
+  against the 20-35 it reads at alone.
+
+**What it leaves:** neither a unit's reads (above) nor compute alone (6.26 ms a step with the weights free) binds a
+product's span; the two together under the card's whole traffic do: each unit's reads and its `m = 1` kernel through a
+one-block slot ring, beside the prefetching units.
+
+- [x] **A4, the card's GDDR reads over a step** (the profile mode: B's `READ_BYTES` marks summed over every unit into each
+  op's span in eighths; `summary.md`, `ops.tsv`'s `card_read_*`, a `trace.json` counter; held against the card's 512 GB/s
+  peak, which our movers reach, not 469;
+  [log](../learnings/performance-log.md#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0)). Profile `1793141447`,
+  `Step(64)`: 3,568 MB at **328 GB/s** (64% of 512; 6.97 ms at the peak), at 90%+ for 1.9 of 10.9 ms. The marks cost
+  tile-sized plain reads ~1% in a `profile` image and the decode step nothing. Every product reads near the card's rate
+  at its start and ends in a tail (`gate|up` 634 -> 89 GB/s by eighths, `down` 617 -> 68, `qkv`/`o` almost nothing in
+  their last three eighths); `down`'s middle half reads ~300 (64 units); the small ops' 3.3 ms read 319.
+- [ ] **Next: split the tail by unit** (which units read at each eighth: the product's own, or the prefetch), then choose a
+  lever: more units reading `down`, the next prefetch starting where a product's units drop out, or faster reads under
+  the small ops. An order-changing one (split-K for `down`'s 64 columns) stays the user's decision.
+
 ## The larger changes compared (2026-10-18)
 
 Four larger changes were left after Phases 1-4's bit-for-bit items. Each was checked against profile `1792298755`

@@ -572,6 +572,19 @@ enum Mix {
     /// channel's first byte, through the endpoint tt-metal gives NoC #0
     /// ([`ADJ_PORT`]).
     Adjacent,
+    /// Reads, `r` tiles a channel ([`banked_tiles`]: the tiles moved to the front channel by
+    /// channel), tile `t` reading only channel `t / r` (its own share of it) through the NoC #0
+    /// endpoint of that channel nearest above it ([`nearest_port`]): F27's bank-local reads at
+    /// more than one reader a channel (`docs/plans/decode-to-bandwidth.md` Phase 10, A1).
+    Banked(u8),
+    /// Today's decode product's weight reads (an `m = 1`, `K`-whole job a unit): tile `t` reads
+    /// `nc` consecutive columns of a weight `n * nc` tiles wide and `entries / nc` tall,
+    /// interleaved over the eight channels as `tt_kernels` places it (tile `kk * ct + j` on
+    /// channel `% 8`, slot `/ 8`), `K` tile by `K` tile, one slot an entry, the port rotating
+    /// `(kk + j) % 3` as `record::GATHER`'s does.
+    Decode {
+        nc: u8,
+    },
 }
 
 /// The subchannel (our port) tt-metal's `dram_views` give NoC #0 on each
@@ -681,6 +694,44 @@ fn adjacent_tiles(f: &Fleet) -> Vec<usize> {
     picked
 }
 
+/// The NoC #0 endpoint (port) of channel `ch` nearest above tile `t`: the shortest Y leg, as
+/// [`nearest`] chooses.
+fn nearest_port(f: &Fleet, t: usize, ch: u8) -> u8 {
+    let c = f.dram.channel(ch).unwrap();
+    let gap = |row: u8| (f.raw[t].1 as i32 - row as i32).rem_euclid(12);
+    (0..tt_isa::dram::PORTS)
+        .filter(|&p| c.owns(Niu::Noc0, p))
+        .min_by_key(|&p| gap(DRAM_RAW_Y[(ch % 4) as usize][p as usize]))
+        .unwrap()
+}
+
+/// [`Mix::Banked`]'s readers, `r` a channel, channel by channel: of the tiles [`nearest`] deals
+/// to each channel, the `r` nearest it, by the Y leg to their endpoint and then the X leg from
+/// the DRAM column.
+fn banked_tiles(f: &Fleet, r: usize) -> Vec<usize> {
+    let near = nearest(f, f.movers.len());
+    let mut out = Vec::new();
+    for c in 0..8u8 {
+        let dram_x = if c < 4 { 0 } else { DRAM_MID_X };
+        let mut group: Vec<usize> = (0..near.len()).filter(|&t| near[t].0 == c).collect();
+        group.sort_by_key(|&t| {
+            let row = DRAM_RAW_Y[(c % 4) as usize][near[t].1 as usize];
+            (
+                (f.raw[t].1 as i32 - row as i32).rem_euclid(12),
+                f.raw[t].0.abs_diff(dram_x),
+                t,
+            )
+        });
+        assert!(
+            group.len() >= r,
+            "channel {c}: {} tiles near it, {r} asked",
+            group.len()
+        );
+        out.extend(&group[..r]);
+    }
+    out
+}
+
 /// `first` (indices into the fleet's movers) moved to the front, in that
 /// order, with the per-mover tables following, so that `agg_run`'s first `n`
 /// movers are the ones a placement chose.
@@ -751,6 +802,40 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
         Mix::Column | Mix::Nearest | Mix::NearestBothPorts | Mix::Adjacent
     ) {
         assert_eq!(nc, 8, "the placements assume all eight channels");
+    }
+    match mix {
+        Mix::Banked(r) => {
+            let (ch, k) = ((tile / r as usize) as u8, (tile % r as usize) as u64);
+            let port = nearest_port(fleet, tile, ch) as u32;
+            for i in 0..entries {
+                let off = BASE + k * (entries * len) as u64 + (i * len) as u64;
+                list.push(entry(op::READ, ch, port, off, ring_slot(i, len), len));
+            }
+            return list;
+        }
+        Mix::Decode { nc } => {
+            let nc = nc as u32;
+            let (kt, ct) = (entries / nc, n as u32 * nc);
+            let mut i = 0;
+            for kk in 0..kt {
+                for j in tile as u32 * nc..(tile as u32 + 1) * nc {
+                    let t = (kk * ct + j) as u64;
+                    let off = BASE + (t / 8) * len as u64;
+                    let port = (kk + j) % 3;
+                    list.push(entry(
+                        op::READ,
+                        (t % 8) as u8,
+                        port,
+                        off,
+                        ring_slot(i, len),
+                        len,
+                    ));
+                    i += 1;
+                }
+            }
+            return list;
+        }
+        _ => {}
     }
     for i in 0..entries {
         let (c, k) = match mix {
@@ -1449,6 +1534,112 @@ fn gddr_adjacent_banks() {
                 failed.is_empty(),
                 "under {GATE_LOWER} GB/s at best: {failed:?}"
             );
+        }
+    });
+}
+
+/// F27's first question (`docs/plans/decode-to-bandwidth.md` Phase 10, A1): does a channel still
+/// give its ~64 GB/s when 2, 4 or 8 tiles beside it share it, and at decode's one-tile entries,
+/// and what does today's decode deal ([`Mix::Decode`]) read at on the same card.
+///
+/// - **Decode** first (the fleet in the grid's order, as a session deals units): `DECODE_UNITS`
+///   (default `64,96`) units, `DECODE_NC` columns a unit (default 2, `gate|up`'s), one BF16 tile
+///   slot (2,112 B) an entry.
+/// - **Banked**: `BANK_READERS` (default `1,2,4,8`) tiles a channel ([`banked_tiles`]), each
+///   streaming its own share of its channel through its nearest NoC #0 endpoint, at
+///   `BANK_LENS` (default `2112,16384,131072`) bytes an entry.
+///
+/// Each at the in-flight caps `BANK_CAPS` (default `3,8`: a BF16 weight stream's and the mover's).
+/// The metric is the adjacent gate's: every byte over the first start to the last end. A rate past
+/// the card's ceiling fails (a list that ended before its data landed).
+///
+/// Decision rule (set before running): A2 if 8 readers a channel reach 465 GB/s at 2,112-byte
+/// entries and the decode deal is at most 430; A3 first if only long entries reach 465.
+#[test]
+#[ignore = "benchmark"]
+fn gddr_readers_by_channel() {
+    on_card(|d| {
+        let mut f = fleet(d);
+        let card = f.c.gddr_card();
+        let ceiling = card.as_ref().map_or(GATE_UPPER * 1e9, |p| p.bytes_per_sec);
+        let list = |var: &str, default: &str| -> Vec<u32> {
+            std::env::var(var)
+                .unwrap_or_else(|_| default.into())
+                .split(',')
+                .map(|v| v.trim().parse().unwrap())
+                .collect()
+        };
+        let caps = list("BANK_CAPS", "3,8");
+        let entries_for = |len: u32| ((8u32 << 20) / len).clamp(1, dm::LIST_MAX - 2);
+        let run = |d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape, what: &str| {
+            for &cap in &caps {
+                for m in &f.movers[..n] {
+                    m.set_in_flight_cap(d, &f.w, cap).unwrap();
+                }
+                let label = format!("gddr {what} cap {cap}");
+                let runs = measure(d, f, n, mix, shape, card.as_ref(), &label);
+                let gbs = Stats::of(runs.iter().map(|r| r.together / 1e9)).median;
+                assert!(
+                    gbs * 1e9 <= ceiling * 1.02,
+                    "{label}: {gbs:.1} GB/s is over the card's {:.1}",
+                    ceiling / 1e9
+                );
+                println!("MEASURE by channel: {label}: {gbs:.1} GB/s");
+            }
+        };
+        let nc = list("DECODE_NC", "2")[0];
+        for units in list("DECODE_UNITS", "64,96") {
+            let units = units as usize;
+            assert!(
+                units <= f.movers.len(),
+                "{units} units, {} tiles",
+                f.movers.len()
+            );
+            let len = tt_isa::dm::BF16_TILE_SLOT as u32;
+            let shape = Shape {
+                entries: (dm::LIST_MAX - 2) / nc * nc,
+                len,
+            };
+            let mix = Mix::Decode { nc: nc as u8 };
+            run(
+                d,
+                &mut f,
+                units,
+                mix,
+                shape,
+                &format!("decode {units} units {nc} columns {len} B"),
+            );
+        }
+        for r in list("BANK_READERS", "1,2,4,8") {
+            let tiles = banked_tiles(&f, r as usize);
+            move_to_front(&mut f, &tiles);
+            for c in 0..8usize {
+                let at: Vec<String> = (0..r as usize)
+                    .map(|k| {
+                        let t = c * r as usize + k;
+                        format!("{:?} port {}", f.raw[t], nearest_port(&f, t, c as u8))
+                    })
+                    .collect();
+                println!(
+                    "MEASURE by channel: {r} a channel: channel {c} read by {}",
+                    at.join(", ")
+                );
+            }
+            for len in list("BANK_LENS", "2112,16384,131072") {
+                let shape = Shape {
+                    entries: entries_for(len),
+                    len,
+                };
+                let what = format!("banked {r} a channel {len} B");
+                run(
+                    d,
+                    &mut f,
+                    8 * r as usize,
+                    Mix::Banked(r as u8),
+                    shape,
+                    &what,
+                );
+            }
         }
     });
 }

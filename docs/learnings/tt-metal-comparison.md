@@ -695,6 +695,13 @@ links this section. Priorities are our judgement. Sections 4.x have the evidence
   columns to units would follow the channel, not the column); (3) whether `gate|up`/`down`'s units can take the
   activations multicast it needs and what the L1 and the prefetch ring cost. The decode floor at BF16 is about 7.3
   ms of weights at 469 GB/s; at 511 it is 6.7 ms. A hypothesis, not a measurement of a decode step.
+  **Probed 2026-10-27 and stopped** (card 0, [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)):
+  (1) at decode's 2,112-byte entries a tile reads ~6.5 GB/s (safe) or ~20-35 (`fast-reads`) whatever channel it reads, so 8
+  readers beside each channel give 425 / 466 GB/s, the same as today's interleaved deal on as many units (424 / 466; 96
+  units 449 / 491); with 16 KiB or longer entries 2-4 readers a channel give 509-511. The decode products already read every
+  channel evenly (`channels.tsv`). (2) With reads 5x cheaper (`fast-reads`) the products' spans move 4% (`down` 120.8 ->
+  114.9 us, the step 10.82 -> 10.60 ms): a unit's read rate does not bind them, so neither a bank-local deal nor a
+  long-entry layout pays for decode. Not built.
 
 ## 7. Caveats
 

@@ -21,6 +21,15 @@
 //! reads, and data movement. In the
 //! default [`Detail::Ops`] the data entries are not stamped (they keep the mover's untraced fast
 //! paths); their time is the span less the rest.
+//!
+//! **The card's GDDR reads over a replay** ([`unit_reads`], [`card_reads`]): every unit's B marks
+//! the GDDR bytes it has issued (`tt_isa::mailbox::trace::READ_BYTES`) at each barrier's arrival and
+//! release, and when a queued prefetch starts and when it has issued its last read. Between two
+//! marks a unit's bytes are spread evenly; each unit's clock is put on unit 0's by the barrier
+//! releases they share; the sum over units is the card's read rate in each op's span on unit 0,
+//! in [`READ_BINS`] parts of it. Counted at issue, not landing, so a read is charged up to its
+//! latency early (an op's first part can read above the card's rate); what B fetches of the
+//! trace's own stream is counted too, and reads of other tiles' L1 are not.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -30,6 +39,13 @@ use tt_isa::dm::op;
 use tt_isa::mailbox::trace as ev;
 
 use crate::profile::{Event, RoleTotal};
+
+/// The `READ_BYTES` marks a prefetch `GATHER` (`tt_isa::dm::record::GATHER_PREFETCH`) stamps: when
+/// it is queued and when its last read is issued, which may be under a later op.
+pub const PREFETCH_MARKS: u32 = 2;
+
+/// Parts of an op's span the card's read rate is told in ([`TraceSamples::reads`]).
+pub const READ_BINS: usize = 8;
 
 /// How much of an op the movers stamp.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,13 +97,17 @@ impl ProfileOptions {
     /// Events an entry headed by `op` may stamp, at most: its begin and end, the one event a
     /// launch (`KICK`) or a kernels' wait (`ROLES_DONE`) adds inside it, and after a wait the math
     /// role's two totals ([`ProfileOptions::push`]).
+    /// A `BARRIER` adds its two `READ_BYTES` marks (as does a prefetch `GATHER`, which the
+    /// caller counts: [`PREFETCH_MARKS`]).
     pub fn stamps(&self, op: u32) -> u32 {
         let waits = matches!(op, op::KERNEL | op::KERNEL_WAIT);
-        match self.detail {
-            Detail::Ops if !tt_isa::dm::trace_mode::ops_stamped(op) => 0,
-            _ if waits && self.push => 6,
-            _ => 3,
-        }
+        let marks = if op == op::BARRIER { 2 } else { 0 };
+        marks
+            + match self.detail {
+                Detail::Ops if !tt_isa::dm::trace_mode::ops_stamped(op) => 0,
+                _ if waits && self.push => 6,
+                _ => 3,
+            }
     }
 }
 
@@ -133,9 +153,11 @@ pub struct OpTime {
 /// a push that waited on a full FIFO takes far more.
 pub const PUSH_BOUND_CYCLES_A_WORD: f64 = 4.0;
 
-/// The card's measured GDDR read rate, 120 tiles (performance scoreboard, "GDDR6 reads, card,
-/// 120 tiles"): what a step's bytes are held against.
-pub const CARD_READ_GBPS: f64 = 469.0;
+/// The card's GDDR6 read rate, what a step's bytes are held against: its peak, 512 GB/s, which
+/// reads reach on our movers (511.2 with one reader beside each channel and long entries,
+/// performance scoreboard, tt-metal's adjacent gate). Not the 469 of every tile reading its own
+/// share (the scoreboard's "120 tiles" row): that is a limit of how we read, not of the card.
+pub const CARD_READ_GBPS: f64 = 512.0;
 
 /// What one captured op moves through GDDR, summed over its units: counted from its entries when
 /// the trace is stored, with records expanded as the movers expand them. Bytes are requested
@@ -158,7 +180,17 @@ pub struct OpBytes {
     /// `PREFETCH` list, a busy unit's `BUSY_PREFETCH` (`trace::OpRecord::ahead`). Not moved in
     /// the op's own span.
     pub ahead: u64,
+    /// Of `read`, the bytes by GDDR channel and the NoC #0 endpoint (port) the read goes to, as
+    /// the mover maps its rotation (`DramChannel::port_for`): where an op's reads land
+    /// (`decode-to-bandwidth.md` Phase 10, A0). A host-encoded read is not placed.
+    pub endpoint: [[u64; PORTS]; CHANNELS],
+    /// Of `endpoint`, what lists read ahead of the op (as `ahead` is of `read`).
+    pub ahead_endpoint: [[u64; PORTS]; CHANNELS],
 }
+
+/// GDDR channels and the endpoints (ports) a channel has.
+const CHANNELS: usize = tt_isa::dram::CHANNELS as usize;
+const PORTS: usize = tt_isa::dram::PORTS as usize;
 
 impl OpBytes {
     pub fn add(&mut self, o: &OpBytes) {
@@ -169,6 +201,23 @@ impl OpBytes {
         self.a += o.a;
         self.b += o.b;
         self.ahead += o.ahead;
+        for c in 0..CHANNELS {
+            for p in 0..PORTS {
+                self.endpoint[c][p] += o.endpoint[c][p];
+                self.ahead_endpoint[c][p] += o.ahead_endpoint[c][p];
+            }
+        }
+    }
+
+    /// Of `endpoint`, what was read in the op's own span: less what was read ahead.
+    pub fn span_endpoint(&self) -> [[u64; PORTS]; CHANNELS] {
+        let mut out = self.endpoint;
+        for (o, a) in out.iter_mut().zip(&self.ahead_endpoint) {
+            for (o, a) in o.iter_mut().zip(a) {
+                *o -= a;
+            }
+        }
+        out
     }
 
     /// Count `entries` (a list, a stream or a section; `PAIR` headers, credits and control entries
@@ -223,6 +272,12 @@ impl OpBytes {
             op::READ | op::READ_TRANSPOSED | op::READ_BROADCAST_COL => {
                 self.read += e[5] as u64;
                 self.reads += 1;
+                let all = tt_isa::dram::Dram::from_usable_mask(u8::MAX);
+                if let Some(ch) = u8::try_from(e[1]).ok().and_then(|c| all.channel(c)) {
+                    let port =
+                        ch.port_for(tt_isa::noc::niu::Niu::Noc0, (e[2] % PORTS as u32) as u8);
+                    self.endpoint[ch.index() as usize][port as usize] += e[5] as u64;
+                }
                 e[5] as u64
             }
             op::READ_ENCODED => {
@@ -504,6 +559,145 @@ pub fn unit_times(
     pairs.next().is_none().then_some(out)
 }
 
+/// One unit's GDDR reads in a replay ([`unit_reads`]), on its own clock.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnitReads {
+    /// `(from, to, bytes)`: what B issued between two of its `READ_BYTES` marks. The first mark
+    /// of the replay counts from one before it that was not stamped, and is left out.
+    pub spans: Vec<(u64, u64, u64)>,
+    /// Its barriers' releases: `(the trace's barrier it waited for, when)`. An arrival waits for
+    /// its own; a wait standing for `n` waits for the last of them.
+    pub releases: Vec<(u32, u64)>,
+    /// When the replay began (its outermost list), for its first op.
+    pub begin: u64,
+}
+
+/// One replay's stamps on a unit whose barriers are `seq`, stamped within the window `lo..hi` (as
+/// [`unit_times`]): its `READ_BYTES` marks as spans of time and its barrier releases. `None` if the
+/// stamps and `seq` do not line up.
+pub fn unit_reads(
+    events: &[TraceEvent],
+    seq: &[UnitBarrier],
+    lo: u32,
+    hi: u32,
+) -> Option<UnitReads> {
+    let stamps: Vec<(Event, u64)> = events.iter().filter_map(mover).collect();
+    let Some(start) = stamps
+        .iter()
+        .rposition(|(e, _)| matches!(e, Event::List { begin: true, .. }))
+    else {
+        return Some(UnitReads::default());
+    };
+    let mut out = UnitReads {
+        begin: stamps[start].1,
+        ..Default::default()
+    };
+    let mut last_mark = None;
+    let mut ends = Vec::new();
+    for &(event, t) in &stamps[start..] {
+        match event {
+            Event::ReadBytes { bytes } => {
+                if let Some(from) = last_mark {
+                    out.spans.push((from, t, bytes));
+                }
+                last_mark = Some(t);
+            }
+            Event::Entry {
+                begin: false,
+                op: op::BARRIER,
+            } => ends.push(t),
+            _ => {}
+        }
+    }
+    let mut ends = ends.into_iter();
+    let mut count = 0u32;
+    for b in seq {
+        if hi == 0 || (lo <= count && count < hi) {
+            out.releases.push((count + b.counts - 1, ends.next()?));
+        }
+        count += b.counts;
+    }
+    ends.next().is_none().then_some(out)
+}
+
+/// The card's GDDR reads in one replay: each unit's [`UnitReads`] (by unit, `None` where unknown)
+/// put on unit 0's clock and summed into [`READ_BINS`] parts of each op's span there. Unit 0's
+/// barriers are `seq0`; the ops are [`attribute_replay`]'s, from `first` (op 0 with `lo == 0`,
+/// timed from the replay's start). A unit's clock is unit 0's plus the median of its releases'
+/// offsets from unit 0's of the same barrier (a release reaches the tiles within a multicast's
+/// flight).
+pub fn card_reads(
+    units: &[Option<UnitReads>],
+    seq0: &[UnitBarrier],
+    first: usize,
+    lo: u32,
+) -> Vec<(usize, [u64; READ_BINS])> {
+    let Some(Some(u0)) = units.first() else {
+        return Vec::new();
+    };
+    // Unit 0's release of each barrier it waited for, and each op's end there.
+    let release0: BTreeMap<u32, u64> = u0.releases.iter().copied().collect();
+    let mut ends: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut count = 0u32;
+    for b in seq0 {
+        if let (Some(k), Some(&t)) = (b.arrival_of, release0.get(&(count + b.counts - 1))) {
+            ends.insert(k as usize, t);
+        }
+        count += b.counts;
+    }
+    // Each op's span on unit 0: from the op before's end (the replay's start for op 0).
+    let mut spans: Vec<(usize, i64, i64)> = Vec::new();
+    for (&k, &end) in &ends {
+        if k < first {
+            continue;
+        }
+        let begin = match k.checked_sub(1) {
+            Some(prev) => ends.get(&prev).copied(),
+            None if lo == 0 => Some(u0.begin),
+            None => None,
+        };
+        if let Some(begin) = begin.filter(|&b| b <= end) {
+            spans.push((k, begin as i64, end as i64));
+        }
+    }
+    let mut out: Vec<(usize, [u64; READ_BINS])> =
+        spans.iter().map(|&(k, ..)| (k, [0; READ_BINS])).collect();
+    for u in units.iter().flatten() {
+        let mut offsets: Vec<i64> = u
+            .releases
+            .iter()
+            .filter_map(|&(n, t)| release0.get(&n).map(|&t0| t as i64 - t0 as i64))
+            .collect();
+        if offsets.is_empty() {
+            continue;
+        }
+        offsets.sort_unstable();
+        let offset = offsets[offsets.len() / 2];
+        for &(from, to, bytes) in &u.spans {
+            let (a, b) = ((from as i64 - offset) as f64, (to as i64 - offset) as f64);
+            for (&(_, begin, end), (_, bins)) in spans.iter().zip(out.iter_mut()) {
+                if b < begin as f64 || a > end as f64 {
+                    continue;
+                }
+                let width = (end - begin).max(1) as f64 / READ_BINS as f64;
+                for (i, bin) in bins.iter_mut().enumerate() {
+                    let lo = begin as f64 + i as f64 * width;
+                    let hi = lo + width;
+                    let share = if b > a {
+                        (hi.min(b) - lo.max(a)).max(0.0) / (b - a)
+                    } else if (lo..hi).contains(&b) {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    *bin += (bytes as f64 * share).round() as u64;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One eager op's profile.
 #[derive(Clone, Debug)]
 pub struct EagerSample {
@@ -592,6 +786,9 @@ pub struct TraceSamples {
     /// [`Detail::Full`]: per op, unit 0's entries by kind ([`attribute_entries`]), summed over the
     /// replays that stamped it (`samples[k].len()` of them).
     pub entries: Vec<EntryCosts>,
+    /// Per op, once per replay that stamped it, the GDDR bytes every unit's B issued in each of
+    /// [`READ_BINS`] equal parts of the op's span on unit 0 ([`card_reads`]).
+    pub reads: Vec<Vec<[u64; READ_BINS]>>,
     /// Per unit, its barriers in stream order (empty where unknown).
     unit_barriers: Vec<Vec<UnitBarrier>>,
     pub replays: u32,
@@ -666,6 +863,7 @@ impl Profiler {
             TraceSamples {
                 samples: vec![Vec::new(); ops.len()],
                 units: vec![Vec::new(); ops.len()],
+                reads: vec![Vec::new(); ops.len()],
                 entries: vec![EntryCosts::new(); ops.len()],
                 ops,
                 stamps,
@@ -782,6 +980,21 @@ impl Profiler {
                                     s.cycles += c.cycles;
                                     s.gap += c.gap;
                                 }
+                            }
+                        }
+                    }
+                    let marks: Vec<Option<UnitReads>> = units
+                        .iter()
+                        .enumerate()
+                        .map(|(u, events)| {
+                            let seq = t.unit_barriers.get(u).filter(|s| !s.is_empty())?;
+                            unit_reads(events, seq, lo, hi)
+                        })
+                        .collect();
+                    if let Some(seq0) = t.unit_barriers.first() {
+                        for (k, bins) in card_reads(&marks, seq0, first, lo) {
+                            if let Some(s) = t.reads.get_mut(k) {
+                                s.push(bins);
                             }
                         }
                     }
@@ -906,6 +1119,19 @@ impl TraceSamples {
                         }
                     })
                     .collect()
+            })
+            .collect()
+    }
+
+    /// Per op, the card's reads in its span ([`TraceSamples::reads`]) from the replay with the
+    /// median total, or `None` for an op none measured.
+    pub fn read_medians(&self) -> Vec<Option<[u64; READ_BINS]>> {
+        self.reads
+            .iter()
+            .map(|s| {
+                let mut s = s.clone();
+                s.sort_by_key(|b| b.iter().sum::<u64>());
+                s.get(s.len() / 2).copied()
             })
             .collect()
     }
@@ -1101,6 +1327,50 @@ impl ProfileReport {
                 self.us(s.span) - floor(moved),
             );
         }
+        // Where the products' reads land: by label, their in-span reads by channel and NoC #0
+        // endpoint, each against an even share (1.00: every channel, or each of the 16 endpoints
+        // NoC #0 owns, read alike).
+        let mut by_label: BTreeMap<&str, (u64, OpBytes)> = BTreeMap::new();
+        for (o, m) in covered.iter().filter(|(o, _)| o.bytes.b > 0) {
+            let e = by_label.entry(o.label).or_default();
+            e.0 += m.span;
+            e.1.add(&o.bytes);
+        }
+        if !by_label.is_empty() {
+            let _ = writeln!(
+                out,
+                "\nWhere the products read in their spans (by channel and NoC #0 endpoint;                  busiest against an even share, 1.00 even):\n\n                 | label | us | span MB | busiest channel | its share | busiest endpoint | its share |\n\
+                 |---|--:|--:|--:|--:|--:|--:|"
+            );
+            for (label, (span, b)) in &by_label {
+                let e = b.span_endpoint();
+                let total: u64 = e.iter().flatten().sum();
+                if total == 0 {
+                    continue;
+                }
+                let (ch, ch_bytes) = e
+                    .iter()
+                    .enumerate()
+                    .map(|(c, p)| (c, p.iter().sum::<u64>()))
+                    .max_by_key(|&(c, b)| (b, std::cmp::Reverse(c)))
+                    .unwrap_or_default();
+                let ((ec, ep), ep_bytes) = e
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(c, p)| p.iter().enumerate().map(move |(q, &b)| ((c, q), b)))
+                    .max_by_key(|&(at, b)| (b, std::cmp::Reverse(at)))
+                    .unwrap_or_default();
+                let endpoints = (CHANNELS * (PORTS - 1)) as f64;
+                let _ = writeln!(
+                    out,
+                    "| {label} | {:.1} | {:.1} | {ch} | {:.2} | {ec}.{ep} | {:.2} |",
+                    self.us(*span),
+                    mb(total),
+                    ch_bytes as f64 * CHANNELS as f64 / total as f64,
+                    ep_bytes as f64 * endpoints / total as f64,
+                );
+            }
+        }
     }
 
     /// A trace's units against each other, by label: per op, each unit's median work (from its
@@ -1180,6 +1450,97 @@ impl ProfileReport {
                 gbps(s.slowest_bytes, self.us(s.slowest)),
                 s.span_bytes as f64 / CARD_READ_GBPS / 1e3,
                 often.join(", ")
+            );
+        }
+    }
+
+    /// A trace's GDDR reads card-wide over its replays ([`TraceSamples::reads`]): in all, how long
+    /// the card read at what share of [`CARD_READ_GBPS`] (each op's span in [`READ_BINS`] parts),
+    /// and by label, against what the label's ops read in their own spans.
+    fn reads_table(&self, out: &mut String, t: &TraceSamples, medians: &[Option<OpTime>]) {
+        let reads = t.read_medians();
+        let measured: Vec<(&OpInfo, &OpTime, &[u64; READ_BINS])> = t
+            .ops
+            .iter()
+            .zip(medians)
+            .zip(&reads)
+            .filter_map(|((o, m), r)| Some((o, m.as_ref()?, r.as_ref()?)))
+            .collect();
+        if measured.is_empty() {
+            return;
+        }
+        // Time at each share of the card's rate: under 25%, 25-50%, 50-75%, 75-90%, 90% and over.
+        const SHARES: [f64; 4] = [0.25, 0.5, 0.75, 0.9];
+        let mut at = [0f64; 5];
+        let (mut bytes, mut span) = (0u64, 0u64);
+        #[derive(Default)]
+        struct Label {
+            ops: u64,
+            span: u64,
+            issued: u64,
+            own: u64,
+            bins: [u64; READ_BINS],
+        }
+        let mut labels: BTreeMap<&str, Label> = BTreeMap::new();
+        for &(o, m, r) in &measured {
+            let part = self.us(m.span) / READ_BINS as f64;
+            for &b in r {
+                let share = gbps(b, part) / CARD_READ_GBPS;
+                at[SHARES.iter().take_while(|&&s| share >= s).count()] += part;
+            }
+            let issued: u64 = r.iter().sum();
+            bytes += issued;
+            span += m.span;
+            let l = labels.entry(o.label).or_default();
+            l.ops += 1;
+            l.span += m.span;
+            l.issued += issued;
+            l.own += o.bytes.read - o.bytes.ahead;
+            for (s, b) in l.bins.iter_mut().zip(r) {
+                *s += b;
+            }
+        }
+        let _ = writeln!(
+            out,
+            "\nThe card's GDDR reads (every unit's B, as it issued them, by its `READ_BYTES` marks, \
+             on unit 0's clock; {} of the trace's ops measured): {:.1} MB in {:.1} us, {:.0} GB/s. \
+             Time at under 25% / 25-50% / 50-75% / 75-90% / 90% and over of {CARD_READ_GBPS} GB/s \
+             (by eighths of each op's span): {:.1} / {:.1} / {:.1} / {:.1} / {:.1} us.\n\n\
+             | label | ops | us | MB read in the span | GB/s | its own MB in the span | \
+             GB/s by eighth of the span |\n|---|--:|--:|--:|--:|--:|---|",
+            measured.len(),
+            bytes as f64 / 1e6,
+            self.us(span),
+            gbps(bytes, self.us(span)),
+            at[0],
+            at[1],
+            at[2],
+            at[3],
+            at[4],
+        );
+        let mut labels: Vec<_> = labels.into_iter().collect();
+        labels.sort_by_key(|(_, l)| std::cmp::Reverse(l.span));
+        for (label, l) in labels {
+            let part = self.us(l.span) / READ_BINS as f64;
+            let bins: Vec<String> = l
+                .bins
+                .iter()
+                .map(|&b| format!("{:.0}", gbps(b, part)))
+                .collect();
+            let _ = writeln!(
+                out,
+                "| {} | {} | {:.1} | {:.2} | {:.0} | {:.2} | {} |",
+                if label.is_empty() {
+                    "(unlabelled)"
+                } else {
+                    label
+                },
+                l.ops,
+                self.us(l.span),
+                l.issued as f64 / 1e6,
+                gbps(l.issued, self.us(l.span)),
+                l.own as f64 / 1e6,
+                bins.join(" ")
             );
         }
     }
@@ -1304,6 +1665,36 @@ impl ProfileReport {
         out
     }
 
+    /// Every trace op's GDDR reads by channel and NoC #0 endpoint, one line a (channel, endpoint)
+    /// it reads: in its own span and ahead of it, megabytes, beside the op's median span.
+    pub fn channels_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
+        let mut out =
+            String::from("source\tindex\tlabel\twhat\tspan_us\tchannel\tport\tspan_mb\tahead_mb\n");
+        for (&id, t) in &self.traces {
+            let source = name(id);
+            for (i, (o, m)) in t.ops.iter().zip(t.medians()).enumerate() {
+                let span = m.map_or(0.0, |m| self.us(m.span));
+                let (all, ahead) = (&o.bytes.endpoint, &o.bytes.ahead_endpoint);
+                for c in 0..CHANNELS {
+                    for p in 0..PORTS {
+                        if all[c][p] == 0 {
+                            continue;
+                        }
+                        let _ = writeln!(
+                            out,
+                            "{source}\t{i}\t{}\t{}\t{span:.3}\t{c}\t{p}\t{:.4}\t{:.4}",
+                            o.label,
+                            o.what,
+                            (all[c][p] - ahead[c][p]) as f64 / 1e6,
+                            ahead[c][p] as f64 / 1e6,
+                        );
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// [`Detail::Full`]: every trace op's entries on unit 0 by kind, one line a kind, averaged over
     /// the replays that stamped the op ([`attribute_entries`]). Microseconds a replay. Empty
     /// without full detail.
@@ -1398,6 +1789,7 @@ impl ProfileReport {
             );
             self.label_table(&mut out, &rows, "ops");
             self.bytes_tables(&mut out, t, &medians);
+            self.reads_table(&mut out, t, &medians);
             self.skew_table(&mut out, t);
             self.push_table(&mut out, t);
             let mut top: Vec<(usize, &OpTime)> = medians
@@ -1437,7 +1829,7 @@ impl ProfileReport {
     /// (medians over their samples). Microseconds.
     pub fn tsv(&self, name: &dyn Fn(u64) -> String) -> String {
         let mut out = String::from(
-            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\tfetch_us\twriter_us\tahead_bytes\tprefetch_us\tpush_us\tdrain_us\tpush_words\n",
+            "source\tindex\tlabel\twhat\tunits\tsamples\tspan_us\tbarrier_us\tkernels_us\tcontrol_us\tdata_us\tother_us\tread_bytes\twrite_bytes\treads\twrites\ta_bytes\tb_bytes\tgbps\tfetch_us\twriter_us\tahead_bytes\tprefetch_us\tpush_us\tdrain_us\tpush_words\tcard_read_bytes\tcard_read_gbps\n",
         );
         let none = OpBytes::default();
         // The math role's totals: an eager op's on its longest unit, a trace op's on its slowest.
@@ -1446,11 +1838,16 @@ impl ProfileReport {
                        o: (&str, &str, usize, &OpBytes),
                        n: usize,
                        t: &OpTime,
-                       (push, drain, words): (u64, u64, u64)| {
+                       (push, drain, words): (u64, u64, u64),
+                       issued: Option<u64>| {
             let b = o.3;
+            let (issued, issued_gbps) = match issued {
+                Some(i) => (i.to_string(), format!("{:.1}", gbps(i, self.us(t.span)))),
+                None => (String::new(), String::new()),
+            };
             let _ = writeln!(
                 out,
-                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.3}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{}",
+                "{source}\t{i}\t{}\t{}\t{}\t{n}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.3}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{}\t{issued}\t{issued_gbps}",
                 o.0,
                 o.1,
                 o.2,
@@ -1478,11 +1875,20 @@ impl ProfileReport {
         };
         for (i, s) in self.eager.iter().enumerate() {
             let totals = (s.time.push, s.time.drain, s.time.words);
-            row("eager", i, (s.label, s.what, 0, &none), 1, &s.time, totals);
+            row(
+                "eager",
+                i,
+                (s.label, s.what, 0, &none),
+                1,
+                &s.time,
+                totals,
+                None,
+            );
         }
         for (&id, t) in &self.traces {
             let source = name(id);
             let units = t.unit_medians();
+            let reads = t.read_medians();
             for (i, (o, m)) in t.ops.iter().zip(t.medians()).enumerate() {
                 if let Some(m) = m {
                     let totals = units[i]
@@ -1496,6 +1902,7 @@ impl ProfileReport {
                         t.samples[i].len(),
                         &m,
                         totals,
+                        reads[i].map(|r| r.iter().sum()),
                     );
                 }
             }
@@ -1504,16 +1911,26 @@ impl ProfileReport {
     }
 
     /// A Perfetto/Chrome trace: eager ops one after another on one track, and each trace's ops one
-    /// after another at their median spans on a track of its own, each span named by its label.
+    /// after another at their median spans on a track of its own, each span named by its label,
+    /// with the card's GDDR read rate as a counter beside them ([`TraceSamples::reads`]).
     pub fn chrome_trace(&self, name: &dyn Fn(u64) -> String) -> String {
+        type Op<'a> = (&'a str, &'a str, &'a OpTime, Option<[u64; READ_BINS]>);
         let mut events = Vec::new();
-        let mut track = |pid: usize, title: &str, ops: Vec<(&str, &str, &OpTime)>| {
+        let mut track = |pid: usize, title: &str, ops: Vec<Op>| {
             events.push(format!(
                 "{{\"ph\":\"M\",\"pid\":{pid},\"name\":\"process_name\",\"args\":{{\"name\":{title:?}}}}}"
             ));
             let mut at = 0.0;
-            for (label, what, t) in ops {
+            for (label, what, t, reads) in ops {
                 let dur = self.us(t.span);
+                for (i, &b) in reads.iter().flatten().enumerate() {
+                    let part = dur / READ_BINS as f64;
+                    events.push(format!(
+                        "{{\"ph\":\"C\",\"pid\":{pid},\"name\":\"GDDR reads\",\"ts\":{:.3},\"args\":{{\"GB/s\":{:.1}}}}}",
+                        at + i as f64 * part,
+                        gbps(b, part)
+                    ));
+                }
                 events.push(format!(
                     "{{\"ph\":\"X\",\"pid\":{pid},\"tid\":0,\"name\":{label:?},\"ts\":{at:.3},\"dur\":{dur:.3},\"args\":{{\"what\":{what:?},\"barrier_us\":{:.3},\"kernels_us\":{:.3},\"control_us\":{:.3},\"fetch_us\":{:.3},\"writer_us\":{:.3},\"prefetch_us\":{:.3},\"data_us\":{:.3}}}}}",
                     self.us(t.barrier),
@@ -1532,16 +1949,18 @@ impl ProfileReport {
             "eager ops",
             self.eager
                 .iter()
-                .map(|s| (s.label, s.what, &s.time))
+                .map(|s| (s.label, s.what, &s.time, None))
                 .collect(),
         );
         for (k, (&id, t)) in self.traces.iter().enumerate() {
             let medians = t.medians();
+            let reads = t.read_medians();
             let ops = t
                 .ops
                 .iter()
                 .zip(&medians)
-                .filter_map(|(o, m)| m.as_ref().map(|m| (o.label, o.what, m)))
+                .zip(reads)
+                .filter_map(|((o, m), r)| m.as_ref().map(|m| (o.label, o.what, m, r)))
                 .collect();
             track(k + 1, &format!("trace {}", name(id)), ops);
         }
@@ -1556,6 +1975,71 @@ impl ProfileReport {
 mod tests {
     use super::*;
     use tt_isa::dm::record;
+
+    /// A product's `B` reads land by channel and NoC #0 endpoint as its tensor and the mover's
+    /// port rotation place them: a `[4, 16]`-tile weight over eight channels puts its column `j`
+    /// on channel `j % 8`, two columns a channel, each read on the port its rotation names, or
+    /// CMFW's where that is NoC #1's (the rule written out here, not `port_for`).
+    #[test]
+    fn a_gathers_reads_are_counted_by_channel_and_endpoint() {
+        let (kt, ct) = (4u32, 16u32);
+        let b = record::TensorRef {
+            n: 8,
+            channels: [0, 1, 2, 3, 4, 5, 6, 7],
+            base: [0x10_0000; 8],
+            first: 0,
+            ct,
+        };
+        let [a0, a1] = record::TensorRef::default().encode();
+        let [b0, b1] = b.encode();
+        let head = [
+            record::GATHER,
+            record::GATHER_A_RESIDENT | kt << 8,
+            0x2_0000,
+            0x6_0000,
+            0,
+            1,
+            0,
+            ct,
+        ];
+        let mut got = OpBytes::default();
+        got.count(&[head, a0, a1, b0, b1]);
+        let tile = tt_isa::dm::TILE_SLOT;
+        let mut want = [[0u64; PORTS]; CHANNELS];
+        for kk in 0..kt as usize {
+            for j in 0..ct as usize {
+                let ch = j % 8;
+                let (noc1, cmfw) = (
+                    if ch < 4 { 1 } else { 0 },
+                    if (1..=3).contains(&ch) { 0 } else { 2 },
+                );
+                let port = match (kk + j) % 3 {
+                    p if p == noc1 => cmfw,
+                    p => p,
+                };
+                want[ch][port] += tile;
+            }
+        }
+        assert_eq!(got.endpoint, want);
+        for (c, ports) in got.endpoint.iter().enumerate() {
+            assert_eq!(
+                ports.iter().sum::<u64>(),
+                2 * kt as u64 * tile,
+                "channel {c}"
+            );
+            assert_eq!(
+                ports[if c < 4 { 1 } else { 0 }],
+                0,
+                "NoC #1's endpoint, channel {c}"
+            );
+        }
+        assert_eq!(got.read, got.endpoint.iter().flatten().sum::<u64>());
+        // Read ahead, the same bytes are the op's own and none in its span.
+        let mut op = OpBytes::default();
+        op.add(&got);
+        op.ahead_endpoint = got.endpoint;
+        assert_eq!(op.span_endpoint(), [[0; PORTS]; CHANNELS]);
+    }
 
     fn e(event: u32, detail: u32, cycles: u64) -> TraceEvent {
         TraceEvent {
@@ -1701,6 +2185,67 @@ mod tests {
         // Stamps that do not line up with the stream are refused, not misattributed.
         assert_eq!(unit_times(&w, &sat_out(), 5, 1, 5), None, "one stamp short");
         assert_eq!(unit_times(&x, &sat_out(), 5, 2, 5), None, "one stamp over");
+    }
+
+    #[test]
+    fn every_units_reads_land_in_the_ops_spans_on_unit_0s_clock() {
+        let arrive = |k| UnitBarrier {
+            arrival_of: Some(k),
+            counts: 1,
+        };
+        let marks = |t, bytes: u32| e(ev::READ_BYTES, bytes >> ev::READ_UNIT_SHIFT, t);
+        // Unit 0 runs ops 0 and 1, spans 100..150 and 150..250, and reads 4,000 B before its
+        // first arrival.
+        let seq0 = vec![arrive(0), arrive(1)];
+        let mut u0 = vec![e(ev::LIST_BEGIN, 1, 100), marks(100, 64 * 3)];
+        u0.extend([marks(140, 4000), e(ev::ENTRY_BEGIN, op::BARRIER, 140)]);
+        u0.extend([marks(150, 0), e(ev::ENTRY_END, op::BARRIER, 150)]);
+        u0.extend([marks(240, 0), e(ev::ENTRY_BEGIN, op::BARRIER, 240)]);
+        u0.extend([marks(250, 0), e(ev::ENTRY_END, op::BARRIER, 250)]);
+        // Unit 1, its clock 1,000 ahead, waits out both ops and meanwhile issues an 8,000 B
+        // prefetch from 150 to 200 on unit 0's clock.
+        let seq1 = vec![UnitBarrier {
+            arrival_of: None,
+            counts: 2,
+        }];
+        let mut u1 = vec![e(ev::LIST_BEGIN, 1, 1100), marks(1100, 0)];
+        u1.extend([marks(1100, 0), e(ev::ENTRY_BEGIN, op::BARRIER, 1100)]);
+        u1.extend([marks(1150, 0), marks(1200, 8000)]);
+        u1.extend([marks(1250, 0), e(ev::ENTRY_END, op::BARRIER, 1250)]);
+
+        let r0 = unit_reads(&u0, &seq0, 0, 0).unwrap();
+        // The first mark counts from before the replay: left out.
+        assert_eq!(r0.spans[0], (100, 140, 4000 / 64 * 64));
+        assert_eq!(r0.releases, vec![(0, 150), (1, 250)]);
+        let r1 = unit_reads(&u1, &seq1, 0, 0).unwrap();
+        assert_eq!(
+            r1.releases,
+            vec![(1, 1250)],
+            "a wait releases at its last barrier"
+        );
+
+        let got = card_reads(&[Some(r0), Some(r1)], &seq0, 0, 0);
+        let b = 4000 / 64 * 64;
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, 0);
+        // 6.25 cycles an eighth of op 0: six whole eighths at 100 B a cycle, then 2.5 cycles.
+        let part = b as f64 * 6.25 / 40.0;
+        for (i, &v) in got[0].1.iter().enumerate() {
+            let want = match i {
+                0..=5 => part,
+                6 => b as f64 * 2.5 / 40.0,
+                _ => 0.0,
+            };
+            assert!(
+                (v as f64 - want).abs() <= 1.0,
+                "op 0 eighth {i}: {v} vs {want}"
+            );
+        }
+        // Unit 1's prefetch, moved onto unit 0's clock, is the first half of op 1.
+        assert_eq!(got[1], (1, [2000, 2000, 2000, 2000, 0, 0, 0, 0]));
+
+        // Stamps that do not line up with the stream are refused.
+        assert_eq!(unit_reads(&u0, &seq0[..1], 0, 0), None);
     }
 
     #[test]

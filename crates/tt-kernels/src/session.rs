@@ -2367,7 +2367,8 @@ fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
 /// NC, which runs the writer's, does not stamp). B also stamps each fetch of a chunk of the stream
 /// or of a reader section, its wait for its writer and each prefetch `WAIT`
 /// (`tt_isa::dm::trace_mode::FETCH`, `WRITER_WAIT`, `PREFETCH_WAIT`): two events each, and `range`
-/// may touch one chunk more than it fills.
+/// may touch one chunk more than it fills. A prefetch `GATHER` adds its two `READ_BYTES` marks
+/// (`crate::profile_mode::PREFETCH_MARKS`), here though the second may fall under a later op.
 fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
@@ -2384,6 +2385,11 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2
             count[1] += full.stamps(head);
             if head == tt_isa::dm::op::WAIT && entries[i][1] == tt_isa::dm::WAIT_PREFETCH {
                 count[0] += 2;
+            }
+            use tt_isa::dm::record;
+            if head == record::GATHER && entries[i][1] & record::GATHER_PREFETCH != 0 {
+                count[0] += crate::profile_mode::PREFETCH_MARKS;
+                count[1] += crate::profile_mode::PREFETCH_MARKS;
             }
             i += (tt_isa::dm::record::len(head) as usize).max(1);
         }
@@ -5950,6 +5956,12 @@ impl<T: Transport> Session<T> {
                         per_unit[*u].add(&ahead);
                     }
                     per_unit[*u].ahead += ahead.read;
+                    let own = &mut per_unit[*u].ahead_endpoint;
+                    for (o, a) in own.iter_mut().zip(&ahead.endpoint) {
+                        for (o, a) in o.iter_mut().zip(a) {
+                            *o += a;
+                        }
+                    }
                 }
                 for (u, b) in per_unit.into_iter().enumerate() {
                     op.bytes.add(&b);

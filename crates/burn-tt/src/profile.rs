@@ -15,12 +15,18 @@
 //!   - every trace's ops the same way, by name (`SharedStateTraces` keys, `TracedInference::set_name`),
 //!     with how many replays covered them;
 //!   - each trace's replays (input write, replay, output read);
+//!   - each trace's GDDR reads card-wide, from every unit's marks of what it issued: how long the
+//!     card read at what share of its rate, and by label the rate in eighths of the ops' spans;
 //!   - the host's side: server-thread time and calls per Burn op, the session's host stages,
 //!     dataflow counts and lists per tile.
-//! * `ops.tsv`: every attributed op, one per line.
+//! * `ops.tsv`: every attributed op, one per line (a trace op's `card_read_bytes` and `card_read_gbps`:
+//!   every unit's GDDR reads issued in its span).
 //! * `skew.tsv`: every trace op's units, one per line: each unit's work and its wait at the op's
 //!   barrier, from its own stamps.
-//! * `trace.json`: the same as a Perfetto/Chrome trace, spans named by Burn op.
+//! * `channels.tsv`: every trace op's GDDR reads by channel and NoC #0 endpoint, in its span
+//!   and read ahead (`summary.md` has each product label's busiest channel and endpoint).
+//! * `trace.json`: the same as a Perfetto/Chrome trace, spans named by Burn op, with the card's
+//!   GDDR read rate as a counter beside each trace's ops.
 //! * `entries.tsv` (`TT_PROFILE_DETAIL=full` only): every trace op's entries on unit 0 by kind,
 //!   their time and the gaps before them (`tt_kernels::profile_mode::attribute_entries`).
 //!
@@ -125,13 +131,14 @@ impl Profile {
         out
     }
 
-    /// Write `summary.md`, `ops.tsv`, `skew.tsv` and `trace.json` into `dir`, creating it.
+    /// Write `summary.md`, `ops.tsv`, `skew.tsv`, `channels.tsv` and `trace.json` into `dir`, creating it.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         let name = |id: u64| self.name(id);
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("summary.md"), self.summary())?;
         std::fs::write(dir.join("ops.tsv"), self.device.tsv(&name))?;
         std::fs::write(dir.join("skew.tsv"), self.device.skew_tsv(&name))?;
+        std::fs::write(dir.join("channels.tsv"), self.device.channels_tsv(&name))?;
         if self
             .device
             .traces

@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The card's GDDR reads over a decode step](#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0) | 2026-10-27 | the profile mode now sums every unit's issued GDDR reads into the card's rate in eighths of each op's span (`READ_BYTES` marks), held against the card's 512 GB/s peak (not 469): the 1.7B `Step(64)` reads 3,568 MB at 328 GB/s (64%), at 90%+ for only 1.9 of 10.9 ms; every product starts near the peak and ends in a tail (`gate\|up` 634 -> 89 GB/s, `down` 617 -> 68), `down`'s middle half ~300, the small ops 319; the marks cost tile-sized plain reads ~1% in a `profile` image (~4% while a check sat in the list loop) and the decode step nothing |
+| [F27 probed: bank-local reads, and what does not bind a decode product](#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0) | 2026-10-27 | the profile mode counts each op's reads by channel and NoC #0 endpoint (`channels.tsv`): the 1.7B's products read every channel evenly (busiest 1.00 of an even share), one endpoint 1.33x; `gddr_readers_by_channel`: a tile reads 2,112-byte entries at ~6.5 GB/s (safe) or ~35 (`fast-reads`), 1-8 tiles a channel at that size reach 51-425 / 89-466 GB/s, today's decode deal 364-449 / 429-491, long entries 505-510 at 2+ readers a channel: **bank-local reads add nothing**; with reads 5x cheaper a step moves 10.82 -> 10.60 ms (`down` 120.8 -> 114.9 us): **a unit's read rate does not bind a product**; F27 stopped, A2 and A3 not built |
 | [The tt-mnist regression found, and RMSNorm's scale in its op](#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1) | 2026-10-27 | the scoreboard's MNIST and transformer rows were 2026-10-03/04 numbers, MNIST since on a 5.3x larger model; the transformer's 9.2 -> 92 ms/step bisected to `c4255c7` (9.2 -> 22.6) and `6d979e7` (-> 329: the embedding gradient's ~20 ops an index); that gradient as one op, **92.5 -> 10.9 ms/step**, the same losses; cross-entropy's gather and scatter-add as one and a few ops: MNIST 784-128-10 **2.0 -> 1.39 ms/step** (`3344db6` 1.4), the transformer **-> 8.21** (`3344db6` 9.2); tt-mnist in `cargo xtask bench`; RMSNorm's scale inside the norm's op, a 1.7B step **11.31 -> 11.18 ms**; a residual sum and its norm as one op, bit for bit but slower (11.18 -> 11.26), opt-in; a ragged RMS statistic of 18-31 rows at 2048 columns hung (its unrolled programs past a program slot), fixed |
 | [The decode and prefill streams merged](#the-decode-and-prefill-streams-merged-2026-10-27-card-0) | 2026-10-27 | the barriers pruned (S5) and each K-tile pair's tiles whole in their `Src` (P4) together, card 0: 135M **6.92 / 7.47 / 8.14 ms**, 1.7B **11.32 / 11.84 / 12.64**, the 1.7B prefill 283.7 / 5,983 ms at 1,000 / 7,992 tokens; every gate, conformance and the MNIST goldens hold; eight failing or hanging tests that predate both fixed |
 | [Which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0) | 2026-10-26 | a small op is 9.8 us on unit 0 (135M; 11.6 on the 1.7B), ~3 of it its barrier; 194 of the 135M step's 591 barriers (82 of the 1.7B's 403) order nothing the data needs, and a capture drops them: 135M **7.35 -> 6.97 ms**, 1.7B 11.76 -> **11.59**; sparse waits after products would save 0.03-0.07 ms (the barrier time there is the slowest unit's work); one launch for back-to-back ops ~0.12 ms at best |
@@ -373,6 +375,137 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The card's GDDR reads over a decode step (2026-10-27, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 10, A4: the meter F27 left wanting. A unit's read rate
+does not bind a product, nor does compute alone; what does is the card's traffic over time, which nothing measured.
+
+**The meter** (the profile mode, `profile` images only): B counts the GDDR bytes it issues (`tt_firmware::noc::read_bytes`)
+and stamps what it issued since its last mark (`tt_isa::mailbox::trace::READ_BYTES`) at each barrier's arrival and
+release, at a replay's start, and when a queued prefetch starts and when it has issued its last read; a barrier whose wait
+stands for several meets the window if any of them does, so a unit waiting across a window's start still times its
+prefetch. The host spreads each unit's bytes evenly between its marks, puts each unit's clock on unit 0's by the median
+offset of the barrier releases they share, and sums the units into each op's span on unit 0 in eight parts
+(`unit_reads`, `card_reads`; unit test `every_units_reads_land_in_the_ops_spans_on_unit_0s_clock`, watched failing with
+the offset ignored). Out: a table in `summary.md`, `card_read_bytes`/`card_read_gbps` in `ops.tsv`, a `GDDR reads` counter
+in `trace.json`. Bytes are counted at issue, so an op's first eighth can read above the card's rate (requests queue).
+
+**Held against 512 GB/s, not 469.** The profile mode's `CARD_READ_GBPS` is now the card's peak, 512, which our movers
+reach (511.2, one reader beside each channel with long entries; 509-511 with 2+ readers a channel at 16 KiB,
+`gddr_readers_by_channel`). 469 is what every tile reading its own share gets: a limit of how we read, not of the card.
+
+SmolLM2-1.7B-Instruct, BF16 weights, `TT_TILES=all`, release, safe image, profile `1793141447`. The step's total, 3,568 MB
+over 273 of `Step(64)`'s ops, matches what the host counts for the step (3.57 GB), so nothing is lost or counted twice.
+
+| `Step(64)` | ops | us | GB/s | GB/s by eighth of the span |
+|---|--:|--:|--:|---|
+| the step | 273 | 10,867 | **328 (64% of 512)** | at 90%+ of 512 for 1.9 ms; 75-90% 2.5; 50-75% 3.6; 25-50% 1.3; under 25% 1.6 |
+| `gate\|up` (120 units) | 25 | 138 each | | 634 483 428 421 366 354 233 **89** |
+| `down` (64 units, streamed) | 24 | 120 each | | 617 497 413 **311 303 302** 219 **68** |
+| `qkv`, `o` (read ahead) | 47 | 27 each | | 396 390 324 206 98 **19 1 1** |
+| everything but the products | | 3,277 | **319** | |
+
+(Per-op shapes from `trace.json` of `1793136687`, the same meter a build earlier; `1793141447` agrees: products 332
+GB/s, 582 -> 70 by eighths.) `Step(128)` and `Step(512)` agree (326 and 312 GB/s; at 512 the longer attention reads 268).
+
+- **The step reads at 64% of the card's peak.** At 512 GB/s its 3.57 GB take 6.97 ms; it takes 10.9.
+- **Every product ends in a tail.** The card reads near its peak at a product's start and falls away to its end: the
+  last quarter of `gate|up` and `down` reads 70-230 GB/s, and `qkv` and `o` (their weights read ahead) read almost nothing
+  in their last three eighths, which are their kernels and barrier. The likely reading, not yet split by unit: the
+  prefetching units' reads come early, and the product's slowest units finish alone (their spread is the skew table's).
+- **`down`'s middle half reads ~300 GB/s:** 64 units at ~5 GB/s each, well under the peak even with the prefetch beside
+  it. `gate|up` on 120 units holds ~420.
+- **The small ops' ~3.3 ms read at 319 GB/s**: the prefetch runs under them, but at 62% of the peak.
+
+**What profiling costs the reads.** The raw read bench needs a `profile` image (it times with stamps), so its rows are
+against HEAD's `profile` image, the same session (GB/s; 8 readers a channel, one tile alone, today's deal on 64 units):
+
+| `gddr_readers_by_channel`, 2,112-byte entries, cap 3 / 8 | HEAD (`1793140610`) | marks in the list loop (`1793138241`) | final (`1793142271`) |
+|---|--:|--:|--:|
+| 8 readers a channel | 404.3 / 428.6 | 388.3 / 411.6 | 399.2 / 423.4 |
+| 1 tile | 50.7 / 53.7 | 48.6 / 51.5 | 50.0 / 53.0 |
+| decode deal, 64 units | 398.0 / 421.8 | 383.5 / 406.6 | 394.0 / 418.4 |
+| 16 KiB and 128 KiB entries, any readers | 465-511 | the same | the same |
+
+- **A check in the mover's list loop cost tile-sized plain reads ~4%,** even with nothing stamped: the marks moved into
+  the barrier entry and a cold function (`barrier_mark`, `read_mark_now`). What is left, ~1% at 2 KiB entries, is the
+  byte count on each request; long entries, which the channels bind, are unchanged.
+- **The NIU's own read-data counter is not the GDDR's:** `NIU_MST_RD_DATA_WORD_RECEIVED` (free to read) gave the step
+  3,847 MB against 3,568, the rest reads of other tiles' L1 (`rope` +55 MB, `tt_silu_mul` +47, products +121; profile
+  `1793139793`). ttsim does not model it (divergence row 106). The marks count B's GDDR requests instead.
+- **The decode step does not move:** with the `profile` image and the mode off, 11.36 / 12.73 ms at 32 / 256 tokens
+  (`1793141252`) against HEAD's `profile` image 11.45 / 12.77 (`1793140686`); the default image 11.38 / 12.55
+  (`1793138473`), so a `profile` image itself costs up to ~0.2 ms at 256 tokens, before this change. With the mode on,
+  the marks add ~0.05 ms to the step's summed spans (10.82 in `1793130462`, 10.87 here), and no replay overflowed.
+
+What a lever must do, then: fill the products' tails and `down`'s middle (more units reading `down`, or the next
+product's prefetch starting where this one's units drop out), and read faster under the small ops. Which, is the next
+step's decision.
+
+## F27 probed: bank-local reads, and what does not bind a decode product (2026-10-27, card 0)
+
+[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 10 (F27 of [tt-metal-comparison.md](tt-metal-comparison.md)).
+The question: inside their own spans, a 1.7B BF16 decode step's products read only ~230-300 GB/s, while one tile
+beside each channel reads 511 (the adjacent gate). Is that where the products' reads land, or how many read a channel?
+SmolLM2-1.7B-Instruct, BF16 weights, `TT_TILES=all`, release, card 0.
+
+**A0, the meter** (no behaviour change): `OpBytes::endpoint` counts each read by GDDR channel and the NoC #0 endpoint the
+mover sends it to (`DramChannel::port_for` of its rotation), in its op's span and read ahead (`ahead_endpoint`); the
+profile mode writes `channels.tsv` and a table of each product label's busiest channel and endpoint against an even share
+(unit test `a_gathers_reads_are_counted_by_channel_and_endpoint`, watched failing with the channel map shifted). Profile
+`1793130462` (safe image), `Step(64)` 10.82 ms:
+
+| `Step(64)` products | ops | us | in-span MB | in-span GB/s | busiest channel | busiest endpoint |
+|---|--:|--:|--:|--:|--:|--:|
+| `gate\|up` (120 units) | 24 | 3,010 | 882 | 293 | | |
+| `down` (64) | 24 | 2,900 | 675 | 233 | | |
+| `qkv`, `o` (read wholly ahead) | 47 | 1,245 | 0 | | | |
+| all `float_matmul` | 96 | 7,609 | 1,737 | 228 | **1.00** | 1.35 |
+
+Each column lies in one channel (`t % 8` over widths that are multiples of 8), and the deal spreads the columns, so every
+channel is read alike; one of NoC #0's two endpoints a channel takes two thirds of its reads (the port rotation maps NoC
+#1's port to CMFW's).
+
+**A1, the adjacent gate at more readers a channel** (`silicon_bench_memory::gddr_readers_by_channel`, new): `Mix::Banked(r)`,
+`r` tiles a channel each reading its own share through its nearest NoC #0 endpoint; `Mix::Decode`, today's deal (each unit
+2 consecutive columns of an interleaved weight, one 2,112-byte BF16 slot an entry, ports rotating as `GATHER`'s). Every
+byte over the first start to the last end, GB/s, caps 3 / 8 (a BF16 stream's / the mover's):
+
+| | safe image (`1793131300`) | `fast-reads` (`1793131553`) | one tile, safe / fast |
+|---|--:|--:|--:|
+| decode deal, 64 units | 400 / 424 | 429 / 466 | 6.3-6.7 / 8.0-9.0 |
+| decode deal, 96 units | **449** / 364 | 456 / **491** | 5.4-6.5 / 5.5-7.4 |
+| 1 a channel, 2,112 B | 51 / 54 | 89 / 140 | 6.5-6.8 / 19.8-35.3 |
+| 2 a channel, 2,112 B | 101 / 107 | 178 / 274 | |
+| 4 a channel, 2,112 B | 202 / 215 | 347 / 353 | |
+| 8 a channel, 2,112 B | 401 / **425** | 420 / **466** | |
+| 1 a channel, 16 KiB / 128 KiB | 390-414 / 507 | 419 / 419 | 49-52 and 63.7 / 63.7 and 63.7 |
+| 2 a channel, 16 KiB / 128 KiB | **509 / 509** | 461 / 461 | 31.9 |
+| 4 a channel, 16 KiB / 128 KiB | 509-511 / 509 | 485 / 485 | 16.0 |
+| 8 a channel, 16 KiB / 128 KiB | 468-507 / 466-506 | 466-506 / 463-506 | 8.0 |
+
+- **A tile is entry-bound at tile-sized entries:** ~6.5 GB/s in the safe image (~360 cycles an entry), ~20-35 with
+  `fast-reads`, whatever the channel or how few share it.
+- **Bank-local reads add nothing:** 8 readers a channel at 2,112 B equal the decode deal on as many units (425 against 424
+  safe, 466 against 466 fast). The plan's A2 rule (8 a channel >= 465 GB/s *and* the deal <= 430) fails in both images.
+- **Long entries reach the channels' 505-511 at 2 or more readers a channel.** One reader a channel in the fast image
+  shows 419 together, each tile 63.7 alone: the metric is held down by the eight readers' start spread there.
+
+**The check before A3** (a column's tiles contiguous, so a unit reads long entries): the same profile in the `fast-reads`
+image, where a unit's 2,112-byte reads are ~5x cheaper (profile `1793131649`):
+
+| `Step(64)` | safe | `fast-reads` |
+|---|--:|--:|
+| `down`, 24 ops | 2,900 us (120.8 an op), 233 GB/s in span | 2,757 (114.9), 245 |
+| `gate\|up`, 24 ops | 3,010 (125.4), 293 | 2,882 (120.1), 306 |
+| the step | 10.82 ms | 10.60 |
+
+A `down` unit works 57-112 us an op (median 103) and moves its span's bytes at ~5.6 GB/s, against the 20-35 it reads at
+alone with `fast-reads`. **A unit's read rate does not bind a product**, so long entries (A3) can buy at most what
+`fast-reads` did (~0.2 ms a step). Nor does compute alone: with the weights free the step is 6.26 ms (`1793024167`). What is
+left is the two together under the card's whole traffic (each unit's reads and its kernel through a one-block slot ring,
+beside the prefetching units), which nothing meters over time yet. **F27 stopped by its rules; A2 and A3 not built.**
 
 ## The tt-mnist regression found, and RMSNorm's scale in its op (2026-10-27, cards 0 and 1)
 

@@ -333,6 +333,7 @@ fn account(
             Event::Kick { .. }
             | Event::Throttle { .. }
             | Event::RolePush { .. }
+            | Event::ReadBytes { .. }
             | Event::Role { .. }
             | Event::Unknown(_) => {
                 if open.is_none() {

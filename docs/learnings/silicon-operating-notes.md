@@ -1284,6 +1284,27 @@ programs.
 - **Many units reading the same few tiles serialise on a channel:** 64 units each reading one row's 2-tile packed twin made
   a norm 17.5 us against 14.4 on 32 (`1792431978`).
 
+## A channel's rate by readers and entry size (2026-10-27, card 0)
+
+From decode-to-bandwidth.md Phase 10 (F27), `silicon_bench_memory::gddr_readers_by_channel` (runs `1793131300` safe,
+`1793131553` `fast-reads`; [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)).
+
+- **A tile's read rate is set by its entry size, not by its channel or how few share it.** At one 2,112-byte BF16 slot an
+  entry a tile reads ~6.5 GB/s in the safe image (~360 cycles an entry) and ~20 (cap 3) to ~35 (cap 8) with `fast-reads`;
+  1, 2, 4 and 8 tiles a channel scale that linearly (8 a channel: 401-425 safe, 420-466 fast).
+- **Long entries fill a channel from 2 readers:** 16 KiB or 128 KiB entries give 505-511 GB/s at 2, 4 or 8 tiles a
+  channel; one tile a channel reads 63.7 GB/s at 128 KiB (99.6% of 64).
+- **Reading only the channel beside a tile buys nothing at decode's entry size:** 8 such readers a channel equal 64 units
+  reading an interleaved weight's columns (`m = 1` products' deal) to within 1 GB/s in both images.
+- **The NoC #0 endpoint nearest above a tile** (shortest Y leg) is how the bench picks its port; on card 0 the
+  nearest tiles to channels 0-3 sit at raw X 1-6 and to 4-7 at raw X 11-16 (`banked_tiles`).
+- **The B mover's list loop is that tight:** one more check per entry there (a barrier test, nothing stamped) cost
+  tile-sized plain reads ~4% (8 a channel 428.6 -> 411.6 GB/s at cap 8, against HEAD's `profile` image the same session,
+  `1793140610`, `1793138241`); counting each request's bytes in a `.local` word costs ~1%. Keep profiling work out of
+  the loop and in cold functions ([log](performance-log.md#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0)).
+- **`NIU_MST_RD_DATA_WORD_RECEIVED` counts every read landing at the tile,** GDDR and other tiles' L1 alike, in 64-byte
+  flits: over a 1.7B decode step 3,847 MB against the 3,568 of GDDR reads. Not a GDDR meter; ttsim refuses it (row 106).
+
 ## GDDR reads are one queue: prefetch traffic is paid by the small ops (2026-10-20, cards 0 and 1)
 
 [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8.

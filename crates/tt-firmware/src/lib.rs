@@ -534,6 +534,12 @@ pub mod noc {
     /// counters too.
     #[link_section = ".local"]
     static mut NOC1_USED: bool = false;
+    /// Bytes of the GDDR requests issued through NoC #0 since `reset` (wrapping), in a `profile`
+    /// image; never counted otherwise. On RISCV B, which writes no GDDR, its reads: what its
+    /// `READ_BYTES` marks count (`tt_isa::mailbox::trace::READ_BYTES`). Counted here rather than
+    /// read from the NIU's read-data counter, which also counts reads of other tiles' L1.
+    #[link_section = ".local"]
+    static mut READ_BYTES: u32 = 0;
 
     /// Requests that waited for room under their ID's cap, and the cycles
     /// they waited by the image's clock (`set_clock`; 0 without one).
@@ -561,6 +567,22 @@ pub mod noc {
         unsafe { &mut *core::ptr::addr_of_mut!(NOC1_USED) }
     }
 
+    /// Count `len` bytes issued through NoC #0's GDDR paths ([`read_bytes`]), in a `profile` image.
+    #[inline(always)]
+    fn count_read(len: u32) {
+        if cfg!(feature = "profile") {
+            // SAFETY: as `in_flight`.
+            unsafe { READ_BYTES = READ_BYTES.wrapping_add(len) };
+        }
+    }
+
+    /// The GDDR bytes issued through NoC #0 since `reset`, wrapping: 0 without the `profile`
+    /// feature.
+    pub fn read_bytes() -> u32 {
+        // SAFETY: as `in_flight`.
+        unsafe { READ_BYTES }
+    }
+
     /// Every ID at no requests in flight and the default cap; nothing issued
     /// on NoC #1; no stalls, no clock. Called once, before `firmware_main`.
     pub(crate) fn reset() {
@@ -572,6 +594,8 @@ pub mod noc {
             clock: None,
         };
         *noc1_used() = false;
+        // SAFETY: as `in_flight`; nothing else runs yet.
+        unsafe { READ_BYTES = 0 };
     }
 
     /// This tile's own coordinate as `niu` names it (`NOC_ID_LOGICAL`,
@@ -684,6 +708,8 @@ pub mod noc {
         let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
         if NOC1 {
             *noc1_used() = true;
+        } else {
+            count_read(len);
         }
         if in_flight(niu, txn).at_cap() {
             make_room(niu, txn);
@@ -799,6 +825,7 @@ pub mod noc {
     ) {
         use initiator::*;
         let niu = Niu::Noc0;
+        count_read(len);
         let p = read_path();
         let key = targ_hi | len << 12;
         // SAFETY: initiator 1's registers, MMIO in every Tensix and Ethernet tile,
@@ -895,6 +922,7 @@ pub mod noc {
             if self.batch.full() {
                 refill_batch(&mut self.batch, self.txn);
             }
+            count_read(len);
             let key = targ_hi | len << 12;
             // SAFETY: initiator 1's registers, as `issue_read`.
             unsafe {

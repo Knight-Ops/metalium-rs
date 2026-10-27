@@ -261,6 +261,17 @@ pub mod trace {
     /// Cycles a [`ROLE_PUSH`] or [`ROLE_DRAIN`] detail counts: 64, so a detail
     /// holds ~8.4 million (about 6 ms at 1.35 GHz).
     pub const PUSH_UNIT_SHIFT: u32 = 6;
+    /// RISCV B's GDDR read bytes issued since its last `READ_BYTES` mark (or since the mark
+    /// before, unstamped, outside the window), in units of `1 << READ_UNIT_SHIFT` bytes, at
+    /// most [`DETAIL_MAX`]; what does not fit (under a unit, or past the most) carries to the
+    /// next mark. B marks at
+    /// each `BARRIER`'s begin and end whose barriers meet the window, at a traced list's
+    /// begin, and when a queued prefetch starts and when its last read is issued: with each
+    /// mark's time, a unit's issue curve, which the profile mode sums into the card's read
+    /// rate over a replay (`tt_kernels::profile_mode`).
+    pub const READ_BYTES: u32 = 26;
+    /// Bytes a [`READ_BYTES`] detail counts: 64, so a detail holds ~8.4 MB.
+    pub const READ_UNIT_SHIFT: u32 = 6;
 
     /// The source of the data mover's events. Role runners use their Tensix
     /// thread, 0..3.

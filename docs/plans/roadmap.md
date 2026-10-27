@@ -527,6 +527,18 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         **Found and fixed on the way:** decode attention's job recorded too low an L1 top, so busy prefetch read the next
         weights over its `K` and `V` at `Step(512)` (a 1.7B traced generation chose other tokens at a 256-token prompt;
         gate `step209`).
+        **F27, bank-local reads: probed and stopped** (2026-10-27, card 0, decode-to-bandwidth Phase 10,
+        [log](../learnings/performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)):
+        the profile mode now counts each op's reads by channel and endpoint (`channels.tsv`), and the products read every
+        channel evenly; 8 readers beside each channel equal today's deal at decode's 2 KiB entries (425 / 466 GB/s safe /
+        `fast-reads`), and with reads 5x cheaper the step moves only 10.82 -> 10.60 ms. A unit's read rate does not bind a
+        product; neither a channel deal nor long entries was built.
+        **The card's reads over a step, metered** (A4, profile `1793141447`,
+        [log](../learnings/performance-log.md#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0)): every unit's
+        issued GDDR reads summed into each op's span in eighths. `Step(64)` reads 3,568 MB at 328 GB/s (64% of the card's
+        512, which our movers reach; 469 is how we read, not the card);
+        every product ends in a tail (`gate|up` 634 -> 89 GB/s, `down` 617 -> 68), `down`'s middle reads ~300, the small
+        ops 319. **Next:** split the tail by unit, then choose a lever (before a decision on split-K for `down`).
   - [ ] **The step's bandwidth budget** ([decode-step-bandwidth.md](decode-step-bandwidth.md), 2026-10-17).
     - **B0, done:** the profile mode counts every captured op's GDDR bytes and entries (gate `step197`).
       - A 1.7B step moves 9.6 GB, which at 469 GB/s takes 20.5 ms, against 42.3 ms measured.
@@ -1376,8 +1388,8 @@ of these closes. Not scheduled; in the order the review suggests, evidence first
   our numbers. Every tt-metal comparison so far is a derived figure for a different model mix. **F11** (mostly done 2026-10-26: our mirror of tt-metal's
   490 GB/s adjacent-core DRAM gate, `silicon_bench_memory::gddr_adjacent_banks`, gives 507.7-511.2 GB/s with `fast-reads` on
   card 1, runs `1793028574` / `1793028275`; left: tt-metal's own binary on the card, and the gate as a standing check).
-  **F27** bank-sharded weights read by the tile beside each channel (one reader a channel reaches 99.8% of it; decode's
-  weight stream 84%). **F12** do our readers leak the NoC VC state that
+  ~~**F27** bank-sharded weights read by the tile beside each channel~~ (probed 2026-10-27, decode-to-bandwidth Phase 10:
+  at decode's entry size bank-local readers equal today's deal, and cheaper reads move a decode step 2%; not built). **F12** do our readers leak the NoC VC state that
   costs tt-metal about 20% of DRAM read bandwidth after a DRAM-sharded reader?
 - [ ] **F2** one card-to-card Ethernet hop with our E1 movers (4-16 KiB, no host): the go/no-go of
   [sram-residency-and-multi-card-decode.md](../proposals/sram-residency-and-multi-card-decode.md). tt-metal's
