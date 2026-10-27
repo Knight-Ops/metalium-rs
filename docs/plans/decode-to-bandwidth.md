@@ -1115,7 +1115,9 @@ half-size tiles (A5).
     replay-fixed-cost P1 (barriers on the units an op ran on), and the 135M (7.3 ms, ~0.6 of it weights) measures it.
   - **S5 (2026-10-26):** the products' barrier time is the slowest unit's work: their consumers need most of their
     units (a what-if of sparse waits saves 0.07 ms). Barriers no data needs are pruned: 1.7B 11.59 / 12.17 / 12.95 ms,
-    135M 6.97 / 7.54 / 8.27 (card 0).
+    135M 6.97 / 7.54 / 8.27 (card 0). With prefill-operand-reuse P4 merged (2026-10-27, card 0): 1.7B **11.32 / 11.84 /
+    12.64 ms**, 135M **6.92 / 7.47 / 8.14**
+    ([log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0)).
 
 ## The larger changes compared (2026-10-18)
 

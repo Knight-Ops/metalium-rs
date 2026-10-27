@@ -14,8 +14,8 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
-  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 22.1 tokens/s traced against
-  burn-flex's 3.3 (13.6 on 2026-10-15; the cache's row write, thin matmul reads, fused projections and block views since), and prefills 29-35x faster.
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 88 tokens/s traced against
+  burn-flex's 3.4 (11.32 ms a step with BF16 weights, card 0, 2026-10-27, [log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0); 13.6 tokens/s on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
   5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
@@ -23,9 +23,10 @@ linking to its evidence and to the detailed plan. Closed work lives in
   ([log](../learnings/performance-log.md#row-select-an-embedding-lookup-without-staging-2026-10-13-card-0));
   BF16 tables still take the staged path.
   The MNIST MLP, CNN and TinyTransformer still train from scratch in `tt-mnist`.
-- **Performance: behind the CPU unless traced.** Untraced training is 2–3× slower than
-  burn-flex ([scoreboard](../learnings/performance-scoreboard.md)); the cost is host-side
-  submission, not the device. Traced MNIST inference already beats the CPU, and traced, the three
+- **Performance: behind the CPU unless traced.** Untraced training is 1.8x (MNIST, 3.4 ms/step against 1.9) and
+  25x (the transformer, 92 against 3.7) slower than burn-flex on 2026-10-27
+  ([scoreboard](../learnings/performance-scoreboard.md); the transformer was 8.8 on 2026-10-10, an order of magnitude
+  the log records as unexplained); the cost is host-side submission, not the device. Traced MNIST inference already beats the CPU, and traced, the three
   models match or beat burn-flex on every tile: the SmolLM2 decode step 26.46 ms against 26.42,
   ViT-Tiny 11.6 ms against 112, ResNet-18 17.2 against 164 (2026-10-15, Track 2 item 6,
   [replay-fixed-cost.md](replay-fixed-cost.md)). A whole traced generation (ids in, logits out, any
@@ -511,7 +512,8 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         1.7B's 403. 135M 7.35 / 7.85 / 8.52 -> **6.97 / 7.54 / 8.27 ms**, 1.7B 11.76 / 12.23 / 12.95 -> **11.59 / 12.17 /
         12.95**. The products' barrier time is their slowest unit's work (their consumers need most units: sparse waits
         would save 0.03-0.07 ms), so A2 (sparse waits) and A3 (one launch for back-to-back ops, ~0.12 ms at best) are
-        not built.
+        not built. **Merged with P4** (2026-10-27, card 0, [log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0)): 135M **6.92 / 7.47 / 8.14 ms**,
+        1.7B **11.32 / 11.84 / 12.64** (burn-flex 26.5 / 29.1 / 30.5 and 298 / 318 / 336).
         **Found and fixed on the way:** decode attention's job recorded too low an L1 top, so busy prefetch read the next
         weights over its `K` and `V` at `Step(512)` (a 1.7B traced generation chose other tokens at a 256-token prompt;
         gate `step209`).
@@ -602,7 +604,8 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         alone), two unpacks a pair instead of twelve, bit for bit (a host checker of each `Dst` block's accumulation
         order, `matmul::order`; `step229`). The kernel 1.5-1.9x; the products are now bound by their gathers (the unpacks
         never bound them). `BLOCK_PAIR_US` re-fitted 0.4 -> 0.2. The 1.7B's prefill (BF16 weights, card 1, chunks of
-        512): 1,000 / 7,992 tokens **346.8 / 6,386 -> 283.8 / 5,984 ms**. Next: Step 2 (P5), the gathers.
+        512): 1,000 / 7,992 tokens **346.8 / 6,386 -> 283.8 / 5,984 ms**; on card 0 merged with S5, 283.7 / 5,983
+        (`1793060076`, [log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0)). Next: Step 2 (P5), the gathers.
       - [x] **The long-context softmax** (2026-10-25, card 0,
         [log](../learnings/performance-log.md#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0)).
         - **Measured first** (profile `1792900837`): at 8,192 positions the softmax is 48% of a 64-token chunk's

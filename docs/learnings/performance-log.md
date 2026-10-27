@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The decode and prefill streams merged](#the-decode-and-prefill-streams-merged-2026-10-27-card-0) | 2026-10-27 | the barriers pruned (S5) and each K-tile pair's tiles whole in their `Src` (P4) together, card 0: 135M **6.92 / 7.47 / 8.14 ms**, 1.7B **11.32 / 11.84 / 12.64**, the 1.7B prefill 283.7 / 5,983 ms at 1,000 / 7,992 tokens; every gate, conformance and the MNIST goldens hold; eight failing or hanging tests that predate both fixed |
 | [Which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0) | 2026-10-26 | a small op is 9.8 us on unit 0 (135M; 11.6 on the 1.7B), ~3 of it its barrier; 194 of the 135M step's 591 barriers (82 of the 1.7B's 403) order nothing the data needs, and a capture drops them: 135M **7.35 -> 6.97 ms**, 1.7B 11.76 -> **11.59**; sparse waits after products would save 0.03-0.07 ms (the barrier time there is the slowest unit's work); one launch for back-to-back ops ~0.12 ms at best |
 | [Compact BF16 slots, and where a BF16 decode step goes](#compact-bf16-slots-and-where-a-bf16-decode-step-goes-2026-10-26-cards-0-and-1) | 2026-10-26 | a 1.7B BF16 step is products 8.37 ms + 283 small ops 2.98 (weights free 6.26 ms); compact BF16 `B` slots in L1, bit for bit, 11.78 -> 11.68 ms; more read ahead (`ring`, `wide`) does not shorten a product; `fast-reads` 11.74 -> **11.54 ms** (card 1), all of it the weight stream, nothing for small ops |
 | [tt-metal's adjacent-core DRAM read gate on our mover](#tt-metals-adjacent-core-dram-read-gate-on-our-mover-2026-10-26-card-1) | 2026-10-26 | `gddr_adjacent_banks`: eight readers, one a channel, each on the tile beside its channel's NoC #0 endpoint, as tt-metal's Blackhole CI gate (490-512 GB/s): **507.7-508.3 GB/s** with a `fast-reads` image and tt-metal's 16 KiB packets as entries, **511.2** with 128 KiB entries (99.8% of 512), **496** the FF1 shape; the safe image 414 with packet entries (a safe entry costs ~359 cycles) and 511 with long ones |
@@ -371,6 +372,42 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The decode and prefill streams merged (2026-10-27, card 0)
+
+`decode-fixed-cost` (S5 A0-A1: [which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0),
+card 0) and `prefill-pair` (P4: [a K-tile pair's order](#a-k-tile-pairs-order-each-tile-whole-in-its-src-2026-10-26-card-1),
+card 1) merged into `traced-generation`, measured together on card 0 at `aa1a492`. Release, safe image, BF16 weights,
+`TT_TILES=all`, 2 warmups and 9 samples, every replay checked bit for bit; burn-flex in the same run.
+
+| | before both (card 0) | S5 alone (card 0) | P4 alone (card 1) | **merged (card 0)** | burn-flex |
+|---|--:|--:|--:|--:|--:|
+| 135M decode step, 32 / 128 / 256 tokens | 7.35 / 7.85 / 8.52 ms (`1793034872`) | 7.01 / 7.57 / 8.26 (`1793044749`) | not measured | **6.92 / 7.47 / 8.14** (`1793059270`) | 26.5 / 29.1 / 30.5 |
+| 1.7B decode step | 11.76 / 12.23 / 12.95 (`1793035290`) | 11.61 / 12.11 / 12.92 (`1793044901`) | not measured | **11.32 / 11.84 / 12.64** (`1793059419`) | 298.3 / 318.4 / 335.7 |
+| 1.7B prefill, 1,000 / 7,992 tokens, chunks of 512, 8,192 positions | not measured | not measured | 283.8 / 5,984 ms (`1793039593`; 346.8 / 6,386 before, `1793035166`) | **283.7 / 5,983** (`1793060076`) | |
+| 1.7B decode step after 1,000 / 7,992 tokens | | | 19.58 / 47.11 | **19.38 / 46.74** | |
+| traced build, 135M / 1.7B | 60.5 / 112 s | 54.7 / 134 | | 57.0 / 150 | |
+
+- **The merge is a little faster than S5 alone:** 0.09-0.12 ms on the 135M and 0.27-0.29 ms on the 1.7B. P4's order
+  changes every F32 / BF16-`B` product, decode's included; not profiled, so how much of the step's products it shortens is not
+  split out. Prefill on card 0 equals card 1's to 0.1 ms.
+- **tt-mnist, card 0, against the pre-merge commit `b6da451` in the same session:** MNIST 3.4 ms/step (b6da451: 3.6),
+  92.90% test accuracy (burn-flex 1.9 ms/step, 92.96%); transformer 92.1 ms/step (b6da451: 92.6; burn-flex 3.70). The merge
+  changes neither. Both are the order of magnitude slower than the scoreboard's 2026-10-10 rows that this log already records as
+  unexplained (the closeout's run, "All of these runs are an order of magnitude slower than the scoreboard's"): the
+  transformer's step is 59.6 ms of caller-side time outside any device call and a 32 ms wait for its download.
+- **Gates on the merged tree, card 0:** 107 of 109 in `1793054933` (both streams' gates, `step229`, the matmul and decode
+  steps, `step185`-`step188`, `step231`-`step233`, `step60`, `step121`, `step190`); the two left, then passed:
+  `step10`'s timestamper gate with `--profile` (it needs the stamping firmware) and `step188::the_native_context_agrees_with_flex`
+  in 2,190 s (`1793056743`, burn-flex's reference 1,501 s of it; the 900 s limit cut it off). `step12_mnist` (every test but
+  the two-card one) and `probe_pair_src_rows` 11 of 11. ttsim: the workspace tests, `step12_mnist --features e2e` (8 of 8,
+  goldens hold), conformance `1793054642` (2,973 of 3,025, the 52 listed failures and no other).
+- **Tests that failed before either stream, fixed in the merge:** `step190` hung in parallel runs (a sibling's fork
+  inherited `plan_floor`'s cache mid-initialisation: the parent's planning now goes through `outside_fork`); `essentials`
+  (F16's capabilities since `cff6742`); `step121` (the hazard checker took the pack roles' `SFPNOP` separator for a
+  take's consumer); `step21`, `step22` (blocked products, `5ae40a2`) and `step24` (thin reads, `dbe71bb`) each on the path
+  it gates; `step60` (the ops now fit its 24 KiB program cache: 8 KiB); `step10`'s timestamper (stamping is the `profile`
+  firmware's since `fcbc8bb`); `step188`'s native context (`cargo xtask silicon` gives it 3,600 s, `LONG`).
 
 ## Which barriers a decode step needs (2026-10-26, card 0)
 

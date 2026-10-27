@@ -135,7 +135,8 @@ has 64 x 64 output tiles: 8x8 blocks are 64 jobs on 120 units).
     - **B5:** `BLOCK_PAIR_US` 0.4 -> 0.2 (the tiles kernel's ~0.14-0.23 us a pair): `down`'s blocks read less (BF16 `B`
       18.5 -> 22.2 TFLOPS at 1,024 rows). The 1.7B's prefill at 8,192 positions, chunks of 512, BF16 weights, card 1:
       **346.8 / 6,386 -> 283.8 / 5,984 ms** for 1,000 / 7,992 tokens (`1793035166`, `1793039593`; tiles alone 298.4 /
-      5,937, `1793037497`). With the re-fit, card 1 `1793041458`: ResNet-18, ViT-Tiny, `step187` (10), `step188` (the 1.7B against burn-flex, 8,192 positions included), `step229`, `step205`, `step20`, `step184`, 43 of 43.
+      5,937, `1793037497`); on card 0 merged with decode-small-ops S5, 283.7 / 5,983 (`1793060076`,
+      [log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0)). With the re-fit, card 1 `1793041458`: ResNet-18, ViT-Tiny, `step187` (10), `step188` (the 1.7B against burn-flex, 8,192 positions included), `step229`, `step205`, `step20`, `step184`, 43 of 43.
   - [ ] **Next:** the gathers. With the tiles kernel a blocked product reads at ~240-394 GB/s and computes in ~60% of
     its time: P5 (each operand out of GDDR about once), the model's choice for the long prompt's attention products
     (the re-fit gives back 0.8% at 7,992 tokens), and whether the kernel's L1 reads slow the mover's writes (the phases

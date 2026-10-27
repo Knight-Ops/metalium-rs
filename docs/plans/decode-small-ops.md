@@ -329,6 +329,8 @@ the runs) holds or nothing changes.
 - **Measured** (card 0): 135M 7.35 / 7.85 / 8.52 -> **6.97 / 7.54 / 8.27 ms** (`1793039044`, burn-flex 26.9 / 29.2 /
   34.1); 1.7B 11.76 / 12.23 / 12.95 -> **11.59 / 12.17 / 12.95** (`1793039248`). The 135M's `Step(64)` is 398 ops
   (592). The analysis adds to a capture's build: the 1.7B traced generation's 112 -> 134 s (`1793044901`).
+  Merged with prefill-operand-reuse P4 (2026-10-27, card 0, [log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0)): 135M **6.92 / 7.47 / 8.14**
+  (`1793059270`), 1.7B **11.32 / 11.84 / 12.64** (`1793059419`).
 - **Aligning deals (opt-in, `TT_FOLLOW_RUNS=1`, `Session::set_follow_runs`):** an element-wise op whose operand the op
   before made over the same tiles on fewer units takes those units. On the 1.7B, `x gamma` follows RMSNorm's 32: 49
   more barriers pruned (131 of 403), and 11.63 / 12.11 / 12.93 ms (`1793040730`): within noise, the scale on half
