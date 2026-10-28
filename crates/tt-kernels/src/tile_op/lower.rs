@@ -57,7 +57,7 @@ pub fn jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Vec<
     let mut jobs = Vec::with_capacity(deal.runs.len());
     for (j, run) in deal.runs.iter().enumerate() {
         let len = run.len();
-        let half = deal.pipelined.then(|| tensor::half_of(j, units));
+        let half = deal.pipelined.then(|| super::distribute::half_of(j, units));
         let at = At::Run {
             len,
             half,
@@ -300,7 +300,7 @@ fn read(
                         wrap: None,
                     },
                 ) if iter == *outer && c == *inner => {
-                    for h in tensor::block_reads(run.start, len, w * ct, at, ct) {
+                    for h in block_reads(run.start, len, w * ct, at, ct) {
                         push(h);
                     }
                 }
@@ -337,6 +337,34 @@ fn read(
         _ => return Err(unsupported()),
     }
     Ok(())
+}
+
+/// `B`'s reads for a [`crate::sfpu::ops::Broadcast::Block`] run over `A`'s tiles `first..first + count` (row-major,
+/// `ct` a tile row), the slots from `at` on: output tile `t` reads `B`'s tile `t % period`
+/// (`period` its tiles, `B`'s tile rows times `ct`), as plain `READ_RUN`s over `B`'s own grid, one
+/// for each stretch between wraps. What a row gather expanding `B` to `A`'s shape would put in
+/// each slot, with no list of rows.
+///
+/// [`Broadcast::Block`]: crate::sfpu::ops::Broadcast::Block
+fn block_reads(first: usize, count: usize, period: usize, at: u64, ct: usize) -> Vec<[u32; 8]> {
+    let mut out = Vec::new();
+    let mut n = 0;
+    while n < count {
+        let t = (first + n) % period;
+        let len = (period - t).min(count - n);
+        out.push([
+            record::READ_RUN,
+            t as u32,
+            len as u32,
+            (at + n as u64 * tt_isa::dm::TILE_SLOT) as u32,
+            0,
+            ct as u32,
+            0,
+            0,
+        ]);
+        n += len;
+    }
+    out
 }
 
 /// A result's tiles for one run, from the slots at `at`.
@@ -497,7 +525,7 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
         let mut steps = Vec::with_capacity(3 * chunks.len());
         for (c, &(k0, count)) in chunks.iter().enumerate() {
             let half = match combine {
-                Combine::InDst => deal.pipelined.then(|| tensor::half_of(j, units)),
+                Combine::InDst => deal.pipelined.then(|| super::distribute::half_of(j, units)),
                 Combine::L1Halves { .. } => Some((c % 2) as u8),
                 Combine::GddrPartials { .. } => None,
             };
@@ -645,9 +673,10 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
                     .copied()
                     .flatten()
                     .is_some_and(|top| b_at >= top);
-            if ahead && gather.len() >= 5 && gather[gather.len() - 5][0] == record::GATHER {
-                let mut early = gather.split_off(gather.len() - 5);
-                early[0][1] = early[0][1] & !record::GATHER_STREAM | record::GATHER_PREFETCH;
+            if let Some(early) = ahead
+                .then(|| super::ahead::split(&mut gather, true))
+                .flatten()
+            {
                 gather.push([
                     tt_isa::dm::op::WAIT,
                     tt_isa::dm::WAIT_PREFETCH,

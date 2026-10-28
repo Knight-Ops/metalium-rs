@@ -2,7 +2,7 @@
 //! body as `l1::Requirements` ([`Microkernel::needs`]), placed here and nowhere else.
 //!
 //! A run is placed in the arena (`l1::arena`), or, staged in half `h` of it where its unit's runs
-//! are pipelined, planned in the first half (`matmul::half_arena`) and moved `h` halves up; a
+//! are pipelined, planned in the first half (`l1::half_arena`) and moved `h` halves up; a
 //! buffer declared against the arena's end ([`l1::Requirements::against_end`]) lies against the
 //! ring's end (`l1::ring_end`). Each placement is checked independently of the planner
 //! ([`l1::check`]) and noted as the op's (`l1::note_planned`), the same on every run whether or not
@@ -39,10 +39,7 @@ pub fn place(req: &Arc<Requirements>, half: Option<u8>) -> Result<Placed> {
         return Ok(placed.clone());
     }
     let (region, by) = match half {
-        Some(h) => (
-            crate::matmul::half_arena(),
-            h as u64 * crate::matmul::half(),
-        ),
+        Some(h) => (l1::half_arena(), h as u64 * l1::half()),
         None if req.has_end() => (
             tt_isa::l1::Region {
                 end: l1::ring_end(),
@@ -112,7 +109,7 @@ mod tests {
         let p0 = l1::take_planned();
         let second = place(&req, Some(1)).unwrap();
         let p1 = l1::take_planned();
-        let by = crate::matmul::half();
+        let by = l1::half();
         for name in ["sfpu A slots", "sfpu B slots", "sfpu output slots"] {
             assert_eq!(second.addr(name), first.addr(name) + by, "{name}");
         }

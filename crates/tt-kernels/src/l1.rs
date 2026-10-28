@@ -67,6 +67,21 @@ std::thread_local! {
     static RING_END: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// How far the second half of the arena ([`arena`]) is from the first, where a run is staged in
+/// alternating halves (pipelined): half the arena, on a slot-friendly boundary.
+pub fn half() -> u64 {
+    (arena().len() / 2) / 4096 * 4096
+}
+
+/// The first half of the arena ([`half`]).
+pub(crate) fn half_arena() -> Region {
+    Region {
+        name: "first half of the data arena",
+        base: tt_isa::l1::DATA.base,
+        end: tt_isa::l1::DATA.base + half(),
+    }
+}
+
 /// Where a product's `B` ring is placed against (`matmul::matmul_requirements_top_b`): [`arena`]'s
 /// end, or, while a capture plans into the trace arena (`tt_isa::l1::TRACE_ARENA`), the base of its
 /// persistent region above `DATA` -- the one layout that reaches past `DATA`, so every other

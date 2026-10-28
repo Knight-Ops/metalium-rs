@@ -2797,20 +2797,9 @@ pub enum Staging {
     SlotsHalf,
 }
 
-/// How far the second half of the data arena ([`crate::l1::arena`]) is from the first, for
-/// [`Staging::SlotsHalf`]: half the arena, on a slot-friendly boundary.
-pub fn half() -> u64 {
-    (crate::l1::arena().len() / 2) / 4096 * 4096
-}
-
-/// The first half of the data arena ([`Staging::SlotsHalf`]).
-pub(crate) fn half_arena() -> tt_isa::l1::Region {
-    tt_isa::l1::Region {
-        name: "first half of the data arena",
-        base: tt_isa::l1::DATA.base,
-        end: tt_isa::l1::DATA.base + half(),
-    }
-}
+pub use crate::l1::half;
+/// The arena's halves, where [`Staging::SlotsHalf`] stages a run (`crate::l1::half`).
+pub(crate) use crate::l1::half_arena;
 
 /// [`plan_layout_in`] in slots ([`Staging::Slots`] or [`Staging::SlotsHalf`]) for a product
 /// whose `A` is read packed (`crate::tensor`'s packed `A`): its ring holds the `a_slots` slots
