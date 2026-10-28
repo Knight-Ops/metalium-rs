@@ -2994,7 +2994,7 @@ fn plan_slots(
     use crate::runtime::RunError;
     use tt_isa::dm::{TILE_DATA, TILE_SLOT};
     assert!(
-        tile_image_bytes(in_fmt) <= TILE_DATA + 4096,
+        TileFormat::new(in_fmt).slot_bytes() <= TILE_SLOT,
         "slot staging must fit the operand image"
     );
     let m = match top_b {
@@ -3124,13 +3124,16 @@ pub enum SrcRoute {
     Bf16FromBf16,
     /// Packed block-float operands moved directly to Src.
     Bfp(crate::bfp::BfpFormat),
-    /// `A` as [`SrcRoute::Tf32FromFp32`]; `B` a weight stored packed in L1 (BF16, half the bytes,
-    /// or BFP8/4/2), moved as is in its own format ([`TileFormat::src_codes`]; a packed format in
-    /// with TF32 out is undefined, which ttsim refuses). A BF16 value in `Src` is a TF32 one whose
-    /// low three mantissa bits are clear, and BFP converts to BF16 losslessly, so the product is
-    /// [`SrcRoute::Tf32FromFp32`]'s over `B`'s values bit for bit (gate `step232` for BF16,
-    /// `step239` for BFP; `docs/plans/bf16-weight-storage.md`).
-    Tf32WithB(TileFormat),
+    /// Each operand in its own edge format (`docs/learnings/dataflow-compiler.md` §4, ADR 0004),
+    /// at least one of them packed ([`SrcRoute::edges`] gives [`SrcRoute::Tf32FromFp32`] for two
+    /// FP32 edges): an FP32 edge as [`SrcRoute::Tf32FromFp32`] takes it, a packed one (BF16, half
+    /// the bytes, or BFP8/4/2) moved as is in its own format ([`TileFormat::src_codes`]; a packed
+    /// format in with TF32 out is undefined, which ttsim refuses). A BF16 value in `Src` is a TF32
+    /// one whose low three mantissa bits are clear, and BFP converts to BF16 losslessly, so the
+    /// product is [`SrcRoute::Tf32FromFp32`]'s over the values the operands decode to, bit for bit
+    /// (gates `step232` for a BF16 `B`, `step239` for BFP, `step241` for every pair;
+    /// `docs/plans/bf16-weight-storage.md`).
+    Edges { a: TileFormat, b: TileFormat },
 }
 
 /// The L1 format and `OutDataFormat` of each operand of a product: `A` (in0, into `SrcB`) and
@@ -3141,6 +3144,23 @@ pub struct SrcFormats {
     pub a_out: u32,
     pub b: L1Format,
     pub b_out: u32,
+}
+
+/// Whether an edge format is FP32 (through TF32 in [`SrcRoute::Edges`]).
+const fn is_fp32(format: TileFormat) -> bool {
+    matches!(format.l1(), L1Format::Fp32)
+}
+
+/// The `OutDataFormat` an edge of `format` is unpacked under in [`SrcRoute::Edges`]: TF32 for
+/// FP32, the format itself for a packed one (moved as is into an e8 `Src` type).
+const fn edge_code(format: TileFormat) -> u32 {
+    if is_fp32(format) {
+        return TF32_CODE;
+    }
+    match format.src_codes(SrcType::Bf16) {
+        Some((_, out)) => out,
+        None => panic!("a packed edge unpacks into BF16"),
+    }
 }
 
 impl SrcFormats {
@@ -3169,7 +3189,7 @@ impl SrcRoute {
                     None => panic!("every BFP format's code is measured"),
                 },
             ),
-            SrcRoute::Tf32WithB(_) => (L1Format::Fp32, TF32_CODE),
+            SrcRoute::Edges { a, .. } => (a.l1(), edge_code(a)),
         }
     }
 
@@ -3177,14 +3197,11 @@ impl SrcRoute {
     /// slot size of every L1 plan's `A` and outputs; `B`'s is [`SrcRoute::b_slot`].
     pub const fn src_formats(self) -> SrcFormats {
         match self {
-            SrcRoute::Tf32WithB(b) => SrcFormats {
-                a: L1Format::Fp32,
-                a_out: TF32_CODE,
+            SrcRoute::Edges { a, b } => SrcFormats {
+                a: a.l1(),
+                a_out: edge_code(a),
                 b: b.l1(),
-                b_out: match b.src_codes(SrcType::Bf16) {
-                    Some((_, out)) => out,
-                    None => panic!("a packed `B` unpacks into BF16"),
-                },
+                b_out: edge_code(b),
             },
             _ => {
                 let (in_fmt, out) = self.formats();
@@ -3193,16 +3210,52 @@ impl SrcRoute {
         }
     }
 
-    /// `B`'s format where it is a packed weight beside an FP32 `A` ([`SrcRoute::Tf32WithB`]).
+    /// The route of two operands of edge formats `a` and `b` under the default contract: an FP32
+    /// edge through TF32, a packed one moved as is ([`SrcRoute::Edges`]), and two FP32 edges
+    /// [`SrcRoute::Tf32FromFp32`]. `None` for a format no gather reads or that is not one family
+    /// with TF32 (`tt_isa::dm::record::GATHER_FORMATS`: FP32, BF16, BFP8/4/2).
+    pub const fn edges(a: TileFormat, b: TileFormat) -> Option<SrcRoute> {
+        if tt_isa::dm::record::gather_a_format(a.l1()).is_none()
+            || tt_isa::dm::record::gather_b_format(b.l1()).is_none()
+        {
+            return None;
+        }
+        if is_fp32(a) && is_fp32(b) {
+            Some(SrcRoute::Tf32FromFp32)
+        } else {
+            Some(SrcRoute::Edges { a, b })
+        }
+    }
+
+    /// `B`'s format where it is packed ([`SrcRoute::Edges`]).
     pub const fn packed_b(self) -> Option<TileFormat> {
         match self {
-            SrcRoute::Tf32WithB(format) => Some(format),
+            SrcRoute::Edges { b, .. } if !is_fp32(b) => Some(b),
             _ => None,
         }
     }
 
-    /// The route of a weight stored BF16.
-    pub const TF32_WITH_BF16_B: SrcRoute = SrcRoute::Tf32WithB(TileFormat::BF16);
+    /// `A`'s format where it is packed ([`SrcRoute::Edges`]).
+    pub const fn packed_a(self) -> Option<TileFormat> {
+        match self {
+            SrcRoute::Edges { a, .. } if !is_fp32(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The route of a weight stored BF16 beside an FP32 `A`.
+    pub const TF32_WITH_BF16_B: SrcRoute = SrcRoute::Edges {
+        a: TileFormat::FP32,
+        b: TileFormat::BF16,
+    };
+
+    /// The route of a weight stored in `format` beside an FP32 `A`.
+    pub const fn tf32_with_b(format: TileFormat) -> SrcRoute {
+        match SrcRoute::edges(TileFormat::FP32, format) {
+            Some(route) => route,
+            None => panic!("a weight format no gather reads"),
+        }
+    }
 
     /// The bytes a `B` tile takes in a GDDR-staged plan's L1: a packed `B`'s own slot (its format's,
     /// [`tt_isa::dm::record::gather_b_format`] reads it there), so a ring holds more tiles
@@ -3214,9 +3267,14 @@ impl SrcRoute {
         }
     }
 
-    /// The bytes an `A` tile takes in a GDDR-staged plan's L1: [`tt_isa::dm::TILE_SLOT`].
+    /// The bytes an `A` tile takes in a GDDR-staged plan's L1: a packed `A`'s own slot (its
+    /// format's, [`tt_isa::dm::record::gather_a_format`] reads it there), as [`SrcRoute::b_slot`] is
+    /// `B`'s; [`tt_isa::dm::TILE_SLOT`] otherwise.
     pub const fn a_slot(self) -> u64 {
-        tt_isa::dm::TILE_SLOT
+        match self.packed_a() {
+            Some(format) => format.slot_bytes(),
+            None => tt_isa::dm::TILE_SLOT,
+        }
     }
 
     /// Both operands' slots in a GDDR-staged plan's L1.
@@ -3401,7 +3459,10 @@ fn chunk_fits_at(
     slots: Slots,
 ) -> bool {
     let in_fmt = route.formats().0;
-    if staging != Staging::Host && !matches!(in_fmt, L1Format::Fp32 | L1Format::Bf16) {
+    // Slots hold FP32 and BF16, and any edge format a gather reads ([`SrcRoute::Edges`]).
+    let slotted = matches!(in_fmt, L1Format::Fp32 | L1Format::Bf16)
+        || matches!(route, SrcRoute::Edges { .. });
+    if staging != Staging::Host && !slotted {
         return false;
     }
     let Ok(layout) = plan_layout_route(tiles, in_fmt, staging, slots) else {
@@ -3771,9 +3832,9 @@ mod tests {
         for (route, want) in [
             (SrcRoute::Tf32FromFp32, PairOrder::Tiles),
             (SrcRoute::TF32_WITH_BF16_B, PairOrder::Tiles),
-            (SrcRoute::Tf32WithB(TileFormat::BFP8), PairOrder::Tiles),
-            (SrcRoute::Tf32WithB(TileFormat::BFP4), PairOrder::Tiles),
-            (SrcRoute::Tf32WithB(TileFormat::BFP2), PairOrder::Tiles),
+            (SrcRoute::tf32_with_b(TileFormat::BFP8), PairOrder::Tiles),
+            (SrcRoute::tf32_with_b(TileFormat::BFP4), PairOrder::Tiles),
+            (SrcRoute::tf32_with_b(TileFormat::BFP2), PairOrder::Tiles),
             (SrcRoute::Bf16FromFp32, PairOrder::Faces),
             (SrcRoute::Bf16FromBf16, PairOrder::Faces),
             (SrcRoute::Bfp(crate::bfp::BfpFormat::Bfp8), PairOrder::Faces),

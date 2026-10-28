@@ -1892,17 +1892,17 @@ pub(crate) fn matmul_dram_prefetching(
     spread: usize,
     busy: &[Option<u64>],
 ) -> Result<(Work, Option<usize>, Option<Handoff>)> {
-    a.expect("a matmul", Elem::F32)?;
-    b.expect(
-        "a matmul",
-        match route.packed_b() {
-            Some(format) => Elem::Packed(format),
-            None => Elem::F32,
-        },
-    )?;
+    let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
+    a.expect("a matmul", edge(route.packed_a()))?;
+    b.expect("a matmul", edge(route.packed_b()))?;
     if route.packed_b().is_some() && b_transposed {
         return Err(TensorError::Shape(
             "a packed `B` is read untransposed: store its transpose".into(),
+        ));
+    }
+    if route.packed_a().is_some() && (a_transposed || reads.thin || reads.packed_a.is_some()) {
+        return Err(TensorError::Shape(
+            "a packed `A` is read untransposed and as whole tiles".into(),
         ));
     }
     let (m, ka) = if a_transposed {
@@ -2105,16 +2105,23 @@ pub(crate) fn matmul_dram_prefetching(
     ))
 }
 
-/// [`record::gather_b_format`] where `route` reads a packed `B` ([`SrcRoute::Tf32WithB`]): its
-/// tiles from their slots into L1 slots of its format's size, which every layout of the route
-/// plans ([`SrcRoute::b_slot`]).
-fn gather_b_format(route: SrcRoute) -> u32 {
-    match route.packed_b() {
+/// [`record::gather_b_format`] and [`record::gather_a_format`] where `route` reads a packed
+/// operand ([`SrcRoute::Edges`]): its tiles from their slots into L1 slots of its format's size,
+/// which every layout of the route plans ([`SrcRoute::slots`]).
+fn gather_formats(route: SrcRoute) -> u32 {
+    let b = match route.packed_b() {
         Some(format) => {
             record::gather_b_format(format.l1()).expect("a route's packed `B` is a gather format")
         }
         None => 0,
-    }
+    };
+    let a = match route.packed_a() {
+        Some(format) => {
+            record::gather_a_format(format.l1()).expect("a route's packed `A` is a gather format")
+        }
+        None => 0,
+    };
+    a | b
 }
 
 /// How one `[m, k, n]` product is cut into jobs: what [`matmul_dram`] and
@@ -2306,7 +2313,7 @@ impl BlockPlan {
                     } else {
                         0
                     }
-                    | gather_b_format(self.route);
+                    | gather_formats(self.route);
                 let mut gather = Vec::new();
                 if let (Some(pa), false) = (self.packed_a, resident) {
                     gather.extend(packed_a_reads(pa, 0, kt, a_at));
@@ -2986,7 +2993,7 @@ impl BlockPlan {
                     } else {
                         0
                     }
-                    | gather_b_format(self.route);
+                    | gather_formats(self.route);
                 let gather = probe_gather(
                     gather,
                     [
@@ -3150,7 +3157,7 @@ impl BlockPlan {
                         } else {
                             0
                         }
-                        | gather_b_format(self.route);
+                        | gather_formats(self.route);
                     let gather = match self.packed_a {
                         Some(pa) => packed_a_reads(pa, k0, count, layout.a_at),
                         None => Vec::new(),
@@ -3600,7 +3607,7 @@ fn push_block_stream_jobs(
                     } else {
                         0
                     }
-                    | gather_b_format(route);
+                    | gather_formats(route);
                 let gather = probe_gather(
                     Vec::new(),
                     [
