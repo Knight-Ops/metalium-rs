@@ -147,7 +147,7 @@ case [64, 8192] @ [8192, 512] [Fp32, Fp32] units 8 spread 8 pipeline true k Some
 case [64, 8192] @ [8192, 512] [Fp32, Fp32] units 1 spread 1 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0xaa200 need 0xaa200
 case [64, 8192] @ [8192, 512] [Fp32, Fp32] units 8 spread 8 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
-  planned top 0xa4080 need 0xa4080
+  planned top 0x38600 need 0x38600
 case [37, 2048] @ [2048, 300] [Fp32, Fp32] units 1 spread 1 pipeline true k Some(16) packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0x42880 need 0xe5080
 case [37, 2048] @ [2048, 300] [Fp32, Fp32] units 8 spread 8 pipeline true k Some(16) packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
@@ -201,7 +201,7 @@ case [1, 8192] @ [8192, 2048] [Fp32, Fp32] units 8 spread 8 pipeline true k None
 case [1, 8192] @ [8192, 2048] [Fp32, Fp32] units 8 spread 8 pipeline true k Some(16) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0x4bac0 need 0x4bac0
 case [1, 8192] @ [8192, 2048] [Fp32, Fp32] units 8 spread 8 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
-  planned top 0xa4080 need 0xa4080
+  planned top 0x66140 need 0x66140
 case [1, 8192] @ [8192, 2048] [Fp32, Fp32] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0xa4080 need 0xe5080
 case [1, 8192] @ [8192, 2048] [Fp32, Fp32] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
@@ -211,7 +211,7 @@ case [1, 8192] @ [8192, 2048] [Fp32, Fp32] units 64 spread 64 pipeline true k No
 case [1, 8192] @ [8192, 2048] [Fp32, Fp32] units 64 spread 64 pipeline true k Some(16) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0x4bac0 need 0x4bac0
 case [1, 8192] @ [8192, 2048] [Fp32, Fp32] units 64 spread 64 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
-  planned top 0xa4080 need 0xa4080
+  planned top 0x66140 need 0x66140
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 8 spread 8 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0x640c0 need 0xee2c0
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 8 spread 8 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
@@ -219,7 +219,7 @@ case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 8 spread 8 pipeline true k None 
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 8 spread 8 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0x100000 need 0xee2c0
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 8 spread 8 pipeline true k Some(16) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
-  planned top 0x42880 need 0xee2c0
+  planned top 0x375c0 need 0xee2c0
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 8 spread 8 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0x100000 need 0xee2c0
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
@@ -229,7 +229,7 @@ case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 64 spread 64 pipeline true k Non
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0x100000 need 0xee2c0
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 64 spread 64 pipeline true k Some(16) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
-  planned top 0x42880 need 0xee2c0
+  planned top 0x375c0 need 0xee2c0
 case [1, 1056] @ [1056, 200] [Fp32, Fp32] units 64 spread 64 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto
   planned top 0x100000 need 0xee2c0
 case [1, 2048] @ [2048, 6144] [Fp32, Fp32] units 64 spread 120 pipeline true k None packed_a true prefetch true busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] handoff None second 0 balanced 0 block Auto" Auto

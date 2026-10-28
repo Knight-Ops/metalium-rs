@@ -1970,8 +1970,8 @@ pub(crate) fn matmul_dram_prefetching(
         }
     }
     // The plan's block is what runs, so the arena must keep it (`matmul::plan_floor`) -- except
-    // where a packed `A`'s `K` is blocked: its blocks are `packed_k_block`'s, which notes its own
-    // layout, and its jobs a column each, whatever the plan's width; and a smaller arena keeps `K`
+    // where a packed `A`'s `K` is blocked: its blocks are `packed_k_block`'s, noted where they are
+    // placed (`tile_op::allocate`), and its jobs a column each, whatever the plan's width; and a smaller arena keeps `K`
     // blocked (`docs/plans/planned-l1-residency.md` 2h-i: `down` at 8192, 8960 and 14,336 laid
     // out and timed alike past the plan's floor).
     if !(reads.packed_a.is_some() && kc < kt) {
@@ -2155,9 +2155,10 @@ fn packed_k_block(
         if kc > limit {
             continue;
         }
-        let Ok((layout, reload)) =
+        // A measurement: the block chosen is noted where it is placed (`tile_op::allocate`).
+        let Ok((layout, reload)) = crate::l1::unnoted(|| {
             matmul::k_block_layout_with(kc, packed_a_slots(kc), route.slots())
-        else {
+        }) else {
             continue;
         };
         let layout = matmul::Layout {
@@ -2202,7 +2203,10 @@ pub(crate) fn stream_chunks(
         if kt.div_ceil(kq) % 2 != 0 || kq > limit {
             continue;
         }
-        let Ok(layout) = matmul::k_stream_layout(kq, a_slots, route.b_slot()) else {
+        // A measurement: the chunks chosen are noted where they are placed (`tile_op::allocate`).
+        let Ok(layout) =
+            crate::l1::unnoted(|| matmul::k_stream_layout(kq, a_slots, route.b_slot()))
+        else {
             continue;
         };
         let fits = (0..2).all(|c| {
@@ -2226,7 +2230,7 @@ pub(crate) fn stream_chunks(
 /// Size both first and continuation programs against the resident-cache limit.
 pub(crate) fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -> Result<usize> {
     loop {
-        if let Ok((layout, reload)) = matmul::k_block_layout(kc) {
+        if let Ok((layout, reload)) = crate::l1::unnoted(|| matmul::k_block_layout(kc)) {
             let fits = [None, Some(reload)].into_iter().all(|r| {
                 matmul::k_block_kernel(&layout, r, route, fidelity, false, matmul::LiveRows::All)
                     .iter()
@@ -2405,11 +2409,7 @@ pub(crate) fn block_stream_plan(
         return None;
     }
     type Key = (BlockStream, [usize; 3], usize, u64, SrcRoute, Fidelity, u64);
-    type Value = Option<(
-        BlockStreamShape,
-        matmul::BlockStreamLayout,
-        crate::l1::Planned,
-    )>;
+    type Value = Option<(BlockStreamShape, matmul::BlockStreamLayout)>;
     static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let arena = crate::l1::arena();
@@ -2423,11 +2423,7 @@ pub(crate) fn block_stream_plan(
         arena.end,
     );
     if let Some(v) = cache.lock().unwrap().get(&key) {
-        // What the layout needs of the arena, noted again as a fresh plan would.
-        return v.clone().map(|(s, l, p)| {
-            crate::l1::note_planned(p);
-            (s, l)
-        });
+        return v.clone();
     }
     let fits_arena = |tiles: [usize; 3]| {
         // Two semaphores pairs' worth of slack past the slots.
@@ -2462,25 +2458,20 @@ pub(crate) fn block_stream_plan(
         }
     };
     candidates.sort_by(|a, b| a.us.total_cmp(&b.us).then(a.bytes.total_cmp(&b.bytes)));
-    // The candidates' layouts are measurements: only the chosen one's plan is noted.
-    let chosen = crate::l1::unnoted(|| {
+    // The candidates' layouts are measurements: the chosen one is noted where it is placed
+    // (`tile_op::allocate`).
+    let value = crate::l1::unnoted(|| {
         candidates
             .into_iter()
             .filter(|s| mode != BlockStream::Auto || s.us < 0.9 * other_us)
             .filter(|s| fits_arena(s.tiles))
             .take(BLOCK_FIT_TRIES)
-            .find(|s| {
+            .find_map(|s| {
                 matmul::block_stream_layout(s.tiles, route.slots())
-                    .is_ok_and(|layout| block_stream_programs_fit(&layout, route, fidelity))
+                    .ok()
+                    .filter(|layout| block_stream_programs_fit(layout, route, fidelity))
+                    .map(|layout| (s, layout))
             })
-    });
-    let value = chosen.and_then(|s| {
-        let before = crate::l1::take_planned();
-        let layout = matmul::block_stream_layout(s.tiles, route.slots());
-        let planned = crate::l1::take_planned();
-        crate::l1::note_planned(before);
-        crate::l1::note_planned(planned);
-        Some((s, layout.ok()?, planned))
     });
     if let (BlockStream::Fixed(asked), None) = (mode, &value) {
         // Once a question (the cache keeps the answer): a sweep must not time the other paths
@@ -2491,7 +2482,7 @@ pub(crate) fn block_stream_plan(
         );
     }
     cache.lock().unwrap().insert(key, value.clone());
-    value.map(|(s, l, _)| (s, l))
+    value
 }
 
 /// The shape [`block_stream_plan`] chooses, without its layout: what a gate or a benchmark reports.
