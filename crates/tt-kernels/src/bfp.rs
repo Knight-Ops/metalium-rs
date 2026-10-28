@@ -46,6 +46,15 @@ impl BfpFormat {
     fn code(self) -> u32 {
         self.l1_format().code().expect("measured BFP format")
     }
+    /// The BFP format a tile of `format` is stored in, or `None` for a format that is not BFP.
+    pub const fn of(format: TileFormat) -> Option<BfpFormat> {
+        match format.l1() {
+            L1Format::Bfp8 => Some(Self::Bfp8),
+            L1Format::Bfp4 => Some(Self::Bfp4),
+            L1Format::Bfp2 => Some(Self::Bfp2),
+            _ => None,
+        }
+    }
 }
 
 /// A matrix of resident packed tiles, each four 16x16 faces. Every consecutive
@@ -60,6 +69,22 @@ pub struct BfpTensor {
 }
 
 impl BfpTensor {
+    /// The tensor whose `rows x cols` tiles of `format` are `placement`'s slots: another handle
+    /// on an allocation a [`DramTensor`] of [`Elem::Packed`] already names
+    /// ([`DramTensor::as_bfp`]).
+    pub(crate) fn from_parts(
+        rows: usize,
+        cols: usize,
+        format: BfpFormat,
+        placement: Placement,
+    ) -> Self {
+        BfpTensor {
+            rows,
+            cols,
+            format,
+            placement,
+        }
+    }
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -306,141 +331,6 @@ pub(crate) fn expand(alloc: &mut DramAlloc, input: &BfpTensor) -> Result<Work> {
     }
     out.set_pad(Pad::Zero);
     Ok(Work { out, jobs })
-}
-
-/// Full exponent groups reach Src directly. Each output tile uses the existing
-/// matrix face order and F32 accumulator reload between bounded K blocks.
-pub(crate) fn matmul(
-    alloc: &mut DramAlloc,
-    a: &BfpTensor,
-    b: &BfpTensor,
-    fidelity: crate::matmul::Fidelity,
-    k_limit: Option<usize>,
-) -> Result<Work> {
-    use crate::matmul::{self, SrcRoute};
-    use tt_isa::dm::{record, TILE_SLOT};
-    if a.format != b.format || a.cols != b.rows || [a.rows, a.cols, b.rows, b.cols].contains(&0) {
-        return Err(TensorError::Shape(
-            "packed BFP matmul requires compatible matrices of one format".into(),
-        ));
-    }
-    let route = SrcRoute::Bfp(a.format);
-    let kt = a.cols.div_ceil(32);
-    let kc = crate::tensor::k_block_size(kt.min(k_limit.unwrap_or(8)), route, fidelity)?;
-    let out = DramTensor::alloc(alloc, a.rows, b.cols)?;
-    let build = || -> Result<Vec<Job>> {
-        let mut jobs = Vec::new();
-        let rc = out.tensor_ref().encode();
-        for i in 0..a.rows.div_ceil(32) {
-            let live = crate::matmul::LiveRows::for_job(a.rows, i, 1);
-            for j in 0..b.cols.div_ceil(32) {
-                let mut job = Vec::new();
-                for k0 in (0..kt).step_by(kc) {
-                    let count = kc.min(kt - k0);
-                    let (layout, reload) = matmul::k_block_layout(count)?;
-                    let mut reads = Vec::new();
-                    if k0 > 0 {
-                        reads.push([op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
-                        reads.extend([
-                            [
-                                record::READ_RUN,
-                                (i * b.cols.div_ceil(32) + j) as u32,
-                                1,
-                                reload.prior as u32,
-                                0,
-                                0,
-                                0,
-                                0,
-                            ],
-                            rc[0],
-                            rc[1],
-                        ]);
-                    }
-                    for q in 0..count {
-                        reads.push(transfer(
-                            a.slot(i * kt + k0 + q),
-                            true,
-                            0,
-                            layout.a_at + q as u64 * TILE_SLOT,
-                            a.format.slot_bytes() as u32,
-                        ));
-                        reads.push(transfer(
-                            b.slot((k0 + q) * b.cols.div_ceil(32) + j),
-                            true,
-                            0,
-                            layout.b_at + q as u64 * TILE_SLOT,
-                            b.format.slot_bytes() as u32,
-                        ));
-                    }
-                    let (roles, _) = matmul::kernel_programs(
-                        [1, count, 1],
-                        if k0 > 0 { 0xb1 } else { 0xb0 },
-                        route,
-                        fidelity,
-                        layout.sems,
-                        false,
-                        false,
-                        live,
-                        || {
-                            (
-                                matmul::k_block_kernel(
-                                    &layout,
-                                    (k0 > 0).then_some(reload),
-                                    route,
-                                    fidelity,
-                                    false,
-                                    live,
-                                ),
-                                [None; 3],
-                            )
-                        },
-                    );
-                    job.extend([
-                        Step::List {
-                            what: "packed BFP matmul gather",
-                            entries: reads,
-                        },
-                        Step::Kernel {
-                            roles,
-                            init: layout.init,
-                            mop: Box::new([None; 3]),
-                            loops: Default::default(),
-                            half: None,
-                        },
-                        Step::List {
-                            what: "packed BFP matmul scatter",
-                            entries: vec![
-                                [
-                                    record::SCATTER,
-                                    layout.outputs[0].out as u32,
-                                    TILE_SLOT as u32,
-                                    i as u32,
-                                    1,
-                                    j as u32,
-                                    1,
-                                    0,
-                                ],
-                                rc[0],
-                                rc[1],
-                            ],
-                        },
-                    ]);
-                }
-                jobs.push(job);
-            }
-        }
-        Ok(jobs)
-    };
-    match build() {
-        Ok(jobs) => {
-            out.set_pad(Pad::Undefined);
-            Ok(Work { out, jobs })
-        }
-        Err(e) => {
-            alloc.free(&out.placement);
-            Err(e)
-        }
-    }
 }
 
 pub(crate) fn copy_into(src: &BfpTensor, dst: &BfpTensor) -> Result<Vec<Job>> {

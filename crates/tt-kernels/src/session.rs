@@ -855,6 +855,8 @@ pub struct Session<T: Transport> {
     resident_matmul_a: bool,
     /// [`Session::set_unpack_transposed_b`].
     unpack_transposed_b: bool,
+    /// [`Session::set_derived_fidelity`].
+    derived_fidelity: bool,
     /// [`Session::set_thin_stream_units`].
     thin_stream_units: bool,
     /// [`Session::set_thin_stream_count`].
@@ -1798,10 +1800,14 @@ fn l1_footprint(entries: &[[u32; 8]], gather: bool) -> Option<Vec<std::ops::Rang
                 record::GATHER if gather => {
                     let kt = record::gather_kt(head[1]) as u64;
                     // A resident `A` is not written: its slots hold what an earlier gather read.
+                    // A packed operand's tiles are slots of its format in L1
+                    // (`record::gather_a_format`, `record::gather_b_format`).
                     if head[1] & record::GATHER_A_RESIDENT == 0 {
-                        ranges.push(slots(head[2], head[5] as u64 * kt));
+                        let a = record::gather_a_tile_format(head[1])
+                            .map_or(TILE_SLOT, |f| f.slot_bytes());
+                        let at = head[2] as u64;
+                        ranges.push(at..at + head[5] as u64 * kt * a);
                     }
-                    // A packed `B`'s tiles are slots of its format in L1 (`record::gather_b_format`).
                     let b =
                         record::gather_b_tile_format(head[1]).map_or(TILE_SLOT, |f| f.slot_bytes());
                     let at = head[3] as u64;
@@ -2651,6 +2657,7 @@ impl<T: Transport> Session<T> {
             pending_allocs: 0,
             resident_matmul_a: true,
             unpack_transposed_b: true,
+            derived_fidelity: std::env::var("TT_DERIVED_FIDELITY").is_ok_and(|v| v == "1"),
             thin_stream_units: true,
             // `TT_THIN_STREAM_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             thin_stream_count: units_from_env("TT_THIN_STREAM_UNITS", THIN_STREAM_UNITS),
@@ -3301,42 +3308,6 @@ impl<T: Transport> Session<T> {
             .collect()
     }
 
-    /// Native F32 product of decoded BFP operands. Transposes, ragged edges
-    /// and K blocking follow the same scheduler as ordinary resident products.
-    pub fn bfp_matmul(
-        &mut self,
-        a: &crate::bfp::BfpTensor,
-        a_transposed: bool,
-        b: &crate::bfp::BfpTensor,
-        b_transposed: bool,
-        fidelity: Fidelity,
-    ) -> Result<DramTensor, TensorError> {
-        if !a_transposed && !b_transposed && a.format() == b.format() {
-            let limit = self.matmul_k_block_limit.map(std::num::NonZeroUsize::get);
-            let work = crate::bfp::matmul(&mut self.dram_state()?.alloc, a, b, fidelity, limit)?;
-            return self.execute(work, RESET_BUDGET);
-        }
-        let aa = self.bfp_to_f32(a)?;
-        let result = match self.bfp_to_f32(b) {
-            Ok(bb) => {
-                let result = self.matmul_dram(
-                    &aa,
-                    a_transposed,
-                    &bb,
-                    b_transposed,
-                    SrcRoute::Tf32FromFp32,
-                    fidelity,
-                    RESET_BUDGET,
-                );
-                let _ = self.free(bb);
-                result
-            }
-            Err(error) => Err(error),
-        };
-        let _ = self.free(aa);
-        result
-    }
-
     pub fn repack_bf16(
         &mut self,
         input: &crate::bf16::Bf16Tensor,
@@ -3505,33 +3476,6 @@ impl<T: Transport> Session<T> {
     ) -> Result<DramTensor, TensorError> {
         let work = crate::fpu::bf16_block(&mut self.dram_state()?.alloc, tensor, op)?;
         self.execute(work, RESET_BUDGET)
-    }
-
-    /// Multiply packed BF16 matrices with F32 accumulation/output. Large K
-    /// reloads the prior F32 accumulator between packed operand blocks.
-    pub fn matmul_bf16(
-        &mut self,
-        a: &crate::bf16::Bf16Tensor,
-        b: &crate::bf16::Bf16Tensor,
-        fidelity: Fidelity,
-        budget: u64,
-    ) -> Result<DramTensor, TensorError> {
-        let (mt, kt, nt) = (
-            a.rows.div_ceil(32),
-            a.cols.div_ceil(32),
-            b.cols.div_ceil(32),
-        );
-        let units = self.spread_for_product(mt * nt * kt);
-        let k_limit = self.matmul_k_block_limit.map(std::num::NonZeroUsize::get);
-        let work = crate::bf16::matmul(
-            &mut self.dram_state()?.alloc,
-            a,
-            b,
-            fidelity,
-            units,
-            k_limit,
-        )?;
-        self.execute_on(work, units, budget)
     }
 
     /// Traceable shape/index constants encoded as mover immediates. Callers
@@ -8034,6 +7978,9 @@ impl<T: Transport> Session<T> {
         if need == PadNeed::Any || t.pad() == Pad::Zero {
             return Ok(None);
         }
+        if let tensor::Elem::Packed(format) = t.elem {
+            return self.zero_packed_padding(t, format).map(Some);
+        }
         let units = self.spread_for(tiles_of(t));
         if t.placement.owned() {
             self.note_written(t);
@@ -8052,6 +7999,29 @@ impl<T: Transport> Session<T> {
         Ok(Some(copy))
     }
 
+    /// A copy of the packed tensor `t` (of `format`) whose padding is zero, for an op that reads
+    /// it: a BF16 tensor's datums copied bit for bit with zero around them
+    /// (`crate::bf16::repack_padded`). A BFP tensor's padding is zero by construction
+    /// ([`DramTensor::from_bfp`]); any other packed tensor whose padding is not known zero is
+    /// refused.
+    fn zero_packed_padding(
+        &mut self,
+        t: &DramTensor,
+        format: tt_isa::format::TileFormat,
+    ) -> Result<DramTensor, TensorError> {
+        let Some(bf16) = t.as_bf16() else {
+            return Err(TensorError::Shape(format!(
+                "a packed {format:?} operand whose padding is not known to be zero"
+            )));
+        };
+        let (rows, cols) = (t.rows, t.cols);
+        let sources: Vec<Option<[usize; 2]>> = (0..rows)
+            .flat_map(|r| (0..cols).map(move |c| Some([r, c])))
+            .collect();
+        let zeroed = self.repack_bf16_padded(&bf16, &sources, [rows, cols], 0)?;
+        Ok(DramTensor::from_bf16(zeroed, tensor::Pad::Zero))
+    }
+
     /// `op(A) @ op(B)` with every operand and the result in GDDR
     /// ([`tensor::matmul_dram`]), on the resident roles.
     #[allow(clippy::too_many_arguments)]
@@ -8066,23 +8036,45 @@ impl<T: Transport> Session<T> {
         budget: u64,
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
+        use tt_isa::format::TileFormat;
         // Before any padding fill: an integer tensor is refused untouched.
-        a.expect("a matmul", tensor::Elem::F32)?;
-        // A stored packed weight is read as it is, in its own format into `SrcA`: the product of
-        // the same values in FP32 bit for bit (`SrcRoute::Tf32WithB`, gates `step232`, `step239`).
-        let route = match (b.elem, route) {
-            (tensor::Elem::Packed(format), SrcRoute::Tf32FromFp32 | SrcRoute::Tf32WithB(_)) => {
-                SrcRoute::Tf32WithB(format)
+        for t in [a, b] {
+            if matches!(t.elem, tensor::Elem::I32 | tensor::Elem::Bool) {
+                t.expect("a matmul", tensor::Elem::F32)?;
             }
-            (tensor::Elem::Packed(format), _) => {
+        }
+        // Each operand is read as it is, in its own edge format: a packed one (BF16, BFP8/4/2)
+        // unpacked in that format, the product of the values it decodes to in FP32, bit for bit
+        // (`SrcRoute::Edges`, gates `step232`, `step239`, `step241`).
+        let packed = a.format() != TileFormat::FP32 || b.format() != TileFormat::FP32;
+        let route = match route {
+            SrcRoute::Tf32FromFp32 | SrcRoute::Edges { .. } => {
+                SrcRoute::edges(a.format(), b.format()).ok_or_else(|| {
+                    TensorError::Shape(format!(
+                        "a product of {:?} and {:?} operands: no gather reads them",
+                        a.format(),
+                        b.format()
+                    ))
+                })?
+            }
+            _ if packed => {
                 return Err(TensorError::Shape(format!(
-                    "a stored {format:?} `B` multiplies through TF32 only, not {route:?}"
+                    "packed operands ({:?}, {:?}) multiply through TF32 only, not {route:?}",
+                    a.format(),
+                    b.format()
                 )))
             }
-            _ => {
-                b.expect("a matmul", tensor::Elem::F32)?;
-                route
-            }
+            _ => route,
+        };
+        if route.packed_a().is_some() && a_transposed {
+            return Err(TensorError::Shape(
+                "a packed `A` is read untransposed: store its transpose".into(),
+            ));
+        }
+        // Every mantissa bit in the phases the edge formats need ([`Session::set_derived_fidelity`]).
+        let fidelity = match fidelity {
+            Fidelity::HiFi4 if self.derived_fidelity => route.full_precision(),
+            other => other,
         };
         // A single-face TF32 operand has a validated Src transpose route.
         // Conversion is already required by this product; arbitrary storage
@@ -8142,7 +8134,10 @@ impl<T: Transport> Session<T> {
         let pipeline = self.pipeline;
         let max_k_tiles = self.matmul_k_block_limit;
         let m = if a_transposed { a.cols } else { a.rows };
-        let thin = self.thin_matmul_reads && tensor::thin_rows(m, a_transposed) != 0;
+        // A packed `A` is read as whole tiles of its format.
+        let thin = self.thin_matmul_reads
+            && route.packed_a().is_none()
+            && tensor::thin_rows(m, a_transposed) != 0;
         let resident_a = self.resident_matmul_a;
         let unpack_b = self.unpack_transposed_b;
         // One row over a long `K`: every unit would read `A`'s `K / 32` tiles, an entry each,
@@ -8153,7 +8148,8 @@ impl<T: Transport> Session<T> {
             && !a_transposed
             && a.cols % 32 == 0
             && kt >= PACKED_A_K_TILES
-            && matches!(route, SrcRoute::Tf32FromFp32 | SrcRoute::Tf32WithB(_));
+            && route.packed_a().is_none()
+            && matches!(route, SrcRoute::Tf32FromFp32 | SrcRoute::Edges { .. });
         // The op that made `A` may have packed it already (`Session::set_packed_twins`).
         let twin = packs.then(|| self.packed_twin(a).cloned()).flatten();
         let packed = if packs && twin.is_none() {
@@ -9609,6 +9605,16 @@ impl<T: Transport> Session<T> {
     /// each tile as it reads it (`READ_TRANSPOSED`, ~10 us a tile on silicon), the same bits.
     pub fn set_unpack_transposed_b(&mut self, on: bool) {
         self.unpack_transposed_b = on;
+    }
+
+    /// Whether a product asked for at [`Fidelity::HiFi4`] (every mantissa bit) runs only the
+    /// phases its operands' edge formats need ([`SrcRoute::full_precision`], hypothesis H3 of
+    /// `docs/learnings/dataflow-compiler.md`): fewer `MVMUL`s where an edge brings fewer bits.
+    /// Opt-in (`TT_DERIVED_FIDELITY=1`): the bits are HiFi4's wherever no product overflows FP32,
+    /// and differ where one does (`step241`), so it is another numeric contract, not a schedule of
+    /// the default one (ADR 0005). A product asked for at fewer phases runs at them either way.
+    pub fn set_derived_fidelity(&mut self, on: bool) {
+        self.derived_fidelity = on;
     }
 
     /// Whether a one-tile-row GDDR product over a long `K` (at least [`THIN_STREAM_K_TILES`]

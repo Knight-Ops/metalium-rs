@@ -54,7 +54,8 @@ impl Format {
         }
     }
 
-    fn storage(self) -> StorageFormat {
+    /// The storage a matrix in this format is held in (F32 for the half dtypes and F32).
+    pub fn storage(self) -> StorageFormat {
         match self {
             Format::Bfp8 => StorageFormat::Bfp8,
             Format::Bfp4 => StorageFormat::Bfp4,
@@ -85,9 +86,23 @@ impl Plan {
     /// Every matrix stored BF16 ([`Format::Bf16Stored`]) but the embedding table, whose rows a
     /// lookup reads (an output head tied to it is stored on its own, [`crate::llama::Llama::untied`]).
     pub fn bf16_weights() -> Self {
+        Self::stored_weights(Format::Bf16Stored)
+    }
+
+    /// Every matrix stored in `format` ([`Format::Bf16Stored`], [`Format::Bfp8`], [`Format::Bfp4`]
+    /// or [`Format::Bfp2`]: a logical F32 matrix whose storage the products read where it lies)
+    /// but the embedding table, as [`Plan::bf16_weights`].
+    ///
+    /// # Panics
+    /// For a format that is not stored (F32 or a half dtype).
+    pub fn stored_weights(format: Format) -> Self {
+        assert!(
+            format.storage() != StorageFormat::F32,
+            "{format:?} is not a stored weight format"
+        );
         Self::new()
             .rule("embed_tokens", Format::F32)
-            .rule("", Format::Bf16Stored)
+            .rule("", format)
     }
 
     pub fn format(&self, name: &str) -> Format {

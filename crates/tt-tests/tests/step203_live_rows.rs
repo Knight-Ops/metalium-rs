@@ -269,7 +269,21 @@ fn a_bf16_product_computes_only_its_rows() {
             s.set_matmul_k_block_limit(k_block.and_then(std::num::NonZeroUsize::new));
             let product = |s: &mut Session<_>, trim: bool| {
                 set_trim_rows(trim);
-                let out = s.matmul_bf16(&a, &b, Fidelity::HiFi4, BUDGET);
+                let out = s.matmul_dram(
+                    &tt_kernels::tensor::DramTensor::from_bf16(
+                        a.clone(),
+                        tt_kernels::tensor::Pad::Zero,
+                    ),
+                    false,
+                    &tt_kernels::tensor::DramTensor::from_bf16(
+                        b.clone(),
+                        tt_kernels::tensor::Pad::Zero,
+                    ),
+                    false,
+                    tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    BUDGET,
+                );
                 set_trim_rows(true);
                 out.unwrap_or_else(|e| panic!("{label}: {e}"))
             };

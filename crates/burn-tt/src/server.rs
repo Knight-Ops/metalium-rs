@@ -124,13 +124,6 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
-    fn matmul_bf16(
-        &mut self,
-        _a: BufferId,
-        _b: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), TtError> {
-        Err(unsupported())
-    }
     /// Convert between resident F32 and physical BF16 storage on Tensix.
     fn cast_float(
         &mut self,
@@ -144,13 +137,6 @@ pub trait Engine {
         &mut self,
         _id: BufferId,
         _format: Option<tt_kernels::bfp::BfpFormat>,
-    ) -> Result<(BufferId, [usize; 2]), TtError> {
-        Err(unsupported())
-    }
-    fn matmul_bfp(
-        &mut self,
-        _a: BufferId,
-        _b: BufferId,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -181,8 +167,9 @@ pub trait Engine {
     }
     /// Forget one.
     fn free(&mut self, _id: BufferId) {}
-    /// `op(A) @ op(B)`, each operand transposed if asked, result left on the
-    /// device, as `(id, [rows, cols])`.
+    /// `op(A) @ op(B)`, each operand transposed if asked and in its own storage format (F32,
+    /// BF16, BFP: one product for every pair, `Session::matmul_dram`), result left on the device as
+    /// F32, as `(id, [rows, cols])`.
     fn matmul_dram(
         &mut self,
         _a: BufferId,
@@ -788,7 +775,6 @@ pub struct DramBuffers {
     next: BufferId,
     live: HashMap<BufferId, tt_kernels::tensor::DramTensor>,
     bf16: HashMap<BufferId, tt_kernels::bf16::Bf16Tensor>,
-    bfp: HashMap<BufferId, tt_kernels::bfp::BfpTensor>,
     next_trace: u64,
     traces: HashMap<u64, tt_kernels::trace::TraceId>,
     /// The profile mode's names for traces, by the session's trace number
@@ -891,27 +877,6 @@ impl DramBuffers {
             .map_err(TtError::from)?;
         Ok(self.insert(out))
     }
-    pub fn matmul_bf16<T: tt_device::Transport>(
-        &mut self,
-        s: &mut Session<T>,
-        a: BufferId,
-        b: BufferId,
-        fidelity: Fidelity,
-        budget: u64,
-    ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let ta = self
-            .bf16
-            .get(&a)
-            .ok_or_else(|| TtError::Device(format!("no BF16 buffer {a}")))?;
-        let tb = self
-            .bf16
-            .get(&b)
-            .ok_or_else(|| TtError::Device(format!("no BF16 buffer {b}")))?;
-        let out = s
-            .matmul_bf16(ta, tb, fidelity, budget)
-            .map_err(TtError::from)?;
-        Ok(self.insert(out))
-    }
     pub fn upload_bf16<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -963,16 +928,10 @@ impl DramBuffers {
         let error = |e: tt_kernels::tensor::TensorError| TtError::from(e);
         if let Some(format) = format {
             let t = s.bfp_from_f32(self.get(id)?, format).map_err(error)?;
-            let dims = [t.rows(), t.cols()];
-            self.next += 1;
-            self.bfp.insert(self.next, t);
-            Ok((self.next, dims))
+            Ok(self.insert(tt_kernels::tensor::DramTensor::from_bfp(t)))
         } else {
-            let t = self
-                .bfp
-                .get(&id)
-                .ok_or_else(|| TtError::Device(format!("no BFP buffer {id}")))?;
-            let t = s.bfp_to_f32(t).map_err(error)?;
+            let t = self.bfp(id)?;
+            let t = s.bfp_to_f32(&t).map_err(error)?;
             Ok(self.insert(t))
         }
     }
@@ -993,20 +952,6 @@ impl DramBuffers {
         Ok(self.insert(out))
     }
 
-    pub fn matmul_bfp<T: tt_device::Transport>(
-        &mut self,
-        s: &mut Session<T>,
-        a: BufferId,
-        b: BufferId,
-        fidelity: Fidelity,
-    ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let a = self.bfp.get(&a).ok_or_else(unsupported)?;
-        let b = self.bfp.get(&b).ok_or_else(unsupported)?;
-        let out = s
-            .bfp_matmul(a, false, b, false, fidelity)
-            .map_err(TtError::from)?;
-        Ok(self.insert(out))
-    }
     fn insert_bf16(&mut self, t: tt_kernels::bf16::Bf16Tensor) -> (BufferId, [usize; 2]) {
         let dims = [t.rows, t.cols];
         self.next += 1;
@@ -1120,14 +1065,13 @@ impl DramBuffers {
         src: BufferId,
         dst: BufferId,
     ) -> Result<(), TtError> {
-        if let Some(src_t) = self.bfp.get(&src) {
+        if let Ok(src_t) = self.bfp(src) {
             let dst_t = self
-                .bfp
-                .get(&dst)
-                .ok_or_else(|| TtError::Device("copy_into storage formats differ".into()))?;
-            return s.copy_into_bfp(src_t, dst_t).map_err(TtError::from);
+                .bfp(dst)
+                .map_err(|_| TtError::Device("copy_into storage formats differ".into()))?;
+            return s.copy_into_bfp(&src_t, &dst_t).map_err(TtError::from);
         }
-        if self.bfp.contains_key(&dst) {
+        if self.is_bfp(dst) {
             return Err(TtError::Device("copy_into storage formats differ".into()));
         }
         if let Some(src_t) = self.bf16.get(&src) {
@@ -1324,8 +1268,8 @@ impl DramBuffers {
         s: &mut Session<T>,
         id: BufferId,
     ) -> Result<Vec<f32>, TtError> {
-        if let Some(t) = self.bfp.get(&id) {
-            return s.download_bfp(t).map_err(TtError::from);
+        if let Ok(t) = self.bfp(id) {
+            return s.download_bfp(&t).map_err(TtError::from);
         }
         let t = self.get(id)?;
         s.download(t).map_err(TtError::from)
@@ -1385,9 +1329,6 @@ impl DramBuffers {
         if let Some(t) = self.live.remove(&id) {
             let _ = s.free(t);
         }
-        if let Some(t) = self.bfp.remove(&id) {
-            let _ = s.free_bfp(t);
-        }
         if let Some(t) = self.bf16.remove(&id) {
             let _ = s.free_bf16(t);
         }
@@ -1405,7 +1346,14 @@ impl DramBuffers {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
+        let (ta, tb) = (self.operand(a)?, self.operand(b)?);
+        // A packed operand's values are exact in either `Src` type: its edge picks the route.
+        let route = match (ta.elem, tb.elem) {
+            (tt_kernels::tensor::Elem::Packed(_), _) | (_, tt_kernels::tensor::Elem::Packed(_)) => {
+                SrcRoute::Tf32FromFp32
+            }
+            _ => route,
+        };
         let c = s
             .matmul_dram(
                 &ta,
@@ -1542,7 +1490,7 @@ impl DramBuffers {
         column: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         for b in [table, values] {
-            if self.bf16.contains_key(&b) || self.bfp.contains_key(&b) {
+            if self.bf16.contains_key(&b) || self.is_bfp(b) {
                 return Err(TtError::Device(
                     "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
                 ));
@@ -1568,7 +1516,7 @@ impl DramBuffers {
         column: bool,
     ) -> Result<(), TtError> {
         for b in [table, values.id] {
-            if self.bf16.contains_key(&b) || self.bfp.contains_key(&b) {
+            if self.bf16.contains_key(&b) || self.is_bfp(b) {
                 return Err(TtError::Device(
                     "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
                 ));
@@ -1647,7 +1595,7 @@ impl DramBuffers {
         table: BufferId,
         indices: BufferId,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+        if self.bf16.contains_key(&table) || self.is_bfp(table) {
             return Err(TtError::Device(
                 "a row select of a packed (BF16, F16 or BFP) table is not implemented".into(),
             ));
@@ -1668,7 +1616,7 @@ impl DramBuffers {
         indices: BufferId,
         zero_row: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+        if self.bf16.contains_key(&table) || self.is_bfp(table) {
             return Err(TtError::Device(
                 "a tap select of a packed (BF16, F16 or BFP) table is not implemented".into(),
             ));
@@ -2024,12 +1972,9 @@ impl DramBuffers {
         first: usize,
         rows: usize,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if let Some(t) = self.bfp.get(&a) {
+        if let Ok(t) = self.bfp(a) {
             let v = t.rows_view(first, rows).map_err(TtError::from)?;
-            let dims = [v.rows(), v.cols()];
-            self.next += 1;
-            self.bfp.insert(self.next, v);
-            return Ok((self.next, dims));
+            return Ok(self.insert(tt_kernels::tensor::DramTensor::from_bfp(v)));
         }
         if let Some(t) = self.bf16.get(&a) {
             let v = t.rows_view(first, rows).map_err(TtError::from)?;
@@ -2048,17 +1993,45 @@ impl DramBuffers {
 
     /// How many are live.
     pub fn len(&self) -> usize {
-        self.live.len() + self.bf16.len() + self.bfp.len()
+        self.live.len() + self.bf16.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.live.is_empty() && self.bf16.is_empty() && self.bfp.is_empty()
+        self.live.is_empty() && self.bf16.is_empty()
     }
 
     fn get(&self, id: BufferId) -> Result<&tt_kernels::tensor::DramTensor, TtError> {
         self.live
             .get(&id)
             .ok_or_else(|| TtError::Device(format!("no device buffer {id}")))
+    }
+
+    /// A product's operand: a buffer of the live map, or a BF16 one as a packed tensor (the same
+    /// allocation; its padding unknown, which the product repairs where `K` reaches it).
+    fn operand(&self, id: BufferId) -> Result<tt_kernels::tensor::DramTensor, TtError> {
+        if let Some(t) = self.bf16.get(&id) {
+            return Ok(tt_kernels::tensor::DramTensor::from_bf16(
+                t.clone(),
+                tt_kernels::tensor::Pad::Undefined,
+            ));
+        }
+        Ok(self.get(id)?.clone())
+    }
+
+    /// Whether `id` is a BF16 buffer (`Elem`'s half dtype, not a stored weight).
+    pub fn is_bf16(&self, id: BufferId) -> bool {
+        self.bf16.contains_key(&id)
+    }
+
+    /// A buffer stored BFP, as the BFP ops take it (the same allocation).
+    fn bfp(&self, id: BufferId) -> Result<tt_kernels::bfp::BfpTensor, TtError> {
+        self.get(id)?
+            .as_bfp()
+            .ok_or_else(|| TtError::Device(format!("no BFP buffer {id}")))
+    }
+
+    fn is_bfp(&self, id: BufferId) -> bool {
+        self.bfp(id).is_ok()
     }
 }
 
@@ -3036,37 +3009,6 @@ pub(crate) fn cast_bf16_storage(
     )
 }
 
-pub(crate) fn matmul_bfp(
-    device: TtDevice,
-    a: BufferId,
-    b: BufferId,
-    dims: [usize; 2],
-) -> (BufferId, [usize; 2]) {
-    submit(
-        "matmul_bfp",
-        device,
-        dims,
-        || "packed BFP matmul".into(),
-        move |engine, ids| engine.matmul_bfp(ids.get(a)?, ids.get(b)?),
-    )
-}
-
-/// Upload datums as bits, panicking on a device error.
-pub(crate) fn matmul_bf16(
-    device: TtDevice,
-    a: BufferId,
-    b: BufferId,
-    dims: [usize; 2],
-) -> (BufferId, [usize; 2]) {
-    submit(
-        "matmul_bf16",
-        device,
-        dims,
-        || "direct BF16 matmul".into(),
-        move |engine, ids| engine.matmul_bf16(ids.get(a)?, ids.get(b)?),
-    )
-}
-
 /// Upload datums as bits, panicking on a device error.
 pub(crate) fn upload_bits(
     device: TtDevice,
@@ -3817,15 +3759,6 @@ impl Engine for KmdEngine {
             dims,
         )
     }
-    fn matmul_bf16(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
-        self.buffers.as_mut().ok_or_else(unsupported)?.matmul_bf16(
-            &mut self.session,
-            a,
-            b,
-            self.fidelity,
-            self.budget,
-        )
-    }
     fn upload_bf16(&mut self, bits: &[u16], rows: usize, cols: usize) -> Result<BufferId, TtError> {
         self.buffers.as_mut().ok_or_else(unsupported)?.upload_bf16(
             &mut self.session,
@@ -3865,14 +3798,6 @@ impl Engine for KmdEngine {
             .as_mut()
             .ok_or_else(unsupported)?
             .cast_bf16_storage(&mut self.session, id, store)
-    }
-    fn matmul_bfp(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
-        self.buffers.as_mut().ok_or_else(unsupported)?.matmul_bfp(
-            &mut self.session,
-            a,
-            b,
-            self.fidelity,
-        )
     }
     fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, TtError> {
         Ok(self
@@ -4809,6 +4734,43 @@ pub struct MeshEngine<T: tt_device::Transport> {
 }
 
 impl<T: tt_device::Transport> MeshEngine<T> {
+    /// A product with a BF16 operand: the fabric moves F32 tiles, so both are widened first.
+    fn matmul_bf16_widened(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        // The existing Ethernet fabric transports F32 physical tiles. Widen
+        // on the root chip, compute BF16 Src products across the mesh, and
+        // let the Burn boundary narrow the joined F32 output once.
+        let mut temporary = Vec::new();
+        let result = (|| {
+            let (a, _) = self.cast_float(a, false)?;
+            temporary.push(a);
+            let (b, _) = self.cast_float(b, false)?;
+            temporary.push(b);
+            let a = self.buffers.get(a)?.clone();
+            let b = self.buffers.get(b)?.clone();
+            let out = self
+                .fabric
+                .matmul_resident(
+                    &a,
+                    false,
+                    &b,
+                    false,
+                    SrcRoute::Bf16FromFp32,
+                    self.fidelity,
+                    self.budget,
+                )
+                .map_err(TtError::from)?;
+            Ok(self.buffers.insert(out))
+        })();
+        for id in temporary {
+            self.buffers.free(self.fabric.chips[0].session(), id);
+        }
+        result
+    }
+
     /// Exact matmul would run unpartitioned on chip 0 here: refused by name.
     pub fn with_matmul_mode(self, mode: MatmulMode) -> Result<Self, TtError> {
         if mode != MatmulMode::Fast {
@@ -4935,37 +4897,6 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         self.buffers
             .pool_bf16(self.fabric.chips[0].session(), a, windows, divisors, dims)
     }
-    fn matmul_bf16(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
-        // The existing Ethernet fabric transports F32 physical tiles. Widen
-        // on the root chip, compute BF16 Src products across the mesh, and
-        // let the Burn boundary narrow the joined F32 output once.
-        let mut temporary = Vec::new();
-        let result = (|| {
-            let (a, _) = self.cast_float(a, false)?;
-            temporary.push(a);
-            let (b, _) = self.cast_float(b, false)?;
-            temporary.push(b);
-            let a = self.buffers.get(a)?.clone();
-            let b = self.buffers.get(b)?.clone();
-            let out = self
-                .fabric
-                .matmul_resident(
-                    &a,
-                    false,
-                    &b,
-                    false,
-                    SrcRoute::Bf16FromFp32,
-                    self.fidelity,
-                    self.budget,
-                )
-                .map_err(TtError::from)?;
-            Ok(self.buffers.insert(out))
-        })();
-        for id in temporary {
-            self.buffers.free(self.fabric.chips[0].session(), id);
-        }
-        result
-    }
     fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, TtError> {
         let b = &mut self.buffers;
         b.upload(self.fabric.chips[0].session(), v, rows, cols)
@@ -5007,6 +4938,12 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         b: BufferId,
         tb: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
+        if self.buffers.is_bf16(a) || self.buffers.is_bf16(b) {
+            if ta || tb {
+                return Err(unsupported());
+            }
+            return self.matmul_bf16_widened(a, b);
+        }
         let a = self.buffers.get(a)?.clone();
         let b = self.buffers.get(b)?.clone();
         let out = self

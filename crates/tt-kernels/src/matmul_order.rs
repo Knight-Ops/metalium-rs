@@ -594,7 +594,7 @@ mod tests {
             for b_transposed in [false, true] {
                 for route in ROUTES {
                     let shape = [2, 3, 2];
-                    let layout = block_stream_layout(shape, route.b_slot()).unwrap();
+                    let layout = block_stream_layout(shape, route.slots()).unwrap();
                     let (plain, _) = layout.chunk(0, shape);
                     let (code, loops) = block_stream_kernel_looped(
                         &layout,
@@ -654,7 +654,7 @@ mod tests {
                 ORDER_HERE.set(Some(order));
                 for route in ROUTES {
                     let shape = [2, 3, 2];
-                    let layout = block_stream_layout(shape, route.b_slot()).unwrap();
+                    let layout = block_stream_layout(shape, route.slots()).unwrap();
                     for c in [0, 1] {
                         let (code, loops) = block_stream_kernel_looped(
                             &layout,
@@ -702,7 +702,7 @@ mod tests {
                 for order in ORDERS {
                     ORDER_HERE.set(Some(order));
                     for fidelity in [Fidelity::Lo, Fidelity::HiFi4] {
-                        let layout = block_stream_layout(shape.tiles, route.b_slot()).unwrap();
+                        let layout = block_stream_layout(shape.tiles, route.slots()).unwrap();
                         let mut line = format!(
                             "{tiles:?} {route:?} {:?} {order:?} {fidelity:?}:",
                             shape.tiles

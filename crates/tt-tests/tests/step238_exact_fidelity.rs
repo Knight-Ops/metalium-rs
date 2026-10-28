@@ -90,7 +90,21 @@ fn product(
     b: &tt_kernels::bfp::BfpTensor,
     fidelity: Fidelity,
 ) -> Vec<u32> {
-    let out = s.bfp_matmul(a, false, b, false, fidelity).unwrap();
+    let (a, b) = (
+        tt_kernels::tensor::DramTensor::from_bfp(a.clone()),
+        tt_kernels::tensor::DramTensor::from_bfp(b.clone()),
+    );
+    let out = s
+        .matmul_dram(
+            &a,
+            false,
+            &b,
+            false,
+            tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+            fidelity,
+            1 << 40,
+        )
+        .unwrap();
     let bits = s
         .download(&out)
         .unwrap()

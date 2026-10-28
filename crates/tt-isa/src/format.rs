@@ -27,6 +27,14 @@ pub enum Family {
     Int,
 }
 
+/// A source register of the Matrix Unit: `SrcA` (unpacker 0; a product's `B`, in1, in this
+/// stack) or `SrcB` (unpacker 1; `A`, in0).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Src {
+    A,
+    B,
+}
+
 /// A datum type in `SrcA`/`SrcB` (`SrcASrcB.md`, "Data types").
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum SrcType {
@@ -161,6 +169,32 @@ impl TileFormat {
             (F::Int8 | F::Uint8, S::Int8) => Some(0),
             _ => None,
         }
+    }
+
+    /// Whether a tile of this format may be unpacked into `src` as `to` whole: one unpack of its
+    /// 1,024 datums (a block-float tile's exponent section with them), its rows then reached
+    /// through the RWCs, instead of a face at a time. Each `true` is measured on silicon, bit for
+    /// bit against the face order:
+    /// - FP32 as TF32, into either `Src`, and BF16 into `SrcA` (`docs/plans/prefill-operand-reuse.md`
+    ///   P4, card 1);
+    /// - BFP8, BFP4 and BFP2 into `SrcA`, hypothesis H7 of `docs/learnings/dataflow-compiler.md`
+    ///   (`step239`, ttsim and card 0 `1793160473`).
+    ///
+    /// BF16 and the block floats are moved into `Src` as they are, so either e8 type names the same
+    /// conversion. The rest are unmeasured, not refused by the hardware: a schedule takes the face
+    /// order there.
+    pub const fn whole_tile_unpack(self, to: SrcType, src: Src) -> bool {
+        use L1Format as F;
+        use SrcType as S;
+        matches!(
+            (self.l1, to, src),
+            (F::Fp32, S::Tf32, _)
+                | (
+                    F::Bf16 | F::Bfp8 | F::Bfp4 | F::Bfp2,
+                    S::Tf32 | S::Bf16,
+                    Src::A
+                )
+        )
     }
 
     /// The unpacker's `(InDataFormat, OutDataFormat)` codes for this format into `Src` as

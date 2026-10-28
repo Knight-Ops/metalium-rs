@@ -6,7 +6,9 @@
 [0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and
 [0005](../adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md).
 **Branch:** `dataflow-compiler`, in a worktree.
-**Silicon:** card 1 only until the owner says otherwise. No `--device all`, and no mesh, multi-card or Ethernet gate.
+**Silicon:** cards 0 and 1 (owner, 2026-10-28; card 1 only before that). Each gate is validated on one card, card 0 by
+default; benches stay on card 1, where Stage 0's baselines were taken, and a before/after pair always uses one card. No
+`--device all`, and no mesh, multi-card or Ethernet gate.
 
 Every stage opens by writing its hypothesis, prediction and kill criterion into the Bible's register (§13), then
 measures its baseline on card 1 at the stage's starting commit. A stage is kept only if its gates are bit-exact and the
@@ -25,7 +27,8 @@ track's order follows the evidence: products are bound by operand reads (scorebo
   - MNIST 1.398 / 2.882 / 8.290 ms/step (`1793150926`).
   - Prefill tokens/s is in the decode runs' first-token rows.
 - [ ] A 1.7B `Step(64)` profile on card 1 (`--profile`), for the card read meter and the tails. This is H4's baseline, taken
-  when F4a starts.
+  when F4a starts. One exists at F1's close (`1793170516`, BF16 weights, `28ed325`: Step(64) 10.90 ms on the card,
+  products 7.64 ms).
 - [x] Recorded in the log as card-1 baselines.
 
 ## Stage F1: `TileFormat` (ADR 0004), and one matmul for every format pair
@@ -46,20 +49,49 @@ track's order follows the evidence: products are bound by operand reads (scorebo
   on card 1** (`1793150259`, along with `step172`/`step173`/`step232`/`step233`/`step94`).
   - Still to cover: mixed pairs, once F1c builds them, and NaN/infinity blocks.
   - If it holds on silicon, the default contract's fidelity rule becomes "full precision for the edge formats".
-- [x] **F1c, the tensor handle carries its format** (`b9ba4c2`; `step239` on ttsim and card 1 `1793152118`; [log](../learnings/performance-log.md#packed-weights-on-the-block-stream-path-what-bytes-buy-2026-10-28-card-1)). Still to do: route a BFP weight here from burn-tt (today `bfp_matmul` widens a mixed pair), then judge the decode prediction through the model's decode path. In the probe's session one-row products are entry-bound, and the bytes buy nothing there.
-- [ ] **H7, whole tiles for packed formats:** BFP weights take the face order today (14.8 TFLOPS against BF16's 22.3 at prefill shapes).
-- [ ] **F1c, as first specified** (kept for its detail): Generalize the stored-BF16-weight precedent:
-  - `DramTensor::format() -> TileFormat`, with `Elem::Bf16` and a BFP weight as edge formats;
-  - `SrcRoute::Tf32WithBf16B` becomes `SrcRoute::Tf32WithB(TileFormat)`, its `b_slot`, `src_formats` and GATHER flags all
-    taken from the format.
-  - BFP8/4/2 weights beside TF32 activations then take the block-stream path, with its blocking, prefetch and
-    pipelining. Today `bfp::matmul` builds one output tile per job with no block reuse.
-  - `PairOrder::Auto`'s whole-tile unpacks (P4) are tried for packed formats by a gate, not assumed.
-- [ ] **F1d.** One matmul job builder, parameterized by the A, B, out and accumulator edge formats, replacing `tensor::matmul_dram*`, `bf16::matmul` and `bfp::matmul`.
-  - Gate: bit-exact against each old builder on every pair it supported, and new mixed pairs (BFP8/4 weights × BF16 or TF32 activations) against the specification model and burn-flex within derived bounds.
-  - Then delete the old builders, the `bfp.rs` same-format refusal and their per-format server functions.
-- [ ] `step12_mnist`, `cargo xtask conformance --release`, and silicon gates on card 1.
+- [x] **F1c, the tensor handle carries its format** (`b9ba4c2`; `step239` on ttsim and card 1 `1793152118`; [log](../learnings/performance-log.md#packed-weights-on-the-block-stream-path-what-bytes-buy-2026-10-28-card-1)).
+- [x] **F1c from burn-tt** (`562b170`, `7daa887`): a BFP weight is one `DramTensor` in burn-tt's one buffer map
+  (`DramTensor::as_bfp`; the separate `bfp` map is gone), and any packed weight beside an F32 activation is one product
+  (`ops::packed_weight_matmul`). `Plan::stored_weights(format)` and `Llama::with_stored_weights(format)` store a model's
+  weights in any packed format; the bench takes `TT_WEIGHT_STORAGE=bf16|bfp8|bfp4|bfp2|f32`. A transposed view stored
+  packed is made plain first, so a tied head is read as it lies (`7daa887`: before it, a BFP head was widened at every
+  step, 37 ms a 1.7B step).
+  - Gate `step240_bfp_weight_storage` (in `--smoke`): synthetic Llamas and SmolLM2-135M with BFP8/4 (and BFP2 on
+    silicon) weights generate the F32 model's tokens and logits bit for bit, eager and traced, with no widening; a tied
+    model stored as a checkpoint is; unrounded weights differ (the control). ttsim, card 0 `1793160231`, `1793175246`.
+  - `step168` was not tightened: its BFP plans store `embed_tokens`, whose lookup widens by design. `step240` holds the
+    no-widening claim instead.
+- [x] **H7, whole tiles for packed formats** (`eda859f`): confirmed. The licence is the descriptor fact
+  `TileFormat::whole_tile_unpack(to, src)`, read by `PairOrder::resolve`; `step239::whole_tile_orders_give_a_packed_weights_bits`
+  on ttsim and card 0 alone (`1793160473`). BFP weights at HiFi4 1.51x (`[1024,2048]@[2048,8192]`, 22.4 TFLOPS, BF16's
+  rate) and 2.3-2.5x (`[1024,8192]@[8192,2048]`, 26.6-29.1, above BF16's 22.1), card 1 `1793162109` -> `1793167801`.
+- [x] **F1c, as first specified:** done by the items above and F1d. `DramTensor` carries its format, the route is the
+  two edges' formats, a BFP weight takes the block-stream path, and whole tiles were gated (H7), not assumed.
+- [x] **F1d, one matmul builder** (`c5aab9a`, `3bc1d89`, `27c8d38`, `28ed325`).
+  - `matmul::Slots {a, b}` through every layout; GATHER bits 22-24 carry `A`'s format (kt is bits 8-21); a packed `A`
+    reads whole slots of its format, untransposed, with no thin rows or `pack_row`. Bit 2 (`GATHER_BF16`) is retired and
+    refused. `step172`/`step173` pass in the safe, `fast-reads` and `encoded-guard` modes.
+  - `SrcRoute::Edges {a, b}`: the `Src` types are derived from the two edge formats; `Bf16FromFp32` stays the one named
+    lossy contract. `Session::matmul_dram` is the only entry.
+  - Gate `step241_one_matmul_builder` (card 0 `1793162345`): every pair the old builders took, bit for bit against them,
+    then the old builders deleted (459 lines: `bf16::matmul`, `matmul_continuing`, `bf16::gather`, `bfp::matmul`,
+    `Session::{matmul_bf16, bfp_matmul}`, burn-tt's `Engine::{matmul_bf16, matmul_bfp}` and their twins). Mixed pairs
+    are checked against the card's FP32 product of the decoded values (the specification model's oracle), not burn-flex.
+    Negative control: `A`'s slot one size off fails it. Card 0 `1793164216`: 143 of 144, the one failure predating the
+    branch (`step167`'s BF16 RoPE, fixed in `5b99f6a`).
+  - **Derived fidelity is opt-in** (`TT_DERIVED_FIDELITY=1`, `27c8d38`): the phases each edge pair needs equal HiFi4 bit
+    for bit for every pair, signed zeros and subnormals included, until a product overflows FP32
+    (`step241::derived_phases_are_hifi4_until_a_product_overflows`, ttsim and card 0 `1793163275`). HiFi4 stays the
+    default contract.
+- [x] `step12_mnist` (8 of 8, the goldens), `cargo xtask conformance --release` (2,973 pass, 52 listed, 0 unexpected),
+  and the silicon gates on card 0: `--smoke` 1,236 of 1,236 at `7daa887` (`1793177942`).
 - **Prediction:** a BFP4-weight product is faster than BF16 at decode shapes in proportion to its bytes, at least 1.5× at m = 1. If H3 holds, the compute-bound BFP products run at ≥3× the BF16 HiFi4 rate.
+- **Result (2026-10-28, card 1): refuted at m = 1.** BFP4 weights make a 1.7B decode step 10.31 / 10.86 / 11.46 ms
+  against BF16's 11.25 / 11.89 / 12.64 (1.09x; `1793175898`, `1793165085`). The products' card time falls 7.64 -> 6.45
+  ms, but a one-row product is bound by its unpacks and math, not its bytes (profiles `1793170516`, `1793172384`), and
+  derived fidelity does not move it (`1793177229`). The routing stays: it reads a quarter of the bytes, is bit for bit,
+  and frees GDDR bandwidth for whatever binds next. The compute-bound half is not yet measured (BFP × BFP at prefill).
+  [Log](../learnings/performance-log.md#one-matmul-for-every-format-pair-and-bfp-weights-through-the-model-2026-10-28-cards-0-and-1).
 
 ## Stage F2: typed channels and the cross-core credit
 

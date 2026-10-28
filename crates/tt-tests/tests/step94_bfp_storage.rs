@@ -39,6 +39,45 @@ fn with_session(f: impl FnOnce(&mut Session<Transport<'_>>)) {
 
 // Independent f64 arithmetic oracle, with the measured late conversion's
 // special exponent-255 significands and subnormal flushing.
+/// `op(A) @ op(B)` of two BFP tensors: read where they lie by the one product
+/// (`SrcRoute::Edges`, F1d); a transposed operand, which a product reads only in
+/// FP32, decoded first.
+fn bfp_product(
+    s: &mut Session<Transport<'_>>,
+    a: &tt_kernels::bfp::BfpTensor,
+    a_transposed: bool,
+    b: &tt_kernels::bfp::BfpTensor,
+    b_transposed: bool,
+) -> tt_kernels::tensor::DramTensor {
+    use tt_kernels::tensor::DramTensor;
+    let operand = |s: &mut Session<Transport<'_>>, t: &tt_kernels::bfp::BfpTensor, transposed| {
+        if transposed {
+            (s.bfp_to_f32(t).unwrap(), true)
+        } else {
+            (DramTensor::from_bfp(t.clone()), false)
+        }
+    };
+    let (da, owned_a) = operand(s, a, a_transposed);
+    let (db, owned_b) = operand(s, b, b_transposed);
+    let out = s
+        .matmul_dram(
+            &da,
+            a_transposed,
+            &db,
+            b_transposed,
+            tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+            tt_kernels::matmul::Fidelity::HiFi4,
+            1 << 40,
+        )
+        .unwrap();
+    for (t, owned) in [(da, owned_a), (db, owned_b)] {
+        if owned {
+            s.free(t).unwrap();
+        }
+    }
+    out
+}
+
 fn block(row: &[f32], bits: u32) -> (u8, Vec<u8>) {
     let exp = row.iter().map(|x| (x.to_bits() >> 23) as u8).max().unwrap();
     let quantum = 2f64.powi(exp as i32 - 133);
@@ -231,9 +270,7 @@ fn packed_products_match_decoded_operands_through_k_reloads() {
                     std::num::NonZeroUsize::new(2),
                 ] {
                     s.set_matmul_k_block_limit(limit);
-                    let out = s
-                        .bfp_matmul(&ap, false, &bp, false, tt_kernels::matmul::Fidelity::HiFi4)
-                        .unwrap();
+                    let out = bfp_product(s, &ap, false, &bp, false);
                     assert_eq!(
                         s.download(&out).unwrap(),
                         want,
@@ -250,9 +287,7 @@ fn packed_products_match_decoded_operands_through_k_reloads() {
                     let tb = s.upload(&tail_b, 1, n).unwrap();
                     let pa = s.bfp_from_f32(&ta, format).unwrap();
                     let pb = s.bfp_from_f32(&tb, format).unwrap();
-                    let wrong = s
-                        .bfp_matmul(&pa, false, &pb, false, tt_kernels::matmul::Fidelity::HiFi4)
-                        .unwrap();
+                    let wrong = bfp_product(s, &pa, false, &pb, false);
                     assert_ne!(
                         s.download(&wrong).unwrap(),
                         want,
@@ -395,9 +430,7 @@ fn benchmark_resident_bfp_conversion_and_packed_product() {
                 assert_eq!(s.download(&aa).unwrap(), vec![1.0; m * k]);
                 assert_eq!(s.download(&bb).unwrap(), vec![1.0; k * n]);
                 let t = Instant::now();
-                let c = s
-                    .bfp_matmul(&a, false, &b, false, tt_kernels::matmul::Fidelity::HiFi4)
-                    .unwrap();
+                let c = bfp_product(s, &a, false, &b, false);
                 s.sync().unwrap();
                 let product = t.elapsed();
                 assert_eq!(s.download(&c).unwrap(), vec![k as f32; m * n]);
@@ -479,8 +512,10 @@ fn transposed_mixed_products_separate_decode_and_compression_error() {
                 (BfpFormat::Bfp4, BfpFormat::Bfp4),
                 (BfpFormat::Bfp2, BfpFormat::Bfp2),
             ] {
+                // An untransposed pair is read as it lies, in its own formats; ttsim refuses a
+                // BFP2 `Src` (divergence "Packed BFP2 matrix multiply"), so those are silicon's.
                 #[cfg(not(feature = "silicon"))]
-                if !transpose && fa == BfpFormat::Bfp2 && fb == BfpFormat::Bfp2 {
+                if !transpose && (fa == BfpFormat::Bfp2 || fb == BfpFormat::Bfp2) {
                     continue;
                 }
                 let ap = s.bfp_from_f32(&af, fa).unwrap();
@@ -516,15 +551,7 @@ fn transposed_mixed_products_separate_decode_and_compression_error() {
                     }
                 }
                 s.set_matmul_k_block_limit(std::num::NonZeroUsize::new(1));
-                let out = s
-                    .bfp_matmul(
-                        &ap,
-                        transpose,
-                        &bp,
-                        transpose,
-                        tt_kernels::matmul::Fidelity::HiFi4,
-                    )
-                    .unwrap();
+                let out = bfp_product(s, &ap, transpose, &bp, transpose);
                 let got = s.download(&out).unwrap();
                 assert_eq!(got, want);
                 for (got, (base, bound)) in got.into_iter().zip(compression) {

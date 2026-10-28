@@ -1016,9 +1016,18 @@ impl<B: burn_tt::storage::StorageBackend> Llama<B> {
     /// multiplies F32 (`docs/plans/bf16-weight-storage.md`). Apply after [`Llama::fused`], so the
     /// fused matrices are the ones stored.
     pub fn with_bf16_weights(self) -> Self {
+        self.with_stored_weights(crate::quant::Format::Bf16Stored)
+    }
+
+    /// Every weight but the embedding table stored in `format` (BF16 or BFP8/4/2), the output
+    /// head untied first ([`crate::quant::Plan::stored_weights`]). Each product reads its weight in
+    /// that format where it lies and computes the values it decodes to in F32, so the logits equal
+    /// the F32 model's whose weights hold those values, bit for bit
+    /// (`docs/plans/dataflow-compiler.md` F1c). Apply after [`Llama::fused`].
+    pub fn with_stored_weights(self, format: crate::quant::Format) -> Self {
         crate::quant::apply(
             self.untied(),
-            &crate::quant::Plan::bf16_weights(),
+            &crate::quant::Plan::stored_weights(format),
             &crate::quant::Native,
         )
     }

@@ -37,39 +37,40 @@ pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     if crate::matmul_mode::effective(a.device) != crate::MatmulMode::Fast {
         return None;
     }
-    if let Some(t) = bf16_weight_matmul(a, b) {
+    if let Some(t) = packed_weight_matmul(a, b) {
         return Some(t);
     }
-    if a.storage_format() != b.storage_format()
-        || a.storage_format() == crate::storage::StorageFormat::F32
-        || a.shape().num_dims() != 2
+    // Any other pair of storage formats (BFP or BF16 on either side, one format or two): one
+    // product of the values each decodes to, its result stored as the wider input
+    // ([`bfp_result_storage`]).
+    if a.shape().num_dims() != 2
         || b.shape().num_dims() != 2
         || a.is_transposed()
         || b.is_transposed()
         || a.is_view()
         || b.is_view()
+        || !crate::server::supports_dram(a.device)
     {
         return None;
     }
-    assert_eq!(a.device, b.device, "BFP matmul devices differ");
+    assert_eq!(a.device, b.device, "packed matmul devices differ");
     let (aa, bb) = (a.to_dram(), b.to_dram());
-    let (id, dims) = crate::server::matmul_bfp(
-        a.device,
-        aa.buffer.id,
-        bb.buffer.id,
-        [aa.buffer.rows, bb.buffer.cols],
-    );
-    Some(device_result(a.device, id, dims).with_storage(a.storage_format()))
+    let (id, dims) = crate::server::matmul_dram(a.device, aa.buffer.id, false, bb.buffer.id, false);
+    Some(bfp_compute_result(
+        device_result(a.device, id, dims),
+        bfp_result_storage("float_matmul", &[a, b]),
+    ))
 }
 
-/// `a @ b` for an F32 `a` and a weight `b` stored BF16 ([`crate::storage::StorageFormat::Bf16`]),
-/// read where it lies: `a`'s leading dimensions folded into rows, one product on the card, bit for
-/// bit the product of `b`'s values in F32 (`Session::matmul_dram`, `SrcRoute::TF32_WITH_BF16_B`).
-/// `None` (the widening path) for anything else: a transposed or viewed `b`, `b` with a batch, a
-/// host `a`, an engine without GDDR.
-fn bf16_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
+/// `a @ b` for an F32 `a` and a weight `b` stored in any packed format (BF16, BFP8, BFP4, BFP2:
+/// [`crate::storage::StorageFormat`]), read where it lies: `a`'s leading dimensions folded into
+/// rows, one product on the card, bit for bit the product of the values `b` decodes to, in F32
+/// (`Session::matmul_dram`, `SrcRoute::Tf32WithB`: the format is `b`'s edge). `None` (the
+/// widening path) for anything else: a transposed or viewed `b`, `b` with a batch, a host `a`, an
+/// engine without GDDR.
+fn packed_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     use crate::storage::StorageFormat;
-    if b.storage_format() != StorageFormat::Bf16
+    if b.storage_format() == StorageFormat::F32
         || a.storage_format() != StorageFormat::F32
         || a.dtype() != DType::F32
         || b.is_transposed()
@@ -86,7 +87,7 @@ fn bf16_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     if ls[ls.len() - 1] != k {
         return None;
     }
-    assert_eq!(a.device, b.device, "BF16 weight matmul devices differ");
+    assert_eq!(a.device, b.device, "packed weight matmul devices differ");
     let rows: usize = ls[..ls.len() - 1].iter().product();
     let mut out = vec![1; rs.len().saturating_sub(ls.len())];
     out.extend_from_slice(&ls[..ls.len() - 1]);
@@ -338,12 +339,7 @@ pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
         a.buffer.cols, b.buffer.rows,
         "BF16 matmul inner dimensions differ"
     );
-    let (id, dims) = crate::server::matmul_bf16(
-        lhs.device,
-        a.buffer.id,
-        b.buffer.id,
-        [a.buffer.rows, b.buffer.cols],
-    );
+    let (id, dims) = crate::server::matmul_dram(lhs.device, a.buffer.id, false, b.buffer.id, false);
     Some(cast_native(
         device_result(lhs.device, id, dims),
         DType::BF16,
@@ -424,17 +420,14 @@ fn materialized_batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTenso
         };
         let a = pack(lhs, &va, &ls, &la, [m, k]);
         let b = pack(rhs, &vb, &rs, &lb, [k, n]);
-        let (id, dims) = if dtype == DType::BF16 {
-            crate::server::matmul_bf16(device, a.to_dram().buffer.id, b.to_dram().buffer.id, [m, n])
-        } else {
-            crate::server::matmul_dram(
-                device,
-                a.to_dram().buffer.id,
-                false,
-                b.to_dram().buffer.id,
-                false,
-            )
-        };
+        // F32 or BF16 operands alike: one product of their values (F1d).
+        let (id, dims) = crate::server::matmul_dram(
+            device,
+            a.to_dram().buffer.id,
+            false,
+            b.to_dram().buffer.id,
+            false,
+        );
         outputs.push(device_result(device, id, dims));
     }
     let ids = outputs.iter().map(|t| t.to_dram().buffer.id).collect();

@@ -291,7 +291,21 @@ fn bf16_mnist_matmul() {
                 for rep in 0..=REPS {
                     let start = Instant::now();
                     let out = if packed {
-                        s.matmul_bf16(&ba, &bb, Fidelity::HiFi4, 40_000_000)
+                        s.matmul_dram(
+                            &tt_kernels::tensor::DramTensor::from_bf16(
+                                ba.clone(),
+                                tt_kernels::tensor::Pad::Zero,
+                            ),
+                            false,
+                            &tt_kernels::tensor::DramTensor::from_bf16(
+                                bb.clone(),
+                                tt_kernels::tensor::Pad::Zero,
+                            ),
+                            false,
+                            tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+                            Fidelity::HiFi4,
+                            40_000_000,
+                        )
                     } else {
                         s.matmul_dram(
                             &fa,

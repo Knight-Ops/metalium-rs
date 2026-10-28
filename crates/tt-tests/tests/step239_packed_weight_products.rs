@@ -14,7 +14,7 @@
 //! a transposed packed weight and any route but TF32's are refused.
 use tt_isa::format::{SrcType, TileFormat};
 use tt_kernels::bfp::BfpFormat;
-use tt_kernels::matmul::{Fidelity, SrcRoute};
+use tt_kernels::matmul::{set_pair_order, Fidelity, PairOrder, SrcRoute};
 use tt_kernels::session::{Session, Spread, TileChoice};
 use tt_kernels::tensor::{BlockStream, DramTensor, Elem};
 use tt_ttsim::fork_scope;
@@ -243,6 +243,82 @@ fn a_packed_weight_multiplies_as_its_decoded_values() {
             for t in [a, w, stored, want, got] {
                 s.free(t).unwrap();
             }
+        }
+    });
+}
+
+/// Hypothesis H7 (`docs/learnings/dataflow-compiler.md` §13): a packed weight's tile unpacked whole
+/// into `SrcA` (one 1,024-datum unpack, its exponent section included), with `A`'s whole or by
+/// faces, gives the faces order's bits. Each forced order's product of the packed weight equals
+/// the product of its decoded values (FP32, `PairOrder::Auto`), at HiFi4 and at the derived phases,
+/// on the paths that build their pairs differently (whole K, ragged, K blocks, 2-D blocks).
+#[test]
+fn whole_tile_orders_give_a_packed_weights_bits() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        let cases: [Case; 4] = [
+            (64, 256, 96, None, BlockStream::Off, "whole K, slots"),
+            (
+                37,
+                100,
+                70,
+                None,
+                BlockStream::Off,
+                "ragged in every dimension",
+            ),
+            (64, 256, 96, Some(2), BlockStream::Off, "K blocks"),
+            (
+                70,
+                288,
+                100,
+                None,
+                BlockStream::Fixed([2, 3, 2]),
+                "2-D blocks, ragged",
+            ),
+        ];
+        let orders = [
+            PairOrder::Faces,
+            PairOrder::Tiles,
+            PairOrder::SrcAWhole,
+            PairOrder::SrcBWhole,
+        ];
+        for format in formats() {
+            let tile = TileFormat::new(format.l1_format());
+            let derived =
+                Fidelity::full_precision((TileFormat::FP32, SrcType::Tf32), (tile, SrcType::Bf16))
+                    .expect("TF32 beside BFP has a full-precision phase count");
+            for (seed, (m, k, n, limit, block, what)) in cases.into_iter().enumerate() {
+                let seed = seed as u64;
+                let a = s.upload(&values(300 + seed, m * k), m, k).unwrap();
+                let w = s.upload(&values(400 + seed, k * n), k, n).unwrap();
+                let packed = s.bfp_from_f32(&w, format).unwrap();
+                let decoded = s.bfp_to_f32(&packed).unwrap();
+                let stored = DramTensor::from_bfp(packed);
+                s.set_matmul_k_block_limit(limit.and_then(std::num::NonZeroUsize::new));
+                s.set_block_stream(block);
+                set_pair_order(PairOrder::Auto);
+                let want = mm(s, &a, &decoded, Fidelity::HiFi4);
+                let want_v = s.download(&want).unwrap();
+                assert!(want_v.iter().any(|&v| v != 0.0), "{what}: an empty product");
+                for order in orders {
+                    set_pair_order(order);
+                    for fidelity in [Fidelity::HiFi4, derived] {
+                        let got = mm(s, &a, &stored, fidelity);
+                        assert_bits(
+                            &format!("{format:?}, {what}, {order:?}, {fidelity:?}"),
+                            &s.download(&got).unwrap(),
+                            &want_v,
+                        );
+                        s.free(got).unwrap();
+                    }
+                }
+                set_pair_order(PairOrder::Auto);
+                for t in [a, w, stored, decoded, want] {
+                    s.free(t).unwrap();
+                }
+            }
+            s.set_matmul_k_block_limit(None);
+            s.set_block_stream(BlockStream::Auto);
         }
     });
 }
