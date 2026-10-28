@@ -118,6 +118,12 @@ const LONG: &[(&str, u64)] = &[
         "step188_smollm2_1_7b::the_native_context_agrees_with_flex",
         3600,
     ),
+    // 127-137 s on card 0 (`1793118783`, `1793123581`, `1793216293`): past the default, so it
+    // timed out unless a run raised the limit (`1793216268`).
+    (
+        "step188_smollm2_1_7b::traced_generation_equals_the_eager_one",
+        240,
+    ),
 ];
 
 pub const SMOKE: &[&str] = &[

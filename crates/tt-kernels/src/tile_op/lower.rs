@@ -41,14 +41,14 @@ use super::distribute::Deal;
 use super::{Access, Combine, Dim, IterKind, Layout, RunCode, TileMap, TileOp};
 use crate::tensor::{self, Job, Result, Step, TensorError};
 
-pub fn jobs(op: &TileOp, deal: &Deal, units: usize) -> Result<Vec<Job>> {
+pub fn jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Vec<Job>> {
     let parallel: Vec<usize> = op.parallel().collect();
     let reductions: Vec<usize> = op.reductions().collect();
+    if op.body.block().is_some() {
+        return block_jobs(op, deal, units, first);
+    }
     if let Some(chunk) = partials_chunk(op) {
         return chunked_jobs(op, chunk);
-    }
-    if !deal.blocks.is_empty() {
-        return block_jobs(op, deal);
     }
     let [gather_what, scatter_what] = op.body.lists(false);
     let weight = op.weight();
@@ -198,7 +198,7 @@ fn run_record(first: usize, count: usize, at: u64, flags: u32, ct: usize, rt: u3
 
 fn tiles_of(a: &Access) -> Result<tt_isa::dm::record::TensorRef> {
     match &a.layout {
-        Layout::Tiles(r) => Ok(*r),
+        Layout::Tiles(r) | Layout::Packed { tiles: r, .. } => Ok(*r),
         Layout::PackedRow(_) => Err(TensorError::Shape(
             "an operand read packed one row is not a tile edge".into(),
         )),
@@ -314,7 +314,7 @@ fn read(
 /// A result's tiles for one run, from the slots at `at`.
 fn write(r: &Access, run: &std::ops::Range<usize>, at: u64, out: &mut Vec<[u32; 8]>) {
     match &r.layout {
-        Layout::Tiles(t) => {
+        Layout::Tiles(t) | Layout::Packed { tiles: t, .. } => {
             let t = t.encode();
             out.extend([
                 [
@@ -394,60 +394,92 @@ fn edge_format(a: &Access, of: fn(tt_isa::tile::L1Format) -> Option<u32>) -> Res
     of(f.l1()).ok_or_else(|| TensorError::Shape(format!("no gather reads a {f:?} edge")))
 }
 
-/// The jobs of a contraction dealt in blocks, its terms in chunks continued in L1
-/// ([`Combine::L1Halves`]): a job a block, three steps a chunk, the results written by the last.
-fn block_jobs(op: &TileOp, deal: &Deal) -> Result<Vec<Job>> {
-    let (pair, [p, k, _]) = contraction(op)?;
-    let chunk = match op.domain[k].kind {
-        IterKind::Reduction(c) => match c.combine {
-            Combine::L1Halves { chunk } => chunk,
-            other => {
-                return Err(TensorError::Shape(format!(
-                    "blocks whose terms combine {other:?}"
-                )))
-            }
-        },
+/// The jobs of a contraction dealt in blocks: a job a block, three steps a chunk of its terms, the
+/// chunks as the reduction's contract says:
+/// - [`Combine::InDst`]: one chunk of every term, staged in alternating halves where the deal is
+///   pipelined (a unit's runs alternate);
+/// - [`Combine::L1Halves`]: chunks alternating halves, the results written by the last;
+/// - [`Combine::GddrPartials`]: blocks of one tile, each chunk after the first waiting for the
+///   last's write and reloading the partial from the result after its reads, every chunk written.
+///
+/// A held first operand ([`Microkernel::holds`]) is not read again by a unit's run that needs
+/// the same tiles in the same slots: a packed one reads none, a tiled one is marked resident
+/// (`GATHER_A_RESIDENT`). A unit's first run, staged in place, reads its `STREAM`ed operand
+/// ahead where [`TileOp::ahead`] allows (a `BUSY_PREFETCH` list, the gather waiting for it).
+fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Vec<Job>> {
+    let units = units.max(1);
+    let (pair, [p, k, q]) = contraction(op)?;
+    let combine = match op.domain[k].kind {
+        IterKind::Reduction(c) => c.combine,
         IterKind::Parallel => unreachable!("a contraction's reduction"),
     };
     let [gather_what, scatter_what] = op.body.lists(false);
     let weight = op.weight();
-    let chunks = weight.div_ceil(chunk.max(1));
-    let (ra, rb) = (
-        tiles_of(&op.operands[pair.a])?,
-        tiles_of(&op.operands[pair.b])?,
-    );
+    let (a, b) = (&op.operands[pair.a], &op.operands[pair.b]);
+    let (ra, rb) = (tiles_of(a)?, tiles_of(b)?);
+    let row = match a.layout {
+        Layout::Packed { row, .. } => Some(row),
+        _ => None,
+    };
     let result = op
         .results
         .first()
         .ok_or_else(|| TensorError::Shape("a contraction has no result".into()))?;
     let rc = tiles_of(result)?.encode();
     let [ta, tb] = pair.transposed;
-    let formats = edge_format(&op.operands[pair.a], record::gather_a_format)?
-        | edge_format(&op.operands[pair.b], record::gather_b_format)?;
+    let formats =
+        edge_format(a, record::gather_a_format)? | edge_format(b, record::gather_b_format)?;
     let unpack_b = op.body.transposes(pair.b);
+    let holds = op.body.holds(pair.a);
     // The outer iterator's last tile row: the rows that hold data.
     let (rt, ragged) = (op.domain[p].tiles(), op.domain[p].elems % 32);
+    let ct = op.domain[q].tiles();
     let reversed = tensor::probing_reverse_chunks();
+    let skip_a = tensor::probing_skip_a();
+    // Per unit, the first operand's tiles (rows, terms) and slot its last run left held.
+    type Held = (std::ops::Range<usize>, std::ops::Range<usize>, u64);
+    let mut held: Vec<Option<Held>> = vec![None; units];
     let mut jobs = Vec::with_capacity(deal.blocks.len());
-    for [rows, cols] in &deal.blocks {
+    for (r, [rows, cols]) in deal.blocks.iter().enumerate() {
+        let j = first + r;
+        let unit = j % units;
         let last_row = rows.end == rt && ragged != 0;
         let live = if last_row { ragged as u32 } else { 32 };
         // `A` read to its live rows: one row of each tile for a one-row product.
-        let thin = match last_row && op.operands[pair.a].live_rows && !ta {
+        let thin = match last_row && a.live_rows && !ta && row.is_none() {
             true if ragged <= 16 => ragged as u32,
             _ => 0,
         };
-        let mut steps = Vec::with_capacity(3 * chunks);
-        for c in 0..chunks {
-            let range = if reversed { chunks - 1 - c } else { c };
-            let k0 = range * chunk;
-            let count = chunk.min(weight - k0);
-            let code: RunCode = op
-                .body
-                .block_chunk(c, [rows.len(), count, cols.len()], live)?;
-            let (mut ar, mut br) = (ra, rb);
-            ar.first += if ta { k0 * ar.ct as usize } else { k0 } as u32;
-            br.first += if tb { k0 } else { k0 * br.ct as usize } as u32;
+        let chunks: Vec<(usize, usize)> = match combine {
+            Combine::InDst => vec![(0, weight)],
+            Combine::L1Halves { chunk } | Combine::GddrPartials { chunk } => {
+                let n = weight.div_ceil(chunk.max(1));
+                (0..n)
+                    .map(|c| {
+                        let range = match (combine, reversed && row.is_none()) {
+                            (Combine::L1Halves { .. }, true) => n - 1 - c,
+                            _ => c,
+                        };
+                        let k0 = range * chunk;
+                        (k0, chunk.min(weight - k0))
+                    })
+                    .collect()
+            }
+        };
+        let mut steps = Vec::with_capacity(3 * chunks.len());
+        for (c, &(k0, count)) in chunks.iter().enumerate() {
+            let half = match combine {
+                Combine::InDst => deal.pipelined.then(|| tensor::half_of(j, units)),
+                Combine::L1Halves { .. } => Some((c % 2) as u8),
+                Combine::GddrPartials { .. } => None,
+            };
+            let code: RunCode = op.body.block_chunk(&super::Chunk {
+                c,
+                k0,
+                tiles: [rows.len(), count, cols.len()],
+                live,
+                half,
+            })?;
             let (a_at, b_at) = match (code.operands[pair.a], code.operands[pair.b]) {
                 (Some(a), Some(b)) => (a, b),
                 _ => {
@@ -456,12 +488,51 @@ fn block_jobs(op: &TileOp, deal: &Deal) -> Result<Vec<Job>> {
                     ))
                 }
             };
+            let (terms, at) = code.resident.clone().unwrap_or((k0..k0 + count, a_at));
+            let key = (rows.clone(), terms.clone(), at);
+            let resident = (skip_a && combine == Combine::InDst)
+                || (holds && held[unit].as_ref() == Some(&key));
+            held[unit] = Some(key);
+            let mut gather = Vec::new();
+            if c > 0 && matches!(combine, Combine::GddrPartials { .. }) {
+                // The reload depends on the last chunk's write to GDDR.
+                gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+            }
+            if let (Some(row), false) = (row, resident) {
+                // A tile of the packed row holds 32 terms.
+                let (lo, hi) = (terms.start / 32, (terms.end - 1) / 32);
+                let row = row.encode();
+                gather.extend([
+                    [
+                        record::READ_RUN,
+                        lo as u32,
+                        (hi - lo + 1) as u32,
+                        at as u32,
+                        0,
+                        1,
+                        0,
+                        0,
+                    ],
+                    row[0],
+                    row[1],
+                ]);
+            }
+            // The record names `A` from the first term its slots hold, `B` from the chunk's.
+            let (mut ar, mut br) = (ra, rb);
+            let a0 = terms.start;
+            ar.first += if ta { a0 * ar.ct as usize } else { a0 } as u32;
+            br.first += if tb { k0 } else { k0 * br.ct as usize } as u32;
             let flags = u32::from(ta)
                 | u32::from(tb) << 1
                 | record::gather_rows(thin)
                 | (count as u32) << 8
-                | if tensor::probing_skip_a() {
+                | if skip_a || resident || row.is_some() {
                     record::GATHER_A_RESIDENT
+                } else {
+                    0
+                }
+                | if row.is_some() {
+                    record::GATHER_STREAM
                 } else {
                     0
                 }
@@ -471,11 +542,10 @@ fn block_jobs(op: &TileOp, deal: &Deal) -> Result<Vec<Job>> {
                     0
                 }
                 | formats;
-            let gather = if tensor::probing_skip_block_gathers() {
-                vec![[tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]]
-            } else {
-                let (ar, br) = (ar.encode(), br.encode());
-                vec![
+            let (are, bre) = (ar.encode(), br.encode());
+            let mut gather = tensor::probe_gather(
+                gather,
+                [
                     [
                         record::GATHER,
                         flags,
@@ -486,13 +556,43 @@ fn block_jobs(op: &TileOp, deal: &Deal) -> Result<Vec<Job>> {
                         cols.start as u32,
                         cols.len() as u32,
                     ],
-                    ar[0],
-                    ar[1],
-                    br[0],
-                    br[1],
-                ]
+                    are[0],
+                    are[1],
+                    bre[0],
+                    bre[1],
+                ],
+                row.is_some(),
+            );
+            if matches!(combine, Combine::L1Halves { .. })
+                && row.is_none()
+                && tensor::probing_skip_block_gathers()
+            {
+                gather = vec![[tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]];
+            }
+            if let (true, Some(prior)) = (
+                c > 0 && matches!(combine, Combine::GddrPartials { .. }),
+                code.prior,
+            ) {
+                gather.extend([
+                    [
+                        record::READ_RUN,
+                        (rows.start * ct + cols.start) as u32,
+                        1,
+                        prior as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    rc[0],
+                    rc[1],
+                ]);
+            }
+            let written = match combine {
+                Combine::L1Halves { .. } => c + 1 == chunks.len(),
+                _ => true,
             };
-            let scatter = if c + 1 == chunks {
+            let scatter = if written {
                 vec![
                     [
                         record::SCATTER,
@@ -510,6 +610,38 @@ fn block_jobs(op: &TileOp, deal: &Deal) -> Result<Vec<Job>> {
             } else {
                 Vec::new()
             };
+            // A unit's first run reads its `STREAM`ed operand ahead of its barrier if the ops it
+            // ran since all planned below that operand's slots, and the record reads plainly (a
+            // read ahead may not transpose).
+            let ahead = matches!(combine, Combine::InDst)
+                && row.is_some()
+                && half.is_none()
+                && j < units
+                && (!tb || unpack_b)
+                && op
+                    .ahead
+                    .get(unit)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|top| b_at >= top);
+            if ahead && gather.len() >= 5 && gather[gather.len() - 5][0] == record::GATHER {
+                let mut early = gather.split_off(gather.len() - 5);
+                early[0][1] = early[0][1] & !record::GATHER_STREAM | record::GATHER_PREFETCH;
+                gather.push([
+                    tt_isa::dm::op::WAIT,
+                    tt_isa::dm::WAIT_PREFETCH,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]);
+                steps.push(Step::List {
+                    what: tensor::BUSY_PREFETCH,
+                    entries: early,
+                });
+            }
             steps.extend([
                 Step::List {
                     what: gather_what,
@@ -518,9 +650,9 @@ fn block_jobs(op: &TileOp, deal: &Deal) -> Result<Vec<Job>> {
                 Step::Kernel {
                     roles: code.roles,
                     init: code.init,
-                    mop: Box::new([None; 3]),
+                    mop: Box::new(code.mop),
                     loops: code.loops,
-                    half: Some((c % 2) as u8),
+                    half,
                 },
                 Step::List {
                     what: scatter_what,

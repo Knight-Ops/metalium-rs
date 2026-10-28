@@ -87,6 +87,7 @@ pub fn reduce(a: &DramTensor, op: ReduceOp, axis: Axis, then: ReduceThen) -> Res
             chunk,
         }),
         contract: NumericContract::Program,
+        ahead: Vec::new(),
         out: (dims, op.elem()),
     })
 }
@@ -127,6 +128,8 @@ impl Microkernel for Reduce {
             prior: None,
             out: layout.out_at,
             stride: 0,
+            resident: None,
+            mop: [None; 3],
             init: layout.init.clone(),
             roles,
             loops,
@@ -144,6 +147,8 @@ impl Microkernel for Reduce {
             prior: Some(c.prior_at),
             out: c.layout.out_at,
             stride: 0,
+            resident: None,
+            mop: [None; 3],
             init: c.layout.init.clone(),
             roles: Arc::new(roles),
             loops: Arc::new(loops),

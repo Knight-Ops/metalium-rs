@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use tt_isa::dm::record::TensorRef;
 use tt_isa::format::TileFormat;
+use tt_isa::frontend::mop::MopConfig;
 use tt_isa::isa::Instruction;
 
 use crate::runtime::SemaphoreInit;
@@ -139,6 +140,10 @@ pub enum Layout {
     /// A one-row result's data rows, written again packed `[K / 32, 32]` as a product's `A` reads
     /// them: no packing op (`tensor::packed_twin_writes`).
     PackedRow(DramTensor),
+    /// A one-row operand's tiles (`tiles`, which a record names) also packed `[K / 32, 32]`
+    /// (`row`, `tensor::pack_row`): read from the packed row into slots it is then held in, a
+    /// tile holding 32 terms.
+    Packed { tiles: TensorRef, row: TensorRef },
 }
 
 /// An operand or result: where it lies, which tile each domain index reads ([`TileMap`]), and
@@ -185,6 +190,11 @@ pub struct RunCode {
     pub out: u64,
     /// The results' slot stride, where a run is a block ([`Microkernel::block`]).
     pub stride: u64,
+    /// Where a block's first operand is held for more terms than the chunk's: the terms its
+    /// slots hold and their first slot (read once and kept while they repeat on a unit). `None`:
+    /// the chunk's terms, at its slot in [`RunCode::operands`].
+    pub resident: Option<(std::ops::Range<usize>, u64)>,
+    pub mop: [Option<MopConfig>; 3],
     pub init: Vec<SemaphoreInit>,
     pub roles: Arc<[Vec<Instruction>; 3]>,
     pub loops: Arc<[Vec<crate::code::Loop>; 3]>,
@@ -209,19 +219,15 @@ pub trait Microkernel {
             "this body carries no partials through GDDR".into(),
         ))
     }
-    /// Where a run is a block of the domain's two parallel iterators' tiles, the block's
-    /// `[rows, cols]` (each clamped at the domain's edge); `None` where a run is consecutive
-    /// items ([`Microkernel::group`]).
-    fn block(&self) -> Option<[usize; 2]> {
+    /// Where a run is a block of the domain's two parallel iterators' tiles, how they are cut
+    /// ([`Blocks`]); `None` where a run is consecutive items ([`Microkernel::group`]).
+    fn block(&self) -> Option<Blocks<'_>> {
         None
     }
-    /// Chunk `c` of a block's terms ([`Combine::L1Halves`]): `[rows, count, cols]` tiles, and
-    /// `live`, the rows of the block's last tile row that hold data (32 where it is whole).
-    fn block_chunk(&self, c: usize, tiles: [usize; 3], live: u32) -> Result<RunCode> {
-        let _ = (c, tiles, live);
-        Err(TensorError::Shape(
-            "this body computes no blocks in chunks".into(),
-        ))
+    /// One chunk of a block's terms ([`Chunk`]): its slots and programs.
+    fn block_chunk(&self, chunk: &Chunk) -> Result<RunCode> {
+        let _ = chunk;
+        Err(TensorError::Shape("this body computes no blocks".into()))
     }
     /// Whether the body transposes operand `o`'s tiles itself (at unpack) where its map stores
     /// them transposed, so that the mover reads them as they lie.
@@ -229,6 +235,40 @@ pub trait Microkernel {
         let _ = o;
         false
     }
+    /// Whether operand `o`'s slots keep its tiles from a unit's run to its next, so that a run
+    /// needing the same tiles in the same slots reads none.
+    fn holds(&self, o: usize) -> bool {
+        let _ = o;
+        false
+    }
+}
+
+/// How a body's blocks cut the two parallel iterators' tiles: `rows` tile rows a block, rows
+/// outer, and the columns `cols`.
+pub struct Blocks<'a> {
+    pub rows: usize,
+    pub cols: Cols<'a>,
+    /// Consecutive blocks of a unit staged in alternating halves of the arena.
+    pub pipelined: bool,
+}
+
+/// A block's columns: every `n` (the last ragged), or these runs in this order.
+pub enum Cols<'a> {
+    Every(usize),
+    Runs(&'a [std::ops::Range<usize>]),
+}
+
+/// One chunk of a block's terms, as the lowering asks the body for its code.
+pub struct Chunk {
+    /// The chunk's place in the block's chain, and its first term.
+    pub c: usize,
+    pub k0: usize,
+    /// `[rows, count, cols]` tiles.
+    pub tiles: [usize; 3],
+    /// The rows of the block's last tile row that hold data (32 where it is whole).
+    pub live: u32,
+    /// The arena half it is staged in, where it is.
+    pub half: Option<u8>,
 }
 
 /// The tile-generic op.
@@ -242,6 +282,10 @@ pub struct TileOp {
     pub contract: NumericContract,
     /// The result tensor's shape and element type.
     pub out: ([usize; 2], Elem),
+    /// Per unit, the lowest L1 address a read ahead of its first run may write: a
+    /// data-independent read (a `STREAM`ed contraction operand) at or above it is read ahead
+    /// of the unit's barrier ([`lower`]). Empty: nothing is read ahead.
+    pub ahead: Vec<Option<u64>>,
 }
 
 impl TileOp {
@@ -318,7 +362,19 @@ impl TileOp {
     /// run lowered. Several ops' jobs make one [`Work`] this way (a batch of products into one
     /// result).
     pub fn jobs(&self, units: usize, overlap: Overlap) -> Result<Vec<crate::tensor::Job>> {
+        self.jobs_from(units, overlap, 0)
+    }
+
+    /// [`TileOp::jobs`], the first job the `first`-th of its work: job `j` runs on unit
+    /// `j % units`, so a unit's runs and halves continue from the jobs before.
+    pub fn jobs_from(
+        &self,
+        units: usize,
+        overlap: Overlap,
+        first: usize,
+    ) -> Result<Vec<crate::tensor::Job>> {
         self.check()?;
-        distribute::deal(self, units, overlap).and_then(|deal| lower::jobs(self, &deal, units))
+        distribute::deal(self, units, overlap)
+            .and_then(|deal| lower::jobs(self, &deal, units, first))
     }
 }

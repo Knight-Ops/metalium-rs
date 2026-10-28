@@ -15,7 +15,7 @@
 
 use std::ops::Range;
 
-use super::{Dim, Layout, TileOp};
+use super::{Blocks, Cols, Dim, Layout, TileOp};
 use crate::tensor::{self, Overlap, Result, TensorError};
 
 /// How an op's items are dealt: run `j` to unit `j % units`.
@@ -33,6 +33,9 @@ pub struct Deal {
 
 pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
     let (items, weight) = (op.items(), op.weight());
+    if let Some(cut) = op.body.block() {
+        return blocks(op, cut);
+    }
     // Partials through GDDR chain an item's chunks on one unit: a job an item
     // (`lower::chunked_jobs`).
     if super::lower::partials_chunk(op).is_some() {
@@ -42,9 +45,6 @@ pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
             pipelined: false,
             held: vec![false; op.operands.len()],
         });
-    }
-    if let Some(block) = op.body.block() {
-        return blocks(op, block);
     }
     let group = |half: bool| op.body.group(half);
     let piped = tensor::pipelined_runs(items, weight, units, group(true).unwrap_or(0), overlap);
@@ -107,8 +107,8 @@ pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
     })
 }
 
-/// The two parallel iterators' tiles in `[mb, nb]` blocks, rows outer.
-fn blocks(op: &TileOp, [mb, nb]: [usize; 2]) -> Result<Deal> {
+/// The two parallel iterators' tiles in blocks as `cut` says, rows outer.
+fn blocks(op: &TileOp, cut: Blocks<'_>) -> Result<Deal> {
     let parallel: Vec<usize> = op.parallel().collect();
     let &[outer, inner] = &parallel[..] else {
         return Err(TensorError::Shape(format!(
@@ -117,21 +117,30 @@ fn blocks(op: &TileOp, [mb, nb]: [usize; 2]) -> Result<Deal> {
         )));
     };
     let [rt, ct] = [op.domain[outer].tiles(), op.domain[inner].tiles()];
-    if mb == 0 || nb == 0 {
+    let mb = cut.rows;
+    let cols: Vec<Range<usize>> = match cut.cols {
+        Cols::Every(nb) if nb > 0 => (0..ct)
+            .step_by(nb)
+            .map(|j0| j0..(j0 + nb).min(ct))
+            .collect(),
+        Cols::Runs(runs) if runs.iter().all(|r| !r.is_empty() && r.end <= ct) => runs.to_vec(),
+        _ => {
+            return Err(TensorError::Shape(
+                "a block's columns are empty or past the domain".into(),
+            ))
+        }
+    };
+    if mb == 0 {
         return Err(TensorError::Shape("an empty block".into()));
     }
     let blocks = (0..rt)
         .step_by(mb)
-        .flat_map(|i0| {
-            (0..ct)
-                .step_by(nb)
-                .map(move |j0| [i0..(i0 + mb).min(rt), j0..(j0 + nb).min(ct)])
-        })
+        .flat_map(|i0| cols.iter().map(move |c| [i0..(i0 + mb).min(rt), c.clone()]))
         .collect();
     Ok(Deal {
         runs: Vec::new(),
         blocks,
-        pipelined: false,
+        pipelined: cut.pipelined,
         held: vec![false; op.operands.len()],
     })
 }

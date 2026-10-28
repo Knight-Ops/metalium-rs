@@ -9040,7 +9040,7 @@ impl<T: Transport> Session<T> {
 
     /// Whether a one-row product with a packed `A` streams each output column's `K` in chunks,
     /// the mover reading one while the kernel computes the one before (on by default; see
-    /// `tensor::BlockPlan::push_stream_jobs`). Off, a column's whole `K` is read before its
+    /// `tile_op::matmul::Schedule::Stream`). Off, a column's whole `K` is read before its
     /// kernel starts: the gates compare the two.
     pub fn set_streamed_k(&mut self, on: bool) {
         self.streamed_k = on;

@@ -233,6 +233,40 @@ and B1 at the close. The set:
     All four goldens are unchanged word for word, and a mutated chunk half fails both matmul goldens. tt-kernels passes
     313 of 313. On ttsim, `step229`, `step60` and `step184` pass. On card 0 (`1793213075`),
     `step229/60/184/241/239/18` pass 24 of 24.
+  - [x] **F3.7, blocked, K-block and stream.** One lowering now cuts every contraction:
+    `lower::block_jobs`, a job a block, a chunk's three steps as the reduction's contract says.
+    - `InDst`: one chunk, halves where the deal is pipelined.
+    - `L1Halves`: as in F3.6.
+    - `GddrPartials`: `WAIT`, the reads, then the partial's reload from the result.
+
+    `Mma` gains `Schedule::{Blocks, KBlocks, Stream}`. The description gains:
+    - `Layout::Packed { tiles, row }`: a one-row operand read from its packed row, a tile holding 32 terms;
+    - `Microkernel::holds`: a first operand kept in its slots while a unit's runs need the same tiles there
+      (`GATHER_A_RESIDENT`, or no packed read);
+    - `RunCode::resident`: the terms its slots hold where they span more than the chunk, the stream's whole `K`;
+    - `RunCode::mop`;
+    - `Blocks`/`Cols` with the column runs of `thin_runs`;
+    - `Chunk`;
+    - `TileOp::ahead`: a unit's first run reads its `STREAM`ed operand ahead into a `BUSY_PREFETCH` list where its
+      slots lie above the unit's busy top;
+    - `TileOp::jobs_from`: job `j` on unit `j % units` across a work of several ops.
+
+    `push_k_jobs` and `push_stream_jobs` are deleted. `BlockPlan::push_jobs` is now a wrapper building the op, kept
+    only until F3.8 ports `push_prefetched_jobs`, `push_balanced_jobs` and `second_jobs`, which call it.
+    - **For the H6 audit:** the partial's reload sits after the reads in a block's chunk, but before them in the
+      linear `chunked_jobs` (the reduction). That is word order only, since a list completes before its kernel. It
+      is kept so that both goldens stay word for word.
+
+    All four goldens are unchanged. Two mutations are each caught by the goldens:
+    - stream residency off;
+    - the K-block reload's item off by one.
+
+    tt-kernels passes 313 of 313.
+    - ttsim: `step18/60/68/184/205/216/229/232/239/241`, 44 of 44.
+    - Card 0 (`1793213768`): 57 of 58 across those and `step233/238/240/185/188`, the 1.7B at its native context
+      included. The one that failed was `step188::traced_generation_equals_the_eager_one`, a timeout. It has run
+      127-137 s since it was written, past the runner's 120 s default; alone it passes in 129.9 s (`1793216293`).
+      It now has its own 240 s in `xtask` `LONG`.
 - [ ] Allocation through `l1::Requirements` and the op's `channel::Graph::check`, once the matmul's layouts are
   microkernel layouts: today each client's microkernel plans its own L1 (`sfpu::kernel::plan_layout_in`,
   `sfpu::reduce::plan_layout`).

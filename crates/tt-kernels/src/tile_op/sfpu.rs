@@ -147,6 +147,7 @@ pub fn eltwise(
             rows: tensor::eltwise_rows(op.kind, a.rows),
         }),
         contract: NumericContract::Program,
+        ahead: Vec::new(),
         out: ([a.rows, a.cols], out_elem),
     }))
 }
@@ -187,6 +188,8 @@ impl Microkernel for Sfpu {
             prior: None,
             out: layout.out_at,
             stride: 0,
+            resident: None,
+            mop: [None; 3],
             init: layout.init.clone(),
             roles,
             loops,
