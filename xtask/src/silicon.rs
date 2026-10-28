@@ -336,6 +336,9 @@ pub const SMOKE: &[&str] = &[
     "step236_select_add_rows::",
     // A gather and a scatter-add of one index a row (cross-entropy's), 2 and 6 jobs where 8 and 18.
     "step237_column_picks::",
+    // Hypothesis H3 (docs/learnings/dataflow-compiler.md): the fidelity phases the operand
+    // formats need give HiFi4's bits.
+    "step238_exact_fidelity::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

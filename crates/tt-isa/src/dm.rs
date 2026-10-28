@@ -275,8 +275,9 @@ pub const PREFETCH_CAP: u64 = MAILBOX_BASE + 0xF8;
 pub const PREFETCH_CAP_DEFAULT: u32 = 2;
 /// Host -> RISCV B: the in-flight cap of a weight stream's reads (`record::GATHER_STREAM`),
 /// read as each such record starts; 0 is [`TILE_IN_FLIGHT_CAP`]. The low 16 bits are an FP32
-/// stream's, the high 16 a stream of BF16 weights' (`record::GATHER_B_BF16`, half the bytes a
-/// read; 0 there is the low half's) ([`stream_caps`]).
+/// stream's, the high 16 a stream of packed weights' (`record::gather_b_packed`: BF16, half the
+/// bytes a read, or BFP; 0 there is the low half's) ([`stream_caps`]). One cap serves every packed
+/// format until a measurement asks for one by slot size (`docs/learnings/dataflow-compiler.md` §8).
 pub const STREAM_CAP: u64 = MAILBOX_BASE + 0xFC;
 /// [`STREAM_CAP`]'s word for an FP32 stream's cap and a BF16 stream's.
 pub const fn stream_caps(f32_cap: u32, bf16_cap: u32) -> u32 {
@@ -788,10 +789,11 @@ pub mod nc {
 /// (zero, as `tt_layout` writes it), 1024 datums in face order, and padding to
 /// a multiple of [`crate::dram::ALIGN`] -- so every slot is 64-byte aligned
 /// wherever it sits, and any slot may be copied to any other under the C64
-/// read rule (divergence row 64).
-pub const TILE_SLOT: u64 = 4160;
-/// BF16's 1024 two-byte datums plus header, rounded to 64-byte slot alignment.
-pub const BF16_TILE_SLOT: u64 = 2112;
+/// read rule (divergence row 64). [`crate::format::TileFormat::slot_bytes`] of FP32: 4,160.
+pub const TILE_SLOT: u64 = crate::format::TileFormat::FP32.slot_bytes();
+/// BF16's 1024 two-byte datums plus header, rounded to 64-byte slot alignment: 2,112.
+pub const BF16_TILE_SLOT: u64 = crate::format::TileFormat::BF16.slot_bytes();
+const _: () = assert!(TILE_SLOT == 4160 && BF16_TILE_SLOT == 2112);
 /// Where a tile's datums start within its slot.
 pub const TILE_DATA: u64 = 16;
 const _: () = assert!(TILE_SLOT % crate::dram::ALIGN == 0);

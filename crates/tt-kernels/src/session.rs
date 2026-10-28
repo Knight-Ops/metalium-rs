@@ -1801,12 +1801,9 @@ fn l1_footprint(entries: &[[u32; 8]], gather: bool) -> Option<Vec<std::ops::Rang
                     if head[1] & record::GATHER_A_RESIDENT == 0 {
                         ranges.push(slots(head[2], head[5] as u64 * kt));
                     }
-                    // A BF16 `B`'s tiles are 2,112-byte slots in L1 (`record::GATHER_B_BF16`).
-                    let b = if head[1] & record::GATHER_B_BF16 != 0 {
-                        tt_isa::dm::BF16_TILE_SLOT
-                    } else {
-                        TILE_SLOT
-                    };
+                    // A packed `B`'s tiles are slots of its format in L1 (`record::gather_b_format`).
+                    let b =
+                        record::gather_b_tile_format(head[1]).map_or(TILE_SLOT, |f| f.slot_bytes());
                     let at = head[3] as u64;
                     ranges.push(at..at + kt * head[7] as u64 * b);
                 }

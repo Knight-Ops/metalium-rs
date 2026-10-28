@@ -8,6 +8,7 @@
 
 use tt_isa::backend::ConfigWords;
 use tt_isa::cfg::generated::{alu, thread};
+use tt_isa::format::{SrcType, TileFormat};
 use tt_isa::isa::generated::encode;
 use tt_isa::isa::Instruction;
 use tt_isa::tile::{L1Format, TileImage};
@@ -579,6 +580,30 @@ impl Fidelity {
             Fidelity::HiFi2 => 2,
             Fidelity::HiFi3 => 3,
             Fidelity::HiFi4 => 4,
+        }
+    }
+
+    /// The fidelity that runs the first `phases` phases, 1 to 4.
+    pub const fn from_phases(phases: u32) -> Option<Fidelity> {
+        match phases {
+            1 => Some(Fidelity::Lo),
+            2 => Some(Fidelity::HiFi2),
+            3 => Some(Fidelity::HiFi3),
+            4 => Some(Fidelity::HiFi4),
+            _ => None,
+        }
+    }
+
+    /// The fewest phases that take every mantissa bit both operands bring into `Src`
+    /// ([`tt_isa::format::full_precision_phases`]): `b` is the operand in `SrcA` (in1),
+    /// `a` the one in `SrcB` (in0). `None` where no phase count takes every bit.
+    pub const fn full_precision(
+        a: (TileFormat, SrcType),
+        b: (TileFormat, SrcType),
+    ) -> Option<Fidelity> {
+        match tt_isa::format::full_precision_phases(b, a) {
+            Some(phases) => Fidelity::from_phases(phases),
+            None => None,
         }
     }
 }
@@ -3137,10 +3162,9 @@ impl SrcRoute {
             SrcRoute::Bf16FromBf16 => (L1Format::Bf16, BF16_CODE),
             SrcRoute::Bfp(format) => (
                 format.l1_format(),
-                match format {
-                    crate::bfp::BfpFormat::Bfp8 => 6,
-                    crate::bfp::BfpFormat::Bfp4 => 7,
-                    crate::bfp::BfpFormat::Bfp2 => 15,
+                match TileFormat::new(format.l1_format()).src_codes(SrcType::Bf16) {
+                    Some((_, out)) => out,
+                    None => panic!("every BFP format's code is measured"),
                 },
             ),
             SrcRoute::Tf32WithBf16B => (L1Format::Fp32, TF32_CODE),
