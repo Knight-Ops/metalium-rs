@@ -762,7 +762,14 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
   path is unchanged within noise. Refuted: BFP4 weights decode only 1.09x faster than BF16 (one-row products are
   unpack/math-bound). Derived fidelity is opt-in (`TT_DERIVED_FIDELITY=1`), since it differs from HiFi4 once a product
   overflows FP32.
-- [ ] **F2:** typed channels and the cross-core credit.
+- [x] **F2:** typed channels and the cross-core credit (2026-10-28,
+  [log](../learnings/performance-log.md#a-cross-core-credit-against-the-barrier-h8-2026-10-28-card-1)).
+  - The in-core streams are local channels, word for word (a packet golden pins them).
+  - `op::CREDIT`/`op::WAIT_CREDIT` hand pages between tiles through remote, broadcast and GDDR rings
+    (`tt_kernels::channel::Ring`, gate `step242`, card 0), and the protocol is checked before emission.
+  - `channel::Graph` refuses unbalanced rates and deadlocks.
+  - H8: a credited handoff costs 1.81 us against a two-unit barrier's 2.6 us (prediction 1.5 missed, claim held).
+  - No op uses a cross-core channel yet. F4b and F4a are the first.
 - [ ] **F3:** the tile-generic op (H6).
 - [ ] **F4b:** operand reuse across cores (H1).
 - [ ] **F4a:** channels instead of barriers in decode (H4).

@@ -151,7 +151,7 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 - [x] **F2.6, H8 measured** (`2f29d9f`, `silicon_bench_channel_credit`, card 1 `1793200301`):
   - a credited handoff is 1.81 us, against a two-unit barrier's 2.66 us polled and 2.59 us released;
   - the prediction (<= 1.5 us) is missed, and the claim (cheaper than a barrier) holds. See the Bible's H8.
-- [ ] Close-out: `--smoke` on card 0 and `step12_mnist`.
+- [x] Close-out: `--smoke` on card 0, 1,241 of 1,241 (`1793200324`); `step12_mnist` 8 of 8 on ttsim, goldens unchanged.
 - **Not yet built:** no op uses a cross-core channel. F4b (operand reuse) and F4a (channels instead of barriers) are
   the first. `channel::Graph` is not yet run on an op's graph, and a `Gddr` ring's GDDR placement is the caller's.
 
