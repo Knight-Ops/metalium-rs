@@ -181,7 +181,7 @@ It replaces what is scattered today across seven types in four crates: `L1Format
 
 **F5. Adding a format is adding a descriptor row.** New code is needed only for a new numeric family (none is planned) or for a conversion the hardware does not do (`HostDtype`/`tt-layout` on the host). The test for any optimization: *does it name a format?* If it does, it is in the wrong layer.
 
-**F6. Generic fidelity** [MEAS: H3, `1793150259`, same-format BFP; mixed pairs still HYP]. Fidelity comes from the edge formats (T4, `tt_isa::format::full_precision_phases`), not from a knob for each format. For same-format BFP products, the derived phase count gives HiFi4's bits on card 1: BFP4×BFP4 runs 1 phase of 4, BFP8×BFP8 2 of 4, at the same exactness.
+**F6. Generic fidelity** [MEAS: H3, `1793150259` same-format BFP; every pair `step241`, card 0 `1793163275`]. Fidelity comes from the edge formats (T4, `tt_isa::format::full_precision_phases`, `SrcRoute::full_precision`), not from a knob for each format. For every pair of FP32, BF16 and BFP8/4/2 edges the derived phase count gives HiFi4's bits **while no product overflows FP32**: BFP4×BFP4 runs 1 phase of 4, BFP8×BFP8 2, a BFP4 weight beside TF32 3; TF32 or BF16 in `SrcA` keeps all four. Past FP32's range (operands of `1e30`) the bits differ, on ttsim and silicon alike. So the derived phases are a contract of their own, opt-in (`Session::set_derived_fidelity`, `TT_DERIVED_FIDELITY=1`), not a schedule of the default one (S3, ADR 0005).
 
 ---
 
@@ -365,7 +365,7 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 | D6 | Credit granularity | A page (often a tile) | A compute-sized batch (ours) | **Open.** Decided per channel class by the cost model once H4 measures sync cost against overlap |
 | D7 | Replicating rows to many readers | Multicast | Sharded rows | **Decided: sharded.** Replicated rows by contended multicast took 43.9 ms a step against 20.92 (roadmap, residency 2e/2f) |
 | D8 | `Dst` width | BF16 `Dst`, 8 tiles a half, often the default | FP32 `Dst`, 4 a half | **Decided: FP32** in the default contract (S2). 16-bit is an opt-in contract |
-| D9 | Fidelity | A per-op knob, LoFi..HiFi4 | Derived from edge formats | **Derived** for same-format BFP (H3 confirmed, `1793150259`); mixed pairs open |
+| D9 | Fidelity | A per-op knob, LoFi..HiFi4 | Derived from edge formats | **Derived, as an opt-in contract** (2026-10-28): HiFi4's bits for every edge pair while products stay in FP32's range, not past it (H3, `step241`), so HiFi4 stays the default |
 
 ---
 
@@ -419,16 +419,43 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
   - *Negative control:* BFP8 at 1 phase differs.
   - *Consequence:* the default contract's fidelity rule may be "full precision for the edge formats"
     (`Fidelity::full_precision`) for these pairs. It is adopted where F1c builds the product.
-  - *Still open:* mixed pairs (BFP weights × TF32 or BF16 activations, needing F1c), and NaN or infinity inside a block.
+  - *Mixed pairs, and the boundary (2026-10-28):* every pair of FP32, BF16 and BFP8/4/2 edges, `A` or `B`, gives HiFi4's
+    bits at the derived phases with signed zeros and subnormals, **until a product overflows FP32**: with operands of
+    `1e30` the bits differ (`step241::derived_phases_are_hifi4_until_a_product_overflows`, ttsim and card 0 `1793163275`).
+    So H3 holds on FP32's range, and the derived phases stay opt-in (`TT_DERIVED_FIDELITY=1`). NaN and infinity inside
+    a BFP block are not taken (BFP compression holds finite values).
   - *Prediction left:* BFP4 × BFP4 products at ≥3× the BF16 HiFi4 rate when compute-bound.
-- **H7 Whole-tile unpacks are format-generic.** `PairOrder::Auto` gives whole tiles in `Src` (P4) to FP32 and BF16
-  operands only, by name, so a BFP weight takes the face order. At `[1024,2048]@[2048,8192]` that order is
+- **H7 Whole-tile unpacks are format-generic. Confirmed, 2026-10-28.** `PairOrder::Auto` gave whole tiles in `Src` (P4) to FP32 and BF16
+  operands only, by name, so a BFP weight took the face order. At `[1024,2048]@[2048,8192]` that order is
   fidelity-bound: 14.8 / 17.4 / 20.2 TFLOPS at four / three / one phases, against BF16's 22.3 whole-tile
   (`1793152122`).
   - *Claim:* the whole-tile order is correct for every packed format.
   - *Prediction:* BFP weights reach ≥ BF16's rate at the same shapes, bit for bit.
   - *Measured by:* `step239` with the order forced, on ttsim and card 1, then the pair-cost probe.
   - *Kills it:* any bit difference, or < 1.2x.
+  - *Result:* the bits are equal. `step239::whole_tile_orders_give_a_packed_weights_bits` forces the whole-tile order
+    for BFP8/BFP4 (and BFP2 on silicon) `B` and gets the decoded FP32 product, on ttsim and on card 0, run alone
+    (`1793160473`). The licence is now a descriptor fact, `TileFormat::whole_tile_unpack(to, src)`, read by
+    `PairOrder::resolve` (`eda859f`). Pair cost on card 1 at HiFi4, before (`1793162109`) and after (`1793167801`):
+
+    | shape | B | before | after |
+    |---|---|--:|--:|
+    | `[1024,2048]@[2048,8192]` | BFP8 / BFP4 / BFP2 | 14.87 / 14.88 / 14.85 | 22.48 / 22.44 / 22.40 (1.51×) |
+    | `[1024,8192]@[8192,2048]` | BFP8 / BFP4 / BFP2 | 11.69 / 11.70 / 11.72 | 29.09 / 26.63 / 27.03 (2.3-2.5×) |
+    | both | BF16 / FP32 | 22.64, 22.15 / 15.97, 16.96 | within 0.7% |
+
+    At LoFi, where the face order was not fidelity-bound, the first shape gains 10% and the second is unchanged. BFP
+    weights now run at BF16's rate or above at HiFi4, so the prediction holds.
+- **F1's decode prediction. Refuted, 2026-10-28.** A BFP4-weight product beats BF16 at decode shapes in proportion to
+  its bytes, ≥1.5× at m = 1 ([plan](../plans/dataflow-compiler.md) F1).
+  - *Result:* through the model's own traced decode (burn-tt routing a BFP weight to the block-stream path, F1c), a 1.7B
+    step is 1.09× faster with BFP4 weights than BF16 (10.31 against 11.25 ms at a 32-token prompt, card 1 `1793175898`).
+    The products' card time falls 7.64 -> 6.45 ms while reading only 145 GB/s; the slowest unit's math role spends 5.7
+    of 6.3 ms pushing into a full FIFO. So a one-row product is bound by unpacking and multiplying 32-row tiles for one
+    live row, not by its weight bytes. Fewer fidelity phases do not move it (`1793177229`).
+  - *Consequence:* at batch 1, fewer weight bytes buy little until the one-row product's unpack/math cost falls. That
+    is a kernel question (what a product does per tile for one live row), and it bears on H4: the 1.7B step's read rate
+    is not the only bound.
 - **H4 Channels instead of barriers.** With per-edge credits and data-independent reads started as units free up, a 1.7B decode step's card read rate rises from 328 GB/s (64%).
   - *Prediction:* ≥ 400 GB/s average and step ≤ 9.5 ms (from 10.9), bit-exact.
   - *Measured by:* the profile's card read meter.

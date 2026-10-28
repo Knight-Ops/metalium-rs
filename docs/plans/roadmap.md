@@ -753,9 +753,15 @@ Track 1 model. Evidence and bottlenecks:
 - Schedules choose only among bit-equivalent options under each op's numeric contract.
 - Every step is a hypothesis with a kill criterion.
 
-The staged work is [dataflow-compiler.md](dataflow-compiler.md), in a worktree on branch `dataflow-compiler`, with silicon on card 1 for now:
-- [ ] **Stage 0:** card-1 baselines.
-- [ ] **F1:** `TileFormat`, and one matmul for every format pair, with exact fidelity (H3).
+The staged work is [dataflow-compiler.md](dataflow-compiler.md), in a worktree on branch `dataflow-compiler`, with silicon on cards 0 and 1 (gates on card 0, benches on card 1):
+- [x] **Stage 0:** card-1 baselines (2026-10-28).
+- [x] **F1:** `TileFormat`, and one matmul for every format pair, with exact fidelity (H3) (2026-10-28,
+  [log](../learnings/performance-log.md#one-matmul-for-every-format-pair-and-bfp-weights-through-the-model-2026-10-28-cards-0-and-1)).
+  One builder takes any edge-format pair, and the three old builders are deleted. Models store weights in any packed
+  format (`Llama::with_stored_weights`), bit for bit. BFP weights at prefill shapes reach BF16's rate (H7). The default
+  path is unchanged within noise. Refuted: BFP4 weights decode only 1.09x faster than BF16 (one-row products are
+  unpack/math-bound). Derived fidelity is opt-in (`TT_DERIVED_FIDELITY=1`), since it differs from HiFi4 once a product
+  overflows FP32.
 - [ ] **F2:** typed channels and the cross-core credit.
 - [ ] **F3:** the tile-generic op (H6).
 - [ ] **F4b:** operand reuse across cores (H1).

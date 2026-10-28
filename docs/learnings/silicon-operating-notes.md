@@ -1154,6 +1154,23 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
   unpack role with `ConfigWords` it would clear the packer's formats, so the probe has the pack role write it.
   Unpacker 1's (word 118) ttsim refuses (divergence row 105). Products exact at x1 and x2 with it set.
 
+## A packed operand's tile in `Src`, and fewer fidelity phases (2026-10-28, ttsim and card 0)
+
+`docs/plans/dataflow-compiler.md` F1 (H7, F1d), gates `step239`, `step241`.
+- **A BFP8, BFP4 or BFP2 tile unpacks whole into `SrcA`** (one `UNPACR` of its 1,024 datums, the exponent section
+  with them, rows then through the RWCs): bit for bit the face order, with `A` whole or by faces, at HiFi4 and at three
+  phases (`step239::whole_tile_orders_give_a_packed_weights_bits`, run alone first on card 0 `1793160473`). The unpack
+  configuration is the faces order's; only `SETADCXX`'s count differs. `TileFormat::whole_tile_unpack` records which
+  unpacks are measured whole; a BF16 or BFP tile in `SrcB` (a packed `A`) is not yet measured whole and takes faces.
+- **Every pair of FP32, BF16 and BFP8/4/2 operands multiplies in one kernel**, each unpacked in its own format (BF16 and
+  BFP moved as they are, FP32 cut to TF32), including TF32 in `SrcA` beside BF16 or BFP in `SrcB`: bit for bit the
+  FP32 product of the decoded values (`step241`, card 0 `1793162345`).
+- **Fewer phases than HiFi4 keep HiFi4's bits only while no product overflows FP32.** The phases an edge pair needs
+  (`full_precision_phases`) give HiFi4's bits with signed zeros and subnormals; with operands of `1e30` they differ
+  (`step241::derived_phases_are_hifi4_until_a_product_overflows`, card 0 `1793163275`; ttsim agrees). Which step of
+  an overflowing product the extra phases change is not isolated. The derived phases are opt-in
+  (`TT_DERIVED_FIDELITY=1`).
+
 ## An op's recorded L1 top must cover everything it lays out (2026-10-26, card 0 and 1)
 
 Busy prefetch places a unit's next weight ring above the highest `l1_top` the ops since the last product recorded

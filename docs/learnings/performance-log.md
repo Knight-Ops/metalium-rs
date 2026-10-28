@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [One matmul for every format pair, and BFP weights through the model](#one-matmul-for-every-format-pair-and-bfp-weights-through-the-model-2026-10-28-cards-0-and-1) | 2026-10-28 | F1 closed: one builder for every edge-format pair (F1d), BFP weights from burn-tt (F1c), whole tiles for packed formats (H7: pair cost BFP 14.9 -> **22.4** and 11.7 -> **26.6-29.1 TFLOPS** at HiFi4, bit for bit); the default path unchanged within noise (1.7B BF16 decode 11.25 / 11.89 / 12.64 ms); BFP4 weights decode **10.31 / 10.86 / 11.46 ms**, 1.09x BF16: the 1.5x prediction refuted (a one-row product is unpack/math-bound); a tied BFP head widened at every step (37 ms), fixed |
 | [Packed weights on the block-stream path: what bytes buy](#packed-weights-on-the-block-stream-path-what-bytes-buy-2026-10-28-card-1) | 2026-10-28 | BFP8/4/2 weights on BF16's product path, bit for bit (`step239`, card 1); one-row products take ~400-470 us whatever the weight's bytes in the probe's session (entry-bound, not the decode configuration): the 1.5x prediction not borne out there; at prefill BFP is 14.8 TFLOPS against BF16's 22.3 (face order, fidelity-bound), HiFi3 derived and exact 1.17x; next: whole tiles for packed formats (H7) |
 | [Card-1 baselines for the dataflow compiler, and exact fidelity](#card-1-baselines-for-the-dataflow-compiler-and-exact-fidelity-2026-10-28-card-1) | 2026-10-28 | Stage 0 of `docs/plans/dataflow-compiler.md` on card 1: matmul at prefill shapes, ResNet-18 / ViT-Tiny traced (host 38.45 / 26.77 ms), SmolLM2-135M decode **6.92 / 7.46 / 8.13 ms** and 1.7B **11.20 / 11.83 / 12.62** at the scoreboard's conditions (`TT_SPREAD=work:64:4` makes decode 9.9-11.1 and 18.7-21.4: not the decode condition), MNIST 1.398 / 2.882 / 8.290 ms/step; H3 confirmed: BFP8 at 2 phases and BFP4/BFP2 at 1 equal HiFi4 bit for bit (`step238`, `1793150259`) |
 | [The card's GDDR reads over a decode step](#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0) | 2026-10-27 | the profile mode now sums every unit's issued GDDR reads into the card's rate in eighths of each op's span (`READ_BYTES` marks), held against the card's 512 GB/s peak (not 469): the 1.7B `Step(64)` reads 3,568 MB at 328 GB/s (64%), at 90%+ for only 1.9 of 10.9 ms; every product starts near the peak and ends in a tail (`gate\|up` 634 -> 89 GB/s, `down` 617 -> 68), `down`'s middle half ~300, the small ops 319; the marks cost tile-sized plain reads ~1% in a `profile` image (~4% while a check sat in the list loop) and the decode step nothing |
@@ -377,6 +378,54 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## One matmul for every format pair, and BFP weights through the model (2026-10-28, cards 0 and 1)
+
+F1 of [dataflow-compiler.md](../plans/dataflow-compiler.md), closed: one matmul builder whose operand formats are edge
+data (F1d), BFP weights routed from burn-tt (F1c), and whole tiles for packed formats (H7). Every gate ran on card 0. The
+benches ran on card 1, the same set before (`aa04c20`) and after (`28ed325`; the BFP decode rows at `7daa887`), release,
+validated output, warmups, medians.
+
+| benchmark (card 1) | before | after | change |
+|---|--:|--:|--:|
+| 1.7B decode step, BF16 weights, 32 / 128 / 256 tokens | 11.36 / 11.78 / 12.56 ms | 11.25 / 11.89 / 12.64 | -1.0 / +0.9 / +0.6% |
+| 1.7B first token, BF16, 32 / 128 / 256 | 43.31 / 52.59 / 79.04 ms | 43.63 / 52.94 / 79.26 | +0.3-0.7% |
+| 1.7B decode step, BFP8 / BFP4 / BFP2 weights, 32 tokens | (widened at every call) | 10.53 / **10.31** / 10.31 ms | BFP4 1.09x BF16 |
+| the same at 128 / 256 tokens, BFP4 | | 10.86 / 11.46 ms | 1.09 / 1.10x BF16 |
+| 1.7B first token, BFP4, 32 / 128 / 256 | | 43.03 / 51.47 / 74.24 ms | 1.01 / 1.03 / 1.07x BF16 |
+| 1.7B prefill, 1,000 / 7,992 tokens (chunks of 512) | 284.0 / 5,987 ms | 284.6 / 5,994 | +0.2 / +0.1% |
+| decode step after them | 22.74 / 46.64 ms | 22.87 / 46.72 | +0.6 / +0.2% |
+| 135M decode step, 32 / 128 / 256 | 6.93 / 7.49 / 8.06 ms | 6.94 / 7.52 / 8.22 | +0.1 / +0.4 / +2.0% |
+| ResNet-18 / ViT-Tiny traced forward | 12.61 / 7.83 ms | 12.85 / 7.90 | +1.9 / +0.9% |
+| MNIST 784-128-10 / 784-512-256-10 / transformer, ms a step | 1.398 / 2.924 / 9.25 | 1.398 / 2.882 / 8.09 | 0 / -1.5 / -12.5% |
+| `matmul_throughput` `[1024,2048]@[2048,8192]` | 14.09 TFLOPS | 14.00 | -0.6% |
+| pair cost HiFi4 `[1024,2048]@[2048,8192]`, BFP8 / BFP4 / BFP2 | 14.87 / 14.88 / 14.85 | 22.48 / 22.44 / 22.40 | **1.51x** |
+| pair cost HiFi4 `[1024,8192]@[8192,2048]`, BFP8 / BFP4 / BFP2 | 11.69 / 11.70 / 11.72 | 29.09 / 26.63 / 27.03 | **2.3-2.5x** |
+| pair cost HiFi4, BF16 / FP32 weights | 22.64 / 15.97 | 22.48 / 15.98 | within 0.7% |
+| `step163` accurate matmul 1024^3 (explicit Lo, a named contract) | 193.9 ms | 189.2 | -2.4% |
+
+Runs: before `1793159503` (1.7B), `1793160907` (135M), `1793161123` (prefill), `1793162109` (products, MNIST, `step163`),
+`1793162369` (ResNet/ViT); after `1793165085`, `1793166504`, `1793166718`, `1793167801`, `1793167744`; BFP8 / BFP4 / BFP2
+decode `1793175245` / `1793175898` / `1793176550`; BFP4 with derived fidelity `1793177229`. burn-flex's 1.7B decode
+step was 296-329 ms in both sets.
+
+- **The default path did not move.** BF16 decode, prefill, the 135M, the image models and the products are within
+  run-to-run noise. The transformer's 12.5% and the small `step163` fast-mode products are noise, not the change:
+  `step163` and `matmul_throughput` re-run back to back on card 0, before and after alternating
+  (`1793170354`/`1793170517`, `1793170526`/`1793170535`), agree within ~4%, and `[1024,2048]@[2048,2048]` swings ±25%
+  in both trees.
+- **H7 holds** ([dataflow-compiler.md](dataflow-compiler.md) §13): BFP weights at HiFi4 now run at BF16's rate or above
+  at prefill shapes, bit for bit.
+- **F1's decode prediction is refuted**: BFP4 weights make a 1.7B decode step 1.09x faster than BF16, not ≥1.5x. A
+  `--profile` run of each (`1793170516` BF16, `1793172384` BFP4; card 1) shows why. The products' card time falls
+  7.64 -> 6.45 ms with a quarter of BF16's weight bytes, but they read only 145 GB/s, and on each product's slowest
+  unit the math role spends 5.7 of 6.3 ms pushing into a full FIFO: a one-row product is bound by its unpacks and math
+  over 32-row tiles, not by its bytes. Running fewer fidelity phases (`TT_DERIVED_FIDELITY=1`, HiFi3 for TF32 beside
+  BFP4) changes nothing (10.30 / 10.81 / 11.44 ms), so the phases are not that bound either.
+- **Found on the way:** a tied head stored BFP stayed a transposed view, which burn-tt's packed product refuses, so every
+  step widened the 49,152 x 2,048 head to F32 (`with_storage` in the trace). The step took 37-39 ms with the card's own
+  span at 9.65 ms. Fixed in `7daa887` (a packed transposed view is made plain first, as BF16's was); `step240` gained the
+  checkpoint's path, which failed before the fix.
 
 ## Card-1 baselines for the dataflow compiler, and exact fidelity (2026-10-28, card 1)
 
