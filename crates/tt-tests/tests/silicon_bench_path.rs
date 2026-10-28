@@ -357,10 +357,16 @@ struct Split {
 }
 
 fn split(p: &DeviceProfile) -> Split {
+    try_split(p).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`split`], or the unit whose events do not nest: with NC writing beside B, a profile's
+/// events can come out unbalanced (an entry's end repeated), and then no device time is certified.
+fn try_split(p: &DeviceProfile) -> Result<Split, tt_kernels::profile::Unbalanced> {
     let mut s = Split::default();
     let (mut first, mut last) = (u64::MAX, 0);
     for u in &p.units {
-        for sp in u.spans().unwrap_or_else(|e| panic!("{e}")) {
+        for sp in u.spans()? {
             let len = (sp.end - sp.begin) as f64;
             if sp.name == "list" {
                 s.lists += 1;
@@ -374,7 +380,7 @@ fn split(p: &DeviceProfile) -> Split {
         }
     }
     s.device = last.saturating_sub(first) as f64;
-    s
+    Ok(s)
 }
 
 /// Real ops through a one-unit `Session`, profiled: per op, the device time
@@ -719,7 +725,8 @@ fn matmul_pipeline_sweep() {
                     // the buffer (and the op's sync reports it): time those
                     // from the host.
                     // With NC scattering, B's timestamper events come out
-                    // garbled (an entry's end repeated): host time instead.
+                    // garbled (an entry's end repeated): host time instead,
+                    // for the whole configuration, where any run's do.
                     let profiled = m * k * n < 1 << 29;
                     overflowed |= !profiled;
                     for _ in 0..REPS {
@@ -731,7 +738,10 @@ fn matmul_pipeline_sweep() {
                         host.push(h0.elapsed().as_secs_f64() * 1e6);
                         if profiled {
                             match s.profile_stop() {
-                                Ok(p) => device.push(split(&p).device),
+                                Ok(p) => match try_split(&p) {
+                                    Ok(sp) => device.push(sp.device),
+                                    Err(_) => overflowed = true,
+                                },
                                 Err(_) => overflowed = true,
                             }
                         }
