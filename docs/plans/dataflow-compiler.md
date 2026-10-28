@@ -165,9 +165,12 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 Scope (owner, 2026-10-28): every lowering behind `Session::matmul_dram` (block-stream, blocked/K-block/stream,
 thin/prefetch/handoff). `matmul_dram_batched` and attention's `matmul_step` are follow-on clients.
 
-**Before and after, card 1.** `cargo xtask bench-diff <B0.jsonl> <B1.jsonl>` (`61478ca`) joins two collections by test and
-key and judges each pair by its own p10..p90 spread. B0 is taken at F3.0, the per-client subsets after each client,
-and B1 at the close. The set:
+**Before and after, card 1.** Since the matmul port (owner, 2026-10-28), the check is `bench_training` against Stage 0's
+rows. The jobs are word for word, so device time cannot move, and a trace builds once, so only an eager op's build can
+cost anything; untraced training is where that shows. The full set below, with its 3% cutoff, is no longer run as a
+gate. It stays the tool for finding where a regression is, if `bench_training` shows one. `cargo xtask bench-diff
+<B0.jsonl> <B1.jsonl>` (`61478ca`) joins two collections by test and key and judges each pair by its own p10..p90
+spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`. The set:
 - plain: `host_time_per_op` (now with the call, enqueue, build and a cold first call for add, `exp`, a row broadcast, a
   sum over columns and a matmul), `small_and_large_ops_by_spread`, `matmul_throughput`, `k_block_matmul_baselines`,
   `norm_forward_baselines`, ResNet-18 / ViT-Tiny traced, and `bench_training`;
@@ -288,10 +291,13 @@ and B1 at the close. The set:
       119.88 s (`1793217290`). It now has its own 240 s in `LONG`.
     - After F3.8: `step12_mnist` passes 8 of 8 on ttsim with the goldens unchanged.
       `cargo xtask conformance --release` gives 2,973 passing, 52 listed, 0 unexpected, as at F1's close.
+    - Eager step time, card 1 (`bench_training`, `1793218316`): 1.398 / 2.892 / 8.260 ms/step against Stage 0's
+      1.398 / 2.882 / 8.290 (`1793150926`; 1.387 / 2.882 / 8.210 the run before). Within drift, so the generic
+      lowering costs untraced training nothing measurable.
 - [ ] Allocation through `l1::Requirements` and the op's `channel::Graph::check`, once the matmul's layouts are
   microkernel layouts: today each client's microkernel plans its own L1 (`sfpu::kernel::plan_layout_in`,
   `sfpu::reduce::plan_layout`).
-- [ ] **F3.9:** the H6 audit, B1, `--smoke` on card 0, and the close-out.
+- [ ] **F3.9:** the H6 audit, `--smoke` on card 0, and the close-out.
 - **H6 prediction:** no pass contains code specific to one of the three clients. If one does, the description gets the missing concept and the Bible records it.
 
 ## Stage F4b (compute): operand reuse across cores, H1

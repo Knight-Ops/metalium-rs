@@ -390,6 +390,12 @@ Stage F3 of [dataflow-compiler.md](../plans/dataflow-compiler.md). The pointwise
 deleted. Both reproduce their job goldens word for word (`tile_op::golden`, `050cbbd`), so their device work is
 unchanged by construction; what the port can change is the host's time to build the jobs.
 
+**The matmul (F3.6-F3.8, `c6fd79b`).** Every `matmul_dram` and batched lowering is on `TileOp`, word for word against
+the job goldens, so the product's device work is unchanged by construction. The owner dropped the 3% host-time cutoff
+(2026-10-28): the check is eager step time. `bench_training` on card 1 (`1793218316`) gives 1.398 / 2.892 / 8.260
+ms/step (MNIST 784-128-10, MNIST default, transformer), against Stage 0's 1.398 / 2.882 / 8.290 (`1793150926`) and
+1.387 / 2.882 / 8.210 the run before (`1793128372`). That is within drift.
+
 **Method.**
 - B0 is a worktree at `050cbbd` (the goldens, before any port), the after side `0bfb79e`.
 - Both ran back to back on card 1 (release, safe image) with nothing else on the host. A first B0 taken while the
