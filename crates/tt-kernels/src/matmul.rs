@@ -8,7 +8,7 @@
 
 use tt_isa::backend::ConfigWords;
 use tt_isa::cfg::generated::{alu, thread};
-use tt_isa::format::{SrcType, TileFormat};
+use tt_isa::format::{Src, SrcType, TileFormat};
 use tt_isa::isa::generated::encode;
 use tt_isa::isa::Instruction;
 use tt_isa::tile::{L1Format, TileImage};
@@ -1585,14 +1585,20 @@ impl PairOrder {
         }
     }
 
-    /// The order a product of `fmts` takes.
+    /// The order a product of `fmts` takes: [`PairOrder::Auto`] holds both tiles whole where each
+    /// operand's format and `Src` type license it ([`TileFormat::whole_tile_unpack`], measured),
+    /// else takes the faces order.
     fn resolve(self, fmts: SrcFormats) -> PairOrder {
         match self {
             PairOrder::Auto => {
-                let a = fmts.a == L1Format::Fp32 && fmts.a_out == TF32_CODE;
-                let b = (fmts.b == L1Format::Fp32 && fmts.b_out == TF32_CODE)
-                    || (fmts.b == L1Format::Bf16 && fmts.b_out == BF16_CODE);
-                if a && b {
+                let whole = |format: L1Format, out: u32, src: Src| {
+                    let format = TileFormat::new(format);
+                    [SrcType::Tf32, SrcType::Bf16, SrcType::Fp16]
+                        .into_iter()
+                        .find(|&to| format.src_codes(to).is_some_and(|(_, o)| o == out))
+                        .is_some_and(|to| format.whole_tile_unpack(to, src))
+                };
+                if whole(fmts.a, fmts.a_out, Src::B) && whole(fmts.b, fmts.b_out, Src::A) {
                     PairOrder::Tiles
                 } else {
                     PairOrder::Faces
@@ -3729,6 +3735,27 @@ pub(crate) mod order;
 
 #[cfg(test)]
 mod tests {
+    /// [`PairOrder::Auto`] holds both tiles whole exactly where each operand's unpack is measured
+    /// whole ([`TileFormat::whole_tile_unpack`]): the routes P4 licensed as before, and a packed
+    /// BFP weight beside TF32 since H7; a BF16 or BFP `A` in `SrcB` is not measured.
+    #[test]
+    fn auto_holds_tiles_whole_where_each_unpack_is_measured() {
+        use super::{PairOrder, SrcRoute};
+        let auto = |route: SrcRoute| PairOrder::Auto.resolve(route.src_formats());
+        for (route, want) in [
+            (SrcRoute::Tf32FromFp32, PairOrder::Tiles),
+            (SrcRoute::TF32_WITH_BF16_B, PairOrder::Tiles),
+            (SrcRoute::Tf32WithB(TileFormat::BFP8), PairOrder::Tiles),
+            (SrcRoute::Tf32WithB(TileFormat::BFP4), PairOrder::Tiles),
+            (SrcRoute::Tf32WithB(TileFormat::BFP2), PairOrder::Tiles),
+            (SrcRoute::Bf16FromFp32, PairOrder::Faces),
+            (SrcRoute::Bf16FromBf16, PairOrder::Faces),
+            (SrcRoute::Bfp(crate::bfp::BfpFormat::Bfp8), PairOrder::Faces),
+        ] {
+            assert_eq!(auto(route), want, "{route:?}");
+        }
+    }
+
     use super::*;
 
     /// Every `PACR` of a kernel's pack role sees the packer configuration a whole rewrite for its
