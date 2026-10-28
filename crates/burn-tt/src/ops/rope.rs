@@ -112,12 +112,15 @@ pub(crate) fn rope_native(x: &TtTensor, cos: &TtTensor, sin: &TtTensor) -> Optio
     ))
 }
 
-/// The composition on this backend: `x cos + cat(x2, x1) sin`.
+/// The composition on this backend: `x cos + cat(x2, x1) sin`, through the backend's own ops, so
+/// each takes any dtype as Burn's composition would (a half dtype widened and rounded op by op).
 pub(crate) fn rope_composed(x: TtTensor, cos: TtTensor, sin: TtTensor) -> TtTensor {
+    use burn_backend::ops::FloatTensorOps;
+    type B = crate::TtBackend;
     let shape = x.shape().to_vec();
     let (n, h, t, d) = (shape[0], shape[1], shape[2], shape[3]);
     let half = d / 2;
-    let x1 = float::float_slice(
+    let x1 = B::float_slice(
         x.clone(),
         &[
             (0..n).into(),
@@ -126,7 +129,7 @@ pub(crate) fn rope_composed(x: TtTensor, cos: TtTensor, sin: TtTensor) -> TtTens
             (0..half).into(),
         ],
     );
-    let x2 = float::float_slice(
+    let x2 = B::float_slice(
         x.clone(),
         &[
             (0..n).into(),
@@ -135,8 +138,8 @@ pub(crate) fn rope_composed(x: TtTensor, cos: TtTensor, sin: TtTensor) -> TtTens
             (half..d).into(),
         ],
     );
-    let swapped = float::float_cat(vec![x2, x1], 3);
-    float::float_add(float::float_mul(x, cos), float::float_mul(swapped, sin))
+    let swapped = B::float_cat(vec![x2, x1], 3);
+    B::float_add(B::float_mul(x, cos), B::float_mul(swapped, sin))
 }
 
 /// [`rope_native`], else [`rope_composed`]: charged to an op of its own, `rope`, as Burn's ops are.
