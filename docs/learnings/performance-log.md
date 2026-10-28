@@ -12,7 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
-| [F3: the tile-generic op, pointwise and reduction ported, before and after](#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1) | 2026-10-28 | B0 (`050cbbd`) against the pointwise family and the reduction on `TileOp`, word for word: their build stage first 20-50% slower (per-run allocations, up to 3.9% of a call), then within 1.8% of B0 on every call (`8011dc7`, ABBA); traced decode ABBA 0.997-1.005 of B0 against B0's own 1.5% drift; models and MNIST within drift |
+| [F3: the tile-generic op, pointwise and reduction ported, before and after](#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1) | 2026-10-28 | B0 (`050cbbd`) against the pointwise family and the reduction on `TileOp`, word for word: their build stage first 20-50% slower (per-run allocations, up to 3.9% of a call), then within 1.8% of B0 on every call (`8011dc7`, ABBA); traced decode ABBA 0.997-1.005 of B0 against B0's own 1.5% drift; models and MNIST within drift; F3 closed: the matmul, allocation and channels as passes, eager step time (B1) within drift of F3.8's tree, ABBA |
 | [A cross-core credit against the barrier (H8)](#a-cross-core-credit-against-the-barrier-h8-2026-10-28-card-1) | 2026-10-28 | F2: a credited handoff between two units 1.81 us, a two-unit barrier 2.66 / 2.59 us (polled / released); a 4 KiB page at depth 2 with the consumer's copy 9.39 us; H8's 1.5 us prediction missed, its claim held |
 | [The GDDR write benches run again](#the-gddr-write-benches-run-again-2026-10-28-card-0) | 2026-10-28 | broken since the B/NC split (`3c7756b`: a barrier is B's, NC refused the lists); NC's writes now run in B's transfer packets behind B's barrier: NoC #1 writes 403-408 / 385-388 GB/s at 16 / 120 tiles, as before; 235 at 4 (was 299: the handoff on a short run) |
 | [Why card-wide reads plateau at 469, and what it means for decode](#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0) | 2026-10-28 | `fast-reads`: the 120-tile read loses ~30 GB/s of steady state to too many requests in flight a channel (knee ~32), ~15 to crossing the chip (each tile on its half's channels: ~505 steady, 495 overall) and the rest to an unfair finish; decode's caps re-swept: lowering any of them slows the step (B's own cap 2: +0.45 ms), the defaults stay; `fast-reads` decode 11.05 / 12.39-12.42 ms against the safe image's 11.38 / 12.55 |
@@ -395,6 +395,18 @@ the job goldens, so the product's device work is unchanged by construction. The 
 (2026-10-28): the check is eager step time. `bench_training` on card 1 (`1793218316`) gives 1.398 / 2.892 / 8.260
 ms/step (MNIST 784-128-10, MNIST default, transformer), against Stage 0's 1.398 / 2.882 / 8.290 (`1793150926`) and
 1.387 / 2.882 / 8.210 the run before (`1793128372`). That is within drift.
+
+**Allocation and channels as passes, the H6 audit (F3.9, `d280c46`), and B1.** A body now declares its L1 and
+`tile_op::allocate` places it, each op's channels pass `channel::Graph::check`, and a partial's reload has one form.
+Every job is word for word but the reduction's chunked fallback (its reload moved after its reads, `2f9bc5d`).
+B1 is `bench_training` on card 1, ABBA against F3.8's tree (`a984fa2`, a worktree), release, nothing else on the host:
+
+| tree | runs | MNIST 784-128-10 | MNIST default | transformer |
+|---|---|--:|--:|--:|
+| `d280c46` | `1793222702`, `1793222744`, `1793223083` | 1.398 | 2.903 / 2.892 / 2.892 | 8.300 / 8.300 / 8.270 |
+| `a984fa2` | `1793223007`, `1793223049` | 1.398 | 2.892 / 2.892 | 8.290 / 8.270 |
+
+The two trees' runs overlap: within drift. `--smoke` on card 0 passed 1,241 of 1,241 (`1793221000`).
 
 **Method.**
 - B0 is a worktree at `050cbbd` (the goldens, before any port), the after side `0bfb79e`.

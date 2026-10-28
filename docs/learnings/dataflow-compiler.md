@@ -364,7 +364,7 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 
 | # | Question | Tenstorrent | Alternative | Status and deciding evidence |
 |---|---|---|---|---|
-| D1 | Lowering | Staged (D2M pipeline) | One builder per op (ours today) | **Provisional: staged.** Information-preserving lowering is what makes transforms generic. Confirmed if the first three clients (§13 H6) need no per-op transform code |
+| D1 | Lowering | Staged (D2M pipeline) | One builder per op (ours before F3) | **Decided 2026-10-28: staged.** Information-preserving lowering is what makes transforms generic. H6 held: the three clients (matmul, the pointwise SFPU family, a reduction) run through passes that name none of them, and the one concept the description still lacks, a chain handed between units, goes to F4a as a channel (§13 H6) |
 | D2 | Partials across K chunks | Packer L1 accumulation | Reload into FP32 `Dst` | **Decided: reload** under the default contract (L1 accumulation changes rounding, G3). L1 accumulation stays available as a named contract |
 | D3 | Decode weight readers | DRAM-sharded, one reader beside each bank | Interleaved `READ_RUN` stream | **Decided 2026-10-27: no gain.** At equal entry sizes, 8 readers a channel equal today's deal; with reads 5× cheaper the step moves only 10.82 → 10.60 ms (F27, [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)) |
 | D4 | Layout search | Greedy (tt-mlir, after removing a solver) | Global solver | **Provisional: greedy** [PUB]. Revisit only on a measured loss |
@@ -486,6 +486,43 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
   - *Kills it:* a transform needs per-op special cases. The description is then missing a concept, and it is amended
     here. Or an eager step-time regression that no memo removes: the generic layer then costs eager ops what it gives
     transforms, and that is recorded here.
+  - *Result (2026-10-28): holds, with one concept missing and carried to F4a.*
+    - **The passes name no client.** Distribution (`tile_op::distribute`, 237 lines of code), channels
+      (`tile_op::channels`, 84), allocation (`tile_op::allocate`, 70), lowering (`tile_op::lower`, 616), reads ahead
+      (`tile_op::ahead`, 22) and the description with its driver (`tile_op`, 265) name no body type and call no client
+      module. The audit's three exceptions are named and kept: `tensor::runs` and `tensor::packed_twin_writes` (generic,
+      shared with builders not on `TileOp`), and four dev-only timing probes on the contraction pair in `lower` (skip
+      `A`, skip `B`, skip every gather, reverse the chunks; off in every result, used by `step214`, `step229` and the
+      silicon probes). The op-specific code is the three bodies behind `Microkernel` (`Sfpu`, `Reduce`, `Mma`).
+    - **What the description gained, none of it named after a client:** a reduction's `Combine` (`InDst`,
+      `GddrPartials`, `L1Halves`), 2-D runs, the contraction pair, packed layouts (`PackedRow`, `Packed`), a held first
+      operand, reads ahead (`TileOp::ahead`); and, for the allocation and channel passes, a buffer placed against the
+      arena's end (`l1::Requirements::against_end`), a channel's initial pages (`channel::Channel::initial`, a chain's
+      first link) and a handoff between a tile's roles (`channel::Kind::Roles`).
+    - **Allocation and channels are passes** (`033fc3f`, `c6f426e`). A body declares a run's `l1::Requirements` and
+      reads its placement back by name; `allocate::place` alone chooses the region (the arena, half of it, the ring's
+      end), plans, checks (`l1::check`) and notes. Each op's channels on a unit (the streams at the depth its runs are
+      staged, the roles' handoff, a chain's partial with one initial page) pass `channel::Graph::check` before it is
+      lowered, and the depth is checked against the session's.
+    - **The three items the matmul port left:**
+      1. *The blocking pass's cost input.* `block_stream_plan`, `stream_chunks`, `packed_k_block` and `plan_floor`
+         choose a product's schedule before its description is built. That is §8's per-op cost model, not a
+         transform: the passes take the schedule as given, and fit is now tested through the body's own requirements,
+         unnoted (`90b1cd5`).
+      2. *A partial's reload order.* One link form for both lowerings: wait, reads, then reload (`2f9bc5d`; the
+         reduction's chunked fallback re-blessed, its lists the same entries in a new order).
+      3. *A chain handed between units.* `tile_op::matmul::Plan`'s placement over a spread (prefetching units, second
+         jobs, the balanced deal) and the handoff's split of an `L1Halves` chain are client code written over lowered
+         jobs. The description lacks the concept; F4a gives it, as a remote-credit channel the channel pass places.
+    - **Words:** every job word for word through the stage (`tile_op::golden`), but the deliberate reorder in (2). The
+      L1 notes are pinned too (`5dc2812`), built from cold and warm memos; that golden found two defects, both notes
+      too high, never too low: a reduction's group measured noted (`56752e3`) and a schedule's probes noted
+      (`90b1cd5`, five K-blocked or streamed products' tops lowered).
+    - **Eager step time** (B1, `bench_training`, card 1): 1.398 / 2.892-2.903 / 8.270-8.300 ms/step (MNIST 784-128-10, MNIST default, transformer) in three runs of the
+      closing tree (`d280c46`: `1793222702`, `1793222744`, `1793223083`), against 1.398 / 2.892 / 8.270-8.290 for F3.8's
+      tree run between them (`a984fa2`: `1793223007`, `1793223049`), and Stage 0's 1.398 / 2.882 / 8.290. Within drift:
+      the two trees' runs overlap (8.270 each on the transformer). The passes cost untraced training nothing measurable.
+    - `step243` (the session's capture-time choice of prefetching units) was not needed: that choice did not move.
 - **H8 Per-edge credits are cheap** (F2, opened 2026-10-28). A channel's credit is a NoC atomic increment into the
   consumer's L1 word, sent after the data's write acknowledgements (T7), and a fenced local wait.
   - *Claim:* a credited unicast handoff between two units costs less than one op barrier (~3 us, T10), so replacing a

@@ -153,7 +153,8 @@ track's order follows the evidence: products are bound by operand reads (scorebo
   - the prediction (<= 1.5 us) is missed, and the claim (cheaper than a barrier) holds. See the Bible's H8.
 - [x] Close-out: `--smoke` on card 0, 1,241 of 1,241 (`1793200324`); `step12_mnist` 8 of 8 on ttsim, goldens unchanged.
 - **Not yet built:** no op uses a cross-core channel. F4b (operand reuse) and F4a (channels instead of barriers) are
-  the first. `channel::Graph` is not yet run on an op's graph, and a `Gddr` ring's GDDR placement is the caller's.
+  the first. `channel::Graph` runs on each op's in-core graph since F3 (`tile_op::channels`); a `Gddr` ring's GDDR
+  placement is the caller's.
 
 ## Stage F3: the tile-generic op (L1) and transforms written once
 
@@ -210,7 +211,7 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
     ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
   - `matmul_pipeline_sweep` had failed on every tree (an unbalanced profile with NC writing). It now falls back to host
     time (`db3081e`).
-- [ ] **F3.6-F3.8, matmul:** block-stream, then blocked/K-block/stream, then thin, prefetch and handoff. Owner,
+- [x] **F3.6-F3.8, matmul:** block-stream, then blocked/K-block/stream, then thin, prefetch and handoff. Owner,
   2026-10-28: `matmul_dram_batched` is ported in this stage, so `BlockPlan` goes whole. The opt-in handoff, second job
   and balanced deal are ported, then re-measured under channels in F4a.
   - [x] **F3.6a, the batched golden** (`9dad570`). `tile_op::golden::batched_jobs_are_pinned` pins 58 cases of
@@ -294,11 +295,49 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
     - Eager step time, card 1 (`bench_training`, `1793218316`): 1.398 / 2.892 / 8.260 ms/step against Stage 0's
       1.398 / 2.882 / 8.290 (`1793150926`; 1.387 / 2.882 / 8.210 the run before). Within drift, so the generic
       lowering costs untraced training nothing measurable.
-- [ ] Allocation through `l1::Requirements` and the op's `channel::Graph::check`, once the matmul's layouts are
-  microkernel layouts: today each client's microkernel plans its own L1 (`sfpu::kernel::plan_layout_in`,
-  `sfpu::reduce::plan_layout`).
-- [ ] **F3.9:** the H6 audit, `--smoke` on card 0, and the close-out.
-- **H6 prediction:** no pass contains code specific to one of the three clients. If one does, the description gets the missing concept and the Bible records it.
+- [x] **Allocation and the channel check as passes** (2026-10-28).
+  - **The notes pinned first** (`5dc2812`): `tile_op::golden` records each case's `l1::Planned` (the top and need a
+    capture keeps in `OpRecord`) in `golden/planned_<client>.txt`, and builds every case twice, from cold and warm
+    memos, requiring the same jobs and notes. It found a reduction's group measured noted, so the first reduction of a
+    shape in a process noted its probes' top (`56752e3`).
+  - **Allocation** (`033fc3f`): `Microkernel::{run, chunk, block_chunk}` became `needs(at)` and `code(at, placed)`.
+    A body declares a run's `l1::Requirements` (memoised by shape) and reads its placement back by name
+    (`l1::Placed`). `tile_op::allocate::place` alone chooses the region (the arena, half of it moved by `l1::half()`,
+    or the ring's end), plans, checks (`l1::check`), memoises and notes. A product's `B` ring against the arena's end
+    is a planner property (`Requirements::against_end`) in place of a gap sized from the region.
+    `Schedule::{BlockStream, Stream}` carry shapes, not planned layouts. Every golden is unchanged, cold and warm; on
+    ttsim, 26 gate files pass 126 of 126.
+  - **A schedule's fit tested unnoted** (`90b1cd5`): `stream_chunks`, `packed_k_block` and `k_block_size` noted their
+    candidates. Five K-blocked or streamed cases' notes fell; none rose. The default decode schedules are unchanged.
+    `step197/205/216/217/218/219/221/222/228` pass 48 of 48 on ttsim.
+  - **Channels** (`c6f426e`): `tile_op::channels` checks a unit's graph before lowering:
+    - the streams at the depth its runs are staged;
+    - the unpacker's batch to the packer;
+    - a chained reduction's partial, with one initial page (`Channel::initial`; `Kind::Roles` for a handoff between a
+      tile's roles).
+
+    The depth is checked against the lowered kernels' halves. Planted faults: a chain without its first page
+    deadlocks, and pipelined runs claimed one page deep fail the goldens.
+- [x] **F3.9: the H6 audit, `--smoke` on card 0, and the close-out** (2026-10-28). H6 holds; the result is in the Bible
+  (§13 H6), and D1 is decided: staged.
+  - Item 2, the reload order: one link form, with wait, reads, then reload (`2f9bc5d`). The reduction's chunked
+    fallback was re-blessed: four cases, the same entries reordered. `step31/55/67/68/69` pass 25 of 25 on ttsim.
+  - Items 1 and 3 are recorded. The schedule's cost input is §8's, outside the passes. A chain handed between units
+    (`Plan`'s spread placement and the handoff) is the concept the description lacks, carried to F4a.
+  - The audit's moves (`d280c46`):
+    - distribution into `tile_op::distribute`;
+    - the arena's halves into `l1`;
+    - `block_reads` into `lower`;
+    - the read-ahead split into `ahead::split`.
+
+    The exceptions left are named in the Bible.
+  - `step12_mnist` on ttsim passes 8 of 8 with the goldens unchanged. `--smoke` on card 0 passes 1,241 of 1,241
+    (`1793221000`). `cargo xtask conformance` was not rerun, because nothing under `burn-tt` changed.
+  - B1 (`bench_training`, card 1, ABBA against F3.8's tree `a984fa2`): the closing tree gives 1.398 / 2.892-2.903 /
+    8.270-8.300 ms/step (`1793222702`, `1793222744`, `1793223083`); F3.8's tree gives 1.398 / 2.892 / 8.270-8.290
+    (`1793223007`, `1793223049`). Within drift.
+  - `step243` was not needed: the session's capture-time choice of prefetching units did not move.
+- **H6 prediction:** no pass contains code specific to one of the three clients. If one does, the description gets the missing concept and the Bible records it. **Held** (the Bible's H6).
 
 ## Stage F4b (compute): operand reuse across cores, H1
 

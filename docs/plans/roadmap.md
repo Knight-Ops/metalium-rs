@@ -770,16 +770,23 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
   - `channel::Graph` refuses unbalanced rates and deadlocks.
   - H8: a credited handoff costs 1.81 us against a two-unit barrier's 2.6 us (prediction 1.5 missed, claim held).
   - No op uses a cross-core channel yet. F4b and F4a are the first.
-- [ ] **F3:** the tile-generic op (H6), in progress since 2026-10-28.
+- [x] **F3:** the tile-generic op (H6), 2026-10-28. H6 held; D1 decided: staged.
   - Method: a job golden first (`050cbbd`), then each client ported word for word and its old builder deleted.
-  - Done: the pointwise family and the reduction (`33d3562`, `0bfb79e`). On card 0, 65 of 65. On card 1, host time per
+  - The pointwise family and the reduction (`33d3562`, `0bfb79e`). On card 0, 65 of 65. On card 1, host time per
     op within 1.8% of B0 after `8011dc7`, and decode, models and MNIST within drift
     ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
-  - The matmul (2026-10-28): block-stream (F3.6, `e579690`), K whole, K-block and stream (F3.7, `ddc23a0`) and the
-    batched product are on `TileOp` through one contraction lowering, word for word against the job goldens (a batched
-    golden added first, `9dad570`). `BlockPlan` moved to `tile_op::matmul::Plan`, and its reads ahead are a generic pass
-    (F3.8).
-  - Left: allocation and the channel check as passes, the H6 audit, and B1.
+  - The matmul: block-stream (F3.6, `e579690`), K whole, K-block and stream (F3.7, `ddc23a0`), and thin, prefetch,
+    handoff and batched (F3.8, `c6fd79b`), through one contraction lowering, word for word.
+  - Allocation and channels as passes: a body declares its L1, `tile_op::allocate` alone places and notes it
+    (`033fc3f`), and each op's channels pass `channel::Graph::check` before lowering (`c6f426e`). The L1 notes are
+    pinned beside the jobs (`5dc2812`); that golden found two defects, both notes too high (`56752e3`, `90b1cd5`).
+  - F3.9, the H6 audit ([Bible §13](../learnings/dataflow-compiler.md#13-hypotheses-register)): the passes name no
+    client. One link form for a partial's reload (`2f9bc5d`). What the passes borrowed moved into them (`d280c46`).
+    A chain handed between units is the concept left for F4a.
+  - Closed: `--smoke` on card 0 passes 1,241 of 1,241 (`1793221000`). `step12_mnist` passes 8 of 8 with the goldens
+    unchanged. B1, eager step time on card 1, is within drift of F3.8's tree, ABBA (1.398 / 2.892-2.903 /
+    8.270-8.300 against 1.398 / 2.892 / 8.270-8.290 ms/step)
+    ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
 - [ ] **F4b:** operand reuse across cores (H1).
 - [ ] **F4a:** channels instead of barriers in decode (H4).
 - [ ] **F5:** `Dst` subblocks and half-sync (H2).
