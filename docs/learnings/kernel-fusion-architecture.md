@@ -2,6 +2,8 @@
 
 This document establishes the permanent empirical and architectural principles of **Kernel Fusion** for Tenstorrent Blackhole accelerators within the `metalium-rs` stack. It details how the software-level graph representation in Burn interfaces with the physical micro-architecture of Tensix cores, and why our direct Rust compilation model eliminates the multi-tier compiler bloat seen in traditional accelerator stacks.
 
+> **Superseded in part (2026-10-28):** §4 ("Why We Do Not Need a Second Graph Compiler"), §6.2 (an `SfpuMicroOp` engine that was never built) and §3's "~1.2 MB" arena (it is 896 KiB plus 88 KiB capture-only, `tt_isa::l1`) are superseded by [dataflow-compiler.md](dataflow-compiler.md) and [ADR 0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md). The fusion classes and the rule that fusion never leaves the microsecond compile budget stand.
+
 ---
 
 ## 1. The Two-Stage Fusion Model

@@ -53,6 +53,7 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | Scheduler, credits, traces or recovery  | [streaming architecture](docs/learnings/streaming-dataflow-architecture.md), [traced execution](docs/plans/traced-execution.md)          |
 | Hardware access/bring-up                | [silicon operating notes](docs/learnings/silicon-operating-notes.md), [implementation checklist](docs/completed-plans/phases-0-10-checklist.md) |
 | Simulator refusal or numerical mismatch | [ttsim-divergence.md](docs/learnings/ttsim-divergence.md); read refutations as well as original findings                                 |
+| Optimizations below Burn (formats, fusion, multi-core, credits) | [dataflow-compiler.md](docs/learnings/dataflow-compiler.md) (principles, ADRs 0003-0005), [dataflow-compiler plan](docs/plans/dataflow-compiler.md) |
 | Performance changes                     | [performance-scoreboard.md](docs/learnings/performance-scoreboard.md) (current), [performance-log.md](docs/learnings/performance-log.md) (history) |
 | Architecture/specification rationale    | [phases-0-10-roadmap.md](docs/completed-plans/phases-0-10-roadmap.md), [tt-metal concepts review](docs/learnings/tt-metal-concepts-review.md)                |
 
@@ -64,7 +65,7 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | `tt-device` / `tt-kmd`  | `silicon-operating-notes.md`, `ttsim-divergence.md`                                           | `roadmap.md`                                                                                         |
 | `tt-layout`             | `performance-scoreboard.md`                                                              | `roadmap.md`, `new-op-definition-of-done.md`                                                         |
 | `tt-firmware`           | `performance-scoreboard.md`, `streaming-dataflow-architecture.md`, `silicon-operating-notes.md` | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`                                              |
-| `tt-kernels`            | `streaming-dataflow-architecture.md`, `tt-metal-concepts-review.md`                           | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`, `new-op-definition-of-done.md`              |
+| `tt-kernels`            | `dataflow-compiler.md`, `streaming-dataflow-architecture.md`, `tt-metal-concepts-review.md`                           | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`, `new-op-definition-of-done.md`              |
 | `burn-tt`               | `tt-metal-concepts-review.md`                                                                 | `roadmap.md`, `burn-backend-parity.md`, `burn-native-cutover.md`, `traced-execution.md`, `burn-op-notes.md` |
 | `tt-tests` / `tt-mnist` | `ttsim-divergence.md`, `performance-scoreboard.md`                                       | `roadmap.md`, `new-op-definition-of-done.md`                                                         |
 | `xtask`                 | `silicon-operating-notes.md`                                                                  | `roadmap.md`, `burn-backend-parity.md`                                                               |

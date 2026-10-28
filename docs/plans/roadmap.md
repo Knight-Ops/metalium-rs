@@ -746,6 +746,25 @@ Goal: training at or below burn-flex per step on MNIST and the transformer, then
 Track 1 model. Evidence and bottlenecks:
 [performance-scoreboard.md](../learnings/performance-scoreboard.md) ("Where the overhead is").
 
+**Since 2026-10-28, optimizations below Burn follow [dataflow-compiler.md](../learnings/dataflow-compiler.md)** (ADRs
+0003-0005).
+- Formats are edge data, and no work is done per format.
+- Transforms are written once, over a tile-generic op description.
+- Schedules choose only among bit-equivalent options under each op's numeric contract.
+- Every step is a hypothesis with a kill criterion.
+
+The staged work is [dataflow-compiler.md](dataflow-compiler.md), in a worktree on branch `dataflow-compiler`, with silicon on card 1 for now:
+- [ ] **Stage 0:** card-1 baselines.
+- [ ] **F1:** `TileFormat`, and one matmul for every format pair, with exact fidelity (H3).
+- [ ] **F2:** typed channels and the cross-core credit.
+- [ ] **F3:** the tile-generic op (H6).
+- [ ] **F4b:** operand reuse across cores (H1).
+- [ ] **F4a:** channels instead of barriers in decode (H4).
+- [ ] **F5:** `Dst` subblocks and half-sync (H2).
+- [ ] **F6:** fusion through channels and spatial pipelining (H5).
+
+This takes over the open parts of "Use the grid" (G4 subblocks, G7 multicast) and "Prefill P5" below. Their evidence stands.
+
 **What the model ladder measured (2026-10-12, [profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)),
 and so the order to work in.** Against burn-flex on the same machine: ResNet-18 105x slower (16.3 s), SmolLM2 decode
 25x (619 ms a step) and ViT-Tiny 7.8x (815 ms), with a token embedding alone 15.9 s. The first two have a single cause

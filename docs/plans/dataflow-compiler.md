@@ -1,0 +1,98 @@
+# Plan: the dataflow compiler, staged
+
+**Status:** approved and scheduled 2026-10-28 (owner). Its design principles are in
+[dataflow-compiler.md](../learnings/dataflow-compiler.md) (the Bible), and its binding decisions in ADRs
+[0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md),
+[0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and
+[0005](../adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md).
+**Branch:** `dataflow-compiler`, in a worktree.
+**Silicon:** card 1 only until the owner says otherwise. No `--device all`, and no mesh, multi-card or Ethernet gate.
+
+Every stage opens by writing its hypothesis, prediction and kill criterion into the Bible's register (§13), then
+measures its baseline on card 1 at the stage's starting commit. A stage is kept only if its gates are bit-exact and the
+prediction holds. Otherwise the refutation is recorded and the stage stops.
+
+The two performance tracks, decode and compute, alternate after the shared foundations, as the owner chose on 2026-10-27. The compute
+track's order follows the evidence: products are bound by operand reads (scoreboard, matmul row), so operand reuse
+(H1) comes before `Dst` subblocks (H2).
+
+## Stage 0: baselines on card 1
+
+- [ ] Release benches on card 1 at the starting commit:
+  - `matmul_throughput` at prefill shapes, F32/TF32 and BF16-weight;
+  - SmolLM2-135M and 1.7B traced decode;
+  - 1.7B prefill at 256 tokens;
+  - ResNet-18 and ViT-Tiny traced;
+  - MNIST.
+- [ ] A 1.7B `Step(64)` profile on card 1, for the card read meter and the per-product tails.
+- [ ] Record the rows in the scoreboard and log with their run IDs, marked as card-1 baselines.
+
+## Stage F1: `TileFormat` (ADR 0004), and one matmul for every format pair
+
+- [ ] Add `tt_isa::tile::TileFormat`:
+  - code, datum bits, exponent block, image and slot bytes, family;
+  - unpack routes to `Src` and to `Dst`, and pack routes;
+  - fidelity slices and narrowing semantics.
+  - Each field is derived from `vendor/` or a measured row. Unit tests pin it against the existing `L1Format`/`TileImage` values and the slot constants.
+- [ ] Route `TILE_SLOT`, `BF16_TILE_SLOT`, `BfpFormat::slot_bytes` and `SrcRoute`/`SrcFormats` through it. No behaviour change: existing gates stay bit-identical.
+- [ ] Add `TileFormat::exact_fidelity(a, b)`. **H3 gate first:** ttsim, then card 1. Across the format matrix, products at derived fidelity equal products at HiFi4 bit for bit, including −0, subnormals, NaN, infinities and mixed exponents inside a group.
+  - If equal, the default contract's fidelity rule becomes "exact for the edge formats".
+  - If not, it stays HiFi4 and exact fidelity is a named contract.
+- [ ] One matmul job builder, parameterized by the A, B, out and accumulator edge formats, replacing `tensor::matmul_dram*`, `bf16::matmul` and `bfp::matmul`.
+  - Gate: bit-exact against each old builder on every pair it supported, and new mixed pairs (BFP8/4 weights × BF16 or TF32 activations) against the specification model and burn-flex within derived bounds.
+  - Then delete the old builders, the `bfp.rs` same-format refusal and their per-format server functions.
+- [ ] `step12_mnist`, `cargo xtask conformance --release`, and silicon gates on card 1.
+- **Prediction:** a BFP4-weight product is faster than BF16 at decode shapes in proportion to its bytes, at least 1.5× at m = 1. If H3 holds, the compute-bound BFP products run at ≥3× the BF16 HiFi4 rate.
+
+## Stage F2: typed channels and the cross-core credit
+
+- [ ] Add a `Channel` to `tt-kernels`: one producer, N consumers, a depth, and a page of `TileFormat` × tiles. Its kind is `Local`, `Remote`, `Broadcast` or `Gddr`, and its credit words are declared through `l1::Requirements`. The existing `Input`, `Output` and `Transfer` streams are re-expressed as `Local` channels, and every existing gate stays bit-identical.
+- [ ] Add the remote credit: a NoC atomic increment into a peer's L1 word, issued after the data's write acknowledgements (T7), plus a local wait.
+  - The encoding goes in `tt_isa::dataflow` and `tt_isa::dm`, the firmware in `tt-firmware/src/dataflow.rs`/`mover.rs`.
+  - Build both mover modes, and lint with and without `profile`/`encoded-guard`.
+  - Run `step172`/`step173` in both read modes.
+- [ ] Gates:
+  - ttsim, with negative controls: one credit too few stalls and is reported, never races; a credit sent before its data's acknowledgement is caught.
+  - An isolated silicon gate on card 1 before any op uses it.
+  - A divergence row if ttsim refuses the atomic.
+- [ ] Plan-time checks: rate balance and deadlock freedom (every cycle with its reverse credit edges holds enough initial tokens), with a refusal gate for each.
+
+## Stage F3: the tile-generic op (L1) and transforms written once
+
+- [ ] Add `TileOp`: domain with iterator kinds, affine tile maps, edges with `TileFormat` and `OpPadding`, a body of microkernel calls, and a `NumericContract`.
+- [ ] Write the passes against it: grid distribution (from `Spread`), L1 blocking (from `block_stream_layout`), allocation (through `l1::Requirements`), channels (F2), the role split, and lowering to `Step`/`Job`/`Work`.
+- [ ] Port three clients, one per dataflow class: matmul (from F1), the pointwise SFPU family (`sfpu_eltwise_blocks`, 121 kinds) and a row reduction. Each is bit-exact against its old builder, and the old builder is then deleted.
+- **H6 prediction:** no pass contains code specific to one of the three clients. If one does, the description gets the missing concept and the Bible records it.
+
+## Stage F4b (compute): operand reuse across cores, H1
+
+- [ ] Decide D5 by measurement first, on card 1, for one prefill product shape, between:
+  - a few holders whose rows or columns are pulled with `READ_L1`;
+  - one sender per row or column rectangle multicasting with `WRITE_L1_MCAST` and remote credits;
+  - larger blocks re-read from GDDR.
+- [ ] Build the winner as F3's reuse pass, so every format and every contraction gets it.
+- **Prediction:** `[m,2048]@[2048,16384]` at m = 2,048 from 18.2 to ≥35 TFLOPS.
+- **Kill:** GDDR reads drop and TFLOPS do not.
+
+## Stage F4a (decode): channels instead of barriers, H4
+
+- [ ] Derive per-edge channels from the residency plan (`residency.rs`, `Applied::rewrite`) and barrier analysis (`tt_kernels::barriers::analyse`). Keep barriers only where no channel can express the dependency (Bible §7).
+- [ ] Let units that finish their share start data-independent reads (the next product's weights) at once.
+- **Prediction:** the 1.7B decode step's card read rate ≥400 GB/s (from 328) and the step ≤9.5 ms (from 10.9), bit-exact.
+- **Kill:** the step moves <0.3 ms, or small ops lose what products gain.
+
+## Stage F5 (compute): `Dst` subblocks and half-sync, H2
+
+- [ ] Add a `Dst` tiling pass: output subblocks of `h×w ≤ 4` FP32 tiles, and half-sync between math and pack. Relax `retire_batch` (`tt-firmware/src/corpus.rs`) so roles overlap across batches, which needs the configuration to be the same in every batch or fenced.
+- **Prediction:** ≥1.4× on the H1 shapes after F4b, bit-exact.
+- **Kill:** <1.1×.
+
+## Stage F6 (gated on F4a and F5): fusion through channels and spatial pipelining, H5
+
+- [ ] Fusion through channels: register epilogues and prologues that replay every narrowing rounding (Bible X5), the B13c matmul epilogue fuser, and fusion of L1 and cross-core channels.
+- [ ] Spatial pipelining of a decode layer on disjoint core sets, only if H4's tails are not GDDR-queue-bound.
+
+## Not in scope
+
+- Opt-in contracts: split-K, flash attention, packer L1 accumulation, a 16-bit `Dst`, and fidelity below the contract. Each is the owner's call.
+- Multi-card schemes.
