@@ -4,7 +4,10 @@
 //! - **HiFi4 against LoFi:** four `MVMUL` phases a pair against one. If the rate barely moves, the
 //!   pair is not bound by the Matrix Unit.
 //! - **`B` in FP32 against `B` stored BF16** (`Session::store_bf16`): half the bytes each of `B`'s
-//!   eight face unpacks a pair moves. If the rate moves, the unpacker binds.
+//!   eight face unpacks a pair moves. If the rate moves, the unpacker binds. And `B` stored BFP8,
+//!   BFP4 and BFP2 (`DramTensor::from_bfp`, `docs/plans/dataflow-compiler.md` F1c), each checked
+//!   against the values its storage decodes to: at one-row decode shapes (`TT_PAIR_SHAPES=1,...`) a
+//!   product is bound by its weight's bytes, which these hold in ~0.28 / 0.15 / 0.09 of FP32's.
 //! - **No drain** (`matmul::probe_no_drain`, its own test, so its own process): each pair's step
 //!   without waiting for both unpackers to finish before the next bases are written. The products
 //!   may be wrong; only the time is measured.
@@ -119,6 +122,22 @@ fn run_orders(
             let a = s.upload(&av, m, k).unwrap();
             let b = s.upload(&bv, k, n).unwrap();
             let bb = s.store_bf16(&b).unwrap();
+            // Each BFP weight with the values its storage decodes to (BFP2's one magnitude bit
+            // cannot hold these integers, so the reference is the decoded weight).
+            let packed: Vec<(&str, DramTensor, Vec<f32>)> = [
+                ("BFP8", tt_kernels::bfp::BfpFormat::Bfp8),
+                ("BFP4", tt_kernels::bfp::BfpFormat::Bfp4),
+                ("BFP2", tt_kernels::bfp::BfpFormat::Bfp2),
+            ]
+            .into_iter()
+            .map(|(name, f)| {
+                let p = s.bfp_from_f32(&b, f).unwrap();
+                let decoded = s.bfp_to_f32(&p).unwrap();
+                let values = s.download(&decoded).unwrap();
+                s.free(decoded).unwrap();
+                (name, DramTensor::from_bfp(p), values)
+            })
+            .collect();
             let flops = 2.0 * (m * k * n) as f64;
             for &order in orders {
             if let Some(order) = order {
@@ -149,15 +168,17 @@ fn run_orders(
                         })
                         .collect()
                 });
-            let cases: Vec<(String, &DramTensor, Fidelity)> = [("FP32", &b), ("BF16", &bb)]
+            let mut weights: Vec<(&str, &DramTensor, &[f32])> = vec![("FP32", &b, &bv), ("BF16", &bb, &bv)];
+            weights.extend(packed.iter().map(|(name, t, v)| (*name, t, v.as_slice())));
+            let cases: Vec<(String, &DramTensor, &[f32], Fidelity)> = weights
                 .into_iter()
-                .flat_map(|(format, b)| {
+                .flat_map(|(format, b, bv)| {
                     fidelities
                         .iter()
-                        .map(move |&(name, f)| (format!("{name}, B {format}"), b, f))
+                        .map(move |&(name, f)| (format!("{name}, B {format}"), b, bv, f))
                 })
                 .collect();
-            for (what, b, fidelity) in cases {
+            for (what, b, bv, fidelity) in cases {
                 let (us, out) = replay_us(&mut s, &a, b, fidelity);
                 let tflops = flops / us / 1e6;
                 if !no_drain && skip == Skip::Nothing {
@@ -176,7 +197,7 @@ fn run_orders(
                 );
             }
             }
-            for t in [a, b, bb] {
+            for t in [a, b, bb].into_iter().chain(packed.into_iter().map(|(_, t, _)| t)) {
                 s.free(t).unwrap();
             }
         }

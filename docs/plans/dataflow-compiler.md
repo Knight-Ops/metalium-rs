@@ -18,14 +18,15 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 
 ## Stage 0: baselines on card 1
 
-- [ ] Release benches on card 1 at the starting commit:
-  - `matmul_throughput` at prefill shapes, F32/TF32 and BF16-weight;
-  - SmolLM2-135M and 1.7B traced decode;
-  - 1.7B prefill at 256 tokens;
-  - ResNet-18 and ViT-Tiny traced;
-  - MNIST.
-- [ ] A 1.7B `Step(64)` profile on card 1, for the card read meter and the per-product tails.
-- [ ] Record the rows in the scoreboard and log with their run IDs, marked as card-1 baselines.
+- [x] Release benches on card 1, 2026-10-28 ([log](../learnings/performance-log.md#card-1-baselines-for-the-dataflow-compiler-and-exact-fidelity-2026-10-28-card-1)):
+  - matmul at prefill shapes, `[1024,2048]@[2048,8192]` 14.64 TFLOPS (`1793149570`);
+  - ResNet-18 / ViT-Tiny traced, host-timed 38.45 / 26.77 ms;
+  - decode at `TT_TILES=all`: 135M 6.92 / 7.46 / 8.13 ms (`1793150978`), 1.7B 11.20 / 11.83 / 12.62 (`1793151302`);
+  - MNIST 1.398 / 2.882 / 8.290 ms/step (`1793150926`).
+  - Prefill tokens/s is in the decode runs' first-token rows.
+- [ ] A 1.7B `Step(64)` profile on card 1 (`--profile`), for the card read meter and the tails. This is H4's baseline, taken
+  when F4a starts.
+- [x] Recorded in the log as card-1 baselines.
 
 ## Stage F1: `TileFormat` (ADR 0004), and one matmul for every format pair
 
