@@ -439,6 +439,11 @@ impl Requirements {
         channel: &crate::channel::Channel,
         live: Range<u32>,
     ) -> Buf {
+        assert!(
+            channel.kind != crate::channel::Kind::Roles,
+            "{name}: a channel between a tile's roles is credited by its body's semaphores, and has \
+             no words"
+        );
         let (bytes, align) = channel_words(&channel.kind);
         let kind = match channel.kind {
             crate::channel::Kind::Local(_) => Kind::Counters,

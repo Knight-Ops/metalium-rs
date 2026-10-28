@@ -12,9 +12,12 @@
 //!   acknowledgements (T7); the consumer waits on its own word.
 //! - [`Kind::Broadcast`]: one page multicast to a rectangle of consumers, each credited.
 //! - [`Kind::Gddr`]: a page through GDDR, credited to the tile that reads it back.
+//! - [`Kind::Roles`]: within one tile, from one of its roles to another through `Dst` or L1,
+//!   credited by the body's own semaphores: it has no words of its own.
 //!
 //! The local kind is what every op emits today; this module is where its words are made
-//! ([`Channel::credit`]), so a stream's credits are written in one place.
+//! ([`Channel::credit`]), so a stream's credits are written in one place. Each op's channels are
+//! checked as a [`Graph`] before its jobs are lowered (`tile_op::channels`).
 
 use tt_isa::dataflow::{Action, Endpoint, Stream};
 use tt_isa::format::TileFormat;
@@ -50,6 +53,9 @@ pub enum Kind {
     Broadcast,
     /// Through GDDR, credited to the reader.
     Gddr,
+    /// Within one tile, between two of its roles (an unpacked batch to the packer, a partial
+    /// packed for the next chunk's unpack), credited by the body's own semaphores.
+    Roles,
 }
 
 /// One end of a channel: the role on a unit that produces or consumes it, and how many tokens it
@@ -70,6 +76,9 @@ pub struct Channel {
     pub consumers: Vec<End>,
     /// Pages held at once: the credits the reverse edge starts with.
     pub depth: u16,
+    /// Pages held before the first firing (at most `depth`): a chain's first link, which takes
+    /// none from the last (synchronous dataflow's delay tokens).
+    pub initial: u16,
     pub page: Page,
     pub kind: Kind,
 }
@@ -94,6 +103,7 @@ impl Channel {
             producer: end(stream.producer()),
             consumers: vec![end(stream.consumer())],
             depth,
+            initial: 0,
             page: Page::Batch,
             kind: Kind::Local(stream),
         }
@@ -487,7 +497,7 @@ impl Ring {
 /// (`docs/learnings/dataflow-compiler.md` §7). A process is a role on a unit (an [`End`]'s `unit`
 /// and `endpoint`); each consumer of a channel is an edge from its producer, carrying the
 /// producer's tokens a firing in and the consumer's out, with room for `depth` tokens: its reverse
-/// edge starts with `depth` credits.
+/// edge starts with `depth` credits, less the `initial` pages the forward edge starts with.
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
     channels: Vec<Channel>,
@@ -506,7 +516,7 @@ impl Graph {
     }
 
     /// The graph's repetition vector, once its rates balance (Lee and Messerschmitt 1987) and one
-    /// iteration runs to the end with every channel's depth as its credits.
+    /// iteration runs to the end from each channel's initial pages, with its depth as its room.
     pub fn check(&self) -> Result<Schedule, ChannelError> {
         let key = |e: &End| (e.unit, e.endpoint);
         let mut processes: Vec<(usize, Endpoint)> = Vec::new();
@@ -517,12 +527,19 @@ impl Graph {
                 processes.len() - 1
             }
         };
-        // (channel, from, to, produced a firing, consumed a firing, depth)
+        // (channel, from, to, produced a firing, consumed a firing, depth), and the initial pages.
         let mut edges = Vec::new();
+        let mut initial = Vec::new();
         for (c, channel) in self.channels.iter().enumerate() {
             if channel.depth == 0 || channel.producer.tokens == 0 {
                 return Err(ChannelError::Invalid(format!(
                     "channel {c} holds nothing or carries nothing"
+                )));
+            }
+            if channel.initial > channel.depth {
+                return Err(ChannelError::Invalid(format!(
+                    "channel {c} starts with {} pages and holds {}",
+                    channel.initial, channel.depth
                 )));
             }
             let from = index(key(&channel.producer));
@@ -541,12 +558,13 @@ impl Graph {
                     consumer.tokens as u64,
                     channel.depth as u64,
                 ));
+                initial.push(channel.initial as u64);
             }
         }
         let firings = repetitions(processes.len(), &edges)?;
         // One iteration, self-timed: any process with its inputs' tokens and its outputs' room
         // fires, until each has fired its count or none can.
-        let mut tokens = vec![0u64; edges.len()];
+        let mut tokens = initial;
         let mut fired = vec![0u64; processes.len()];
         loop {
             let mut progress = false;
@@ -753,6 +771,7 @@ mod tests {
                 tokens: 1,
             }],
             depth: 2,
+            initial: 0,
             page: Page::Tiles {
                 format: TileFormat::BF16,
                 tiles: 4,
@@ -977,6 +996,7 @@ mod tests {
             producer: end(from),
             consumers: vec![end(to)],
             depth,
+            initial: 0,
             page: Page::Batch,
             kind: Kind::Remote,
         }
@@ -996,6 +1016,33 @@ mod tests {
         let schedule = graph.check().unwrap();
         assert_eq!(schedule.processes.len(), 6);
         assert!(schedule.firings.iter().all(|&q| q == 1));
+    }
+
+    /// A chain's partial, packed by one firing for the next one's unpack: a cycle that runs only
+    /// from its one initial page; without it, nothing fires. More initial pages than room is
+    /// refused.
+    #[test]
+    fn a_chain_runs_from_its_initial_page_and_deadlocks_without_it() {
+        use Endpoint::*;
+        let chain = |initial| {
+            let mut partial = edge((0, Pack, 1), (0, Unpack, 1), 1);
+            partial.kind = Kind::Roles;
+            partial.initial = initial;
+            let mut batch = edge((0, Unpack, 1), (0, Pack, 1), 1);
+            batch.kind = Kind::Roles;
+            Graph::new(vec![
+                Channel::local(0, Stream::Input, 2),
+                batch,
+                partial,
+                Channel::local(0, Stream::Output, 2),
+            ])
+        };
+        assert!(chain(1).check().is_ok());
+        assert!(matches!(
+            chain(0).check(),
+            Err(ChannelError::Deadlock { .. })
+        ));
+        assert!(matches!(chain(2).check(), Err(ChannelError::Invalid(_))));
     }
 
     #[test]

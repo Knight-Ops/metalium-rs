@@ -7,9 +7,9 @@
 //!   and build it; nothing past them names a client.
 //! - [`Microkernel`] is the only op-specific code a pass calls: how many items a run of the body
 //!   holds, what L1 a run needs, and its role programs over the L1 it was given.
-//! - [`distribute`] deals the domain's items over units in runs; [`allocate`] places each run's
-//!   L1; [`lower`] turns each run into a job, reading every operand's tiles as its map says
-//!   ([`TileMap`]).
+//! - [`distribute`] deals the domain's items over units in runs; [`channels`] checks a unit's
+//!   channels as a dataflow graph; [`allocate`] places each run's L1; [`lower`] turns each run
+//!   into a job, reading every operand's tiles as its map says ([`TileMap`]).
 //!
 //! The first commit of the stage pins every job the hand-written builders it replaces emit
 //! ([`golden`]): each client is ported word for word against those jobs, then its builder is
@@ -27,6 +27,7 @@ use crate::tensor::{DramAlloc, DramTensor, Elem, Overlap, Result, TensorError, W
 
 pub mod ahead;
 pub mod allocate;
+pub mod channels;
 pub mod distribute;
 pub mod lower;
 pub(crate) mod matmul;
@@ -399,7 +400,18 @@ impl TileOp {
         first: usize,
     ) -> Result<Vec<crate::tensor::Job>> {
         self.check()?;
-        distribute::deal(self, units, overlap)
-            .and_then(|deal| lower::jobs(self, &deal, units, first))
+        let deal = distribute::deal(self, units, overlap)?;
+        let depth = channels::check(self, &deal)?;
+        let jobs = lower::jobs(self, &deal, units, first)?;
+        // The streams are as deep as the session will make them: two where a job's kernels are
+        // staged in halves (`session::streaming_segments`).
+        debug_assert!(
+            jobs.iter().flatten().all(|step| match step {
+                crate::tensor::Step::Kernel { half, .. } => half.is_some() == (depth == 2),
+                _ => true,
+            }),
+            "channels {depth} deep for kernels staged otherwise"
+        );
+        Ok(jobs)
     }
 }
