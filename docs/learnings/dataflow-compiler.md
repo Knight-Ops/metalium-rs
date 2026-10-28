@@ -421,6 +421,14 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     (`Fidelity::full_precision`) for these pairs. It is adopted where F1c builds the product.
   - *Still open:* mixed pairs (BFP weights × TF32 or BF16 activations, needing F1c), and NaN or infinity inside a block.
   - *Prediction left:* BFP4 × BFP4 products at ≥3× the BF16 HiFi4 rate when compute-bound.
+- **H7 Whole-tile unpacks are format-generic.** `PairOrder::Auto` gives whole tiles in `Src` (P4) to FP32 and BF16
+  operands only, by name, so a BFP weight takes the face order. At `[1024,2048]@[2048,8192]` that order is
+  fidelity-bound: 14.8 / 17.4 / 20.2 TFLOPS at four / three / one phases, against BF16's 22.3 whole-tile
+  (`1793152122`).
+  - *Claim:* the whole-tile order is correct for every packed format.
+  - *Prediction:* BFP weights reach ≥ BF16's rate at the same shapes, bit for bit.
+  - *Measured by:* `step239` with the order forced, on ttsim and card 1, then the pair-cost probe.
+  - *Kills it:* any bit difference, or < 1.2x.
 - **H4 Channels instead of barriers.** With per-edge credits and data-independent reads started as units free up, a 1.7B decode step's card read rate rises from 328 GB/s (64%).
   - *Prediction:* ≥ 400 GB/s average and step ≤ 9.5 ms (from 10.9), bit-exact.
   - *Measured by:* the profile's card read meter.

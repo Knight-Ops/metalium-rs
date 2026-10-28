@@ -46,7 +46,9 @@ track's order follows the evidence: products are bound by operand reads (scorebo
   on card 1** (`1793150259`, along with `step172`/`step173`/`step232`/`step233`/`step94`).
   - Still to cover: mixed pairs, once F1c builds them, and NaN/infinity blocks.
   - If it holds on silicon, the default contract's fidelity rule becomes "full precision for the edge formats".
-- [ ] **F1c, the tensor handle carries its format.** Generalize the stored-BF16-weight precedent:
+- [x] **F1c, the tensor handle carries its format** (`b9ba4c2`; `step239` on ttsim and card 1 `1793152118`; [log](../learnings/performance-log.md#packed-weights-on-the-block-stream-path-what-bytes-buy-2026-10-28-card-1)). Still to do: route a BFP weight here from burn-tt (today `bfp_matmul` widens a mixed pair), then judge the decode prediction through the model's decode path. In the probe's session one-row products are entry-bound, and the bytes buy nothing there.
+- [ ] **H7, whole tiles for packed formats:** BFP weights take the face order today (14.8 TFLOPS against BF16's 22.3 at prefill shapes).
+- [ ] **F1c, as first specified** (kept for its detail): Generalize the stored-BF16-weight precedent:
   - `DramTensor::format() -> TileFormat`, with `Elem::Bf16` and a BFP weight as edge formats;
   - `SrcRoute::Tf32WithBf16B` becomes `SrcRoute::Tf32WithB(TileFormat)`, its `b_slot`, `src_formats` and GATHER flags all
     taken from the format.
