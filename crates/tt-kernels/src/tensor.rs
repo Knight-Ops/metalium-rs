@@ -707,6 +707,21 @@ impl DramTensor {
         d
     }
 
+    /// A stored BFP weight's slots as a [`crate::bfp::BfpTensor`] (the same allocation, for the
+    /// BFP ops: widening, downloading, copying); `None` for any other elem.
+    pub fn as_bfp(&self) -> Option<crate::bfp::BfpTensor> {
+        let Elem::Packed(format) = self.elem else {
+            return None;
+        };
+        let format = crate::bfp::BfpFormat::of(format)?;
+        Some(crate::bfp::BfpTensor::from_parts(
+            self.rows,
+            self.cols,
+            format,
+            self.placement.clone(),
+        ))
+    }
+
     /// A stored BF16 weight's slots as a [`crate::bf16::Bf16Tensor`] (the same allocation,
     /// for the BF16 ops: widening, downloading); `None` for any other elem.
     pub fn as_bf16(&self) -> Option<crate::bf16::Bf16Tensor> {

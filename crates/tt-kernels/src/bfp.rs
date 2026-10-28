@@ -46,6 +46,15 @@ impl BfpFormat {
     fn code(self) -> u32 {
         self.l1_format().code().expect("measured BFP format")
     }
+    /// The BFP format a tile of `format` is stored in, or `None` for a format that is not BFP.
+    pub const fn of(format: TileFormat) -> Option<BfpFormat> {
+        match format.l1() {
+            L1Format::Bfp8 => Some(Self::Bfp8),
+            L1Format::Bfp4 => Some(Self::Bfp4),
+            L1Format::Bfp2 => Some(Self::Bfp2),
+            _ => None,
+        }
+    }
 }
 
 /// A matrix of resident packed tiles, each four 16x16 faces. Every consecutive
@@ -60,6 +69,22 @@ pub struct BfpTensor {
 }
 
 impl BfpTensor {
+    /// The tensor whose `rows x cols` tiles of `format` are `placement`'s slots: another handle
+    /// on an allocation a [`DramTensor`] of [`Elem::Packed`] already names
+    /// ([`DramTensor::as_bfp`]).
+    pub(crate) fn from_parts(
+        rows: usize,
+        cols: usize,
+        format: BfpFormat,
+        placement: Placement,
+    ) -> Self {
+        BfpTensor {
+            rows,
+            cols,
+            format,
+            placement,
+        }
+    }
     pub fn rows(&self) -> usize {
         self.rows
     }

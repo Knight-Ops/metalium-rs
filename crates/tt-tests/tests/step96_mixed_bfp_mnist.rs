@@ -19,9 +19,17 @@ type AD = Autodiff<TtBackend>;
 fn f32_policy(_: &str) -> S {
     S::F32
 }
+/// A BFP2 weight beside an F32 activation: a product reads it as its `B` where it lies
+/// (`SrcRoute::Tf32WithB`), whose BFP2 `Src` format ttsim refuses (divergence "Packed BFP2 matrix
+/// multiply"), so on ttsim the policy stores that weight BFP4.
+const WEIGHT_BFP2: S = if cfg!(feature = "silicon") {
+    S::Bfp2
+} else {
+    S::Bfp4
+};
 fn policy2(name: &str) -> S {
     if name.ends_with("hidden.weight") || name.ends_with("conv.weight") {
-        S::Bfp2
+        WEIGHT_BFP2
     } else if name.ends_with("head.weight") {
         S::Bfp8
     } else if name.ends_with("relu") {
@@ -45,7 +53,7 @@ fn policy8(name: &str) -> S {
     if name.ends_with("hidden.weight") || name.ends_with("conv.weight") {
         S::Bfp8
     } else if name.ends_with("head.weight") {
-        S::Bfp2
+        WEIGHT_BFP2
     } else if name.ends_with("relu") {
         S::Bfp4
     } else {

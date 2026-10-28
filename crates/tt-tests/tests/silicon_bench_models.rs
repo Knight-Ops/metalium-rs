@@ -1000,15 +1000,42 @@ fn decode_ms(g: &tt_models::generate::Generation) -> f64 {
     d[d.len() / 2]
 }
 
-/// `TT_WEIGHT_STORAGE`: `bf16` (the default) stores a model's weights BF16
-/// (`Llama::with_bf16_weights`: the SmolLM2 checkpoints are BF16, so the logits are the F32 model's
-/// bit for bit, `step234`), `f32` keeps them F32.
-fn weight_storage_bf16() -> bool {
+/// `TT_WEIGHT_STORAGE`: the format a model's weights but the embedding table are stored in
+/// (`Llama::with_stored_weights`), or `None` to keep them F32 (`f32`). `bf16`, the default: the
+/// SmolLM2 checkpoints are BF16, so the logits are the F32 model's bit for bit (`step234`).
+/// `bfp8`, `bfp4`, `bfp2`: block floating point, which rounds the weights (the logits are those of
+/// the F32 model holding the rounded values, `step240`).
+fn weight_storage() -> Option<tt_models::quant::Format> {
+    use tt_models::quant::Format;
     match std::env::var("TT_WEIGHT_STORAGE").as_deref() {
-        Ok("bf16") | Err(_) => true,
-        Ok("f32") => false,
-        Ok(other) => panic!("TT_WEIGHT_STORAGE={other}: bf16 or f32"),
+        Ok("bf16") | Err(_) => Some(Format::Bf16Stored),
+        Ok("bfp8") => Some(Format::Bfp8),
+        Ok("bfp4") => Some(Format::Bfp4),
+        Ok("bfp2") => Some(Format::Bfp2),
+        Ok("f32") => None,
+        Ok(other) => panic!("TT_WEIGHT_STORAGE={other}: bf16, bfp8, bfp4, bfp2 or f32"),
     }
+}
+
+/// [`weight_storage`]'s name in a conditions row.
+fn weight_storage_name() -> String {
+    std::env::var("TT_WEIGHT_STORAGE").unwrap_or_else(|_| "bf16".into())
+}
+
+/// Bytes a weight's datum takes in [`weight_storage`]'s format: its tile image without the
+/// header, over the tile's datums (an exponent section included).
+fn weight_datum_bytes() -> f64 {
+    use tt_isa::format::TileFormat;
+    let format = match weight_storage().map(|f| f.storage()) {
+        None => TileFormat::FP32,
+        Some(burn_tt::storage::StorageFormat::Bf16) => TileFormat::BF16,
+        Some(burn_tt::storage::StorageFormat::Bfp8) => TileFormat::BFP8,
+        Some(burn_tt::storage::StorageFormat::Bfp4) => TileFormat::BFP4,
+        Some(burn_tt::storage::StorageFormat::Bfp2) => TileFormat::BFP2,
+        Some(burn_tt::storage::StorageFormat::F32) => TileFormat::FP32,
+    };
+    let image = format.image();
+    (image.total_bytes() - image.header_bytes()) as f64 / TileFormat::TILE_DATUMS as f64
 }
 
 fn ms(t: std::time::Duration) -> f64 {
@@ -1037,21 +1064,22 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
         let (m, _) = Llama::<B>::pretrained(config, name, Precision::F32, &d).unwrap();
         // What a decode step reads at least: every F32 parameter once (counted before fusing, whose
         // views would count the fused matrices twice).
-        let weight_bytes = burn::module::Module::num_params(&m) as f64
-            * if weight_storage_bf16() { 2.0 } else { 4.0 };
+        let weight_bytes = burn::module::Module::num_params(&m) as f64 * weight_datum_bytes();
         // `q|k|v` and `gate|up` one product each (`Llama::fused`, bit for bit the unfused model;
         // `TT_GEN_FUSED=0` keeps them apart).
         let fused = std::env::var("TT_GEN_FUSED").map_or(true, |v| v != "0");
         println!("BENCH {{\"kind\":\"conditions\",\"fused_projections\":{fused}}}");
         let m = if fused { m.fused() } else { m };
         // The weights stored BF16 (`Llama::with_bf16_weights`, bit for bit for this BF16
-        // checkpoint; the default) or kept F32 (`TT_WEIGHT_STORAGE=f32`).
-        let bf16 = weight_storage_bf16();
+        // checkpoint; the default), BFP, or kept F32 (`TT_WEIGHT_STORAGE`).
         println!(
             "BENCH {{\"kind\":\"conditions\",\"weight_storage\":\"{}\"}}",
-            if bf16 { "bf16" } else { "f32" }
+            weight_storage_name()
         );
-        let m = if bf16 { m.with_bf16_weights() } else { m };
+        let m = match weight_storage() {
+            Some(format) => m.with_stored_weights(format),
+            None => m,
+        };
         let t0 = Instant::now();
         // Decode steps attending to 64, 128, ... positions (`TT_GEN_STEPS`, "64,128,256"; empty
         // for the whole cache at every step).
@@ -1319,12 +1347,14 @@ fn traced_generation_stream_ceiling() {
         );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = m.fused();
-        let bf16 = weight_storage_bf16();
         println!(
             "BENCH {{\"kind\":\"conditions\",\"weight_storage\":\"{}\"}}",
-            if bf16 { "bf16" } else { "f32" }
+            weight_storage_name()
         );
-        let m = if bf16 { m.with_bf16_weights() } else { m };
+        let m = match weight_storage() {
+            Some(format) => m.with_stored_weights(format),
+            None => m,
+        };
         // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
         let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
             v.split(',').map(|n| n.trim().parse().unwrap()).collect()

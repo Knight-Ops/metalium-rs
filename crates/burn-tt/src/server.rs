@@ -788,7 +788,6 @@ pub struct DramBuffers {
     next: BufferId,
     live: HashMap<BufferId, tt_kernels::tensor::DramTensor>,
     bf16: HashMap<BufferId, tt_kernels::bf16::Bf16Tensor>,
-    bfp: HashMap<BufferId, tt_kernels::bfp::BfpTensor>,
     next_trace: u64,
     traces: HashMap<u64, tt_kernels::trace::TraceId>,
     /// The profile mode's names for traces, by the session's trace number
@@ -963,16 +962,10 @@ impl DramBuffers {
         let error = |e: tt_kernels::tensor::TensorError| TtError::from(e);
         if let Some(format) = format {
             let t = s.bfp_from_f32(self.get(id)?, format).map_err(error)?;
-            let dims = [t.rows(), t.cols()];
-            self.next += 1;
-            self.bfp.insert(self.next, t);
-            Ok((self.next, dims))
+            Ok(self.insert(tt_kernels::tensor::DramTensor::from_bfp(t)))
         } else {
-            let t = self
-                .bfp
-                .get(&id)
-                .ok_or_else(|| TtError::Device(format!("no BFP buffer {id}")))?;
-            let t = s.bfp_to_f32(t).map_err(error)?;
+            let t = self.bfp(id)?;
+            let t = s.bfp_to_f32(&t).map_err(error)?;
             Ok(self.insert(t))
         }
     }
@@ -1000,10 +993,10 @@ impl DramBuffers {
         b: BufferId,
         fidelity: Fidelity,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let a = self.bfp.get(&a).ok_or_else(unsupported)?;
-        let b = self.bfp.get(&b).ok_or_else(unsupported)?;
+        let a = self.bfp(a).map_err(|_| unsupported())?;
+        let b = self.bfp(b).map_err(|_| unsupported())?;
         let out = s
-            .bfp_matmul(a, false, b, false, fidelity)
+            .bfp_matmul(&a, false, &b, false, fidelity)
             .map_err(TtError::from)?;
         Ok(self.insert(out))
     }
@@ -1120,14 +1113,13 @@ impl DramBuffers {
         src: BufferId,
         dst: BufferId,
     ) -> Result<(), TtError> {
-        if let Some(src_t) = self.bfp.get(&src) {
+        if let Ok(src_t) = self.bfp(src) {
             let dst_t = self
-                .bfp
-                .get(&dst)
-                .ok_or_else(|| TtError::Device("copy_into storage formats differ".into()))?;
-            return s.copy_into_bfp(src_t, dst_t).map_err(TtError::from);
+                .bfp(dst)
+                .map_err(|_| TtError::Device("copy_into storage formats differ".into()))?;
+            return s.copy_into_bfp(&src_t, &dst_t).map_err(TtError::from);
         }
-        if self.bfp.contains_key(&dst) {
+        if self.is_bfp(dst) {
             return Err(TtError::Device("copy_into storage formats differ".into()));
         }
         if let Some(src_t) = self.bf16.get(&src) {
@@ -1324,8 +1316,8 @@ impl DramBuffers {
         s: &mut Session<T>,
         id: BufferId,
     ) -> Result<Vec<f32>, TtError> {
-        if let Some(t) = self.bfp.get(&id) {
-            return s.download_bfp(t).map_err(TtError::from);
+        if let Ok(t) = self.bfp(id) {
+            return s.download_bfp(&t).map_err(TtError::from);
         }
         let t = self.get(id)?;
         s.download(t).map_err(TtError::from)
@@ -1384,9 +1376,6 @@ impl DramBuffers {
     pub fn free<T: tt_device::Transport>(&mut self, s: &mut Session<T>, id: BufferId) {
         if let Some(t) = self.live.remove(&id) {
             let _ = s.free(t);
-        }
-        if let Some(t) = self.bfp.remove(&id) {
-            let _ = s.free_bfp(t);
         }
         if let Some(t) = self.bf16.remove(&id) {
             let _ = s.free_bf16(t);
@@ -1542,7 +1531,7 @@ impl DramBuffers {
         column: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         for b in [table, values] {
-            if self.bf16.contains_key(&b) || self.bfp.contains_key(&b) {
+            if self.bf16.contains_key(&b) || self.is_bfp(b) {
                 return Err(TtError::Device(
                     "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
                 ));
@@ -1568,7 +1557,7 @@ impl DramBuffers {
         column: bool,
     ) -> Result<(), TtError> {
         for b in [table, values.id] {
-            if self.bf16.contains_key(&b) || self.bfp.contains_key(&b) {
+            if self.bf16.contains_key(&b) || self.is_bfp(b) {
                 return Err(TtError::Device(
                     "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
                 ));
@@ -1647,7 +1636,7 @@ impl DramBuffers {
         table: BufferId,
         indices: BufferId,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+        if self.bf16.contains_key(&table) || self.is_bfp(table) {
             return Err(TtError::Device(
                 "a row select of a packed (BF16, F16 or BFP) table is not implemented".into(),
             ));
@@ -1668,7 +1657,7 @@ impl DramBuffers {
         indices: BufferId,
         zero_row: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+        if self.bf16.contains_key(&table) || self.is_bfp(table) {
             return Err(TtError::Device(
                 "a tap select of a packed (BF16, F16 or BFP) table is not implemented".into(),
             ));
@@ -2024,12 +2013,9 @@ impl DramBuffers {
         first: usize,
         rows: usize,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if let Some(t) = self.bfp.get(&a) {
+        if let Ok(t) = self.bfp(a) {
             let v = t.rows_view(first, rows).map_err(TtError::from)?;
-            let dims = [v.rows(), v.cols()];
-            self.next += 1;
-            self.bfp.insert(self.next, v);
-            return Ok((self.next, dims));
+            return Ok(self.insert(tt_kernels::tensor::DramTensor::from_bfp(v)));
         }
         if let Some(t) = self.bf16.get(&a) {
             let v = t.rows_view(first, rows).map_err(TtError::from)?;
@@ -2048,17 +2034,28 @@ impl DramBuffers {
 
     /// How many are live.
     pub fn len(&self) -> usize {
-        self.live.len() + self.bf16.len() + self.bfp.len()
+        self.live.len() + self.bf16.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.live.is_empty() && self.bf16.is_empty() && self.bfp.is_empty()
+        self.live.is_empty() && self.bf16.is_empty()
     }
 
     fn get(&self, id: BufferId) -> Result<&tt_kernels::tensor::DramTensor, TtError> {
         self.live
             .get(&id)
             .ok_or_else(|| TtError::Device(format!("no device buffer {id}")))
+    }
+
+    /// A buffer stored BFP, as the BFP ops take it (the same allocation).
+    fn bfp(&self, id: BufferId) -> Result<tt_kernels::bfp::BfpTensor, TtError> {
+        self.get(id)?
+            .as_bfp()
+            .ok_or_else(|| TtError::Device(format!("no BFP buffer {id}")))
+    }
+
+    fn is_bfp(&self, id: BufferId) -> bool {
+        self.bfp(id).is_ok()
     }
 }
 

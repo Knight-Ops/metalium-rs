@@ -37,7 +37,7 @@ pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     if crate::matmul_mode::effective(a.device) != crate::MatmulMode::Fast {
         return None;
     }
-    if let Some(t) = bf16_weight_matmul(a, b) {
+    if let Some(t) = packed_weight_matmul(a, b) {
         return Some(t);
     }
     if a.storage_format() != b.storage_format()
@@ -62,14 +62,15 @@ pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     Some(device_result(a.device, id, dims).with_storage(a.storage_format()))
 }
 
-/// `a @ b` for an F32 `a` and a weight `b` stored BF16 ([`crate::storage::StorageFormat::Bf16`]),
-/// read where it lies: `a`'s leading dimensions folded into rows, one product on the card, bit for
-/// bit the product of `b`'s values in F32 (`Session::matmul_dram`, `SrcRoute::TF32_WITH_BF16_B`).
-/// `None` (the widening path) for anything else: a transposed or viewed `b`, `b` with a batch, a
-/// host `a`, an engine without GDDR.
-fn bf16_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
+/// `a @ b` for an F32 `a` and a weight `b` stored in any packed format (BF16, BFP8, BFP4, BFP2:
+/// [`crate::storage::StorageFormat`]), read where it lies: `a`'s leading dimensions folded into
+/// rows, one product on the card, bit for bit the product of the values `b` decodes to, in F32
+/// (`Session::matmul_dram`, `SrcRoute::Tf32WithB`: the format is `b`'s edge). `None` (the
+/// widening path) for anything else: a transposed or viewed `b`, `b` with a batch, a host `a`, an
+/// engine without GDDR.
+fn packed_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     use crate::storage::StorageFormat;
-    if b.storage_format() != StorageFormat::Bf16
+    if b.storage_format() == StorageFormat::F32
         || a.storage_format() != StorageFormat::F32
         || a.dtype() != DType::F32
         || b.is_transposed()
@@ -86,7 +87,7 @@ fn bf16_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     if ls[ls.len() - 1] != k {
         return None;
     }
-    assert_eq!(a.device, b.device, "BF16 weight matmul devices differ");
+    assert_eq!(a.device, b.device, "packed weight matmul devices differ");
     let rows: usize = ls[..ls.len() - 1].iter().product();
     let mut out = vec![1; rs.len().saturating_sub(ls.len())];
     out.extend_from_slice(&ls[..ls.len() - 1]);

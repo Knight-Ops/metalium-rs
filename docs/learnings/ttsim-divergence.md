@@ -356,6 +356,12 @@ terminates the forked child. BFP8/4 direct products are modeled; BFP2 conversion
 pack/unpack works. The BFP2 matrix arm is silicon-only and passes both cards
 (`1791299490`), including ragged shapes and K accumulator reloads.
 
+**Also a BFP2 weight beside TF32 (2026-10-28).** Since burn-tt reads a stored weight where it lies
+(`SrcRoute::Tf32WithB`, `docs/plans/dataflow-compiler.md` F1c), a BFP2 weight times an F32
+activation is `tensix_matmul_op: bf16 src_a_fmt=15 src_b_fmt=4` on ttsim (it was widened to F32
+before). `step239` and `step240` store BFP2 on silicon only; `step96`'s policies store a BFP2 weight
+BFP4 on ttsim and BFP2 on silicon.
+
 ### Direct RISC-V PRNG initialization (2026-10-06)
 
 Step91's `riscv_seed_store_characterization` passes inside `fork_scope` and on
