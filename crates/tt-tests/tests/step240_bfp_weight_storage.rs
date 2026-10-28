@@ -21,8 +21,8 @@
 
 mod ladder_support;
 
-use burn::module::{Module, ModuleVisitor, Param};
-use burn::tensor::Tensor;
+use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
+use burn::tensor::{Tensor, TensorData};
 use burn_tt::storage::{StorageFormat, TensorStorageExt};
 use burn_tt::{TtBackend, TtDevice};
 use ladder_support::{assert_same, generate, prompt, traced};
@@ -199,6 +199,66 @@ fn synthetic_llamas_with_bfp_weights_generate_bit_for_bit() {
                 assert_stored_as_rounded(&reference, &stored, format, &what);
                 assert_stored_is_f32(&reference, &stored, &what, &d);
             }
+        }
+    });
+}
+
+/// `model` with its embedding table's values `±1/16` (by sign): every block of every BFP format
+/// holds them exactly, along the table's rows or its columns.
+fn with_signed_table(model: Llama<TtBackend>) -> Llama<TtBackend> {
+    struct Signed(Vec<String>);
+    impl ModuleMapper<TtBackend> for Signed {
+        fn enter_module(&mut self, name: &str, _: &str) {
+            self.0.push(name.into());
+        }
+        fn exit_module(&mut self, _: &str, _: &str) {
+            self.0.pop();
+        }
+        fn map_float<const D: usize>(
+            &mut self,
+            p: Param<Tensor<TtBackend, D>>,
+        ) -> Param<Tensor<TtBackend, D>> {
+            if !self.0.join(".").contains("embed_tokens") {
+                return p;
+            }
+            p.map(|t| {
+                let (shape, device) = (t.shape(), t.device());
+                let v: Vec<f32> = t
+                    .into_data()
+                    .to_vec::<f32>()
+                    .expect("F32 values")
+                    .iter()
+                    .map(|x| if *x < 0.0 { -0.0625 } else { 0.0625 })
+                    .collect();
+                Tensor::from_data(TensorData::new(v, shape), &device)
+            })
+        }
+    }
+    model.map(&mut Signed(Vec::new()))
+}
+
+/// A tied model stored as a checkpoint is (`with_stored_weights` on the model itself, whose head
+/// is then a transposed view of the table): the head is stored as the product reads it, `[hidden,
+/// vocab]` in blocks along the vocabulary, and no step widens it (a transposed packed weight
+/// would be decoded to F32 at every call).
+#[test]
+fn a_tied_head_is_stored_as_its_product_reads_it() {
+    with_device(Config::default(), |d| {
+        let (_, config) = synthetic_configs()[0];
+        assert!(config.tied_head);
+        for format in formats() {
+            let what = format!("tied head, {format:?}");
+            // Every matrix but the table rounded first; the table's values are held exactly by
+            // every blocking, so its transpose (the head) is too.
+            let model = apply(
+                with_signed_table(Llama::<TtBackend>::new(&config, &d)).fused(),
+                &Plan::stored_weights(format),
+                &Emulated,
+            );
+            let reference = model.clone().untied();
+            let stored = model.with_stored_weights(format);
+            assert_stored_as_rounded(&reference, &stored, format, &what);
+            assert_stored_is_f32(&reference, &stored, &what, &d);
         }
     });
 }

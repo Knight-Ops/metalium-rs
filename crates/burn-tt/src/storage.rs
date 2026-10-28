@@ -63,9 +63,10 @@ impl TtTensor {
         let src = input.to_dram();
         let dims = [src.buffer.rows, src.buffer.cols];
         let from = input.storage_format();
-        // A transposed view stored BF16 is its transpose made plain first: a product reads a
-        // stored weight as it lies (the tied output head, `x @ table^T`).
-        let plain = (format == StorageFormat::Bf16 && src.transposed)
+        // A transposed view stored in a packed format is its transpose made plain first: a product
+        // reads a stored weight as it lies (the tied output head, `x @ table^T`), and a transposed
+        // packed weight would be widened at every call.
+        let plain = (format != StorageFormat::F32 && src.transposed)
             .then(|| crate::ops::plain_dram(&input));
         let (src, dims) = match &plain {
             Some(p) => (p, [p.buffer.rows, p.buffer.cols]),
