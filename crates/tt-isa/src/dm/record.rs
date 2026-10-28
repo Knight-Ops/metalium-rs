@@ -22,13 +22,15 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// rows, j0, cols]` + `A` + `B`. Row `i` of the block's `A` tiles, `K` tile
 /// `kk`, goes to `a_at + (i * kt + kk) * TILE_SLOT`; `K` tile `kk` of its
 /// column `j` of `B` to `b_at + (kk * cols + j) * TILE_SLOT`. `flags`: bit 0
-/// `A` is read transposed, bit 1 `B`, bits 8..=24 `kt` ([`gather_kt`]), bit 25
-/// [`GATHER_A_RESIDENT`], bit 26 [`GATHER_B_UNPACK_TRANSPOSE`], bit 27 [`GATHER_PREFETCH`],
-/// bit 28 [`GATHER_STREAM`], bits 29-31 `B`'s format ([`gather_b_format`]). Bit 2 selects packed
+/// `A` is read transposed, bit 1 `B`, bits 8..=21 `kt` ([`gather_kt`]), bits 22-24 `A`'s format
+/// ([`gather_a_format`]), bit 25 [`GATHER_A_RESIDENT`], bit 26 [`GATHER_B_UNPACK_TRANSPOSE`], bit
+/// 27 [`GATHER_PREFETCH`], bit 28 [`GATHER_STREAM`], bits 29-31 `B`'s format ([`gather_b_format`]).
+/// Bit 2 selects packed
 /// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
 /// logical rows/columns and words 6/7 their tile row/column origins.
 /// GDDR slots are 2112 bytes; L1 slots remain 4160. A packed `B` ([`gather_b_format`]) is the
-/// exception: its tiles are slots of its format in L1 too, at `b_at + (kk * cols + j) * slot`.
+/// exception: its tiles are slots of its format in L1 too, at `b_at + (kk * cols + j) * slot`;
+/// and a packed `A` ([`gather_a_format`]) at `a_at + (i * kt + kk) * slot`.
 /// Only local ragged lanes are zeroed, without changing the source tensor; a
 /// tile with at most 16 valid rows is read only through its last valid row of
 /// face 1 (faces 2 and 3 not at all), since the zeroing overwrites the rest.
@@ -63,7 +65,7 @@ pub const GATHER_PREFETCH: u32 = 1 << 27;
 /// record's as without it. Not with [`GATHER_PREFETCH`], whose reads have a cap of their own.
 pub const GATHER_STREAM: u32 = 1 << 28;
 /// [`GATHER`]'s bits 29-31: the format of a packed `B` beside an FP32 `A`, by code
-/// ([`GATHER_B_FORMATS`]). Code 0 is an FP32 `B` in [`TILE_SLOT`]s. Any other code names a
+/// ([`GATHER_FORMATS`]). Code 0 is an FP32 `B` in [`TILE_SLOT`]s. Any other code names a
 /// weight stored in fewer bytes: `B`'s tiles are images of that format in GDDR slots of
 /// [`crate::format::TileFormat::slot_bytes`], each read whole into an L1 slot of the same size
 /// (`b_at + (kk * cols + j) * slot`: more tiles in a ring than an FP32 `B`'s,
@@ -75,34 +77,77 @@ pub const GATHER_STREAM: u32 = 1 << 28;
 pub const GATHER_B_FORMAT_SHIFT: u32 = 29;
 /// [`GATHER`]'s bits that hold `B`'s format code.
 pub const GATHER_B_FORMAT_MASK: u32 = 0b111 << GATHER_B_FORMAT_SHIFT;
-/// The `B` formats a [`GATHER`] names, by code (`docs/learnings/dataflow-compiler.md` §4: a
-/// format is an edge's, and its slot is its descriptor's).
-pub const GATHER_B_FORMATS: [crate::tile::L1Format; 5] = {
+/// [`GATHER`]'s bits 22-24: the format of a packed `A`, by code ([`GATHER_FORMATS`]), as bits
+/// 29-31 name `B`'s. Code 0 is an FP32 `A` in [`TILE_SLOT`]s. Any other code names an operand
+/// stored in fewer bytes: `A`'s tiles are images of that format in GDDR slots of
+/// [`crate::format::TileFormat::slot_bytes`], each read whole into an L1 slot of the same size
+/// (`a_at + (i * kt + kk) * slot`), where the kernel unpacks it in its own format
+/// (`docs/learnings/dataflow-compiler.md` §4: one product for every edge format). A packed `A` is
+/// untransposed only (not bit 0), read as whole tiles (not [`gather_rows`]), and not with packed
+/// BF16 (bit 2). Its tensor's padding is the writer's: nothing is filled.
+pub const GATHER_A_FORMAT_SHIFT: u32 = 22;
+/// [`GATHER`]'s bits that hold `A`'s format code.
+pub const GATHER_A_FORMAT_MASK: u32 = 0b111 << GATHER_A_FORMAT_SHIFT;
+/// The operand formats a [`GATHER`] names, by code, for `A` and `B` alike
+/// (`docs/learnings/dataflow-compiler.md` §4: a format is an edge's, and its slot is its
+/// descriptor's).
+pub const GATHER_FORMATS: [crate::tile::L1Format; 5] = {
     use crate::tile::L1Format as F;
     [F::Fp32, F::Bf16, F::Bfp8, F::Bfp4, F::Bfp2]
 };
-/// [`GATHER`]'s flags for a `B` of `format`, or `None` for a format a gather cannot read.
-pub const fn gather_b_format(format: crate::tile::L1Format) -> Option<u32> {
+/// [`GATHER_FORMATS`]' code of `format`, or `None` for a format a gather cannot read.
+const fn gather_format_code(format: crate::tile::L1Format) -> Option<u32> {
     let mut code = 0;
-    while code < GATHER_B_FORMATS.len() {
-        if GATHER_B_FORMATS[code] as u32 == format as u32 {
-            return Some((code as u32) << GATHER_B_FORMAT_SHIFT);
+    while code < GATHER_FORMATS.len() {
+        if GATHER_FORMATS[code] as u32 == format as u32 {
+            return Some(code as u32);
         }
         code += 1;
     }
     None
 }
-/// The format of [`GATHER`]'s `B` under `flags`, or a refusal for a code no format has.
-pub const fn gather_b_tile_format(flags: u32) -> Result<crate::format::TileFormat, u32> {
-    let code = ((flags & GATHER_B_FORMAT_MASK) >> GATHER_B_FORMAT_SHIFT) as usize;
-    if code >= GATHER_B_FORMATS.len() {
+/// The format [`GATHER_FORMATS`] gives the code in `flags` under `mask` at `shift`, or a refusal
+/// for a code no format has.
+const fn gather_tile_format(
+    flags: u32,
+    mask: u32,
+    shift: u32,
+) -> Result<crate::format::TileFormat, u32> {
+    let code = ((flags & mask) >> shift) as usize;
+    if code >= GATHER_FORMATS.len() {
         return Err(super::error::RANGE);
     }
-    Ok(crate::format::TileFormat::new(GATHER_B_FORMATS[code]))
+    Ok(crate::format::TileFormat::new(GATHER_FORMATS[code]))
+}
+/// [`GATHER`]'s flags for a `B` of `format`, or `None` for a format a gather cannot read.
+pub const fn gather_b_format(format: crate::tile::L1Format) -> Option<u32> {
+    match gather_format_code(format) {
+        Some(code) => Some(code << GATHER_B_FORMAT_SHIFT),
+        None => None,
+    }
+}
+/// [`GATHER`]'s flags for an `A` of `format`, or `None` for a format a gather cannot read.
+pub const fn gather_a_format(format: crate::tile::L1Format) -> Option<u32> {
+    match gather_format_code(format) {
+        Some(code) => Some(code << GATHER_A_FORMAT_SHIFT),
+        None => None,
+    }
+}
+/// The format of [`GATHER`]'s `B` under `flags`, or a refusal for a code no format has.
+pub const fn gather_b_tile_format(flags: u32) -> Result<crate::format::TileFormat, u32> {
+    gather_tile_format(flags, GATHER_B_FORMAT_MASK, GATHER_B_FORMAT_SHIFT)
+}
+/// The format of [`GATHER`]'s `A` under `flags`, or a refusal for a code no format has.
+pub const fn gather_a_tile_format(flags: u32) -> Result<crate::format::TileFormat, u32> {
+    gather_tile_format(flags, GATHER_A_FORMAT_MASK, GATHER_A_FORMAT_SHIFT)
 }
 /// Whether [`GATHER`]'s `B` is packed (any format but FP32).
 pub const fn gather_b_packed(flags: u32) -> bool {
     flags & GATHER_B_FORMAT_MASK != 0
+}
+/// Whether [`GATHER`]'s `A` is packed (any format but FP32).
+pub const fn gather_a_packed(flags: u32) -> bool {
+    flags & GATHER_A_FORMAT_MASK != 0
 }
 /// [`GATHER`]'s flags for a `B` stored BF16 (a weight in half the bytes) beside an FP32 `A`:
 /// [`gather_b_format`] of BF16, code 1.
@@ -117,12 +162,28 @@ const GATHER_FLAG_BITS: u32 = GATHER_A_RESIDENT
     | GATHER_PREFETCH
     | GATHER_STREAM
     | GATHER_B_FORMAT_MASK
+    | GATHER_A_FORMAT_MASK
     | 0xff;
 
 /// `B`'s slot under `flags`, in GDDR and L1 alike, and each read's length: its format's
 /// ([`gather_b_tile_format`]), [`TILE_SLOT`] for an FP32 `B`.
 const fn gather_b_slot(flags: u32) -> Result<u64, u32> {
     match gather_b_tile_format(flags) {
+        Ok(format) => Ok(format.slot_bytes()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `A`'s slot under `flags`, as [`gather_b_slot`] is `B`'s; and a refusal for a packed `A` with
+/// what only an FP32 `A` takes: a transposed read (bit 0), thin rows ([`gather_rows`]), packed BF16
+/// (bit 2).
+const fn gather_a_slot(flags: u32) -> Result<u64, u32> {
+    if gather_a_packed(flags)
+        && (flags & 1 != 0 || flags & GATHER_BF16 != 0 || (flags >> GATHER_ROWS_SHIFT) & 0x1f != 0)
+    {
+        return Err(super::error::RANGE);
+    }
+    match gather_a_tile_format(flags) {
         Ok(format) => Ok(format.slot_bytes()),
         Err(e) => Err(e),
     }
@@ -170,6 +231,7 @@ impl PrefetchCursor {
         if gather_b_packed(flags) && (b_t || flags & GATHER_BF16 != 0) {
             return Err(super::error::RANGE);
         }
+        gather_a_slot(flags)?;
         if flags & GATHER_BF16 != 0 || (b_t && !unpacked) || flags & GATHER_STREAM != 0 {
             return Err(super::error::RANGE);
         }
@@ -227,8 +289,7 @@ impl Iterator for PrefetchCursor {
     }
 }
 
-/// [`GATHER`]'s `kt`, from its flags (bits 28-31 set make it too large for
-/// [`MAX_EXTENT`], so a record with them is refused).
+/// [`GATHER`]'s `kt`, from its flags: bits 8..=21, at most 16,383 tiles.
 pub const fn gather_kt(flags: u32) -> u32 {
     (flags & !GATHER_FLAG_BITS) >> 8
 }
@@ -645,6 +706,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             if gather_b_packed(flags) && (b_t || flags & GATHER_BF16 != 0) {
                 return Err(super::error::RANGE);
             }
+            let a_slot = gather_a_slot(flags)?;
             // A prefetch's reads stay in flight under the entries after it: plain reads only,
             // never a transposing move (through the scratch, after draining the mover's own ID)
             // or packed BF16's fills.
@@ -766,8 +828,14 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 };
                 let r = if i + 1 == rows { thin } else { 0 };
                 for kk in 0..kt {
-                    let to = a_at + (i * kt + kk) * TILE_SLOT as u32;
+                    let to = a_at + (i * kt + kk) * a_slot as u32;
                     match row.as_mut() {
+                        // A packed `A` (untransposed, whole tiles): its own slot, read whole.
+                        Some(c) if a_slot != TILE_SLOT => {
+                            let mut e = read(c.next_with_slot(a_slot)?, i0 + i, kk, to);
+                            e[5] = a_slot as u32;
+                            emit(e)?;
+                        }
                         // One read of the datums through row `r - 1` of face 1:
                         // face 0 whole (its rows past `r` reach only the
                         // output's padding), then face 1's first `r` rows. One
@@ -1695,14 +1763,14 @@ mod tests {
         }
         // Bits 29-31 name `B`'s format: codes past the last format are refused, and each format
         // reads `B` whole in slots of its own size.
-        for code in GATHER_B_FORMATS.len() as u32..8 {
+        for code in GATHER_FORMATS.len() as u32..8 {
             assert_eq!(
                 gather(code << GATHER_B_FORMAT_SHIFT, a0, b0),
                 Err(super::super::error::RANGE),
                 "code {code}"
             );
         }
-        for format in GATHER_B_FORMATS {
+        for format in GATHER_FORMATS {
             let flags = gather_b_format(format).unwrap();
             let slot = crate::format::TileFormat::new(format).slot_bytes() as u32;
             let reads = gather(flags | GATHER_A_RESIDENT, a0, b0).unwrap();
@@ -1711,6 +1779,43 @@ mod tests {
                 "{format:?}"
             );
         }
+        // Bits 22-24 name `A`'s, alike: each format reads `A` whole in slots of its own size, one
+        // after another from `a_at`, and `B` as before; codes past the last are refused, and so is
+        // a packed `A` with what only an FP32 one takes (a transposed read, thin rows, packed BF16).
+        let fp32 = gather(0, a0, b0).unwrap();
+        let a_entries = (rows * kt) as usize;
+        for code in GATHER_FORMATS.len() as u32..8 {
+            assert_eq!(
+                gather(code << GATHER_A_FORMAT_SHIFT, a0, b0),
+                Err(super::super::error::RANGE),
+                "code {code}"
+            );
+        }
+        for format in GATHER_FORMATS {
+            let flags = gather_a_format(format).unwrap();
+            let slot = crate::format::TileFormat::new(format).slot_bytes() as u32;
+            let reads = gather(flags, a0, b0).unwrap();
+            assert_eq!(reads[a_entries..], fp32[a_entries..], "{format:?}: B");
+            for (n, e) in reads[..a_entries].iter().enumerate() {
+                assert_eq!(e[5], slot, "{format:?}");
+                assert_eq!(e[4], 0x2_0000 + n as u32 * slot, "{format:?}");
+            }
+            assert_eq!(
+                gather(flags | GATHER_A_RESIDENT, a0, b0).unwrap(),
+                fp32[a_entries..],
+                "{format:?}: resident"
+            );
+            if format != crate::tile::L1Format::Fp32 {
+                for bad in [1, gather_rows(3), GATHER_BF16] {
+                    assert_eq!(
+                        gather(flags | bad, a0, b0),
+                        Err(super::super::error::RANGE),
+                        "{format:?}, {bad:#x}"
+                    );
+                }
+            }
+        }
+        assert_eq!(gather_kt(GATHER_A_FORMAT_MASK | 0x3fff << 8), 0x3fff);
     }
 
     /// A BF16 `B` ([`GATHER_B_BF16`]) is read from its own slots: each tile's whole

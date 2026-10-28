@@ -245,7 +245,9 @@ impl OpBytes {
                     if head[1] & record::GATHER_A_RESIDENT != 0 {
                         return 0..0;
                     }
-                    a_at..a_at + rows * kt * TILE_SLOT
+                    let slot =
+                        record::gather_a_tile_format(head[1]).map_or(TILE_SLOT, |f| f.slot_bytes());
+                    a_at..a_at + rows * kt * slot
                 });
                 let _ = record::expand(rec, |e| {
                     let len = self.entry(e);

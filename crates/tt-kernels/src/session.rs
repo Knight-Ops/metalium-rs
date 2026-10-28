@@ -1798,10 +1798,14 @@ fn l1_footprint(entries: &[[u32; 8]], gather: bool) -> Option<Vec<std::ops::Rang
                 record::GATHER if gather => {
                     let kt = record::gather_kt(head[1]) as u64;
                     // A resident `A` is not written: its slots hold what an earlier gather read.
+                    // A packed operand's tiles are slots of its format in L1
+                    // (`record::gather_a_format`, `record::gather_b_format`).
                     if head[1] & record::GATHER_A_RESIDENT == 0 {
-                        ranges.push(slots(head[2], head[5] as u64 * kt));
+                        let a = record::gather_a_tile_format(head[1])
+                            .map_or(TILE_SLOT, |f| f.slot_bytes());
+                        let at = head[2] as u64;
+                        ranges.push(at..at + head[5] as u64 * kt * a);
                     }
-                    // A packed `B`'s tiles are slots of its format in L1 (`record::gather_b_format`).
                     let b =
                         record::gather_b_tile_format(head[1]).map_or(TILE_SLOT, |f| f.slot_bytes());
                     let at = head[3] as u64;

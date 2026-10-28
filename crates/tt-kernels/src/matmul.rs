@@ -818,18 +818,18 @@ pub(crate) struct Reload {
 
 /// One-output K block, with a separate prior tile and declared handshakes.
 pub(crate) fn k_block_layout(kt: usize) -> Result<(Layout, Reload), crate::runtime::RunError> {
-    k_block_layout_with(kt, kt, tt_isa::dm::TILE_SLOT)
+    k_block_layout_with(kt, kt, Slots::FP32)
 }
 
 /// [`k_block_layout`] with `a_slots` slots for `A`: a packed `A`'s, `ceil(kt / 32) + 1` (a block's
-/// `K` range may start inside a packed tile), and `B`'s tiles `b_slot` bytes apart
-/// ([`SrcRoute::b_slot`]).
+/// `K` range may start inside a packed tile), and each operand's tiles its slot apart
+/// ([`SrcRoute::slots`]).
 pub(crate) fn k_block_layout_with(
     kt: usize,
     a_slots: usize,
-    b_slot: u64,
+    slots: Slots,
 ) -> Result<(Layout, Reload), crate::runtime::RunError> {
-    let mut m = matmul_requirements_placed([1, kt, 1], a_slots, None, b_slot);
+    let mut m = matmul_requirements_placed([1, kt, 1], a_slots, None, slots);
     let prior = m
         .req
         .scratch("matmul prior", tt_isa::dm::TILE_SLOT, 64, 0..1);
@@ -849,12 +849,7 @@ pub(crate) fn k_block_layout_with(
         b_at,
         outputs: vec![OutputTile {
             pairs: (0..kt)
-                .map(|k| {
-                    (
-                        a_at + k as u64 * tt_isa::dm::TILE_SLOT,
-                        b_at + k as u64 * b_slot,
-                    )
-                })
+                .map(|k| (a_at + k as u64 * slots.a, b_at + k as u64 * slots.b))
                 .collect(),
             out: plan.addr(m.out) + tt_isa::dm::TILE_DATA,
         }],
@@ -984,8 +979,8 @@ pub(crate) struct BlockStreamLayout {
     pub tiles: [usize; 3],
     pub a_at: [u64; 2],
     pub b_at: [u64; 2],
-    /// `B`'s tiles apart ([`SrcRoute::b_slot`]).
-    pub b_slot: u64,
+    /// `A`'s and `B`'s tiles apart ([`SrcRoute::slots`]).
+    pub slots: Slots,
     /// Each set's first output slot (its first byte: the packer writes past the header).
     pub out: [u64; 2],
     pub sems: MatmulSemaphores,
@@ -1006,7 +1001,7 @@ impl BlockStreamLayout {
     /// slots, `B` tile `(kk, j)` at `b_at + (kk cols + j)`): its layout, its outputs row-major,
     /// and their priors when it continues.
     pub fn chunk(&self, c: usize, [rows, count, cols]: [usize; 3]) -> (Layout, Option<Vec<u64>>) {
-        use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+        use tt_isa::dm::TILE_DATA;
         let [mb, kq, nb] = self.tiles;
         assert!(
             (1..=mb).contains(&rows) && (1..=kq).contains(&count) && (1..=nb).contains(&cols),
@@ -1021,8 +1016,8 @@ impl BlockStreamLayout {
                 let pairs = (0..count)
                     .map(|kk| {
                         (
-                            a_at + (i * count + kk) as u64 * TILE_SLOT,
-                            b_at + (kk * cols + j) as u64 * self.b_slot,
+                            a_at + (i * count + kk) as u64 * self.slots.a,
+                            b_at + (kk * cols + j) as u64 * self.slots.b,
                         )
                     })
                     .collect();
@@ -1044,11 +1039,11 @@ impl BlockStreamLayout {
     }
 }
 
-/// [`BlockStreamLayout`] for `[mb, kq, nb]` and `B`'s tiles `b_slot` bytes apart
-/// ([`SrcRoute::b_slot`]), planned in the current arena (`crate::l1::arena`).
+/// [`BlockStreamLayout`] for `[mb, kq, nb]` and each operand's tiles its slot apart
+/// ([`SrcRoute::slots`]), planned in the current arena (`crate::l1::arena`).
 pub(crate) fn block_stream_layout(
     [mb, kq, nb]: [usize; 3],
-    b_slot: u64,
+    slots: Slots,
 ) -> Result<BlockStreamLayout, crate::runtime::RunError> {
     use crate::l1::{Endpoint, PlanError, Requirements};
     use tt_isa::dm::TILE_SLOT;
@@ -1069,15 +1064,15 @@ pub(crate) fn block_stream_layout(
         (Endpoint::Pack, Endpoint::Mover),
     );
     let a = ["matmul A, half 0", "matmul A, half 1"]
-        .map(|name| ring(name, TILE_SLOT, mb * kq, input.0, input.1));
+        .map(|name| ring(name, slots.a, mb * kq, input.0, input.1));
     let b = ["matmul B, half 0", "matmul B, half 1"]
-        .map(|name| ring(name, b_slot, kq * nb, input.0, input.1));
+        .map(|name| ring(name, slots.b, kq * nb, input.0, input.1));
     let out = ["matmul out, set 0", "matmul out, set 1"]
         .map(|name| ring(name, TILE_SLOT, mb * nb, output.0, output.1));
     let sems = MatmulSemaphores::declare(&mut req, 0..1);
     let cleared = req.semaphore("matmul cleared", 0, 0..1);
     let loaded = req.semaphore("matmul loaded", 0, 0..1);
-    let bytes = block_stream_bytes([mb, kq, nb], b_slot);
+    let bytes = block_stream_bytes([mb, kq, nb], slots);
     let plan = req.plan(crate::l1::arena()).map_err(|e| match e {
         PlanError::DoesNotFit { .. } | PlanError::TooManyPages { .. } => {
             crate::runtime::RunError::DoesNotFit {
@@ -1092,7 +1087,7 @@ pub(crate) fn block_stream_layout(
         tiles: [mb, kq, nb],
         a_at: a.map(|a| plan.addr(a)),
         b_at: b.map(|b| plan.addr(b)),
-        b_slot,
+        slots,
         out: out.map(|o| plan.addr(o)),
         sems: MatmulSemaphores::planned(&plan, sems),
         cleared: plan.semaphore(cleared),
@@ -1102,8 +1097,10 @@ pub(crate) fn block_stream_layout(
 }
 
 /// The bytes of a [`block_stream_layout`]'s slots: two halves of `A` and `B` and two output sets.
-pub(crate) fn block_stream_bytes([mb, kq, nb]: [usize; 3], b_slot: u64) -> u64 {
-    2 * ((kq * mb + mb * nb) as u64 * tt_isa::dm::TILE_SLOT + (kq * nb) as u64 * b_slot)
+pub(crate) fn block_stream_bytes([mb, kq, nb]: [usize; 3], slots: Slots) -> u64 {
+    2 * ((kq * mb) as u64 * slots.a
+        + (mb * nb) as u64 * tt_isa::dm::TILE_SLOT
+        + (kq * nb) as u64 * slots.b)
 }
 
 /// The three role programs of a [`BlockStreamLayout`] chunk: every output tile of the block over
@@ -1143,7 +1140,7 @@ const B_COL_GPR: u32 = 31;
 const PRIOR_GPR: u32 = 40;
 const ZERO_GPR: u32 = 41;
 const OUT_GPR: u32 = 42;
-/// `B`'s slot, which `B`'s column steps by ([`BlockStreamLayout::b_slot`]).
+/// `B`'s slot, which `B`'s column steps by ([`BlockStreamLayout::slots`]).
 const B_SLOT_GPR: u32 = 43;
 
 /// [`block_stream_kernel`] with each output tile's block of each role stored once and repeated
@@ -1191,17 +1188,17 @@ pub(crate) fn block_stream_kernel_looped(
     // Unpack: the strides `gpr_step` adds, and each stepped GPR a step before its first use (the
     // blocks add first).
     let mut unpack = prelude;
-    set(&mut unpack, A_STRIDE_GPR, slot);
-    let b_slot = units(layout.b_slot);
+    set(&mut unpack, A_STRIDE_GPR, units(layout.slots.a));
+    let b_slot = units(layout.slots.b);
     set(
         &mut unpack,
         B_STRIDE_GPR,
-        units(cols as u64 * layout.b_slot),
+        units(cols as u64 * layout.slots.b),
     );
     set(&mut unpack, SLOT_GPR, slot);
     set(&mut unpack, B_SLOT_GPR, b_slot);
     set(&mut unpack, ZERO_GPR, 0);
-    let a_row_step = units(count as u64 * TILE_SLOT);
+    let a_row_step = units(count as u64 * layout.slots.a);
     set(&mut unpack, A_ROW_STEP_GPR, a_row_step);
     set(&mut unpack, A_ROW_GPR, units(a_at) - a_row_step);
     let prior0 = layout.out_slot(1 - h, cols, 0, 0);
@@ -2731,7 +2728,10 @@ pub fn plan_layout_packed_a(
         staging,
         a_slots,
         staging == Staging::Slots,
-        b_slot,
+        Slots {
+            a: tt_isa::dm::TILE_SLOT,
+            b: b_slot,
+        },
     )
 }
 
@@ -2741,21 +2741,21 @@ pub fn plan_layout_in(
     in_fmt: L1Format,
     staging: Staging,
 ) -> Result<Layout, crate::runtime::RunError> {
-    plan_layout_route(tiles, in_fmt, staging, tt_isa::dm::TILE_SLOT)
+    plan_layout_route(tiles, in_fmt, staging, Slots::FP32)
 }
 
-/// [`plan_layout_in`] with a slot staging's `B` tiles `b_slot` bytes apart ([`SrcRoute::b_slot`]).
-/// [`Staging::Host`] lays both operands out at `in_fmt`'s image, whatever `b_slot`.
+/// [`plan_layout_in`] with a slot staging's operand tiles their slots apart ([`SrcRoute::slots`]).
+/// [`Staging::Host`] lays both operands out at `in_fmt`'s image, whatever `slots`.
 pub fn plan_layout_route(
     [mt, kt, nt]: [usize; 3],
     in_fmt: L1Format,
     staging: Staging,
-    b_slot: u64,
+    slots: Slots,
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::runtime::RunError;
     match staging {
         Staging::Slots | Staging::SlotsHalf => {
-            return planned_slots([mt, kt, nt], in_fmt, staging, mt * kt, false, b_slot)
+            return planned_slots([mt, kt, nt], in_fmt, staging, mt * kt, false, slots)
         }
         Staging::Host => {}
     }
@@ -2822,7 +2822,7 @@ pub fn matmul_requirements([mt, kt, nt]: [usize; 3]) -> MatmulBuffers {
 /// [`matmul_requirements`] with `a_slots` slots for `A` (a packed `A`'s few,
 /// [`packed_a_pairs`]).
 pub fn matmul_requirements_with(tiles: [usize; 3], a_slots: usize) -> MatmulBuffers {
-    matmul_requirements_placed(tiles, a_slots, None, tt_isa::dm::TILE_SLOT)
+    matmul_requirements_placed(tiles, a_slots, None, Slots::FP32)
 }
 
 /// [`matmul_requirements_with`] with `B`'s ring at the end of `arena_bytes` of arena: `A` and the
@@ -2834,28 +2834,23 @@ pub fn matmul_requirements_top_b(
     tiles: [usize; 3],
     a_slots: usize,
     arena_bytes: u64,
-    b_slot: u64,
+    slots: Slots,
 ) -> Option<MatmulBuffers> {
-    let gap = arena_bytes.checked_sub(slot_bytes(tiles, a_slots, b_slot))?;
-    Some(matmul_requirements_placed(
-        tiles,
-        a_slots,
-        Some(gap),
-        b_slot,
-    ))
+    let gap = arena_bytes.checked_sub(slot_bytes(tiles, a_slots, slots))?;
+    Some(matmul_requirements_placed(tiles, a_slots, Some(gap), slots))
 }
 
-/// The bytes of a slot staging's rings: `a_slots` of `A` and the outputs' FP32 slots, and `B`'s
-/// `kt * nt` tiles `b_slot` apart.
-fn slot_bytes([mt, kt, nt]: [usize; 3], a_slots: usize, b_slot: u64) -> u64 {
-    (a_slots + mt * nt) as u64 * tt_isa::dm::TILE_SLOT + (kt * nt) as u64 * b_slot
+/// The bytes of a slot staging's rings: `a_slots` of `A`'s slots, the outputs' FP32 slots, and
+/// `B`'s `kt * nt` tiles its slot apart.
+fn slot_bytes([mt, kt, nt]: [usize; 3], a_slots: usize, slots: Slots) -> u64 {
+    a_slots as u64 * slots.a + (mt * nt) as u64 * tt_isa::dm::TILE_SLOT + (kt * nt) as u64 * slots.b
 }
 
 fn matmul_requirements_placed(
     [mt, kt, nt]: [usize; 3],
     a_slots: usize,
     gap: Option<u64>,
-    b_slot: u64,
+    slots: Slots,
 ) -> MatmulBuffers {
     use crate::l1::{Endpoint, Requirements};
     use tt_isa::dm::TILE_SLOT;
@@ -2876,7 +2871,7 @@ fn matmul_requirements_placed(
     let a = ring(
         &mut req,
         "matmul A",
-        TILE_SLOT,
+        slots.a,
         a_slots,
         Endpoint::Mover,
         Endpoint::Unpack,
@@ -2885,7 +2880,7 @@ fn matmul_requirements_placed(
         ring(
             req,
             "matmul B",
-            b_slot,
+            slots.b,
             kt * nt,
             Endpoint::Mover,
             Endpoint::Unpack,
@@ -2944,11 +2939,11 @@ fn planned_slots(
     staging: Staging,
     a_slots: usize,
     top_b: bool,
-    b_slot: u64,
+    slots: Slots,
 ) -> Result<Layout, crate::runtime::RunError> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = ([usize; 3], L1Format, Staging, usize, bool, u64, u64, u64);
+    type Key = ([usize; 3], L1Format, Staging, usize, bool, u64, u64, Slots);
     // Each layout with what its plan reached and needed, noted again on every hit
     // (`crate::l1::note_planned`); by the arena's end too, and the end `B`'s ring sits against
     // (`crate::l1::ring_end`).
@@ -2962,7 +2957,7 @@ fn planned_slots(
         top_b,
         crate::l1::arena().end,
         crate::l1::ring_end(),
-        b_slot,
+        slots,
     );
     if let Some((l, p)) = cache.lock().unwrap().get(&key) {
         crate::l1::note_planned(*p);
@@ -2978,7 +2973,7 @@ fn planned_slots(
         _ => crate::l1::arena(),
     };
     let before = crate::l1::take_planned();
-    let planned = plan_slots(tiles, in_fmt, arena, a_slots, top_b, b_slot);
+    let planned = plan_slots(tiles, in_fmt, arena, a_slots, top_b, slots);
     let p = crate::l1::take_planned();
     crate::l1::note_planned(before);
     crate::l1::note_planned(p);
@@ -2993,7 +2988,7 @@ fn plan_slots(
     arena: tt_isa::l1::Region,
     a_slots: usize,
     top_b: bool,
-    b_slot: u64,
+    slots: Slots,
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::l1::PlanError;
     use crate::runtime::RunError;
@@ -3003,14 +2998,14 @@ fn plan_slots(
         "slot staging must fit the operand image"
     );
     let m = match top_b {
-        true => matmul_requirements_top_b([mt, kt, nt], a_slots, arena.len(), b_slot).ok_or(
+        true => matmul_requirements_top_b([mt, kt, nt], a_slots, arena.len(), slots).ok_or(
             RunError::DoesNotFit {
                 what: "the operand tiles",
-                bytes: slot_bytes([mt, kt, nt], a_slots, b_slot),
+                bytes: slot_bytes([mt, kt, nt], a_slots, slots),
                 limit: arena.len(),
             },
         )?,
-        false => matmul_requirements_placed([mt, kt, nt], a_slots, None, b_slot),
+        false => matmul_requirements_placed([mt, kt, nt], a_slots, None, slots),
     };
     let plan = m.req.plan(arena).map_err(|e| match e {
         PlanError::DoesNotFit { name, bytes, arena } => RunError::DoesNotFit {
@@ -3035,8 +3030,8 @@ fn plan_slots(
             let pairs = (0..kt)
                 .map(|kk| {
                     (
-                        a_at + (i * kt + kk) as u64 * TILE_SLOT,
-                        b_at + (kk * nt + j) as u64 * b_slot,
+                        a_at + (i * kt + kk) as u64 * slots.a,
+                        b_at + (kk * nt + j) as u64 * slots.b,
                     )
                 })
                 .collect();
@@ -3218,6 +3213,36 @@ impl SrcRoute {
             None => tt_isa::dm::TILE_SLOT,
         }
     }
+
+    /// The bytes an `A` tile takes in a GDDR-staged plan's L1: [`tt_isa::dm::TILE_SLOT`].
+    pub const fn a_slot(self) -> u64 {
+        tt_isa::dm::TILE_SLOT
+    }
+
+    /// Both operands' slots in a GDDR-staged plan's L1.
+    pub const fn slots(self) -> Slots {
+        Slots {
+            a: self.a_slot(),
+            b: self.b_slot(),
+        }
+    }
+}
+
+/// The bytes each operand's tile takes in a GDDR-staged plan's L1 (`A`'s, `B`'s): its format's slot
+/// ([`TileFormat::slot_bytes`]), as a gather reads it there, so a packed operand's ring holds more
+/// tiles. The outputs are FP32 slots ([`tt_isa::dm::TILE_SLOT`]) whatever the operands.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct Slots {
+    pub a: u64,
+    pub b: u64,
+}
+
+impl Slots {
+    /// Two FP32 operands.
+    pub const FP32: Slots = Slots {
+        a: tt_isa::dm::TILE_SLOT,
+        b: tt_isa::dm::TILE_SLOT,
+    };
 }
 
 /// `C[m, n] = A[m, k] @ B[k, n]` for row-major `f32` operands, on the Tensix
@@ -3347,38 +3372,39 @@ pub fn set_bf16_plans(mode: Bf16Plans) {
     bf16_plans_cell().store(mode as u8, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The `B` slot a product's width is first planned with ([`plan_uncached`]): [`SrcRoute::b_slot`]
-/// under [`Bf16Plans::Wide`], else an FP32 `B`'s.
-fn planned_b_slot(route: SrcRoute) -> u64 {
+/// The slots a product's width is first planned with ([`plan_uncached`]): [`SrcRoute::slots`]
+/// under [`Bf16Plans::Wide`], else FP32 operands'. A packed operand then lays out in no more room
+/// than the plan's.
+fn planned_slots_of(route: SrcRoute) -> Slots {
     match bf16_plans() {
-        Bf16Plans::Wide => route.b_slot(),
-        _ => tt_isa::dm::TILE_SLOT,
+        Bf16Plans::Wide => route.slots(),
+        _ => Slots::FP32,
     }
 }
 
-/// [`chunk_fits`] for either [`Staging`]. Its probe plans `B` at [`planned_b_slot`].
+/// [`chunk_fits`] for either [`Staging`]. Its probe plans the operands at [`planned_slots_of`].
 pub fn chunk_fits_in(
     tiles: [usize; 3],
     route: SrcRoute,
     fidelity: Fidelity,
     staging: Staging,
 ) -> bool {
-    chunk_fits_at(tiles, route, fidelity, staging, planned_b_slot(route))
+    chunk_fits_at(tiles, route, fidelity, staging, planned_slots_of(route))
 }
 
-/// [`chunk_fits_in`] with `B`'s tiles `b_slot` apart.
+/// [`chunk_fits_in`] with the operands' tiles `slots` apart.
 fn chunk_fits_at(
     tiles: [usize; 3],
     route: SrcRoute,
     fidelity: Fidelity,
     staging: Staging,
-    b_slot: u64,
+    slots: Slots,
 ) -> bool {
     let in_fmt = route.formats().0;
     if staging != Staging::Host && !matches!(in_fmt, L1Format::Fp32 | L1Format::Bf16) {
         return false;
     }
-    let Ok(layout) = plan_layout_route(tiles, in_fmt, staging, b_slot) else {
+    let Ok(layout) = plan_layout_route(tiles, in_fmt, staging, slots) else {
         return false;
     };
     let roles = programs(
@@ -3573,7 +3599,7 @@ pub fn plan_floor(
             let nt = mkn[2].div_ceil(32).max(1);
             if let Some(wider) = (nc + 1..=most.min(nt))
                 .rev()
-                .find(|&w| chunk_fits_at([mc, kc, w], route, fidelity, staging, route.b_slot()))
+                .find(|&w| chunk_fits_at([mc, kc, w], route, fidelity, staging, route.slots()))
             {
                 s.tiles = [mc, kc, wider];
             }
@@ -3581,8 +3607,8 @@ pub fn plan_floor(
         // The floor of what is laid out: compact past `Bf16Plans::F32` (whose floor stays an FP32
         // `B`'s probe, as before compact rings).
         let floor_slot = match bf16_plans() {
-            Bf16Plans::F32 => planned_b_slot(route),
-            _ => route.b_slot(),
+            Bf16Plans::F32 => planned_slots_of(route),
+            _ => route.slots(),
         };
         let floor = match (p, staging) {
             (None, _) | (_, Staging::Host) => 0,
@@ -4021,7 +4047,16 @@ mod tests {
         }
         let tiles = [2, 5, 3];
         for st in [Staging::Slots, Staging::SlotsHalf] {
-            let l = plan_layout_route(tiles, L1Format::Fp32, st, BF16_TILE_SLOT).unwrap();
+            let l = plan_layout_route(
+                tiles,
+                L1Format::Fp32,
+                st,
+                Slots {
+                    a: TILE_SLOT,
+                    b: BF16_TILE_SLOT,
+                },
+            )
+            .unwrap();
             for (o, out) in l.outputs.iter().enumerate() {
                 let (i, j) = (o / 3, o % 3);
                 for (kk, &(a, b)) in out.pairs.iter().enumerate() {
@@ -4030,7 +4065,15 @@ mod tests {
                 }
             }
         }
-        let (kb, _) = k_block_layout_with(7, 2, BF16_TILE_SLOT).unwrap();
+        let (kb, _) = k_block_layout_with(
+            7,
+            2,
+            Slots {
+                a: TILE_SLOT,
+                b: BF16_TILE_SLOT,
+            },
+        )
+        .unwrap();
         assert!(kb.outputs[0]
             .pairs
             .windows(2)
@@ -4042,16 +4085,46 @@ mod tests {
             .windows(2)
             .all(|p| p[1].1 - p[0].1 == BF16_TILE_SLOT));
         assert!(s.b_at[0].abs_diff(s.b_at[1]) >= 16 * BF16_TILE_SLOT);
-        let bl = block_stream_layout([2, 4, 3], BF16_TILE_SLOT).unwrap();
+        let bl = block_stream_layout(
+            [2, 4, 3],
+            Slots {
+                a: TILE_SLOT,
+                b: BF16_TILE_SLOT,
+            },
+        )
+        .unwrap();
         let (c, _) = bl.chunk(0, [2, 4, 3]);
         assert_eq!(
             c.outputs[4].pairs[3].1,
             bl.b_at[0] + (3 * 3 + 1) * BF16_TILE_SLOT
         );
         assert_eq!(
-            block_stream_bytes([2, 4, 3], BF16_TILE_SLOT),
+            block_stream_bytes(
+                [2, 4, 3],
+                Slots {
+                    a: TILE_SLOT,
+                    b: BF16_TILE_SLOT
+                }
+            ),
             2 * ((8 + 6) * TILE_SLOT + 12 * BF16_TILE_SLOT)
         );
+        // A packed `A` likewise: its tiles its own slot apart, the outputs FP32 slots.
+        let packed_a = Slots {
+            a: BF16_TILE_SLOT,
+            b: TILE_SLOT,
+        };
+        let bl = block_stream_layout([2, 4, 3], packed_a).unwrap();
+        let (c, _) = bl.chunk(1, [2, 4, 3]);
+        assert_eq!(
+            c.outputs[4].pairs[3].0,
+            bl.a_at[1] + (4 + 3) * BF16_TILE_SLOT
+        );
+        assert_eq!(
+            block_stream_bytes([2, 4, 3], packed_a),
+            2 * (8 * BF16_TILE_SLOT + (6 + 12) * TILE_SLOT)
+        );
+        let l = plan_layout_route([2, 5, 3], L1Format::Fp32, Staging::Slots, packed_a).unwrap();
+        assert_eq!(l.outputs[4].pairs[3].0, l.a_at + (5 + 3) * BF16_TILE_SLOT);
     }
 
     #[test]
