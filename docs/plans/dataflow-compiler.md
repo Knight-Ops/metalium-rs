@@ -5,7 +5,7 @@
 [0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md),
 [0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and
 [0005](../adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md).
-**Branch:** `dataflow-compiler`, in a worktree.
+**Branch:** `traced-generation` (F1 was built on `dataflow-compiler` in a worktree and merged back, `d84ef47`).
 **Silicon:** cards 0 and 1 (owner, 2026-10-28; card 1 only before that). Each gate is validated on one card, card 0 by
 default; benches stay on card 1, where Stage 0's baselines were taken, and a before/after pair always uses one card. No
 `--device all`, and no mesh, multi-card or Ethernet gate.
@@ -95,6 +95,8 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 
 ## Stage F2: typed channels and the cross-core credit
 
+- **H8** (Bible §13, opened 2026-10-28): a credited handoff between two units costs less than a barrier, ≤ 1.5 us on card 1;
+  the in-core streams re-expressed as `Local` channels emit today's words.
 - [ ] Add a `Channel` to `tt-kernels`: one producer, N consumers, a depth, and a page of `TileFormat` × tiles. Its kind is `Local`, `Remote`, `Broadcast` or `Gddr`, and its credit words are declared through `l1::Requirements`. The existing `Input`, `Output` and `Transfer` streams are re-expressed as `Local` channels, and every existing gate stays bit-identical.
 - [ ] Add the remote credit: a NoC atomic increment into a peer's L1 word, issued after the data's write acknowledgements (T7), plus a local wait.
   - The encoding goes in `tt_isa::dataflow` and `tt_isa::dm`, the firmware in `tt-firmware/src/dataflow.rs`/`mover.rs`.

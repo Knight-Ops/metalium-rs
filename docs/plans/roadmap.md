@@ -753,7 +753,7 @@ Track 1 model. Evidence and bottlenecks:
 - Schedules choose only among bit-equivalent options under each op's numeric contract.
 - Every step is a hypothesis with a kill criterion.
 
-The staged work is [dataflow-compiler.md](dataflow-compiler.md), in a worktree on branch `dataflow-compiler`, with silicon on cards 0 and 1 (gates on card 0, benches on card 1):
+The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `traced-generation`, with silicon on cards 0 and 1 (gates on card 0, benches on card 1):
 - [x] **Stage 0:** card-1 baselines (2026-10-28).
 - [x] **F1:** `TileFormat`, and one matmul for every format pair, with exact fidelity (H3) (2026-10-28,
   [log](../learnings/performance-log.md#one-matmul-for-every-format-pair-and-bfp-weights-through-the-model-2026-10-28-cards-0-and-1)).

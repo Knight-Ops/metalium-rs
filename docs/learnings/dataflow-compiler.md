@@ -466,6 +466,17 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
 - **H6 Generic ops.** The L1 description covers matmul, the 121 pointwise SFPU kinds and a row reduction with no transform code specific to any of them.
   - *Measured by:* lines of per-op transform code, and the three old builders deleted bit-exact.
   - *Kills it:* a transform needs per-op special cases. The description is then missing a concept, and it is amended here.
+- **H8 Per-edge credits are cheap** (F2, opened 2026-10-28). A channel's credit is a NoC atomic increment into the
+  consumer's L1 word, sent after the data's write acknowledgements (T7), and a fenced local wait.
+  - *Claim:* a credited unicast handoff between two units costs less than one op barrier (~3 us, T10), so replacing a
+    barrier by per-edge credits (X6) does not spend in synchronization what overlap gains. Re-expressing the in-core streams as
+    `Local` channels costs nothing, because it emits the same words.
+  - *Prediction:* one page written to a peer's L1, then credited, reaches the consumer's returned wait in <= 1.5 us on
+    card 1, and the local streams' packets are word for word today's.
+  - *Measured by:* a credit probe beside the barrier on the same two units, release, card 1; the packet golden for the
+    words.
+  - *Kills it:* the handoff costs as much as the barrier or more. D6 then leans to coarse credits (a batch, not a
+    page), and that is recorded here.
 
 ---
 
