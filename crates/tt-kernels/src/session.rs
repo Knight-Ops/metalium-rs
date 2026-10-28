@@ -1640,16 +1640,7 @@ fn transfer_segments(steps: Vec<Step>) -> Vec<Segment> {
         out.push(segment);
     }
     let credit = |action: Action, depth: u16| {
-        [
-            op::CB,
-            Stream::Transfer.word(),
-            action.word(),
-            depth as u32,
-            0,
-            0,
-            0,
-            0,
-        ]
+        crate::channel::Channel::local(0, Stream::Transfer, depth).credit(action)
     };
     let mut out = Vec::new();
     let mut packet: Option<Packet> = None;
@@ -1996,7 +1987,8 @@ fn lead_with(seg: &mut Segment, entry: [u32; 8]) -> bool {
 /// A unit's steps as ownership regions and control lists, for a program cache
 /// of `cache` bytes (`Session::limit_program_cache`).
 fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, TensorError> {
-    use tt_isa::dataflow::Action;
+    use crate::channel::Channel;
+    use tt_isa::dataflow::{Action, Stream};
     use tt_isa::dm::op;
     let mut result = Vec::new();
     // Consecutive standalone transfers share one control list (and one queue
@@ -2052,7 +2044,11 @@ fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, Tens
         if !transfers.is_empty() {
             result.extend(transfer_segments(std::mem::take(&mut transfers)));
         }
-        let capacity = if blocks[0].half.is_some() { 2 } else { 1 };
+        let capacity: u16 = if blocks[0].half.is_some() { 2 } else { 1 };
+        let (input, output) = (
+            Channel::local(0, Stream::Input, capacity),
+            Channel::local(0, Stream::Output, capacity),
+        );
         let mut segment = Segment {
             streaming: true,
             resident: true,
@@ -2108,12 +2104,12 @@ fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, Tens
             if reuse > released {
                 reader.push([op::RELEASED, reuse as u32, 1, 0, 0, 0, 0, 0]);
             }
-            reader.push([op::CB, 0, Action::Reserve.word(), capacity, 0, 0, 0, 0]);
+            reader.push(input.credit(Action::Reserve));
             reader.extend(block.gather.1);
-            reader.push([op::CB, 0, Action::Push.word(), capacity, 0, 0, 0, 0]);
-            writer.push([op::CB, 1, Action::Wait.word(), capacity, 0, 0, 0, 0]);
+            reader.push(input.credit(Action::Push));
+            writer.push(output.credit(Action::Wait));
             writer.extend(block.scatter.1);
-            writer.push([op::CB, 1, Action::Pop.word(), capacity, 0, 0, 0, 0]);
+            writer.push(output.credit(Action::Pop));
             segment.steps += 3;
         }
         segment.roles = segment.kernel_roles.first().cloned();
@@ -2124,7 +2120,7 @@ fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, Tens
             op::PAIR,
             reader.len() as u32,
             writer.len() as u32,
-            capacity,
+            capacity as u32,
             0,
             0,
             0,
@@ -3064,13 +3060,29 @@ impl<T: Transport> Session<T> {
             return Err(TraceError::Capturing.into());
         }
         self.sync()?;
+        use crate::channel::Channel;
+        use tt_isa::dataflow::Stream;
         let mut requirements = crate::l1::Requirements::new(1);
-        let input = requirements.scratch("input page counters", 8, 4, 0..1);
-        let output = requirements.scratch("output page counters", 8, 4, 0..1);
+        // The streams' counters are the channels' words; their depth is each packet's.
+        let input = requirements.channel(
+            "input page counters",
+            &Channel::local(0, Stream::Input, 1),
+            0..1,
+        );
+        let output = requirements.channel(
+            "output page counters",
+            &Channel::local(0, Stream::Output, 1),
+            0..1,
+        );
         let state = requirements.scratch(
             "stream cancellation, progress and waits",
-            tt_isa::dataflow::END - tt_isa::dataflow::ABORT,
+            tt_isa::dataflow::TRANSFER - tt_isa::dataflow::ABORT,
             4,
+            0..1,
+        );
+        let transfer = requirements.channel(
+            "transfer page counters",
+            &Channel::local(0, Stream::Transfer, 1),
             0..1,
         );
         let arena = tt_isa::l1::Region {
@@ -3085,6 +3097,7 @@ impl<T: Transport> Session<T> {
         if plan.addr(input) != tt_isa::dataflow::INPUT
             || plan.addr(output) != tt_isa::dataflow::OUTPUT
             || plan.addr(state) != tt_isa::dataflow::ABORT
+            || plan.addr(transfer) != tt_isa::dataflow::TRANSFER
         {
             return Err(TensorError::Shape(
                 "stream-control plan disagrees with firmware".into(),

@@ -192,6 +192,20 @@ pub enum Kind {
         producer: Endpoint,
         consumer: Endpoint,
     },
+    /// An in-core stream's counters, received then consumed ([`crate::channel::Kind::Local`]).
+    Counters,
+    /// One cross-core credit word, alone in its 16 bytes: a peer's NoC atomic increments it, and
+    /// a NoC atomic names a word by its 16-byte unit ([`crate::channel::Kind::Remote`]).
+    Credit,
+}
+
+/// The bytes and alignment of a channel's words on one tile: a stream's two counters, or one
+/// credit word in its own 16 bytes.
+pub const fn channel_words(kind: &crate::channel::Kind) -> (u64, u64) {
+    match kind {
+        crate::channel::Kind::Local(_) => (8, 4),
+        _ => (16, 16),
+    }
 }
 
 /// One buffer a kernel needs.
@@ -381,6 +395,29 @@ impl Requirements {
         })
     }
 
+    /// Declare `channel`'s words on this tile, live in `live`: a local stream's counters, or a
+    /// credit word a peer increments (each end of a cross-core channel declares its own, the
+    /// consumer's for the data's credits and the producer's for the freed pages').
+    pub fn channel(
+        &mut self,
+        name: &'static str,
+        channel: &crate::channel::Channel,
+        live: Range<u32>,
+    ) -> Buf {
+        let (bytes, align) = channel_words(&channel.kind);
+        let kind = match channel.kind {
+            crate::channel::Kind::Local(_) => Kind::Counters,
+            _ => Kind::Credit,
+        };
+        self.buffer(BufferSpec {
+            name,
+            bytes,
+            align,
+            live,
+            kind,
+        })
+    }
+
     /// Declare a semaphore starting at `initial`, in use in `live`.
     pub fn semaphore(&mut self, name: &'static str, initial: u8, live: Range<u32>) -> Sem {
         self.sems.push(SemSpec {
@@ -531,6 +568,18 @@ impl Requirements {
                         b.name
                     ));
                 }
+            }
+            let words = match b.kind {
+                Kind::Counters => Some((8, 4)),
+                Kind::Credit => Some((16, 16)),
+                _ => None,
+            };
+            if words.is_some_and(|(bytes, align)| b.bytes != bytes || b.align % align != 0) {
+                return bad(format!(
+                    "{}: a channel's words are its counters (8 bytes) or a credit word alone in \
+                     16 aligned bytes",
+                    b.name
+                ));
             }
         }
         for s in &self.sems {

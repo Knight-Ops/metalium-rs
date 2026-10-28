@@ -22,6 +22,7 @@ pub mod attention;
 pub mod barriers;
 pub mod bf16;
 pub mod bfp;
+pub mod channel;
 pub mod code;
 pub mod datapath;
 pub mod dm;
