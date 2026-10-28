@@ -267,6 +267,25 @@ and B1 at the close. The set:
       included. The one that failed was `step188::traced_generation_equals_the_eager_one`, a timeout. It has run
       127-137 s since it was written, past the runner's 120 s default; alone it passes in 129.9 s (`1793216293`).
       It now has its own 240 s in `xtask` `LONG`.
+  - [x] **F3.8, thin, prefetch, handoff, second job, balanced deal, batched.**
+    - `BlockPlan` is gone from `tensor.rs`. It is now the product's schedule, `tile_op::matmul::Plan`, beside
+      `block_stream_plan`'s role: which columns a unit takes, which go ahead to idle units, and where a handed column
+      splits.
+    - Every job it places is lowered by `lower::block_jobs`.
+    - Its three hand-written splits of a job's contraction reads are now one generic pass, `tile_op::ahead::take_reads`
+      (X8): the first `n` gathers' `GATHER` records moved to a list placed ahead, optionally `STREAM` -> `PREFETCH`.
+    - `matmul_dram_batched_limited` builds through `Plan` and `tile_op::matmul`.
+    - `matmul_dram_limited` stays: a wrapper of `matmul_dram_prefetching` for the tensor tests, not a builder.
+    - **For the H6 audit:** the placement over a spread (prefetching, balanced and second jobs) and the handoff's split
+      of an `L1Halves` chain into two ops are still client code in `Plan`, written over lowered jobs. The handoff
+      retargets a chunk's write to the partials, which is a contract the description lacks: a chain handed between
+      units. F4a re-expresses it as a channel (a remote credit), so it is not given a `Combine` here.
+    - All four goldens are unchanged, and tt-kernels passes 313 of 313.
+    - ttsim: `step60/68/184/205/216/229/241` pass 38 of 38 (`step205` forces the handoff, second job and balanced
+      deal).
+    - Card 0 (`1793216912`): 52 of 53 with `step18/239/240/185/188`. The failure was
+      `step188::device_agrees_with_flex`, a timeout at 120.16 s against its 116-135 s history; alone it passes in
+      119.88 s (`1793217290`). It now has its own 240 s in `LONG`.
 - [ ] Allocation through `l1::Requirements` and the op's `channel::Graph::check`, once the matmul's layouts are
   microkernel layouts: today each client's microkernel plans its own L1 (`sfpu::kernel::plan_layout_in`,
   `sfpu::reduce::plan_layout`).

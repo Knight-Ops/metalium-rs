@@ -24,6 +24,7 @@ use tt_isa::isa::Instruction;
 use crate::runtime::SemaphoreInit;
 use crate::tensor::{DramAlloc, DramTensor, Elem, Overlap, Result, TensorError, Work};
 
+pub mod ahead;
 pub mod distribute;
 pub mod lower;
 pub(crate) mod matmul;

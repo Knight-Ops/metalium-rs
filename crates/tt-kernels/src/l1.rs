@@ -82,7 +82,7 @@ pub fn ring_end() -> u64 {
 
 /// Make [`ring_end`] `end` on this thread (`None`: the arena's end), in the trace arena -- above
 /// the arena's end for a capture's first ring, below a first ring for a second
-/// (`tensor::BlockPlan::push_prefetched_jobs`) -- returning what it was.
+/// (`tile_op::matmul::Plan::push_prefetched_jobs`) -- returning what it was.
 pub(crate) fn set_ring_end(end: Option<u64>) -> Option<u64> {
     if let Some(end) = end {
         assert!(

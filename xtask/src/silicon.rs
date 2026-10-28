@@ -124,6 +124,9 @@ const LONG: &[(&str, u64)] = &[
         "step188_smollm2_1_7b::traced_generation_equals_the_eager_one",
         240,
     ),
+    // 116-135 s on card 0 (`1793030672`, `1793123716`): about the default, so it timed out at
+    // 120.16 s in a run that otherwise passed (`1793216912`).
+    ("step188_smollm2_1_7b::device_agrees_with_flex", 240),
 ];
 
 pub const SMOKE: &[&str] = &[

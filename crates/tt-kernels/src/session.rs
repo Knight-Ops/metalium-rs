@@ -4810,7 +4810,7 @@ impl<T: Transport> Session<T> {
         });
         let fold = barrier.filter(|_| self.capture.is_none());
         let mut folded = vec![false; spread];
-        // A prefetching product's `PREFETCH` lists (`tensor::BlockPlan::push_prefetched_jobs`): in
+        // A prefetching product's `PREFETCH` lists (`tile_op::matmul::Plan::push_prefetched_jobs`): in
         // a capture each goes into its unit's stream ahead of the unit's catch-up wait, behind a
         // wait for its anchor -- the last weight-streaming product, or the last the unit took
         // part in ([`PrefetchAnchor`]) -- alone, so the unit reads its `B` while the ops since
@@ -9058,7 +9058,7 @@ impl<T: Transport> Session<T> {
     /// columns on units idle since the last such product (or since the last they took part in,
     /// [`Session::set_prefetch_anchor`]), each reading its columns' `B` as soon as that product
     /// is done -- under the ops between the two -- and the product then reading
-    /// only `A` there (on by default; `tensor::BlockPlan::push_prefetched_jobs`). Only in a
+    /// only `A` there (on by default; `tile_op::matmul::Plan::push_prefetched_jobs`). Only in a
     /// capture, whose streams show which units ran nothing in between. Off, every column is read
     /// by the product: the gates compare the two.
     pub fn set_weight_prefetch(&mut self, on: bool) {

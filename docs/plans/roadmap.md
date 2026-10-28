@@ -775,8 +775,11 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
   - Done: the pointwise family and the reduction (`33d3562`, `0bfb79e`). On card 0, 65 of 65. On card 1, host time per
     op within 1.8% of B0 after `8011dc7`, and decode, models and MNIST within drift
     ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
-  - Left: every `matmul_dram` lowering (F3.6-F3.8), then allocation and the channel check as passes, the H6 audit,
-    and B1.
+  - The matmul (2026-10-28): block-stream (F3.6, `e579690`), K whole, K-block and stream (F3.7, `ddc23a0`) and the
+    batched product are on `TileOp` through one contraction lowering, word for word against the job goldens (a batched
+    golden added first, `9dad570`). `BlockPlan` moved to `tile_op::matmul::Plan`, and its reads ahead are a generic pass
+    (F3.8).
+  - Left: allocation and the channel check as passes, the H6 audit, and B1.
 - [ ] **F4b:** operand reuse across cores (H1).
 - [ ] **F4a:** channels instead of barriers in decode (H4).
 - [ ] **F5:** `Dst` subblocks and half-sync (H2).

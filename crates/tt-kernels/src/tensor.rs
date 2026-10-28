@@ -1628,10 +1628,10 @@ pub(crate) struct Reads {
     /// ([`record::GATHER_A_RESIDENT`]): with `K` whole under [`Staging::Slots`], `A` is at the
     /// same slots for every block.
     pub resident_a: bool,
-    /// A transposed `B` is transposed by the kernel's unpacker (`BlockPlan::unpack_b`).
+    /// A transposed `B` is transposed by the kernel's unpacker (`tile_op::matmul::Plan::unpack_b`).
     pub unpack_b: bool,
     /// `A` (one row) as [`pack_row`] laid it out, `[K / 32, 32]`: each block reads its
-    /// `K / 1024` tiles instead of a thin read a `K` tile ([`BlockPlan::packed_a`]).
+    /// `K / 1024` tiles instead of a thin read a `K` tile (`tile_op::matmul::Plan::packed_a`).
     pub packed_a: Option<TensorRef>,
     /// With `packed_a`, each output column's `K` in chunks the mover reads while the kernel
     /// computes the chunk before (`tile_op::matmul::Schedule::Stream`).
@@ -1645,11 +1645,11 @@ pub(crate) struct Reads {
     /// between two units at this chunk (`Some(0)`: half the chunks; [`Handoff`]).
     pub handoff: Option<usize>,
     /// A `K`-whole product's prefetching units each take a second job of one column, its `B` in a
-    /// ring below the first's and read ahead with it ([`BlockPlan::push_prefetched_jobs`]).
+    /// ring below the first's and read ahead with it (`tile_op::matmul::Plan::push_prefetched_jobs`).
     pub second_job: bool,
     /// A `K`-whole product whose own units would run more than a round deals the columns its span
     /// reads over its prefetching units too, not its own units alone
-    /// ([`BlockPlan::push_prefetched_jobs`], [`balanced_shares`]).
+    /// (`tile_op::matmul::Plan::push_prefetched_jobs`, [`balanced_shares`]).
     pub balanced_deal: bool,
     /// Whether a product of several tile rows runs as 2-D blocks with `K` streamed
     /// ([`BlockStream`]).
@@ -1822,7 +1822,7 @@ pub(crate) fn matmul_dram_limited(
 
 /// What a list that reads a product's `B` ahead of it is called: the session puts it in a unit's
 /// trace stream ahead of the wait that orders the unit after the ops before the product
-/// ([`BlockPlan::push_prefetched_jobs`]).
+/// (`tile_op::matmul::Plan::push_prefetched_jobs`).
 pub const PREFETCH: &str = "weight prefetch";
 
 /// What a list that reads a product's `B` ahead on a unit that runs the ops before the product
@@ -1858,7 +1858,7 @@ pub(crate) struct Handoff {
 
 /// [`matmul_dram_limited`], with `prefetch` (units at or past `units`, below `spread`) each
 /// taking one job of the product whose `B` its own list reads ahead ([`PREFETCH`],
-/// [`BlockPlan::push_prefetched_jobs`]) -- where the product is one row with a packed `A` and
+/// `tile_op::matmul::Plan::push_prefetched_jobs`) -- where the product is one row with a packed `A` and
 /// its `K` whole or streamed (a prefetching unit's one job is in the first half when pipelined). Returns the work, `Some(spread)` when its jobs are dealt over
 /// `spread` units (job `j` to unit `j % spread`), else `None` (over `units`, `prefetch` unused),
 /// and, where `reads.handoff` hands columns, the second op (dealt as the first).
@@ -1989,7 +1989,7 @@ pub(crate) fn matmul_dram_prefetching(
             "a packed `A` is one row read as it is, not [{m}, {k}] transposed {a_transposed}"
         )));
     }
-    let plan = BlockPlan {
+    let plan = crate::tile_op::matmul::Plan {
         tiles: [mt, kt, nt],
         m,
         block: [mc, nc],
@@ -2091,56 +2091,6 @@ pub(crate) fn matmul_dram_prefetching(
     ))
 }
 
-/// How one `[m, k, n]` product is cut into jobs: what [`matmul_dram`] and
-/// [`matmul_dram_batched`] share.
-#[derive(Clone)]
-struct BlockPlan {
-    tiles: [usize; 3],
-    /// The product's rows: a job of its last tile row alone computes only those it holds
-    /// ([`matmul::LiveRows`]).
-    m: usize,
-    block: [usize; 2],
-    k_block: usize,
-    staging: Staging,
-    units: usize,
-    route: SrcRoute,
-    fidelity: Fidelity,
-    allow_mop: bool,
-    /// [`thin_rows`] of `op(A)`, set on the gathers of its last tile row.
-    thin: u32,
-    /// Mark a block [`record::GATHER_A_RESIDENT`] when its unit's previous block of the same
-    /// `push_jobs` read the same `A` rows to the same slots. Only under [`Staging::Slots`]:
-    /// [`Staging::SlotsHalf`] moves `A` between halves.
-    resident_a: bool,
-    /// The output's columns, one run a job in dealing order, when [`thin_runs`]
-    /// deals them (instead of `block`'s width).
-    col_runs: Option<Vec<std::ops::Range<usize>>>,
-    /// A transposed `B`'s tiles are read as they lie and transposed by the kernel's unpacker
-    /// ([`record::GATHER_B_UNPACK_TRANSPOSE`]), not one datum at a time by the mover
-    /// (`READ_TRANSPOSED`, ~10 us a tile). Only on the TF32 route, where `B`'s unpack to `SrcA`
-    /// converts it anyway.
-    unpack_b: bool,
-    /// A one-row `A` packed `[K / 32, 32]` ([`pack_row`]): a block reads the packed tiles
-    /// holding its `K` range ([`record::READ_RUN`]) and its gather reads only `B`
-    /// ([`record::GATHER_A_RESIDENT`]). The kernel unpacks `K` tile `kk`'s faces `(0, k)` from
-    /// row `kk % 16` of the packed faces `((kk % 32) / 16, k)` ([`matmul::packed_a_pairs`]):
-    /// row 0 of `SrcB` holds the same values, and the other rows only reach output rows past
-    /// the product's one.
-    packed_a: Option<TensorRef>,
-    /// One job a column, its `K` in chunks (`tile_op::matmul::Schedule::Stream`): with `packed_a`,
-    /// one tile row, [`Staging::Slots`], and a `K` too long for one block (its chunks no longer
-    /// than `k_block`) only.
-    stream_k: bool,
-    /// Per unit of a capture, the highest `DATA` address the ops it ran since the last
-    /// weight-streaming product planned, where all are known: the unit's first job reads its `B`
-    /// ahead ([`BUSY_PREFETCH`]) if `B`'s ring lies above it. Empty: none does.
-    busy: Vec<Option<u64>>,
-    /// [`Reads::second_job`].
-    second_job: bool,
-    /// [`Reads::balanced_deal`].
-    balanced_deal: bool,
-}
-
 /// A one-tile-row product's output columns, one run a job, in the order a
 /// session deals them (job `j` to unit `j % units`): whole rounds of the plan's
 /// width `nc`, then what is left as even runs over as many units as it covers.
@@ -2179,72 +2129,6 @@ pub fn balanced_shares(left: usize, deal: usize) -> Vec<usize> {
     };
     let more = deal - left % deal;
     (0..deal).map(|d| each + usize::from(d >= more)).collect()
-}
-
-impl BlockPlan {
-    /// The jobs of `op(A) @ op(B)` as this plan cuts it ([`crate::tile_op::matmul`]), the
-    /// operands and the output named by `refs` (`[A, B, C]`, each a tensor or a tile-aligned
-    /// block of one: the records read `K` and the output from the ref's first tile on, at the
-    /// ref's row stride), appended to `jobs`: job `j` runs on unit `j % units`, so a unit's
-    /// blocks and halves continue from the jobs before.
-    fn push_jobs(
-        &self,
-        jobs: &mut Vec<Job>,
-        [ra, rb, rc]: [TensorRef; 3],
-        [a_transposed, b_transposed]: [bool; 2],
-    ) -> Result<()> {
-        use crate::tile_op::matmul::{Schedule, Side};
-        let [mt, kt, nt] = self.tiles;
-        let schedule = if self.stream_k {
-            debug_assert_eq!(mt, 1);
-            let (kq, layout) = stream_chunks(kt, self.k_block, self.route, self.fidelity)?;
-            // A column a job: the plan's runs' columns, in order, or every column.
-            let cols = self.col_runs.as_ref().map(|runs| {
-                runs.iter()
-                    .flat_map(|r| r.clone())
-                    .map(|j| j..j + 1)
-                    .collect()
-            });
-            Schedule::Stream { kq, layout, cols }
-        } else if self.k_block < kt {
-            Schedule::KBlocks {
-                k_block: self.k_block,
-            }
-        } else {
-            Schedule::Blocks {
-                block: self.block,
-                cols: self.col_runs.clone(),
-                staging: self.staging,
-                resident_a: self.resident_a,
-                allow_mop: self.allow_mop,
-            }
-        };
-        let elem = |f: Option<TileFormat>| f.map_or(Elem::F32, Elem::Packed);
-        let mut op = crate::tile_op::matmul(
-            Side {
-                at: ra,
-                transposed: a_transposed,
-                elem: elem(self.route.packed_a()),
-                live_rows: self.thin != 0,
-            },
-            Side {
-                at: rb,
-                transposed: b_transposed,
-                elem: elem(self.route.packed_b()),
-                live_rows: false,
-            },
-            [self.m, kt * 32, nt * 32],
-            self.route,
-            self.fidelity,
-            self.unpack_b,
-            self.packed_a,
-            schedule,
-        )?;
-        op.results[0].layout = crate::tile_op::Layout::Tiles(rc);
-        op.ahead = self.busy.clone();
-        jobs.extend(op.jobs_from(self.units, Overlap::Off, jobs.len())?);
-        Ok(())
-    }
 }
 
 /// `A` slots a K block of `count` tiles takes with `A` packed: the packed tiles its `K` range
@@ -2295,405 +2179,6 @@ fn packed_k_block(
     ))
 }
 
-impl BlockPlan {
-    /// The jobs of a one-row product with a packed `A`, its `K` whole or streamed
-    /// (`tile_op::matmul::Schedule::Stream`), its first columns on the `prefetch` units -- each a job
-    /// of the plan's width (a column, streamed), its gather's `B` reads moved into a list of their
-    /// own ahead of the job ([`PREFETCH`]; streamed, its first two chunks', which fill the ring's
-    /// two halves), its gather left reading the packed `A` -- and the rest dealt over the plan's
-    /// units as [`thin_runs`] deals them. Laid out for a deal over `spread` units: a regular unit
-    /// `u`'s `k`th job at `k spread + u`, a prefetching unit's at its own index. A prefetching
-    /// unit's `B` slots are the job's own, written by its `PREFETCH` list and read by its kernel,
-    /// with nothing on the unit between the two (the session takes as prefetching only units
-    /// idle since their anchor product; a streamed job's third chunk refills the first half only
-    /// after the first chunk's kernel, as unprefetched), so each output column is its
-    /// unprefetched self, bit for bit.
-    ///
-    /// With `handoff` (`(h, partials)`, streamed only), each column dealt to the plan's units is
-    /// handed while a unit of the deal is left with no job: the column's unit computes its first
-    /// `h` chunks (`0`: half) and writes the partial to `partials`, the spare unit reads the
-    /// packed `A` and the next two chunks' `B` ahead ([`HANDED_AHEAD`]) and, in the second op
-    /// returned (laid out as the first), reloads the partial and computes the rest ([`Handoff`]).
-    /// Empty: no column is handed.
-    fn push_prefetched_jobs(
-        &self,
-        jobs: &mut Vec<Job>,
-        refs: [TensorRef; 3],
-        transposed: [bool; 2],
-        prefetch: &[usize],
-        spread: usize,
-        handoff: Option<(usize, TensorRef)>,
-    ) -> Result<Vec<Job>> {
-        let [_, kt, nt] = self.tiles;
-        let nc = if self.stream_k { 1 } else { self.block[1] };
-        // The gathers each prefetched job reads ahead: a streamed column's first two chunks.
-        let ahead = if self.stream_k { 2 } else { 1 };
-        let firsts = (prefetch.len() * nc).min(nt);
-        // A `K`-whole product's prefetching units each take a second column after their first
-        // job's, its `B` in a ring directly below the first job's (`crate::l1::ring_end` lowered by
-        // that ring), read ahead in the same list: what the window carries grows where L1 holds it
-        // (in a capture planning into the trace arena), and nothing changes where it does not. Only
-        // with `B` against the ring's end ([`Staging::Slots`]): a pipelined product's jobs stage
-        // `B` in a half of the arena, the second's where the first's is.
-        // And only where the plan's own units would still run more than a round of columns: where
-        // the first jobs leave less, the window already carries what the product reads, and a
-        // second job is only a column more of compute on a unit the others then wait for (a 1.7B
-        // step's `qkv` 51 -> 80 us and `o` 22 -> 33 us, profile `1792721989`).
-        let busy_rounds = (nt - firsts).div_ceil((self.units * nc).max(1));
-        let seconds = match self.second_job
-            && !self.stream_k
-            && self.staging == Staging::Slots
-            && busy_rounds > 1
-        {
-            true => self.second_jobs(refs, transposed, firsts, nt, prefetch.len())?,
-            false => Vec::new(),
-        };
-        let moved = firsts + seconds.len();
-        // The columns the span reads dealt over the prefetching units too: where the plan's own
-        // units would run more than a round, the prefetching units otherwise finish their job read
-        // ahead in ~13 us and wait at the barrier for units reading 5 columns more (a 1.7B step's
-        // `gate|up`, profile `1792762439`).
-        let balanced = self.balanced_deal
-            && seconds.is_empty()
-            && !self.stream_k
-            && self.staging == Staging::Slots
-            && busy_rounds > 1;
-        let mut regular = Vec::new();
-        // The regular jobs' columns, in their order (a streamed job's one).
-        let mut regular_cols = Vec::new();
-        if moved < nt && !balanced {
-            let rest = nt - moved;
-            let runs = thin_runs([1, kt, rest], [kt, nc], Staging::Slots, self.units)
-                .unwrap_or_else(|| {
-                    (0..rest)
-                        .step_by(nc)
-                        .map(|j| j..(j + nc).min(rest))
-                        .collect()
-                });
-            let plan = BlockPlan {
-                col_runs: Some(
-                    runs.into_iter()
-                        .map(|r| r.start + moved..r.end + moved)
-                        .collect(),
-                ),
-                ..self.clone()
-            };
-            plan.push_jobs(&mut regular, refs, transposed)?;
-            regular_cols = plan
-                .col_runs
-                .iter()
-                .flatten()
-                .flat_map(|r| r.clone())
-                .collect();
-        }
-        let mut early = Vec::new();
-        for j0 in (0..firsts).step_by(nc) {
-            let plan = BlockPlan {
-                units: 1,
-                col_runs: Some(std::iter::once(j0..(j0 + nc).min(firsts)).collect()),
-                resident_a: false,
-                busy: Vec::new(),
-                ..self.clone()
-            };
-            let mut one = Vec::new();
-            plan.push_jobs(&mut one, refs, transposed)?;
-            let mut job = one.pop().expect("a job a block");
-            let mut b_reads = Vec::new();
-            let gathers = job.iter_mut().filter_map(|step| match step {
-                Step::List { entries, .. } => entries
-                    .iter()
-                    .position(|e| e[0] == record::GATHER)
-                    .map(|at| (entries, at)),
-                _ => None,
-            });
-            for (entries, at) in gathers.take(ahead) {
-                b_reads.extend(entries.split_off(at));
-            }
-            assert!(!b_reads.is_empty(), "a block's gather record");
-            job.insert(
-                0,
-                Step::List {
-                    what: PREFETCH,
-                    entries: b_reads,
-                },
-            );
-            early.push(job);
-        }
-        let units = self.units.max(1);
-        if balanced {
-            return self.push_balanced_jobs(jobs, refs, transposed, early, prefetch, spread);
-        }
-        let mut handed = Vec::new();
-        let mut handed_ahead = Vec::new();
-        if let Some((at, rp)) = handoff.filter(|_| self.stream_k) {
-            let (kq, layout) = stream_chunks(kt, self.k_block, self.route, self.fidelity)?;
-            let chunks = kt.div_ceil(kq);
-            let h = match at {
-                0 => chunks / 2,
-                at => at.min(chunks - 1),
-            };
-            // The units of the deal with no job: neither the plan's nor a prefetching one.
-            let taken: Vec<usize> = (0..regular.len().min(units))
-                .chain(prefetch.iter().copied().take(early.len()))
-                .collect();
-            let mut spare = (0..spread).filter(|u| !taken.contains(u));
-            for (job, &j) in regular.iter_mut().zip(&regular_cols) {
-                if h == 0 {
-                    break;
-                }
-                let Some(y) = spare.next() else {
-                    break;
-                };
-                let plan = BlockPlan {
-                    units: 1,
-                    col_runs: Some(std::iter::once(j..j + 1).collect()),
-                    resident_a: false,
-                    busy: Vec::new(),
-                    ..self.clone()
-                };
-                let mut whole = Vec::new();
-                plan.push_jobs(&mut whole, refs, transposed)?;
-                let mut rest = whole.pop().expect("a job a column");
-                let first = rest.drain(..3 * h).collect::<Vec<_>>();
-                // The column's unit: its first `h` chunks, the last one's partial to `partials`.
-                job.truncate(3 * h);
-                let Some(Step::List { entries, .. }) = job.last_mut() else {
-                    unreachable!("a chunk ends with its scatter list");
-                };
-                *entries = vec![
-                    [
-                        record::SCATTER,
-                        (layout.out[(h - 1) % 2] + tt_isa::dm::TILE_DATA) as u32,
-                        TILE_SLOT as u32,
-                        0,
-                        1,
-                        j as u32,
-                        1,
-                        0,
-                    ],
-                    rp.encode()[0],
-                    rp.encode()[1],
-                ];
-                // The spare unit, first op: the packed `A` (chunk 0's reads before its gather)
-                // and the next two chunks' gathers as a prefetch.
-                let mut ahead: Vec<[u32; 8]> = match first.first() {
-                    Some(Step::List { entries, .. }) => entries
-                        .iter()
-                        .take_while(|e| e[0] != record::GATHER)
-                        .copied()
-                        .collect(),
-                    _ => unreachable!("a chunk starts with its gather list"),
-                };
-                let gathers = rest.iter_mut().filter_map(|step| match step {
-                    Step::List { entries, .. } => entries
-                        .iter()
-                        .position(|e| e[0] == record::GATHER)
-                        .map(|at| (entries, at)),
-                    _ => None,
-                });
-                for (entries, at) in gathers.take(2) {
-                    let mut gather = entries.split_off(at);
-                    gather[0][1] = gather[0][1] & !record::GATHER_STREAM | record::GATHER_PREFETCH;
-                    ahead.extend(gather);
-                }
-                // The second op: the partial into the slot chunk `h` reloads from, after the
-                // first op's barrier, and the prefetch drained before chunk `h`'s kernel.
-                let Some(Step::List { entries, .. }) = rest.first_mut() else {
-                    unreachable!("a chunk starts with its gather list");
-                };
-                let mut lead = vec![
-                    [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0],
-                    [
-                        record::READ_RUN,
-                        j as u32,
-                        1,
-                        layout.out[(h - 1) % 2] as u32,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
-                    rp.encode()[0],
-                    rp.encode()[1],
-                    [
-                        tt_isa::dm::op::WAIT,
-                        tt_isa::dm::WAIT_PREFETCH,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
-                ];
-                lead.append(entries);
-                *entries = lead;
-                if handed.is_empty() {
-                    handed = vec![Vec::new(); spread];
-                }
-                handed[y] = rest;
-                handed_ahead.push((
-                    y,
-                    vec![Step::List {
-                        what: HANDED_AHEAD,
-                        entries: ahead,
-                    }],
-                ));
-            }
-        }
-        let rounds = regular
-            .len()
-            .div_ceil(units)
-            .max(1 + usize::from(!seconds.is_empty()));
-        let mut laid: Vec<Job> = vec![Vec::new(); rounds * spread];
-        for (k, job) in regular.into_iter().enumerate() {
-            laid[k / units * spread + k % units] = job;
-        }
-        let mut seconds = seconds.into_iter();
-        for (mut job, &u) in early.into_iter().zip(prefetch) {
-            // The second job's `B` reads after the first's, in its one list.
-            if let Some((b_reads, second)) = seconds.next() {
-                let Some(Step::List { entries, .. }) = job.first_mut() else {
-                    unreachable!("a prefetched job starts with its list");
-                };
-                entries.extend(b_reads);
-                laid[spread + u] = second;
-            }
-            laid[u] = job;
-        }
-        for (u, job) in handed_ahead {
-            laid[u] = job;
-        }
-        jobs.extend(laid);
-        Ok(handed)
-    }
-
-    /// The jobs of a product dealt by [`Reads::balanced_deal`], laid a round of `spread` units at a
-    /// time: each prefetching unit's job read ahead (`early`, columns `0..firsts`) and the plan's
-    /// own units' first round (read ahead where [`BUSY_PREFETCH`] allows) as without it; then the
-    /// columns left, in [`balanced_shares`] over the plan's units and then the prefetching ones, in
-    /// runs of at most the plan's width, each unit's after its first job in the same ring. Every
-    /// output tile's accumulation is unchanged: only which unit holds it moves.
-    fn push_balanced_jobs(
-        &self,
-        jobs: &mut Vec<Job>,
-        refs: [TensorRef; 3],
-        transposed: [bool; 2],
-        early: Vec<Job>,
-        prefetch: &[usize],
-        spread: usize,
-    ) -> Result<Vec<Job>> {
-        let [_, _, nt] = self.tiles;
-        let nc = self.block[1];
-        let units = self.units.max(1);
-        let firsts = (prefetch.len() * nc).min(nt);
-        let lead = (units * nc).min(nt - firsts);
-        let mut first_round = Vec::new();
-        BlockPlan {
-            col_runs: Some(
-                (0..lead)
-                    .step_by(nc)
-                    .map(|j| firsts + j..firsts + (j + nc).min(lead))
-                    .collect(),
-            ),
-            ..self.clone()
-        }
-        .push_jobs(&mut first_round, refs, transposed)?;
-        let deal: Vec<usize> = (0..units)
-            .chain(prefetch.iter().copied().take(early.len()))
-            .collect();
-        let mut at = firsts + lead;
-        let mut later: Vec<Vec<Job>> = Vec::with_capacity(deal.len());
-        for share in balanced_shares(nt - at, deal.len()) {
-            let mut own = Vec::new();
-            if share > 0 {
-                BlockPlan {
-                    units: 1,
-                    col_runs: Some(
-                        (0..share)
-                            .step_by(nc)
-                            .map(|j| at + j..at + (j + nc).min(share))
-                            .collect(),
-                    ),
-                    busy: Vec::new(),
-                    ..self.clone()
-                }
-                .push_jobs(&mut own, refs, transposed)?;
-            }
-            at += share;
-            later.push(own);
-        }
-        debug_assert_eq!(at, nt, "every column dealt");
-        let rounds = 1 + later.iter().map(Vec::len).max().unwrap_or(0);
-        let mut laid: Vec<Job> = vec![Vec::new(); rounds * spread];
-        for (u, job) in first_round.into_iter().enumerate() {
-            laid[u] = job;
-        }
-        for (job, &u) in early.into_iter().zip(prefetch) {
-            laid[u] = job;
-        }
-        for (&u, own) in deal.iter().zip(later) {
-            for (r, job) in own.into_iter().enumerate() {
-                laid[(1 + r) * spread + u] = job;
-            }
-        }
-        jobs.extend(laid);
-        Ok(Vec::new())
-    }
-
-    /// The second jobs of `count` prefetching units ([`Reads::second_job`]): columns `first..`, one
-    /// each, each its gather's `B` reads (split off, for the unit's prefetch list) and the job left
-    /// reading the packed `A`. Its `B` ring is directly below the first job's, which sits against
-    /// [`crate::l1::ring_end`] and is `kt` columns of the plan's width (a narrower last first job
-    /// leaves a gap). None where that does not plan: no second ring fits below the first.
-    fn second_jobs(
-        &self,
-        refs: [TensorRef; 3],
-        transposed: [bool; 2],
-        first: usize,
-        nt: usize,
-        count: usize,
-    ) -> Result<Vec<(Vec<[u32; 8]>, Job)>> {
-        let kt = self.tiles[1];
-        let ring = (kt * self.block[1]) as u64 * self.route.b_slot();
-        let top = crate::l1::ring_end();
-        if top < tt_isa::l1::DATA.base + ring {
-            return Ok(Vec::new());
-        }
-        let was = crate::l1::set_ring_end(Some(top - ring));
-        let built = (first..(first + count).min(nt))
-            .map(|j| {
-                let plan = BlockPlan {
-                    units: 1,
-                    col_runs: Some(std::iter::once(j..j + 1).collect()),
-                    resident_a: false,
-                    busy: Vec::new(),
-                    second_job: false,
-                    balanced_deal: false,
-                    ..self.clone()
-                };
-                let mut one = Vec::new();
-                plan.push_jobs(&mut one, refs, transposed)?;
-                let mut job = one.pop().expect("a job a block");
-                let Some((entries, at)) = job.iter_mut().find_map(|step| match step {
-                    Step::List { entries, .. } => entries
-                        .iter()
-                        .position(|e| e[0] == record::GATHER)
-                        .map(|at| (entries, at)),
-                    _ => None,
-                }) else {
-                    unreachable!("a block's gather record");
-                };
-                let b_reads = entries.split_off(at);
-                Ok((b_reads, job))
-            })
-            .collect::<Result<Vec<_>>>();
-        crate::l1::set_ring_end(was);
-        // A second ring that does not plan below the first (outside the trace arena) is none.
-        Ok(built.unwrap_or_default())
-    }
-}
-
 /// Fewest chunks a streamed column's `K` is cut into (`tile_op::matmul::Schedule::Stream`): the
 /// mover reads one while the kernel computes the one before, so the last's compute is what is
 /// left after the reads.
@@ -2703,7 +2188,7 @@ const MIN_STREAM_CHUNKS: usize = 4;
 /// and its layout: an even number of chunks (a column's first in half 0, so a unit's columns
 /// alternate halves throughout), at least [`MIN_STREAM_CHUNKS`], each at most `limit` tiles (the
 /// K block the product would otherwise take), the fewest whose layout and programs fit.
-fn stream_chunks(
+pub(crate) fn stream_chunks(
     kt: usize,
     limit: usize,
     route: SrcRoute,
@@ -3265,7 +2750,7 @@ pub(crate) fn matmul_dram_batched_limited(
             return Ok(Work { out: c, jobs });
         }
     }
-    let plan = BlockPlan {
+    let plan = crate::tile_op::matmul::Plan {
         tiles: [mt, kt, nt],
         m,
         block: blocks([mt, nt], [mc, nc], per_item),
