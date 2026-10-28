@@ -252,17 +252,17 @@ case Sum Cols [256, 512] units 8 Captured then Some((269, 228737632))
   jobs 8ffcb0c7 b372eb2a 4d458b57 06f9eb21 25d5b0fb 357b427b 122fa951 337c142a
 case Sum Cols [64, 65536] units 1 Fresh then None
   out 64x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920]] jobs 2
-  jobs 3dccbf3c 98456856
+  jobs 30d1406a 9e66f5aa
 case Sum Cols [64, 65536] units 8 Fresh then None
   out 64x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920]] jobs 2
-  jobs 3dccbf3c 98456856
+  jobs 30d1406a 9e66f5aa
 case Sum Cols [64, 65536] units 1 Fresh then Some((269, 0))
   refused: a reduction too long for one tile's programs takes no finishing kind
 case Sum Rows [65536, 64] units 1 Fresh then None
   out 1x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920]] jobs 2
-  jobs 49acf41c cb868fb6
+  jobs 3788eadd eabd1a46
 case Sum Rows [65536, 64] units 8 Fresh then None
   out 1x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920]] jobs 2
-  jobs 49acf41c cb868fb6
+  jobs 3788eadd eabd1a46
 case Sum Rows [65536, 64] units 1 Fresh then Some((269, 0))
   refused: a reduction too long for one tile's programs takes no finishing kind

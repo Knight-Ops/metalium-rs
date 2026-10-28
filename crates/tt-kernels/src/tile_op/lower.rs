@@ -30,8 +30,9 @@
 //! missing concept (H6), not a special case.
 //!
 //! A reduction whose contract carries its partials through GDDR ([`Combine::GddrPartials`]) is
-//! lowered by [`chunked_jobs`]: a job an item, a chunk of its terms a step, each chunk after the
-//! first reloading the partial the last wrote to the result.
+//! lowered by [`chunked_jobs`] (or, for a contraction, [`block_jobs`]): a job an item, a chunk of
+//! its terms a step, each chunk after the first a link of one form ([`WAIT_FOR_PARTIAL`], its
+//! reads, then [`reload`]) reloading the partial the last wrote to the result.
 
 use tt_isa::dm::record;
 
@@ -105,6 +106,20 @@ pub fn jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Vec<
     Ok(jobs)
 }
 
+/// A link of a chain of partials through GDDR after the first: first in its gather, the wait that
+/// orders its reload after the last link's write to the result.
+const WAIT_FOR_PARTIAL: [u32; 8] = [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0];
+
+/// Last in such a link's gather, after its reads: the partial the last link wrote to the result's
+/// tile `tile` (`result`, its reference), reloaded into the slot `prior`.
+fn reload(tile: usize, prior: u64, result: &[[u32; 8]; 2]) -> [[u32; 8]; 3] {
+    [
+        [record::READ_RUN, tile as u32, 1, prior as u32, 0, 0, 0, 0],
+        result[0],
+        result[1],
+    ]
+}
+
 /// The chunk a reduction iterator's contract splits its terms in, carrying partials through GDDR.
 pub fn partials_chunk(op: &TileOp) -> Option<usize> {
     op.domain.iter().find_map(|i| match i.kind {
@@ -118,7 +133,8 @@ pub fn partials_chunk(op: &TileOp) -> Option<usize> {
 
 /// A reduction in chunks of `chunk` terms: each item's chunks in order, one job, so its partial
 /// passes from chunk to chunk through the result's tile on one unit. A chunk after the first waits
-/// for the last chunk's write, then reloads the partial ([`super::RunCode::prior`]).
+/// for the last chunk's write, reads its terms, then reloads the partial
+/// ([`super::RunCode::prior`]).
 pub fn chunked_jobs(op: &TileOp, chunk: usize) -> Result<Vec<Job>> {
     let parallel: Vec<usize> = op.parallel().collect();
     let reductions: Vec<usize> = op.reductions().collect();
@@ -140,18 +156,18 @@ pub fn chunked_jobs(op: &TileOp, chunk: usize) -> Result<Vec<Job>> {
                 last: first + count == weight,
             };
             let code = allocate::run(&*op.body, &at, None)?;
+            let reloaded = match (first > 0, code.prior) {
+                (false, _) => None,
+                (true, Some(prior)) => Some(reload(item, prior, &partial)),
+                (true, None) => {
+                    return Err(TensorError::Shape(
+                        "a chunk after the first has no slot for its partial".into(),
+                    ))
+                }
+            };
             let mut gather = Vec::new();
-            if first > 0 {
-                let prior = code.prior.ok_or_else(|| {
-                    TensorError::Shape("a chunk after the first has no slot for its partial".into())
-                })?;
-                // The reload depends on the last chunk's write to GDDR.
-                gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
-                gather.extend([
-                    [record::READ_RUN, item as u32, 1, prior as u32, 0, 0, 0, 0],
-                    partial[0],
-                    partial[1],
-                ]);
+            if reloaded.is_some() {
+                gather.push(WAIT_FOR_PARTIAL);
             }
             let items = item..item + 1;
             let span = item * weight + first..item * weight + first + count;
@@ -170,6 +186,7 @@ pub fn chunked_jobs(op: &TileOp, chunk: usize) -> Result<Vec<Job>> {
                     )?;
                 }
             }
+            gather.extend(reloaded.into_iter().flatten());
             steps.push(Step::List {
                 what: gather_what,
                 entries: gather,
@@ -513,8 +530,7 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
             held[unit] = Some(key);
             let mut gather = Vec::new();
             if c > 0 && matches!(combine, Combine::GddrPartials { .. }) {
-                // The reload depends on the last chunk's write to GDDR.
-                gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+                gather.push(WAIT_FOR_PARTIAL);
             }
             if let (Some(row), false) = (row, resident) {
                 // A tile of the packed row holds 32 terms.
@@ -591,20 +607,7 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
                 c > 0 && matches!(combine, Combine::GddrPartials { .. }),
                 code.prior,
             ) {
-                gather.extend([
-                    [
-                        record::READ_RUN,
-                        (rows.start * ct + cols.start) as u32,
-                        1,
-                        prior as u32,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
-                    rc[0],
-                    rc[1],
-                ]);
+                gather.extend(reload(rows.start * ct + cols.start, prior, &rc));
             }
             let written = match combine {
                 Combine::L1Halves { .. } => c + 1 == chunks.len(),
