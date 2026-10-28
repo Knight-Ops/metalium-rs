@@ -4042,6 +4042,11 @@ static COL_ONCE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
 
 /// Set whether a column broadcast's runs keep to tile rows and read their `B` tile once
 /// ([`row_runs`]); returns what it was. A gate's negative control and a benchmark's comparison.
+/// Held by a host test while it changes or depends on [`set_col_once`], process-wide: tests run
+/// side by side in one process.
+#[cfg(test)]
+pub(crate) static SWITCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn set_col_once(on: bool) -> bool {
     COL_ONCE.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
@@ -8140,6 +8145,7 @@ mod tests {
             }
             alloc.free(&work.out.placement);
         }
+        let _held = super::SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
         let was = set_col_once(false);
         let work = sfpu_eltwise(
             &mut alloc,

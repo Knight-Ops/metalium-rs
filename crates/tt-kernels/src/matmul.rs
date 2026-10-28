@@ -1334,6 +1334,13 @@ pub fn set_block_loops(on: bool) {
     BLOCK_LOOPS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A host test's own [`set_block_loops`], on its own thread: tests run side by side in one
+    /// process.
+    pub(crate) static LOOPS_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// A kernel's three role programs and their block repeats, shared.
 pub(crate) type SharedLoopedRoles = (
     std::sync::Arc<[Vec<Instruction>; 3]>,
@@ -1370,6 +1377,11 @@ pub(crate) fn block_stream_programs(
     );
     static CACHE: OnceLock<Mutex<HashMap<Key, SharedLoopedRoles>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
+    #[cfg(test)]
+    let looped = LOOPS_HERE
+        .get()
+        .unwrap_or_else(|| BLOCK_LOOPS.load(std::sync::atomic::Ordering::Relaxed));
+    #[cfg(not(test))]
     let looped = BLOCK_LOOPS.load(std::sync::atomic::Ordering::Relaxed);
     let key = (
         tiles,

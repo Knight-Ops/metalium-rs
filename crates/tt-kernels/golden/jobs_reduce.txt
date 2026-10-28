@@ -1,0 +1,268 @@
+case Sum Cols [37, 70] units 1 Off then None
+  out 37x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 716792c3
+case Sum Cols [37, 70] units 3 Fresh then None
+  out 37x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs a86df6e8 2304e560
+case Sum Cols [256, 512] units 8 Fresh then None
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 8e396217 7800a688 51528d46 faf5a81f 43ded640 b48df4af 15830add e3d40719
+case Sum Cols [256, 512] units 120 Captured then None
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 8e396217 7800a688 51528d46 faf5a81f 43ded640 b48df4af 15830add e3d40719
+case Sum Rows [37, 70] units 1 Off then None
+  out 1x70 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs c05dd049
+case Sum Rows [37, 70] units 3 Fresh then None
+  out 1x70 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs 09e22ff3 cde8e937 b36336ef
+case Sum Rows [256, 512] units 8 Fresh then None
+  out 1x512 F32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs c3d3542f 3a8d4fd2 f3a282c5 c6a41519 859b36ac 9a67f6e5 f5951c81 be9cd215
+case Sum Rows [256, 512] units 120 Captured then None
+  out 1x512 F32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs 65a1926f cad0470f e94cf90a 96d66c44 a7cfef90 4223a11a aa65cdde 78948a8e b4fe3108 09b0f6d0 dbe654ad 1d75f1a8 f3355163 d2729eca 53f7ad73 a875a188
+case Max Cols [37, 70] units 1 Off then None
+  out 37x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 439b67a7
+case Max Cols [37, 70] units 3 Fresh then None
+  out 37x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs 72ae8179 8e407a41
+case Max Cols [256, 512] units 8 Fresh then None
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 7525ca5d c74b2f10 5ea3f8ca 38d88db0 12e2e433 eb09ca1b da11dcfa 9719b6c2
+case Max Cols [256, 512] units 120 Captured then None
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 7525ca5d c74b2f10 5ea3f8ca 38d88db0 12e2e433 eb09ca1b da11dcfa 9719b6c2
+case Max Rows [37, 70] units 1 Off then None
+  out 1x70 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs f3ec14bc
+case Max Rows [37, 70] units 3 Fresh then None
+  out 1x70 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs b34b1ec5 f0b821db ce641b55
+case Max Rows [256, 512] units 8 Fresh then None
+  out 1x512 F32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 0493ec64 3b374e8a eaa1879b 872dfda4 c54d1a71 6d8649ac 8c71d71e e2bb237c
+case Max Rows [256, 512] units 120 Captured then None
+  out 1x512 F32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs 0fd553d6 fb56ac88 6bba14fe 26ae24d5 fc7b9f6c efdf5844 d8c68e5d d946e929 1db35a35 38be3c58 dff2430e a5525823 5cc47936 28234071 c11ba30b 2800645c
+case Prod Cols [37, 70] units 1 Off then None
+  out 37x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs a014418c
+case Prod Cols [37, 70] units 3 Fresh then None
+  out 37x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs b2333605 1730cef8
+case Prod Cols [256, 512] units 8 Fresh then None
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 7e75185f 0aa78e72 7c7261f9 103fbcf3 9bc80d8c 238d3e48 d1056055 ff0ef55e
+case Prod Cols [256, 512] units 120 Captured then None
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 7e75185f 0aa78e72 7c7261f9 103fbcf3 9bc80d8c 238d3e48 d1056055 ff0ef55e
+case Prod Rows [37, 70] units 1 Off then None
+  out 1x70 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs d604af33
+case Prod Rows [37, 70] units 3 Fresh then None
+  out 1x70 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs 1df34e90 18a5eee9 0536243c
+case Prod Rows [256, 512] units 8 Fresh then None
+  out 1x512 F32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs d7514826 31cb2ea8 491fc18d 143f9955 b195cfa6 fdf684f6 fd509bb7 c1f6c481
+case Prod Rows [256, 512] units 120 Captured then None
+  out 1x512 F32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs b0eaa9a1 46cd42f6 f3a3dad1 be9a72bd 99453fef 4b938549 1d722598 4b6de415 5763262e 3dd70f16 22c65417 005e6ed6 21d14dcf 67ab33ed 209fdfd4 fdc28f9c
+case All Cols [37, 70] units 1 Off then None
+  out 37x1 Bool at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs d4f4fb4c
+case All Cols [37, 70] units 3 Fresh then None
+  out 37x1 Bool at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs 6a33a7b8 35829a64
+case All Cols [256, 512] units 8 Fresh then None
+  out 256x1 Bool at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs c7ab4307 cccf959e e520988d 891015af 39a300aa c47e7012 642717b9 840f15e0
+case All Cols [256, 512] units 120 Captured then None
+  out 256x1 Bool at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs c7ab4307 cccf959e e520988d 891015af 39a300aa c47e7012 642717b9 840f15e0
+case All Rows [37, 70] units 1 Off then None
+  out 1x70 Bool at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 11a92a76
+case All Rows [37, 70] units 3 Fresh then None
+  out 1x70 Bool at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs ad0c7f4b d2961efd c1da1932
+case All Rows [256, 512] units 8 Fresh then None
+  out 1x512 Bool at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs df6c265a 7f82b302 05dc2576 ae1c02d1 e58ade76 4c0ff26e 919a00ae 641102ae
+case All Rows [256, 512] units 120 Captured then None
+  out 1x512 Bool at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs fccf2c6e 37c6de6c 95e12590 5fb6da21 f9278d0a 54013f07 ca71eedb fd209928 bfddcc64 f07b2729 817cc973 d100b363 e67311b1 77de92c4 118105f9 98213a8b
+case Any Cols [37, 70] units 1 Off then None
+  out 37x1 Bool at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 62474bd1
+case Any Cols [37, 70] units 3 Fresh then None
+  out 37x1 Bool at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs 33daecd2 a4bea2ed
+case Any Cols [256, 512] units 8 Fresh then None
+  out 256x1 Bool at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 0e6a6b1c 70f7e69d cc9c847d c1d2cfdd 171e9663 794a96b0 2c557442 1d783df2
+case Any Cols [256, 512] units 120 Captured then None
+  out 256x1 Bool at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 0e6a6b1c 70f7e69d cc9c847d c1d2cfdd 171e9663 794a96b0 2c557442 1d783df2
+case Any Rows [37, 70] units 1 Off then None
+  out 1x70 Bool at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 06264467
+case Any Rows [37, 70] units 3 Fresh then None
+  out 1x70 Bool at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs d69609f3 57ef5a99 8ad61bc0
+case Any Rows [256, 512] units 8 Fresh then None
+  out 1x512 Bool at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 155ca7da 389aa1c2 f8705be8 3c5b9bd3 a9fe2f13 70ad97bb 094ebca5 47312d40
+case Any Rows [256, 512] units 120 Captured then None
+  out 1x512 Bool at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs e43bed6e b4dee28a 05c66a34 c5a17e74 ec44edca f3ff83ff 737537b4 1ec3eecb 4b9cca07 718244a8 b5958d13 17d5012a 2f14b927 0e184b9c f069da43 707e6700
+case BitOr Cols [37, 70] units 1 Off then None
+  out 37x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 62474bd1
+case BitOr Cols [37, 70] units 3 Fresh then None
+  out 37x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs 33daecd2 a4bea2ed
+case BitOr Cols [256, 512] units 8 Fresh then None
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 0e6a6b1c 70f7e69d cc9c847d c1d2cfdd 171e9663 794a96b0 2c557442 1d783df2
+case BitOr Cols [256, 512] units 120 Captured then None
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 0e6a6b1c 70f7e69d cc9c847d c1d2cfdd 171e9663 794a96b0 2c557442 1d783df2
+case BitOr Rows [37, 70] units 1 Off then None
+  out 1x70 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 06264467
+case BitOr Rows [37, 70] units 3 Fresh then None
+  out 1x70 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs d69609f3 57ef5a99 8ad61bc0
+case BitOr Rows [256, 512] units 8 Fresh then None
+  out 1x512 F32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 155ca7da 389aa1c2 f8705be8 3c5b9bd3 a9fe2f13 70ad97bb 094ebca5 47312d40
+case BitOr Rows [256, 512] units 120 Captured then None
+  out 1x512 F32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs e43bed6e b4dee28a 05c66a34 c5a17e74 ec44edca f3ff83ff 737537b4 1ec3eecb 4b9cca07 718244a8 b5958d13 17d5012a 2f14b927 0e184b9c f069da43 707e6700
+case SumI32 Cols [37, 70] units 1 Off then None
+  out 37x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 7e8abb08
+case SumI32 Cols [37, 70] units 3 Fresh then None
+  out 37x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs 0f31aaf5 91155741
+case SumI32 Cols [256, 512] units 8 Fresh then None
+  out 256x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 08dc11bc d0ebf342 be47062a f6ddbdd0 a75056e4 fbf22639 0cf20d49 c71a5171
+case SumI32 Cols [256, 512] units 120 Captured then None
+  out 256x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 08dc11bc d0ebf342 be47062a f6ddbdd0 a75056e4 fbf22639 0cf20d49 c71a5171
+case SumI32 Rows [37, 70] units 1 Off then None
+  out 1x70 I32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 635aa61d
+case SumI32 Rows [37, 70] units 3 Fresh then None
+  out 1x70 I32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs 48a3c73f e6798a13 2b63e8d9
+case SumI32 Rows [256, 512] units 8 Fresh then None
+  out 1x512 I32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 13439ab2 5db23833 2520b35a fd6eb088 0999e087 9807d366 dc3a612b 53d616a7
+case SumI32 Rows [256, 512] units 120 Captured then None
+  out 1x512 I32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs 96f6add1 8776d646 2dc018d2 f8320731 dfb6a2b5 29b105bc 791e2794 56b020fe 2b041e36 2e619c32 52d825fd f3d06d0e 1c779287 7024074f 3ba84439 4c50c56f
+case ProdI32 Cols [37, 70] units 1 Off then None
+  out 37x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 245f74fc
+case ProdI32 Cols [37, 70] units 3 Fresh then None
+  out 37x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs 556b15db a659069d
+case ProdI32 Cols [256, 512] units 8 Fresh then None
+  out 256x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 876157c2 02c00b0a 01aa006b a61cd729 daf0fdb0 1e843eae 191b0704 3a623fc2
+case ProdI32 Cols [256, 512] units 120 Captured then None
+  out 256x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 876157c2 02c00b0a 01aa006b a61cd729 daf0fdb0 1e843eae 191b0704 3a623fc2
+case ProdI32 Rows [37, 70] units 1 Off then None
+  out 1x70 I32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs a5ca13ca
+case ProdI32 Rows [37, 70] units 3 Fresh then None
+  out 1x70 I32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs 7a020b1a eb66dd1f 881dd600
+case ProdI32 Rows [256, 512] units 8 Fresh then None
+  out 1x512 I32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs f0567c02 d628782d 72f14add 0ac16208 6978462e 7bafe0e5 788ac7aa 1817b250
+case ProdI32 Rows [256, 512] units 120 Captured then None
+  out 1x512 I32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs 58b72186 7ad47b05 9fd5e6f2 a44a01f1 07c1bae3 8b369d79 204de773 4a4fc24f 35365d94 b311deb3 651f5928 7e03aaba a0b1d2ce e8eed2b3 bbe2882b bb1dc7d9
+case MinI32 Cols [37, 70] units 1 Off then None
+  out 37x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs a16dc747
+case MinI32 Cols [37, 70] units 3 Fresh then None
+  out 37x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs 7f2e64ae f1e02a6a
+case MinI32 Cols [256, 512] units 8 Fresh then None
+  out 256x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 019cbe04 392a2ec5 dcd1a891 5a16eb70 62c6c14d c691b2a3 e4ab8b31 8d0db16b
+case MinI32 Cols [256, 512] units 120 Captured then None
+  out 256x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 019cbe04 392a2ec5 dcd1a891 5a16eb70 62c6c14d c691b2a3 e4ab8b31 8d0db16b
+case MinI32 Rows [37, 70] units 1 Off then None
+  out 1x70 I32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 3619c8a3
+case MinI32 Rows [37, 70] units 3 Fresh then None
+  out 1x70 I32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs f51e53f8 c6679ebe 74d1a9cd
+case MinI32 Rows [256, 512] units 8 Fresh then None
+  out 1x512 I32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 5159f7c4 9e882570 5cd1a9e0 a6bdf3fd 57040338 f4a871ff f2289c2c df45db6c
+case MinI32 Rows [256, 512] units 120 Captured then None
+  out 1x512 I32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs ddecd9f9 676a5739 aa62cf22 f997bbdd 9097a7cd 5f42d361 f989a552 e996cd72 88c3934e f669ddf1 f541c8ec c8385026 915e7946 4483f5aa df81a0ed 8c13338f
+case MaxI32 Cols [37, 70] units 1 Off then None
+  out 37x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 702d3af0
+case MaxI32 Cols [37, 70] units 3 Fresh then None
+  out 37x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 2
+  jobs 4867a515 d922c442
+case MaxI32 Cols [256, 512] units 8 Fresh then None
+  out 256x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs dea59a66 dbc77660 ac565e4a 2123129f f16d258d 3248164f ce54213b f9eaff2d
+case MaxI32 Cols [256, 512] units 120 Captured then None
+  out 256x1 I32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs dea59a66 dbc77660 ac565e4a 2123129f f16d258d 3248164f ce54213b f9eaff2d
+case MaxI32 Rows [37, 70] units 1 Off then None
+  out 1x70 I32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 1
+  jobs 589a7abe
+case MaxI32 Rows [37, 70] units 3 Fresh then None
+  out 1x70 I32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [4160, 4160, 4160, 4160, 4160, 4160, 4160, 4160]] jobs 3
+  jobs 261764ad 2e1d23ab b5adcab0
+case MaxI32 Rows [256, 512] units 8 Fresh then None
+  out 1x512 I32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs e64e08d8 84eb98d7 b0056fce 813fa2ed c42389ac 240159ee 4b2d7230 6152e6dd
+case MaxI32 Rows [256, 512] units 120 Captured then None
+  out 1x512 I32 at [[8, 1985229328, 0, 16, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 16
+  jobs 356f9ad5 a708b354 82159a37 99c51efc d87702f1 3fb8c07e 8b0388f1 55c8a2e3 89f291e4 2fe0634f edf252ac 4c6f4294 45447323 a789549a d79f1866 24ff9827
+case Max Cols [256, 512] units 1 Off then Some((269, 4286578687))
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 1
+  jobs 4d8b2cfb
+case Max Cols [256, 512] units 8 Captured then Some((269, 4286578687))
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs d685c28d c6b8f288 38917c2b 543b63d2 f4875d2d df06b9e3 8be4e6e7 39ec88d9
+case Sum Cols [256, 512] units 1 Off then Some((269, 228737632))
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 1
+  jobs d80bab70
+case Sum Cols [256, 512] units 8 Captured then Some((269, 228737632))
+  out 256x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 8
+  jobs 8ffcb0c7 b372eb2a 4d458b57 06f9eb21 25d5b0fb 357b427b 122fa951 337c142a
+case Sum Cols [64, 65536] units 1 Fresh then None
+  out 64x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920]] jobs 2
+  jobs 3dccbf3c 98456856
+case Sum Cols [64, 65536] units 8 Fresh then None
+  out 64x1 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920]] jobs 2
+  jobs 3dccbf3c 98456856
+case Sum Cols [64, 65536] units 1 Fresh then Some((269, 0))
+  refused: a reduction too long for one tile's programs takes no finishing kind
+case Sum Rows [65536, 64] units 1 Fresh then None
+  out 1x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920]] jobs 2
+  jobs 49acf41c cb868fb6
+case Sum Rows [65536, 64] units 8 Fresh then None
+  out 1x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920, 2129920]] jobs 2
+  jobs 49acf41c cb868fb6
+case Sum Rows [65536, 64] units 1 Fresh then Some((269, 0))
+  refused: a reduction too long for one tile's programs takes no finishing kind
