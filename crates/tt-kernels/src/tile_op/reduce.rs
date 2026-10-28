@@ -121,7 +121,7 @@ impl Microkernel for Reduce {
             self.op, self.axis, len, self.per, self.valid, half, self.then,
         )?;
         Ok(RunCode {
-            operands: vec![Some(layout.in_at)],
+            operands: [Some(layout.in_at), None, None],
             prior: None,
             out: layout.out_at,
             init: layout.init.clone(),
@@ -137,7 +137,7 @@ impl Microkernel for Reduce {
         let valid = if last { self.valid } else { 32 };
         let (roles, loops) = continuation_roles(c, self.op, self.axis, prior, count, valid, last);
         Ok(RunCode {
-            operands: vec![Some(c.layout.in_at)],
+            operands: [Some(c.layout.in_at), None, None],
             prior: Some(c.prior_at),
             out: c.layout.out_at,
             init: c.layout.init.clone(),

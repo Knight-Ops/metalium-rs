@@ -43,11 +43,11 @@ pub fn jobs(op: &TileOp, deal: &Deal, units: usize) -> Result<Vec<Job>> {
         let len = run.len();
         let half = deal.pipelined.then(|| tensor::half_of(j, units));
         let code = op.body.run(len, half, &deal.held)?;
-        let mut gather = Vec::new();
+        let mut gather = Vec::with_capacity(3 * op.operands.len());
         for (o, a) in op.operands.iter().enumerate() {
             if let Some(at) = code.operands.get(o).copied().flatten() {
                 let span = run.start * weight..run.end * weight;
-                gather.extend(read(
+                read(
                     op,
                     a,
                     &parallel,
@@ -56,12 +56,13 @@ pub fn jobs(op: &TileOp, deal: &Deal, units: usize) -> Result<Vec<Job>> {
                     span,
                     at,
                     deal.held[o],
-                )?);
+                    &mut gather,
+                )?;
             }
         }
-        let mut scatter = Vec::new();
+        let mut scatter = Vec::with_capacity(3 * op.results.len());
         for r in &op.results {
-            scatter.extend(write(r, run, code.out)?);
+            write(r, run, code.out, &mut scatter);
         }
         jobs.push(vec![
             Step::List {
@@ -131,7 +132,7 @@ pub fn chunked_jobs(op: &TileOp, chunk: usize) -> Result<Vec<Job>> {
             let span = item * weight + first..item * weight + first + count;
             for (o, a) in op.operands.iter().enumerate() {
                 if let Some(at) = code.operands.get(o).copied().flatten() {
-                    gather.extend(read(
+                    read(
                         op,
                         a,
                         &parallel,
@@ -140,7 +141,8 @@ pub fn chunked_jobs(op: &TileOp, chunk: usize) -> Result<Vec<Job>> {
                         span.clone(),
                         at,
                         false,
-                    )?);
+                        &mut gather,
+                    )?;
                 }
             }
             steps.push(Step::List {
@@ -154,9 +156,11 @@ pub fn chunked_jobs(op: &TileOp, chunk: usize) -> Result<Vec<Job>> {
                 loops: code.loops,
                 half: None,
             });
+            let mut scatter = Vec::with_capacity(3);
+            write(result, &items, code.out, &mut scatter);
             steps.push(Step::List {
                 what: scatter_what,
-                entries: write(result, &items, code.out)?,
+                entries: scatter,
             });
         }
         jobs.push(steps);
@@ -199,10 +203,10 @@ fn read(
     span: std::ops::Range<usize>,
     at: u64,
     held: bool,
-) -> Result<Vec<[u32; 8]>> {
+    out: &mut Vec<[u32; 8]>,
+) -> Result<()> {
     let r = tiles_of(a)?.encode();
     let tiles = |i: usize| op.domain[i].tiles();
-    let with_ref = |h: [u32; 8]| [h, r[0], r[1]];
     let len = run.len();
     let unsupported = || {
         TensorError::Shape(format!(
@@ -211,7 +215,8 @@ fn read(
             a.map
         ))
     };
-    let headers: Vec<[u32; 8]> = match (parallel, reductions, a.map) {
+    let mut push = |h: [u32; 8]| out.extend([h, r[0], r[1]]);
+    match (parallel, reductions, a.map) {
         // Element-wise: the domain's two parallel iterators.
         ([outer, inner], [], TileMap { rows, cols }) => {
             let ct = tiles(*inner);
@@ -223,7 +228,7 @@ fn read(
                         wrap: None,
                     },
                 ) if iter == *outer && c == *inner => {
-                    vec![run_record(run.start, len, at, 0, ct, 0)]
+                    push(run_record(run.start, len, at, 0, ct, 0))
                 }
                 (
                     Dim::Fixed,
@@ -231,19 +236,17 @@ fn read(
                         iter: c,
                         wrap: None,
                     },
-                ) if c == *inner => {
-                    vec![run_record(run.start, len, at, 1, ct, 0)]
-                }
+                ) if c == *inner => push(run_record(run.start, len, at, 1, ct, 0)),
                 (Dim::Iter { iter, wrap: None }, Dim::Fixed) if iter == *outer => {
                     let count = if held { 1 } else { len };
-                    vec![run_record(
+                    push(run_record(
                         run.start,
                         count,
                         at,
                         record::READ_RUN_COL_AS_IT_LIES,
                         ct,
                         0,
-                    )]
+                    ))
                 }
                 (
                     Dim::Iter {
@@ -255,7 +258,9 @@ fn read(
                         wrap: None,
                     },
                 ) if iter == *outer && c == *inner => {
-                    tensor::block_reads(run.start, len, w * ct, at, ct)
+                    for h in tensor::block_reads(run.start, len, w * ct, at, ct) {
+                        push(h);
+                    }
                 }
                 _ => return Err(unsupported()),
             }
@@ -269,7 +274,7 @@ fn read(
                     wrap: None,
                 },
             ) if iter == *p && c == *k => {
-                vec![run_record(span.start, span.len(), at, 0, tiles(*k), 0)]
+                push(run_record(span.start, span.len(), at, 0, tiles(*k), 0))
             }
             (
                 Dim::Iter { iter, wrap: None },
@@ -277,29 +282,27 @@ fn read(
                     iter: c,
                     wrap: None,
                 },
-            ) if iter == *k && c == *p => {
-                vec![run_record(
-                    span.start,
-                    span.len(),
-                    at,
-                    4,
-                    tiles(*p),
-                    tiles(*k) as u32,
-                )]
-            }
+            ) if iter == *k && c == *p => push(run_record(
+                span.start,
+                span.len(),
+                at,
+                4,
+                tiles(*p),
+                tiles(*k) as u32,
+            )),
             _ => return Err(unsupported()),
         },
         _ => return Err(unsupported()),
-    };
-    Ok(headers.into_iter().flat_map(with_ref).collect())
+    }
+    Ok(())
 }
 
 /// A result's tiles for one run, from the slots at `at`.
-fn write(r: &Access, run: &std::ops::Range<usize>, at: u64) -> Result<Vec<[u32; 8]>> {
-    Ok(match &r.layout {
+fn write(r: &Access, run: &std::ops::Range<usize>, at: u64, out: &mut Vec<[u32; 8]>) {
+    match &r.layout {
         Layout::Tiles(t) => {
             let t = t.encode();
-            vec![
+            out.extend([
                 [
                     record::WRITE_RUN,
                     run.start as u32,
@@ -312,8 +315,10 @@ fn write(r: &Access, run: &std::ops::Range<usize>, at: u64) -> Result<Vec<[u32; 
                 ],
                 t[0],
                 t[1],
-            ]
+            ]);
         }
-        Layout::PackedRow(twin) => tensor::packed_twin_writes(twin, run.start, run.len(), at),
-    })
+        Layout::PackedRow(twin) => {
+            out.extend(tensor::packed_twin_writes(twin, run.start, run.len(), at))
+        }
+    }
 }

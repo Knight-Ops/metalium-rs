@@ -162,10 +162,14 @@ pub enum NumericContract {
     Program,
 }
 
+/// The most operands a body reads: `A`, `B` and a ternary op's `C`.
+pub const MAX_OPERANDS: usize = 3;
+
 /// A run's L1 and programs ([`Microkernel::run`]).
 pub struct RunCode {
-    /// Each operand's first slot, `None` for one the body reads no tiles of.
-    pub operands: Vec<Option<u64>>,
+    /// Each operand's first slot, `None` for one the body reads no tiles of (or past the
+    /// operands it has).
+    pub operands: [Option<u64>; MAX_OPERANDS],
     /// Where a chunk reloads its item's partial ([`Combine::GddrPartials`]).
     pub prior: Option<u64>,
     /// The results' first slot.
@@ -234,6 +238,12 @@ impl TileOp {
     /// iterator is read by some operand.
     pub fn check(&self) -> Result<()> {
         let n = self.domain.len();
+        if self.operands.len() > MAX_OPERANDS {
+            return Err(TensorError::Shape(format!(
+                "{} operands: a body reads at most {MAX_OPERANDS}",
+                self.operands.len()
+            )));
+        }
         for a in self.operands.iter().chain(&self.results) {
             for d in [a.map.rows, a.map.cols] {
                 if let Dim::Iter { iter, wrap } = d {

@@ -178,7 +178,7 @@ impl Microkernel for Sfpu {
             b_once,
         )?;
         Ok(RunCode {
-            operands: vec![Some(layout.a_at), layout.b_at, layout.c_at],
+            operands: [Some(layout.a_at), layout.b_at, layout.c_at],
             prior: None,
             out: layout.out_at,
             init: layout.init.clone(),
