@@ -1158,6 +1158,11 @@ one-block slot ring, beside the prefetching units.
   tile-sized plain reads ~1% in a `profile` image and the decode step nothing. Every product reads near the card's rate
   at its start and ends in a tail (`gate|up` 634 -> 89 GB/s by eighths, `down` 617 -> 68, `qkv`/`o` almost nothing in
   their last three eighths); `down`'s middle half reads ~300 (64 units); the small ops' 3.3 ms read 319.
+- [x] **Why card-wide reads stop at 469, and whether decode's caps should change** (2026-10-28,
+  [log](../learnings/performance-log.md#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0)):
+  too many requests a channel, crossing the chip and an unfair finish; but every lower cap slows the `fast-reads` decode
+  step (B's own cap 2: 11.05 -> 11.51 ms), so neither a card-wide request budget nor a nearest-channel deal is the lever
+  for decode's 2 KiB reads. The defaults stay.
 - [ ] **Next: split the tail by unit** (which units read at each eighth: the product's own, or the prefetch), then choose a
   lever: more units reading `down`, the next prefetch starting where a product's units drop out, or faster reads under
   the small ops. An order-changing one (split-K for `down`'s 64 columns) stays the user's decision.

@@ -425,6 +425,9 @@ struct Fleet {
     w4: Window,
     dram: Dram,
     movers: Vec<DataMover<Noc0>>,
+    /// Each tile's NC mover, beside `movers` (B's), for the fleets that write
+    /// ([`fleet_on`] with `dm::Mover::NC`); empty otherwise.
+    writers: Vec<DataMover<Noc0>>,
     c: Conditions,
     /// Each tile's counter less tile 0's, in cycles, and the uncertainty of it.
     offset: Vec<i64>,
@@ -438,13 +441,12 @@ fn fleet(d: &mut Dev<'static>) -> Fleet {
     fleet_on(d, dm::Mover::B)
 }
 
-/// Every tile's `mover`, traced: B's, or NC's for the benchmarks of NoC #1
-/// writes (only NC's image has them).
+/// Every tile's B mover, traced; with `mover` NC, each tile's NC mover too
+/// (`Fleet::writers`, untraced), for the benchmarks of writes: NC writes, on
+/// either NoC, but only inside B's transfer packets ([`agg_write_lists`]),
+/// and B's barrier starts them.
 fn fleet_on(d: &mut Dev<'static>, mover: dm::Mover) -> Fleet {
-    let image = match mover.core {
-        tt_isa::tensix::Core::NC => tt_firmware_images::DM_NC.1,
-        _ => tt_firmware_images::DM_B.1,
-    };
+    let writes = mover == dm::Mover::NC;
     let w = d.alloc_window(WindowKind::TwoMib).unwrap();
     let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
     let dram = d.dram_grid(&w).unwrap();
@@ -453,12 +455,28 @@ fn fleet_on(d: &mut Dev<'static>, mover: dm::Mover) -> Fleet {
     let c = Conditions::measure(d, device_index(), tensix_tile());
     c.print();
     let mut movers = Vec::new();
+    let mut writers = Vec::new();
     for t in coords {
         let t = tile(d, t.x(), t.y());
-        match DataMover::start_on(d, &w, t, &dram, mover, image) {
-            Ok(m) => {
-                d.write32(&w, t, mover.at(dm::TRACE), 1).unwrap();
+        let started = DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).and_then(|m| {
+            if !writes {
+                return Ok((m, None));
+            }
+            let nc =
+                DataMover::start_on(d, &w, t, &dram, dm::Mover::NC, tt_firmware_images::DM_NC.1);
+            match nc {
+                Ok(nc) => Ok((m, Some(nc))),
+                Err(e) => {
+                    m.stop(d, &w).unwrap();
+                    Err(e)
+                }
+            }
+        });
+        match started {
+            Ok((m, nc)) => {
+                d.write32(&w, t, dm::Mover::B.at(dm::TRACE), 1).unwrap();
                 movers.push(m);
+                writers.extend(nc);
             }
             Err(e) => println!(
                 "MEASURE skipping ({},{}): the mover did not start: {e}",
@@ -489,6 +507,7 @@ fn fleet_on(d: &mut Dev<'static>, mover: dm::Mover) -> Fleet {
         w4,
         dram,
         movers,
+        writers,
         c,
         offset,
         skew_bound,
@@ -743,6 +762,13 @@ fn move_to_front(f: &mut Fleet, first: &[usize]) {
         .map(Some)
         .collect();
     f.movers = order.iter().map(|&i| movers[i].take().unwrap()).collect();
+    if !f.writers.is_empty() {
+        let mut writers: Vec<Option<DataMover<Noc0>>> = std::mem::take(&mut f.writers)
+            .into_iter()
+            .map(Some)
+            .collect();
+        f.writers = order.iter().map(|&i| writers[i].take().unwrap()).collect();
+    }
     f.offset = order.iter().map(|&i| f.offset[i]).collect();
     f.skew_bound = order.iter().map(|&i| f.skew_bound[i]).collect();
     f.raw = order.iter().map(|&i| f.raw[i]).collect();
@@ -883,6 +909,81 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
     list
 }
 
+impl Mix {
+    /// Whether the mix writes: NC's, inside B's packets ([`agg_write_lists`]).
+    fn writes(self) -> bool {
+        matches!(self, Mix::Write | Mix::OneChannelWrite)
+    }
+}
+
+/// `writes` (WRITE entries) as one transfer packet (`dm::op::PAIR`) for B:
+/// B's reader section only hands NC one credit, and NC's writer section waits
+/// for it, makes the writes and returns it. B finishes the packet once NC's
+/// section is done; a `trailer` (a barrier) then runs on B.
+fn write_packet(writes: &[Entry], trailer: Option<Entry>) -> Vec<Entry> {
+    use tt_isa::dataflow::{Action, Stream};
+    let credit = |action: Action| {
+        [
+            op::CB,
+            Stream::Transfer.word(),
+            action.word(),
+            1,
+            0,
+            0,
+            0,
+            0,
+        ]
+    };
+    let reader = [credit(Action::Reserve), credit(Action::Push)];
+    let mut packet = vec![[
+        op::PAIR,
+        reader.len() as u32,
+        writes.len() as u32 + 2,
+        1,
+        trailer.is_some() as u32,
+        0,
+        0,
+        0,
+    ]];
+    packet.extend(reader);
+    packet.push(credit(Action::Wait));
+    packet.extend_from_slice(writes);
+    packet.push(credit(Action::Pop));
+    packet.extend(trailer);
+    packet
+}
+
+/// [`agg_list`]'s write list (a barrier, then the writes) as B's two lists:
+/// the barrier, then the writes in a packet ([`write_packet`]) -- a barrier is
+/// B's alone, and NC writes only inside B's packets. B's events still time
+/// the run, release to its last `LIST_END`: the reader section's own list
+/// ends as soon as it hands NC the credit, so the packet's trailer, a
+/// wait-only barrier on the same counter (already at its target: one NoC
+/// read), is a last list on B that ends after NC's last write has landed.
+/// NC stays untraced: its events would share the tile's timestamper with B's
+/// (`performance-scoreboard.md`, concurrent B/NC exports).
+fn agg_write_lists(list: &[Entry]) -> (Vec<Entry>, Vec<Entry>) {
+    assert_eq!(list[0][0], op::BARRIER);
+    let mut wait = list[0];
+    wait[4] = 1;
+    let packet = write_packet(&list[1..], Some(wait));
+    // Both sit in B's ring at once: the barrier's one entry and the packet.
+    assert!(
+        packet.len() < dm::LIST_MAX as usize,
+        "a packet of {} entries",
+        packet.len()
+    );
+    (list[..1].to_vec(), packet)
+}
+
+/// Queue a write list's two lists ([`agg_write_lists`]) on a tile's B mover
+/// `m`; [`DataMover::drain`] waits for them.
+fn submit_writes(d: &mut Dev<'_>, w: &Window, m: &mut DataMover<Noc0>, list: &[Entry]) {
+    let (barrier, packet) = agg_write_lists(list);
+    m.enqueue(d, w, &barrier).unwrap();
+    m.enqueue(d, w, &packet).unwrap();
+}
+
 /// One run of `n` tiles' lists at once: per tile, its rate from barrier exit
 /// to list end; together, all bytes over the earliest exit to the latest end
 /// on tile 0's clock (each tile's events less its offset); and the host's
@@ -892,8 +993,10 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
     let coord = f.movers[0].tile();
     d.write32(&f.w, coord, dm::BARRIER_COUNTER, 0).unwrap();
     let lists: Vec<_> = (0..n).map(|t| agg_list(f, t, n, mix, shape)).collect();
+    // A write mix's requests wait under NC's cap, not B's.
     let throttle = |d: &mut Dev<'_>, f: &Fleet| {
-        f.movers[..n]
+        let issuers = if mix.writes() { &f.writers } else { &f.movers };
+        issuers[..n]
             .iter()
             .map(|m| m.throttle(d, &f.w).unwrap().stalls as u64)
             .sum::<u64>()
@@ -914,19 +1017,42 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
     }
     // The barrier holds every list until the last is submitted.
     for (m, list) in f.movers[..n].iter_mut().zip(&lists) {
-        m.submit_list(d, &f.w, list).unwrap();
+        if mix.writes() {
+            submit_writes(d, &f.w, m, list);
+        } else {
+            m.submit_list(d, &f.w, list).unwrap();
+        }
     }
     let h0 = Instant::now();
-    for m in &f.movers[..n] {
-        m.wait(d, &f.w).unwrap();
+    for m in &mut f.movers[..n] {
+        if mix.writes() {
+            m.drain(d, &f.w).unwrap();
+        } else {
+            m.wait(d, &f.w).unwrap();
+        }
     }
     let host_us = h0.elapsed().as_secs_f64() * 1e6;
     let bytes = shape.bytes();
     let mut rates = Vec::new();
     let (mut first, mut last) = (i64::MAX, i64::MIN);
     let (mut last_release, mut first_end) = (i64::MIN, i64::MAX);
+    // `AGG_TRACE=full`: every tile's read entries' ends on tile 0's clock, with their bytes.
+    let mut issued: Vec<(i64, u64)> = Vec::new();
     for (i, m) in f.movers[..n].iter().enumerate() {
         let trace = d.read_trace(&f.w, m.tile(), TRACE_BUFFER).unwrap();
+        if trace_mode == dm::trace_mode::FULL {
+            issued.extend(
+                trace
+                    .iter()
+                    .filter(|e| {
+                        let (src, event) = ev::split(e.token);
+                        src == ev::MOVER
+                            && event == ev::ENTRY_END
+                            && matches!(ev::detail(e.token), op::READ | op::READ_ENCODED)
+                    })
+                    .map(|e| (e.cycles as i64 - f.offset[i], shape.len as u64)),
+            );
+        }
         // The barrier is the list's first entry: its end is the release.
         let released = trace
             .iter()
@@ -957,6 +1083,26 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
     }
     let together = f.c.rate(bytes * n as f64, (last - first) as f64);
     let stalls = throttle(d, f) - stalls_before;
+    // What the card read while every tile was reading, and in tenths of the run.
+    let in_window = |a: i64, b: i64| -> f64 {
+        let moved: u64 = issued
+            .iter()
+            .filter(|&&(t, _)| t > a && t <= b)
+            .map(|&(_, l)| l)
+            .sum();
+        f.c.rate(moved as f64, (b - a).max(1) as f64)
+    };
+    let (all_running, tenths) = if issued.is_empty() {
+        (None, Vec::new())
+    } else {
+        let tenth = (last - first) / 10;
+        (
+            (first_end > last_release).then(|| in_window(last_release, first_end)),
+            (0..10)
+                .map(|k| in_window(first + k * tenth, first + (k + 1) * tenth))
+                .collect(),
+        )
+    };
     AggRun {
         rates,
         together,
@@ -964,6 +1110,8 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
         stalls,
         release_spread: (last_release - first) as f64,
         end_spread: (last - first_end) as f64,
+        all_running,
+        tenths,
     }
 }
 
@@ -980,6 +1128,11 @@ struct AggRun {
     /// every tile moving at once.
     release_spread: f64,
     end_spread: f64,
+    /// `AGG_TRACE=full` only: the card's rate (bytes per second, by the read entries' ends) from
+    /// the last barrier release to the first list end, while every tile reads.
+    all_running: Option<f64>,
+    /// `AGG_TRACE=full` only: the card's rate in each tenth of the run.
+    tenths: Vec<f64>,
 }
 
 /// [`agg_run`] after a warm-up, [`REPS`] times, reported as `label`: the
@@ -1033,6 +1186,29 @@ fn measure(
         "device",
         Stats::of(runs.iter().map(|r| f.c.cycles_to_us(r.end_spread))),
     );
+    let all: Vec<f64> = runs.iter().filter_map(|r| r.all_running).collect();
+    if !all.is_empty() {
+        let s = Stats::of(all.iter().map(|r| r / 1e9));
+        println!(
+            "MEASURE {label}: while every tile reads {:.1} GB/s (p10 {:.1}, p90 {:.1}, n {})",
+            s.median,
+            s.p10,
+            s.p90,
+            all.len()
+        );
+    }
+    if runs.iter().all(|r| r.tenths.len() == 10) {
+        let tenths: Vec<String> = (0..10)
+            .map(|k| {
+                let s = Stats::of(runs.iter().map(|r| r.tenths[k] / 1e9));
+                format!("{:.0}", s.median)
+            })
+            .collect();
+        println!(
+            "MEASURE {label}: GB/s by tenth of the run {}",
+            tenths.join(" ")
+        );
+    }
     report(
         &format!("{label}: requests that waited under the in-flight cap, per run"),
         "requests",
@@ -1168,10 +1344,12 @@ fn gddr_aggregate() {
             "MEASURE gddr_aggregate: 'together' spans carry up to {bound} cycles ({:.2} us) of counter-offset uncertainty",
             f.c.cycles_to_us(bound as f64)
         );
-        let Fleet { w, movers, .. } = f;
-        for m in movers {
+        let Fleet {
+            w, movers, writers, ..
+        } = f;
+        for m in writers.into_iter().chain(movers) {
             let t = m.tile();
-            d.write32(&w, t, mover.at(dm::TRACE), 0).unwrap();
+            d.write32(&w, t, m.mover().at(dm::TRACE), 0).unwrap();
             m.stop(d, &w).unwrap();
         }
     });
@@ -1648,9 +1826,9 @@ fn gddr_readers_by_channel() {
 /// writes on each NIU (`tt_isa::dm::WRITE_NOC`; reads are always NoC #0's).
 /// Each GDDR endpoint is one NoC's (`DramChannel::owns`), so the mixes with
 /// writes on NoC #1 put both NoCs on the card at once without sharing an
-/// endpoint -- the SYS-1419 hang needs one endpoint fed by both. Run on NC's
-/// mover, the only one with NoC #1 writes. `AGG_TILES` picks the tile
-/// counts, as there.
+/// endpoint -- the SYS-1419 hang needs one endpoint fed by both. The writes
+/// are NC's, the only mover with NoC #1 writes, in B's packets
+/// ([`agg_write_lists`]). `AGG_TILES` picks the tile counts, as there.
 #[test]
 #[ignore = "benchmark"]
 fn gddr_aggregate_nocs() {
@@ -1670,13 +1848,14 @@ fn gddr_aggregate_nocs() {
         let src = pattern(L1_SPAN as usize, 5);
         // `AGG_CAP`, as in `gddr_aggregate_affinity`.
         let cap = env_cap();
-        for m in &f.movers {
+        // The writes are NC's (in B's packets): its cap and its NoC.
+        for m in &f.writers {
             d.write(&f.w, m.tile(), L1 as u64, &src).unwrap();
             m.set_in_flight_cap(d, &f.w, cap).unwrap();
         }
         println!("MEASURE nocs: in-flight cap {cap}");
         for noc in [WriteNoc::Noc0, WriteNoc::Noc1, WriteNoc::Alternate] {
-            for m in &f.movers {
+            for m in &f.writers {
                 m.set_write_noc(d, &f.w, noc).unwrap();
             }
             let mixes: Vec<Mix> = match std::env::var("AGG_MIXES") {
@@ -1702,10 +1881,12 @@ fn gddr_aggregate_nocs() {
                 }
             }
             // A write through `noc` lands: tile 0's first write entry, run
-            // alone from a known L1 (the mixes' reads overwrote it).
+            // alone (a packet of its own, on B) from a known L1.
             let list = agg_list(&f, 0, have, Mix::Write, shape);
             d.write(&f.w, f.movers[0].tile(), L1 as u64, &src).unwrap();
-            f.movers[0].run_list(d, &f.w, &list[1..2]).unwrap();
+            f.movers[0]
+                .run_list(d, &f.w, &write_packet(&list[1..2], None))
+                .unwrap();
             let ch = f.dram.channel(list[1][1] as u8).unwrap();
             let mut back = vec![0u8; shape.len as usize];
             d.dram_read(
@@ -1719,12 +1900,17 @@ fn gddr_aggregate_nocs() {
                 "{noc:?}: tile 0's write did not land"
             );
         }
-        let Fleet { w, movers, .. } = f;
-        for m in movers {
-            let t = m.tile();
+        let Fleet {
+            w, movers, writers, ..
+        } = f;
+        for m in writers {
             m.set_write_noc(d, &w, Niu::Noc0).unwrap();
             m.set_in_flight_cap(d, &w, dm::TILE_IN_FLIGHT_CAP).unwrap();
-            d.write32(&w, t, dm::Mover::NC.at(dm::TRACE), 0).unwrap();
+            m.stop(d, &w).unwrap();
+        }
+        for m in movers {
+            d.write32(&w, m.tile(), dm::Mover::B.at(dm::TRACE), 0)
+                .unwrap();
             m.stop(d, &w).unwrap();
         }
     });

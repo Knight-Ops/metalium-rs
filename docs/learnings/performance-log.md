@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The GDDR write benches run again](#the-gddr-write-benches-run-again-2026-10-28-card-0) | 2026-10-28 | broken since the B/NC split (`3c7756b`: a barrier is B's, NC refused the lists); NC's writes now run in B's transfer packets behind B's barrier: NoC #1 writes 403-408 / 385-388 GB/s at 16 / 120 tiles, as before; 235 at 4 (was 299: the handoff on a short run) |
+| [Why card-wide reads plateau at 469, and what it means for decode](#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0) | 2026-10-28 | `fast-reads`: the 120-tile read loses ~30 GB/s of steady state to too many requests in flight a channel (knee ~32), ~15 to crossing the chip (each tile on its half's channels: ~505 steady, 495 overall) and the rest to an unfair finish; decode's caps re-swept: lowering any of them slows the step (B's own cap 2: +0.45 ms), the defaults stay; `fast-reads` decode 11.05 / 12.39-12.42 ms against the safe image's 11.38 / 12.55 |
 | [The card's GDDR reads over a decode step](#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0) | 2026-10-27 | the profile mode now sums every unit's issued GDDR reads into the card's rate in eighths of each op's span (`READ_BYTES` marks), held against the card's 512 GB/s peak (not 469): the 1.7B `Step(64)` reads 3,568 MB at 328 GB/s (64%), at 90%+ for only 1.9 of 10.9 ms; every product starts near the peak and ends in a tail (`gate\|up` 634 -> 89 GB/s, `down` 617 -> 68), `down`'s middle half ~300, the small ops 319; the marks cost tile-sized plain reads ~1% in a `profile` image (~4% while a check sat in the list loop) and the decode step nothing |
 | [F27 probed: bank-local reads, and what does not bind a decode product](#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0) | 2026-10-27 | the profile mode counts each op's reads by channel and NoC #0 endpoint (`channels.tsv`): the 1.7B's products read every channel evenly (busiest 1.00 of an even share), one endpoint 1.33x; `gddr_readers_by_channel`: a tile reads 2,112-byte entries at ~6.5 GB/s (safe) or ~35 (`fast-reads`), 1-8 tiles a channel at that size reach 51-425 / 89-466 GB/s, today's decode deal 364-449 / 429-491, long entries 505-510 at 2+ readers a channel: **bank-local reads add nothing**; with reads 5x cheaper a step moves 10.82 -> 10.60 ms (`down` 120.8 -> 114.9 us): **a unit's read rate does not bind a product**; F27 stopped, A2 and A3 not built |
 | [The tt-mnist regression found, and RMSNorm's scale in its op](#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1) | 2026-10-27 | the scoreboard's MNIST and transformer rows were 2026-10-03/04 numbers, MNIST since on a 5.3x larger model; the transformer's 9.2 -> 92 ms/step bisected to `c4255c7` (9.2 -> 22.6) and `6d979e7` (-> 329: the embedding gradient's ~20 ops an index); that gradient as one op, **92.5 -> 10.9 ms/step**, the same losses; cross-entropy's gather and scatter-add as one and a few ops: MNIST 784-128-10 **2.0 -> 1.39 ms/step** (`3344db6` 1.4), the transformer **-> 8.21** (`3344db6` 9.2); tt-mnist in `cargo xtask bench`; RMSNorm's scale inside the norm's op, a 1.7B step **11.31 -> 11.18 ms**; a residual sum and its norm as one op, bit for bit but slower (11.18 -> 11.26), opt-in; a ragged RMS statistic of 18-31 rows at 2048 columns hung (its unrolled programs past a program slot), fixed |
@@ -375,6 +377,62 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Why card-wide reads plateau at 469, and what it means for decode (2026-10-28, card 0)
+
+The scoreboard's "GDDR6 reads, card, 120 tiles: 469 GB/s" against a 512 GB/s card our movers reach (511.2 one reader a
+channel). All runs `fast-reads`, card 0. `gddr_aggregate_affinity` with `AGG_TRACE=full` (new: every read entry stamped,
+which costs <2% at 64 KiB entries) now also reports the card's rate while every tile reads (last barrier release to first
+list end) and in tenths of the run, by the read entries' ends (issue, not landing: at cap 8 the first tenth's ~600 GB/s
+is each tile's first eight requests going out at once; at cap 1 issue follows landing).
+
+| 120 tiles, 64 KiB entries | overall | while every tile reads | tenths 2-9 | last tenth |
+|---|--:|--:|--:|--:|
+| every tile through all 8 channels (the 469 row), cap 8 (`1793146618`) | 466 | 510 (the start's burst) | 436-479 | 419 |
+| the same, cap 1 / 2 / 3 (`1793146392`, `1793146467`, `1793146542`) | 475 / 469 / 473 | 490 / 487 / 487 | 480-493 / 448-489 / 462-489 | 397 / 435 / 452 |
+| each tile on its own half's 4 channels (`Column`), cap 2 (`1793146693`) | **495** | 503 | **499-509** | 439 |
+| each tile on its nearest channel (`Nearest`), cap 2 | 381 | 483 | | 62-64 (uneven groups) |
+
+The in-flight knee (`gddr_readers_by_channel`, `1793144632`): with 16 KiB entries, 8 readers a channel give 500 / 506 /
+506 / 495 / 486 / 467 / 452 GB/s at caps 1 / 2 / 3 / 4 / 6 / 8 / 16 (8-128 requests a channel); 4 a channel 509 at 32 a
+channel and 487 at 64; 2 a channel 510 at any cap. Today's decode deal at 2,112-byte entries: 64 units 317 / **500** /
+477 / 483 / 487 / 489 / 481, 120 units **499** / 478 / 471 / 481 / 494 / 495 / 491.
+
+- **Three losses make the 469:** ~30 GB/s of steady state to too many requests in flight a channel (past ~32 the rate
+  falls, by count not bytes); ~15 to crossing the chip (a tile reading its own half's channels holds ~505, 99% of the
+  peak); and an unfair finish (equal shares end between ~310 and ~1,000 us, the last tenth at ~400-450).
+- **The card-wide read is not the decode step's limit.** Re-swept on the `fast-reads` 1.7B decode (`traced_generation_
+  stream_ceiling`, `TT_TILES=all`), the step at 32 / 256 tokens:
+
+| caps | ms | run |
+|---|--:|---|
+| defaults (B 8, BF16 stream 3, prefetch 2), twice | **11.06 / 12.39**, **11.05 / 12.42** | `1793147275`, `1793148842` |
+| B's own (`TT_IN_FLIGHT_CAP`) 2 / 3 / 4 | 11.51 / 12.94, 11.26 / 12.62, 11.18 / 12.56 | `1793147476`, `1793147673`, `1793147868` |
+| BF16 stream (`TT_STREAM_CAP_BF16`) 2 / 4 | 11.21 / 12.59, 11.14 / 12.52 | `1793148062`, `1793148258` |
+| prefetch (`TT_PREFETCH_CAP`) 1 / 3 | 11.21 / 12.46, 11.05 / 12.38 | `1793148452`, `1793148647` |
+
+  Every lower cap is slower, the more so the lower: a decode unit is bound by how soon its own reads come back (F27),
+  so fewer in flight starves it before it relieves a channel. The defaults stay. With the reads at 2 KiB, reading the
+  channels beside a unit buys nothing either (F27: 8 readers a channel at cap 3, 475 GB/s, against the deal's 477).
+- **`fast-reads` decode:** 11.05-11.06 / 12.39-12.42 ms against the safe image's 11.38 / 12.55 (`1793138473`, the day
+  before): 0.3 / 0.15 ms of a step.
+
+## The GDDR write benches run again (2026-10-28, card 0)
+
+`gddr_aggregate_nocs` and `gddr_aggregate` with `BENCH_MOVER=nc` had refused every list since the B/NC split (`3c7756b`):
+`agg_list` starts each with a `BARRIER`, which only B runs, so NC's lists failed with `DIRECTION` before submission. They
+now run NC's writes inside B's transfer packets (`op::PAIR`, as `copy_pipeline` does), behind B's barrier
+(`agg_write_lists`, `write_packet`); a wait-only barrier after the packet ends B's last list once NC's last write has
+landed, so the timing stays B's alone (NC untraced: concurrent B and NC stamps can be invalid). Card writes on NoC #1, 64
+KiB entries, cap 8, GB/s:
+
+| tiles | 4 | 16 | 64 | 120 |
+|---|--:|--:|--:|--:|
+| before the split (port option C, change log) | 299 | 421 | 382 | 378 |
+| now (`1793149115`, `1793149203`; `1793149510` safe + `fast-reads` merged) | 235 | 403-408 | 396-397 | 385-388 |
+
+From 16 tiles up the same within noise; at 4 tiles the packet's credit handoff and NC's start are a large share of a
+~67 us run. One channel: 63.3-63.9 GB/s (99.8%) at every NoC setting.
 
 ## The card's GDDR reads over a decode step (2026-10-27, card 0)
 

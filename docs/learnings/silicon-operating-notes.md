@@ -1302,6 +1302,11 @@ From decode-to-bandwidth.md Phase 10 (F27), `silicon_bench_memory::gddr_readers_
   tile-sized plain reads ~4% (8 a channel 428.6 -> 411.6 GB/s at cap 8, against HEAD's `profile` image the same session,
   `1793140610`, `1793138241`); counting each request's bytes in a `.local` word costs ~1%. Keep profiling work out of
   the loop and in cold functions ([log](performance-log.md#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0)).
+- **Past ~32 requests in flight a channel the card reads less** (`fast-reads`, 2026-10-28): 8 readers a channel at
+  16 KiB, 500-506 GB/s at 8-24 a channel, 467 at 64, 452 at 128; by count, not bytes. **Reading across the chip costs
+  ~15 GB/s more:** 120 tiles each on its own half's channels hold ~505 while every tile reads, on all eight ~485-490. With
+  equal shares the finish is unfair (tiles end between ~310 and ~1,000 us). What makes the scoreboard's 469
+  ([log](performance-log.md#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0)).
 - **`NIU_MST_RD_DATA_WORD_RECEIVED` counts every read landing at the tile,** GDDR and other tiles' L1 alike, in 64-byte
   flits: over a 1.7B decode step 3,847 MB against the 3,568 of GDDR reads. Not a GDDR meter; ttsim refuses it (row 106).
 
