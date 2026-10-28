@@ -190,6 +190,12 @@ pub enum ChannelError {
         bytes: u64,
         entry: usize,
     },
+    /// A graph whose rates admit no repeating schedule: channel `channel` (an index into the
+    /// graph's) cannot carry what its producer makes as often as its consumer takes it.
+    Unbalanced { channel: usize },
+    /// A graph that stops before one iteration completes: every process in `blocked` waits for
+    /// data or room no other process can give.
+    Deadlock { blocked: Vec<(usize, Endpoint)> },
 }
 
 impl std::fmt::Display for ChannelError {
@@ -215,6 +221,13 @@ impl std::fmt::Display for ChannelError {
             } => write!(
                 f,
                 "entry {entry} credits page {page} with {written} of its {bytes} bytes written"
+            ),
+            ChannelError::Unbalanced { channel } => {
+                write!(f, "channel {channel}'s rates admit no repeating schedule")
+            }
+            ChannelError::Deadlock { blocked } => write!(
+                f,
+                "the graph deadlocks: {blocked:?} each wait for data or room"
             ),
         }
     }
@@ -468,6 +481,160 @@ impl Ring {
         }
         Ok(())
     }
+}
+
+/// Channels as a synchronous dataflow graph, checked before anything is emitted
+/// (`docs/learnings/dataflow-compiler.md` §7). A process is a role on a unit (an [`End`]'s `unit`
+/// and `endpoint`); each consumer of a channel is an edge from its producer, carrying the
+/// producer's tokens a firing in and the consumer's out, with room for `depth` tokens: its reverse
+/// edge starts with `depth` credits.
+#[derive(Clone, Debug, Default)]
+pub struct Graph {
+    channels: Vec<Channel>,
+}
+
+/// How often each process fires in one iteration of a balanced graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Schedule {
+    pub processes: Vec<(usize, Endpoint)>,
+    pub firings: Vec<u64>,
+}
+
+impl Graph {
+    pub fn new(channels: Vec<Channel>) -> Self {
+        Graph { channels }
+    }
+
+    /// The graph's repetition vector, once its rates balance (Lee and Messerschmitt 1987) and one
+    /// iteration runs to the end with every channel's depth as its credits.
+    pub fn check(&self) -> Result<Schedule, ChannelError> {
+        let key = |e: &End| (e.unit, e.endpoint);
+        let mut processes: Vec<(usize, Endpoint)> = Vec::new();
+        let mut index = |p: (usize, Endpoint)| match processes.iter().position(|&q| q == p) {
+            Some(i) => i,
+            None => {
+                processes.push(p);
+                processes.len() - 1
+            }
+        };
+        // (channel, from, to, produced a firing, consumed a firing, depth)
+        let mut edges = Vec::new();
+        for (c, channel) in self.channels.iter().enumerate() {
+            if channel.depth == 0 || channel.producer.tokens == 0 {
+                return Err(ChannelError::Invalid(format!(
+                    "channel {c} holds nothing or carries nothing"
+                )));
+            }
+            let from = index(key(&channel.producer));
+            for consumer in &channel.consumers {
+                if consumer.tokens == 0 {
+                    return Err(ChannelError::Invalid(format!(
+                        "channel {c}'s consumer takes nothing"
+                    )));
+                }
+                let to = index(key(consumer));
+                edges.push((
+                    c,
+                    from,
+                    to,
+                    channel.producer.tokens as u64,
+                    consumer.tokens as u64,
+                    channel.depth as u64,
+                ));
+            }
+        }
+        let firings = repetitions(processes.len(), &edges)?;
+        // One iteration, self-timed: any process with its inputs' tokens and its outputs' room
+        // fires, until each has fired its count or none can.
+        let mut tokens = vec![0u64; edges.len()];
+        let mut fired = vec![0u64; processes.len()];
+        loop {
+            let mut progress = false;
+            for p in 0..processes.len() {
+                while fired[p] < firings[p]
+                    && edges
+                        .iter()
+                        .zip(&tokens)
+                        .all(|(&(_, from, to, made, taken, depth), &t)| {
+                            (to != p || t >= taken) && (from != p || depth - t >= made)
+                        })
+                {
+                    for (e, &(_, from, to, made, taken, _)) in edges.iter().enumerate() {
+                        if to == p {
+                            tokens[e] -= taken;
+                        }
+                        if from == p {
+                            tokens[e] += made;
+                        }
+                    }
+                    fired[p] += 1;
+                    progress = true;
+                }
+            }
+            if fired == firings {
+                return Ok(Schedule { processes, firings });
+            }
+            if !progress {
+                let blocked = (0..processes.len())
+                    .filter(|&p| fired[p] < firings[p])
+                    .map(|p| processes[p])
+                    .collect();
+                return Err(ChannelError::Deadlock { blocked });
+            }
+        }
+    }
+}
+
+/// The least positive firings `q` with `q[from] x made == q[to] x taken` on every edge.
+fn repetitions(
+    processes: usize,
+    edges: &[(usize, usize, usize, u64, u64, u64)],
+) -> Result<Vec<u64>, ChannelError> {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    // Each process's rate as a fraction (numerator, denominator), spread from a first one in each
+    // connected part.
+    let mut rate: Vec<Option<(u64, u64)>> = vec![None; processes];
+    for start in 0..processes {
+        if rate[start].is_some() {
+            continue;
+        }
+        rate[start] = Some((1, 1));
+        let mut queue = vec![start];
+        while let Some(p) = queue.pop() {
+            let (n, d) = rate[p].unwrap();
+            for &(c, from, to, made, taken, _) in edges {
+                // q[to] = q[from] x made / taken, and the reverse.
+                let (other, num, den) = if from == p {
+                    (to, n * made, d * taken)
+                } else if to == p {
+                    (from, n * taken, d * made)
+                } else {
+                    continue;
+                };
+                let g = gcd(num, den);
+                let r = (num / g, den / g);
+                match rate[other] {
+                    None => {
+                        rate[other] = Some(r);
+                        queue.push(other);
+                    }
+                    Some(q) if q.0 * r.1 == r.0 * q.1 => {}
+                    Some(_) => return Err(ChannelError::Unbalanced { channel: c }),
+                }
+            }
+        }
+    }
+    let rate: Vec<(u64, u64)> = rate.into_iter().map(Option::unwrap).collect();
+    let lcm = rate.iter().fold(1, |l, &(_, d)| l / gcd(l, d) * d);
+    let whole: Vec<u64> = rate.iter().map(|&(n, d)| n * (lcm / d)).collect();
+    let g = whole.iter().fold(0, |g, &q| gcd(g, q));
+    Ok(whole.into_iter().map(|q| q / g.max(1)).collect())
 }
 
 /// A mover held at a credit wait ([`tt_isa::dm::op::WAIT_CREDIT`]): the word's count and the target
@@ -798,6 +965,96 @@ mod tests {
         r.depth = 2;
         r.page_bytes = 24;
         assert!(r.send(0, base).is_err());
+    }
+
+    fn edge(from: (usize, Endpoint, u32), to: (usize, Endpoint, u32), depth: u16) -> Channel {
+        let end = |(unit, endpoint, tokens)| End {
+            unit,
+            endpoint,
+            tokens,
+        };
+        Channel {
+            producer: end(from),
+            consumers: vec![end(to)],
+            depth,
+            page: Page::Batch,
+            kind: Kind::Remote,
+        }
+    }
+
+    #[test]
+    fn a_double_buffered_pipeline_across_two_units_is_scheduled() {
+        use Endpoint::*;
+        // Unit 0 reads, unpacks, packs and hands its writer's pages to unit 1's reader.
+        let graph = Graph::new(vec![
+            Channel::local(0, Stream::Input, 2),
+            edge((0, Unpack, 1), (0, Pack, 1), 1),
+            Channel::local(0, Stream::Output, 2),
+            edge((0, Writer, 1), (1, Reader, 1), 2),
+            Channel::local(1, Stream::Input, 2),
+        ]);
+        let schedule = graph.check().unwrap();
+        assert_eq!(schedule.processes.len(), 6);
+        assert!(schedule.firings.iter().all(|&q| q == 1));
+    }
+
+    #[test]
+    fn rates_give_each_process_its_firings() {
+        use Endpoint::*;
+        // A reader making two pages a firing, an unpacker taking one, a packer three to a writer
+        // taking two.
+        let graph = Graph::new(vec![
+            edge((0, Reader, 2), (0, Unpack, 1), 2),
+            edge((0, Unpack, 3), (0, Pack, 2), 6),
+        ]);
+        let schedule = graph.check().unwrap();
+        let q = |p| schedule.firings[schedule.processes.iter().position(|&x| x == p).unwrap()];
+        // The least firings: two pages unpacked a read, three packed every two unpacks.
+        assert_eq!([q((0, Reader)), q((0, Unpack)), q((0, Pack))], [1, 2, 3]);
+    }
+
+    #[test]
+    fn unbalanced_rates_are_refused() {
+        use Endpoint::*;
+        // Two paths from the reader to the writer that disagree on how often the writer fires.
+        let graph = Graph::new(vec![
+            edge((0, Reader, 1), (0, Unpack, 1), 2),
+            edge((0, Unpack, 1), (0, Writer, 1), 2),
+            edge((0, Reader, 1), (0, Writer, 2), 2),
+        ]);
+        // Which channel shows it depends on the order the rates are spread in.
+        assert!(matches!(
+            graph.check(),
+            Err(ChannelError::Unbalanced { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cycle_without_initial_tokens_is_refused() {
+        use Endpoint::*;
+        // Unit 0's writer feeds unit 1's, which feeds unit 0's back: each waits for the other's
+        // first page.
+        let graph = Graph::new(vec![
+            edge((0, Writer, 1), (1, Writer, 1), 2),
+            edge((1, Writer, 1), (0, Writer, 1), 2),
+        ]);
+        assert!(matches!(
+            graph.check(),
+            Err(ChannelError::Deadlock { blocked }) if blocked.len() == 2
+        ));
+    }
+
+    #[test]
+    fn a_channel_shallower_than_a_firing_is_refused_and_one_deep_enough_is_not() {
+        use Endpoint::*;
+        let pages = |depth| Graph::new(vec![edge((0, Writer, 2), (1, Reader, 1), depth)]);
+        assert_eq!(
+            pages(1).check(),
+            Err(ChannelError::Deadlock {
+                blocked: vec![(0, Writer), (1, Reader)]
+            })
+        );
+        assert_eq!(pages(2).check().unwrap().firings, [1, 2]);
     }
 
     #[test]
