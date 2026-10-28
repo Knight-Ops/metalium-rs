@@ -64,7 +64,7 @@ pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
 
 /// `a @ b` for an F32 `a` and a weight `b` stored BF16 ([`crate::storage::StorageFormat::Bf16`]),
 /// read where it lies: `a`'s leading dimensions folded into rows, one product on the card, bit for
-/// bit the product of `b`'s values in F32 (`Session::matmul_dram`, `SrcRoute::Tf32WithBf16B`).
+/// bit the product of `b`'s values in F32 (`Session::matmul_dram`, `SrcRoute::TF32_WITH_BF16_B`).
 /// `None` (the widening path) for anything else: a transposed or viewed `b`, `b` with a batch, a
 /// host `a`, an engine without GDDR.
 fn bf16_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
@@ -1631,7 +1631,7 @@ fn device_op_ungated(
             Elem::F32 => DType::F32,
             Elem::I32 => DType::I32,
             Elem::Bool => DType::Bool(burn_backend::BoolStore::Native),
-            Elem::Bf16 => unreachable!("no element-wise op makes a stored BF16 weight"),
+            Elem::Packed(_) => unreachable!("no element-wise op makes a stored packed weight"),
         }
     };
     Some(device_result_shaped(device, id, dims, a.shape(), dtype))
@@ -1907,7 +1907,7 @@ fn view_op(
             Elem::F32 => DType::F32,
             Elem::I32 => DType::I32,
             Elem::Bool => DType::Bool(burn_backend::BoolStore::Native),
-            Elem::Bf16 => unreachable!("no element-wise op makes a stored BF16 weight"),
+            Elem::Packed(_) => unreachable!("no element-wise op makes a stored packed weight"),
         }
     };
     let out = device_view(device, id, dims, None, dtype).to_dram().clone();

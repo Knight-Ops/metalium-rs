@@ -105,7 +105,7 @@ pub const ARGMAX_UNITS: usize = 64;
 /// 352 / 1,024 us).
 pub const THIN_STREAM_UNITS: usize = 64;
 
-/// [`THIN_STREAM_UNITS`] for a weight stored BF16 (`SrcRoute::Tf32WithBf16B`,
+/// [`THIN_STREAM_UNITS`] for a weight stored BF16 (`SrcRoute::TF32_WITH_BF16_B`,
 /// [`Session::set_thin_stream_count_bf16`], `TT_THIN_STREAM_UNITS_BF16`): a unit's reads are half
 /// the bytes, so more units read together before GDDR saturates. Swept on SmolLM2-1.7B with its
 /// weights stored BF16 (card 0, 2026-10-26, `docs/learnings/performance-log.md`, "Re-tuned for BF16
@@ -3185,8 +3185,8 @@ impl<T: Transport> Session<T> {
         self.execute(work, RESET_BUDGET)
     }
 
-    /// `input` stored as a BF16 weight ([`tensor::Elem::Bf16`], half the bytes): what a product
-    /// reads as its `B` through [`SrcRoute::Tf32WithBf16B`], equal bit for bit to the product of
+    /// `input` stored as a BF16 weight ([`tensor::Elem::BF16`], half the bytes): what a product
+    /// reads as its `B` through [`SrcRoute::Tf32WithB`], equal bit for bit to the product of
     /// `input` wherever `input` holds BF16 values (a BF16 checkpoint widened to F32). The
     /// conversion is [`Session::bf16_from_f32`]'s (ties-even, NaNs quieted, BF16 subnormals to
     /// signed zero, as `Src` flushes them anyway); its padding is zero.
@@ -3217,7 +3217,7 @@ impl<T: Transport> Session<T> {
     /// A stored BF16 weight ([`Session::store_bf16`]) widened to a new FP32 tensor, for any op
     /// but a product's `B`.
     pub fn widen_bf16(&mut self, stored: &DramTensor) -> Result<DramTensor, TensorError> {
-        stored.expect("widening a stored BF16 weight", tensor::Elem::Bf16)?;
+        stored.expect("widening a stored BF16 weight", tensor::Elem::BF16)?;
         let t = stored.as_bf16().expect("a stored BF16 weight");
         let out = self.bf16_to_f32(&t)?;
         out.set_pad(stored.pad());
@@ -8068,15 +8068,15 @@ impl<T: Transport> Session<T> {
         use tensor::OpPadding;
         // Before any padding fill: an integer tensor is refused untouched.
         a.expect("a matmul", tensor::Elem::F32)?;
-        // A stored BF16 weight is read as it is, as BF16 into `SrcA`: the product of the same
-        // values in FP32 bit for bit (`SrcRoute::Tf32WithBf16B`, gate `step232`).
+        // A stored packed weight is read as it is, in its own format into `SrcA`: the product of
+        // the same values in FP32 bit for bit (`SrcRoute::Tf32WithB`, gates `step232`, `step239`).
         let route = match (b.elem, route) {
-            (tensor::Elem::Bf16, SrcRoute::Tf32FromFp32 | SrcRoute::Tf32WithBf16B) => {
-                SrcRoute::Tf32WithBf16B
+            (tensor::Elem::Packed(format), SrcRoute::Tf32FromFp32 | SrcRoute::Tf32WithB(_)) => {
+                SrcRoute::Tf32WithB(format)
             }
-            (tensor::Elem::Bf16, _) => {
+            (tensor::Elem::Packed(format), _) => {
                 return Err(TensorError::Shape(format!(
-                    "a stored BF16 `B` multiplies through TF32 only, not {route:?}"
+                    "a stored {format:?} `B` multiplies through TF32 only, not {route:?}"
                 )))
             }
             _ => {
@@ -8125,7 +8125,7 @@ impl<T: Transport> Session<T> {
         // `THIN_STREAM_UNITS` units, and more only share it while each pays its own `A` reads and
         // the deal's last round (`silicon_probe_decode_stream`).
         let units = if self.thin_stream_units && mt == 1 && kt >= THIN_STREAM_K_TILES {
-            units.min(if route.bf16_b() {
+            units.min(if route.packed_b().is_some() {
                 self.thin_stream_count_bf16
             } else {
                 self.thin_stream_count
@@ -8153,7 +8153,7 @@ impl<T: Transport> Session<T> {
             && !a_transposed
             && a.cols % 32 == 0
             && kt >= PACKED_A_K_TILES
-            && matches!(route, SrcRoute::Tf32FromFp32 | SrcRoute::Tf32WithBf16B);
+            && matches!(route, SrcRoute::Tf32FromFp32 | SrcRoute::Tf32WithB(_));
         // The op that made `A` may have packed it already (`Session::set_packed_twins`).
         let twin = packs.then(|| self.packed_twin(a).cloned()).flatten();
         let packed = if packs && twin.is_none() {

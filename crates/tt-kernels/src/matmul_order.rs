@@ -493,7 +493,7 @@ mod tests {
         Fidelity::HiFi4,
     ];
     const LIVE: [LiveRows; 3] = [LiveRows::All, LiveRows::Sixteen, LiveRows::Eight];
-    const ROUTES: [SrcRoute; 2] = [SrcRoute::Tf32FromFp32, SrcRoute::Tf32WithBf16B];
+    const ROUTES: [SrcRoute; 2] = [SrcRoute::Tf32FromFp32, SrcRoute::TF32_WITH_BF16_B];
 
     /// Output tiles over `pairs` pairs each: evenly spaced (the GPR-stepped loop), in runs (a
     /// packed `A`'s shape), or scattered (retargeted every pair).

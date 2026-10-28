@@ -339,6 +339,9 @@ pub const SMOKE: &[&str] = &[
     // Hypothesis H3 (docs/learnings/dataflow-compiler.md): the fidelity phases the operand
     // formats need give HiFi4's bits.
     "step238_exact_fidelity::",
+    // F1c: a weight stored in any packed format (BF16, BFP8/4/2) multiplies as its decoded
+    // values on every product path, and H3 for TF32 beside BFP.
+    "step239_packed_weight_products::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

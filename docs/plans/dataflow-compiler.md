@@ -29,16 +29,30 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 
 ## Stage F1: `TileFormat` (ADR 0004), and one matmul for every format pair
 
-- [ ] Add `tt_isa::tile::TileFormat`:
-  - code, datum bits, exponent block, image and slot bytes, family;
-  - unpack routes to `Src` and to `Dst`, and pack routes;
-  - fidelity slices and narrowing semantics.
-  - Each field is derived from `vendor/` or a measured row. Unit tests pin it against the existing `L1Format`/`TileImage` values and the slot constants.
-- [ ] Route `TILE_SLOT`, `BF16_TILE_SLOT`, `BfpFormat::slot_bytes` and `SrcRoute`/`SrcFormats` through it. No behaviour change: existing gates stay bit-identical.
-- [ ] Add `TileFormat::exact_fidelity(a, b)`. **H3 gate first:** ttsim, then card 1. Across the format matrix, products at derived fidelity equal products at HiFi4 bit for bit, including −0, subnormals, NaN, infinities and mixed exponents inside a group.
-  - If equal, the default contract's fidelity rule becomes "exact for the edge formats".
-  - If not, it stays HiFi4 and exact fidelity is a named contract.
-- [ ] One matmul job builder, parameterized by the A, B, out and accumulator edge formats, replacing `tensor::matmul_dram*`, `bf16::matmul` and `bfp::matmul`.
+- [x] **F1a, the descriptor** (`6dd4444`): `tt_isa::format::TileFormat` with image and slot bytes, family, the
+  unpacker's `Src` codes, and the mantissa bits each format brings into `Src`. `full_precision_phases` derives the
+  phases from `SrcASrcB.md`'s slices: for one format, the vendor table; for mixed pairs, each operand's bits.
+  `TILE_SLOT`/`BF16_TILE_SLOT` are derived from it and asserted equal to 4160/2112. `BfpFormat::slot_bytes` and
+  `SrcRoute`'s BFP codes come from it.
+  - Still to add, as F2 and F5 need them: `Dst` unpack routes, pack routes and narrowing semantics.
+- [x] **F1b, GATHER's `B` by format** (`6dd4444`): bit 29 (a BF16 `B`) became bits 29-31, a format code (FP32, BF16,
+  BFP8, BFP4, BFP2).
+  - Code 1 is bit 29 alone, so every existing record encodes as before. A packed `B` reads whole slots of its format.
+  - The mover's stream cap and the session's L1 ranges read the field.
+  - `step172`/`step173` pass in all three read modes on ttsim, and in the safe image on card 1 (`1793150259`).
+- [x] **H3 gate** `step238_exact_fidelity`: BFP8 at 2 phases and BFP4/BFP2 at 1 equal HiFi4 bit for bit (groups spread
+  over seven binades, signed zeros, K reloads), and BFP8 at 1 phase differs (the negative control). **Passes on ttsim and
+  on card 1** (`1793150259`, along with `step172`/`step173`/`step232`/`step233`/`step94`).
+  - Still to cover: mixed pairs, once F1c builds them, and NaN/infinity blocks.
+  - If it holds on silicon, the default contract's fidelity rule becomes "full precision for the edge formats".
+- [ ] **F1c, the tensor handle carries its format.** Generalize the stored-BF16-weight precedent:
+  - `DramTensor::format() -> TileFormat`, with `Elem::Bf16` and a BFP weight as edge formats;
+  - `SrcRoute::Tf32WithBf16B` becomes `SrcRoute::Tf32WithB(TileFormat)`, its `b_slot`, `src_formats` and GATHER flags all
+    taken from the format.
+  - BFP8/4/2 weights beside TF32 activations then take the block-stream path, with its blocking, prefetch and
+    pipelining. Today `bfp::matmul` builds one output tile per job with no block reuse.
+  - `PairOrder::Auto`'s whole-tile unpacks (P4) are tried for packed formats by a gate, not assumed.
+- [ ] **F1d.** One matmul job builder, parameterized by the A, B, out and accumulator edge formats, replacing `tensor::matmul_dram*`, `bf16::matmul` and `bfp::matmul`.
   - Gate: bit-exact against each old builder on every pair it supported, and new mixed pairs (BFP8/4 weights × BF16 or TF32 activations) against the specification model and burn-flex within derived bounds.
   - Then delete the old builders, the `bfp.rs` same-format refusal and their per-format server functions.
 - [ ] `step12_mnist`, `cargo xtask conformance --release`, and silicon gates on card 1.

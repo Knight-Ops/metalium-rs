@@ -146,7 +146,7 @@ Kahn's theorem then gives every channel the same history under any schedule, any
 **S2. Every op has a numeric contract.** It is part of the algorithm, not of the schedule [MEAS: the stack's standing rule, `tt-metal-concepts-review.md` §4; [PUB] Stream-K and FlashAttention show that splits change bits]. A contract states:
 - **Reduction order:** for each reduction dimension, its chunk size and combine tree. Default: K in ascending tiles, `MVMUL` groups as the hardware forms them, partials carried through FP32 `Dst`.
 - **Accumulator:** FP32 `Dst` by default. A 16-bit `Dst` is a different contract.
-- **Fidelity rule:** HiFi4 today. "Exact for the operand formats" is the candidate rule (H3, §13).
+- **Fidelity rule:** HiFi4 today. "Full precision for the edge formats" equals it bit for bit for same-format BFP products (H3, §13), and is the rule products adopt as F1c builds them.
 - **Rounding points:** every pack that narrows, with its mode (T3).
 - **Approximation:** an SFPU program's own semantics, fixed by the SFPU interpreter model.
 
@@ -181,7 +181,7 @@ It replaces what is scattered today across seven types in four crates: `L1Format
 
 **F5. Adding a format is adding a descriptor row.** New code is needed only for a new numeric family (none is planned) or for a conversion the hardware does not do (`HostDtype`/`tt-layout` on the host). The test for any optimization: *does it name a format?* If it does, it is in the wrong layer.
 
-**F6. Generic fidelity** [HYP: H3]. Fidelity comes from the edge formats (T4), not from a knob for each format. Under the default contract, "exact for these formats" would make BFP4×BFP4 run 4× fewer phases than HiFi4 at the same exactness. Whether it gives the *same bits* as HiFi4 is H3.
+**F6. Generic fidelity** [MEAS: H3, `1793150259`, same-format BFP; mixed pairs still HYP]. Fidelity comes from the edge formats (T4, `tt_isa::format::full_precision_phases`), not from a knob for each format. For same-format BFP products, the derived phase count gives HiFi4's bits on card 1: BFP4×BFP4 runs 1 phase of 4, BFP8×BFP8 2 of 4, at the same exactness.
 
 ---
 
@@ -365,7 +365,7 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 | D6 | Credit granularity | A page (often a tile) | A compute-sized batch (ours) | **Open.** Decided per channel class by the cost model once H4 measures sync cost against overlap |
 | D7 | Replicating rows to many readers | Multicast | Sharded rows | **Decided: sharded.** Replicated rows by contended multicast took 43.9 ms a step against 20.92 (roadmap, residency 2e/2f) |
 | D8 | `Dst` width | BF16 `Dst`, 8 tiles a half, often the default | FP32 `Dst`, 4 a half | **Decided: FP32** in the default contract (S2). 16-bit is an opt-in contract |
-| D9 | Fidelity | A per-op knob, LoFi..HiFi4 | Derived from edge formats | **Open: H3** |
+| D9 | Fidelity | A per-op knob, LoFi..HiFi4 | Derived from edge formats | **Derived** for same-format BFP (H3 confirmed, `1793150259`); mixed pairs open |
 
 ---
 
@@ -410,10 +410,17 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
 - **H2 `Dst` subblocks and half-sync.** Once reads stop binding (after H1), the kernel's math utilization rises from ~41-68% of HiFi4 issue toward ~90%. That range is derived from the 0.14-0.23 µs measured per K-tile pair against 128 cycles of `MVMUL`.
   - *Prediction:* ≥ 1.4× on the same shapes, bit-exact.
   - *Kills it:* < 1.1×.
-- **H3 Exact fidelity.** Running only the phases the operand formats need (T4) gives the same bits as HiFi4 for those formats, because the skipped phases' slices are zero and adding +0 to FP32 `Dst` is an identity.
-  - *Measured by:* a ttsim and silicon gate across the format matrix, including −0 and the group adder's alignment quirk ("a zero slice still sets its exponent", T5).
-  - *Prediction:* bit-identical, and BFP4×BFP4 products ≥ 3× the BF16 HiFi4 rate when compute-bound.
-  - *Kills it:* any bit difference. Exact fidelity is then a separate contract.
+- **H3 Exact fidelity. Confirmed for same-format BFP products, 2026-10-28.**
+  - *Claim:* running only the phases the operand formats need (T4) gives the same bits as HiFi4 for those formats,
+    because the skipped phases' slices are zero and adding +0 to FP32 `Dst` is an identity.
+  - *Gate:* `step238_exact_fidelity`. BFP8 at 2 phases and BFP4/BFP2 at 1 equal HiFi4 bit for bit, on ttsim and on
+    card 1 (run `1793150259`; BFP2 on silicon only, since ttsim refuses its `Src` format). The products put groups of
+    eight terms over seven binades and carry zeros of both signs, at one K block and across K reloads.
+  - *Negative control:* BFP8 at 1 phase differs.
+  - *Consequence:* the default contract's fidelity rule may be "full precision for the edge formats"
+    (`Fidelity::full_precision`) for these pairs. It is adopted where F1c builds the product.
+  - *Still open:* mixed pairs (BFP weights × TF32 or BF16 activations, needing F1c), and NaN or infinity inside a block.
+  - *Prediction left:* BFP4 × BFP4 products at ≥3× the BF16 HiFi4 rate when compute-bound.
 - **H4 Channels instead of barriers.** With per-edge credits and data-independent reads started as units free up, a 1.7B decode step's card read rate rises from 328 GB/s (64%).
   - *Prediction:* ≥ 400 GB/s average and step ≤ 9.5 ms (from 10.9), bit-exact.
   - *Measured by:* the profile's card read meter.

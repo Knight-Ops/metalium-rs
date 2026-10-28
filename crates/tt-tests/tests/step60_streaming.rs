@@ -150,13 +150,17 @@ fn default_ownership_covers_every_sfpu_kind() {
                         Elem::F32 => &floats,
                         Elem::Bool => &booleans,
                         Elem::I32 => &integers,
-                        Elem::Bf16 => unreachable!("no element-wise kind takes BF16"),
+                        Elem::Packed(_) => {
+                            unreachable!("no element-wise kind takes a packed weight")
+                        }
                     };
                     let host = |index: usize| match signature.inputs[index] {
                         Elem::F32 => &data[..],
                         Elem::Bool => &host_bool[..],
                         Elem::I32 => &host_int[..],
-                        Elem::Bf16 => unreachable!("no element-wise kind takes BF16"),
+                        Elem::Packed(_) => {
+                            unreachable!("no element-wise kind takes a packed weight")
+                        }
                     };
                     let second = match operands {
                         Operands::Unary => None,
