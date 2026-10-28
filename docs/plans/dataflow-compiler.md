@@ -286,6 +286,8 @@ and B1 at the close. The set:
     - Card 0 (`1793216912`): 52 of 53 with `step18/239/240/185/188`. The failure was
       `step188::device_agrees_with_flex`, a timeout at 120.16 s against its 116-135 s history; alone it passes in
       119.88 s (`1793217290`). It now has its own 240 s in `LONG`.
+    - After F3.8: `step12_mnist` passes 8 of 8 on ttsim with the goldens unchanged.
+      `cargo xtask conformance --release` gives 2,973 passing, 52 listed, 0 unexpected, as at F1's close.
 - [ ] Allocation through `l1::Requirements` and the op's `channel::Graph::check`, once the matmul's layouts are
   microkernel layouts: today each client's microkernel plans its own L1 (`sfpu::kernel::plan_layout_in`,
   `sfpu::reduce::plan_layout`).
