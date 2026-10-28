@@ -3308,42 +3308,6 @@ impl<T: Transport> Session<T> {
             .collect()
     }
 
-    /// Native F32 product of decoded BFP operands. Transposes, ragged edges
-    /// and K blocking follow the same scheduler as ordinary resident products.
-    pub fn bfp_matmul(
-        &mut self,
-        a: &crate::bfp::BfpTensor,
-        a_transposed: bool,
-        b: &crate::bfp::BfpTensor,
-        b_transposed: bool,
-        fidelity: Fidelity,
-    ) -> Result<DramTensor, TensorError> {
-        if !a_transposed && !b_transposed && a.format() == b.format() {
-            let limit = self.matmul_k_block_limit.map(std::num::NonZeroUsize::get);
-            let work = crate::bfp::matmul(&mut self.dram_state()?.alloc, a, b, fidelity, limit)?;
-            return self.execute(work, RESET_BUDGET);
-        }
-        let aa = self.bfp_to_f32(a)?;
-        let result = match self.bfp_to_f32(b) {
-            Ok(bb) => {
-                let result = self.matmul_dram(
-                    &aa,
-                    a_transposed,
-                    &bb,
-                    b_transposed,
-                    SrcRoute::Tf32FromFp32,
-                    fidelity,
-                    RESET_BUDGET,
-                );
-                let _ = self.free(bb);
-                result
-            }
-            Err(error) => Err(error),
-        };
-        let _ = self.free(aa);
-        result
-    }
-
     pub fn repack_bf16(
         &mut self,
         input: &crate::bf16::Bf16Tensor,
@@ -3512,33 +3476,6 @@ impl<T: Transport> Session<T> {
     ) -> Result<DramTensor, TensorError> {
         let work = crate::fpu::bf16_block(&mut self.dram_state()?.alloc, tensor, op)?;
         self.execute(work, RESET_BUDGET)
-    }
-
-    /// Multiply packed BF16 matrices with F32 accumulation/output. Large K
-    /// reloads the prior F32 accumulator between packed operand blocks.
-    pub fn matmul_bf16(
-        &mut self,
-        a: &crate::bf16::Bf16Tensor,
-        b: &crate::bf16::Bf16Tensor,
-        fidelity: Fidelity,
-        budget: u64,
-    ) -> Result<DramTensor, TensorError> {
-        let (mt, kt, nt) = (
-            a.rows.div_ceil(32),
-            a.cols.div_ceil(32),
-            b.cols.div_ceil(32),
-        );
-        let units = self.spread_for_product(mt * nt * kt);
-        let k_limit = self.matmul_k_block_limit.map(std::num::NonZeroUsize::get);
-        let work = crate::bf16::matmul(
-            &mut self.dram_state()?.alloc,
-            a,
-            b,
-            fidelity,
-            units,
-            k_limit,
-        )?;
-        self.execute_on(work, units, budget)
     }
 
     /// Traceable shape/index constants encoded as mover immediates. Callers

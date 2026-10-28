@@ -72,8 +72,24 @@ fn packed_bf16_matmul_masks_local_padding_and_preserves_parent_bits() {
                 std::num::NonZeroUsize::new(2),
             ] {
                 s.set_matmul_k_block_limit(limit);
+                // Two BF16 edges, one product (`SrcRoute::Edges`, F1d). Their padding is poisoned:
+                // the product repairs a copy (`Session::meet`), never the parents.
                 let out = s
-                    .matmul_bf16(&ta, &tb, Fidelity::HiFi4, 40_000_000)
+                    .matmul_dram(
+                        &tt_kernels::tensor::DramTensor::from_bf16(
+                            ta.clone(),
+                            tt_kernels::tensor::Pad::Undefined,
+                        ),
+                        false,
+                        &tt_kernels::tensor::DramTensor::from_bf16(
+                            tb.clone(),
+                            tt_kernels::tensor::Pad::Undefined,
+                        ),
+                        false,
+                        tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+                        Fidelity::HiFi4,
+                        40_000_000,
+                    )
                     .unwrap();
                 let got = s.download(&out).unwrap();
                 let want: Vec<_> = (0..m)

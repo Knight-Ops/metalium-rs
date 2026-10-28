@@ -12,7 +12,9 @@
 //!   for every pair while no product overflows FP32 -- and not past that (a product of `1e30`s):
 //!   the derived phases are another contract, so they stay opt-in.
 //! - **The pairs the old builders took** (BF16 x BF16, `bf16::matmul`; BFP x BFP of one format,
-//!   `bfp::matmul`) equal those builders bit for bit, signed zeros and subnormals included.
+//!   `bfp::matmul`) equalled those builders bit for bit, signed zeros and subnormals included
+//!   (`3bc1d89`, ttsim and card 0 `1793162345`), before they were deleted; with specials they equal
+//!   the decoded product still.
 //! - A BF16 operand whose padding is not known to be zero is repaired before it is read
 //!   (`Session::meet`), and gives the same bits.
 //!
@@ -260,8 +262,8 @@ fn specials(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The pairs the old builders took, against those builders: BF16 x BF16 (`Session::matmul_bf16`)
-/// and BFP x BFP of one format (`Session::bfp_matmul`), with specials.
+/// The pairs the old builders took -- BF16 x BF16 and BFP x BFP of one format -- with signed zeros,
+/// subnormals and wide binades: the decoded product (the old builders' bits, `3bc1d89`).
 #[test]
 fn the_old_builders_pairs_are_their_bits() {
     with_session(|s| {
@@ -286,23 +288,7 @@ fn the_old_builders_pairs_are_their_bits() {
                 let (b, db) = operand(s, f, &make(specials(400 + seed, k * n)), k, n);
                 s.set_matmul_k_block_limit(limit.and_then(std::num::NonZeroUsize::new));
                 let got = mm(s, &a, &b, Fidelity::HiFi4);
-                let old = if f == TileFormat::BF16 {
-                    s.matmul_bf16(
-                        &a.as_bf16().unwrap(),
-                        &b.as_bf16().unwrap(),
-                        Fidelity::HiFi4,
-                        1 << 40,
-                    )
-                } else {
-                    s.bfp_matmul(
-                        &a.as_bfp().unwrap(),
-                        false,
-                        &b.as_bfp().unwrap(),
-                        false,
-                        Fidelity::HiFi4,
-                    )
-                }
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
+                let old = mm(s, &da, &db, Fidelity::HiFi4);
                 let got_v = s.download(&got).unwrap();
                 assert_bits(&what, &got_v, &s.download(&old).unwrap());
                 // A BF16 operand whose padding is not known zero is repaired first.

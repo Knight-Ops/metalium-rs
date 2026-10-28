@@ -25,15 +25,9 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// `A` is read transposed, bit 1 `B`, bits 8..=21 `kt` ([`gather_kt`]), bits 22-24 `A`'s format
 /// ([`gather_a_format`]), bit 25 [`GATHER_A_RESIDENT`], bit 26 [`GATHER_B_UNPACK_TRANSPOSE`], bit
 /// 27 [`GATHER_PREFETCH`], bit 28 [`GATHER_STREAM`], bits 29-31 `B`'s format ([`gather_b_format`]).
-/// Bit 2 selects packed
-/// BF16 operands (no transpose): their tensor metadata words 4/5 contain the
-/// logical rows/columns and words 6/7 their tile row/column origins.
-/// GDDR slots are 2112 bytes; L1 slots remain 4160. A packed `B` ([`gather_b_format`]) is the
-/// exception: its tiles are slots of its format in L1 too, at `b_at + (kk * cols + j) * slot`;
-/// and a packed `A` ([`gather_a_format`]) at `a_at + (i * kt + kk) * slot`.
-/// Only local ragged lanes are zeroed, without changing the source tensor; a
-/// tile with at most 16 valid rows is read only through its last valid row of
-/// face 1 (faces 2 and 3 not at all), since the zeroing overwrites the rest.
+/// Bit 2 ([`GATHER_BF16`]) is retired: a record with it is refused. A packed operand's tiles
+/// are slots of its format in GDDR and L1 alike: `B`'s ([`gather_b_format`]) at
+/// `b_at + (kk * cols + j) * slot`, `A`'s ([`gather_a_format`]) at `a_at + (i * kt + kk) * slot`.
 /// Bits 3-7 ([`gather_rows`], F32, `A` untransposed): `r`, 1..=16, the rows of
 /// `A`'s last tile row of the block that the product uses, which is then read
 /// as its datums up to row `r` of face 1 (one `1024 + 64 r`-byte read a tile:
@@ -42,6 +36,10 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// padding; either reaches only the same rows of the output -- its padding,
 /// then undefined. 0: whole tiles.
 pub const GATHER: u32 = 0x10;
+/// [`GATHER`]'s retired bit 2: packed BF16 operands with their ragged lanes filled on the card,
+/// which only the BF16 x BF16 product builder used. Any pair of edge formats is one product now
+/// ([`gather_a_format`], [`gather_b_format`]: `docs/plans/dataflow-compiler.md` F1d), so a record
+/// with this bit is refused.
 pub const GATHER_BF16: u32 = 1 << 2;
 /// [`GATHER`]'s flag for a block whose `A` is already in its slots: the same
 /// unit's previous gather of the op read the same `A` block to the same `a_at`,
@@ -71,8 +69,7 @@ pub const GATHER_STREAM: u32 = 1 << 28;
 /// (`b_at + (kk * cols + j) * slot`: more tiles in a ring than an FP32 `B`'s,
 /// `docs/plans/bf16-weight-storage.md` A5b), where the kernel unpacks it in its own format
 /// (`tt_kernels::matmul::SrcRoute::Tf32WithB`). A packed `B` is untransposed only (not bit 1,
-/// not [`GATHER_B_UNPACK_TRANSPOSE`]), and not with packed BF16 (bit 2), which is both operands;
-/// with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
+/// not [`GATHER_B_UNPACK_TRANSPOSE`]); with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
 /// the writer's (zero for a stored weight): nothing is filled.
 pub const GATHER_B_FORMAT_SHIFT: u32 = 29;
 /// [`GATHER`]'s bits that hold `B`'s format code.
@@ -175,12 +172,9 @@ const fn gather_b_slot(flags: u32) -> Result<u64, u32> {
 }
 
 /// `A`'s slot under `flags`, as [`gather_b_slot`] is `B`'s; and a refusal for a packed `A` with
-/// what only an FP32 `A` takes: a transposed read (bit 0), thin rows ([`gather_rows`]), packed BF16
-/// (bit 2).
+/// what only an FP32 `A` takes: a transposed read (bit 0), thin rows ([`gather_rows`]).
 const fn gather_a_slot(flags: u32) -> Result<u64, u32> {
-    if gather_a_packed(flags)
-        && (flags & 1 != 0 || flags & GATHER_BF16 != 0 || (flags >> GATHER_ROWS_SHIFT) & 0x1f != 0)
-    {
+    if gather_a_packed(flags) && (flags & 1 != 0 || (flags >> GATHER_ROWS_SHIFT) & 0x1f != 0) {
         return Err(super::error::RANGE);
     }
     match gather_a_tile_format(flags) {
@@ -223,16 +217,19 @@ impl PrefetchCursor {
         }
         let [_, flags, _, b_at, _, rows, j0, cols] = h;
         let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(gather_kt(flags))?);
+        if flags & GATHER_BF16 != 0 {
+            return Err(super::error::RANGE);
+        }
         let unpacked = flags & GATHER_B_UNPACK_TRANSPOSE != 0;
-        if unpacked && (!b_t || flags & GATHER_BF16 != 0) {
+        if unpacked && !b_t {
             return Err(super::error::RANGE);
         }
         let slot = gather_b_slot(flags)? as u32;
-        if gather_b_packed(flags) && (b_t || flags & GATHER_BF16 != 0) {
+        if gather_b_packed(flags) && b_t {
             return Err(super::error::RANGE);
         }
         gather_a_slot(flags)?;
-        if flags & GATHER_BF16 != 0 || (b_t && !unpacked) || flags & GATHER_STREAM != 0 {
+        if (b_t && !unpacked) || flags & GATHER_STREAM != 0 {
             return Err(super::error::RANGE);
         }
         let (_, cols) = (extent(rows)?, extent(cols)?);
@@ -697,101 +694,28 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         GATHER => {
             let [_, flags, a_at, b_at, i0, rows, j0, cols] = h;
             let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(gather_kt(flags))?);
+            if flags & GATHER_BF16 != 0 {
+                return Err(super::error::RANGE);
+            }
             let resident = flags & GATHER_A_RESIDENT != 0;
             let b_unpacked = flags & GATHER_B_UNPACK_TRANSPOSE != 0;
-            if b_unpacked && (!b_t || flags & GATHER_BF16 != 0) {
+            if b_unpacked && !b_t {
                 return Err(super::error::RANGE);
             }
             let b_slot = gather_b_slot(flags)?;
-            if gather_b_packed(flags) && (b_t || flags & GATHER_BF16 != 0) {
+            if gather_b_packed(flags) && b_t {
                 return Err(super::error::RANGE);
             }
             let a_slot = gather_a_slot(flags)?;
             // A prefetch's reads stay in flight under the entries after it: plain reads only,
-            // never a transposing move (through the scratch, after draining the mover's own ID)
-            // or packed BF16's fills.
+            // never a transposing move (through the scratch, after draining the mover's own ID).
             if flags & GATHER_PREFETCH != 0
-                && (flags & GATHER_BF16 != 0
-                    || (a_t && !resident)
-                    || (b_t && !b_unpacked)
-                    || flags & GATHER_STREAM != 0)
+                && ((a_t && !resident) || (b_t && !b_unpacked) || flags & GATHER_STREAM != 0)
             {
                 return Err(super::error::RANGE);
             }
             let (rows, cols) = (extent(rows)?, extent(cols)?);
             let (a, b) = (tensor(rec, 1)?, tensor(rec, 3)?);
-            if flags & GATHER_BF16 != 0 {
-                if flags & 0xff != GATHER_BF16 {
-                    return Err(super::error::RANGE);
-                }
-                for (x, meta, r0, nr, c0, nc, at) in [
-                    (&a, rec[1], i0, rows, 0, kt, a_at),
-                    (&b, rec[3], 0, kt, j0, cols, b_at),
-                ]
-                .into_iter()
-                .skip(usize::from(resident))
-                {
-                    let (height, width) = (meta[4], meta[5]);
-                    let r0 = r0.checked_add(meta[6]).ok_or(super::error::RANGE)?;
-                    let c0 = c0.checked_add(meta[7]).ok_or(super::error::RANGE)?;
-                    if height == 0
-                        || width == 0
-                        || height > MAX_EXTENT * 32
-                        || width > MAX_EXTENT * 32
-                        || x.ct != width.div_ceil(32)
-                        || r0
-                            .checked_add(nr)
-                            .is_none_or(|end| end > height.div_ceil(32))
-                        || c0.checked_add(nc).is_none_or(|end| end > x.ct)
-                    {
-                        return Err(super::error::RANGE);
-                    }
-                    for i in 0..nr {
-                        let mut row = x.cursor(r0 + i, c0)?;
-                        let valid_rows = (height - (r0 + i) * 32).min(32);
-                        for j in 0..nc {
-                            let (ch, off) = row.next_with_slot(super::BF16_TILE_SLOT)?;
-                            let to = (at as u64) + (i as u64 * nc as u64 + j as u64) * TILE_SLOT;
-                            let to = u32::try_from(to).map_err(|_| super::error::RANGE)?;
-                            if valid_rows <= 16 {
-                                // The datums through row `valid_rows - 1` of face 1
-                                // (512 bytes a face, 32 a face row), one read as
-                                // a whole tile is: the fill below zeroes every
-                                // other datum, so nothing else need land.
-                                const DATA: u32 = TILE_DATA as u32;
-                                let len = 512 + 32 * valid_rows;
-                                let port = (i + j) % PORTS;
-                                emit([op::READ, ch, port, off + DATA, to + DATA, len, 0, 0])?;
-                            } else {
-                                emit([
-                                    op::READ,
-                                    ch,
-                                    (i + j) % PORTS,
-                                    off,
-                                    to,
-                                    super::BF16_TILE_SLOT as u32,
-                                    0,
-                                    0,
-                                ])?;
-                            }
-                            let valid_cols = (width - (c0 + j) * 32).min(32);
-                            if valid_rows != 32 || valid_cols != 32 {
-                                emit([
-                                    op::FILL_HALFWORDS,
-                                    0,
-                                    super::fill::param(valid_rows, valid_cols),
-                                    to,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                ])?;
-                            }
-                        }
-                    }
-                }
-                return Ok(());
-            }
             // Tile (i, j) of op(X), into L1 at `to`.
             let fetch =
                 |x: &TensorRef, t: bool, i: u32, j: u32, to: u32| -> Result<[u32; 8], u32> {
@@ -1291,107 +1215,21 @@ mod tests {
         assert!(expand_reads(&rec, &mut |_| 0, |_| Ok(())).is_ok());
     }
 
+    /// Packed BF16 operands (bit 2) are retired: one product takes any edge format
+    /// ([`gather_a_format`], [`gather_b_format`]), and a record with the bit is refused.
     #[test]
-    fn packed_gather_uses_halfword_slots_and_only_fills_edges() {
-        let mut a = t(3, 3);
-        a.first = 2;
-        let b = t(3, 2);
-        let [mut a0, a1] = a.encode();
-        let [mut b0, b1] = b.encode();
-        a0[4] = 37;
-        a0[5] = 65;
-        b0[4] = 65;
-        b0[5] = 35;
-        let head = [GATHER, GATHER_BF16 | 3 << 8, 0x20000, 0x60000, 0, 2, 0, 2];
-        let mut got = Vec::new();
-        expand_reads(
-            &[head, a0, a1, b0, b1],
-            |_| 0,
-            |e| {
-                got.push(e);
-                Ok(())
-            },
-        )
-        .unwrap();
-        let mut next = 0;
-        for (x, height, width, nr, nc, at) in
-            [(a, 37u32, 65u32, 2, 3, 0x20000), (b, 65, 35, 3, 2, 0x60000)]
-        {
-            for i in 0..nr {
-                for j in 0..nc {
-                    let tile = x.first + i * x.ct + j;
-                    let channel = (tile % 3) as usize;
-                    let off = x.base[channel] + tile / 3 * 2112;
-                    let to = at + (i * nc + j) * 4160;
-                    let rows = (height - i * 32).min(32);
-                    let cols = (width - j * 32).min(32);
-                    if rows <= 16 {
-                        // The datums through row `rows - 1` of face 1 alone, whose
-                        // 16 datums start where the face layout says.
-                        let row = crate::dm::face_index(rows as usize - 1, 16) as u32;
-                        let len = 2 * (row + 16);
-                        assert_eq!(
-                            got[next],
-                            [
-                                op::READ,
-                                x.channels[channel] as u32,
-                                (i + j) % PORTS,
-                                off + 16,
-                                to + 16,
-                                len,
-                                0,
-                                0
-                            ]
-                        );
-                        next += 1;
-                    } else {
-                        assert_eq!(
-                            got[next],
-                            [
-                                op::READ,
-                                x.channels[channel] as u32,
-                                (i + j) % PORTS,
-                                off,
-                                to,
-                                2112,
-                                0,
-                                0
-                            ]
-                        );
-                        next += 1;
-                    }
-                    if rows != 32 || cols != 32 {
-                        assert_eq!(
-                            got[next],
-                            [
-                                op::FILL_HALFWORDS,
-                                0,
-                                super::super::fill::param(rows, cols),
-                                to,
-                                0,
-                                0,
-                                0,
-                                0
-                            ]
-                        );
-                        next += 1;
-                    }
-                }
-            }
+    fn packed_bf16_gathers_are_refused() {
+        let (a, b) = (t(3, 3), t(3, 2));
+        let [a0, a1] = a.encode();
+        let [b0, b1] = b.encode();
+        for flags in [GATHER_BF16, GATHER_BF16 | GATHER_A_RESIDENT] {
+            let head = [GATHER, flags | 3 << 8, 0x20000, 0x60000, 0, 2, 0, 2];
+            assert_eq!(
+                expand_reads(&[head, a0, a1, b0, b1], |_| 0, |_| Ok(())),
+                Err(super::super::error::RANGE),
+                "{flags:#x}"
+            );
         }
-        // A's last tile row (5 rows) and B's (1 row) are read thin, an entry a
-        // tile as before.
-        assert_eq!(next, 20);
-        assert_eq!(next, got.len());
-        let mut bad = head;
-        bad[1] |= 1; // A BF16 transpose cannot enter the F32 mover transform.
-        assert!(expand_reads(&[bad, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
-        let mut bad = head;
-        bad[1] |= gather_rows(1); // BF16 finds its rows in the metadata.
-        assert!(expand_reads(&[bad, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
-        a0[5] = 32; // Descriptor dimensions must agree with its grid.
-        assert!(expand_reads(&[head, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
-        assert!(expand_writes(&[head, a0, a1, b0, b1], |_| 0, |_| Ok(())).is_err());
     }
 
     /// Every tile a record names is the one `TensorRef::tile` gives: the
@@ -1717,14 +1555,14 @@ mod tests {
             assert_eq!(resident, whole[a_entries..], "flags {flags:#x}");
             assert!(resident.iter().all(|e| e[4] >= 0x6_0000), "only B's slots");
         }
-        // Packed BF16, both operands ragged (`A` 70 x 150, `B` 110 x 200): the fills go with the
-        // tiles they pad.
-        let (mut pa, mut pb) = (a0, b0);
-        [pa[4], pa[5], pb[4], pb[5]] = [70, 150, 110, 200];
-        let whole = gather(GATHER_BF16, pa, pb).unwrap();
-        let resident = gather(GATHER_BF16 | GATHER_A_RESIDENT, pa, pb).unwrap();
-        let first_b = whole.iter().position(|e| e[4] >= 0x6_0000).unwrap();
-        assert_eq!(resident, whole[first_b..]);
+        // Packed BF16 (bit 2) is retired, resident or not.
+        for flags in [GATHER_BF16, GATHER_BF16 | GATHER_A_RESIDENT] {
+            assert_eq!(
+                gather(flags, a0, b0),
+                Err(super::super::error::RANGE),
+                "{flags:#x}"
+            );
+        }
         assert_eq!(gather_kt(GATHER_A_RESIDENT | 7 << 8 | 0xff), 7);
         // A prefetch reads what the same record reads without the flag (only the ID differs),
         // and only as plain reads: not packed BF16, not a transposing move.

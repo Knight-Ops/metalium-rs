@@ -260,19 +260,6 @@ fn sim_factory(
             self.buffers
                 .pool_bf16(&mut self.session, a, windows, divisors, dims)
         }
-        fn matmul_bf16(
-            &mut self,
-            a: burn_tt::BufferId,
-            b: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
-            self.buffers.matmul_bf16(
-                &mut self.session,
-                a,
-                b,
-                self.config.fidelity,
-                self.config.budget,
-            )
-        }
         fn upload_bf16(
             &mut self,
             bits: &[u16],
@@ -305,14 +292,6 @@ fn sim_factory(
             format: Option<tt_kernels::bfp::BfpFormat>,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.cast_bfp(&mut self.session, id, format)
-        }
-        fn matmul_bfp(
-            &mut self,
-            a: burn_tt::BufferId,
-            b: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
-            self.buffers
-                .matmul_bfp(&mut self.session, a, b, self.config.fidelity)
         }
         fn supports_dram(&self) -> bool {
             true
