@@ -1,0 +1,180 @@
+case Sum Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case Sum Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case Sum Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case Sum Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case Sum Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case Sum Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case Sum Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case Sum Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case Max Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case Max Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case Max Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case Max Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case Max Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case Max Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case Max Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case Max Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case Prod Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case Prod Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case Prod Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case Prod Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case Prod Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case Prod Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case Prod Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case Prod Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case All Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case All Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case All Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case All Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case All Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case All Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case All Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case All Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case Any Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case Any Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case Any Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case Any Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case Any Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case Any Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case Any Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case Any Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case BitOr Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case BitOr Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case BitOr Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case BitOr Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case BitOr Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case BitOr Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case BitOr Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case BitOr Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case SumI32 Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case SumI32 Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case SumI32 Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case SumI32 Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case SumI32 Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case SumI32 Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case SumI32 Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case SumI32 Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case ProdI32 Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case ProdI32 Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case ProdI32 Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case ProdI32 Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case ProdI32 Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case ProdI32 Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case ProdI32 Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case ProdI32 Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case MinI32 Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case MinI32 Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case MinI32 Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case MinI32 Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case MinI32 Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case MinI32 Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case MinI32 Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case MinI32 Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case MaxI32 Cols [37, 70] units 1 Off then None
+  planned top 0x28200 need 0x28200
+case MaxI32 Cols [37, 70] units 3 Fresh then None
+  planned top 0x24100 need 0x24100
+case MaxI32 Cols [256, 512] units 8 Fresh then None
+  planned top 0x31440 need 0x31440
+case MaxI32 Cols [256, 512] units 120 Captured then None
+  planned top 0x31440 need 0x31440
+case MaxI32 Rows [37, 70] units 1 Off then None
+  planned top 0x29240 need 0x29240
+case MaxI32 Rows [37, 70] units 3 Fresh then None
+  planned top 0x230c0 need 0x230c0
+case MaxI32 Rows [256, 512] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case MaxI32 Rows [256, 512] units 120 Captured then None
+  planned top 0x29240 need 0x29240
+case Max Cols [256, 512] units 1 Off then Some((269, 4286578687))
+  planned top 0xaa200 need 0xaa200
+case Max Cols [256, 512] units 8 Captured then Some((269, 4286578687))
+  planned top 0x31440 need 0x31440
+case Sum Cols [256, 512] units 1 Off then Some((269, 228737632))
+  planned top 0xaa200 need 0xaa200
+case Sum Cols [256, 512] units 8 Captured then Some((269, 228737632))
+  planned top 0x31440 need 0x31440
+case Sum Cols [64, 65536] units 1 Fresh then None
+  planned top 0x32480 need 0x32480
+case Sum Cols [64, 65536] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case Sum Cols [64, 65536] units 1 Fresh then Some((269, 0))
+  planned top 0x0 need 0x0
+case Sum Rows [65536, 64] units 1 Fresh then None
+  planned top 0x32480 need 0x32480
+case Sum Rows [65536, 64] units 8 Fresh then None
+  planned top 0x32480 need 0x32480
+case Sum Rows [65536, 64] units 1 Fresh then Some((269, 0))
+  planned top 0x0 need 0x0
