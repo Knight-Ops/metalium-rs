@@ -7,6 +7,10 @@
 //!   specification: a packed datum is moved into `Src` as it is, a BF16 or BFP value is a TF32 one
 //!   with its low bits clear), on every path a product takes: whole `K`, ragged, `K` blocks, 2-D
 //!   blocks with `K` streamed, looped and not.
+//! - **H3 for every pair, and where it ends.** With `Session::set_derived_fidelity`, a product asked
+//!   at HiFi4 runs only the phases its edge formats need (`SrcRoute::full_precision`): HiFi4's bits
+//!   for every pair while no product overflows FP32 -- and not past that (a product of `1e30`s):
+//!   the derived phases are another contract, so they stay opt-in.
 //! - **The pairs the old builders took** (BF16 x BF16, `bf16::matmul`; BFP x BFP of one format,
 //!   `bfp::matmul`) equal those builders bit for bit, signed zeros and subnormals included.
 //! - A BF16 operand whose padding is not known to be zero is repaired before it is read
@@ -359,6 +363,54 @@ fn packed_operands_are_their_own_values_and_read_as_they_lie() {
             );
             for t in [a, da, raw, b, got, want, at, packed_t, dt] {
                 s.free(t).unwrap();
+            }
+        }
+    });
+}
+
+/// Hypothesis H3 for every pair of edge formats, and its boundary: the derived phases give HiFi4's
+/// bits wherever the products stay in FP32's range, signed zeros and subnormals included, and other
+/// bits once products overflow it.
+#[test]
+fn derived_phases_are_hifi4_until_a_product_overflows() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        let (m, k, n) = (64, 256, 96);
+        for (huge, what) in [(1.0e15f32, "in range"), (1.0e30, "overflowing")] {
+            let vals = |seed, len| -> Vec<f32> {
+                specials(seed, len)
+                    .into_iter()
+                    .map(|x| if x.abs() > 1.0 { x.signum() * huge } else { x })
+                    .collect()
+            };
+            let mut differ = 0;
+            for fa in formats() {
+                for fb in formats() {
+                    let (a, da) = operand(s, fa, &vals(500, m * k), m, k);
+                    let (b, db) = operand(s, fb, &vals(600, k * n), k, n);
+                    s.set_derived_fidelity(false);
+                    let hifi4 = mm(s, &a, &b, Fidelity::HiFi4);
+                    s.set_derived_fidelity(true);
+                    let derived = mm(s, &a, &b, Fidelity::HiFi4);
+                    s.set_derived_fidelity(false);
+                    let (h, d) = (s.download(&hifi4).unwrap(), s.download(&derived).unwrap());
+                    let fewer =
+                        SrcRoute::edges(fa, fb).unwrap().full_precision() != Fidelity::HiFi4;
+                    if !fewer || huge < 1.0e20 {
+                        assert_bits(&format!("{fa:?} x {fb:?}, {what}"), &d, &h);
+                    } else if h.iter().zip(&d).any(|(x, y)| x.to_bits() != y.to_bits()) {
+                        differ += 1;
+                    }
+                    for t in [a, da, b, db, hifi4, derived] {
+                        s.free(t).unwrap();
+                    }
+                }
+            }
+            if huge > 1.0e20 {
+                assert!(
+                    differ > 0,
+                    "overflowing products: the derived phases' bits differ"
+                );
             }
         }
     });

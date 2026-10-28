@@ -855,6 +855,8 @@ pub struct Session<T: Transport> {
     resident_matmul_a: bool,
     /// [`Session::set_unpack_transposed_b`].
     unpack_transposed_b: bool,
+    /// [`Session::set_derived_fidelity`].
+    derived_fidelity: bool,
     /// [`Session::set_thin_stream_units`].
     thin_stream_units: bool,
     /// [`Session::set_thin_stream_count`].
@@ -2655,6 +2657,7 @@ impl<T: Transport> Session<T> {
             pending_allocs: 0,
             resident_matmul_a: true,
             unpack_transposed_b: true,
+            derived_fidelity: std::env::var("TT_DERIVED_FIDELITY").is_ok_and(|v| v == "1"),
             thin_stream_units: true,
             // `TT_THIN_STREAM_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             thin_stream_count: units_from_env("TT_THIN_STREAM_UNITS", THIN_STREAM_UNITS),
@@ -8131,6 +8134,11 @@ impl<T: Transport> Session<T> {
                 "a packed `A` is read untransposed: store its transpose".into(),
             ));
         }
+        // Every mantissa bit in the phases the edge formats need ([`Session::set_derived_fidelity`]).
+        let fidelity = match fidelity {
+            Fidelity::HiFi4 if self.derived_fidelity => route.full_precision(),
+            other => other,
+        };
         // A single-face TF32 operand has a validated Src transpose route.
         // Conversion is already required by this product; arbitrary storage
         // transpose and physically packed BF16 remain raw-copy operations.
@@ -9660,6 +9668,16 @@ impl<T: Transport> Session<T> {
     /// each tile as it reads it (`READ_TRANSPOSED`, ~10 us a tile on silicon), the same bits.
     pub fn set_unpack_transposed_b(&mut self, on: bool) {
         self.unpack_transposed_b = on;
+    }
+
+    /// Whether a product asked for at [`Fidelity::HiFi4`] (every mantissa bit) runs only the
+    /// phases its operands' edge formats need ([`SrcRoute::full_precision`], hypothesis H3 of
+    /// `docs/learnings/dataflow-compiler.md`): fewer `MVMUL`s where an edge brings fewer bits.
+    /// Opt-in (`TT_DERIVED_FIDELITY=1`): the bits are HiFi4's wherever no product overflows FP32,
+    /// and differ where one does (`step241`), so it is another numeric contract, not a schedule of
+    /// the default one (ADR 0005). A product asked for at fewer phases runs at them either way.
+    pub fn set_derived_fidelity(&mut self, on: bool) {
+        self.derived_fidelity = on;
     }
 
     /// Whether a one-tile-row GDDR product over a long `K` (at least [`THIN_STREAM_K_TILES`]

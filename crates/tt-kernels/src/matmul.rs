@@ -3277,6 +3277,48 @@ impl SrcRoute {
         }
     }
 
+    /// Each operand's L1 format and `Src` type: `(A, B)`, `A` into `SrcB`, `B` into `SrcA`.
+    pub const fn src_types(self) -> ((TileFormat, SrcType), (TileFormat, SrcType)) {
+        const fn edge(format: TileFormat) -> (TileFormat, SrcType) {
+            if is_fp32(format) {
+                (format, SrcType::Tf32)
+            } else {
+                (format, SrcType::Bf16)
+            }
+        }
+        match self {
+            SrcRoute::Tf32FromFp32 => (
+                (TileFormat::FP32, SrcType::Tf32),
+                (TileFormat::FP32, SrcType::Tf32),
+            ),
+            SrcRoute::Bf16FromFp32 => (
+                (TileFormat::FP32, SrcType::Bf16),
+                (TileFormat::FP32, SrcType::Bf16),
+            ),
+            SrcRoute::Bf16FromBf16 => (
+                (TileFormat::BF16, SrcType::Bf16),
+                (TileFormat::BF16, SrcType::Bf16),
+            ),
+            SrcRoute::Bfp(f) => {
+                let f = TileFormat::new(f.l1_format());
+                ((f, SrcType::Bf16), (f, SrcType::Bf16))
+            }
+            SrcRoute::Edges { a, b } => (edge(a), edge(b)),
+        }
+    }
+
+    /// The fidelity that takes every mantissa bit this route's operands bring into `Src`
+    /// ([`Fidelity::full_precision`]): fewer phases than [`Fidelity::HiFi4`] where an edge brings
+    /// fewer bits (BF16, BFP), the same bits (hypothesis H3, gates `step238`, `step239`,
+    /// `step241`). [`Fidelity::HiFi4`] where no count takes every bit (TF32 in `SrcA`).
+    pub const fn full_precision(self) -> Fidelity {
+        let (a, b) = self.src_types();
+        match Fidelity::full_precision(a, b) {
+            Some(f) => f,
+            None => Fidelity::HiFi4,
+        }
+    }
+
     /// Both operands' slots in a GDDR-staged plan's L1.
     pub const fn slots(self) -> Slots {
         Slots {
@@ -3825,6 +3867,51 @@ mod tests {
     /// [`PairOrder::Auto`] holds both tiles whole exactly where each operand's unpack is measured
     /// whole ([`TileFormat::whole_tile_unpack`]): the routes P4 licensed as before, and a packed
     /// BFP weight beside TF32 since H7; a BF16 or BFP `A` in `SrcB` is not measured.
+    /// The phases each pair of edge formats needs for every mantissa bit (H3): FP32 beside FP32
+    /// keeps all four (TF32 in `SrcA` has a bit no phase takes); fewer bits in an edge, fewer phases.
+    #[test]
+    fn full_precision_by_edges() {
+        use super::{Fidelity as F, SrcRoute};
+        let all = [
+            TileFormat::FP32,
+            TileFormat::BF16,
+            TileFormat::BFP8,
+            TileFormat::BFP4,
+            TileFormat::BFP2,
+        ];
+        for a in all {
+            for b in all {
+                let r = SrcRoute::edges(a, b).unwrap();
+                // TF32 in `SrcA` (`B`): all four. Else `B`'s high slice with `A`'s low one needs
+                // three where `A` brings seven or more bits, `B` four or fewer; both slices of
+                // `B` need two; one where both bring few.
+                let wide_a = matches!(a.l1(), L1Format::Fp32 | L1Format::Bf16);
+                let narrow_b = matches!(b.l1(), L1Format::Bfp4 | L1Format::Bfp2);
+                let want = match (b.l1(), wide_a, narrow_b) {
+                    (L1Format::Fp32, _, _) => F::HiFi4,
+                    (_, true, false) => F::HiFi4,
+                    (_, true, true) => F::HiFi3,
+                    (_, false, false) => F::HiFi2,
+                    (_, false, true) => F::Lo,
+                };
+                assert_eq!(r.full_precision(), want, "{a:?} x {b:?}");
+            }
+        }
+        assert_eq!(SrcRoute::Tf32FromFp32.full_precision(), F::HiFi4);
+        assert_eq!(
+            SrcRoute::Bfp(crate::bfp::BfpFormat::Bfp8).full_precision(),
+            F::HiFi2
+        );
+        assert_eq!(
+            SrcRoute::Bfp(crate::bfp::BfpFormat::Bfp4).full_precision(),
+            F::Lo
+        );
+        assert_eq!(
+            SrcRoute::tf32_with_b(TileFormat::BFP4).full_precision(),
+            F::HiFi3
+        );
+    }
+
     #[test]
     fn auto_holds_tiles_whole_where_each_unpack_is_measured() {
         use super::{PairOrder, SrcRoute};
