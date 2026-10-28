@@ -8,6 +8,7 @@
 
 use tt_isa::backend::ConfigWords;
 use tt_isa::cfg::generated::{alu, thread};
+use tt_isa::format::{SrcType, TileFormat};
 use tt_isa::isa::generated::encode;
 use tt_isa::isa::Instruction;
 use tt_isa::tile::{L1Format, TileImage};
@@ -579,6 +580,30 @@ impl Fidelity {
             Fidelity::HiFi2 => 2,
             Fidelity::HiFi3 => 3,
             Fidelity::HiFi4 => 4,
+        }
+    }
+
+    /// The fidelity that runs the first `phases` phases, 1 to 4.
+    pub const fn from_phases(phases: u32) -> Option<Fidelity> {
+        match phases {
+            1 => Some(Fidelity::Lo),
+            2 => Some(Fidelity::HiFi2),
+            3 => Some(Fidelity::HiFi3),
+            4 => Some(Fidelity::HiFi4),
+            _ => None,
+        }
+    }
+
+    /// The fewest phases that take every mantissa bit both operands bring into `Src`
+    /// ([`tt_isa::format::full_precision_phases`]): `b` is the operand in `SrcA` (in1),
+    /// `a` the one in `SrcB` (in0). `None` where no phase count takes every bit.
+    pub const fn full_precision(
+        a: (TileFormat, SrcType),
+        b: (TileFormat, SrcType),
+    ) -> Option<Fidelity> {
+        match tt_isa::format::full_precision_phases(b, a) {
+            Some(phases) => Fidelity::from_phases(phases),
+            None => None,
         }
     }
 }
@@ -3098,12 +3123,13 @@ pub enum SrcRoute {
     Bf16FromBf16,
     /// Packed block-float operands moved directly to Src.
     Bfp(crate::bfp::BfpFormat),
-    /// `A` as [`SrcRoute::Tf32FromFp32`]; `B` BF16 in L1 (a weight stored in half the bytes),
-    /// moved as is ([`BF16_CODE`]; BF16 in with TF32 out is undefined, which ttsim refuses). A
-    /// BF16 value in `Src` is a TF32 one whose low three mantissa bits are clear, and the product
-    /// is [`SrcRoute::Tf32FromFp32`]'s over the same values bit for bit, specials and every
-    /// fidelity included (gate `step232`; `docs/plans/bf16-weight-storage.md`).
-    Tf32WithBf16B,
+    /// `A` as [`SrcRoute::Tf32FromFp32`]; `B` a weight stored packed in L1 (BF16, half the bytes,
+    /// or BFP8/4/2), moved as is in its own format ([`TileFormat::src_codes`]; a packed format in
+    /// with TF32 out is undefined, which ttsim refuses). A BF16 value in `Src` is a TF32 one whose
+    /// low three mantissa bits are clear, and BFP converts to BF16 losslessly, so the product is
+    /// [`SrcRoute::Tf32FromFp32`]'s over `B`'s values bit for bit (gate `step232` for BF16,
+    /// `step239` for BFP; `docs/plans/bf16-weight-storage.md`).
+    Tf32WithB(TileFormat),
 }
 
 /// The L1 format and `OutDataFormat` of each operand of a product: `A` (in0, into `SrcB`) and
@@ -3137,13 +3163,12 @@ impl SrcRoute {
             SrcRoute::Bf16FromBf16 => (L1Format::Bf16, BF16_CODE),
             SrcRoute::Bfp(format) => (
                 format.l1_format(),
-                match format {
-                    crate::bfp::BfpFormat::Bfp8 => 6,
-                    crate::bfp::BfpFormat::Bfp4 => 7,
-                    crate::bfp::BfpFormat::Bfp2 => 15,
+                match TileFormat::new(format.l1_format()).src_codes(SrcType::Bf16) {
+                    Some((_, out)) => out,
+                    None => panic!("every BFP format's code is measured"),
                 },
             ),
-            SrcRoute::Tf32WithBf16B => (L1Format::Fp32, TF32_CODE),
+            SrcRoute::Tf32WithB(_) => (L1Format::Fp32, TF32_CODE),
         }
     }
 
@@ -3151,11 +3176,14 @@ impl SrcRoute {
     /// slot size of every L1 plan's `A` and outputs; `B`'s is [`SrcRoute::b_slot`].
     pub const fn src_formats(self) -> SrcFormats {
         match self {
-            SrcRoute::Tf32WithBf16B => SrcFormats {
+            SrcRoute::Tf32WithB(b) => SrcFormats {
                 a: L1Format::Fp32,
                 a_out: TF32_CODE,
-                b: L1Format::Bf16,
-                b_out: BF16_CODE,
+                b: b.l1(),
+                b_out: match b.src_codes(SrcType::Bf16) {
+                    Some((_, out)) => out,
+                    None => panic!("a packed `B` unpacks into BF16"),
+                },
             },
             _ => {
                 let (in_fmt, out) = self.formats();
@@ -3164,19 +3192,24 @@ impl SrcRoute {
         }
     }
 
-    /// Whether `B` is BF16 in L1 while `A` is FP32 ([`SrcRoute::Tf32WithBf16B`]).
-    pub const fn bf16_b(self) -> bool {
-        matches!(self, SrcRoute::Tf32WithBf16B)
+    /// `B`'s format where it is a packed weight beside an FP32 `A` ([`SrcRoute::Tf32WithB`]).
+    pub const fn packed_b(self) -> Option<TileFormat> {
+        match self {
+            SrcRoute::Tf32WithB(format) => Some(format),
+            _ => None,
+        }
     }
 
-    /// The bytes a `B` tile takes in a GDDR-staged plan's L1: a BF16 `B`'s own 2,112-byte slot
-    /// ([`tt_isa::dm::record::GATHER_B_BF16`] reads it there), so a ring holds twice the tiles
+    /// The route of a weight stored BF16.
+    pub const TF32_WITH_BF16_B: SrcRoute = SrcRoute::Tf32WithB(TileFormat::BF16);
+
+    /// The bytes a `B` tile takes in a GDDR-staged plan's L1: a packed `B`'s own slot (its format's,
+    /// [`tt_isa::dm::record::gather_b_format`] reads it there), so a ring holds more tiles
     /// (`docs/plans/bf16-weight-storage.md` A5b); [`tt_isa::dm::TILE_SLOT`] otherwise.
     pub const fn b_slot(self) -> u64 {
-        if self.bf16_b() {
-            tt_isa::dm::BF16_TILE_SLOT
-        } else {
-            tt_isa::dm::TILE_SLOT
+        match self.packed_b() {
+            Some(format) => format.slot_bytes(),
+            None => tt_isa::dm::TILE_SLOT,
         }
     }
 }
@@ -3525,7 +3558,9 @@ pub fn plan_floor(
     let p = crate::l1::unnoted(|| {
         let mut p = plan_uncached(mkn, route, fidelity, staging);
         // A BF16 `B`'s ring in the bytes an FP32 one's takes: the most columns up to that which fit.
-        let ring = route.bf16_b() && bf16_plans() == Bf16Plans::Ring && staging != Staging::Host;
+        let ring = route.packed_b().is_some()
+            && bf16_plans() == Bf16Plans::Ring
+            && staging != Staging::Host;
         if let (Some(s), true) = (p.as_mut(), ring) {
             let [mc, kc, nc] = s.tiles;
             let most = (nc as u64 * tt_isa::dm::TILE_SLOT / route.b_slot()) as usize;
@@ -3907,7 +3942,7 @@ mod tests {
         assert_ne!(at(floor - 64, mkn, Staging::SlotsHalf), p);
     }
 
-    /// A BF16 `B` ([`SrcRoute::Tf32WithBf16B`]) takes 2,112-byte slots in every slot layout
+    /// A BF16 `B` ([`SrcRoute::TF32_WITH_BF16_B`]) takes 2,112-byte slots in every slot layout
     /// (`docs/plans/bf16-weight-storage.md` A5b): its pairs step by them, its rings take that many
     /// bytes a page, and a decode product's plan holds more columns than an FP32 `B`'s in the
     /// same arena. An FP32 `B`'s plans are unchanged.
@@ -3915,7 +3950,7 @@ mod tests {
     fn a_bf16_b_plans_compact_slots() {
         use tt_isa::dm::{BF16_TILE_SLOT, TILE_SLOT};
         let fid = Fidelity::HiFi4;
-        let (f32_b, bf16_b) = (SrcRoute::Tf32FromFp32, SrcRoute::Tf32WithBf16B);
+        let (f32_b, bf16_b) = (SrcRoute::Tf32FromFp32, SrcRoute::TF32_WITH_BF16_B);
         assert_eq!(
             (f32_b.b_slot(), bf16_b.b_slot()),
             (TILE_SLOT, BF16_TILE_SLOT)

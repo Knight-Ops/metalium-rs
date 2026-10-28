@@ -28,6 +28,7 @@ use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::dm::record::{self, TensorRef};
 use tt_isa::dm::{TILE_DATA, TILE_SLOT};
 use tt_isa::dram::{Dram, DramChannel, DramRange, CHANNEL_BYTES};
+use tt_isa::format::TileFormat;
 use tt_isa::isa::Instruction;
 
 use crate::dm::DmError;
@@ -605,15 +606,21 @@ pub trait OpPadding {
 /// - `Bool` is `0` or `1` as an `I32` (never `1.0`: an FP32 op sees `1` as a
 ///   denormal and would flush it).
 ///
-/// `Bf16` is the exception: BF16 datums in [`crate::bf16::TILE_SLOT`]-byte slots (a weight
-/// stored in half the bytes, `docs/plans/bf16-weight-storage.md`), which only a product reads,
-/// as its `B` ([`SrcRoute::Tf32WithBf16B`]); every other op refuses it by its elem.
+/// `Packed` is the exception: a weight stored in fewer bytes than FP32, tiles of its
+/// [`TileFormat`] in slots of that format's size (BF16, `docs/plans/bf16-weight-storage.md`; or
+/// BFP8/4/2), which only a product reads, as its `B` ([`SrcRoute::Tf32WithB`]); every other op
+/// refuses it by its elem. The format is the edge's (`docs/learnings/dataflow-compiler.md` §4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
     F32,
     I32,
     Bool,
-    Bf16,
+    Packed(TileFormat),
+}
+
+impl Elem {
+    /// A weight stored BF16.
+    pub const BF16: Elem = Elem::Packed(TileFormat::BF16);
 }
 
 /// A `[rows, cols]` matrix of 32-bit datums in GDDR, tiled, FP32 unless
@@ -664,13 +671,35 @@ impl DramTensor {
         self.placement.slot(i * ct + j)
     }
 
-    /// A BF16 tensor's slots as a stored BF16 weight ([`Elem::Bf16`]): a product's `B`
-    /// ([`SrcRoute::Tf32WithBf16B`]), whose padding is `pad`.
+    /// The format of this tensor's tiles: FP32 for every elem but a packed weight's.
+    pub fn format(&self) -> TileFormat {
+        match self.elem {
+            Elem::Packed(format) => format,
+            Elem::F32 | Elem::I32 | Elem::Bool => TileFormat::FP32,
+        }
+    }
+
+    /// A BFP tensor's slots as a stored BFP weight ([`Elem::Packed`]): a product's `B`
+    /// ([`SrcRoute::Tf32WithB`]). A BFP tensor's padding is zero.
+    pub fn from_bfp(t: crate::bfp::BfpTensor) -> Self {
+        let d = DramTensor {
+            rows: t.rows(),
+            cols: t.cols(),
+            elem: Elem::Packed(TileFormat::new(t.format().l1_format())),
+            placement: t.placement,
+            pad: std::cell::Cell::new(Pad::Undefined),
+        };
+        d.set_pad(Pad::Zero);
+        d
+    }
+
+    /// A BF16 tensor's slots as a stored BF16 weight ([`Elem::BF16`]): a product's `B`
+    /// ([`SrcRoute::Tf32WithB`]), whose padding is `pad`.
     pub fn from_bf16(t: crate::bf16::Bf16Tensor, pad: Pad) -> Self {
         let d = DramTensor {
             rows: t.rows,
             cols: t.cols,
-            elem: Elem::Bf16,
+            elem: Elem::BF16,
             placement: t.placement,
             pad: std::cell::Cell::new(Pad::Undefined),
         };
@@ -681,7 +710,7 @@ impl DramTensor {
     /// A stored BF16 weight's slots as a [`crate::bf16::Bf16Tensor`] (the same allocation,
     /// for the BF16 ops: widening, downloading); `None` for any other elem.
     pub fn as_bf16(&self) -> Option<crate::bf16::Bf16Tensor> {
-        (self.elem == Elem::Bf16).then(|| crate::bf16::Bf16Tensor {
+        (self.elem == Elem::BF16).then(|| crate::bf16::Bf16Tensor {
             rows: self.rows,
             cols: self.cols,
             placement: self.placement.clone(),
@@ -1851,15 +1880,14 @@ pub(crate) fn matmul_dram_prefetching(
     a.expect("a matmul", Elem::F32)?;
     b.expect(
         "a matmul",
-        if route.bf16_b() {
-            Elem::Bf16
-        } else {
-            Elem::F32
+        match route.packed_b() {
+            Some(format) => Elem::Packed(format),
+            None => Elem::F32,
         },
     )?;
-    if route.bf16_b() && b_transposed {
+    if route.packed_b().is_some() && b_transposed {
         return Err(TensorError::Shape(
-            "a BF16 `B` is read untransposed: store its transpose".into(),
+            "a packed `B` is read untransposed: store its transpose".into(),
         ));
     }
     let (m, ka) = if a_transposed {
@@ -2062,14 +2090,15 @@ pub(crate) fn matmul_dram_prefetching(
     ))
 }
 
-/// [`record::GATHER_B_BF16`] where `route` reads a BF16 `B` ([`SrcRoute::Tf32WithBf16B`]): its
-/// tiles from their BF16 slots into 2,112-byte L1 slots, which every layout of the route plans
-/// ([`SrcRoute::b_slot`]).
+/// [`record::gather_b_format`] where `route` reads a packed `B` ([`SrcRoute::Tf32WithB`]): its
+/// tiles from their slots into L1 slots of its format's size, which every layout of the route
+/// plans ([`SrcRoute::b_slot`]).
 fn gather_b_format(route: SrcRoute) -> u32 {
-    if route.bf16_b() {
-        record::GATHER_B_BF16
-    } else {
-        0
+    match route.packed_b() {
+        Some(format) => {
+            record::gather_b_format(format.l1()).expect("a route's packed `B` is a gather format")
+        }
+        None => 0,
     }
 }
 
@@ -7928,7 +7957,9 @@ mod tests {
                     Some(Elem::F32) | None => floats.to_vec(),
                     Some(Elem::Bool) => vec![f32::from_bits(1)],
                     Some(Elem::I32) => [1, u32::MAX, 0x8000_0000].map(f32::from_bits).to_vec(),
-                    Some(Elem::Bf16) => unreachable!("no element-wise kind takes BF16"),
+                    Some(Elem::Packed(_)) => {
+                        unreachable!("no element-wise kind takes a packed weight")
+                    }
                 }
             };
             for s in scalars {

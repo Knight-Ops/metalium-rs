@@ -19,6 +19,7 @@ pub mod dataflow;
 pub mod dm;
 pub mod dram;
 pub mod eth;
+pub mod format;
 pub mod frontend;
 pub mod hazard;
 pub mod isa;

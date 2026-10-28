@@ -1834,7 +1834,7 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
                 TXN,
                 dm::stream_cap(
                     rd(M.at(dm::STREAM_CAP)),
-                    rec[0][1] & record::GATHER_B_BF16 != 0,
+                    record::gather_b_packed(rec[0][1]),
                 ),
             );
         }

@@ -36,6 +36,7 @@ flowchart TD
         L6["streaming-dataflow-architecture.md (Reader/Writer Contract)"]
         L7["kernel-fusion-architecture.md (Two-Stage Fusion & Dst/L1)"]
         L8["tt-metal-comparison.md (+ method): where we stand against tt-metal, fixes to investigate"]
+        L9["dataflow-compiler.md (Design Principles below Burn, ADRs 0003-0005)"]
     end
 
     subgraph Done["docs/completed-plans/ (archive)"]
@@ -56,7 +57,7 @@ flowchart TD
 search them with `scryer query-adrs`. So far:
 [0001](adr/0001-llm-support-is-generic-across-architectures-not-model-specific.md), LLM support is generic across
 architectures; [0002](adr/0002-profiling-is-one-switchable-mode-and-costs-nothing-unless-built-in.md), profiling is
-one switchable mode and costs nothing unless built in.
+one switchable mode and costs nothing unless built in; [0003](adr/0003-a-tile-level-dataflow-compiler-below-burn.md), a tile-level dataflow compiler below Burn; [0004](adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md), formats are edge data converted only at unpack and pack; [0005](adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md), every op has a numeric contract and schedules choose only among bit-equivalent options.
 
 ## The Three Tiers
 
@@ -72,7 +73,8 @@ Permanent, cumulative empirical realities discovered through silicon execution, 
   - [`tt-metal-concepts-review.md`](learnings/tt-metal-concepts-review.md): Architectural comparison of tt-metal concepts (G1–G16) vs this native Rust stack.
   - [`tt-metal-comparison.md`](learnings/tt-metal-comparison.md): Dated snapshot (2026-10-26) of the project's state and of every performance result and limit against tt-metal's own LLM stack (traces, dispatch cost, attention, SFPU, multi-chip, DRAM), with fixes to investigate (F1-F27). Re-run it with [`tt-metal-comparison-method.md`](learnings/tt-metal-comparison-method.md): the procedure, claims sheet and agent prompts.
   - [`streaming-dataflow-architecture.md`](learnings/streaming-dataflow-architecture.md): The core architectural contract of the GDDR streaming scheduler (B reader on NoC0, T0–T2 compute, NC writer on NoC1, streaming credits, transfer channels).
-  - [`kernel-fusion-architecture.md`](learnings/kernel-fusion-architecture.md): Architectural ground truth on two-stage kernel fusion (Burn IR vs. Tensix hardware), Dst register allocation, and L1 Circular Buffer streaming.
+  - [`dataflow-compiler.md`](learnings/dataflow-compiler.md): **The design principles every optimization below Burn builds on** (ADRs 0003-0005): the machine's fundamental truths, Kahn semantics and per-op numeric contracts, formats as edge data, the tile-generic op and dataflow-graph IR, transforms written once with their legality, credits and deadlock checks, the cost model, decisions between Tenstorrent's designs and alternatives, and a hypotheses register. Every principle carries its evidence.
+  - [`kernel-fusion-architecture.md`](learnings/kernel-fusion-architecture.md): Architectural ground truth on two-stage kernel fusion (Burn IR vs. Tensix hardware), Dst register allocation, and L1 Circular Buffer streaming. Its §4 (no second graph compiler) and §6.2 are superseded by `dataflow-compiler.md`.
 
 ### 2. `docs/plans/` — Active Implementation Plans
 Actionable technical specifications, interface contracts, and execution checklists (`[ ]` / `[x]`) for active and long-running engineering milestones.
@@ -90,6 +92,7 @@ Actionable technical specifications, interface contracts, and execution checklis
   - [`mixed-bfp-storage.md`](plans/mixed-bfp-storage.md): Delivered BFP8/4/2 storage and training contract, acceptance checklist, PRNG diagnostics and remaining application RNG work.
   - [`traced-execution.md`](plans/traced-execution.md): Comprehensive implementation plan for generalized multi-input inference and whole training step hardware traces (`TracedInference`, `TracedTrainingStep`).
   - [`kernel-fusion.md`](plans/kernel-fusion.md): Actionable specification and execution checklist for Burn backend kernel fusion milestones B12 and B13a–B13c.
+  - [`dataflow-compiler.md`](plans/dataflow-compiler.md): the staged dataflow compiler (2026-10-28): card-1 baselines, `TileFormat` and one matmul for every format pair, typed channels with cross-core credits, the tile-generic op, operand reuse (compute) and channels instead of barriers (decode), `Dst` subblocks, then fusion and spatial pipelining; each stage a hypothesis with a kill criterion.
   - [`decode-matmul-bandwidth.md`](plans/decode-matmul-bandwidth.md): an LLM decode step's `m = 1` products against GDDR's bandwidth (P0-P3 done: thin activation reads, an even last round, fused projections; P5 open: one channel a column).
   - [`decode-to-bandwidth.md`](plans/decode-to-bandwidth.md): the umbrella plan for single-user decode at 90-95% of GDDR's bandwidth, ordering the decode plans below; with [`decode-attention.md`](plans/decode-attention.md) (attention reading the cache in place).
   - [`decode-small-ops.md`](plans/decode-small-ops.md): the decode step's non-matmul half (RMSNorm, RoPE, attention, SiLU): repack fixes first, then where fusion lives.

@@ -4,7 +4,7 @@
 //! A BF16 value is an FP32 one with its low sixteen bits clear, and the unpacker's TF32 keeps the
 //! top ten mantissa bits, so in `Src` the two should be the same datum. If the Matrix Unit's
 //! phases slice `SrcA` by its bit positions alone, a weight stored BF16 multiplies exactly as the
-//! same weight widened to FP32 -- at half the bytes. `SrcRoute::Tf32WithBf16B` (`B` moved as BF16,
+//! same weight widened to FP32 -- at half the bytes. `SrcRoute::TF32_WITH_BF16_B` (`B` moved as BF16,
 //! `A` truncated to TF32) is checked against `SrcRoute::Tf32FromFp32` over the same values at
 //! every fidelity, specials included; the control stages `B` values with mantissa bits below
 //! BF16's, which the BF16 staging must lose. (BF16 in with TF32 out is the other way to write
@@ -121,7 +121,7 @@ fn bf16_b_is_the_fp32_product_bit_for_bit() {
                 want.iter().any(|&w| w != 0),
                 "the reference must not be empty"
             );
-            let got = product(&a, &b, mkn, SrcRoute::Tf32WithBf16B, fidelity);
+            let got = product(&a, &b, mkn, SrcRoute::TF32_WITH_BF16_B, fidelity);
             if let Some((i, g, w)) = first_difference(&got, &want) {
                 let count = got.iter().zip(&want).filter(|(g, w)| g != w).count();
                 panic!(
@@ -139,7 +139,7 @@ fn bf16_b_is_the_fp32_product_bit_for_bit() {
         .map(|v| f32::from_bits(v.to_bits() | 0x0000_7000))
         .collect();
     let want = product(&a, &b, mkn, SrcRoute::Tf32FromFp32, Fidelity::HiFi4);
-    let got = product(&a, &b, mkn, SrcRoute::Tf32WithBf16B, Fidelity::HiFi4);
+    let got = product(&a, &b, mkn, SrcRoute::TF32_WITH_BF16_B, Fidelity::HiFi4);
     assert!(
         first_difference(&got, &want).is_some(),
         "BF16 staging must lose the low bits the FP32 route keeps"

@@ -1,7 +1,7 @@
 //! Per-tensor physical storage, separate from the logical F32 dtype.
 //!
 //! [`StorageFormat::Bf16`] is a weight in half the bytes: a product reads it as its `B` directly
-//! (bit for bit the product of its values in F32, `tt_kernels::matmul::SrcRoute::Tf32WithBf16B`),
+//! (bit for bit the product of its values in F32, `tt_kernels::matmul::SrcRoute::TF32_WITH_BF16_B`),
 //! and every other op widens it first. Storing rounds ties-even, so it is exact for BF16-valued
 //! data (a BF16 checkpoint widened to F32).
 //!

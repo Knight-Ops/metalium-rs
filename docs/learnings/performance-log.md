@@ -14,6 +14,8 @@ The chronology is the [Change log](#change-log).
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
 | [The GDDR write benches run again](#the-gddr-write-benches-run-again-2026-10-28-card-0) | 2026-10-28 | broken since the B/NC split (`3c7756b`: a barrier is B's, NC refused the lists); NC's writes now run in B's transfer packets behind B's barrier: NoC #1 writes 403-408 / 385-388 GB/s at 16 / 120 tiles, as before; 235 at 4 (was 299: the handoff on a short run) |
 | [Why card-wide reads plateau at 469, and what it means for decode](#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0) | 2026-10-28 | `fast-reads`: the 120-tile read loses ~30 GB/s of steady state to too many requests in flight a channel (knee ~32), ~15 to crossing the chip (each tile on its half's channels: ~505 steady, 495 overall) and the rest to an unfair finish; decode's caps re-swept: lowering any of them slows the step (B's own cap 2: +0.45 ms), the defaults stay; `fast-reads` decode 11.05 / 12.39-12.42 ms against the safe image's 11.38 / 12.55 |
+| [Packed weights on the block-stream path: what bytes buy](#packed-weights-on-the-block-stream-path-what-bytes-buy-2026-10-28-card-1) | 2026-10-28 | BFP8/4/2 weights on BF16's product path, bit for bit (`step239`, card 1); one-row products take ~400-470 us whatever the weight's bytes in the probe's session (entry-bound, not the decode configuration): the 1.5x prediction not borne out there; at prefill BFP is 14.8 TFLOPS against BF16's 22.3 (face order, fidelity-bound), HiFi3 derived and exact 1.17x; next: whole tiles for packed formats (H7) |
+| [Card-1 baselines for the dataflow compiler, and exact fidelity](#card-1-baselines-for-the-dataflow-compiler-and-exact-fidelity-2026-10-28-card-1) | 2026-10-28 | Stage 0 of `docs/plans/dataflow-compiler.md` on card 1: matmul at prefill shapes, ResNet-18 / ViT-Tiny traced (host 38.45 / 26.77 ms), SmolLM2-135M decode **6.92 / 7.46 / 8.13 ms** and 1.7B **11.20 / 11.83 / 12.62** at the scoreboard's conditions (`TT_SPREAD=work:64:4` makes decode 9.9-11.1 and 18.7-21.4: not the decode condition), MNIST 1.398 / 2.882 / 8.290 ms/step; H3 confirmed: BFP8 at 2 phases and BFP4/BFP2 at 1 equal HiFi4 bit for bit (`step238`, `1793150259`) |
 | [The card's GDDR reads over a decode step](#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0) | 2026-10-27 | the profile mode now sums every unit's issued GDDR reads into the card's rate in eighths of each op's span (`READ_BYTES` marks), held against the card's 512 GB/s peak (not 469): the 1.7B `Step(64)` reads 3,568 MB at 328 GB/s (64%), at 90%+ for only 1.9 of 10.9 ms; every product starts near the peak and ends in a tail (`gate\|up` 634 -> 89 GB/s, `down` 617 -> 68), `down`'s middle half ~300, the small ops 319; the marks cost tile-sized plain reads ~1% in a `profile` image (~4% while a check sat in the list loop) and the decode step nothing |
 | [F27 probed: bank-local reads, and what does not bind a decode product](#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0) | 2026-10-27 | the profile mode counts each op's reads by channel and NoC #0 endpoint (`channels.tsv`): the 1.7B's products read every channel evenly (busiest 1.00 of an even share), one endpoint 1.33x; `gddr_readers_by_channel`: a tile reads 2,112-byte entries at ~6.5 GB/s (safe) or ~35 (`fast-reads`), 1-8 tiles a channel at that size reach 51-425 / 89-466 GB/s, today's decode deal 364-449 / 429-491, long entries 505-510 at 2+ readers a channel: **bank-local reads add nothing**; with reads 5x cheaper a step moves 10.82 -> 10.60 ms (`down` 120.8 -> 114.9 us): **a unit's read rate does not bind a product**; F27 stopped, A2 and A3 not built |
 | [The tt-mnist regression found, and RMSNorm's scale in its op](#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1) | 2026-10-27 | the scoreboard's MNIST and transformer rows were 2026-10-03/04 numbers, MNIST since on a 5.3x larger model; the transformer's 9.2 -> 92 ms/step bisected to `c4255c7` (9.2 -> 22.6) and `6d979e7` (-> 329: the embedding gradient's ~20 ops an index); that gradient as one op, **92.5 -> 10.9 ms/step**, the same losses; cross-entropy's gather and scatter-add as one and a few ops: MNIST 784-128-10 **2.0 -> 1.39 ms/step** (`3344db6` 1.4), the transformer **-> 8.21** (`3344db6` 9.2); tt-mnist in `cargo xtask bench`; RMSNorm's scale inside the norm's op, a 1.7B step **11.31 -> 11.18 ms**; a residual sum and its norm as one op, bit for bit but slower (11.18 -> 11.26), opt-in; a ragged RMS statistic of 18-31 rows at 2048 columns hung (its unrolled programs past a program slot), fixed |
@@ -433,6 +435,61 @@ KiB entries, cap 8, GB/s:
 
 From 16 tiles up the same within noise; at 4 tiles the packet's credit handoff and NC's start are a large share of a
 ~67 us run. One channel: 63.3-63.9 GB/s (99.8%) at every NoC setting.
+
+## Card-1 baselines for the dataflow compiler, and exact fidelity (2026-10-28, card 1)
+
+Stage 0 of [dataflow-compiler.md](../plans/dataflow-compiler.md): the numbers its stages are held to, on card 1 (the
+owner's card for this work), release, at `4f545b2`-`b9ba4c2` (format plumbing that changes no product's bits, gated
+bit-for-bit on ttsim and card 1 before the runs it shares).
+
+- **Products at prefill shapes** (`matmul_throughput`, every tile, TF32/HiFi4, `1793149570`): `[256,2048]@[2048,2048]`
+  4.65 TFLOPS, `@[2048,8192]` 10.84, `[1024,2048]@[2048,2048]` 8.45, `@[2048,8192]` **14.64** (card 1's 14.88 of
+  `1793039140`), GDDR reads 175-250 GB/s.
+- **ResNet-18 / ViT-Tiny traced** (`silicon_bench_models`, host timing through readback, `1793149570`): **38.45 / 26.77
+  ms**, the same as `1793119700`'s 38.52 / 26.88 on that measure (burn-flex 154.9 / 106.0). The scoreboard's "traced
+  12.90 / 7.89" for that run is a different measure from the bench's host time; which one is to be pinned before a stage
+  quotes either.
+- **SmolLM2 decode, traced, at the scoreboard's conditions** (`TT_TILES=all`, default spread): 135M **6.92 / 7.46 /
+  8.13 ms** at 32 / 128 / 256 tokens (`1793150978`; card 0's 6.92 / 7.47 / 8.14), 1.7B **11.20 / 11.83 / 12.62**
+  (`1793151302`; 11.32 / 11.84 / 12.64). With `TT_SPREAD=work:64:4` added (the untraced model rows' condition) decode is
+  9.93 / 10.46 / 11.07 and 21.44 / 19.00 / 18.67 (`1793149821`, `1793150285`): that spread is not decode's condition.
+- **tt-mnist training** (`bench_training`, `1793150926`): 1.398 / 2.882 / 8.290 ms/step (`1793128372`'s 1.387 / 2.882 /
+  8.210).
+
+**H3, exact fidelity** ([dataflow-compiler.md](dataflow-compiler.md) §13; gate `step238_exact_fidelity`, ttsim and card 1
+`1793150259`): a product that runs only the fidelity phases its operand formats need
+(`tt_isa::format::full_precision_phases`) equals HiFi4 bit for bit for same-format BFP: BFP8 at 2 phases, BFP4 and
+BFP2 at 1. Its data put groups of eight terms over seven binades and zeros of both signs, at one K block and across
+reloads. BFP8 at 1 phase differs (the control).
+
+## Packed weights on the block-stream path: what bytes buy (2026-10-28, card 1)
+
+F1c of [dataflow-compiler.md](../plans/dataflow-compiler.md) puts a BFP8/4/2 weight on the product path a BF16 weight
+takes (`SrcRoute::Tf32WithB`). Gate `step239_packed_weight_products` passes on ttsim and card 1 (`1793152118`): eight
+product paths for each format, bit for bit the FP32 product of the decoded values, and TF32 beside BFP at the derived phase
+count (three) equal to HiFi4. That is H3 for mixed pairs.
+
+`silicon_probe_pair_cost::pair_cost` (`1793152122`, every tile, traced, the probe's own session) with the weight in each
+format, in us:
+
+| product | FP32 | BF16 | BFP8 | BFP4 | BFP2 |
+|---|--:|--:|--:|--:|--:|
+| `[1,2048]@[2048,8192]` HiFi4 | 403 | 426 | 414 | 411 | 413 |
+| `[1,8192]@[8192,2048]` HiFi4 | 399 | 464 | 472 | 465 | 472 |
+| `[1024,2048]@[2048,8192]` HiFi4 | 2,170 (15.8 TFLOPS) | 1,538 (22.3) | 2,323 (14.8) | 2,323 (14.8) | 2,331 (14.7) |
+| the same at HiFi3 / LoFi | 2,179 / 2,173 | 1,534 / 1,541 | 1,979 / 1,705 | 1,982 / 1,703 | 1,979 / 1,705 |
+
+- **The prediction "a BFP4 weight beats BF16 at decode shapes by at least 1.5x" is not borne out in this probe.** One-row
+  products take the same time whatever the weight's bytes (0.09-1.0 of FP32's). In this session they read ~168 GB/s of
+  FP32 weight, so they are bound by the mover's entries a tile, not the bytes (T8 of
+  [dataflow-compiler.md](dataflow-compiler.md): a tile's read rate is set by its entry size). It is not the decode step's
+  configuration, where products read ~430 GB/s. The prediction is to be judged through the model's own decode path,
+  once burn-tt routes a BFP weight there (F1c, burn-tt).
+- **At prefill shapes a BFP weight is slower than BF16** (14.8 against 22.3 TFLOPS at HiFi4). A packed BFP `B` takes
+  the face order: `PairOrder::Auto` gives whole tiles to FP32/BF16 operands only, by name. That order is fidelity-bound
+  (2,323 / 1,979 / 1,705 us at four / three / one phases), where BF16's whole-tile order is not. So the derived fidelity
+  for TF32 beside BFP4/BFP2 (three phases, bit for bit, `step239`) is worth 1.17x free. The next lever is whole tiles
+  for packed formats (hypothesis H7, [dataflow-compiler.md](dataflow-compiler.md) §13).
 
 ## The card's GDDR reads over a decode step (2026-10-27, card 0)
 

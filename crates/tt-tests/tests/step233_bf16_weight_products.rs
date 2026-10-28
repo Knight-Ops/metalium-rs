@@ -1,11 +1,11 @@
-//! A weight stored BF16 (`Session::store_bf16`, `tensor::Elem::Bf16`: half the bytes) multiplies
+//! A weight stored BF16 (`Session::store_bf16`, `tensor::Elem::BF16`: half the bytes) multiplies
 //! as the same weight in FP32, bit for bit, on every path a product takes: whole tiles, a thin
 //! last tile row, `K` blocks, a packed one-row `A`, a streamed `K`, 2-D blocks with `K` streamed,
 //! ragged edges, and a capture whose products read their weights ahead on idle units
 //! (`docs/plans/bf16-weight-storage.md` A2). Its `B` is read from BF16 slots into 2,112-byte L1
 //! slots (`record::GATHER_B_BF16`, A5b: every layout steps `B` by `SrcRoute::b_slot`, the looped
 //! 2-D block kernel by a register of its own, so both block kernels are run) and unpacked as BF16
-//! (`SrcRoute::Tf32WithBf16B`, gate `step232`).
+//! (`SrcRoute::TF32_WITH_BF16_B`, gate `step232`).
 //! The control stores a weight with mantissa bits below BF16's, which the storage rounds away.
 use tt_kernels::kind;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
@@ -172,7 +172,7 @@ fn a_stored_bf16_weight_multiplies_as_its_fp32_values() {
             let wv = bf16_values(200 + seed, k * n);
             let w = s.upload(&wv, k, n).unwrap();
             let stored = store(s, &w, &wv);
-            assert_eq!(stored.elem, tt_kernels::tensor::Elem::Bf16);
+            assert_eq!(stored.elem, tt_kernels::tensor::Elem::BF16);
             s.set_matmul_k_block_limit(limit.and_then(std::num::NonZeroUsize::new));
             s.set_block_stream(block);
             // 2-D blocks: the looped kernel and the unrolled one.

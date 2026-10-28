@@ -11,6 +11,7 @@ use tt_isa::{
     cfg::generated::{alu, thcon},
     dm::{op, TILE_DATA},
     dram::DramRange,
+    format::TileFormat,
     isa::{generated::encode, Instruction},
     matrix::Banks,
     sync::{self, Unit},
@@ -37,9 +38,10 @@ impl BfpFormat {
         TileImage::new(datapath::tile_descriptor(), self.l1_format())
             .expect("fixed BFP tile layout")
     }
-    /// Includes header, exponent section, packed datums and 64-byte alignment.
-    pub fn slot_bytes(self) -> u64 {
-        (self.tile_image().total_bytes().div_ceil(64) * 64) as u64
+    /// Includes header, exponent section, packed datums and 64-byte alignment
+    /// ([`TileFormat::slot_bytes`]).
+    pub const fn slot_bytes(self) -> u64 {
+        TileFormat::new(self.l1_format()).slot_bytes()
     }
     fn code(self) -> u32 {
         self.l1_format().code().expect("measured BFP format")
