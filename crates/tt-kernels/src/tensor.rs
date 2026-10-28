@@ -5100,8 +5100,9 @@ fn measure_reduce_group(
     }
     let (inputs, _) = math_programs(op, axis, per, valid);
     let fin = finishing(op, axis, then)?;
+    // Measured, not the op's: not noted (`crate::l1::unnoted`), as an SFPU group's are.
     let lens = |n: usize| -> Option<[usize; 3]> {
-        let layout = plan_layout(n, per).ok()?;
+        let layout = crate::l1::unnoted(|| plan_layout(n, per)).ok()?;
         // As stored: a repeated block once, with its loop table
         // (`sfpu::reduce::roles_code`).
         let (code, loops) = roles_code(&layout, &inputs, &fin);
