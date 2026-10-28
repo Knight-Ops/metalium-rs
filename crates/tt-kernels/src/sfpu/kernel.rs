@@ -131,35 +131,56 @@ pub fn plan_layout_in(
     operands: Operands,
     arena: tt_isa::l1::Region,
 ) -> Result<Layout, PlanError> {
+    let req = std::sync::Arc::new(requirements(tiles, operands));
+    let plan = req.plan(arena)?;
+    Ok(Layout::placed(
+        tiles,
+        operands,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// What a run of `tiles` tiles needs: slots for the operands and the outputs, and the three
+/// semaphores ([`Layout::placed`] reads them back).
+pub fn requirements(tiles: usize, operands: Operands) -> Requirements {
     let mut req = Requirements::new(1);
     let bytes = tiles as u64 * TILE_SLOT;
     let align = tt_isa::dram::ALIGN;
-    let a = req.scratch("sfpu A slots", bytes, align, 0..1);
-    let b = (operands != Operands::Unary).then(|| req.scratch("sfpu B slots", bytes, align, 0..1));
-    let c =
-        (operands == Operands::Ternary).then(|| req.scratch("sfpu C slots", bytes, align, 0..1));
-    let out = req.scratch("sfpu output slots", bytes, align, 0..1);
+    req.scratch("sfpu A slots", bytes, align, 0..1);
+    if operands != Operands::Unary {
+        req.scratch("sfpu B slots", bytes, align, 0..1);
+    }
+    if operands == Operands::Ternary {
+        req.scratch("sfpu C slots", bytes, align, 0..1);
+    }
+    req.scratch("sfpu output slots", bytes, align, 0..1);
     // Declared in this order so the planner numbers them as a matmul's are --
     // the first starting at zero, the second at one -- and a tile that ran
     // one needs no setup run before the other (`runtime::Resident`).
-    let unpacked = req.semaphore("sfpu unpacked", 0, 0..1);
-    let free = req.semaphore("sfpu Dst free", 1, 0..1);
-    let computed = req.semaphore("sfpu computed", 0, 0..1);
-    let plan = req.plan(arena)?;
-    Ok(Layout {
-        tiles,
-        a_at: plan.addr(a),
-        b_at: b.map(|b| plan.addr(b)),
-        b_once: false,
-        c_at: c.map(|c| plan.addr(c)),
-        out_at: plan.addr(out),
-        sems: SfpuSemaphores {
-            unpacked: plan.semaphore(unpacked),
-            computed: plan.semaphore(computed),
-            free: plan.semaphore(free),
-        },
-        init: plan.semaphore_init(),
-    })
+    req.semaphore("sfpu unpacked", 0, 0..1);
+    req.semaphore("sfpu Dst free", 1, 0..1);
+    req.semaphore("sfpu computed", 0, 0..1);
+    req
+}
+
+impl Layout {
+    /// A run of `tiles` tiles where its [`requirements`] were placed.
+    pub fn placed(tiles: usize, operands: Operands, l1: &crate::l1::Placed) -> Layout {
+        Layout {
+            tiles,
+            a_at: l1.addr("sfpu A slots"),
+            b_at: (operands != Operands::Unary).then(|| l1.addr("sfpu B slots")),
+            b_once: false,
+            c_at: (operands == Operands::Ternary).then(|| l1.addr("sfpu C slots")),
+            out_at: l1.addr("sfpu output slots"),
+            sems: SfpuSemaphores {
+                unpacked: l1.semaphore("sfpu unpacked"),
+                computed: l1.semaphore("sfpu computed"),
+                free: l1.semaphore("sfpu Dst free"),
+            },
+            init: l1.semaphore_init(),
+        }
+    }
 }
 
 /// Most tiles a run may have: a slot per operand and one for the output, each,

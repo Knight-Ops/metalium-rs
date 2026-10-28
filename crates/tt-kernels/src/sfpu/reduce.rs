@@ -491,33 +491,56 @@ pub fn plan_layout_in(
     per: usize,
     arena: tt_isa::l1::Region,
 ) -> Result<Layout, PlanError> {
+    let req = std::sync::Arc::new(requirements(outputs, per));
+    let plan = req.plan(arena)?;
+    Ok(Layout::placed(
+        outputs,
+        per,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// What a run of `outputs` output tiles, each from `per` input tiles, needs: the inputs' and the
+/// outputs' slots, and the four semaphores ([`Layout::placed`] reads them back).
+pub fn requirements(outputs: usize, per: usize) -> Requirements {
     let mut req = Requirements::new(1);
     let align = tt_isa::dram::ALIGN;
-    let input = req.scratch(
+    req.scratch(
         "reduce inputs",
         (outputs * per) as u64 * TILE_SLOT,
         align,
         0..1,
     );
-    let out = req.scratch("reduce outputs", outputs as u64 * TILE_SLOT, align, 0..1);
-    let unpacked = req.semaphore("reduce unpacked", 0, 0..1);
-    let consumed = req.semaphore("reduce consumed", 1, 0..1);
-    let computed = req.semaphore("reduce computed", 0, 0..1);
-    let packed = req.semaphore("reduce packed", 1, 0..1);
-    let plan = req.plan(arena)?;
-    Ok(Layout {
-        outputs,
-        per,
-        in_at: plan.addr(input),
-        out_at: plan.addr(out),
-        sems: ReduceSemaphores {
-            unpacked: plan.semaphore(unpacked),
-            consumed: plan.semaphore(consumed),
-            computed: plan.semaphore(computed),
-            packed: plan.semaphore(packed),
-        },
-        init: plan.semaphore_init(),
-    })
+    req.scratch("reduce outputs", outputs as u64 * TILE_SLOT, align, 0..1);
+    declare_semaphores(&mut req);
+    req
+}
+
+fn declare_semaphores(req: &mut Requirements) {
+    req.semaphore("reduce unpacked", 0, 0..1);
+    req.semaphore("reduce consumed", 1, 0..1);
+    req.semaphore("reduce computed", 0, 0..1);
+    req.semaphore("reduce packed", 1, 0..1);
+}
+
+impl Layout {
+    /// A run of `outputs` output tiles, each from `per` input tiles, where its [`requirements`]
+    /// (or a chunk's, [`chunk_requirements`]) were placed.
+    pub fn placed(outputs: usize, per: usize, l1: &crate::l1::Placed) -> Layout {
+        Layout {
+            outputs,
+            per,
+            in_at: l1.addr("reduce inputs"),
+            out_at: l1.addr("reduce outputs"),
+            sems: ReduceSemaphores {
+                unpacked: l1.semaphore("reduce unpacked"),
+                consumed: l1.semaphore("reduce consumed"),
+                computed: l1.semaphore("reduce computed"),
+                packed: l1.semaphore("reduce packed"),
+            },
+            init: l1.semaphore_init(),
+        }
+    }
 }
 
 /// The math programs of one output tile: per input, in order, then the
@@ -844,37 +867,39 @@ pub struct ChunkLayout {
 }
 
 pub fn plan_chunk_layout(outputs: usize) -> Result<ChunkLayout, PlanError> {
+    let req = std::sync::Arc::new(chunk_requirements(outputs));
+    let plan = req.plan(crate::l1::arena())?;
+    Ok(ChunkLayout::placed(
+        outputs,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// What a chunk of `outputs` output tiles needs: their priors, a chunk's inputs, the outputs and
+/// the four semaphores ([`ChunkLayout::placed`] reads them back).
+pub fn chunk_requirements(outputs: usize) -> Requirements {
     let mut req = Requirements::new(1);
     let align = tt_isa::dram::ALIGN;
-    let prior = req.scratch("sum prior", outputs as u64 * TILE_SLOT, align, 0..1);
-    let input = req.scratch(
-        "sum inputs",
+    req.scratch("sum prior", outputs as u64 * TILE_SLOT, align, 0..1);
+    req.scratch(
+        "reduce inputs",
         (outputs * ROW_CHUNK) as u64 * TILE_SLOT,
         align,
         0..1,
     );
-    let out = req.scratch("sum outputs", outputs as u64 * TILE_SLOT, align, 0..1);
-    let unpacked = req.semaphore("reduce unpacked", 0, 0..1);
-    let consumed = req.semaphore("reduce consumed", 1, 0..1);
-    let computed = req.semaphore("reduce computed", 0, 0..1);
-    let packed = req.semaphore("reduce packed", 1, 0..1);
-    let plan = req.plan(crate::l1::arena())?;
-    Ok(ChunkLayout {
-        layout: Layout {
-            outputs,
-            per: ROW_CHUNK,
-            in_at: plan.addr(input),
-            out_at: plan.addr(out),
-            sems: ReduceSemaphores {
-                unpacked: plan.semaphore(unpacked),
-                consumed: plan.semaphore(consumed),
-                computed: plan.semaphore(computed),
-                packed: plan.semaphore(packed),
-            },
-            init: plan.semaphore_init(),
-        },
-        prior_at: plan.addr(prior),
-    })
+    req.scratch("reduce outputs", outputs as u64 * TILE_SLOT, align, 0..1);
+    declare_semaphores(&mut req);
+    req
+}
+
+impl ChunkLayout {
+    /// A chunk of `outputs` output tiles where its [`chunk_requirements`] were placed.
+    pub fn placed(outputs: usize, l1: &crate::l1::Placed) -> ChunkLayout {
+        ChunkLayout {
+            layout: Layout::placed(outputs, ROW_CHUNK, l1),
+            prior_at: l1.addr("sum prior"),
+        }
+    }
 }
 
 /// The role programs of one chunk of a long sum over rows: `tiles` input

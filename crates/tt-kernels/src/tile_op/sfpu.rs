@@ -1,7 +1,12 @@
 //! The pointwise SFPU family as a [`TileOp`]: every kind of `sfpu::ops` (`Eltwise`), unary,
 //! binary with any broadcast, and ternary, over blocks of resident tensors.
 
-use super::{Access, Dim, Iter, Layout, Microkernel, NumericContract, RunCode, TileMap, TileOp};
+use std::sync::{Arc, OnceLock};
+
+use super::{
+    allocate, Access, At, Dim, Iter, Layout, Microkernel, NumericContract, RunCode, TileMap, TileOp,
+};
+use crate::l1::{Placed, Requirements};
 use crate::sfpu::kernel::Operands;
 use crate::sfpu::ops::Broadcast;
 use crate::tensor::{self, BlockOperand, DramTensor, Eltwise, Result, TensorError};
@@ -171,7 +176,21 @@ impl Microkernel for Sfpu {
         Some(tensor::sfpu_group(self.op, self.bcast, self.operands, half))
     }
 
-    fn run(&self, len: usize, half: Option<u8>, held: &[bool]) -> Result<RunCode> {
+    fn needs(&self, at: &At<'_>) -> Result<Arc<Requirements>> {
+        static MEMO: allocate::Declared<(usize, Operands)> = OnceLock::new();
+        let &At::Run { len, .. } = at else {
+            return Err(at.refused());
+        };
+        let operands = self.operands;
+        Ok(allocate::declared(&MEMO, (len, operands), || {
+            crate::sfpu::kernel::requirements(len, operands)
+        }))
+    }
+
+    fn code(&self, at: &At<'_>, l1: &Placed) -> Result<RunCode> {
+        let &At::Run { len, half, held } = at else {
+            return Err(at.refused());
+        };
         // Only `B` is ever one tile a row (a column's broadcast).
         let b_once = held.get(1).copied().unwrap_or(false);
         let (layout, roles, loops) = tensor::sfpu_programs(
@@ -182,6 +201,7 @@ impl Microkernel for Sfpu {
             half,
             self.rows,
             b_once,
+            l1,
         )?;
         Ok(RunCode {
             operands: [Some(layout.a_at), layout.b_at, layout.c_at],

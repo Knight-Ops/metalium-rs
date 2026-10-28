@@ -283,6 +283,14 @@ impl MatmulSemaphores {
         }
     }
 
+    /// The pair where `l1` placed them ([`MatmulSemaphores::declare`]'s names).
+    pub fn placed(l1: &crate::l1::Placed) -> Self {
+        MatmulSemaphores {
+            ready: l1.semaphore("matmul Dst ready"),
+            free: l1.semaphore("matmul Dst free"),
+        }
+    }
+
     /// The pair, and their initialisation, for a matmul that is the whole of
     /// a tile's work: a plan of nothing else.
     pub fn alone() -> (Self, Vec<crate::runtime::SemaphoreInit>) {
@@ -840,21 +848,39 @@ pub(crate) fn k_block_layout_with(
     a_slots: usize,
     slots: Slots,
 ) -> Result<(Layout, Reload), crate::runtime::RunError> {
-    let mut m = matmul_requirements_placed([1, kt, 1], a_slots, None, slots);
-    let prior = m
-        .req
+    let req = std::sync::Arc::new(k_block_requirements(kt, a_slots, slots));
+    let plan = req
+        .plan(crate::l1::arena())
+        .map_err(|_| crate::runtime::RunError::DoesNotFit {
+            what: "a K-block matmul",
+            bytes: (2 * kt + 2) as u64 * tt_isa::dm::TILE_SLOT,
+            limit: crate::l1::arena().len(),
+        })?;
+    Ok(k_block_placed(
+        kt,
+        slots,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// What a K block of `kt` tiles needs ([`k_block_layout_with`]): a product's rings, a prior tile
+/// and the reload's two semaphores ([`k_block_placed`] reads them back).
+pub(crate) fn k_block_requirements(
+    kt: usize,
+    a_slots: usize,
+    slots: Slots,
+) -> crate::l1::Requirements {
+    let mut m = matmul_requirements_placed([1, kt, 1], a_slots, false, slots);
+    m.req
         .scratch("matmul prior", tt_isa::dm::TILE_SLOT, 64, 0..1);
-    let cleared = m.req.semaphore("matmul cleared", 0, 0..1);
-    let loaded = m.req.semaphore("matmul loaded", 0, 0..1);
-    let plan =
-        m.req
-            .plan(crate::l1::arena())
-            .map_err(|_| crate::runtime::RunError::DoesNotFit {
-                what: "a K-block matmul",
-                bytes: (2 * kt + 2) as u64 * tt_isa::dm::TILE_SLOT,
-                limit: crate::l1::arena().len(),
-            })?;
-    let (a_at, b_at) = (plan.addr(m.a), plan.addr(m.b));
+    m.req.semaphore("matmul cleared", 0, 0..1);
+    m.req.semaphore("matmul loaded", 0, 0..1);
+    m.req
+}
+
+/// A K block of `kt` tiles where its [`k_block_requirements`] were placed.
+pub(crate) fn k_block_placed(kt: usize, slots: Slots, l1: &crate::l1::Placed) -> (Layout, Reload) {
+    let (a_at, b_at) = (l1.addr("matmul A"), l1.addr("matmul B"));
     let layout = Layout {
         a_at,
         b_at,
@@ -862,19 +888,19 @@ pub(crate) fn k_block_layout_with(
             pairs: (0..kt)
                 .map(|k| (a_at + k as u64 * slots.a, b_at + k as u64 * slots.b))
                 .collect(),
-            out: plan.addr(m.out) + tt_isa::dm::TILE_DATA,
+            out: l1.addr("matmul out") + tt_isa::dm::TILE_DATA,
         }],
-        sems: MatmulSemaphores::planned(&plan, m.sems),
-        init: plan.semaphore_init(),
+        sems: MatmulSemaphores::placed(l1),
+        init: l1.semaphore_init(),
     };
-    Ok((
+    (
         layout,
         Reload {
-            prior: plan.addr(prior),
-            cleared: plan.semaphore(cleared),
-            loaded: plan.semaphore(loaded),
+            prior: l1.addr("matmul prior"),
+            cleared: l1.semaphore("matmul cleared"),
+            loaded: l1.semaphore("matmul loaded"),
         },
-    ))
+    )
 }
 
 /// The L1 of a one-row product streamed over `K` in chunks of `kq` tiles ([`k_stream_layout`]):
@@ -931,6 +957,28 @@ pub(crate) fn k_stream_layout(
     a_slots: usize,
     b_slot: u64,
 ) -> Result<StreamLayout, crate::runtime::RunError> {
+    use tt_isa::dm::TILE_SLOT;
+    let req = std::sync::Arc::new(k_stream_requirements(kq, a_slots, b_slot));
+    let plan = req
+        .plan(crate::l1::arena())
+        .map_err(|_| crate::runtime::RunError::DoesNotFit {
+            what: "a K-streamed matmul",
+            bytes: (a_slots + 2) as u64 * TILE_SLOT + 2 * kq as u64 * b_slot,
+            limit: crate::l1::arena().len(),
+        })?;
+    Ok(StreamLayout::placed(
+        b_slot,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// What a [`StreamLayout`] needs: the packed `A`'s ring, two halves' `B` rings and output slots,
+/// and four semaphores ([`StreamLayout::placed`] reads them back).
+pub(crate) fn k_stream_requirements(
+    kq: usize,
+    a_slots: usize,
+    b_slot: u64,
+) -> crate::l1::Requirements {
     use crate::l1::{Endpoint, Requirements};
     use tt_isa::dm::TILE_SLOT;
     let mut req = Requirements::new(1);
@@ -949,31 +997,36 @@ pub(crate) fn k_stream_layout(
         (Endpoint::Mover, Endpoint::Unpack),
         (Endpoint::Pack, Endpoint::Mover),
     );
-    let a = ring("matmul A", TILE_SLOT, a_slots, input.0, input.1);
-    let b = ["matmul B, half 0", "matmul B, half 1"]
-        .map(|name| ring(name, b_slot, kq, input.0, input.1));
-    let out = ["matmul out, half 0", "matmul out, half 1"]
-        .map(|name| ring(name, TILE_SLOT, 1, output.0, output.1));
-    let sems = MatmulSemaphores::declare(&mut req, 0..1);
-    let cleared = req.semaphore("matmul cleared", 0, 0..1);
-    let loaded = req.semaphore("matmul loaded", 0, 0..1);
-    let plan = req
-        .plan(crate::l1::arena())
-        .map_err(|_| crate::runtime::RunError::DoesNotFit {
-            what: "a K-streamed matmul",
-            bytes: (a_slots + 2) as u64 * TILE_SLOT + 2 * kq as u64 * b_slot,
-            limit: crate::l1::arena().len(),
-        })?;
-    Ok(StreamLayout {
-        a_at: plan.addr(a),
-        b_at: b.map(|b| plan.addr(b)),
-        b_slot,
-        out: out.map(|o| plan.addr(o)),
-        sems: MatmulSemaphores::planned(&plan, sems),
-        cleared: plan.semaphore(cleared),
-        loaded: plan.semaphore(loaded),
-        init: plan.semaphore_init(),
-    })
+    ring("matmul A", TILE_SLOT, a_slots, input.0, input.1);
+    for name in STREAM_B {
+        ring(name, b_slot, kq, input.0, input.1);
+    }
+    for name in STREAM_OUT {
+        ring(name, TILE_SLOT, 1, output.0, output.1);
+    }
+    MatmulSemaphores::declare(&mut req, 0..1);
+    req.semaphore("matmul cleared", 0, 0..1);
+    req.semaphore("matmul loaded", 0, 0..1);
+    req
+}
+
+const STREAM_B: [&str; 2] = ["matmul B, half 0", "matmul B, half 1"];
+const STREAM_OUT: [&str; 2] = ["matmul out, half 0", "matmul out, half 1"];
+
+impl StreamLayout {
+    /// The layout where its [`k_stream_requirements`] were placed, `B`'s tiles `b_slot` apart.
+    pub fn placed(b_slot: u64, l1: &crate::l1::Placed) -> StreamLayout {
+        StreamLayout {
+            a_at: l1.addr("matmul A"),
+            b_at: STREAM_B.map(|b| l1.addr(b)),
+            b_slot,
+            out: STREAM_OUT.map(|o| l1.addr(o)),
+            sems: MatmulSemaphores::placed(l1),
+            cleared: l1.semaphore("matmul cleared"),
+            loaded: l1.semaphore("matmul loaded"),
+            init: l1.semaphore_init(),
+        }
+    }
 }
 
 /// The L1 of a 2-D blocked product streamed over `K` ([`block_stream_layout`],
@@ -1053,10 +1106,36 @@ impl BlockStreamLayout {
 /// [`BlockStreamLayout`] for `[mb, kq, nb]` and each operand's tiles its slot apart
 /// ([`SrcRoute::slots`]), planned in the current arena (`crate::l1::arena`).
 pub(crate) fn block_stream_layout(
-    [mb, kq, nb]: [usize; 3],
+    tiles: [usize; 3],
     slots: Slots,
 ) -> Result<BlockStreamLayout, crate::runtime::RunError> {
-    use crate::l1::{Endpoint, PlanError, Requirements};
+    use crate::l1::PlanError;
+    let req = std::sync::Arc::new(block_stream_requirements(tiles, slots));
+    let bytes = block_stream_bytes(tiles, slots);
+    let plan = req.plan(crate::l1::arena()).map_err(|e| match e {
+        PlanError::DoesNotFit { .. } | PlanError::TooManyPages { .. } => {
+            crate::runtime::RunError::DoesNotFit {
+                what: "a K-streamed blocked matmul",
+                bytes,
+                limit: crate::l1::arena().len(),
+            }
+        }
+        e => panic!("the blocked matmul's own requirements are invalid: {e}"),
+    })?;
+    Ok(BlockStreamLayout::placed(
+        tiles,
+        slots,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// What a [`BlockStreamLayout`] of `[mb, kq, nb]` needs: two halves of `A`'s and `B`'s rings, two
+/// output sets and four semaphores ([`BlockStreamLayout::placed`] reads them back).
+pub(crate) fn block_stream_requirements(
+    [mb, kq, nb]: [usize; 3],
+    slots: Slots,
+) -> crate::l1::Requirements {
+    use crate::l1::{Endpoint, Requirements};
     use tt_isa::dm::TILE_SLOT;
     let mut req = Requirements::new(1);
     let mut ring = |name, page: u64, pages: usize, from, to| {
@@ -1074,37 +1153,40 @@ pub(crate) fn block_stream_layout(
         (Endpoint::Mover, Endpoint::Unpack),
         (Endpoint::Pack, Endpoint::Mover),
     );
-    let a = ["matmul A, half 0", "matmul A, half 1"]
-        .map(|name| ring(name, slots.a, mb * kq, input.0, input.1));
-    let b = ["matmul B, half 0", "matmul B, half 1"]
-        .map(|name| ring(name, slots.b, kq * nb, input.0, input.1));
-    let out = ["matmul out, set 0", "matmul out, set 1"]
-        .map(|name| ring(name, TILE_SLOT, mb * nb, output.0, output.1));
-    let sems = MatmulSemaphores::declare(&mut req, 0..1);
-    let cleared = req.semaphore("matmul cleared", 0, 0..1);
-    let loaded = req.semaphore("matmul loaded", 0, 0..1);
-    let bytes = block_stream_bytes([mb, kq, nb], slots);
-    let plan = req.plan(crate::l1::arena()).map_err(|e| match e {
-        PlanError::DoesNotFit { .. } | PlanError::TooManyPages { .. } => {
-            crate::runtime::RunError::DoesNotFit {
-                what: "a K-streamed blocked matmul",
-                bytes,
-                limit: crate::l1::arena().len(),
-            }
+    for name in BLOCK_A {
+        ring(name, slots.a, mb * kq, input.0, input.1);
+    }
+    for name in BLOCK_B {
+        ring(name, slots.b, kq * nb, input.0, input.1);
+    }
+    for name in BLOCK_OUT {
+        ring(name, TILE_SLOT, mb * nb, output.0, output.1);
+    }
+    MatmulSemaphores::declare(&mut req, 0..1);
+    req.semaphore("matmul cleared", 0, 0..1);
+    req.semaphore("matmul loaded", 0, 0..1);
+    req
+}
+
+const BLOCK_A: [&str; 2] = ["matmul A, half 0", "matmul A, half 1"];
+const BLOCK_B: [&str; 2] = ["matmul B, half 0", "matmul B, half 1"];
+const BLOCK_OUT: [&str; 2] = ["matmul out, set 0", "matmul out, set 1"];
+
+impl BlockStreamLayout {
+    /// The layout of `tiles` where its [`block_stream_requirements`] were placed.
+    pub fn placed(tiles: [usize; 3], slots: Slots, l1: &crate::l1::Placed) -> BlockStreamLayout {
+        BlockStreamLayout {
+            tiles,
+            a_at: BLOCK_A.map(|a| l1.addr(a)),
+            b_at: BLOCK_B.map(|b| l1.addr(b)),
+            slots,
+            out: BLOCK_OUT.map(|o| l1.addr(o)),
+            sems: MatmulSemaphores::placed(l1),
+            cleared: l1.semaphore("matmul cleared"),
+            loaded: l1.semaphore("matmul loaded"),
+            init: l1.semaphore_init(),
         }
-        e => panic!("the blocked matmul's own requirements are invalid: {e}"),
-    })?;
-    Ok(BlockStreamLayout {
-        tiles: [mb, kq, nb],
-        a_at: a.map(|a| plan.addr(a)),
-        b_at: b.map(|b| plan.addr(b)),
-        slots,
-        out: out.map(|o| plan.addr(o)),
-        sems: MatmulSemaphores::planned(&plan, sems),
-        cleared: plan.semaphore(cleared),
-        loaded: plan.semaphore(loaded),
-        init: plan.semaphore_init(),
-    })
+    }
 }
 
 /// The bytes of a [`block_stream_layout`]'s slots: two halves of `A` and `B` and two output sets.
@@ -2845,22 +2927,15 @@ pub fn matmul_requirements([mt, kt, nt]: [usize; 3]) -> MatmulBuffers {
 /// [`matmul_requirements`] with `a_slots` slots for `A` (a packed `A`'s few,
 /// [`packed_a_pairs`]).
 pub fn matmul_requirements_with(tiles: [usize; 3], a_slots: usize) -> MatmulBuffers {
-    matmul_requirements_placed(tiles, a_slots, None, Slots::FP32)
+    matmul_requirements_placed(tiles, a_slots, false, Slots::FP32)
 }
 
-/// [`matmul_requirements_with`] with `B`'s ring at the end of `arena_bytes` of arena: `A` and the
-/// outputs first, then a gap that fills the rest, then `B`, so first fit puts `B` against the
-/// arena's end (`docs/plans/decode-to-bandwidth.md` Phase 8: the ops between two products plan
-/// low, and a prefetch of the next product's `B` lands above them). `None` if the three do not
-/// fit, as the plain order would not.
-pub fn matmul_requirements_top_b(
-    tiles: [usize; 3],
-    a_slots: usize,
-    arena_bytes: u64,
-    slots: Slots,
-) -> Option<MatmulBuffers> {
-    let gap = arena_bytes.checked_sub(slot_bytes(tiles, a_slots, slots))?;
-    Some(matmul_requirements_placed(tiles, a_slots, Some(gap), slots))
+/// [`matmul_requirements_with`] with `B`'s ring against the arena's end
+/// ([`crate::l1::Requirements::against_end`]): `A` and the outputs first, `B` above them at the
+/// end (`docs/plans/decode-to-bandwidth.md` Phase 8: the ops between two products plan low, and a
+/// prefetch of the next product's `B` lands above them).
+pub fn matmul_requirements_top_b(tiles: [usize; 3], a_slots: usize, slots: Slots) -> MatmulBuffers {
+    matmul_requirements_placed(tiles, a_slots, true, slots)
 }
 
 /// The bytes of a slot staging's rings: `a_slots` of `A`'s slots, the outputs' FP32 slots, and
@@ -2869,10 +2944,10 @@ fn slot_bytes([mt, kt, nt]: [usize; 3], a_slots: usize, slots: Slots) -> u64 {
     a_slots as u64 * slots.a + (mt * nt) as u64 * tt_isa::dm::TILE_SLOT + (kt * nt) as u64 * slots.b
 }
 
-fn matmul_requirements_placed(
+pub(crate) fn matmul_requirements_placed(
     [mt, kt, nt]: [usize; 3],
     a_slots: usize,
-    gap: Option<u64>,
+    top_b: bool,
     slots: Slots,
 ) -> MatmulBuffers {
     use crate::l1::{Endpoint, Requirements};
@@ -2919,17 +2994,16 @@ fn matmul_requirements_placed(
             Endpoint::Mover,
         )
     };
-    let (b, out) = match gap {
-        None => {
+    let (b, out) = match top_b {
+        false => {
             let b = b_ring(&mut req);
             (b, out_ring(&mut req))
         }
-        Some(gap) => {
+        true => {
             let out = out_ring(&mut req);
-            if gap > 0 {
-                req.slack("matmul gap", gap, tt_isa::dram::ALIGN, 0..1);
-            }
-            (b_ring(&mut req), out)
+            let b = b_ring(&mut req);
+            req.against_end(b);
+            (b, out)
         }
     };
     let sems = MatmulSemaphores::declare(&mut req, 0..1);
@@ -3015,22 +3089,21 @@ fn plan_slots(
 ) -> Result<Layout, crate::runtime::RunError> {
     use crate::l1::PlanError;
     use crate::runtime::RunError;
-    use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+    use tt_isa::dm::TILE_SLOT;
     assert!(
         TileFormat::new(in_fmt).slot_bytes() <= TILE_SLOT,
         "slot staging must fit the operand image"
     );
-    let m = match top_b {
-        true => matmul_requirements_top_b([mt, kt, nt], a_slots, arena.len(), slots).ok_or(
-            RunError::DoesNotFit {
-                what: "the operand tiles",
-                bytes: slot_bytes([mt, kt, nt], a_slots, slots),
-                limit: arena.len(),
-            },
-        )?,
-        false => matmul_requirements_placed([mt, kt, nt], a_slots, None, slots),
-    };
-    let plan = m.req.plan(arena).map_err(|e| match e {
+    if top_b && slot_bytes([mt, kt, nt], a_slots, slots) > arena.len() {
+        return Err(RunError::DoesNotFit {
+            what: "the operand tiles",
+            bytes: slot_bytes([mt, kt, nt], a_slots, slots),
+            limit: arena.len(),
+        });
+    }
+    let req =
+        std::sync::Arc::new(matmul_requirements_placed([mt, kt, nt], a_slots, top_b, slots).req);
+    let plan = req.plan(arena).map_err(|e| match e {
         PlanError::DoesNotFit { name, bytes, arena } => RunError::DoesNotFit {
             what: name,
             bytes,
@@ -3046,7 +3119,26 @@ fn plan_slots(
         },
         e => panic!("the matmul's own requirements are invalid: {e}"),
     })?;
-    let (a_at, b_at, out_at) = (plan.addr(m.a), plan.addr(m.b), plan.addr(m.out));
+    Ok(slots_layout(
+        [mt, kt, nt],
+        slots,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// A slot staging's layout of `[mt, kt, nt]` tiles where its requirements
+/// ([`matmul_requirements_placed`]) were placed.
+pub(crate) fn slots_layout(
+    [mt, kt, nt]: [usize; 3],
+    slots: Slots,
+    l1: &crate::l1::Placed,
+) -> Layout {
+    use tt_isa::dm::{TILE_DATA, TILE_SLOT};
+    let (a_at, b_at, out_at) = (
+        l1.addr("matmul A"),
+        l1.addr("matmul B"),
+        l1.addr("matmul out"),
+    );
     let mut outputs = Vec::with_capacity(mt * nt);
     for i in 0..mt {
         for j in 0..nt {
@@ -3064,13 +3156,13 @@ fn plan_slots(
             });
         }
     }
-    Ok(Layout {
+    Layout {
         a_at,
         b_at,
         outputs,
-        sems: MatmulSemaphores::planned(&plan, m.sems),
-        init: plan.semaphore_init(),
-    })
+        sems: MatmulSemaphores::placed(l1),
+        init: l1.semaphore_init(),
+    }
 }
 
 /// Tile `a` and `b` (row-major) in `in_fmt` and plan one [`OutputTile`] per

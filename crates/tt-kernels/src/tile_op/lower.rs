@@ -37,8 +37,9 @@ use tt_isa::dm::record;
 
 use tt_isa::format::TileFormat;
 
+use super::allocate;
 use super::distribute::Deal;
-use super::{Access, Combine, Dim, IterKind, Layout, RunCode, TileMap, TileOp};
+use super::{Access, At, Combine, Dim, IterKind, Layout, RunCode, TileMap, TileOp};
 use crate::tensor::{self, Job, Result, Step, TensorError};
 
 pub fn jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Vec<Job>> {
@@ -56,7 +57,12 @@ pub fn jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Vec<
     for (j, run) in deal.runs.iter().enumerate() {
         let len = run.len();
         let half = deal.pipelined.then(|| tensor::half_of(j, units));
-        let code = op.body.run(len, half, &deal.held)?;
+        let at = At::Run {
+            len,
+            half,
+            held: &deal.held,
+        };
+        let code = allocate::run(&*op.body, &at, half)?;
         let mut gather = Vec::with_capacity(3 * op.operands.len());
         for (o, a) in op.operands.iter().enumerate() {
             if let Some(at) = code.operands.get(o).copied().flatten() {
@@ -128,7 +134,12 @@ pub fn chunked_jobs(op: &TileOp, chunk: usize) -> Result<Vec<Job>> {
         let mut steps = Vec::new();
         for first in (0..weight).step_by(chunk.max(1)) {
             let count = chunk.min(weight - first);
-            let code = op.body.chunk(first > 0, count, first + count == weight)?;
+            let at = At::Item {
+                prior: first > 0,
+                count,
+                last: first + count == weight,
+            };
+            let code = allocate::run(&*op.body, &at, None)?;
             let mut gather = Vec::new();
             if first > 0 {
                 let prior = code.prior.ok_or_else(|| {
@@ -473,13 +484,20 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
                 Combine::L1Halves { .. } => Some((c % 2) as u8),
                 Combine::GddrPartials { .. } => None,
             };
-            let code: RunCode = op.body.block_chunk(&super::Chunk {
+            let chunk = super::Chunk {
                 c,
                 k0,
                 tiles: [rows.len(), count, cols.len()],
                 live,
                 half,
-            })?;
+            };
+            // A chain's halves are the body's own buffers; only a pipelined run is staged in a
+            // half of the arena.
+            let staged = match combine {
+                Combine::InDst => half,
+                Combine::L1Halves { .. } | Combine::GddrPartials { .. } => None,
+            };
+            let code: RunCode = allocate::run(&*op.body, &At::Block(&chunk), staged)?;
             let (a_at, b_at) = match (code.operands[pair.a], code.operands[pair.b]) {
                 (Some(a), Some(b)) => (a, b),
                 _ => {

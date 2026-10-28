@@ -6,9 +6,10 @@
 //! - [`TileOp`] is the description. Its constructors ([`eltwise`], [`reduce`], [`matmul()`]) check what a client accepts
 //!   and build it; nothing past them names a client.
 //! - [`Microkernel`] is the only op-specific code a pass calls: how many items a run of the body
-//!   holds, and a run's L1 slots and role programs.
-//! - [`distribute`] deals the domain's items over units in runs; [`lower`] turns each run into a
-//!   job, reading every operand's tiles as its map says ([`TileMap`]).
+//!   holds, what L1 a run needs, and its role programs over the L1 it was given.
+//! - [`distribute`] deals the domain's items over units in runs; [`allocate`] places each run's
+//!   L1; [`lower`] turns each run into a job, reading every operand's tiles as its map says
+//!   ([`TileMap`]).
 //!
 //! The first commit of the stage pins every job the hand-written builders it replaces emit
 //! ([`golden`]): each client is ported word for word against those jobs, then its builder is
@@ -25,6 +26,7 @@ use crate::runtime::SemaphoreInit;
 use crate::tensor::{DramAlloc, DramTensor, Elem, Overlap, Result, TensorError, Work};
 
 pub mod ahead;
+pub mod allocate;
 pub mod distribute;
 pub mod lower;
 pub(crate) mod matmul;
@@ -180,7 +182,7 @@ pub enum NumericContract {
 /// The most operands a body reads: `A`, `B` and a ternary op's `C`.
 pub const MAX_OPERANDS: usize = 3;
 
-/// A run's L1 and programs ([`Microkernel::run`]).
+/// A run's L1 and programs ([`Microkernel::code`]).
 pub struct RunCode {
     /// Each operand's first slot, `None` for one the body reads no tiles of (or past the
     /// operands it has).
@@ -201,6 +203,38 @@ pub struct RunCode {
     pub loops: Arc<[Vec<crate::code::Loop>; 3]>,
 }
 
+/// What the passes ask a body for, one run at a time.
+#[derive(Copy, Clone, Debug)]
+pub enum At<'a> {
+    /// A run of `len` items, staged in `half` of the arena where pipelined; `held[o]`: operand
+    /// `o`'s one tile is read once a run and held.
+    Run {
+        len: usize,
+        half: Option<u8>,
+        held: &'a [bool],
+    },
+    /// One chunk of `count` terms of one item ([`Combine::GddrPartials`]): `prior`, a partial to
+    /// reload first; `last`, the chunk that folds.
+    Item {
+        prior: bool,
+        count: usize,
+        last: bool,
+    },
+    /// One chunk of a block's terms ([`Microkernel::block`]).
+    Block(&'a Chunk),
+}
+
+impl At<'_> {
+    /// A refusal of a run this body has no code for.
+    pub fn refused(&self) -> TensorError {
+        TensorError::Shape(match self {
+            At::Run { .. } => "this body runs in blocks of output tiles".into(),
+            At::Item { .. } => "this body carries no partials through GDDR".into(),
+            At::Block(_) => "this body computes no blocks".into(),
+        })
+    }
+}
+
 /// A body as the passes see it: the only op-specific code they call.
 pub trait Microkernel {
     /// The labels of a job's two lists, the gather's and the scatter's, for a run or (`chunked`)
@@ -209,26 +243,15 @@ pub trait Microkernel {
     /// The most items a run holds, in the whole arena or (`half`) in half of it for a run
     /// double-buffered with the next; `None` where not one item fits.
     fn group(&self, half: bool) -> Option<usize>;
-    /// A run of `len` items: its slots and programs, staged in `half` of the arena where
-    /// pipelined; `held[o]`: operand `o`'s one tile is read once a run and held.
-    fn run(&self, len: usize, half: Option<u8>, held: &[bool]) -> Result<RunCode>;
-    /// One chunk of `count` terms of one item ([`Combine::GddrPartials`]): `prior`, a partial to
-    /// reload first; `last`, the chunk that folds.
-    fn chunk(&self, prior: bool, count: usize, last: bool) -> Result<RunCode> {
-        let _ = (prior, count, last);
-        Err(TensorError::Shape(
-            "this body carries no partials through GDDR".into(),
-        ))
-    }
+    /// The L1 run `at` needs, declared ([`crate::l1::Requirements`]) and placed by the
+    /// allocation pass ([`allocate`]); the same requirements, by identity, for the same shape.
+    fn needs(&self, at: &At<'_>) -> Result<Arc<crate::l1::Requirements>>;
+    /// Run `at`'s slots and programs, over the L1 it was given.
+    fn code(&self, at: &At<'_>, l1: &crate::l1::Placed) -> Result<RunCode>;
     /// Where a run is a block of the domain's two parallel iterators' tiles, how they are cut
     /// ([`Blocks`]); `None` where a run is consecutive items ([`Microkernel::group`]).
     fn block(&self) -> Option<Blocks<'_>> {
         None
-    }
-    /// One chunk of a block's terms ([`Chunk`]): its slots and programs.
-    fn block_chunk(&self, chunk: &Chunk) -> Result<RunCode> {
-        let _ = chunk;
-        Err(TensorError::Shape("this body computes no blocks".into()))
     }
     /// Whether the body transposes operand `o`'s tiles itself (at unpack) where its map stores
     /// them transposed, so that the mover reads them as they lie.
@@ -260,6 +283,7 @@ pub enum Cols<'a> {
 }
 
 /// One chunk of a block's terms, as the lowering asks the body for its code.
+#[derive(Clone, Debug)]
 pub struct Chunk {
     /// The chunk's place in the block's chain, and its first term.
     pub c: usize,

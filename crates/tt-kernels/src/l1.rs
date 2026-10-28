@@ -96,8 +96,8 @@ pub(crate) fn set_ring_end(end: Option<u64>) -> Option<u64> {
 
 /// What the L1 plans of one op reached ([`take_planned`]): its highest `DATA` address, and the
 /// lowest arena end ([`arena`]) at which its layouts are the ones it has. That leaves out room a
-/// plan declared it can do without ([`Requirements::slack`]: a product's `B` ring placed against
-/// the arena's end, with a gap below it), and takes in what a choice sized from the arena tested
+/// plan placed higher than it had to ([`Requirements::against_end`]: a product's `B` ring placed
+/// against the arena's end, with a gap below it), and takes in what a choice sized from the arena tested
 /// (`matmul::plan_floor`: the widest block that fits, probed with `A` unpacked), so `need` may pass
 /// `top`. A capture's ops all have their layouts in any arena ending at or above their highest
 /// need, which is what sizes a residency plan's region (`docs/plans/planned-l1-residency.md` 2h).
@@ -113,7 +113,7 @@ std::thread_local! {
 }
 
 /// Note that a layout reaches `top` of `DATA` and needs all of it (every [`Requirements::plan`] in
-/// `DATA` without slack, and the layouts placed by hand there): a capture keeps each op's highest
+/// `DATA` with nothing against its end, and the layouts placed by hand there): a capture keeps each op's highest
 /// in its [`crate::trace::OpRecord::l1_top`], what it needs of a unit's arena.
 pub(crate) fn note_planned_top(top: u64) {
     note_planned(Planned { top, need: top });
@@ -146,21 +146,6 @@ pub(crate) fn unnoted<R>(f: impl FnOnce() -> R) -> R {
     let r = f();
     take_planned();
     note_planned(before);
-    r
-}
-
-/// Run `f`, whose plans are noted where they were planned, and note them `by` higher: a layout
-/// planned in one half of the arena and then moved to the other (`matmul::half`).
-pub(crate) fn planned_shifted<R>(by: u64, f: impl FnOnce() -> R) -> R {
-    let before = take_planned();
-    let r = f();
-    let p = take_planned();
-    let up = |v: u64| if v == 0 { 0 } else { v + by };
-    note_planned(before);
-    note_planned(Planned {
-        top: up(p.top),
-        need: up(p.need),
-    });
     r
 }
 
@@ -311,8 +296,8 @@ pub struct Requirements {
     stages: u32,
     buffers: Vec<BufferSpec>,
     sems: Vec<SemSpec>,
-    /// Bytes of [`Requirements::slack`] declared.
-    slack: u64,
+    /// The buffer placed against the arena's end ([`Requirements::against_end`]).
+    at_end: Option<u32>,
 }
 
 impl Requirements {
@@ -323,12 +308,17 @@ impl Requirements {
             stages,
             buffers: Vec::new(),
             sems: Vec::new(),
-            slack: 0,
+            at_end: None,
         }
     }
 
     pub fn stages(&self) -> u32 {
         self.stages
+    }
+
+    /// What its handles carry: requirements built once are known by it ([`Buf`]).
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn buffers(&self) -> &[BufferSpec] {
@@ -359,13 +349,58 @@ impl Requirements {
         })
     }
 
-    /// Declare scratch that holds nothing: room a layout leaves on purpose, so that what it
-    /// declares after lands higher (a product's `B` ring against the arena's end). It is placed as
-    /// [`Requirements::scratch`] is; a plan notes what the layout needs without it
+    /// Place `b` against the arena's end rather than at the lowest address it fits: a ring that a
+    /// read ahead of the op fills, above what the ops before it plan (a product's `B` ring,
+    /// `docs/plans/decode-to-bandwidth.md` Phase 8). Nothing live with it may be placed above it.
+    /// A plan notes what the layout needs as if `b` lay where first fit puts it
     /// ([`Planned::need`]), which is what a smaller arena would still have to hold.
-    pub fn slack(&mut self, name: &'static str, bytes: u64, align: u64, live: Range<u32>) -> Buf {
-        self.slack += bytes;
-        self.scratch(name, bytes, align, live)
+    ///
+    /// # Panics
+    ///
+    /// On a handle of other requirements, or a second buffer against the end.
+    pub fn against_end(&mut self, b: Buf) {
+        assert_eq!(b.set, self.id, "a buffer handle of other requirements");
+        assert!(
+            self.at_end.replace(b.index).is_none_or(|i| i == b.index),
+            "two buffers against the arena's end"
+        );
+    }
+
+    /// Whether a buffer is placed against the arena's end ([`Requirements::against_end`]).
+    pub fn has_end(&self) -> bool {
+        self.at_end.is_some()
+    }
+
+    /// The buffer declared as `name`.
+    ///
+    /// # Panics
+    ///
+    /// Unless exactly one buffer has that name.
+    pub fn buf(&self, name: &str) -> Buf {
+        let mut found = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.name == name);
+        match (found.next(), found.next()) {
+            (Some((i, _)), None) => Buf {
+                set: self.id,
+                index: i as u32,
+            },
+            _ => panic!("not one buffer named {name:?}"),
+        }
+    }
+
+    /// The semaphore declared as `name` ([`Requirements::buf`]).
+    pub fn sem(&self, name: &str) -> Sem {
+        let mut found = self.sems.iter().enumerate().filter(|(_, s)| s.name == name);
+        match (found.next(), found.next()) {
+            (Some((i, _)), None) => Sem {
+                set: self.id,
+                index: i as u32,
+            },
+            _ => panic!("not one semaphore named {name:?}"),
+        }
     }
 
     /// Declare a circular buffer of `pages` pages of `page` bytes, each page
@@ -446,8 +481,10 @@ impl Requirements {
         edges: &[(Buf, Buf)],
     ) -> Result<Fused, PlanError> {
         let invalid = |s: String| Err(PlanError::Invalid(s));
+        if first.at_end.is_some() || second.at_end.is_some() {
+            return invalid("a kernel with a buffer against the arena's end is not fused".into());
+        }
         let mut req = Requirements::new(first.stages + second.stages);
-        req.slack = first.slack + second.slack;
         let shift = |r: &Range<u32>| r.start + first.stages..r.end + first.stages;
         let mut map_first = Vec::with_capacity(first.buffers.len());
         for b in &first.buffers {
@@ -604,26 +641,29 @@ impl Requirements {
     /// same addresses -- which is what lets programs built from a plan be
     /// memoised by shape.
     pub fn plan(&self, arena: Region) -> Result<Plan, PlanError> {
-        let plan = self.plan_unnoted(arena)?;
+        let (plan, need) = self.plan_unnoted(arena)?;
         // A layout in a tile's data arena, or past it into the trace arena (a product's `B` ring in
         // a capture, `ring_end`): noted as the op's.
         if arena.base >= tt_isa::l1::DATA.base && arena.end <= tt_isa::l1::TRACE_ARENA.end {
-            let top = self
-                .buffers
-                .iter()
-                .zip(&plan.addr)
-                .map(|(b, &at)| at + b.bytes)
-                .max()
-                .unwrap_or(arena.base);
             note_planned(Planned {
-                top,
-                need: top - self.slack.min(top - arena.base),
+                top: self.top(&plan.addr).unwrap_or(arena.base),
+                need: need.unwrap_or(arena.base),
             });
         }
         Ok(plan)
     }
 
-    fn plan_unnoted(&self, arena: Region) -> Result<Plan, PlanError> {
+    /// The highest byte the buffers reach at `addr`.
+    fn top(&self, addr: &[u64]) -> Option<u64> {
+        self.buffers
+            .iter()
+            .zip(addr)
+            .map(|(b, &at)| at + b.bytes)
+            .max()
+    }
+
+    /// The plan, and the top its buffers reach where first fit puts them all (what it needs).
+    fn plan_unnoted(&self, arena: Region) -> Result<(Plan, Option<u64>), PlanError> {
         self.validate()?;
         let mut addr: Vec<u64> = Vec::with_capacity(self.buffers.len());
         for (i, b) in self.buffers.iter().enumerate() {
@@ -652,6 +692,26 @@ impl Requirements {
                 })?;
             addr.push(at);
         }
+        let need = self.top(&addr);
+        if let Some(i) = self.at_end.map(|i| i as usize) {
+            let b = &self.buffers[i];
+            // As high as it fits, below the end and above all that is live with it.
+            let at = (arena.end - b.bytes) / b.align * b.align;
+            if let Some((p, _)) = self
+                .buffers
+                .iter()
+                .zip(&addr)
+                .enumerate()
+                .find(|&(j, (p, &pa))| j != i && overlaps(&p.live, &b.live) && pa + p.bytes > at)
+                .map(|(_, x)| x)
+            {
+                return Err(PlanError::Invalid(format!(
+                    "{} cannot lie against the arena's end: {} is above it",
+                    b.name, p.name
+                )));
+            }
+            addr[i] = at.max(addr[i]);
+        }
         let mut sems: Vec<u32> = Vec::with_capacity(self.sems.len());
         for (i, s) in self.sems.iter().enumerate() {
             let taken: Vec<u32> = self.sems[..i]
@@ -675,15 +735,18 @@ impl Requirements {
             }
         }
         init.sort_by_key(|(sem, ..)| sem.index());
-        Ok(Plan {
-            set: self.id,
-            init,
-            addr,
-            sems: sems
-                .into_iter()
-                .map(|n| Semaphore::new(n as u8).expect("one of eight"))
-                .collect(),
-        })
+        Ok((
+            Plan {
+                set: self.id,
+                init,
+                addr,
+                sems: sems
+                    .into_iter()
+                    .map(|n| Semaphore::new(n as u8).expect("one of eight"))
+                    .collect(),
+            },
+            need,
+        ))
     }
 }
 
@@ -761,6 +824,38 @@ impl Plan {
     /// setup starts it at (`runtime::Schedule::Concurrent`), in semaphore order.
     pub fn semaphore_init(&self) -> Vec<SemaphoreInit> {
         self.init.clone()
+    }
+}
+
+/// A plan read back by the names its requirements declared ([`Requirements::buf`]), its buffers
+/// moved `by` bytes: a layout planned in one half of the arena and run in the other. Its semaphores
+/// do not move.
+#[derive(Clone, Debug)]
+pub struct Placed {
+    req: std::sync::Arc<Requirements>,
+    plan: Plan,
+    by: u64,
+}
+
+impl Placed {
+    pub fn new(req: std::sync::Arc<Requirements>, plan: Plan, by: u64) -> Self {
+        assert_eq!(plan.set, req.id, "a plan of other requirements");
+        Placed { req, plan, by }
+    }
+
+    /// The L1 address of the buffer declared as `name`.
+    pub fn addr(&self, name: &str) -> u64 {
+        self.plan.addr(self.req.buf(name)) + self.by
+    }
+
+    /// The semaphore declared as `name`.
+    pub fn semaphore(&self, name: &str) -> Semaphore {
+        self.plan.semaphore(self.req.sem(name))
+    }
+
+    /// [`Plan::semaphore_init`].
+    pub fn semaphore_init(&self) -> Vec<SemaphoreInit> {
+        self.plan.semaphore_init()
     }
 }
 
@@ -1114,6 +1209,45 @@ mod tests {
             }
         }
         assert!(planned > 900, "{planned}");
+    }
+
+    /// A buffer against the end lies there, above what first fit put below it; the plan notes
+    /// what first fit would have needed, and the checker passes it. Nothing live with it may lie
+    /// above it, and such requirements are not fused.
+    #[test]
+    fn a_buffer_against_the_end_lies_there_and_needs_what_first_fit_does() {
+        let mut r = Requirements::new(1);
+        let a = r.scratch("a", 3 * SLOT, 64, 0..1);
+        let b = r.scratch("b", 2 * SLOT, 64, 0..1);
+        r.against_end(b);
+        let out = r.scratch("out", SLOT, 64, 0..1);
+        take_planned();
+        let p = r.plan(DATA).unwrap();
+        let planned = take_planned();
+        assert_eq!(p.addr(a), DATA.base);
+        assert_eq!(p.addr(b), (DATA.end - 2 * SLOT) / 64 * 64);
+        assert_eq!(
+            p.addr(out),
+            DATA.base + 5 * SLOT,
+            "first fit, as if b lay low"
+        );
+        assert_eq!(planned.top, p.addr(b) + 2 * SLOT);
+        assert_eq!(planned.need, DATA.base + 6 * SLOT);
+        check(&r, &p, DATA).unwrap();
+        // Read back by name.
+        let placed = Placed::new(std::sync::Arc::new(r.clone()), p, 0x100);
+        assert_eq!(placed.addr("b"), (DATA.end - 2 * SLOT) / 64 * 64 + 0x100);
+        // Something live above it.
+        let mut r = Requirements::new(1);
+        let b = r.scratch("b", SLOT, 64, 0..1);
+        r.against_end(b);
+        r.scratch("whole", DATA.len() - 2 * SLOT, 64, 0..1);
+        r.scratch("top", SLOT, 64, 0..1);
+        assert!(matches!(r.plan(DATA), Err(PlanError::Invalid(_))));
+        assert!(matches!(
+            Requirements::fuse(&r, &Requirements::new(1), &[]),
+            Err(PlanError::Invalid(_))
+        ));
     }
 
     /// The checker is evidence only if it refuses a bad plan: two buffers live

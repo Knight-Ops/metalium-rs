@@ -3,12 +3,13 @@
 //! ([`ReduceThen`]).
 
 use super::{
-    Access, Combine, Dim, Iter, Layout, Microkernel, NumericContract, ReductionContract, RunCode,
-    TileMap, TileOp,
+    allocate, Access, At, Combine, Dim, Iter, Layout, Microkernel, NumericContract,
+    ReductionContract, RunCode, TileMap, TileOp,
 };
-use crate::sfpu::reduce::{continuation_roles, plan_chunk_layout, Axis, ChunkLayout, ReduceOp};
+use crate::l1::{Placed, Requirements};
+use crate::sfpu::reduce::{continuation_roles, Axis, ChunkLayout, ReduceOp};
 use crate::tensor::{self, DramTensor, ReduceThen, Result, TensorError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// `a` reduced over `axis` by `op`, then `then`'s exact unary kind on the result before its pack:
 /// bit for bit the kind run on the stored result (a softmax's `clamp_min(max(x))`). Each output
@@ -23,21 +24,17 @@ pub fn reduce(a: &DramTensor, op: ReduceOp, axis: Axis, then: ReduceThen) -> Res
     };
     let valid = if valid == 0 { 32 } else { valid as u32 };
     let fits = tensor::reduce_group(op, axis, per, valid, false, then).is_some();
-    let (combine, chunk) = if fits {
-        (Combine::InDst, None)
+    let combine = if fits {
+        Combine::InDst
     } else {
         if then.is_some() {
             return Err(TensorError::Shape(
                 "a reduction too long for one tile's programs takes no finishing kind".into(),
             ));
         }
-        let c = plan_chunk_layout(1).map_err(|e| TensorError::Shape(e.to_string()))?;
-        (
-            Combine::GddrPartials {
-                chunk: crate::sfpu::reduce::ROW_CHUNK,
-            },
-            Some(c),
-        )
+        Combine::GddrPartials {
+            chunk: crate::sfpu::reduce::ROW_CHUNK,
+        }
     };
     let contract = ReductionContract { combine };
     // The output's iterator first, then the folded one: rows then columns over the columns, and
@@ -84,7 +81,7 @@ pub fn reduce(a: &DramTensor, op: ReduceOp, axis: Axis, then: ReduceThen) -> Res
             per,
             valid,
             then,
-            chunk,
+            chunked: !fits,
         }),
         contract: NumericContract::Program,
         ahead: Vec::new(),
@@ -102,8 +99,8 @@ struct Reduce {
     /// Valid rows (or columns) of the last of them.
     valid: u32,
     then: ReduceThen,
-    /// A chunked reduction's layout, planned once.
-    chunk: Option<ChunkLayout>,
+    /// Its terms in chunks ([`Combine::GddrPartials`]).
+    chunked: bool,
 }
 
 impl Microkernel for Reduce {
@@ -119,9 +116,37 @@ impl Microkernel for Reduce {
         tensor::reduce_group(self.op, self.axis, self.per, self.valid, half, self.then)
     }
 
-    fn run(&self, len: usize, half: Option<u8>, _held: &[bool]) -> Result<RunCode> {
+    fn needs(&self, at: &At<'_>) -> Result<Arc<Requirements>> {
+        type Memo = allocate::Declared<(usize, usize)>;
+        static RUNS: Memo = OnceLock::new();
+        static CHUNKS: Memo = OnceLock::new();
+        match *at {
+            At::Run { len, .. } => {
+                let per = self.per;
+                Ok(allocate::declared(&RUNS, (len, per), || {
+                    crate::sfpu::reduce::requirements(len, per)
+                }))
+            }
+            At::Item { .. } if self.chunked => Ok(allocate::declared(&CHUNKS, (1, 0), || {
+                crate::sfpu::reduce::chunk_requirements(1)
+            })),
+            _ => Err(at.refused()),
+        }
+    }
+
+    fn code(&self, at: &At<'_>, l1: &Placed) -> Result<RunCode> {
+        match *at {
+            At::Run { len, half, .. } => self.run(len, half, l1),
+            At::Item { prior, count, last } if self.chunked => self.chunk(prior, count, last, l1),
+            _ => Err(at.refused()),
+        }
+    }
+}
+
+impl Reduce {
+    fn run(&self, len: usize, half: Option<u8>, l1: &Placed) -> Result<RunCode> {
         let (layout, roles, loops) = tensor::reduce_programs(
-            self.op, self.axis, len, self.per, self.valid, half, self.then,
+            self.op, self.axis, len, self.per, self.valid, half, self.then, l1,
         )?;
         Ok(RunCode {
             operands: [Some(layout.in_at), None, None],
@@ -136,10 +161,8 @@ impl Microkernel for Reduce {
         })
     }
 
-    fn chunk(&self, prior: bool, count: usize, last: bool) -> Result<RunCode> {
-        let c = self.chunk.as_ref().ok_or_else(|| {
-            TensorError::Shape("a reduction that fits one run has no chunks".into())
-        })?;
+    fn chunk(&self, prior: bool, count: usize, last: bool, l1: &Placed) -> Result<RunCode> {
+        let c = &ChunkLayout::placed(1, l1);
         let valid = if last { self.valid } else { 32 };
         let (roles, loops) = continuation_roles(c, self.op, self.axis, prior, count, valid, last);
         Ok(RunCode {

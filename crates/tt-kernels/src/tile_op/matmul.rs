@@ -12,12 +12,16 @@ use tt_isa::dm::{TILE_DATA, TILE_SLOT};
 use tt_isa::format::TileFormat;
 
 use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use super::{
-    Access, Blocks, Chunk, Cols, Combine, Dim, Iter, Layout, Microkernel, NumericContract,
-    ReductionContract, RunCode, TileMap, TileOp,
+    allocate, Access, At, Blocks, Chunk, Cols, Combine, Dim, Iter, Layout, Microkernel,
+    NumericContract, ReductionContract, RunCode, TileMap, TileOp,
 };
-use crate::matmul::{self, BlockStreamLayout, Fidelity, LiveRows, SrcRoute, Staging, StreamLayout};
+use crate::l1::{Placed, Requirements};
+use crate::matmul::{
+    self, BlockStreamLayout, Fidelity, LiveRows, Slots, SrcRoute, Staging, StreamLayout,
+};
 use crate::tensor::{
     self, balanced_shares, stream_chunks, thin_runs, Elem, Job, Overlap, Result, Step, TensorError,
     HANDED_AHEAD, PREFETCH,
@@ -36,9 +40,9 @@ pub struct Side {
 
 /// How a product's output tiles and terms are cut into runs.
 pub enum Schedule {
-    /// `[mb, nb]` blocks of output tiles, a job each, `K` in chunks of `kq` continued in L1
-    /// halves ([`Combine::L1Halves`]; `docs/plans/prefill-operand-reuse.md`).
-    BlockStream { layout: BlockStreamLayout },
+    /// `[mb, nb]` blocks of output tiles (`tiles`, `[mb, kq, nb]`), a job each, `K` in chunks of
+    /// `kq` continued in L1 halves ([`Combine::L1Halves`]; `docs/plans/prefill-operand-reuse.md`).
+    BlockStream { tiles: [usize; 3] },
     /// `K` whole in `Dst` ([`Combine::InDst`]): `[mc, nc]` blocks, or one tile row's columns in
     /// the runs `cols` deals (`tensor::thin_runs`), staged in alternating halves under
     /// [`Staging::SlotsHalf`]; `A` held across a unit's blocks where `resident_a` (or packed).
@@ -56,7 +60,6 @@ pub enum Schedule {
     /// column, `K` in chunks of `kq` continued in L1 halves; the packed `A` read once a unit.
     Stream {
         kq: usize,
-        layout: StreamLayout,
         cols: Option<Vec<Range<usize>>>,
     },
 }
@@ -76,9 +79,7 @@ pub fn matmul(
     schedule: Schedule,
 ) -> Result<TileOp> {
     let combine = match &schedule {
-        Schedule::BlockStream { layout } => Combine::L1Halves {
-            chunk: layout.tiles[1],
-        },
+        Schedule::BlockStream { tiles } => Combine::L1Halves { chunk: tiles[1] },
         Schedule::Blocks { .. } => Combine::InDst,
         Schedule::KBlocks { k_block } => Combine::GddrPartials { chunk: *k_block },
         Schedule::Stream { kq, .. } => Combine::L1Halves { chunk: *kq },
@@ -100,6 +101,17 @@ pub fn matmul(
         elem: s.elem,
         live_rows: s.live_rows,
     };
+    if matches!(
+        schedule,
+        Schedule::Blocks {
+            staging: Staging::Host,
+            ..
+        }
+    ) {
+        return Err(TensorError::Shape(
+            "a product on TileOp reads its tiles into slots, not as the host stages them".into(),
+        ));
+    }
     let a_layout = match packed {
         Some(row) => Layout::Packed { tiles: a.at, row },
         None => Layout::Tiles(a.at),
@@ -154,6 +166,42 @@ fn cols_of(cols: &Option<Vec<Range<usize>>>, every: usize) -> Cols<'_> {
     }
 }
 
+/// What a run of [`Mma`] needs, by shape: the requirements are built once a shape.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Shape {
+    BlockStream([usize; 3], Slots),
+    Slots([usize; 3], usize, bool, Slots),
+    KBlock(usize, usize, Slots),
+    Stream(usize, usize, u64),
+}
+
+impl Mma {
+    /// The slot staging's `A` slots, slot sizes and whether `B` lies against the arena's end, for
+    /// a block of `tiles`: a packed `A`'s ring holds the packed rows its `K` spans
+    /// (`matmul::plan_layout_packed_a`).
+    fn slots(&self, [mt, kt, _]: [usize; 3], staging: Staging) -> (usize, Slots, bool) {
+        match self.packed {
+            true => (
+                tensor::packed_a_slots(self.kt),
+                Slots {
+                    a: TILE_SLOT,
+                    b: self.route.b_slot(),
+                },
+                staging == Staging::Slots,
+            ),
+            false => (mt * kt, self.route.slots(), false),
+        }
+    }
+
+    /// A K block's `A` slots: a packed `A`'s, or one a term.
+    fn k_block_slots(&self, count: usize) -> usize {
+        match self.packed {
+            true => tensor::packed_a_slots(count),
+            false => count,
+        }
+    }
+}
+
 impl Microkernel for Mma {
     fn lists(&self, _chunked: bool) -> [&'static str; 2] {
         match self.schedule {
@@ -168,50 +216,50 @@ impl Microkernel for Mma {
         None
     }
 
-    fn run(&self, _len: usize, _half: Option<u8>, _held: &[bool]) -> Result<RunCode> {
-        Err(TensorError::Shape(
-            "a product runs in blocks of output tiles".into(),
-        ))
+    fn needs(&self, at: &At<'_>) -> Result<Arc<Requirements>> {
+        static MEMO: allocate::Declared<Shape> = OnceLock::new();
+        let At::Block(chunk) = at else {
+            return Err(at.refused());
+        };
+        let shape = match &self.schedule {
+            Schedule::BlockStream { tiles } => Shape::BlockStream(*tiles, self.route.slots()),
+            Schedule::Blocks { staging, .. } => {
+                let (a_slots, slots, top_b) = self.slots(chunk.tiles, *staging);
+                Shape::Slots(chunk.tiles, a_slots, top_b, slots)
+            }
+            Schedule::KBlocks { .. } => {
+                let count = chunk.tiles[1];
+                Shape::KBlock(count, self.k_block_slots(count), self.route.slots())
+            }
+            Schedule::Stream { kq, .. } => {
+                Shape::Stream(*kq, tensor::packed_a_slots(self.kt), self.route.b_slot())
+            }
+        };
+        Ok(allocate::declared(&MEMO, shape, || match shape {
+            Shape::BlockStream(tiles, slots) => matmul::block_stream_requirements(tiles, slots),
+            Shape::Slots(tiles, a_slots, top_b, slots) => {
+                matmul::matmul_requirements_placed(tiles, a_slots, top_b, slots).req
+            }
+            Shape::KBlock(count, a_slots, slots) => {
+                matmul::k_block_requirements(count, a_slots, slots)
+            }
+            Shape::Stream(kq, a_slots, b_slot) => {
+                matmul::k_stream_requirements(kq, a_slots, b_slot)
+            }
+        }))
     }
 
-    fn block(&self) -> Option<Blocks<'_>> {
-        Some(match &self.schedule {
-            Schedule::BlockStream { layout } => Blocks {
-                rows: layout.tiles[0],
-                cols: Cols::Every(layout.tiles[2]),
-                pipelined: false,
-            },
-            Schedule::Blocks {
-                block,
-                cols,
-                staging,
-                ..
-            } => Blocks {
-                rows: block[0],
-                cols: cols_of(cols, block[1]),
-                pipelined: *staging == Staging::SlotsHalf,
-            },
-            Schedule::KBlocks { .. } => Blocks {
-                rows: 1,
-                cols: Cols::Every(1),
-                pipelined: false,
-            },
-            Schedule::Stream { cols, .. } => Blocks {
-                rows: 1,
-                cols: cols_of(cols, 1),
-                pipelined: false,
-            },
-        })
-    }
-
-    fn block_chunk(&self, chunk: &Chunk) -> Result<RunCode> {
+    fn code(&self, at: &At<'_>, l1: &Placed) -> Result<RunCode> {
+        let At::Block(chunk) = at else {
+            return Err(at.refused());
+        };
         let &Chunk {
             c,
             k0,
             tiles,
             live,
             half,
-        } = chunk;
+        } = *chunk;
         let [rows, count, cols] = tiles;
         let live = LiveRows::for_last(rows, live);
         let (route, fidelity, unpack_b) = (self.route, self.fidelity, self.unpack_b);
@@ -227,10 +275,11 @@ impl Microkernel for Mma {
             mop,
         };
         match &self.schedule {
-            Schedule::BlockStream { layout } => {
+            Schedule::BlockStream { tiles: shape } => {
+                let layout = BlockStreamLayout::placed(*shape, route.slots(), l1);
                 let (chunk, _) = layout.chunk(c, tiles);
                 let (roles, loops) = matmul::block_stream_programs(
-                    layout, c, tiles, route, fidelity, unpack_b, live,
+                    &layout, c, tiles, route, fidelity, unpack_b, live,
                 );
                 Ok(code(
                     chunk.a_at,
@@ -248,28 +297,18 @@ impl Microkernel for Mma {
                 staging, allow_mop, ..
             } => {
                 let in_fmt = route.formats().0;
-                // The second half's layout is the first's moved up, and noted there.
-                let up = if half == Some(1) { matmul::half() } else { 0 };
-                let planned = crate::l1::planned_shifted(up, || match self.packed {
-                    true => matmul::plan_layout_packed_a(
-                        tiles,
-                        in_fmt,
-                        *staging,
-                        tensor::packed_a_slots(self.kt),
-                        route.b_slot(),
-                    ),
-                    false => matmul::plan_layout_route(tiles, in_fmt, *staging, route.slots()),
-                })?;
+                assert!(
+                    TileFormat::new(in_fmt).slot_bytes() <= TILE_SLOT,
+                    "slot staging must fit the operand image"
+                );
+                let (_, slots, _) = self.slots(tiles, *staging);
                 let matmul::Layout {
                     a_at,
                     b_at,
                     outputs,
                     sems,
                     init,
-                } = match half {
-                    Some(1) => planned.shifted(matmul::half()),
-                    _ => planned,
-                };
+                } = matmul::slots_layout(tiles, slots, l1);
                 let outputs = match self.packed {
                     true => matmul::packed_a_pairs(&outputs, a_at, 0),
                     false => outputs,
@@ -301,7 +340,7 @@ impl Microkernel for Mma {
                 );
                 // Only the datums go back: the packer writes nothing else, and the unpacker skips
                 // the header whatever it holds (`step18_dram_matmul`). The outputs sit one slot
-                // apart from the first (`plan_layout_in`).
+                // apart from the first (`matmul::slots_layout`).
                 let out = outputs[0].out;
                 debug_assert!(outputs
                     .iter()
@@ -320,11 +359,7 @@ impl Microkernel for Mma {
                 ))
             }
             Schedule::KBlocks { .. } => {
-                let a_slots = match self.packed {
-                    true => tensor::packed_a_slots(count),
-                    false => count,
-                };
-                let (layout, reload) = matmul::k_block_layout_with(count, a_slots, route.slots())?;
+                let (layout, reload) = matmul::k_block_placed(count, route.slots(), l1);
                 let layout = match self.packed {
                     true => matmul::Layout {
                         outputs: matmul::packed_a_pairs(&layout.outputs, layout.a_at, k0),
@@ -368,7 +403,8 @@ impl Microkernel for Mma {
                     [None; 3],
                 ))
             }
-            Schedule::Stream { layout, .. } => {
+            Schedule::Stream { .. } => {
+                let layout = StreamLayout::placed(route.b_slot(), l1);
                 let (chunk, reload) = layout.chunk(c, k0, count);
                 // The programs name this chunk's `K` range in the packed `A`, its half and the
                 // layout `A`'s slots fix.
@@ -403,6 +439,36 @@ impl Microkernel for Mma {
                 ))
             }
         }
+    }
+
+    fn block(&self) -> Option<Blocks<'_>> {
+        Some(match &self.schedule {
+            Schedule::BlockStream { tiles } => Blocks {
+                rows: tiles[0],
+                cols: Cols::Every(tiles[2]),
+                pipelined: false,
+            },
+            Schedule::Blocks {
+                block,
+                cols,
+                staging,
+                ..
+            } => Blocks {
+                rows: block[0],
+                cols: cols_of(cols, block[1]),
+                pipelined: *staging == Staging::SlotsHalf,
+            },
+            Schedule::KBlocks { .. } => Blocks {
+                rows: 1,
+                cols: Cols::Every(1),
+                pipelined: false,
+            },
+            Schedule::Stream { cols, .. } => Blocks {
+                rows: 1,
+                cols: cols_of(cols, 1),
+                pipelined: false,
+            },
+        })
     }
 
     fn transposes(&self, o: usize) -> bool {
@@ -485,7 +551,7 @@ impl Plan {
         let [mt, kt, nt] = self.tiles;
         let schedule = if self.stream_k {
             debug_assert_eq!(mt, 1);
-            let (kq, layout) = stream_chunks(kt, self.k_block, self.route, self.fidelity)?;
+            let (kq, _) = stream_chunks(kt, self.k_block, self.route, self.fidelity)?;
             // A column a job: the plan's runs' columns, in order, or every column.
             let cols = self.col_runs.as_ref().map(|runs| {
                 runs.iter()
@@ -493,7 +559,7 @@ impl Plan {
                     .map(|j| j..j + 1)
                     .collect()
             });
-            Schedule::Stream { kq, layout, cols }
+            Schedule::Stream { kq, cols }
         } else if self.k_block < kt {
             Schedule::KBlocks {
                 k_block: self.k_block,

@@ -1961,7 +1961,9 @@ pub(crate) fn matmul_dram_prefetching(
                 fidelity,
                 reads.unpack_b && route == SrcRoute::Tf32FromFp32,
                 None,
-                crate::tile_op::matmul::Schedule::BlockStream { layout },
+                crate::tile_op::matmul::Schedule::BlockStream {
+                    tiles: layout.tiles,
+                },
             )?;
             let work = op.build(alloc, units, Overlap::Off)?;
             return Ok((work, None, None));
@@ -2732,7 +2734,7 @@ pub(crate) fn matmul_dram_batched_limited(
                     unpack_b && route == SrcRoute::Tf32FromFp32,
                     None,
                     crate::tile_op::matmul::Schedule::BlockStream {
-                        layout: layout.clone(),
+                        tiles: layout.tiles,
                     },
                 )
                 .and_then(|mut op| {
@@ -3653,10 +3655,10 @@ fn measure_sfpu_group(
         .max(1)
 }
 
-/// One run's layout and role programs, memoised by op, scalar, length and
-/// `half` (the half of the arena a pipelined run is staged in; `None` for the
-/// whole arena); `b_once`: a column's one tile of `B` held for the whole run
-/// ([`row_runs`]).
+/// One run's layout and role programs over the L1 it was given (`l1`, `tile_op::allocate`),
+/// memoised by op, scalar, length and `half` (the half of the arena a pipelined run is staged in;
+/// `None` for the whole arena), which with the arena's end fix where it was placed; `b_once`: a
+/// column's one tile of `B` held for the whole run ([`row_runs`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sfpu_programs(
     op: Eltwise,
@@ -3666,6 +3668,7 @@ pub(crate) fn sfpu_programs(
     half: Option<u8>,
     rows: u32,
     b_once: bool,
+    l1: &crate::l1::Placed,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -3695,40 +3698,17 @@ pub(crate) fn sfpu_programs(
         crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
-    // The highest `DATA` address the layout reaches, noted on every hit as a plan notes it on a
-    // miss (`crate::l1::note_planned_top`): its last region's slots, `B`'s one where held once.
-    let note_top = |l: &crate::sfpu::kernel::Layout| {
-        let slots = |at: u64| at + l.tiles as u64 * TILE_SLOT;
-        let b = l
-            .b_at
-            .map(|b| if l.b_once { b + TILE_SLOT } else { slots(b) });
-        let top = [
-            Some(slots(l.a_at)),
-            b,
-            l.c_at.map(slots),
-            Some(slots(l.out_at)),
-        ]
-        .into_iter()
-        .flatten()
-        .max();
-        crate::l1::note_planned_top(top.unwrap_or(0));
-    };
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
-        note_top(&p.0);
         return Ok(p.clone());
     }
-    let layout = match half {
-        None => crate::sfpu::kernel::plan_layout(len, operands),
-        Some(h) => crate::sfpu::kernel::plan_layout_in(len, operands, crate::matmul::half_arena())
-            .map(|l| l.shifted(h as u64 * crate::matmul::half())),
-    }
-    .map_err(|e| TensorError::Shape(e.to_string()))?;
-    // `B` held once uses the first of its planned slots.
-    let layout = crate::sfpu::kernel::Layout { b_once, ..layout };
+    // `B` held once uses the first of its slots.
+    let layout = crate::sfpu::kernel::Layout {
+        b_once,
+        ..crate::sfpu::kernel::Layout::placed(len, operands, l1)
+    };
     let (_, math) = crate::sfpu::ops::code_for_rows(op.kind, [op.scalar, op.scalar2], bcast, rows)
         .expect("checked by the caller");
     let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
-    note_top(&layout);
     let p = (layout, Arc::new(roles), Arc::new(loops));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -5136,7 +5116,9 @@ fn measure_reduce_group(
     Some(GROUP.min(by_slots).min(by_program).max(1))
 }
 
-/// One run's layout and role programs; `half` as for [`sfpu_programs`].
+/// One run's layout and role programs over the L1 it was given; `half` and `l1` as for
+/// [`sfpu_programs`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reduce_programs(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
@@ -5145,10 +5127,9 @@ pub(crate) fn reduce_programs(
     valid: u32,
     half: Option<u8>,
     then: ReduceThen,
+    l1: &crate::l1::Placed,
 ) -> Result<ReducePrograms> {
-    use crate::sfpu::reduce::{
-        math_programs, plan_layout, plan_layout_in, roles_code, Axis, ReduceOp,
-    };
+    use crate::sfpu::reduce::{math_programs, roles_code, Axis, Layout, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     type Key = (
@@ -5161,9 +5142,8 @@ pub(crate) fn reduce_programs(
         ReduceThen,
         u64,
     );
-    // Each layout with what its plan reached, where it was moved to, noted again on every hit
-    // (`crate::l1::note_planned`); by the arena's end too, where it was planned.
-    type Memo = Mutex<HashMap<Key, (ReducePrograms, crate::l1::Planned)>>;
+    // By the arena's end too, which with `half` fixes where the layout was placed.
+    type Memo = Mutex<HashMap<Key, ReducePrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
     let key = (
         op,
@@ -5176,22 +5156,10 @@ pub(crate) fn reduce_programs(
         crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
-    if let Some((p, planned)) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
-        crate::l1::note_planned(*planned);
+    if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
-    let before = crate::l1::take_planned();
-    let layout = match half {
-        None => plan_layout(len, per),
-        Some(h) => crate::l1::planned_shifted(h as u64 * crate::matmul::half(), || {
-            plan_layout_in(len, per, crate::matmul::half_arena())
-        })
-        .map(|l| l.shifted(h as u64 * crate::matmul::half())),
-    };
-    let planned = crate::l1::take_planned();
-    crate::l1::note_planned(before);
-    crate::l1::note_planned(planned);
-    let layout = layout.map_err(|e| TensorError::Shape(e.to_string()))?;
+    let layout = Layout::placed(len, per, l1);
     let (inputs, _) = math_programs(op, axis, per, valid);
     let fin = finishing(op, axis, then)
         .ok_or_else(|| TensorError::Shape("a reduction's finishing kind is no exact one".into()))?;
@@ -5199,7 +5167,7 @@ pub(crate) fn reduce_programs(
     let p = (layout.clone(), Arc::new(roles), Arc::new(loops));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(key, (p.clone(), planned));
+        .insert(key, p.clone());
     Ok(p)
 }
 
