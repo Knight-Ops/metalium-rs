@@ -2,8 +2,10 @@
 //!
 //! One golden a client, under `golden/`: `jobs_eltwise.txt` (the pointwise SFPU family,
 //! [`tensor::sfpu_eltwise`] and [`super::eltwise`], which replaced `tensor::sfpu_eltwise_blocks`), `jobs_reduce.txt`
-//! ([`tensor::sfpu_reduce_then`], with its chunked fallback) and `jobs_matmul.txt` (every lowering
-//! behind [`tensor::matmul_dram_prefetching`], the builder `Session::matmul_dram` calls). Each
+//! ([`tensor::sfpu_reduce_then`], with its chunked fallback), `jobs_matmul.txt` (every lowering
+//! behind [`tensor::matmul_dram_prefetching`], the builder `Session::matmul_dram` calls) and
+//! `jobs_batched.txt` ([`tensor::matmul_dram_batched_limited`], the batched products of blocks
+//! `Session::matmul_dram_batched` builds, which share those lowerings). Each
 //! case is built on a fresh allocator, so its output and addresses are its own. A job is dumped as
 //! its steps: a list or transfer as every entry's eight words, a kernel as each role's length and a
 //! hash of its instruction words, with its semaphores, `MOP`s, loops and half; a refusal as its
@@ -25,8 +27,8 @@ use crate::sfpu::kernel::Operands;
 use crate::sfpu::ops::{self, kind_sfpu};
 use crate::sfpu::reduce::{Axis, ReduceOp};
 use crate::tensor::{
-    self, BlockOperand, BlockStream, DramAlloc, DramTensor, Elem, Eltwise, Job, Overlap, Reads,
-    Step, Work,
+    self, Block, BlockOperand, BlockStream, DramAlloc, DramTensor, Elem, Eltwise, Job, Overlap,
+    Reads, Step, Work,
 };
 
 /// FNV-1a, 64 bits: a stable hash of words.
@@ -817,4 +819,177 @@ fn matmul_jobs_are_pinned() {
         }
     }
     pinned("jobs_matmul.txt", &out);
+}
+
+/// One batched product: blocks of `a` and `b`, each `[m, k] @ [k, n]` after its transposes.
+struct Batched {
+    a: [usize; 2],
+    b: [usize; 2],
+    items: Vec<(Block, Block)>,
+    mkn: [usize; 3],
+    units: usize,
+    pipeline: bool,
+    max_k_tiles: Option<usize>,
+    padded: [bool; 2],
+    unpack_b: bool,
+    block_stream: BlockStream,
+}
+
+impl Batched {
+    fn new(a: [usize; 2], b: [usize; 2], items: Vec<(Block, Block)>, mkn: [usize; 3]) -> Batched {
+        // `Session::matmul_dram_batched_with`'s reads on a fresh session.
+        Batched {
+            a,
+            b,
+            items,
+            mkn,
+            units: 8,
+            pipeline: true,
+            max_k_tiles: None,
+            padded: [false; 2],
+            unpack_b: true,
+            block_stream: BlockStream::Auto,
+        }
+    }
+
+    fn run(&self, out: &mut String) {
+        let mut alloc = fresh();
+        let a = operand(&mut alloc, self.a, Elem::F32);
+        let b = operand(&mut alloc, self.b, Elem::F32);
+        let items: Vec<String> = self
+            .items
+            .iter()
+            .map(|(x, y)| {
+                format!(
+                    "{:?}{}/{:?}{}",
+                    x.at,
+                    if x.transposed { "^T" } else { "" },
+                    y.at,
+                    if y.transposed { "^T" } else { "" }
+                )
+            })
+            .collect();
+        let name = format!(
+            "{:?} {:?} {:?} items [{}] units {} pipeline {} k {:?} padded {:?} unpack_b {} block {:?}",
+            self.a,
+            self.b,
+            self.mkn,
+            items.join(" "),
+            self.units,
+            self.pipeline,
+            self.max_k_tiles,
+            self.padded,
+            self.unpack_b,
+            self.block_stream,
+        );
+        let work = tensor::matmul_dram_batched_limited(
+            &mut alloc,
+            &a,
+            &b,
+            &self.items,
+            self.mkn,
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            self.units,
+            false,
+            self.pipeline,
+            self.max_k_tiles.and_then(std::num::NonZeroUsize::new),
+            self.padded,
+            self.unpack_b,
+            self.block_stream,
+        );
+        case(out, &name, work.map(Some));
+    }
+}
+
+fn block(at: [usize; 2], transposed: bool) -> Block {
+    Block { at, transposed }
+}
+
+#[test]
+fn batched_jobs_are_pinned() {
+    let _held = defaults();
+    let mut out = String::new();
+    // Attention's two products over heads of a projection: `Q K^T` (each head's columns of both,
+    // `K` read transposed) and `P V` (each head's row block of `P`, its columns of `V`).
+    for (s, dk, heads) in [(128usize, 64usize, 4usize), (35, 32, 3), (64, 96, 2)] {
+        let qk: Vec<_> = (0..heads)
+            .map(|h| (block([0, h * dk], false), block([0, h * dk], true)))
+            .collect();
+        let pv: Vec<_> = (0..heads)
+            .map(|h| {
+                (
+                    block([h * s.div_ceil(32) * 32, 0], false),
+                    block([0, h * dk], false),
+                )
+            })
+            .collect();
+        let p_rows = heads * s.div_ceil(32) * 32;
+        for units in [1, 8, 120] {
+            for pipeline in [true, false] {
+                let mut p = Batched::new([s, heads * dk], [s, heads * dk], qk.clone(), [s, dk, s]);
+                (p.units, p.pipeline) = (units, pipeline);
+                p.run(&mut out);
+                let mut p = Batched::new([p_rows, s], [s, heads * dk], pv.clone(), [s, s, dk]);
+                (p.units, p.pipeline, p.padded) = (units, pipeline, [true, false]);
+                p.run(&mut out);
+            }
+        }
+        // `K` transposed by the mover rather than the unpacker.
+        let mut p = Batched::new([s, heads * dk], [s, heads * dk], qk.clone(), [s, dk, s]);
+        p.unpack_b = false;
+        p.run(&mut out);
+    }
+    // One row a head (decode): `q K^T` over a cache of `t` positions, then `p V`.
+    for t in [64, 300] {
+        let heads = 3;
+        let qk: Vec<_> = (0..heads)
+            .map(|h| (block([0, h * 64], false), block([0, h * 64], true)))
+            .collect();
+        let pv: Vec<_> = (0..heads)
+            .map(|h| (block([h * 32, 0], false), block([0, h * 64], false)))
+            .collect();
+        for units in [8, 64] {
+            let mut p = Batched::new([1, heads * 64], [t, heads * 64], qk.clone(), [1, 64, t]);
+            p.units = units;
+            p.run(&mut out);
+            let mut p = Batched::new([heads * 32, t], [t, heads * 64], pv.clone(), [1, t, 64]);
+            (p.units, p.padded) = (units, [true, false]);
+            p.run(&mut out);
+        }
+    }
+    // A long prefix: `P V` with `K` past one block, by the block-stream model, fixed blocks and
+    // off, and `K` blocked by a limit.
+    let pv: Vec<_> = (0..2)
+        .map(|h| (block([h * 512, 0], false), block([0, h * 64], false)))
+        .collect();
+    for (blocks, limit) in [
+        (BlockStream::Auto, None),
+        (BlockStream::Fixed([4, 8, 2]), None),
+        (BlockStream::Off, None),
+        (BlockStream::Auto, Some(16)),
+    ] {
+        for units in [8, 120] {
+            let mut p = Batched::new([1024, 2048], [2048, 128], pv.clone(), [512, 2048, 64]);
+            (p.units, p.block_stream, p.max_k_tiles) = (units, blocks, limit);
+            p.run(&mut out);
+        }
+    }
+    // A batch of one, and refusals: a block past its tensor, and nothing to compute.
+    Batched::new(
+        [96, 320],
+        [320, 288],
+        vec![(block([0, 0], false), block([0, 0], false))],
+        [96, 320, 288],
+    )
+    .run(&mut out);
+    Batched::new(
+        [64, 64],
+        [64, 64],
+        vec![(block([0, 32], false), block([0, 0], false))],
+        [64, 64, 64],
+    )
+    .run(&mut out);
+    Batched::new([64, 64], [64, 64], Vec::new(), [64, 64, 64]).run(&mut out);
+    pinned("jobs_batched.txt", &out);
 }
