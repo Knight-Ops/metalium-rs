@@ -781,10 +781,14 @@ impl<N: NocId> DataMover<N> {
                 decode_contained(self.arena, usable, entries[i]).map_err(DmError::Invalid)?;
                 if matches!(
                     entries[i][0],
-                    op::WRITE_L1 | op::WRITE_L1_MCAST | op::READ_L1
+                    op::WRITE_L1 | op::WRITE_L1_MCAST | op::READ_L1 | op::CREDIT
                 ) && !self.l1_writes.admits(entries[i])
                 {
                     return Err(DmError::Invalid(dm::error::RANGE));
+                }
+                // A credit word waited on is this tile's, in what its lists may name.
+                if entries[i][0] == op::WAIT_CREDIT {
+                    contained(self.arena, op::WAIT_CREDIT, entries[i][1], 4)?;
                 }
             } else {
                 let rec = entries
@@ -1127,13 +1131,18 @@ pub struct L1Writes {
 
 impl L1Writes {
     /// Whether [`op::WRITE_L1`] or [`op::WRITE_L1_MCAST`] entry `e` writes inside the window of
-    /// the tiles (one of them, or a rectangle all of whose tiles are), or [`op::READ_L1`] entry
-    /// `e` reads inside the window of one of them.
+    /// the tiles (one of them, or a rectangle all of whose tiles are), [`op::READ_L1`] entry
+    /// `e` reads inside the window of one of them, or [`op::CREDIT`] entry `e` credits a word
+    /// inside the window of one of them.
     pub fn admits(&self, e: [u32; 8]) -> bool {
-        let (to, len) = (e[3] as u64, e[5] as u64);
+        let (to, len) = if e[0] == op::CREDIT {
+            (e[3] as u64, 4)
+        } else {
+            (e[3] as u64, e[5] as u64)
+        };
         let ours = |x: u8, y: u8| self.tiles.contains(&(x, y));
         let tiles = match e[0] {
-            op::WRITE_L1 | op::READ_L1 => u8::try_from(e[1])
+            op::WRITE_L1 | op::READ_L1 | op::CREDIT => u8::try_from(e[1])
                 .ok()
                 .zip(u8::try_from(e[2]).ok())
                 .is_some_and(|(x, y)| ours(x, y)),
@@ -1195,6 +1204,8 @@ pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
                     Entry::Buffer { .. } => return Err(dm::error::OP),
                     Entry::Move { descriptor, .. } if writer && descriptor.op == op::WRITE => {}
                     Entry::L1Write { .. } | Entry::L1Multicast { .. } if writer => {}
+                    // A cross-core channel's credits, either way (`crate::channel`).
+                    Entry::Credit { .. } | Entry::WaitCredit { .. } if writer => {}
                     Entry::CheckFlags { .. } if writer => {}
                     _ if writer => return Err(dm::error::OP),
                     _ => {}

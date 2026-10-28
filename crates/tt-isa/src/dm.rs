@@ -158,6 +158,11 @@ pub const TXN_NC_MCAST: u8 = 7;
 /// "A transaction ID's outstanding count is the tile's"). Its cap is [`TILE_IN_FLIGHT_CAP`], set
 /// once when the mover starts.
 pub const TXN_FETCH: u8 = 8;
+/// The NoC transaction IDs of a mover's credits ([`op::CREDIT`]): B's and NC's, apart from every
+/// other ID and from each other, since an ID's outstanding count is the tile's NIU's and each mover
+/// waits for its own credit's response.
+pub const TXN_CREDIT_B: u8 = 9;
+pub const TXN_CREDIT_NC: u8 = 10;
 /// Word 6 of an [`op::WRITE_L1_MCAST`]: counted with the run it belongs to, not on its own.
 pub const MCAST_RUN_ACKS: u32 = 1;
 
@@ -176,6 +181,10 @@ pub const BARRIER_COUNTER: u64 = MAILBOX_BASE + 0x60;
 pub const BARRIER_POLL: u64 = MAILBOX_BASE + 0x70;
 /// Where the atomic increment's old value lands.
 pub const BARRIER_RET: u64 = MAILBOX_BASE + 0x80;
+/// Where a credit's atomic increment ([`op::CREDIT`]) returns the word's old value, in the issuing
+/// mover's mailbox ([`Mover::at`]). Nothing reads it.
+pub const CREDIT_RET: u64 = MAILBOX_BASE + 0x84;
+const _: () = assert!(CREDIT_RET + 4 <= QUEUE_HEAD);
 /// The word of a wait-only `op::BARRIER` that says how many barriers it stands for: the
 /// profile mode's window counts it as that many arrivals.
 pub const BARRIER_STANDS_FOR: usize = 5;
@@ -439,6 +448,29 @@ pub mod op {
     /// tiles and `from` to the window it keeps (`docs/plans/planned-l1-residency.md`). B's only.
     /// Only in a list entry.
     pub const READ_L1: u32 = 0x26;
+    /// A channel's credit to a peer (`tt_kernels::channel`): `[CREDIT, x, y, addr, value, 0, 0,
+    /// 0]`. Once every request this mover has issued under its own ID has completed -- a write's
+    /// acknowledgement, a read's data -- one full-width NoC atomic increment adds `value` to the
+    /// word at `addr` in the L1 of the tile at `(x, y)` (this tile's own included), and the mover
+    /// waits for its response before the next entry. A write followed by an atomic is not ordered
+    /// on the NoC (`docs/learnings/dataflow-compiler.md`, T7), so the wait for the acknowledgements
+    /// is what puts the credit after the data it grants; a multicast run is counted before any entry
+    /// not of it, so a credit after one is after its writes too. RISCV B's goes out on NoC #0, NC's on
+    /// the NIU its writes do ([`super::WRITE_NOC`]); each under its own ID ([`super::TXN_CREDIT_B`],
+    /// [`super::TXN_CREDIT_NC`]), returning the old value to its [`super::CREDIT_RET`]. `addr` a
+    /// word inside `crate::l1::LISTED`; `(x, y)` a coordinate a Tensix tile could have
+    /// (`crate::noc::grid::is_tensix_geometry`), narrowed by the host to its session's tiles; `value`
+    /// not zero. Prefetch reads ([`super::TXN_PREFETCH`]) are not waited for. Both movers. Only in a
+    /// list entry.
+    pub const CREDIT: u32 = 0x4D;
+    /// Wait for credits: `[WAIT_CREDIT, addr, target, 0, ...]`. Polls the word at `addr` in this
+    /// tile's L1, through a fence (the NoC writes L1 without invalidating the L0 cache), until it
+    /// has reached `target`, signed modulo 2^32 as a barrier's counter, so a channel's counts may
+    /// wrap. Every poll reads the streams' abort word ([`crate::dataflow::ABORT`]) as a credit wait
+    /// does, so a wait that will never end is cancelled, never left running; while it waits, the
+    /// mover's wait reason ([`crate::dataflow::WAIT_REASON`]) is [`crate::dataflow::CREDIT_WAIT`].
+    /// `addr` a word inside `crate::l1::LISTED`. Both movers. Only in a list entry.
+    pub const WAIT_CREDIT: u32 = 0x4E;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
     /// in order. The other descriptor words are unused.
     pub const LIST: u32 = 3;
@@ -579,6 +611,8 @@ const _: () = {
         op::WRITE_L1,
         op::WRITE_L1_MCAST,
         op::READ_L1,
+        op::CREDIT,
+        op::WAIT_CREDIT,
     ];
     let mut i = 0;
     while i < ops.len() {
@@ -679,7 +713,7 @@ impl Mover {
     /// entries, the roles' launches, barriers, PCIe moves ([`op::HOST_WRITE`]
     /// included), and the reading records. RISCV NC is the writer: only
     /// [`op::WRITE`], [`op::WRITE_L1`], the writing records, [`op::WAIT`] and the credits
-    /// ([`op::CB`]). The packet entries ([`op::PAIR`], [`op::PAIR_CALL`],
+    /// ([`op::CB`], [`op::CREDIT`], [`op::WAIT_CREDIT`]). The packet entries ([`op::PAIR`], [`op::PAIR_CALL`],
     /// [`op::RELEASED`]) and [`op::CALL`] are B's; NC is started by B's
     /// packet, through its `SHARED` and `CALL` words, which are not entries.
     pub const fn permits(self, op: u32) -> bool {
@@ -698,6 +732,8 @@ impl Mover {
                     || op == op::CHECK_FLAGS
                     || op == op::WAIT
                     || op == op::CB
+                    || op == op::CREDIT
+                    || op == op::WAIT_CREDIT
                     || matches!(record::direction(op), Some(record::Direction::Write))
             }
         }
@@ -873,6 +909,10 @@ pub enum Entry {
         from: u32,
         len: u32,
     },
+    /// [`op::CREDIT`]: add `value` to the word at `addr` in the L1 of `(x, y)`.
+    Credit { x: u8, y: u8, addr: u32, value: u32 },
+    /// [`op::WAIT_CREDIT`]: wait until the word at `addr` in this tile's L1 reaches `target`.
+    WaitCredit { addr: u32, target: u32 },
     /// [`op::READ_L1`]: `len` bytes at `from` in the L1 of `(x, y)` to `to` in this tile's.
     L1Read {
         x: u8,
@@ -1037,6 +1077,37 @@ impl Entry {
                 len,
                 run: w[6] == MCAST_RUN_ACKS,
             });
+        }
+        if w[0] == op::CREDIT {
+            let (x, y, addr, value) = (w[1], w[2], w[3], w[4]);
+            if w[5..].iter().any(|&word| word != 0) {
+                return Err(error::OP);
+            }
+            if value == 0 {
+                return Err(error::LENGTH);
+            }
+            if x > 0x3f || y > 0x3f || !crate::noc::grid::is_tensix_geometry(x as u8, y as u8) {
+                return Err(error::RANGE);
+            }
+            if addr % 4 != 0 || !crate::l1::LISTED.contains(addr as u64, 4) {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::Credit {
+                x: x as u8,
+                y: y as u8,
+                addr,
+                value,
+            });
+        }
+        if w[0] == op::WAIT_CREDIT {
+            let (addr, target) = (w[1], w[2]);
+            if w[3..].iter().any(|&word| word != 0) {
+                return Err(error::OP);
+            }
+            if addr % 4 != 0 || !crate::l1::LISTED.contains(addr as u64, 4) {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::WaitCredit { addr, target });
         }
         if w[0] == op::WRITE_L1 || w[0] == op::READ_L1 {
             // The same five words: the remote address third, the local fourth.
@@ -1952,7 +2023,7 @@ mod tests {
             op::PAIR_CALL,
             op::RELEASED,
         ];
-        let shared = [op::WAIT, op::CB];
+        let shared = [op::WAIT, op::CB, op::CREDIT, op::WAIT_CREDIT];
         for o in writes {
             assert!(!Mover::B.permits(o) && Mover::NC.permits(o), "{o:#x}");
         }
@@ -1962,6 +2033,63 @@ mod tests {
         for o in shared {
             assert!(Mover::B.permits(o) && Mover::NC.permits(o), "{o:#x}");
         }
+    }
+
+    /// `CREDIT`: a Tensix coordinate, a word of `LISTED`, a value that adds something, the
+    /// reserved words zero. `WAIT_CREDIT`: a word of `LISTED`, any target (the count wraps).
+    #[test]
+    fn credits_decode_only_whole() {
+        let word = crate::l1::DATA.base as u32 + 0x40;
+        let good = [op::CREDIT, 4, 4, word, 1, 0, 0, 0];
+        assert_eq!(
+            Entry::decode(ALL, good),
+            Ok(Entry::Credit {
+                x: 4,
+                y: 4,
+                addr: word,
+                value: 1
+            })
+        );
+        let with = |k: usize, v: u32| {
+            let mut e = good;
+            e[k] = v;
+            Entry::decode(ALL, e)
+        };
+        assert_eq!(with(4, 0), Err(error::LENGTH), "a credit of nothing");
+        assert!(matches!(with(4, u32::MAX), Ok(Entry::Credit { .. })));
+        assert_eq!(with(1, 8), Err(error::RANGE), "the non-memory column");
+        assert_eq!(with(1, 0x40), Err(error::RANGE));
+        assert_eq!(with(3, word + 2), Err(error::ALIGNMENT));
+        assert_eq!(
+            with(3, MAILBOX_BASE as u32 + 0x60),
+            Err(error::ALIGNMENT),
+            "a mover's own mailbox, the barrier's counter"
+        );
+        assert_eq!(with(3, crate::l1::LISTED.end as u32), Err(error::ALIGNMENT));
+        for k in 5..8 {
+            assert_eq!(with(k, 1), Err(error::OP));
+        }
+        let wait = [op::WAIT_CREDIT, word, u32::MAX, 0, 0, 0, 0, 0];
+        assert_eq!(
+            Entry::decode(ALL, wait),
+            Ok(Entry::WaitCredit {
+                addr: word,
+                target: u32::MAX
+            })
+        );
+        let mut misaligned = wait;
+        misaligned[1] = word + 1;
+        assert_eq!(Entry::decode(ALL, misaligned), Err(error::ALIGNMENT));
+        let mut mailbox = wait;
+        mailbox[1] = crate::dataflow::INPUT as u32;
+        assert_eq!(
+            Entry::decode(ALL, mailbox),
+            Err(error::ALIGNMENT),
+            "the streams' counters are not a channel's credit word"
+        );
+        let mut extra = wait;
+        extra[3] = 1;
+        assert_eq!(Entry::decode(ALL, extra), Err(error::OP));
     }
 
     #[test]

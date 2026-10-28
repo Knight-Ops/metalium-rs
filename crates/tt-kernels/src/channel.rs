@@ -130,6 +130,345 @@ impl Channel {
     }
 }
 
+/// Where a cross-core channel's pages wait for their consumers: a ring of `depth` slots.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Slots {
+    /// In each consumer's L1, at the same address on every one.
+    L1 { base: u32 },
+    /// In GDDR: `channel`'s bytes from `offset`, written through `port`.
+    Gddr {
+        channel: u32,
+        port: u32,
+        offset: u32,
+    },
+}
+
+/// A cross-core channel lowered to mover entries: a [`Kind::Remote`] channel (one consumer and
+/// [`Slots::L1`]), a [`Kind::Broadcast`] one (several consumers, a rectangle, [`Slots::L1`]) or a
+/// [`Kind::Gddr`] one ([`Slots::Gddr`]).
+///
+/// The producer's NC writes page `k` into slot `k % depth` and then credits every consumer's
+/// `received` word ([`tt_isa::dm::op::CREDIT`], which waits for the writes' acknowledgements
+/// first). A consumer waits for `received` to reach `k + 1` ([`tt_isa::dm::op::WAIT_CREDIT`]), uses
+/// the page, and credits the producer's `freed` word. Before it writes page `k >= depth` over page
+/// `k - depth`, the producer waits for `freed` to reach `(k + 1 - depth) x consumers`. Every count
+/// starts at zero, written by the host before either side runs, and none is reset by the card.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ring {
+    /// The producer's tile, as the session names it.
+    pub producer: (u8, u8),
+    /// The consumers' tiles: one, or every tile of a rectangle.
+    pub consumers: Vec<(u8, u8)>,
+    pub depth: u16,
+    /// Bytes a page, a multiple of 16.
+    pub page_bytes: u32,
+    pub slots: Slots,
+    /// The credit word on every consumer that counts the pages it has been sent.
+    pub received: u32,
+    /// The credit word on the producer that counts the pages consumers have freed.
+    pub freed: u32,
+}
+
+/// Why a channel or its lowering is refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChannelError {
+    /// A ring that cannot be lowered: no consumers, depth 0, a page that is not whole 16-byte
+    /// units, broadcast consumers that are not one rectangle.
+    Invalid(String),
+    /// A producer write that lands outside the slot of the page it is writing.
+    OutsideSlot { page: u32, entry: usize },
+    /// A write into the slot of `page` before its consumers have freed the page the slot held.
+    NotFreed { page: u32, entry: usize },
+    /// A write into the slot of `page` after a consumer has already been credited for it: the
+    /// consumer may be reading what is being written.
+    WriteAfterCredit { page: u32, entry: usize },
+    /// A credit for `page` before all of its bytes were written.
+    Unwritten {
+        page: u32,
+        written: u64,
+        bytes: u64,
+        entry: usize,
+    },
+}
+
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelError::Invalid(why) => f.write_str(why),
+            ChannelError::OutsideSlot { page, entry } => {
+                write!(f, "entry {entry} writes page {page} outside its slot")
+            }
+            ChannelError::NotFreed { page, entry } => write!(
+                f,
+                "entry {entry} writes page {page} before its slot's last page is freed"
+            ),
+            ChannelError::WriteAfterCredit { page, entry } => write!(
+                f,
+                "entry {entry} writes page {page} after its consumers were credited for it"
+            ),
+            ChannelError::Unwritten {
+                page,
+                written,
+                bytes,
+                entry,
+            } => write!(
+                f,
+                "entry {entry} credits page {page} with {written} of its {bytes} bytes written"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChannelError {}
+
+const MAX_REQUEST: u32 = tt_isa::noc::niu::MAX_REQUEST_BYTES;
+
+impl Ring {
+    fn validate(&self) -> Result<(), ChannelError> {
+        let invalid = |why: &str| Err(ChannelError::Invalid(why.into()));
+        if self.consumers.is_empty() || self.depth == 0 || self.depth > MAX_DEPTH {
+            return invalid("a ring needs consumers and a depth of 1 to 0x7FFF");
+        }
+        if self.page_bytes == 0 || self.page_bytes % 16 != 0 {
+            return invalid("a page is whole 16-byte units");
+        }
+        if self.received % 4 != 0 || self.freed % 4 != 0 {
+            return invalid("a credit word is a word");
+        }
+        if self.consumers.len() > 1 {
+            if matches!(self.slots, Slots::Gddr { .. }) {
+                return invalid("a GDDR ring has one consumer");
+            }
+            let (start, end) = self.rectangle();
+            let tiles = (end.0 - start.0 + 1) as usize * (end.1 - start.1 + 1) as usize;
+            let mut distinct = self.consumers.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() != self.consumers.len() || tiles != distinct.len() {
+                return invalid("broadcast consumers are every tile of one rectangle, once");
+            }
+            if self.consumers.contains(&self.producer) {
+                return invalid("a multicast never reaches its sender");
+            }
+        }
+        Ok(())
+    }
+
+    /// The consumers' bounding rectangle.
+    fn rectangle(&self) -> ((u8, u8), (u8, u8)) {
+        let xs = self.consumers.iter().map(|c| c.0);
+        let ys = self.consumers.iter().map(|c| c.1);
+        (
+            (xs.clone().min().unwrap(), ys.clone().min().unwrap()),
+            (xs.max().unwrap(), ys.max().unwrap()),
+        )
+    }
+
+    /// Slot `page % depth`'s first byte: an L1 address, or a GDDR offset.
+    pub fn slot(&self, page: u32) -> u32 {
+        let base = match self.slots {
+            Slots::L1 { base } => base,
+            Slots::Gddr { offset, .. } => offset,
+        };
+        base + (page % self.depth as u32) * self.page_bytes
+    }
+
+    fn credit_entry(at: (u8, u8), word: u32, value: u32) -> [u32; 8] {
+        [
+            tt_isa::dm::op::CREDIT,
+            at.0 as u32,
+            at.1 as u32,
+            word,
+            value,
+            0,
+            0,
+            0,
+        ]
+    }
+
+    fn wait_entry(word: u32, target: u32) -> [u32; 8] {
+        [tt_isa::dm::op::WAIT_CREDIT, word, target, 0, 0, 0, 0, 0]
+    }
+
+    /// The producer's (NC's) entries that send page `page` from `from` in its own L1: the wait for
+    /// its slot to be freed (from the ring's second lap), the page's writes, then a credit to each
+    /// consumer.
+    pub fn send(&self, page: u32, from: u32) -> Result<Vec<[u32; 8]>, ChannelError> {
+        use tt_isa::dm::op;
+        self.validate()?;
+        let mut out = Vec::new();
+        let consumers = self.consumers.len() as u32;
+        if page >= self.depth as u32 {
+            out.push(Self::wait_entry(
+                self.freed,
+                (page + 1 - self.depth as u32) * consumers,
+            ));
+        }
+        let slot = self.slot(page);
+        let mut done = 0;
+        while done < self.page_bytes {
+            let len = (self.page_bytes - done).min(MAX_REQUEST);
+            let (to, from) = (slot + done, from + done);
+            out.push(match (self.slots, self.consumers.as_slice()) {
+                (Slots::Gddr { channel, port, .. }, _) => {
+                    [op::WRITE, channel, port, to, from, len, 0, 0]
+                }
+                (Slots::L1 { .. }, [one]) => [
+                    op::WRITE_L1,
+                    one.0 as u32,
+                    one.1 as u32,
+                    to,
+                    from,
+                    len,
+                    0,
+                    0,
+                ],
+                (Slots::L1 { .. }, _) => {
+                    let (start, end) = self.rectangle();
+                    let corners = tt_isa::dm::mcast_corners(start, end);
+                    [op::WRITE_L1_MCAST, corners, 0, to, from, len, 0, 0]
+                }
+            });
+            done += len;
+        }
+        for &consumer in &self.consumers {
+            out.push(Self::credit_entry(consumer, self.received, 1));
+        }
+        Ok(out)
+    }
+
+    /// A consumer's wait for page `page`.
+    pub fn receive(&self, page: u32) -> [u32; 8] {
+        Self::wait_entry(self.received, page + 1)
+    }
+
+    /// A GDDR ring's consumer (B): the wait for page `page`, then its reads into `to`.
+    pub fn fetch(&self, page: u32, to: u32) -> Result<Vec<[u32; 8]>, ChannelError> {
+        self.validate()?;
+        let Slots::Gddr { channel, port, .. } = self.slots else {
+            return Err(ChannelError::Invalid(
+                "only a GDDR ring's page is fetched".into(),
+            ));
+        };
+        let mut out = vec![self.receive(page)];
+        let slot = self.slot(page);
+        let mut done = 0;
+        while done < self.page_bytes {
+            let len = (self.page_bytes - done).min(MAX_REQUEST);
+            out.push([
+                tt_isa::dm::op::READ,
+                channel,
+                port,
+                slot + done,
+                to + done,
+                len,
+                0,
+                0,
+            ]);
+            done += len;
+        }
+        Ok(out)
+    }
+
+    /// A consumer's credit to the producer once it has finished with a page.
+    pub fn free(&self) -> [u32; 8] {
+        Self::credit_entry(self.producer, self.freed, 1)
+    }
+
+    /// Check a producer's entries against the ring's protocol, page by page from page 0: each
+    /// page's writes land in its slot, after the slot's last page was freed and before any consumer
+    /// is credited for it, and every byte of a page is written before its first credit. Entries
+    /// that neither write the ring nor credit or wait on its words are other work and pass.
+    pub fn check_send(&self, entries: &[[u32; 8]]) -> Result<(), ChannelError> {
+        use tt_isa::dm::op;
+        self.validate()?;
+        let consumers = self.consumers.len() as u32;
+        let depth = self.depth as u32;
+        let ring = {
+            let base = self.slot(0) as u64;
+            base..base + depth as u64 * self.page_bytes as u64
+        };
+        // The page being written: the first not yet credited to every consumer.
+        let mut page = 0u32;
+        // Consumers credited for `page` so far.
+        let mut credited = 0u32;
+        let mut written = 0u64;
+        // Pages freed by every consumer, as far as the producer has waited.
+        let mut freed = 0u32;
+        for (entry, e) in entries.iter().enumerate() {
+            let target = match (e[0], self.slots) {
+                (op::WRITE, Slots::Gddr { channel, .. }) if e[1] == channel => {
+                    Some((e[3] as u64, e[5] as u64))
+                }
+                (op::WRITE_L1, Slots::L1 { .. })
+                    if self.consumers.contains(&(e[1] as u8, e[2] as u8)) =>
+                {
+                    Some((e[3] as u64, e[5] as u64))
+                }
+                (op::WRITE_L1_MCAST, Slots::L1 { .. }) => Some((e[3] as u64, e[5] as u64)),
+                _ => None,
+            };
+            if let Some((at, len)) = target {
+                if at + len <= ring.start || at >= ring.end {
+                    continue;
+                }
+                let bytes = self.page_bytes as u64;
+                let index = ((at.max(ring.start) - ring.start) / bytes) as u32;
+                let slot = ring.start + index as u64 * bytes;
+                if at < slot || at + len > slot + bytes {
+                    return Err(ChannelError::OutsideSlot { page, entry });
+                }
+                if index != page % depth {
+                    // The slot of an earlier page, credited already: unless its consumers freed
+                    // it, they may be reading it.
+                    let back = (page % depth + depth - index) % depth;
+                    return Err(match page.checked_sub(back) {
+                        Some(earlier) if earlier >= freed => ChannelError::WriteAfterCredit {
+                            page: earlier,
+                            entry,
+                        },
+                        _ => ChannelError::OutsideSlot { page, entry },
+                    });
+                }
+                if page >= depth && freed < page + 1 - depth {
+                    return Err(ChannelError::NotFreed { page, entry });
+                }
+                if credited > 0 {
+                    return Err(ChannelError::WriteAfterCredit { page, entry });
+                }
+                written += len;
+                continue;
+            }
+            match e[0] {
+                op::WAIT_CREDIT if e[1] == self.freed => {
+                    freed = freed.max(e[2] / consumers);
+                }
+                op::CREDIT
+                    if e[3] == self.received
+                        && self.consumers.contains(&(e[1] as u8, e[2] as u8)) =>
+                {
+                    if written < self.page_bytes as u64 {
+                        return Err(ChannelError::Unwritten {
+                            page,
+                            written,
+                            bytes: self.page_bytes as u64,
+                            entry,
+                        });
+                    }
+                    credited += e[4];
+                    if credited >= consumers {
+                        page += 1;
+                        credited = 0;
+                        written = 0;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +567,177 @@ mod tests {
             });
             assert!(bad.plan(arena).is_err(), "{bytes} {align} {kind:?}");
         }
+    }
+
+    fn ring(consumers: Vec<(u8, u8)>, slots: Slots) -> Ring {
+        Ring {
+            producer: (1, 2),
+            consumers,
+            depth: 2,
+            page_bytes: 20 * 1024,
+            slots,
+            received: tt_isa::l1::DATA.base as u32,
+            freed: tt_isa::l1::DATA.base as u32 + 16,
+        }
+    }
+
+    fn rings() -> [Ring; 3] {
+        let base = tt_isa::l1::DATA.base as u32 + 0x1000;
+        [
+            ring(vec![(3, 4)], Slots::L1 { base }),
+            ring(vec![(3, 4), (4, 4), (3, 5), (4, 5)], Slots::L1 { base }),
+            ring(
+                vec![(3, 4)],
+                Slots::Gddr {
+                    channel: 2,
+                    port: 1,
+                    offset: 0x40_0000,
+                },
+            ),
+        ]
+    }
+
+    /// Five pages over a depth-2 ring: what the producer's NC sends, entry by entry.
+    fn producer_list(r: &Ring) -> Vec<[u32; 8]> {
+        let from = tt_isa::l1::DATA.base as u32 + 0x2_0000;
+        (0..5)
+            .flat_map(|page| r.send(page, from).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_ring_lowers_to_entries_its_movers_run_and_its_protocol_admits() {
+        use tt_isa::dm::{op, Entry, Mover};
+        for r in rings() {
+            let list = producer_list(&r);
+            r.check_send(&list).unwrap();
+            for e in &list {
+                assert!(Mover::NC.permits(e[0]), "{e:x?}");
+                assert!(Entry::decode(u32::MAX, *e).is_ok(), "{e:x?}");
+            }
+            let consumers = r.consumers.len();
+            // A page of 20 KiB is two requests; each consumer credited once a page; from the
+            // third page on, a wait for the first lap's frees, counted over every consumer.
+            let waits: Vec<u32> = list
+                .iter()
+                .filter(|e| e[0] == op::WAIT_CREDIT)
+                .map(|e| e[2])
+                .collect();
+            assert_eq!(
+                waits,
+                [1, 2, 3].map(|freed| freed * consumers as u32),
+                "{:?}",
+                r.slots
+            );
+            assert_eq!(
+                list.iter().filter(|e| e[0] == op::CREDIT).count(),
+                5 * consumers
+            );
+            let data = list
+                .iter()
+                .filter(|e| matches!(e[0], op::WRITE | op::WRITE_L1 | op::WRITE_L1_MCAST));
+            assert_eq!(data.count(), 10);
+            // The consumer's side: waits for page k at k + 1, and frees to the producer.
+            assert_eq!(
+                r.receive(4),
+                [op::WAIT_CREDIT, r.received, 5, 0, 0, 0, 0, 0]
+            );
+            assert_eq!(r.free(), [op::CREDIT, 1, 2, r.freed, 1, 0, 0, 0]);
+            assert!(Mover::B.permits(r.receive(0)[0]) && Mover::B.permits(r.free()[0]));
+        }
+        let gddr = &rings()[2];
+        let fetch = gddr.fetch(3, 0x4_0000).unwrap();
+        assert_eq!(fetch[0], gddr.receive(3));
+        assert_eq!(
+            fetch[1][..6],
+            [op::READ, 2, 1, gddr.slot(3), 0x4_0000, 16384]
+        );
+        assert!(rings()[0].fetch(0, 0x4_0000).is_err());
+    }
+
+    /// The planted faults the protocol check exists for: each one, in each kind of ring, is
+    /// refused by name.
+    #[test]
+    fn a_producer_that_breaks_the_protocol_is_refused() {
+        use tt_isa::dm::op;
+        for r in rings() {
+            let good = producer_list(&r);
+            let at = |kind: u32, nth: usize| {
+                good.iter()
+                    .enumerate()
+                    .filter(|(_, e)| e[0] == kind)
+                    .nth(nth)
+                    .unwrap()
+                    .0
+            };
+            let data = good[1][0];
+            // A write after its page's credit: page 0's first write moved past its credit.
+            let mut late = good.clone();
+            let write = late.remove(at(data, 0));
+            late.insert(at(op::CREDIT, r.consumers.len() - 1), write);
+            assert!(
+                matches!(
+                    r.check_send(&late),
+                    Err(ChannelError::Unwritten { page: 0, .. })
+                        | Err(ChannelError::WriteAfterCredit { page: 0, .. })
+                ),
+                "{:?}",
+                r.check_send(&late)
+            );
+            // Page 0 written again once credited, before it is freed.
+            let mut again = good.clone();
+            again.insert(at(op::CREDIT, r.consumers.len() - 1) + 1, good[0]);
+            assert_eq!(
+                r.check_send(&again),
+                Err(ChannelError::WriteAfterCredit {
+                    page: 0,
+                    entry: at(op::CREDIT, r.consumers.len() - 1) + 1
+                })
+            );
+            // The second lap without waiting for the first's frees.
+            let mut eager = good.clone();
+            eager.remove(at(op::WAIT_CREDIT, 0));
+            assert!(matches!(
+                r.check_send(&eager),
+                Err(ChannelError::NotFreed { page: 2, .. })
+            ));
+            // A wait for one free too few.
+            let mut short = good.clone();
+            short[at(op::WAIT_CREDIT, 0)][2] -= 1;
+            assert!(matches!(
+                r.check_send(&short),
+                Err(ChannelError::NotFreed { page: 2, .. })
+            ));
+            // A page credited with a request's bytes missing.
+            let mut dropped = good.clone();
+            dropped.remove(at(data, 1));
+            assert!(matches!(
+                r.check_send(&dropped),
+                Err(ChannelError::Unwritten { page: 0, .. })
+            ));
+            // A write into the wrong slot.
+            let mut stray = good.clone();
+            stray[at(data, 0)][3] += r.page_bytes;
+            assert!(r.check_send(&stray).is_err());
+        }
+    }
+
+    #[test]
+    fn a_ring_that_cannot_be_lowered_is_refused() {
+        let base = tt_isa::l1::DATA.base as u32;
+        let mut r = ring(vec![(3, 4), (5, 4)], Slots::L1 { base });
+        assert!(
+            matches!(r.send(0, base), Err(ChannelError::Invalid(_))),
+            "not a rectangle"
+        );
+        r.consumers = vec![(1, 2), (2, 2)];
+        assert!(r.send(0, base).is_err(), "the sender inside its multicast");
+        r.consumers = vec![(3, 4)];
+        r.depth = 0;
+        assert!(r.send(0, base).is_err());
+        r.depth = 2;
+        r.page_bytes = 24;
+        assert!(r.send(0, base).is_err());
     }
 
     #[test]

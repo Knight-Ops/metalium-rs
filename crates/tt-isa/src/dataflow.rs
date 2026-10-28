@@ -91,6 +91,11 @@ pub const AHEAD_CHUNK: u64 = OUTER_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::
 const _: () = assert!(AHEAD_CHUNK + dm::TRACE_CHUNK_ENTRIES as u64 * dm::ENTRY_BYTES <= dm::LIST);
 const _: () = assert!(NC_WAITS + NC_WAIT_WORDS * 4 <= mailbox::PROBE_SCRATCH);
 
+/// A mover's wait reason ([`WAIT_REASON`]) while it waits on a cross-core channel's credit word
+/// (`dm::op::WAIT_CREDIT`). The in-core streams' are 1 to 20, a release's 24 to 26 and a role's
+/// retirement 32.
+pub const CREDIT_WAIT: u32 = 40;
+
 /// Which credit channel a `CB` entry names (`dm::op::CB` word 1).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Stream {

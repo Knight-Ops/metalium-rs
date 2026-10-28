@@ -37,6 +37,17 @@ const FETCH_TXN: TxnId = match TxnId::new(dm::TXN_FETCH) {
     None => panic!(),
 };
 
+/// This mover's credits ([`credit`]): apart from its moves', so the wait for a credit's response
+/// is for the credit alone, and from the other mover's, since an ID's count is the tile's NIU's.
+const CREDIT_TXN: TxnId = match TxnId::new(if IS_NC {
+    dm::TXN_CREDIT_NC
+} else {
+    dm::TXN_CREDIT_B
+}) {
+    Some(t) => t,
+    None => panic!(),
+};
+
 /// The chunk [`fetch_ahead`] is reading into `dataflow::AHEAD_CHUNK`: the next `PAIR_CALL`'s
 /// first reader chunk, as `[channel, offset, entries]`. RISCV B only. In local data RAM, set
 /// before the first list.
@@ -432,6 +443,36 @@ fn issue_l1_write(me: (u8, u8), at: (u8, u8), to: u32, from: u32, len: u32) -> R
         len,
     };
     noc::issue(niu, &cmd, me, TXN).map_err(|_| dm::error::ALIGNMENT)
+}
+
+/// [`op::CREDIT`]: once every request this mover has issued under its own ID has completed (a
+/// multicast run is already counted: it ends before any other entry), one full-width atomic
+/// increment of the word at `addr` in the L1 of `at`, then a wait for its response. A write
+/// followed by an atomic is not ordered on the NoC, so the wait for the writes' acknowledgements is
+/// what makes the credit follow its data. B's goes out on NoC #0; NC's through the NIU its writes
+/// do, as [`issue_l1_write`]'s.
+#[link_section = ".text.warm"]
+#[inline(never)]
+fn credit(me: (u8, u8), at: (u8, u8), addr: u32, value: u32) -> Result<(), u32> {
+    use tt_isa::noc::niu::Endpoint;
+    noc::wait(TXN);
+    publish();
+    let (niu, me) = match (IS_NC, writes().niu) {
+        (true, Niu::Noc1) => (Niu::Noc1, writes().me1),
+        _ => (Niu::Noc0, me),
+    };
+    let cmd = Command::AtomicIncrement {
+        to: Endpoint {
+            x: at.0,
+            y: at.1,
+            addr,
+        },
+        value,
+        ret_local: M.at(dm::CREDIT_RET) as u32,
+    };
+    noc::issue(niu, &cmd, me, CREDIT_TXN).map_err(|_| dm::error::ALIGNMENT)?;
+    noc::wait(CREDIT_TXN);
+    Ok(())
 }
 
 /// [`op::WRITE_L1_MCAST`], NC's: once its earlier writes have landed, one multicast of `len` bytes
@@ -1173,6 +1214,12 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             let since = nc_clock();
             issue_l1_write(me, (x, y), to, from, len)?;
             nc_waited(tt_isa::dataflow::NcWait::Issue, since);
+        }
+        Entry::Credit { x, y, addr, value } => credit(me, (x, y), addr, value)?,
+        Entry::WaitCredit { addr, target } => {
+            let since = nc_clock();
+            tt_firmware::dataflow::credit(addr as u64, target, if IS_NC { 4 } else { 0 })?;
+            nc_waited(tt_isa::dataflow::NcWait::Credits, since);
         }
         Entry::L1Read {
             x,

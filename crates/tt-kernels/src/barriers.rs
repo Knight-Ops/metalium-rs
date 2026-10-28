@@ -79,6 +79,7 @@ fn local(head: u32) -> bool {
             | op::KERNEL_WAIT
             | op::TILIZE
             | op::UNTILIZE
+            | op::WAIT_CREDIT
     ) || head == record::POKE_RUN
 }
 
@@ -111,6 +112,19 @@ fn access(w: [u32; 8], units: &[(u8, u8)], out: &mut Vec<Access>) {
                 lo,
                 hi: lo + len,
                 write: w[0] == op::WRITE_L1,
+            });
+        }
+        // A credit writes one word of the peer's L1.
+        op::CREDIT => {
+            let Some(u) = unit_at(w[1], w[2]) else {
+                out.push(Access::Unknown);
+                return;
+            };
+            out.push(Access::Range {
+                space: Space::L1(u),
+                lo: u64::from(w[3]),
+                hi: u64::from(w[3]) + 4,
+                write: true,
             });
         }
         op::WRITE_L1_MCAST => {
