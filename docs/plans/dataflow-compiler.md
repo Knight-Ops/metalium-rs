@@ -97,16 +97,63 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 
 - **H8** (Bible §13, opened 2026-10-28): a credited handoff between two units costs less than a barrier, ≤ 1.5 us on card 1;
   the in-core streams re-expressed as `Local` channels emit today's words.
-- [ ] Add a `Channel` to `tt-kernels`: one producer, N consumers, a depth, and a page of `TileFormat` × tiles. Its kind is `Local`, `Remote`, `Broadcast` or `Gddr`, and its credit words are declared through `l1::Requirements`. The existing `Input`, `Output` and `Transfer` streams are re-expressed as `Local` channels, and every existing gate stays bit-identical.
-- [ ] Add the remote credit: a NoC atomic increment into a peer's L1 word, issued after the data's write acknowledgements (T7), plus a local wait.
-  - The encoding goes in `tt_isa::dataflow` and `tt_isa::dm`, the firmware in `tt-firmware/src/dataflow.rs`/`mover.rs`.
-  - Build both mover modes, and lint with and without `profile`/`encoded-guard`.
-  - Run `step172`/`step173` in both read modes.
-- [ ] Gates:
-  - ttsim, with negative controls: one credit too few stalls and is reported, never races; a credit sent before its data's acknowledgement is caught.
-  - An isolated silicon gate on card 1 before any op uses it.
-  - A divergence row if ttsim refuses the atomic.
-- [ ] Plan-time checks: rate balance and deadlock freedom (every cycle with its reverse credit edges holds enough initial tokens), with a refusal gate for each.
+- [x] **F2.1, the packet golden first** (`d2024f3`): `session::tests::streamed_packet_words_are_pinned` dumps every
+  streamed packet's words for depth-1 and depth-2 regions (apart and shared footprints, past one group), transfers
+  of both depths and past one packet, and a mix between lists, against `crates/tt-kernels/golden/stream_packets.txt`
+  (`TT_BLESS=1`). It has not changed since.
+- [x] **F2.2, `tt_kernels::channel`** (`72f5ce0`):
+  - `Channel {producer, consumers, depth, page, kind}`, with `Page::{Batch, Tiles {format, tiles}}` and
+    `Kind::{Local(Stream), Remote, Broadcast, Gddr}`. It is not `tt_isa::dataflow::Channel`, the firmware's ownership
+    rule.
+  - A local channel's credit is the stream's `CB` entry (`Channel::credit`). `streaming_segments` and
+    `transfer_segments` make every credit through it, so the literals are gone.
+  - `l1::Kind::{Counters, Credit}` through `Requirements::channel`. `enable_dram` declares the three streams' counters
+    as channels, the transfer counters now on their own.
+  - The golden, the session tests, `step60` and `step33` are unchanged.
+- [x] **F2.3, the remote credit** (`656e340`):
+  - **`op::CREDIT [x, y, addr, value]`** drains the mover's own requests, then sends one full-width atomic increment
+    and waits for its response.
+    - B sends on NoC #0, and NC on its writes' NIU.
+    - IDs `TXN_CREDIT_B` 9 and `TXN_CREDIT_NC` 10, returning to `CREDIT_RET`.
+  - **`op::WAIT_CREDIT [addr, target]`** is a fenced, abort-aware poll, signed modulo 2^32, with wait reason
+    `dataflow::CREDIT_WAIT` (40).
+  - Both movers run them, on words in `LISTED`, which the card never resets.
+  - Host checks: `L1Writes::admits` a credit, `check_pair` lets the writer credit and wait, and `barriers::access`
+    treats a credit as a peer-L1 word.
+  - `channel::Ring` lowers remote, broadcast (a rectangle, one multicast and a credit each) and GDDR rings to
+    `send`/`receive`/`fetch`/`free`.
+  - **`Ring::check_send`** is the static ordering check. It refuses a producer list that:
+    - writes after its page's credit;
+    - writes into an unfreed slot;
+    - writes outside its slot;
+    - or credits a page not fully written.
+
+    It belongs to the channel's lowering, not `DataMover::check`, because a list alone does not say which writes a
+    credit grants.
+  - Images (safe): B 35,344 of 43,008 bytes, NC 20,392 of 24,576.
+  - Firmware lints pass in safe, `encoded-guard`, `profile` and `fast-reads`.
+  - On ttsim, `step172`/`step173` pass in safe, `fast-reads` and `fast-reads`+`encoded-guard`.
+- [x] **F2.4, gate `step242_channel_credits`** (`d06c345`, in `--smoke`):
+  - Remote, broadcast (2x2) and GDDR rings hand every page over in order across laps, byte for byte.
+  - One credit too few holds the consumer at its wait. `channel::stalled` reports have and want, the missing page is
+    never copied, and `channel::cancel` fails the list with its code.
+  - The host and the tile refuse malformed credits. A planted consumer without its waits copies poison and fails.
+  - The isolated run on card 0 came first, the remote ring alone (`1793199629`). Then the full file, 5 of 5
+    (`1793199635`). `step172`/`step173` passed in the safe image, 6 of 6 (`1793199651`), and with `fast-reads`,
+    together with `step242`, 16 of 16 (`1793199814`).
+  - The planted faults of the producer's ordering are `channel`'s unit tests. ttsim cannot race a credit against its
+    data's acknowledgement (divergence row 72), and it runs the full-width atomic (row 88), so no new row was needed.
+- [x] **F2.5, plan-time checks** (`22bf51f`): `channel::Graph::check`.
+  - It gives the least repetition vector from the SDF balance equations, and refuses unbalanced rates.
+  - It runs one self-timed iteration with each channel's depth as its reverse edge's credits. A graph that stops is
+    refused: a cycle with no initial tokens, or a channel shallower than a firing.
+  - Each refusal has a unit test, beside a double-buffered two-unit pipeline that passes.
+- [x] **F2.6, H8 measured** (`2f29d9f`, `silicon_bench_channel_credit`, card 1 `1793200301`):
+  - a credited handoff is 1.81 us, against a two-unit barrier's 2.66 us polled and 2.59 us released;
+  - the prediction (<= 1.5 us) is missed, and the claim (cheaper than a barrier) holds. See the Bible's H8.
+- [ ] Close-out: `--smoke` on card 0 and `step12_mnist`.
+- **Not yet built:** no op uses a cross-core channel. F4b (operand reuse) and F4a (channels instead of barriers) are
+  the first. `channel::Graph` is not yet run on an op's graph, and a `Gddr` ring's GDDR placement is the caller's.
 
 ## Stage F3: the tile-generic op (L1) and transforms written once
 

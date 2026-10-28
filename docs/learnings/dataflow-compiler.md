@@ -272,8 +272,15 @@ The 1.7B profile shows where this could pay: products start near 634 GB/s and en
   - A credit per tile is TT-Metal's default [PUB].
   - Finer credits overlap more and synchronize more. Which granularity pays is decision D6.
 - **Cross-core credits** are NoC atomic increments into a consumer's or producer's L1 word, ordered after the data by its write acknowledgements (T7).
-  - Their L1 words and semaphores are declared in `l1::Requirements` like any buffer, and their lifetimes cover trace holds.
-  - Each program writes their initial values (T9).
+  - Built in F2 (2026-10-28) as two mover entries:
+    - `op::CREDIT` drains the mover's own requests, then sends one full-width atomic and waits for its response;
+    - `op::WAIT_CREDIT` is a fenced, abort-aware local poll that compares signed modulo 2^32.
+  - `tt_kernels::channel::Ring` lowers a remote, broadcast or GDDR ring to these entries. `Ring::check_send` refuses a
+    producer list that writes after its page's credit or into an unfreed slot.
+  - Gate `step242_channel_credits`, ttsim and card 0. One handoff costs ~1.8 us on card 1 (H8).
+  - Their L1 words are declared in `l1::Requirements` like any buffer (`Requirements::channel`, `l1::Kind::Credit`, a
+    word alone in its 16 bytes). Their lifetimes cover trace holds.
+  - The host writes their initial values before either side runs (`channel::prepare`, T9). The card never resets them.
   - TT-Metal's compiler needed a "forge_backdoor" to place global semaphores [PUB]. Here placement belongs to the planner from the start.
 - **Barriers remain only** where no channel can express the dependency:
   - a dependency through GDDR whose reader or writer sets are unknown at plan time;
@@ -362,7 +369,7 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 | D3 | Decode weight readers | DRAM-sharded, one reader beside each bank | Interleaved `READ_RUN` stream | **Decided 2026-10-27: no gain.** At equal entry sizes, 8 readers a channel equal today's deal; with reads 5× cheaper the step moves only 10.82 → 10.60 ms (F27, [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)) |
 | D4 | Layout search | Greedy (tt-mlir, after removing a solver) | Global solver | **Provisional: greedy** [PUB]. Revisit only on a measured loss |
 | D5 | Operand reuse in products | 2D multicast matmul | A few holders pulled by `READ_L1`; or GDDR re-reads with larger blocks | **Open.** Contended multicast is slow (T7); pulled rows are measured cheaper for rows. Decided by H1 |
-| D6 | Credit granularity | A page (often a tile) | A compute-sized batch (ours) | **Open.** Decided per channel class by the cost model once H4 measures sync cost against overlap |
+| D6 | Credit granularity | A page (often a tile) | A compute-sized batch (ours) | **Open.** Decided per channel class by the cost model once H4 measures sync cost against overlap. Sync cost measured (H8, 2026-10-28): a cross-core handoff ~1.8 us, a two-unit barrier ~2.6 us |
 | D7 | Replicating rows to many readers | Multicast | Sharded rows | **Decided: sharded.** Replicated rows by contended multicast took 43.9 ms a step against 20.92 (roadmap, residency 2e/2f) |
 | D8 | `Dst` width | BF16 `Dst`, 8 tiles a half, often the default | FP32 `Dst`, 4 a half | **Decided: FP32** in the default contract (S2). 16-bit is an opt-in contract |
 | D9 | Fidelity | A per-op knob, LoFi..HiFi4 | Derived from edge formats | **Derived, as an opt-in contract** (2026-10-28): HiFi4's bits for every edge pair while products stay in FP32's range, not past it (H3, `step241`), so HiFi4 stays the default |
@@ -477,6 +484,19 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     words.
   - *Kills it:* the handoff costs as much as the barrier or more. D6 then leans to coarse credits (a batch, not a
     page), and that is recorded here.
+  - *Result (2026-10-28): the prediction is missed and the claim holds.* The words are today's: the packet golden
+    (`session::tests::streamed_packet_words_are_pinned`) did not change when the streams became channels. On card 1
+    (`silicon_bench_channel_credit`, run `1793200301`, release, AICLK 1,350 MHz, medians of 9) the costs were:
+    - a credited handoff of a 64-byte page took **1.81 us**, half a round trip of a depth-1 ring between NC on one unit
+      and B on the next, host release and poll included;
+    - the barrier on the same two units took **2.66 us** polled and **2.59 us** released.
+
+    So a credit costs 0.70x a barrier: more than the 1.5 us predicted, less than the barrier the kill criterion names.
+    A 4 KiB page at depth 2, which the consumer's B copies out word by word, took 9.39 us a page; that copy, not the
+    credit, is most of it.
+  - *Consequence for D6:* per-edge credits are cheaper than the barriers they would replace, but not free. At ~1.8 us a
+    handoff, a credit per tile (TT-Metal's default) costs more than a K-tile pair's 0.14-0.23 us of math, so a credit
+    stays per page of many tiles or per batch until H4 measures overlap.
 
 ---
 

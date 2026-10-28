@@ -1370,6 +1370,34 @@ From decode-to-bandwidth.md Phase 10 (F27), `silicon_bench_memory::gddr_readers_
   tiles a unit, few units) lose ~3% at 2, so only a weight stream's reads use it (`record::GATHER_STREAM`,
   `dm::STREAM_CAP`, default 2; [log](performance-log.md#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0)).
 
+## A credit between tiles: a NoC atomic after the mover's requests (2026-10-28, ttsim and cards 0 and 1)
+
+`op::CREDIT` and `op::WAIT_CREDIT` (F2, `tt_kernels::channel::Ring`, gate `step242_channel_credits`) hand pages
+between tiles without a barrier.
+- **What orders a credit after its data.** A write followed by an atomic is not ordered on the NoC. So the credit
+  first waits for every request the mover issued under its own ID (`noc::wait(TXN)`: a write's acknowledgement, a
+  read's data). A multicast run is counted before any entry not of it. Only then does the mover send one full-width
+  increment, and it waits for that response too.
+  - Each mover sends under its own ID (9 for B, 10 for NC), since an ID's count is the tile's NIU's (below).
+  - NC's credit goes out on the NIU its writes use. After the acknowledgements, the NoC it takes does not matter.
+- **The wait reads its word through a fence.** NoC writes do not invalidate the L0 cache, so every poll fences first
+  (`publish`). Every poll also reads the streams' abort word, so the host can cancel a wait that will never end
+  (`channel::cancel`).
+- **The abort word now matters outside a packet.** A credit wait in a plain list reads it, silicon keeps L1 between
+  processes, and only a packet's start clears the word. So the host clears it, with the credit words, before either
+  side runs (`channel::prepare`). The card never resets a credit word, so a peer's early credit cannot be lost.
+- **Measured (card 1, `1793200301`):**
+  - a credited 64-byte handoff between neighbouring units is 1.81 us;
+  - the two-unit barrier is 2.66 us polled and 2.59 us released;
+  - a 4 KiB page at depth 2 is 9.39 us, mostly the consumer B's word-by-word copy.
+- **Rings run on card 0, every page byte for byte across laps (`1793199635`):**
+  - remote, 24 pages of 20 KiB (two requests each);
+  - broadcast to a 2x2 rectangle, one multicast a request and a credit to each consumer;
+  - GDDR, NC writing channel 1 and B fetching after its credit.
+
+  A consumer held for a credit that never comes stays held (the host reads `WAIT_REASON` 40 and the word), copies
+  nothing, and fails with the abort's code when cancelled.
+
 ## A transaction ID's outstanding count is the tile's, not the core's (2026-10-21, card 0)
 
 `noc::wait(id)` spins on the NIU's `reqs_outstanding(id)` counter, and the NIU is the tile's: B and NC issuing under the
@@ -1508,6 +1536,7 @@ mailboxes, the probes' scratch, NC's list ring), `TRACE` (the timestamper's buff
   `0x12000` and `OUTER_CHUNK` (`0x13000`). B reads a table there for each `CALL_BODY`, and NC reads it in place
   during the body's pairs. Both fence after the read lands (`publish`), so neither core's L0 data cache serves a
   previous layer's table. B's safe image is 35,284 of 43,008 bytes since (it was 33,668), NC's 19,020 of 24,576.
+  After F1 and F2's credits (2026-10-28, `656e340`): B 35,344, NC 20,392.
 
 ## A stalled replay: what to read (2026-10-23, card 0)
 

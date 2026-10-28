@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [A cross-core credit against the barrier (H8)](#a-cross-core-credit-against-the-barrier-h8-2026-10-28-card-1) | 2026-10-28 | F2: a credited handoff between two units 1.81 us, a two-unit barrier 2.66 / 2.59 us (polled / released); a 4 KiB page at depth 2 with the consumer's copy 9.39 us; H8's 1.5 us prediction missed, its claim held |
 | [The GDDR write benches run again](#the-gddr-write-benches-run-again-2026-10-28-card-0) | 2026-10-28 | broken since the B/NC split (`3c7756b`: a barrier is B's, NC refused the lists); NC's writes now run in B's transfer packets behind B's barrier: NoC #1 writes 403-408 / 385-388 GB/s at 16 / 120 tiles, as before; 235 at 4 (was 299: the handoff on a short run) |
 | [Why card-wide reads plateau at 469, and what it means for decode](#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0) | 2026-10-28 | `fast-reads`: the 120-tile read loses ~30 GB/s of steady state to too many requests in flight a channel (knee ~32), ~15 to crossing the chip (each tile on its half's channels: ~505 steady, 495 overall) and the rest to an unfair finish; decode's caps re-swept: lowering any of them slows the step (B's own cap 2: +0.45 ms), the defaults stay; `fast-reads` decode 11.05 / 12.39-12.42 ms against the safe image's 11.38 / 12.55 |
 | [One matmul for every format pair, and BFP weights through the model](#one-matmul-for-every-format-pair-and-bfp-weights-through-the-model-2026-10-28-cards-0-and-1) | 2026-10-28 | F1 closed: one builder for every edge-format pair (F1d), BFP weights from burn-tt (F1c), whole tiles for packed formats (H7: pair cost BFP 14.9 -> **22.4** and 11.7 -> **26.6-29.1 TFLOPS** at HiFi4, bit for bit); the default path unchanged within noise (1.7B BF16 decode 11.25 / 11.89 / 12.64 ms); BFP4 weights decode **10.31 / 10.86 / 11.46 ms**, 1.09x BF16: the 1.5x prediction refuted (a one-row product is unpack/math-bound); a tied BFP head widened at every step (37 ms), fixed |
@@ -380,6 +381,33 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## A cross-core credit against the barrier (H8) (2026-10-28, card 1)
+
+F2 of [dataflow-compiler.md](../plans/dataflow-compiler.md): what a channel's credit (`op::CREDIT`, a NoC atomic
+increment after the mover's own requests have completed, and `op::WAIT_CREDIT`, a fenced local poll) costs against the
+op barrier, on the same two units. `cargo xtask bench --device 1 --filter silicon_bench_channel_credit`, run
+`1793200301` at `22bf51f` plus the bench (`2f29d9f`), release, AICLK 1,350 MHz, one warm-up and nine samples.
+
+How it is timed: both tiles' lists open with a wait on a start word. Every list is queued before the host releases
+both, so a sample runs from the release to the host seeing both done, over 100 iterations; the release and the final
+poll are counted in it (an upper bound). A first version queued 2,000 iterations, more than a mover's 512-entry ring
+holds. With the movers held at the start word, `enqueue` waited for room that could not come, and it timed out
+(`1793200236`).
+
+| measure (card 1) | median | p10 | p90 |
+|---|--:|--:|--:|
+| credited handoff, 64 B page, depth-1 ring, NC to B and back (half a round trip) | **1.808 us** | 1.804 | 1.821 |
+| a 4 KiB page through a depth-2 ring, the consumer's B copying it out word by word | 9.394 us | 9.385 | 9.397 |
+| barrier, two units, polling the coordinator's counter | 2.659 us | 2.658 | 2.659 |
+| barrier, two units, the coordinator's release (a session's default) | 2.588 us | 2.586 | 2.589 |
+
+- **H8:** a credit costs 0.70x a barrier. The prediction (<= 1.5 us) is missed by 0.3 us; the claim (cheaper than a
+  barrier) holds, and the kill (as dear as a barrier or more) is not met.
+- **The stream** is bound by the consumer's copy (1,024 words on B), not by its credits. It says nothing yet about what
+  a page costs when the consumer is T0 reading the slot in place, which is what an op's channel will do.
+- **For D6:** at ~1.8 us a handoff, a credit per tile would cost several K-tile pairs' math (0.14-0.23 us each), so
+  credits stay per page of many tiles, or per batch, until H4 measures the overlap they buy.
 
 ## Why card-wide reads plateau at 469, and what it means for decode (2026-10-28, card 0)
 
