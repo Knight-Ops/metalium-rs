@@ -157,7 +157,7 @@ struct Sfpu {
 }
 
 impl Microkernel for Sfpu {
-    fn lists(&self) -> [&'static str; 2] {
+    fn lists(&self, _chunked: bool) -> [&'static str; 2] {
         ["sfpu gather", "sfpu scatter"]
     }
 
@@ -179,6 +179,7 @@ impl Microkernel for Sfpu {
         )?;
         Ok(RunCode {
             operands: vec![Some(layout.a_at), layout.b_at, layout.c_at],
+            prior: None,
             out: layout.out_at,
             init: layout.init.clone(),
             roles,

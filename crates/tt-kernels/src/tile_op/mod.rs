@@ -3,7 +3,7 @@
 //! numeric contract, so that distribution, blocking, allocation, channels, the role split and
 //! lowering are written once for every op (Stage F3 of `docs/plans/dataflow-compiler.md`, H6).
 //!
-//! - [`TileOp`] is the description. Its constructors ([`eltwise`]) check what a client accepts
+//! - [`TileOp`] is the description. Its constructors ([`eltwise`], [`reduce`]) check what a client accepts
 //!   and build it; nothing past them names a client.
 //! - [`Microkernel`] is the only op-specific code a pass calls: how many items a run of the body
 //!   holds, and a run's L1 slots and role programs.
@@ -25,8 +25,10 @@ use crate::tensor::{DramAlloc, DramTensor, Elem, Overlap, Result, TensorError, W
 
 pub mod distribute;
 pub mod lower;
+mod reduce;
 mod sfpu;
 
+pub use reduce::reduce;
 pub use sfpu::eltwise;
 
 #[cfg(test)]
@@ -37,6 +39,10 @@ mod golden;
 pub enum Combine {
     /// One run holds every term of an item: the fold is inside the body, in `Dst`.
     InDst,
+    /// The terms in chunks of `chunk` tiles, in order, each chunk's unfolded partial written to
+    /// the result's tile in GDDR and reloaded by the next; the last folds. The chunk is the
+    /// contract's, never the machine's (S4).
+    GddrPartials { chunk: usize },
 }
 
 /// How a reduction iterator's terms are combined: in ascending tile order, through
@@ -160,6 +166,8 @@ pub enum NumericContract {
 pub struct RunCode {
     /// Each operand's first slot, `None` for one the body reads no tiles of.
     pub operands: Vec<Option<u64>>,
+    /// Where a chunk reloads its item's partial ([`Combine::GddrPartials`]).
+    pub prior: Option<u64>,
     /// The results' first slot.
     pub out: u64,
     pub init: Vec<SemaphoreInit>,
@@ -169,14 +177,23 @@ pub struct RunCode {
 
 /// A body as the passes see it: the only op-specific code they call.
 pub trait Microkernel {
-    /// The labels of a job's two lists, the gather's and the scatter's.
-    fn lists(&self) -> [&'static str; 2];
+    /// The labels of a job's two lists, the gather's and the scatter's, for a run or (`chunked`)
+    /// a chunk of a reduction's terms.
+    fn lists(&self, chunked: bool) -> [&'static str; 2];
     /// The most items a run holds, in the whole arena or (`half`) in half of it for a run
     /// double-buffered with the next; `None` where not one item fits.
     fn group(&self, half: bool) -> Option<usize>;
     /// A run of `len` items: its slots and programs, staged in `half` of the arena where
     /// pipelined; `held[o]`: operand `o`'s one tile is read once a run and held.
     fn run(&self, len: usize, half: Option<u8>, held: &[bool]) -> Result<RunCode>;
+    /// One chunk of `count` terms of one item ([`Combine::GddrPartials`]): `prior`, a partial to
+    /// reload first; `last`, the chunk that folds.
+    fn chunk(&self, prior: bool, count: usize, last: bool) -> Result<RunCode> {
+        let _ = (prior, count, last);
+        Err(TensorError::Shape(
+            "this body carries no partials through GDDR".into(),
+        ))
+    }
 }
 
 /// The tile-generic op.

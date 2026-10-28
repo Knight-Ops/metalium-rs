@@ -27,6 +27,15 @@ pub struct Deal {
 
 pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
     let (items, weight) = (op.items(), op.weight());
+    // Partials through GDDR chain an item's chunks on one unit: a job an item
+    // (`lower::chunked_jobs`).
+    if super::lower::partials_chunk(op).is_some() {
+        return Ok(Deal {
+            runs: (0..items).map(|i| i..i + 1).collect(),
+            pipelined: false,
+            held: vec![false; op.operands.len()],
+        });
+    }
     let group = |half: bool| op.body.group(half);
     let piped = tensor::pipelined_runs(items, weight, units, group(true).unwrap_or(0), overlap);
     let pipelined = piped.is_some();

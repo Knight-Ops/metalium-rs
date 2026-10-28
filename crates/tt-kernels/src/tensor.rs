@@ -4911,128 +4911,7 @@ pub fn sfpu_reduce_then(
     overlap: Overlap,
     then: ReduceThen,
 ) -> Result<Work> {
-    a.expect("a reduction", op.elem())?;
-    use crate::sfpu::reduce::Axis;
-    let per = match axis {
-        Axis::Cols => a.grid()[1],
-        Axis::Rows => a.grid()[0],
-    };
-    let valid = match axis {
-        Axis::Cols => a.cols,
-        Axis::Rows => a.rows,
-    } % 32;
-    if reduce_group(
-        op,
-        axis,
-        per,
-        if valid == 0 { 32 } else { valid as u32 },
-        false,
-        then,
-    )
-    .is_none()
-    {
-        if then.is_some() {
-            return Err(TensorError::Shape(
-                "a reduction too long for one tile's programs takes no finishing kind".into(),
-            ));
-        }
-        return reduce_chunked(alloc, a, op, axis, units);
-    }
-    let [rt, ct] = a.grid();
-    let (outs, per, valid, out) = match axis {
-        Axis::Cols => (
-            rt,
-            ct,
-            a.cols % 32,
-            DramTensor::alloc_elem(alloc, a.rows, 1, op.elem())?,
-        ),
-        Axis::Rows => (
-            ct,
-            rt,
-            a.rows % 32,
-            DramTensor::alloc_elem(alloc, 1, a.cols, op.elem())?,
-        ),
-    };
-    let valid = if valid == 0 { 32 } else { valid as u32 };
-    let group = match reduce_group(op, axis, per, valid, false, then) {
-        Some(g) => g,
-        None => {
-            alloc.free(&out.placement);
-            return Err(TensorError::Shape(format!(
-                "a reduction over {per} tiles does not fit one tile's L1 and program slots"
-            )));
-        }
-    };
-    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
-    // Pipelined as element-wise runs are ([`sfpu_eltwise`]).
-    let piped = {
-        let half = reduce_group(op, axis, per, valid, true, then).unwrap_or(0);
-        pipelined_runs(outs, per, units, half, overlap)
-    };
-    let pipelined = piped.is_some();
-    let all = piped.unwrap_or_else(|| runs(outs, units, group));
-    let mut jobs = Vec::new();
-    for (j, run) in all.into_iter().enumerate() {
-        let len = run.len();
-        let half = pipelined.then(|| half_of(j, units));
-        let (layout, roles, loops) = match reduce_programs(op, axis, len, per, valid, half, then) {
-            Ok(p) => p,
-            Err(e) => {
-                alloc.free(&out.placement);
-                return Err(e);
-            }
-        };
-        let (flags, grid_rt) = match axis {
-            Axis::Cols => (0, 0),
-            Axis::Rows => (4, rt as u32),
-        };
-        let gather = [
-            [
-                record::READ_RUN,
-                (run.start * per) as u32,
-                (len * per) as u32,
-                layout.in_at as u32,
-                flags,
-                ct as u32,
-                grid_rt,
-                0,
-            ],
-            ra.encode()[0],
-            ra.encode()[1],
-        ];
-        let scatter = [
-            [
-                record::WRITE_RUN,
-                run.start as u32,
-                len as u32,
-                layout.out_at as u32,
-                0,
-                0,
-                0,
-                0,
-            ],
-            ro.encode()[0],
-            ro.encode()[1],
-        ];
-        jobs.push(vec![
-            Step::List {
-                what: "reduce gather",
-                entries: gather.to_vec(),
-            },
-            Step::Kernel {
-                roles,
-                init: layout.init.clone(),
-                mop: Box::new([None; 3]),
-                loops,
-                half,
-            },
-            Step::List {
-                what: "reduce scatter",
-                entries: scatter.to_vec(),
-            },
-        ]);
-    }
-    Ok(Work { out, jobs })
+    crate::tile_op::reduce(a, op, axis, then)?.build(alloc, units, overlap)
 }
 
 /// Each row's `sqrt(mean(a a) + eps)` over its columns, `[rows, 1]`, on the SFPU
@@ -6270,112 +6149,7 @@ pub fn sfpu_scan(
     Ok(Work { out, jobs })
 }
 
-/// Long reductions carry the full, unfolded accumulator tile in GDDR.
-/// Each output group stays on one unit and reloads only after NC releases
-/// the preceding batch. Folding occurs once, in the final chunk.
-fn reduce_chunked(
-    alloc: &mut DramAlloc,
-    a: &DramTensor,
-    op: crate::sfpu::reduce::ReduceOp,
-    axis: crate::sfpu::reduce::Axis,
-    units: usize,
-) -> Result<Work> {
-    use crate::sfpu::reduce::{continuation_roles, plan_chunk_layout, Axis, ROW_CHUNK};
-    let [rt, ct] = a.grid();
-    let (outs, per, valid, dims) = match axis {
-        Axis::Cols => (rt, ct, a.cols % 32, [a.rows, 1]),
-        Axis::Rows => (ct, rt, a.rows % 32, [1, a.cols]),
-    };
-    let valid = if valid == 0 { 32 } else { valid as u32 };
-    let c = plan_chunk_layout(1).map_err(|e| TensorError::Shape(e.to_string()))?;
-    let out = DramTensor::alloc_elem(alloc, dims[0], dims[1], op.elem())?;
-    let mut jobs = Vec::new();
-    // One output tile per job bounds the largest continuation program.
-    // All chunks of that output remain on the same unit.
-    let _ = units;
-    for output in 0..outs {
-        let mut steps = Vec::new();
-        for first in (0..per).step_by(ROW_CHUNK) {
-            let count = ROW_CHUNK.min(per - first);
-            let last = first + count == per;
-            let mut gather = Vec::new();
-            if first > 0 {
-                // Reload depends on the preceding GDDR write, even though
-                // its L1 destination is separate from the packer's output.
-                gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
-                gather.extend([
-                    [
-                        record::READ_RUN,
-                        output as u32,
-                        1,
-                        c.prior_at as u32,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
-                    out.tensor_ref().encode()[0],
-                    out.tensor_ref().encode()[1],
-                ]);
-            }
-            gather.extend([
-                [
-                    record::READ_RUN,
-                    (output * per + first) as u32,
-                    count as u32,
-                    c.layout.in_at as u32,
-                    if axis == Axis::Rows { 4 } else { 0 },
-                    ct as u32,
-                    if axis == Axis::Rows { rt as u32 } else { 0 },
-                    0,
-                ],
-                a.tensor_ref().encode()[0],
-                a.tensor_ref().encode()[1],
-            ]);
-            steps.push(Step::List {
-                what: "reduce continuation gather",
-                entries: gather,
-            });
-            let (roles, loops) = continuation_roles(
-                &c,
-                op,
-                axis,
-                first > 0,
-                count,
-                if last { valid } else { 32 },
-                last,
-            );
-            steps.push(Step::Kernel {
-                roles: Arc::new(roles),
-                init: c.layout.init.clone(),
-                mop: Box::new([None; 3]),
-                loops: Arc::new(loops),
-                half: None,
-            });
-            steps.push(Step::List {
-                what: "reduce continuation scatter",
-                entries: vec![
-                    [
-                        record::WRITE_RUN,
-                        output as u32,
-                        1,
-                        c.layout.out_at as u32,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
-                    out.tensor_ref().encode()[0],
-                    out.tensor_ref().encode()[1],
-                ],
-            });
-        }
-        jobs.push(steps);
-    }
-    Ok(Work { out, jobs })
-}
-
-type ReducePrograms = (
+pub(crate) type ReducePrograms = (
     crate::sfpu::reduce::Layout,
     Arc<[Vec<Instruction>; 3]>,
     Arc<[Vec<crate::code::Loop>; 3]>,
@@ -6423,7 +6197,7 @@ pub fn reduce_then_fits(
     reduce_group(op, axis, per, valid, false, then).is_some()
 }
 
-fn reduce_group(
+pub(crate) fn reduce_group(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     per: usize,
@@ -6508,7 +6282,7 @@ fn measure_reduce_group(
 }
 
 /// One run's layout and role programs; `half` as for [`sfpu_programs`].
-fn reduce_programs(
+pub(crate) fn reduce_programs(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     len: usize,
