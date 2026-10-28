@@ -345,6 +345,9 @@ pub const SMOKE: &[&str] = &[
     // F1c through burn-tt: a model with BFP-stored weights is the F32 model holding the values
     // they decode to, bit for bit, eager and traced, with no weight widened.
     "step240_bfp_weight_storage::",
+    // F2: cross-core channels; pages handed over by NoC atomic credits (remote, broadcast and
+    // GDDR rings), a missing credit stalls and is cancelled, malformed credits refused.
+    "step242_channel_credits::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

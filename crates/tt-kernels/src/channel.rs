@@ -152,7 +152,8 @@ pub enum Slots {
 /// first). A consumer waits for `received` to reach `k + 1` ([`tt_isa::dm::op::WAIT_CREDIT`]), uses
 /// the page, and credits the producer's `freed` word. Before it writes page `k >= depth` over page
 /// `k - depth`, the producer waits for `freed` to reach `(k + 1 - depth) x consumers`. Every count
-/// starts at zero, written by the host before either side runs, and none is reset by the card.
+/// starts at zero, written by the host before either side runs ([`prepare`]), and none is reset
+/// by the card.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ring {
     /// The producer's tile, as the session names it.
@@ -467,6 +468,65 @@ impl Ring {
         }
         Ok(())
     }
+}
+
+/// A mover held at a credit wait ([`tt_isa::dm::op::WAIT_CREDIT`]): the word's count and the target
+/// it waits for. Credits that never come stall a consumer; they never let it race.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Stall {
+    pub word: u32,
+    pub have: u32,
+    pub want: u32,
+}
+
+/// Whether `mover` on `tile` is held at the credit wait `wait` (the entry the host queued), as its
+/// wait reason ([`tt_isa::dataflow::WAIT_REASON`]) and the word say: `Some` with the count it has.
+pub fn stalled<T: tt_device::Transport, N: tt_isa::noc::NocId>(
+    d: &mut tt_device::Device<T>,
+    w: &tt_device::Window,
+    tile: tt_isa::noc::NocCoord<N>,
+    mover: tt_isa::dm::Mover,
+    wait: [u32; 8],
+) -> Result<Option<Stall>, tt_device::TransportError> {
+    use tt_isa::dataflow::{CREDIT_WAIT, WAIT_REASON};
+    assert_eq!(wait[0], tt_isa::dm::op::WAIT_CREDIT, "not a credit wait");
+    let actor = if mover == tt_isa::dm::Mover::B { 0 } else { 4 };
+    let reason = d.read32(w, tile, WAIT_REASON + actor * 4)?;
+    let have = d.read32(w, tile, wait[1] as u64)?;
+    let reached = (have.wrapping_sub(wait[2]) as i32) >= 0;
+    Ok((reason == CREDIT_WAIT && !reached).then_some(Stall {
+        word: wait[1],
+        have,
+        want: wait[2],
+    }))
+}
+
+/// Make `tile` ready for a cross-core channel's entries: each of its credit `words` zero, and its
+/// abort word ([`tt_isa::dataflow::ABORT`]) clear, since a credit wait outside a packet reads it and
+/// silicon keeps L1 between programs and processes. Before either side of the channel runs.
+pub fn prepare<T: tt_device::Transport, N: tt_isa::noc::NocId>(
+    d: &mut tt_device::Device<T>,
+    w: &tt_device::Window,
+    tile: tt_isa::noc::NocCoord<N>,
+    words: &[u32],
+) -> Result<(), tt_device::TransportError> {
+    for &word in words {
+        d.write32(w, tile, word as u64, 0)?;
+    }
+    d.write32(w, tile, tt_isa::dataflow::ABORT, 0)
+}
+
+/// Cancel what waits on `tile`'s credits and streams: its abort word ([`tt_isa::dataflow::ABORT`]),
+/// which every credit poll reads. The waiting list fails with `code`; a packet that starts later
+/// clears the word.
+pub fn cancel<T: tt_device::Transport, N: tt_isa::noc::NocId>(
+    d: &mut tt_device::Device<T>,
+    w: &tt_device::Window,
+    tile: tt_isa::noc::NocCoord<N>,
+    code: u32,
+) -> Result<(), tt_device::TransportError> {
+    assert_ne!(code, 0, "an abort carries a code");
+    d.write32(w, tile, tt_isa::dataflow::ABORT, code)
 }
 
 #[cfg(test)]
