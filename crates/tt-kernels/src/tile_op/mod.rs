@@ -3,7 +3,7 @@
 //! numeric contract, so that distribution, blocking, allocation, channels, the role split and
 //! lowering are written once for every op (Stage F3 of `docs/plans/dataflow-compiler.md`, H6).
 //!
-//! - [`TileOp`] is the description. Its constructors ([`eltwise`], [`reduce`]) check what a client accepts
+//! - [`TileOp`] is the description. Its constructors ([`eltwise`], [`reduce`], [`matmul()`]) check what a client accepts
 //!   and build it; nothing past them names a client.
 //! - [`Microkernel`] is the only op-specific code a pass calls: how many items a run of the body
 //!   holds, and a run's L1 slots and role programs.
@@ -25,9 +25,11 @@ use crate::tensor::{DramAlloc, DramTensor, Elem, Overlap, Result, TensorError, W
 
 pub mod distribute;
 pub mod lower;
+pub(crate) mod matmul;
 mod reduce;
 mod sfpu;
 
+pub(crate) use matmul::matmul;
 pub use reduce::reduce;
 pub use sfpu::eltwise;
 
@@ -43,6 +45,10 @@ pub enum Combine {
     /// the result's tile in GDDR and reloaded by the next; the last folds. The chunk is the
     /// contract's, never the machine's (S4).
     GddrPartials { chunk: usize },
+    /// The terms in chunks of `chunk` tiles, in order, each chunk continuing the last's partial
+    /// in L1: a run's chunks alternate the arena's halves, so the mover moves one while the roles
+    /// compute another, and only the last chunk's results are written.
+    L1Halves { chunk: usize },
 }
 
 /// How a reduction iterator's terms are combined: in ascending tile order, through
@@ -142,6 +148,9 @@ pub struct Access {
     pub layout: Layout,
     pub map: TileMap,
     pub elem: Elem,
+    /// A ragged last tile row is read only to the rows that hold data, where the mover can
+    /// (`tt_isa::dm::record::gather_rows`); otherwise whole tiles.
+    pub live_rows: bool,
 }
 
 impl Access {
@@ -174,6 +183,8 @@ pub struct RunCode {
     pub prior: Option<u64>,
     /// The results' first slot.
     pub out: u64,
+    /// The results' slot stride, where a run is a block ([`Microkernel::block`]).
+    pub stride: u64,
     pub init: Vec<SemaphoreInit>,
     pub roles: Arc<[Vec<Instruction>; 3]>,
     pub loops: Arc<[Vec<crate::code::Loop>; 3]>,
@@ -197,6 +208,26 @@ pub trait Microkernel {
         Err(TensorError::Shape(
             "this body carries no partials through GDDR".into(),
         ))
+    }
+    /// Where a run is a block of the domain's two parallel iterators' tiles, the block's
+    /// `[rows, cols]` (each clamped at the domain's edge); `None` where a run is consecutive
+    /// items ([`Microkernel::group`]).
+    fn block(&self) -> Option<[usize; 2]> {
+        None
+    }
+    /// Chunk `c` of a block's terms ([`Combine::L1Halves`]): `[rows, count, cols]` tiles, and
+    /// `live`, the rows of the block's last tile row that hold data (32 where it is whole).
+    fn block_chunk(&self, c: usize, tiles: [usize; 3], live: u32) -> Result<RunCode> {
+        let _ = (c, tiles, live);
+        Err(TensorError::Shape(
+            "this body computes no blocks in chunks".into(),
+        ))
+    }
+    /// Whether the body transposes operand `o`'s tiles itself (at unpack) where its map stores
+    /// them transposed, so that the mover reads them as they lie.
+    fn transposes(&self, o: usize) -> bool {
+        let _ = o;
+        false
     }
 }
 
@@ -273,8 +304,7 @@ impl TileOp {
         if let Some(first) = self.results.first_mut() {
             first.layout = Layout::Tiles(out.tensor_ref());
         }
-        let built =
-            distribute::deal(self, units, overlap).and_then(|deal| lower::jobs(self, &deal, units));
+        let built = self.jobs(units, overlap);
         match built {
             Ok(jobs) => Ok(Work { out, jobs }),
             Err(e) => {
@@ -282,5 +312,13 @@ impl TileOp {
                 Err(e)
             }
         }
+    }
+
+    /// The jobs of an op whose results are already placed: its items dealt over `units` and each
+    /// run lowered. Several ops' jobs make one [`Work`] this way (a batch of products into one
+    /// result).
+    pub fn jobs(&self, units: usize, overlap: Overlap) -> Result<Vec<crate::tensor::Job>> {
+        self.check()?;
+        distribute::deal(self, units, overlap).and_then(|deal| lower::jobs(self, &deal, units))
     }
 }

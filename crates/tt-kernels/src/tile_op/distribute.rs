@@ -5,6 +5,9 @@
 //! enough on every unit, runs are pipelined: staged in alternating halves of the arena, so a
 //! unit's mover moves one run while its roles compute another (`tensor::pipelined_runs`).
 //!
+//! A body that computes blocks ([`Microkernel::block`]) is dealt blocks instead: the two parallel
+//! iterators' tiles cut into `[rows, cols]` blocks, rows outer, a block a run.
+//!
 //! An operand whose map does not use the innermost parallel iterator reads one tile for a whole
 //! row of items. Where runs that keep inside one such row are cheaper in transfers than the
 //! plain runs (`tensor::row_runs`), the op takes them and each run reads that operand's tile
@@ -19,6 +22,9 @@ use crate::tensor::{self, Overlap, Result, TensorError};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Deal {
     pub runs: Vec<Range<usize>>,
+    /// Where the body computes blocks, each run a block of the two parallel iterators' tiles,
+    /// `[rows, cols]`, rows outer; `runs` is then empty.
+    pub blocks: Vec<[Range<usize>; 2]>,
     /// Staged in alternating halves of the arena.
     pub pipelined: bool,
     /// Each operand's one tile read once a run and held (the runs keep inside its rows).
@@ -32,9 +38,13 @@ pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
     if super::lower::partials_chunk(op).is_some() {
         return Ok(Deal {
             runs: (0..items).map(|i| i..i + 1).collect(),
+            blocks: Vec::new(),
             pipelined: false,
             held: vec![false; op.operands.len()],
         });
+    }
+    if let Some(block) = op.body.block() {
+        return blocks(op, block);
     }
     let group = |half: bool| op.body.group(half);
     let piped = tensor::pipelined_runs(items, weight, units, group(true).unwrap_or(0), overlap);
@@ -84,14 +94,45 @@ pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
     Ok(match by_rows {
         Some(runs) => Deal {
             runs,
+            blocks: Vec::new(),
             pipelined,
             held: holdable,
         },
         None => Deal {
             runs: plain,
+            blocks: Vec::new(),
             pipelined,
             held: vec![false; op.operands.len()],
         },
+    })
+}
+
+/// The two parallel iterators' tiles in `[mb, nb]` blocks, rows outer.
+fn blocks(op: &TileOp, [mb, nb]: [usize; 2]) -> Result<Deal> {
+    let parallel: Vec<usize> = op.parallel().collect();
+    let &[outer, inner] = &parallel[..] else {
+        return Err(TensorError::Shape(format!(
+            "blocks of a domain of {} parallel iterators",
+            parallel.len()
+        )));
+    };
+    let [rt, ct] = [op.domain[outer].tiles(), op.domain[inner].tiles()];
+    if mb == 0 || nb == 0 {
+        return Err(TensorError::Shape("an empty block".into()));
+    }
+    let blocks = (0..rt)
+        .step_by(mb)
+        .flat_map(|i0| {
+            (0..ct)
+                .step_by(nb)
+                .map(move |j0| [i0..(i0 + mb).min(rt), j0..(j0 + nb).min(ct)])
+        })
+        .collect();
+    Ok(Deal {
+        runs: Vec::new(),
+        blocks,
+        pipelined: false,
+        held: vec![false; op.operands.len()],
     })
 }
 

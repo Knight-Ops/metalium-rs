@@ -17,6 +17,15 @@
 //! | parallel | reduction | each item's tiles in turn, row-major |
 //! | reduction | parallel | each item's tiles in turn, column-major (`flags` 4) |
 //!
+//! A domain of two parallel iterators and one reduction iterator, its runs blocks
+//! ([`super::distribute::Deal::blocks`]), reads its **contraction pair** as one `GATHER`: the
+//! operand whose map uses the outer parallel iterator and the reduction (`A`), and the one that
+//! uses the reduction and the inner parallel iterator (`B`), each stored either way round (a map
+//! with the reduction as `A`'s rows, or as `B`'s columns, is read transposed: `GATHER` bits 0
+//! and 1). The record names the block's rows and columns and a chunk's terms; its formats are
+//! the two edges' (bits 22-24 and 29-31), and an `A` whose last tile row is ragged is read to its
+//! live rows where its access asks (bits 3-7).
+//!
 //! Any other map is refused by name: a mover access the description has no lowering for is a
 //! missing concept (H6), not a special case.
 //!
@@ -26,8 +35,10 @@
 
 use tt_isa::dm::record;
 
+use tt_isa::format::TileFormat;
+
 use super::distribute::Deal;
-use super::{Access, Combine, Dim, IterKind, Layout, TileMap, TileOp};
+use super::{Access, Combine, Dim, IterKind, Layout, RunCode, TileMap, TileOp};
 use crate::tensor::{self, Job, Result, Step, TensorError};
 
 pub fn jobs(op: &TileOp, deal: &Deal, units: usize) -> Result<Vec<Job>> {
@@ -35,6 +46,9 @@ pub fn jobs(op: &TileOp, deal: &Deal, units: usize) -> Result<Vec<Job>> {
     let reductions: Vec<usize> = op.reductions().collect();
     if let Some(chunk) = partials_chunk(op) {
         return chunked_jobs(op, chunk);
+    }
+    if !deal.blocks.is_empty() {
+        return block_jobs(op, deal);
     }
     let [gather_what, scatter_what] = op.body.lists(false);
     let weight = op.weight();
@@ -90,7 +104,7 @@ pub fn partials_chunk(op: &TileOp) -> Option<usize> {
     op.domain.iter().find_map(|i| match i.kind {
         IterKind::Reduction(c) => match c.combine {
             Combine::GddrPartials { chunk } => Some(chunk),
-            Combine::InDst => None,
+            Combine::InDst | Combine::L1Halves { .. } => None,
         },
         IterKind::Parallel => None,
     })
@@ -321,4 +335,200 @@ fn write(r: &Access, run: &std::ops::Range<usize>, at: u64, out: &mut Vec<[u32; 
             out.extend(tensor::packed_twin_writes(twin, run.start, run.len(), at))
         }
     }
+}
+
+/// The contraction a domain of two parallel iterators and one reduction holds: `(a, b)`, the
+/// operands of the pair, and whether each is stored transposed.
+struct Contraction {
+    a: usize,
+    b: usize,
+    transposed: [bool; 2],
+}
+
+fn contraction(op: &TileOp) -> Result<(Contraction, [usize; 3])> {
+    let parallel: Vec<usize> = op.parallel().collect();
+    let reductions: Vec<usize> = op.reductions().collect();
+    let (&[p, q], &[k]) = (&parallel[..], &reductions[..]) else {
+        return Err(TensorError::Shape(format!(
+            "a contraction over parallel {parallel:?} and reductions {reductions:?}"
+        )));
+    };
+    let plain = |i| Dim::Iter {
+        iter: i,
+        wrap: None,
+    };
+    // Each operand's map read as `[x, k]` (`A`) or `[k, y]` (`B`), either way round.
+    let side = |m: TileMap, x: usize, a: bool| match (m.rows, m.cols) {
+        (r, c) if r == plain(x) && c == plain(k) => Some(!a),
+        (r, c) if r == plain(k) && c == plain(x) => Some(a),
+        _ => None,
+    };
+    let find = |x: usize, a: bool| {
+        op.operands
+            .iter()
+            .enumerate()
+            .find_map(|(o, acc)| side(acc.map, x, a).map(|t| (o, t)))
+    };
+    match (find(p, true), find(q, false)) {
+        (Some((a, ta)), Some((b, tb))) if a != b => Ok((
+            Contraction {
+                a,
+                b,
+                transposed: [ta, tb],
+            },
+            [p, k, q],
+        )),
+        _ => Err(TensorError::Shape(format!(
+            "no operand pair of maps {:?} contracts iterator {k}",
+            op.operands.iter().map(|a| a.map).collect::<Vec<_>>()
+        ))),
+    }
+}
+
+/// `record::gather_a_format` or `gather_b_format` of an edge read in its own format, 0 for FP32.
+fn edge_format(a: &Access, of: fn(tt_isa::tile::L1Format) -> Option<u32>) -> Result<u32> {
+    let f = a.format();
+    if f == TileFormat::FP32 {
+        return Ok(0);
+    }
+    of(f.l1()).ok_or_else(|| TensorError::Shape(format!("no gather reads a {f:?} edge")))
+}
+
+/// The jobs of a contraction dealt in blocks, its terms in chunks continued in L1
+/// ([`Combine::L1Halves`]): a job a block, three steps a chunk, the results written by the last.
+fn block_jobs(op: &TileOp, deal: &Deal) -> Result<Vec<Job>> {
+    let (pair, [p, k, _]) = contraction(op)?;
+    let chunk = match op.domain[k].kind {
+        IterKind::Reduction(c) => match c.combine {
+            Combine::L1Halves { chunk } => chunk,
+            other => {
+                return Err(TensorError::Shape(format!(
+                    "blocks whose terms combine {other:?}"
+                )))
+            }
+        },
+        IterKind::Parallel => unreachable!("a contraction's reduction"),
+    };
+    let [gather_what, scatter_what] = op.body.lists(false);
+    let weight = op.weight();
+    let chunks = weight.div_ceil(chunk.max(1));
+    let (ra, rb) = (
+        tiles_of(&op.operands[pair.a])?,
+        tiles_of(&op.operands[pair.b])?,
+    );
+    let result = op
+        .results
+        .first()
+        .ok_or_else(|| TensorError::Shape("a contraction has no result".into()))?;
+    let rc = tiles_of(result)?.encode();
+    let [ta, tb] = pair.transposed;
+    let formats = edge_format(&op.operands[pair.a], record::gather_a_format)?
+        | edge_format(&op.operands[pair.b], record::gather_b_format)?;
+    let unpack_b = op.body.transposes(pair.b);
+    // The outer iterator's last tile row: the rows that hold data.
+    let (rt, ragged) = (op.domain[p].tiles(), op.domain[p].elems % 32);
+    let reversed = tensor::probing_reverse_chunks();
+    let mut jobs = Vec::with_capacity(deal.blocks.len());
+    for [rows, cols] in &deal.blocks {
+        let last_row = rows.end == rt && ragged != 0;
+        let live = if last_row { ragged as u32 } else { 32 };
+        // `A` read to its live rows: one row of each tile for a one-row product.
+        let thin = match last_row && op.operands[pair.a].live_rows && !ta {
+            true if ragged <= 16 => ragged as u32,
+            _ => 0,
+        };
+        let mut steps = Vec::with_capacity(3 * chunks);
+        for c in 0..chunks {
+            let range = if reversed { chunks - 1 - c } else { c };
+            let k0 = range * chunk;
+            let count = chunk.min(weight - k0);
+            let code: RunCode = op
+                .body
+                .block_chunk(c, [rows.len(), count, cols.len()], live)?;
+            let (mut ar, mut br) = (ra, rb);
+            ar.first += if ta { k0 * ar.ct as usize } else { k0 } as u32;
+            br.first += if tb { k0 } else { k0 * br.ct as usize } as u32;
+            let (a_at, b_at) = match (code.operands[pair.a], code.operands[pair.b]) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    return Err(TensorError::Shape(
+                        "a contraction's body names no slots for its pair".into(),
+                    ))
+                }
+            };
+            let flags = u32::from(ta)
+                | u32::from(tb) << 1
+                | record::gather_rows(thin)
+                | (count as u32) << 8
+                | if tensor::probing_skip_a() {
+                    record::GATHER_A_RESIDENT
+                } else {
+                    0
+                }
+                | if unpack_b {
+                    record::GATHER_B_UNPACK_TRANSPOSE
+                } else {
+                    0
+                }
+                | formats;
+            let gather = if tensor::probing_skip_block_gathers() {
+                vec![[tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]]
+            } else {
+                let (ar, br) = (ar.encode(), br.encode());
+                vec![
+                    [
+                        record::GATHER,
+                        flags,
+                        a_at as u32,
+                        b_at as u32,
+                        rows.start as u32,
+                        rows.len() as u32,
+                        cols.start as u32,
+                        cols.len() as u32,
+                    ],
+                    ar[0],
+                    ar[1],
+                    br[0],
+                    br[1],
+                ]
+            };
+            let scatter = if c + 1 == chunks {
+                vec![
+                    [
+                        record::SCATTER,
+                        code.out as u32,
+                        code.stride as u32,
+                        rows.start as u32,
+                        rows.len() as u32,
+                        cols.start as u32,
+                        cols.len() as u32,
+                        0,
+                    ],
+                    rc[0],
+                    rc[1],
+                ]
+            } else {
+                Vec::new()
+            };
+            steps.extend([
+                Step::List {
+                    what: gather_what,
+                    entries: gather,
+                },
+                Step::Kernel {
+                    roles: code.roles,
+                    init: code.init,
+                    mop: Box::new([None; 3]),
+                    loops: code.loops,
+                    half: Some((c % 2) as u8),
+                },
+                Step::List {
+                    what: scatter_what,
+                    entries: scatter,
+                },
+            ]);
+        }
+        jobs.push(steps);
+    }
+    Ok(jobs)
 }

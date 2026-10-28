@@ -744,8 +744,19 @@ impl LiveRows {
     /// Every row while [`set_trim_rows`] has it off.
     pub fn for_job(m: usize, i0: usize, rows: usize) -> Self {
         let mt = m.div_ceil(32);
-        if rows == 1 && i0 + 1 == mt && TRIM_ROWS.load(std::sync::atomic::Ordering::Relaxed) {
-            Self::for_rows(m - 32 * (mt - 1))
+        if i0 + rows == mt {
+            Self::for_last(rows, (m - 32 * (mt - 1)) as u32)
+        } else {
+            LiveRows::All
+        }
+    }
+
+    /// What a run of `rows` output tile rows computes whose last tile row holds `live` rows of
+    /// data: its rows' worth when it is that one row alone, else every row. Every row while
+    /// [`set_trim_rows`] has it off.
+    pub fn for_last(rows: usize, live: u32) -> Self {
+        if rows == 1 && TRIM_ROWS.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::for_rows(live as usize)
         } else {
             LiveRows::All
         }

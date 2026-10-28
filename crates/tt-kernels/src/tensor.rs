@@ -1575,7 +1575,11 @@ pub fn probe_skip_block_gathers(on: bool) {
     PROBE_SKIP_BLOCK_GATHERS.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
-fn probing_skip_a() -> bool {
+pub(crate) fn probing_skip_block_gathers() -> bool {
+    PROBE_SKIP_BLOCK_GATHERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn probing_skip_a() -> bool {
     PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1599,7 +1603,11 @@ pub(crate) fn probing_skip_weights() -> bool {
 
 /// A gather list with its `B`-only `GATHER` left out under [`PROBE_SKIP_WEIGHTS`] (only where `A`
 /// is packed, so the record reads nothing else); a `WAIT` stands in where nothing is left.
-fn probe_gather(mut gather: Vec<[u32; 8]>, record: [[u32; 8]; 5], packed_a: bool) -> Vec<[u32; 8]> {
+pub(crate) fn probe_gather(
+    mut gather: Vec<[u32; 8]>,
+    record: [[u32; 8]; 5],
+    packed_a: bool,
+) -> Vec<[u32; 8]> {
     if packed_a && probing_skip_weights() {
         if gather.is_empty() {
             gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
@@ -1951,7 +1959,7 @@ pub(crate) fn matmul_dram_prefetching(
     if reads.packed_a.is_none() && max_k_tiles.is_none() {
         let [bmc, bnc] = blocks([mt, nt], [mc, nc], units);
         let other = blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], units);
-        if let Some((shape, layout)) = block_stream_plan(
+        if let Some((_, layout)) = block_stream_plan(
             reads.block_stream,
             [mt, kt, nt],
             units,
@@ -1959,26 +1967,23 @@ pub(crate) fn matmul_dram_prefetching(
             route,
             fidelity,
         ) {
-            let c = DramTensor::alloc(alloc, m, n)?;
-            let mut jobs = Vec::new();
-            push_block_stream_jobs(
-                &mut jobs,
-                &shape,
-                &layout,
-                [mt, kt, nt],
-                m,
-                [a.tensor_ref(), b.tensor_ref(), c.tensor_ref()],
-                [a_transposed, b_transposed],
-                if reads.thin {
-                    thin_rows(m, a_transposed)
-                } else {
-                    0
-                },
-                reads.unpack_b && b_transposed && route == SrcRoute::Tf32FromFp32,
+            let side = |t: &DramTensor, transposed| crate::tile_op::matmul::Side {
+                at: t.tensor_ref(),
+                transposed,
+                elem: t.elem,
+                live_rows: reads.thin,
+            };
+            let mut op = crate::tile_op::matmul(
+                side(a, a_transposed),
+                side(b, b_transposed),
+                [m, k, n],
                 route,
                 fidelity,
-            );
-            return Ok((Work { out: c, jobs }, None, None));
+                reads.unpack_b && route == SrcRoute::Tf32FromFp32,
+                crate::tile_op::matmul::Schedule::BlockStream { layout },
+            )?;
+            let work = op.build(alloc, units, Overlap::Off)?;
+            return Ok((work, None, None));
         }
     }
     // The plan's block is what runs, so the arena must keep it (`matmul::plan_floor`) -- except
@@ -3544,144 +3549,8 @@ pub fn probe_reverse_chunks(on: bool) {
     PROBE_REVERSE_CHUNKS.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// One job a block of a K-streamed blocked product ([`BlockStream`], [`matmul::BlockStreamLayout`]):
-/// chunk `c` gathers its `A` and `B` tiles into input half `c % 2`, its kernel computes every output
-/// tile of the block over the chunk's pairs, continuing each from its partial in output set
-/// `1 - c % 2` (none for the first chunk) and packing it into set `c % 2`, and only the last chunk's
-/// are written out. A job's chunks are even, so a unit's batches alternate halves throughout and the
-/// session double-buffers them (`Step::Kernel::half`): the mover reads chunk `c + 1` while the kernel
-/// computes chunk `c`. Each output tile's `K` chain is the same in the same order, through FP32
-/// partials as a K block's are, so bit for bit.
-#[allow(clippy::too_many_arguments)]
-fn push_block_stream_jobs(
-    jobs: &mut Vec<Job>,
-    shape: &BlockStreamShape,
-    layout: &matmul::BlockStreamLayout,
-    [mt, kt, nt]: [usize; 3],
-    m: usize,
-    [ra, rb, rc]: [TensorRef; 3],
-    [a_transposed, b_transposed]: [bool; 2],
-    thin: u32,
-    unpack_b: bool,
-    route: SrcRoute,
-    fidelity: Fidelity,
-) {
-    let [mb, kq, nb] = shape.tiles;
-    let chunks = shape.chunks;
-    debug_assert_eq!(chunks % 2, 0);
-    for i0 in (0..mt).step_by(mb) {
-        let rows = mb.min(mt - i0);
-        let live = matmul::LiveRows::for_job(m, i0, rows);
-        let thin = if i0 + rows == mt { thin } else { 0 };
-        for j0 in (0..nt).step_by(nb) {
-            let cols = nb.min(nt - j0);
-            let mut steps = Vec::with_capacity(3 * chunks);
-            let reversed = PROBE_REVERSE_CHUNKS.load(std::sync::atomic::Ordering::SeqCst);
-            for c in 0..chunks {
-                let range = if reversed { chunks - 1 - c } else { c };
-                let (k0, h) = (range * kq, c % 2);
-                let count = kq.min(kt - k0);
-                let (chunk, _) = layout.chunk(c, [rows, count, cols]);
-                let (mut ar, mut br) = (ra, rb);
-                ar.first += if a_transposed {
-                    (k0 * ar.ct as usize) as u32
-                } else {
-                    k0 as u32
-                };
-                br.first += if b_transposed {
-                    k0 as u32
-                } else {
-                    (k0 * br.ct as usize) as u32
-                };
-                let flags = u32::from(a_transposed)
-                    | u32::from(b_transposed) << 1
-                    | record::gather_rows(thin)
-                    | (count as u32) << 8
-                    | if probing_skip_a() {
-                        record::GATHER_A_RESIDENT
-                    } else {
-                        0
-                    }
-                    | if unpack_b {
-                        record::GATHER_B_UNPACK_TRANSPOSE
-                    } else {
-                        0
-                    }
-                    | gather_formats(route);
-                let gather = probe_gather(
-                    Vec::new(),
-                    [
-                        [
-                            record::GATHER,
-                            flags,
-                            chunk.a_at as u32,
-                            chunk.b_at as u32,
-                            i0 as u32,
-                            rows as u32,
-                            j0 as u32,
-                            cols as u32,
-                        ],
-                        ar.encode()[0],
-                        ar.encode()[1],
-                        br.encode()[0],
-                        br.encode()[1],
-                    ],
-                    false,
-                );
-                let gather = if PROBE_SKIP_BLOCK_GATHERS.load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    vec![[tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]]
-                } else {
-                    gather
-                };
-                let (roles, loops) = matmul::block_stream_programs(
-                    layout,
-                    c,
-                    [rows, count, cols],
-                    route,
-                    fidelity,
-                    unpack_b,
-                    live,
-                );
-                let scatter = if c + 1 == chunks {
-                    vec![
-                        [
-                            record::SCATTER,
-                            (layout.out_slot(h, cols, 0, 0) + TILE_DATA) as u32,
-                            TILE_SLOT as u32,
-                            i0 as u32,
-                            rows as u32,
-                            j0 as u32,
-                            cols as u32,
-                            0,
-                        ],
-                        rc.encode()[0],
-                        rc.encode()[1],
-                    ]
-                } else {
-                    Vec::new()
-                };
-                steps.extend([
-                    Step::List {
-                        what: "blocked matmul gather",
-                        entries: gather,
-                    },
-                    Step::Kernel {
-                        roles,
-                        init: layout.init.clone(),
-                        mop: Box::new([None; 3]),
-                        loops,
-                        half: Some(h as u8),
-                    },
-                    Step::List {
-                        what: "blocked matmul scatter",
-                        entries: scatter,
-                    },
-                ]);
-            }
-            jobs.push(steps);
-        }
-    }
+pub(crate) fn probing_reverse_chunks() -> bool {
+    PROBE_REVERSE_CHUNKS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// One operand of a [`matmul_dram_batched`] product: the block of a tensor
@@ -3870,28 +3739,44 @@ pub(crate) fn matmul_dram_batched_limited(
     if max_k_tiles.is_none() {
         let [bmc, bnc] = blocks([mt, nt], [mc, nc], per_item);
         let other = blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], per_item);
-        if let Some((shape, layout)) =
+        if let Some((_, layout)) =
             block_stream_plan(block_stream, [mt, kt, nt], per_item, other, route, fidelity)
         {
             let rows = if batch == 1 { m } else { batch * mt * 32 };
             let c = DramTensor::alloc(alloc, rows, n)?;
             let mut jobs = Vec::new();
-            for (i, (ra, rb, t)) in refs.into_iter().enumerate() {
+            for (i, (ra, rb, [ta, tb])) in refs.into_iter().enumerate() {
                 let mut rc = c.tensor_ref();
                 rc.first += (i * mt * nt) as u32;
-                push_block_stream_jobs(
-                    &mut jobs,
-                    &shape,
-                    &layout,
-                    [mt, kt, nt],
-                    m,
-                    [ra, rb, rc],
-                    t,
-                    0,
-                    unpack_b && t[1] && route == SrcRoute::Tf32FromFp32,
+                let side = |at, transposed| crate::tile_op::matmul::Side {
+                    at,
+                    transposed,
+                    elem: Elem::F32,
+                    // Whole tiles: attention's products are not the decode weights' reads.
+                    live_rows: false,
+                };
+                let built = crate::tile_op::matmul(
+                    side(ra, ta),
+                    side(rb, tb),
+                    [m, k, n],
                     route,
                     fidelity,
-                );
+                    unpack_b && route == SrcRoute::Tf32FromFp32,
+                    crate::tile_op::matmul::Schedule::BlockStream {
+                        layout: layout.clone(),
+                    },
+                )
+                .and_then(|mut op| {
+                    op.results[0].layout = crate::tile_op::Layout::Tiles(rc);
+                    op.jobs(per_item, Overlap::Off)
+                });
+                match built {
+                    Ok(j) => jobs.extend(j),
+                    Err(e) => {
+                        alloc.free(&c.placement);
+                        return Err(e);
+                    }
+                }
             }
             return Ok(Work { out: c, jobs });
         }

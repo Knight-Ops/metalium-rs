@@ -84,6 +84,7 @@ pub fn eltwise(
         layout: Layout::Tiles(ra),
         map: same,
         elem: a.elem,
+        live_rows: false,
     }];
     if let (Some(rb), Some(b)) = (rb, b) {
         let map = match bcast {
@@ -108,6 +109,7 @@ pub fn eltwise(
             layout: Layout::Tiles(rb),
             map,
             elem: b.elem,
+            live_rows: false,
         });
     }
     if let (Some(rc), Some(c)) = (rc, c) {
@@ -115,6 +117,7 @@ pub fn eltwise(
             layout: Layout::Tiles(rc),
             map: same,
             elem: c.elem,
+            live_rows: false,
         });
     }
     let out_elem = tensor::output_elem(op.kind);
@@ -123,12 +126,14 @@ pub fn eltwise(
         layout: Layout::Tiles(Default::default()),
         map: same,
         elem: out_elem,
+        live_rows: false,
     }];
     if let Some(twin) = twin {
         results.push(Access {
             layout: Layout::PackedRow(twin.clone()),
             map: same,
             elem: out_elem,
+            live_rows: false,
         });
     }
     Ok(Some(TileOp {
@@ -181,6 +186,7 @@ impl Microkernel for Sfpu {
             operands: [Some(layout.a_at), layout.b_at, layout.c_at],
             prior: None,
             out: layout.out_at,
+            stride: 0,
             init: layout.init.clone(),
             roles,
             loops,

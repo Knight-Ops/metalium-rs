@@ -69,12 +69,14 @@ pub fn reduce(a: &DramTensor, op: ReduceOp, axis: Axis, then: ReduceThen) -> Res
                 cols: Dim::of(1),
             },
             elem: a.elem,
+            live_rows: false,
         }],
         results: vec![Access {
             // Placed when the op is built (`TileOp::build`).
             layout: Layout::Tiles(Default::default()),
             map: out_map,
             elem: op.elem(),
+            live_rows: false,
         }],
         body: Box::new(Reduce {
             op,
@@ -124,6 +126,7 @@ impl Microkernel for Reduce {
             operands: [Some(layout.in_at), None, None],
             prior: None,
             out: layout.out_at,
+            stride: 0,
             init: layout.init.clone(),
             roles,
             loops,
@@ -140,6 +143,7 @@ impl Microkernel for Reduce {
             operands: [Some(c.layout.in_at), None, None],
             prior: Some(c.prior_at),
             out: c.layout.out_at,
+            stride: 0,
             init: c.layout.init.clone(),
             roles: Arc::new(roles),
             loops: Arc::new(loops),

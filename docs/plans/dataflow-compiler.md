@@ -207,7 +207,32 @@ and B1 at the close. The set:
     ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
   - `matmul_pipeline_sweep` had failed on every tree (an unbalanced profile with NC writing). It now falls back to host
     time (`db3081e`).
-- [ ] **F3.6-F3.8, matmul:** block-stream, then blocked/K-block/stream, then thin, prefetch and handoff.
+- [ ] **F3.6-F3.8, matmul:** block-stream, then blocked/K-block/stream, then thin, prefetch and handoff. Owner,
+  2026-10-28: `matmul_dram_batched` is ported in this stage, so `BlockPlan` goes whole. The opt-in handoff, second job
+  and balanced deal are ported, then re-measured under channels in F4a.
+  - [x] **F3.6a, the batched golden** (`9dad570`). `tile_op::golden::batched_jobs_are_pinned` pins 58 cases of
+    `tensor::matmul_dram_batched_limited` (attention's `Q K^T` and `P V` over heads, ragged and padded row blocks, a row
+    a head over a cache, a long prefix by the block-stream model, fixed blocks and off, a `K` limit, refusals) in
+    `golden/jobs_batched.txt`. It reaches the plain, block-stream and K-block lowerings. `step243`, which would pin the
+    session's capture-time choice of prefetching units, waits for F3.8, and only if that choice moves.
+  - [x] **F3.6, block-stream.** `tile_op::matmul` describes a product as the domain `[m P, n P, k R]`, with `A` mapped
+    `[m, k]` and `B` `[k, n]` (either stored transposed), behind the `Mma` body. The description gained three concepts,
+    none of them named after a client:
+    - `Combine::L1Halves { chunk }`: a reduction's chunks continued in L1, alternating the arena's halves, with only the
+      last chunk written;
+    - 2-D runs: `Deal::blocks` and `Microkernel::block`;
+    - a lowering row for the **contraction pair**: two operands sharing the reduction iterator read by one `GATHER`.
+      Transposes come from each map's orientation, formats from the edges, and live rows (`gather_rows`) from the
+      ragged iterator where the access asks (`Access::live_rows`).
+
+    `Microkernel` gains `block_chunk` and `transposes` (the unpacker's transpose of `B`), and `RunCode` gains the
+    results' slot stride. `TileOp::jobs` lowers an op whose result is already placed, which is how the batched
+    product's items share one output. `push_block_stream_jobs` is deleted, and `block_stream_plan` still chooses the
+    shape (an H6 audit item: the blocking pass's cost input).
+
+    All four goldens are unchanged word for word, and a mutated chunk half fails both matmul goldens. tt-kernels passes
+    313 of 313. On ttsim, `step229`, `step60` and `step184` pass. On card 0 (`1793213075`),
+    `step229/60/184/241/239/18` pass 24 of 24.
 - [ ] Allocation through `l1::Requirements` and the op's `channel::Graph::check`, once the matmul's layouts are
   microkernel layouts: today each client's microkernel plans its own L1 (`sfpu::kernel::plan_layout_in`,
   `sfpu::reduce::plan_layout`).
@@ -228,6 +253,15 @@ and B1 at the close. The set:
 
 - [ ] Derive per-edge channels from the residency plan (`residency.rs`, `Applied::rewrite`) and barrier analysis (`tt_kernels::barriers::analyse`). Keep barriers only where no channel can express the dependency (Bible §7).
 - [ ] Let units that finish their share start data-independent reads (the next product's weights) at once.
+- [ ] Re-measure the three opt-in decode schedules F3.8 ports, with the dataflow approach (owner, 2026-10-28). Each was
+  bit for bit but not faster with a barrier between its ops:
+  - the K-chain handoff (`TT_STREAM_HANDOFF`, slower: `1792685519`, `1792686180`), which takes a remote `CREDIT` in
+    place of its second op and that op's barrier;
+  - the second prefetched job (`TT_PREFETCH_SECOND`, slower: `1792723098`);
+  - the balanced deal (`TT_BALANCED_DEAL`, not faster: `1792763914`, `1792764065`).
+
+  Any that is still not faster under channels is retired completely: code, knob, setter and golden cases, with run
+  IDs.
 - **Prediction:** the 1.7B decode step's card read rate ≥400 GB/s (from 328) and the step ≤9.5 ms (from 10.9), bit-exact.
 - **Kill:** the step moves <0.3 ms, or small ops lose what products gain.
 
