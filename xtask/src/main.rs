@@ -7,6 +7,7 @@
 
 use std::process::ExitCode;
 
+mod bench_diff;
 mod burn_coverage;
 mod burn_tests;
 mod conformance;
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
         Some("silicon") => silicon::run(args),
         Some("conformance") => conformance::run(args),
         Some("bench") => silicon::bench(args),
+        Some("bench-diff") => bench_diff::run(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
     };
@@ -111,4 +113,7 @@ tasks:
                           list; `cargo xtask conformance --help` for options
   bench [options]         the firmware benchmarks on silicon (release, ignored
                           tests included), collected into target/silicon/bench/;
-                          `cargo xtask bench --help`";
+                          `cargo xtask bench --help`
+  bench-diff <before.jsonl> <after.jsonl>
+                          two bench collections side by side, each result's
+                          ratio and whether it moved past its own spread";

@@ -15,6 +15,7 @@ use tt_kernels::kind;
 use tt_kernels::session::{Session, Spread, TileChoice};
 use tt_kernels::tensor::{DramTensor, Eltwise};
 use tt_tests::backend::device_index;
+use tt_tests::bench::{report, Stats};
 use tt_ttsim::fork_scope;
 
 const REPS: usize = 7;
@@ -99,8 +100,20 @@ fn small_and_large_ops_by_spread() {
             }
             println!(
                 "MEASURE spread {spread:?} on {tiles} tiles: small op {:.1} us (a 64x64 relu, {CHAIN} chained), large op {:.0} us (a 2048x2048 add)",
-                median(small_us),
-                median(big_us)
+                median(small_us.clone()),
+                median(big_us.clone())
+            );
+            report(
+                &format!("spread {spread:?}: 64x64 relu, {CHAIN} chained"),
+                "us/op",
+                "host",
+                Stats::of(small_us),
+            );
+            report(
+                &format!("spread {spread:?}: 2048x2048 add"),
+                "us",
+                "host",
+                Stats::of(big_us),
             );
         }
     })

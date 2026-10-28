@@ -638,7 +638,7 @@ pub fn bench(args: impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 /// A value from one flat JSON object, as its text, quotes removed.
-fn json_field(obj: &str, key: &str) -> Option<String> {
+pub(crate) fn json_field(obj: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\":");
     let start = obj.find(&pat)? + pat.len();
     let rest = &obj[start..];
