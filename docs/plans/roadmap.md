@@ -770,7 +770,13 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
   - `channel::Graph` refuses unbalanced rates and deadlocks.
   - H8: a credited handoff costs 1.81 us against a two-unit barrier's 2.6 us (prediction 1.5 missed, claim held).
   - No op uses a cross-core channel yet. F4b and F4a are the first.
-- [ ] **F3:** the tile-generic op (H6).
+- [ ] **F3:** the tile-generic op (H6), in progress since 2026-10-28.
+  - Method: a job golden first (`050cbbd`), then each client ported word for word and its old builder deleted.
+  - Done: the pointwise family and the reduction (`33d3562`, `0bfb79e`). On card 0, 65 of 65. On card 1, host time per
+    op within 1.8% of B0 after `8011dc7`, and decode, models and MNIST within drift
+    ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
+  - Left: every `matmul_dram` lowering (F3.6-F3.8), then allocation and the channel check as passes, the H6 audit,
+    and B1.
 - [ ] **F4b:** operand reuse across cores (H1).
 - [ ] **F4a:** channels instead of barriers in decode (H4).
 - [ ] **F5:** `Dst` subblocks and half-sync (H2).

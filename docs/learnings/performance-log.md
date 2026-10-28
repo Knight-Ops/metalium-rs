@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [F3: the tile-generic op, pointwise and reduction ported, before and after](#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1) | 2026-10-28 | B0 (`050cbbd`) against the pointwise family and the reduction on `TileOp`, word for word: their build stage first 20-50% slower (per-run allocations, up to 3.9% of a call), then within 1.8% of B0 on every call (`8011dc7`, ABBA); traced decode ABBA 0.997-1.005 of B0 against B0's own 1.5% drift; models and MNIST within drift |
 | [A cross-core credit against the barrier (H8)](#a-cross-core-credit-against-the-barrier-h8-2026-10-28-card-1) | 2026-10-28 | F2: a credited handoff between two units 1.81 us, a two-unit barrier 2.66 / 2.59 us (polled / released); a 4 KiB page at depth 2 with the consumer's copy 9.39 us; H8's 1.5 us prediction missed, its claim held |
 | [The GDDR write benches run again](#the-gddr-write-benches-run-again-2026-10-28-card-0) | 2026-10-28 | broken since the B/NC split (`3c7756b`: a barrier is B's, NC refused the lists); NC's writes now run in B's transfer packets behind B's barrier: NoC #1 writes 403-408 / 385-388 GB/s at 16 / 120 tiles, as before; 235 at 4 (was 299: the handoff on a short run) |
 | [Why card-wide reads plateau at 469, and what it means for decode](#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0) | 2026-10-28 | `fast-reads`: the 120-tile read loses ~30 GB/s of steady state to too many requests in flight a channel (knee ~32), ~15 to crossing the chip (each tile on its half's channels: ~505 steady, 495 overall) and the rest to an unfair finish; decode's caps re-swept: lowering any of them slows the step (B's own cap 2: +0.45 ms), the defaults stay; `fast-reads` decode 11.05 / 12.39-12.42 ms against the safe image's 11.38 / 12.55 |
@@ -381,6 +382,70 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## F3: the tile-generic op, pointwise and reduction ported, before and after (2026-10-28, cards 0 and 1)
+
+Stage F3 of [dataflow-compiler.md](../plans/dataflow-compiler.md). The pointwise SFPU family (`tile_op::eltwise`,
+`33d3562`) and the reduction (`tile_op::reduce`, `0bfb79e`) are built through `TileOp`, and their old builders are
+deleted. Both reproduce their job goldens word for word (`tile_op::golden`, `050cbbd`), so their device work is
+unchanged by construction; what the port can change is the host's time to build the jobs.
+
+**Method.**
+- B0 is a worktree at `050cbbd` (the goldens, before any port), the after side `0bfb79e`.
+- Both ran back to back on card 1 (release, safe image) with nothing else on the host. A first B0 taken while the
+  host compiled and ran ttsim gates read the 135M decode ~1% slow; it is not used.
+- `cargo xtask bench-diff` judges a pair by the benches' own p10..p90. That spread is within one run: between runs
+  the same tree moves more (below), so the claims rest on ABBA runs.
+
+**Card 0:** the pointwise and reduction gates, 65 of 65
+(`step19/29/31/45/46/55/67/69/121/145/192/200/206/207/231`).
+
+**Host time per op** (`host_time_per_op`: 50 ops queued, `REPS` batches; `build` is the call less its enqueue).
+- B0 (`1793206546`) against `0bfb79e` (`1793208008`): every pointwise and reduction `build` row was 20-50% slower:
+  - an add on 8 tiles 4.39 -> 5.91 us;
+  - a sum over columns on 8 tiles 2.17 -> 3.20 us;
+  - up to 3.9% of the call (an add of 64x784 on 8 tiles 40.08 -> 41.64 us).
+  The matmul rows, untouched, did not move.
+- Cause: per run, the lowering allocated each operand's records and the result's writes, and the microkernel a vector
+  of slots.
+- `8011dc7` writes the records into the job's lists and makes the slots a fixed array. ABBA on card 1 (B0
+  `1793209525`/`1793209540`, after `1793209530`/`1793209535`):
+
+  | op (8 tiles) | B0 call | after call | B0 build | after build |
+  |---|--:|--:|--:|--:|
+  | add 64x784 | 39.93 | 40.27 | 4.43 | 4.65 |
+  | add 512x512 | 48.70 | 48.65 | 4.46 | 4.60 |
+  | `exp` 512x512 | 50.54 | 50.54 | 5.75 | 6.24 |
+  | add a row 512x512 | 50.77 | 50.89 | 5.87 | 5.86 |
+  | sum over columns 512x512 | 38.09 | 38.38 | 2.19 | 2.51 |
+  | matmul 256^3 (not ported) | 81.51 | 81.33 | 14.88 | 14.53 |
+
+  Every call is within 1.8% of B0 (the worst a sum over columns on 32 tiles, 73.4 -> 74.8 us), most within 0.5%; the
+  build stage is 0.1-0.5 us an op over B0. B0 against itself moved up to 1.3% (call) and 5% (build). H6's 3% host
+  bound holds.
+
+**Device time, models and training** (B0 `1793206546`, `1793206621`, `1793206987`, `1793207799`; after `1793208008`,
+`1793208083`, `1793208451`, `1793209262`).
+- MNIST 1.398 / 2.882 / 8.290 -> 1.398 / 2.892 / 8.260 ms a step.
+- ResNet-18 and ViT-Tiny traced: equal to 0.01%.
+- The SFPU sweep (host-timed): 0-4% slower on some rows, the build above.
+- Traced decode read 0.6-1.0% slower in that one pair, but its traces are word for word B0's. The decode ABBA on card 1
+  settles it (B0 `1793209832`/`1793210741`, HEAD `db3081e` `1793210135`/`1793210439`, `TT_TILES=all`):
+
+  | | B0 | after | B0 again |
+  |---|--:|--:|--:|
+  | 135M decode step, 32-token prompt | 6.995 | 6.956 / 7.006 | 7.011 |
+  | 128-token prompt | 7.448 | 7.518 / 7.568 | 7.559 |
+  | 256-token prompt | 8.206 | 8.190 / 8.216 | 8.172 |
+  | 1.7B decode step (stream ceiling, off), 32 / 256 tokens | 11.354 / 12.744 | 11.337-11.346 / 12.673-12.739 | 11.310 / 12.697 |
+  | 135M trace build, s | 56.67 | 56.61 / 56.76 | 56.51 |
+
+  After against B0 is 0.997-1.005 on every row, inside B0's own 0.4-1.5% between runs.
+- The untouched matmul's replay moved -14% to +2% between the two single runs (`[1024,2048]@[2048,2048]` 7.99 -> 6.89
+  TFLOPS): one run a side does not resolve a few percent on the card.
+
+**Found on the way:** `matmul_pipeline_sweep` failed on every tree, B0 included. With NC writing beside B, a matmul's
+profile can come out unbalanced. The sweep now falls back to host time there, as the SFPU sweep does (`db3081e`).
 
 ## A cross-core credit against the barrier (H8) (2026-10-28, card 1)
 

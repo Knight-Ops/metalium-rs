@@ -157,9 +157,61 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 
 ## Stage F3: the tile-generic op (L1) and transforms written once
 
-- [ ] Add `TileOp`: domain with iterator kinds, affine tile maps, edges with `TileFormat` and `OpPadding`, a body of microkernel calls, and a `NumericContract`.
-- [ ] Write the passes against it: grid distribution (from `Spread`), L1 blocking (from `block_stream_layout`), allocation (through `l1::Requirements`), channels (F2), the role split, and lowering to `Step`/`Job`/`Work`.
-- [ ] Port three clients, one per dataflow class: matmul (from F1), the pointwise SFPU family (`sfpu_eltwise_blocks`, 121 kinds) and a row reduction. Each is bit-exact against its old builder, and the old builder is then deleted.
+**Opened 2026-10-28.** H6's prediction and kill criterion are in the Bible's register. The method:
+- a job golden pins every job the three old builders emit;
+- each client is ported word for word;
+- each old builder is then deleted.
+
+Scope (owner, 2026-10-28): every lowering behind `Session::matmul_dram` (block-stream, blocked/K-block/stream,
+thin/prefetch/handoff). `matmul_dram_batched` and attention's `matmul_step` are follow-on clients.
+
+**Before and after, card 1.** `cargo xtask bench-diff <B0.jsonl> <B1.jsonl>` (`61478ca`) joins two collections by test and
+key and judges each pair by its own p10..p90 spread. B0 is taken at F3.0, the per-client subsets after each client,
+and B1 at the close. The set:
+- plain: `host_time_per_op` (now with the call, enqueue, build and a cold first call for add, `exp`, a row broadcast, a
+  sum over columns and a matmul), `small_and_large_ops_by_spread`, `matmul_throughput`, `k_block_matmul_baselines`,
+  `norm_forward_baselines`, ResNet-18 / ViT-Tiny traced, and `bench_training`;
+- `TT_TILES=all`: `traced_generation` on the 135M and the 1.7B;
+- `--profile`: `sfpu_pipeline_sweep` and `matmul_pipeline_sweep`, which need stamping firmware.
+
+- [x] **F3.0** (`61478ca`): H6 opened; `host_time_per_op` and the spread bench emit `BENCH` records; `bench-diff`.
+  B0 is taken from a worktree at `050cbbd` beside the after-checkpoint, back to back on a quiet host: a first B0 taken
+  while the host compiled and ran ttsim gates read 135M decode ~1% above Stage 0's, so it is not used.
+- [x] **F3.1, the job golden** (`050cbbd`). `tile_op::golden` pins every job of 409 pointwise cases (every SFPU kind,
+  distribution, pipelining, broadcasts, blocks, a packed twin), 90 reductions (every op and axis, finishing kinds, the
+  chunked fallback) and 223 products (every `matmul_dram` lowering, every edge-format pair, every pair order), a hash a
+  job, in `golden/jobs_{eltwise,reduce,matmul}.txt`; the full dump goes to `target/tile_op_golden/`. The capture-time
+  choice of prefetching units stays in `Session::matmul_dram` until F3.8; the golden pins the builder under explicit
+  prefetch, busy and handoff arguments, so `step243` moves to F3.8.
+- [x] **F3.2-F3.4, `TileOp`, the passes, and the pointwise family** (`33d3562`).
+  - `TileOp`: a domain of iterators in elements (parallel, or reduction with its `ReductionContract`); each operand's
+    and result's `TileMap` (each tile dimension one iterator, wrapped, or fixed for a broadcast); edges with element
+    type and layout (tiles, or a packed row for a one-row result's twin); a `NumericContract`; and a body behind
+    `Microkernel` (a run's group, slots and programs), the only op-specific code a pass calls.
+  - `distribute::deal`: items in runs, pipelined where `pipelined_runs` says. Runs are kept inside a row where an
+    operand reads one tile a row (read off its map) and that moves fewer tiles; `row_runs` takes its transfer counts
+    from the caller.
+  - `lower::jobs`: each operand's mover access read off its map against the walk order (items, then each item's
+    terms), a table of the mover's modes. Any other map is refused by name.
+  - `tile_op::eltwise` replaced `sfpu_eltwise_blocks`, which is deleted. The pointwise golden is word for word unchanged,
+    and the pointwise ttsim gates pass (`step19/29/45/46/55/121/145/192/200/206/207/231`).
+- [x] **F3.5, the row reduction** (`0bfb79e`). `tile_op::reduce`, either axis. The chunked fallback is no longer a
+  builder: its contract is `Combine::GddrPartials { chunk: ROW_CHUNK }`, dealt a job an item and lowered by
+  `lower::chunked_jobs`. `sfpu_reduce_then`'s body and `reduce_chunked` are deleted. Both goldens are word for word
+  unchanged, and `step31/55/67/69` pass on ttsim.
+- [x] **The pointwise and reduction checkpoint on silicon.**
+  - Card 0: `step19/29/31/45/46/55/67/69/121/145/192/200/206/207/231`, 65 of 65.
+  - Card 1: B0 (`050cbbd`) against `0bfb79e`, back to back. The build stage before enqueue was 20-50% slower, up to 3.9%
+    of a call, from per-run allocations in the lowering. With those removed (`8011dc7`), every call is within 1.8% of
+    B0 (ABBA). Traced decode, ResNet-18, ViT-Tiny and MNIST are within run-to-run drift
+    ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
+  - `matmul_pipeline_sweep` had failed on every tree (an unbalanced profile with NC writing). It now falls back to host
+    time (`db3081e`).
+- [ ] **F3.6-F3.8, matmul:** block-stream, then blocked/K-block/stream, then thin, prefetch and handoff.
+- [ ] Allocation through `l1::Requirements` and the op's `channel::Graph::check`, once the matmul's layouts are
+  microkernel layouts: today each client's microkernel plans its own L1 (`sfpu::kernel::plan_layout_in`,
+  `sfpu::reduce::plan_layout`).
+- [ ] **F3.9:** the H6 audit, B1, `--smoke` on card 0, and the close-out.
 - **H6 prediction:** no pass contains code specific to one of the three clients. If one does, the description gets the missing concept and the Bible records it.
 
 ## Stage F4b (compute): operand reuse across cores, H1

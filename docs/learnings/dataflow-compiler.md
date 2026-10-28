@@ -470,9 +470,19 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
 - **H5 Spatial pipelining.** Running a layer's ops on disjoint core sets at once beats running them one after another for decode at batch 1.
   - *Prediction:* none until H4 has run.
   - *Kills it:* H4's tails turn out to be GDDR-queue-bound.
-- **H6 Generic ops.** The L1 description covers matmul, the 121 pointwise SFPU kinds and a row reduction with no transform code specific to any of them.
-  - *Measured by:* lines of per-op transform code, and the three old builders deleted bit-exact.
-  - *Kills it:* a transform needs per-op special cases. The description is then missing a concept, and it is amended here.
+- **H6 Generic ops** (F3, opened 2026-10-28). The L1 description covers matmul, the 121 pointwise SFPU kinds and a row reduction with no transform code specific to any of them.
+  - *Prediction:*
+    - the passes (distribute, block, allocate, channels, roles, lower) contain no line that names a client; only the
+      `Microkernel` implementations do;
+    - every client's jobs are word for word its old builder's (a job golden pins them first), so device time is
+      unchanged;
+    - steady-state host time per op stays within 3% of the baseline (`host_time_per_op`'s `build` and `call` rows).
+  - *Measured by:* lines of per-op transform code; the job golden; the old builders deleted (all of `matmul_dram`'s
+    lowerings, `sfpu_eltwise_blocks`, `sfpu_reduce_then` with `reduce_chunked`); `cargo xtask bench-diff` of the card-1
+    baseline B0 against B1 at the close.
+  - *Kills it:* a transform needs per-op special cases. The description is then missing a concept, and it is amended
+    here. Or a host-time regression past 3% that no memo removes: the generic layer then costs eager ops what it gives
+    transforms, and that is recorded here.
 - **H8 Per-edge credits are cheap** (F2, opened 2026-10-28). A channel's credit is a NoC atomic increment into the
   consumer's L1 word, sent after the data's write acknowledgements (T7), and a fenced local wait.
   - *Claim:* a credited unicast handoff between two units costs less than one op barrier (~3 us, T10), so replacing a
