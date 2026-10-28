@@ -6839,20 +6839,21 @@ impl<T: Transport> Session<T> {
         let overlap = self.overlap();
         let twin = self.new_twin(a.dims[0], a.dims[1], tensor::output_elem(op.kind))?;
         let alloc = &mut self.dram_state()?.alloc;
-        let work =
-            match tensor::sfpu_eltwise_blocks(alloc, op, a, b, c, units, overlap, twin.as_ref()) {
-                Ok(Some(work)) => work,
-                other => {
-                    if let Some(twin) = twin {
-                        self.free(twin)?;
-                    }
-                    other?;
-                    return Err(TensorError::Shape(format!(
-                        "element-wise {:#x} on blocks: no SFPU program computes it",
-                        op.kind
-                    )));
+        let work = match crate::tile_op::eltwise(op, a, b, c, twin.as_ref())
+            .and_then(|o| o.map(|mut o| o.build(alloc, units, overlap)).transpose())
+        {
+            Ok(Some(work)) => work,
+            other => {
+                if let Some(twin) = twin {
+                    self.free(twin)?;
                 }
-            };
+                other?;
+                return Err(TensorError::Shape(format!(
+                    "element-wise {:#x} on blocks: no SFPU program computes it",
+                    op.kind
+                )));
+            }
+        };
         let out = self.execute_on(work, units, RESET_BUDGET);
         self.keep_twin(&out, twin)?;
         let out = out?;

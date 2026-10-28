@@ -1,7 +1,7 @@
 //! Every job the builders [`super`] replaces emit, pinned word for word (F3.1).
 //!
 //! One golden a client, under `golden/`: `jobs_eltwise.txt` (the pointwise SFPU family,
-//! [`tensor::sfpu_eltwise`] and [`tensor::sfpu_eltwise_blocks`]), `jobs_reduce.txt`
+//! [`tensor::sfpu_eltwise`] and [`super::eltwise`], which replaced `tensor::sfpu_eltwise_blocks`), `jobs_reduce.txt`
 //! ([`tensor::sfpu_reduce_then`], with its chunked fallback) and `jobs_matmul.txt` (every lowering
 //! behind [`tensor::matmul_dram_prefetching`], the builder `Session::matmul_dram` calls). Each
 //! case is built on a fresh allocator, so its output and addresses are its own. A job is dumped as
@@ -402,16 +402,17 @@ fn eltwise_jobs_are_pinned() {
                 at,
                 dims,
             };
-            let work = tensor::sfpu_eltwise_blocks(
-                &mut alloc,
+            let work = crate::tile_op::eltwise(
                 ew(kind_sfpu::SILU_MUL, 0.0, 0.0),
                 block(&pa),
                 Some(block(&pb)),
                 None,
-                units,
-                overlap,
                 None,
-            );
+            )
+            .and_then(|o| {
+                o.map(|mut o| o.build(&mut alloc, units, overlap))
+                    .transpose()
+            });
             case(
                 &mut out,
                 &format!("blocks {parent:?} at {at:?} dims {dims:?} units {units} {overlap:?}"),

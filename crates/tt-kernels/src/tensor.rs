@@ -4030,7 +4030,7 @@ pub fn pipelined_runs(
 
 /// Which half of the arena run `j` of a pipelined op is staged in: a unit
 /// takes runs `j`, `j + units`, ... in turn, and alternates halves.
-fn half_of(j: usize, units: usize) -> u8 {
+pub(crate) fn half_of(j: usize, units: usize) -> u8 {
     ((j / units.max(1)) % 2) as u8
 }
 
@@ -4051,18 +4051,25 @@ pub fn set_col_once(on: bool) -> bool {
     COL_ONCE.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a column broadcast's runs keep to tile rows ([`set_col_once`]).
+pub(crate) fn col_once() -> bool {
+    COL_ONCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A run's fixed cost (its lists, the kernel's start and the handshakes) in tile transfers, which
 /// [`row_runs`] weighs against the tiles a busiest unit moves.
 const RUN_FIXED_TRANSFERS: usize = 4;
 
-/// The runs of a column broadcast (`B` a `[rows, 1]` column) over `rt x ct` tiles, each inside
-/// one tile row, so a run reads its row's one tile of `B` once (`kernel::Layout::b_once`), not
-/// once an output tile: on a long softmax row that read was half the op's bytes, 120 units
-/// reading 64 small tiles (`docs/plans/long-context.md`, "Long-prompt softmax passes"). Each row
-/// is cut in `s` runs of at most `max` tiles, as even as integer division allows. The runs are
-/// dealt `j % units`, so an op takes as long as its busiest unit: a run there costs two
-/// transfers a tile (`A` in, the result out) and one for its `B`, against three a tile for
-/// `old`'s runs (the ones it would replace), each with [`RUN_FIXED_TRANSFERS`]. `s` is the
+/// The runs of an op with an operand that reads one tile a row (a column broadcast, `B` a
+/// `[rows, 1]` column) over `rt x ct` tiles, each inside one tile row, so a run reads its row's
+/// one tile of that operand once (`kernel::Layout::b_once`), not once an output tile: on a long
+/// softmax row that read was half the op's bytes, 120 units reading 64 small tiles
+/// (`docs/plans/long-context.md`, "Long-prompt softmax passes"). Each row is cut in `s` runs of
+/// at most `max` tiles, as even as integer division allows. The runs are dealt `j % units`, so an
+/// op takes as long as its busiest unit: `[old, new, held]` are the tiles a run moves for each of
+/// its items in `old`'s runs (the ones it would replace: every operand in and every result out;
+/// three for a column's broadcast), the same with the held operands read once (two), and the
+/// held operands' tiles a run (one), each run with [`RUN_FIXED_TRANSFERS`]. `s` is the
 /// cheapest from `ct.div_ceil(max)` up to twice that where pipelined (each run at least
 /// [`MIN_PIPELINED_RUN`] tiles and two a unit), or up to one tile a run otherwise. `None` unless
 /// that is cheaper than `old`: a decode row or a short chunk's rows keep their spread over the
@@ -4074,6 +4081,7 @@ pub fn row_runs(
     max: usize,
     pipelined: bool,
     old: &[std::ops::Range<usize>],
+    [per_old, per_new, held]: [usize; 3],
 ) -> Option<Vec<std::ops::Range<usize>>> {
     let units = units.max(1);
     if max == 0 || rt == 0 || ct == 0 || (pipelined && ct < MIN_PIPELINED_RUN) {
@@ -4088,13 +4096,13 @@ pub fn row_runs(
     let busiest = |runs: usize, longest: usize, per_tile: usize, extra: usize| {
         runs.div_ceil(units) * (longest * per_tile + extra + RUN_FIXED_TRANSFERS)
     };
-    let now = busiest(old.len(), old.iter().map(|r| r.len()).max()?, 3, 0);
+    let now = busiest(old.len(), old.iter().map(|r| r.len()).max()?, per_old, 0);
     let (cost, s) = (least..=most)
         .filter(|&s| !pipelined || rt * s >= 2 * units)
         // On a tie, more units reading (up to one run each), then fewer runs.
         .map(|s| {
             (
-                busiest(rt * s, ct.div_ceil(s), 2, 1),
+                busiest(rt * s, ct.div_ceil(s), per_new, held),
                 std::cmp::Reverse((rt * s).min(units)),
                 s,
             )
@@ -4218,7 +4226,13 @@ pub fn block_repeats(a: &DramTensor, b: &DramTensor) -> Option<usize> {
 /// each slot, with no list of rows.
 ///
 /// [`Broadcast::Block`]: crate::sfpu::ops::Broadcast::Block
-fn block_reads(first: usize, count: usize, period: usize, at: u64, ct: usize) -> Vec<[u32; 8]> {
+pub(crate) fn block_reads(
+    first: usize,
+    count: usize,
+    period: usize,
+    at: u64,
+    ct: usize,
+) -> Vec<[u32; 8]> {
     let mut out = Vec::new();
     let mut n = 0;
     while n < count {
@@ -4268,16 +4282,16 @@ pub fn sfpu_eltwise(
     if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
         return sfpu_divide(alloc, Eltwise { kind, ..op }, a, b, bcast).map(Some);
     }
-    sfpu_eltwise_blocks(
-        alloc,
+    match crate::tile_op::eltwise(
         op,
         BlockOperand::whole(a),
         b.map(BlockOperand::whole),
         c.map(BlockOperand::whole),
-        units,
-        overlap,
         twin,
-    )
+    )? {
+        Some(mut tile_op) => tile_op.build(alloc, units, overlap).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// A product's jobs (`c` one tile row, `[1, n]`) also writing `c`'s packed twin
@@ -4404,220 +4418,9 @@ impl<'a> BlockOperand<'a> {
         t
     }
 
-    fn tensor_ref(&self, what: &str) -> Result<TensorRef> {
+    pub(crate) fn tensor_ref(&self, what: &str) -> Result<TensorRef> {
         block_ref(self.tensor, self.at, self.dims, what)
     }
-}
-
-/// [`sfpu_eltwise`] over blocks of resident tensors ([`BlockOperand`]), the
-/// result a new tensor of `a`'s block's dims: each operand's tiles read where
-/// they lie at its parent's row stride (`record::READ_RUN` counts over the
-/// output's grid), so a view that is a block of its buffer needs no copy
-/// first. Integer division is refused here (it reads whole tensors).
-#[allow(clippy::too_many_arguments)]
-pub fn sfpu_eltwise_blocks(
-    alloc: &mut DramAlloc,
-    op: Eltwise,
-    a: BlockOperand<'_>,
-    b: Option<BlockOperand<'_>>,
-    c: Option<BlockOperand<'_>>,
-    units: usize,
-    overlap: Overlap,
-    twin: Option<&DramTensor>,
-) -> Result<Option<Work>> {
-    use crate::sfpu::kernel::Operands;
-    use crate::sfpu::ops::Broadcast;
-    let what = "an element-wise op's block";
-    let (ra, rb, rc) = (
-        a.tensor_ref(what)?,
-        b.map(|b| b.tensor_ref(what)).transpose()?,
-        c.map(|c| c.tensor_ref(what)).transpose()?,
-    );
-    let (a, b, c) = (
-        a.shape_only(),
-        b.map(|b| b.shape_only()),
-        c.map(|c| c.shape_only()),
-    );
-    let (a, b, c) = (&a, b.as_ref(), c.as_ref());
-    let (kind, bcast) = broadcast_of(op, a, b)?;
-    let op = Eltwise { kind, ..op };
-    if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
-        return Err(TensorError::Shape(
-            "integer division reads whole tensors, not blocks".into(),
-        ));
-    }
-    let Some((operands, _)) = crate::sfpu::ops::program_for(kind, [op.scalar, op.scalar2], bcast)
-    else {
-        return Ok(None);
-    };
-    // A ternary op's third operand: `A`'s shape, of the kind's type.
-    let rc = match (operands, c) {
-        (Operands::Ternary, Some(c)) => {
-            if (c.rows, c.cols) != (a.rows, a.cols) {
-                return Err(TensorError::Shape(format!(
-                    "a ternary op's third operand [{}, {}] for [{}, {}]",
-                    c.rows, c.cols, a.rows, a.cols
-                )));
-            }
-            if let Some(&want) = crate::sfpu::ops::elems(kind).inputs.get(2) {
-                c.expect(&format!("element-wise op {kind:#x}"), want)?;
-            }
-            rc
-        }
-        (Operands::Ternary, None) => {
-            return Err(TensorError::Shape(
-                "a ternary op needs three operands".into(),
-            ))
-        }
-        (_, Some(_)) => {
-            return Err(TensorError::Shape(format!(
-                "{kind:#x} takes no third operand"
-            )))
-        }
-        _ => None,
-    };
-    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind))?;
-    let [rt, ct] = a.grid();
-    let ro = out.tensor_ref();
-    let rows = eltwise_rows(op.kind, a.rows);
-    // Pipelined (checklist 9.15): runs in alternating halves of the arena,
-    // so a unit's mover moves one run while the roles compute another.
-    let piped = pipelined_runs(
-        rt * ct,
-        1,
-        units,
-        sfpu_group(op, bcast, operands, true),
-        overlap,
-    );
-    let pipelined = piped.is_some();
-    let plain =
-        piped.unwrap_or_else(|| runs(rt * ct, units, sfpu_group(op, bcast, operands, false)));
-    // A column's runs inside one tile row each read its one `B` tile once, where that is cheaper.
-    let by_rows = (bcast == Broadcast::Col && COL_ONCE.load(std::sync::atomic::Ordering::Relaxed))
-        .then(|| {
-            row_runs(
-                rt,
-                ct,
-                units,
-                sfpu_group(op, bcast, operands, pipelined),
-                pipelined,
-                &plain,
-            )
-        })
-        .flatten();
-    let b_once = by_rows.is_some();
-    let all = by_rows.unwrap_or(plain);
-    let mut jobs = Vec::new();
-    for (j, run) in all.into_iter().enumerate() {
-        let len = run.len();
-        let half = pipelined.then(|| half_of(j, units));
-        let (layout, roles, loops) =
-            match sfpu_programs(op, bcast, operands, len, half, rows, b_once) {
-                Ok(p) => p,
-                Err(e) => {
-                    alloc.free(&out.placement);
-                    return Err(e);
-                }
-            };
-        let read = |x: &TensorRef, at: u64, flags: u32| {
-            [
-                [
-                    record::READ_RUN,
-                    run.start as u32,
-                    len as u32,
-                    at as u32,
-                    flags,
-                    ct as u32,
-                    0,
-                    0,
-                ],
-                x.encode()[0],
-                x.encode()[1],
-            ]
-        };
-        let mut gather = read(&ra, layout.a_at, 0).to_vec();
-        if let (Some(rb), Some(b_at)) = (&rb, layout.b_at) {
-            // A column's broadcast is the program's (`Program::broadcast_col0`): the
-            // mover's datum-at-a-time copy cost ~10 us a tile.
-            let flags = match bcast {
-                Broadcast::None | Broadcast::Block => 0,
-                Broadcast::Row => 1,
-                Broadcast::Col => record::READ_RUN_COL_AS_IT_LIES,
-            };
-            if bcast == Broadcast::Block {
-                let b = b.expect("a block broadcast's operand");
-                for h in block_reads(run.start, len, b.grid()[0] * ct, b_at, ct) {
-                    gather.extend([h, rb.encode()[0], rb.encode()[1]]);
-                }
-            } else if layout.b_once {
-                // The run's row's one tile of `B`, into its one slot.
-                gather.extend([
-                    [
-                        record::READ_RUN,
-                        run.start as u32,
-                        1,
-                        b_at as u32,
-                        flags,
-                        ct as u32,
-                        0,
-                        0,
-                    ],
-                    rb.encode()[0],
-                    rb.encode()[1],
-                ]);
-            } else {
-                gather.extend(read(rb, b_at, flags));
-            }
-        }
-        if let (Some(rc), Some(c_at)) = (&rc, layout.c_at) {
-            gather.extend(read(rc, c_at, 0));
-        }
-        let scatter = [
-            [
-                record::WRITE_RUN,
-                run.start as u32,
-                len as u32,
-                layout.out_at as u32,
-                0,
-                0,
-                0,
-                0,
-            ],
-            ro.encode()[0],
-            ro.encode()[1],
-        ];
-        let mut scatter = scatter.to_vec();
-        if let Some(twin) = twin {
-            // A one-row result's data rows, packed as a product's `A` and RMSNorm's statistic
-            // read them, from the slots the scatter writes out: no packing op.
-            if (a.rows, twin.rows, twin.cols) != (1, ct, 32) {
-                alloc.free(&out.placement);
-                return Err(TensorError::Shape(format!(
-                    "a packed twin [{}, {}] for a [{}, {}] result",
-                    twin.rows, twin.cols, a.rows, a.cols
-                )));
-            }
-            scatter.extend(packed_twin_writes(twin, run.start, len, layout.out_at));
-        }
-        jobs.push(vec![
-            Step::List {
-                what: "sfpu gather",
-                entries: gather,
-            },
-            Step::Kernel {
-                roles,
-                init: layout.init.clone(),
-                mop: Box::new([None; 3]),
-                loops,
-                half,
-            },
-            Step::List {
-                what: "sfpu scatter",
-                entries: scatter,
-            },
-        ]);
-    }
-    Ok(Some(Work { out, jobs }))
 }
 
 /// The rows of each tile an element-wise op on a tensor of `rows` rows computes
@@ -4757,7 +4560,7 @@ fn sfpu_divide(
     Ok(Work { out, jobs })
 }
 
-type SfpuPrograms = (
+pub(crate) type SfpuPrograms = (
     crate::sfpu::kernel::Layout,
     Arc<[Vec<Instruction>; 3]>,
     Arc<[Vec<crate::code::Loop>; 3]>,
@@ -4919,7 +4722,7 @@ pub(crate) fn sfpu_group_for_tests(
 }
 
 /// `half`: in half the arena, for a pipelined run.
-fn sfpu_group(
+pub(crate) fn sfpu_group(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
@@ -5001,7 +4804,7 @@ fn measure_sfpu_group(
 /// whole arena); `b_once`: a column's one tile of `B` held for the whole run
 /// ([`row_runs`]).
 #[allow(clippy::too_many_arguments)]
-fn sfpu_programs(
+pub(crate) fn sfpu_programs(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
@@ -8029,6 +7832,10 @@ mod tests {
     /// `max` tiles, two a unit where pipelined; never spread over fewer units than the runs they
     /// replace when those were one a unit; and give way where a row is shorter than a pipelined
     /// run or the runs could not give every unit two.
+    /// What a column broadcast's runs move a tile, as `tile_op::distribute` counts them: `A`
+    /// and `B` in and the result out, `A` in and the result out with `B` held, and `B` once.
+    const COL_BROADCAST: [usize; 3] = [3, 2, 1];
+
     #[test]
     fn row_runs_keep_to_tile_rows() {
         let piped = |rt: usize, ct: usize, units: usize, max: usize| {
@@ -8048,7 +7855,7 @@ mod tests {
             } else {
                 runs(rt * ct, units, max)
             };
-            let r = row_runs(rt, ct, units, max, pipelined, &old)
+            let r = row_runs(rt, ct, units, max, pipelined, &old, COL_BROADCAST)
                 .unwrap_or_else(|| panic!("[{rt}, {ct}] on {units}: no row runs"));
             let mut next = 0;
             for run in &r {
@@ -8079,15 +7886,23 @@ mod tests {
         // A chunk's RMSNorm division (`[64, 2048]` by `[64, 1]`): cut by rows at the fewest runs,
         // four units took 32 tiles each where 120 took one or two (the first rule; the 1.7B's
         // prefill at 1,000 tokens 8% slower). Costed, it keeps every unit.
-        let r = row_runs(2, 64, 120, 64, false, &runs(128, 120, 64)).unwrap();
+        let r = row_runs(2, 64, 120, 64, false, &runs(128, 120, 64), COL_BROADCAST).unwrap();
         assert!(r.len() >= 120, "{} runs", r.len());
         assert_eq!(
-            row_runs(512, 8, 120, 36, true, &piped(512, 8, 120, 36)),
+            row_runs(
+                512,
+                8,
+                120,
+                36,
+                true,
+                &piped(512, 8, 120, 36),
+                COL_BROADCAST
+            ),
             None,
             "a row shorter than a pipelined run"
         );
         assert_eq!(
-            row_runs(2, 256, 120, 36, true, &runs(512, 120, 12)),
+            row_runs(2, 256, 120, 36, true, &runs(512, 120, 12), COL_BROADCAST),
             None,
             "too few runs for every unit"
         );
