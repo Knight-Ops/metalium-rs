@@ -10351,6 +10351,114 @@ mod tests {
         assert_eq!(waits(dependent.concat()), [[1, 0], [2, 0]]);
     }
 
+    /// The streamed packets' words, pinned: the in-core streams' credits,
+    /// slot-reuse waits, omitted reserves and dropped pops for depth one and
+    /// two, kernel regions and transfers, and a mix of both between lists.
+    /// Re-expressing the streams as channels (`crate::channel`) must leave
+    /// every word as it is. `TT_BLESS=1` rewrites `golden/stream_packets.txt`.
+    #[test]
+    fn streamed_packet_words_are_pinned() {
+        use std::fmt::Write;
+        let kernel = |half: Option<u8>| Step::Kernel {
+            roles: Arc::new([Vec::new(), Vec::new(), Vec::new()]),
+            init: Vec::new(),
+            mop: Box::new([None; 3]),
+            loops: Default::default(),
+            half,
+        };
+        let block = |input: u32, output: u32, half: Option<u8>| {
+            [
+                Step::List {
+                    what: "gather",
+                    entries: vec![[op::READ, 0, 0, 0, input, 4096, 0, 0]],
+                },
+                kernel(half),
+                Step::List {
+                    what: "scatter",
+                    entries: vec![[op::WRITE, 0, 0, 0, output, 4096, 0, 0]],
+                },
+            ]
+        };
+        let region = |blocks: usize, depth: u16, input: u32, output: u32| -> Vec<Step> {
+            (0..blocks)
+                .flat_map(|index| {
+                    let half = (depth == 2).then_some((index % 2) as u8);
+                    block(input, output, half)
+                })
+                .collect()
+        };
+        let cases: Vec<(&str, Vec<Step>)> = vec![
+            ("region, depth 1, apart", region(5, 1, 0x2_0000, 0x3_0000)),
+            ("region, depth 1, shared", region(5, 1, 0x2_0000, 0x2_0800)),
+            ("region, depth 2, apart", region(7, 2, 0x2_0000, 0x3_0000)),
+            ("region, depth 2, shared", region(7, 2, 0x2_0000, 0x2_0800)),
+            (
+                "region past one group, depth 2",
+                region(super::GROUP_MAX + 3, 2, 0x2_0000, 0x3_0000),
+            ),
+            ("transfer, depth 1", vec![transfer("t1", 1, 5, 2)]),
+            ("transfer, depth 2", vec![transfer("t2", 2, 5, 2)]),
+            (
+                "transfers of both depths",
+                vec![
+                    transfer("a", 2, 3, 1),
+                    transfer("b", 2, 2, 3),
+                    transfer("c", 1, 2, 1),
+                ],
+            ),
+            (
+                "transfer past one packet",
+                vec![transfer("many", 2, 100, 2)],
+            ),
+            ("mixed", {
+                let mut steps = vec![list(2, 1), transfer("x", 2, 3, 1), list(1, 2)];
+                steps.extend(region(3, 2, 0x2_0000, 0x2_0800));
+                steps.push(transfer("y", 1, 2, 2));
+                steps.extend(region(2, 1, 0x2_0000, 0x3_0000));
+                steps
+            }),
+        ];
+        let mut dump = String::new();
+        for (name, steps) in cases {
+            writeln!(dump, "# {name}").unwrap();
+            let segments = streaming_segments(steps, tt_isa::l1::PROGRAM_CACHE.len()).unwrap();
+            for segment in segments {
+                writeln!(
+                    dump,
+                    "segment {} streaming={} resident={} steps={} kernels={:?} waits={:?}",
+                    segment.what,
+                    segment.streaming,
+                    segment.resident,
+                    segment.steps,
+                    segment.kernels,
+                    segment.waits
+                )
+                .unwrap();
+                for entry in &segment.entries {
+                    let words: Vec<String> = entry.iter().map(|w| format!("{w:x}")).collect();
+                    writeln!(dump, "  {}", words.join(" ")).unwrap();
+                }
+            }
+        }
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("golden/stream_packets.txt");
+        if std::env::var_os("TT_BLESS").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &dump).unwrap();
+        }
+        let golden = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!(
+                "{} is missing: run streamed_packet_words_are_pinned with TT_BLESS=1",
+                path.display()
+            )
+        });
+        assert!(
+            golden == dump,
+            "the streamed packets' words changed from {}",
+            path.display()
+        );
+    }
+
     #[test]
     fn separate_lists_share_one_with_a_wait_between_them() {
         let segs = control_segments(vec![list(2, 1), list(1, 2)]);
