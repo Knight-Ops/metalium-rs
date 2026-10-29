@@ -74,6 +74,10 @@ fn configs() -> Vec<LlamaConfig> {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step212_device_sampling"
+)]
 fn greedy_tokens_on_the_card_are_the_logits_path_s() {
     with_device(Config::default(), |d| {
         for (i, config) in configs().iter().enumerate() {
@@ -109,6 +113,10 @@ fn chosen<B: Backend>(v: &[f32], sampler: &Sampler, u: f32, d: &B::Device) -> i3
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "a Burn-level sweep (30 min on ttsim; the sorts are gated by step135/step136), silicon tier: cargo xtask silicon --release --filter step212_device_sampling"
+)]
 fn sampled_tokens_are_burn_flex_s() {
     with_device(Config::default(), |d| {
         let sample = |temperature, top_k, top_p| Sampler::Sample {
@@ -210,6 +218,10 @@ fn eager_tokens(
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step212_device_sampling"
+)]
 fn a_traced_sampled_generation_is_the_same_choices_eagerly() {
     with_device(Config::default(), |d| {
         let config = configs()[1];

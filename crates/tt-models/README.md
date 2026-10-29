@@ -16,7 +16,7 @@ cargo xtask fetch-weights --model resnet18
 
 Every file is pinned in `PINS.toml` (`[weights]`) by Hugging Face commit, length and SHA-256, and
 verified before it is left under its final name. `vendor/weights/` is not committed. The tests that
-read it are ignored unless `--features weights` (silicon implies it), so a plain
+read it are ignored unless `--features weights` (the `tt-tests` model ladder runs on silicon only), so a plain
 `cargo test --workspace` passes on a checkout that has not fetched them.
 
 | Rung | Model | Source | Ops it exercises |
@@ -90,8 +90,8 @@ The generation path is written for decoders in general, not for SmolLM2 (a test 
 
 `step187_traced_generation` checks it bit for bit against the eager schedule and against the growing
 cache. It runs on Llama shapes SmolLM2 lacks (multi-head attention, GQA 4:1, head widths 32 and 128,
-untied heads, ragged widths) and on a GPT-2-style decoder, with SmolLM2's checkpoint added under
-`--features weights`.
+untied heads, ragged widths) and on a GPT-2-style decoder, with SmolLM2's checkpoint added once
+`cargo xtask fetch-weights` has run. All of it runs on silicon (`cargo xtask silicon`), not ttsim.
 
 ## The `transformers` reference (`reference/llama_reference.py`)
 

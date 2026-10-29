@@ -408,8 +408,9 @@ impl<N: NocId> DataMover<N> {
     /// default admits none. Host state only: what a list is checked against before it is queued.
     pub fn set_l1_writes(&mut self, writes: L1Writes) -> Result<()> {
         let listed = tt_isa::l1::LISTED;
-        if !writes.window.is_empty()
-            && (writes.window.start < listed.base || writes.window.end > listed.end)
+        if [&writes.window, &writes.reads]
+            .into_iter()
+            .any(|w| !w.is_empty() && (w.start < listed.base || w.end > listed.end))
         {
             return Err(DmError::Invalid(dm::error::RANGE));
         }
@@ -1129,13 +1130,18 @@ pub struct L1Writes {
     pub tiles: Vec<(u8, u8)>,
     /// Inside `tt_isa::l1::DATA`; empty refuses every write.
     pub window: std::ops::Range<u64>,
+    /// Where an [`op::READ_L1`] may also read, beyond `window`: a holder's slots, which its
+    /// readers copy (`crate::tile_op::reuse`), wherever the op's arena placed them. Inside
+    /// `tt_isa::l1::LISTED`; empty admits reads only inside `window`. Reading moves nothing into
+    /// the tile read, so a capture's narrower write window (planned residency) leaves it.
+    pub reads: std::ops::Range<u64>,
 }
 
 impl L1Writes {
     /// Whether [`op::WRITE_L1`] or [`op::WRITE_L1_MCAST`] entry `e` writes inside the window of
     /// the tiles (one of them, or a rectangle all of whose tiles are), [`op::READ_L1`] entry
-    /// `e` reads inside the window of one of them, or [`op::CREDIT`] entry `e` credits a word
-    /// inside the window of one of them or of its [`tt_isa::dm::CREDITS`].
+    /// `e` reads inside the window or the read window of one of them, or [`op::CREDIT`] entry
+    /// `e` credits a word inside the window of one of them or of its [`tt_isa::dm::CREDITS`].
     pub fn admits(&self, e: [u32; 8]) -> bool {
         let (to, len) = if e[0] == op::CREDIT {
             (e[3] as u64, 4)
@@ -1158,7 +1164,9 @@ impl L1Writes {
         // session tile's is admitted whatever the window.
         let credits =
             e[0] == op::CREDIT && to >= tt_isa::dm::CREDITS && to + len <= tt_isa::dm::CREDITS_END;
-        tiles && (credits || (to >= self.window.start && to + len <= self.window.end))
+        let inside = |w: &std::ops::Range<u64>| to >= w.start && to + len <= w.end;
+        let read = e[0] == op::READ_L1 && inside(&self.reads);
+        tiles && (credits || read || inside(&self.window))
     }
 }
 
@@ -1223,6 +1231,55 @@ pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
     };
     each(&entries[1..1 + readers], false)?;
     each(&entries[1 + readers..], true)
+}
+
+#[cfg(test)]
+mod l1_writes {
+    use super::L1Writes;
+    use tt_isa::dm::op;
+
+    /// A read window admits reads only: a holder's slots may be copied from, never written,
+    /// and a read outside both windows, or of a tile not the session's, is refused.
+    #[test]
+    fn the_read_window_admits_reads_and_no_writes() {
+        let w = L1Writes {
+            tiles: vec![(1, 2)],
+            window: 0x9_0000..0xA_0000,
+            reads: 0x2_0000..0x8_0000,
+        };
+        let read = |x, from, len| [op::READ_L1, x, 2, from, 0x3_0000, len, 0, 0];
+        let write = |to, len| [op::WRITE_L1, 1, 2, to, 0x3_0000, len, 0, 0];
+        assert!(
+            w.admits(read(1, 0x2_0000, 0x1000)),
+            "a read in the read window"
+        );
+        assert!(
+            w.admits(read(1, 0x9_0000, 0x1000)),
+            "a read in the write window"
+        );
+        assert!(
+            !w.admits(read(1, 0x7_F000, 0x2000)),
+            "a read past the read window"
+        );
+        assert!(
+            !w.admits(read(1, 0x8_0000, 0x1000)),
+            "a read between the windows"
+        );
+        assert!(
+            !w.admits(read(3, 0x2_0000, 0x1000)),
+            "a read of a tile not ours"
+        );
+        assert!(
+            !w.admits(write(0x2_0000, 0x1000)),
+            "a write in the read window"
+        );
+        assert!(
+            w.admits(write(0x9_0000, 0x1000)),
+            "a write in the write window"
+        );
+        let none = L1Writes { reads: 0..0, ..w };
+        assert!(!none.admits(read(1, 0x2_0000, 0x1000)), "no read window");
+    }
 }
 
 #[cfg(test)]

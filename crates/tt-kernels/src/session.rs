@@ -249,6 +249,18 @@ pub fn probe_row_misroute(on: bool) {
     PROBE_ROW_MISROUTE.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+static PROBE_PAUSE_UNREBASED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A negative control (`docs/plans/dataflow-compiler.md` F4b.2): with it on, a paused capture
+/// ([`Session::paused`]) goes on without moving its barrier targets and generations past what
+/// ran while it was paused, so its replay waits for barriers and generations it does not reach.
+/// Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_pause_unrebased(on: bool) {
+    PROBE_PAUSE_UNREBASED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 static PROBE_STALE_B: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A negative control (`docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`"):
@@ -789,6 +801,8 @@ pub struct Session<T: Transport> {
     block_stream: tensor::BlockStream,
     /// [`Session::set_operand_reuse`].
     reuse: tensor::Reuse,
+    /// [`Session::probe_block_scores`].
+    block_scores: Option<BlockScores>,
     /// [`Session::set_stream_prefetch_units`].
     stream_prefetch_units: usize,
     /// [`Session::set_stream_handoff`]: the chunk a handed column is handed at (`Some(0)`: half).
@@ -2270,6 +2284,24 @@ enum Item {
 /// record, a launch, a wait and a scatter record.
 const GROUP_MAX: usize = 40;
 
+/// [`Session::probe_block_scores`]: a candidate's block, reuse and measured time, us, to the
+/// score compared.
+pub type BlockScores = fn([usize; 3], tensor::Reuse, f64) -> f64;
+
+/// Candidates [`tensor::BlockStream::Measured`] times for a product's question, at most: the
+/// first ([`tensor::block_stream_candidates`]) and the climb's ([`tensor::block_stream_neighbours`]).
+pub const MEASURE_MOST: usize = 40;
+/// About how long a measured candidate's trace runs, us: copies of a small product enough for it.
+pub const MEASURE_SPAN_US: f64 = 2000.0;
+/// Copies of a product a measured candidate's trace holds, at most.
+pub const MEASURE_COPIES_MOST: usize = 16;
+/// What a climb's step must gain, a share of the time, to be taken.
+pub const MEASURE_GAIN: f64 = 0.01;
+/// Replays that warm a measured candidate's trace before it is timed ([`Session::time_product`]).
+pub const MEASURE_WARMUPS: usize = 2;
+/// Replays of a measured candidate's trace whose median is its time.
+pub const MEASURE_RUNS: usize = 5;
+
 /// Compatible gather/compute/scatter batches, including single-buffered ones.
 /// For an op whose units hand each other data by credits (`tile_op::reuse`: a credit wait on
 /// one of the op-level credit words), each unit's jobs cut into groups of the same chunks, in
@@ -2685,9 +2717,11 @@ impl<T: Transport> Session<T> {
             prefetch_second_job: std::env::var("TT_PREFETCH_SECOND").is_ok_and(|v| v == "1"),
             balanced_deal: std::env::var("TT_BALANCED_DEAL").is_ok_and(|v| v == "1"),
             softmax_mode: crate::softmax::Mode::default(),
-            // `TT_MATMUL_BLOCK=off|auto|mb,kq,nb` (`docs/plans/prefill-operand-reuse.md`).
+            // `TT_MATMUL_BLOCK=off|auto|measured|mb,kq,nb`, `measured` when unset
+            // (`docs/plans/prefill-operand-reuse.md`, `docs/plans/dataflow-compiler.md` F4b.2).
             block_stream: tensor::BlockStream::from_env(),
             reuse: tensor::Reuse::Off,
+            block_scores: None,
             // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             stream_prefetch_units: units_from_env("TT_STREAM_PREFETCH_UNITS", PREFETCH_UNITS),
             // `TT_STREAM_HANDOFF=1` turns it on; `TT_STREAM_HANDOFF_AT=<h>` hands at chunk `h`
@@ -4035,6 +4069,7 @@ impl<T: Transport> Session<T> {
             self.set_l1_writes(crate::dm::L1Writes {
                 tiles: all.clone(),
                 window: region..data.end,
+                reads: self.l1_writes.reads.clone(),
             })?;
         }
         let reading: Vec<usize> = readers.clone().collect();
@@ -4808,7 +4843,8 @@ impl<T: Transport> Session<T> {
         // An op whose units hand each other data by credits (`tile_op::reuse`) is cut into
         // segments at the same chunks on every unit, a hole one placeholder a segment
         // ([`linked_groups`]).
-        let linked = linked_groups(&jobs, spread)?;
+        let mut linked = linked_groups(&jobs, spread)?;
+        let lens: Vec<usize> = jobs.iter().map(Vec::len).collect();
         let mut queues: Vec<Vec<Step>> = vec![Vec::new(); spread];
         for (j, job) in jobs.into_iter().enumerate() {
             queues[j % spread].extend(job);
@@ -4825,6 +4861,21 @@ impl<T: Transport> Session<T> {
                 .is_some_and(|c| c.planned && c.plan_mismatch.is_some())
             {
                 return Ok(());
+            }
+            // A linked op's groups are cut again from what the plan rewrote, step for step (its
+            // lists may have grown); cut from the jobs as queued, they dropped the rewrite.
+            if linked.is_some() && self.capture.as_ref().is_some_and(|c| c.applied.is_some()) {
+                let mut taken = vec![0; spread];
+                let rewritten: Vec<tensor::Job> = lens
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &len)| {
+                        let (u, at) = (j % spread, taken[j % spread]);
+                        taken[u] += len;
+                        queues[u][at..at + len].to_vec()
+                    })
+                    .collect();
+                linked = linked_groups(&rewritten, spread)?;
             }
         }
         // The units that arrive at this op's barrier: the ones it runs on, in a capture
@@ -5924,7 +5975,12 @@ impl<T: Transport> Session<T> {
             }
         };
         if capture.planned {
-            self.set_l1_writes(crate::dm::L1Writes::default())?;
+            // Its write window ends with it; what the session's movers may read (operand reuse)
+            // does not.
+            self.set_l1_writes(crate::dm::L1Writes {
+                window: 0..0,
+                ..self.l1_writes.clone()
+            })?;
         }
         let planned_base = capture
             .planned
@@ -8281,6 +8337,25 @@ impl<T: Transport> Session<T> {
         let allow_mop = false;
         let pipeline = self.pipeline;
         let max_k_tiles = self.matmul_k_block_limit;
+        // A measured choice is a trace's: what is timed is a product inside a trace, which pays
+        // its planning once. An eager product pays it every call, which nothing timed counts
+        // (eager training ran 1.5-2.9x slower on measured blocks, F4b.2), so it runs `Auto`'s.
+        let measuring =
+            self.block_stream == tensor::BlockStream::Measured && self.capture.is_some();
+        if measuring && max_k_tiles.is_none() {
+            let k = if a_transposed { a.rows } else { a.cols };
+            let n = if b_transposed { b.rows } else { b.cols };
+            let m = if a_transposed { a.cols } else { a.rows };
+            self.measure_product(
+                (a, a_transposed),
+                (b, b_transposed),
+                route,
+                fidelity,
+                budget,
+                [m, k, n],
+                units,
+            );
+        }
         let m = if a_transposed { a.cols } else { a.rows };
         // A packed `A` is read as whole tiles of its format.
         let thin = self.thin_matmul_reads
@@ -8431,7 +8506,10 @@ impl<T: Transport> Session<T> {
         });
         let second_job = self.prefetch_second_job;
         let balanced_deal = self.balanced_deal;
-        let block_stream = self.block_stream;
+        let block_stream = match self.block_stream {
+            tensor::BlockStream::Measured if !measuring => tensor::BlockStream::Auto,
+            mode => mode,
+        };
         let (reuse, tiles) = (self.reuse, self.reuse_tiles(units));
         // A one-row output over a long `n` also writes its row packed, as an element-wise op's
         // does ([`Session::set_packed_twins`]): the norm after a residual sum reads it.
@@ -9186,39 +9264,345 @@ impl<T: Transport> Session<T> {
     /// Whether a product of several tile rows runs as 2-D blocks of output tiles, each job
     /// streaming `K` and reading its `A` and `B` strips once ([`tensor::BlockStream`];
     /// `docs/plans/prefill-operand-reuse.md`). Bit for bit the other paths. `TT_MATMUL_BLOCK` at
-    /// open; [`tensor::BlockStream::Auto`] by default.
+    /// open; [`tensor::BlockStream::Measured`] by default.
     pub fn set_block_stream(&mut self, mode: tensor::BlockStream) {
         self.block_stream = mode;
+    }
+
+    /// A gate's scores in place of the times [`tensor::BlockStream::Measured`] measures: each
+    /// candidate still runs (a capture is still paused for it), and `scores` maps its block,
+    /// reuse and measured time to what is compared, least first. With `Some`, candidates are
+    /// measured on ttsim too, whose times say nothing. `None`: the times.
+    pub fn probe_block_scores(&mut self, scores: Option<BlockScores>) {
+        self.block_scores = scores;
+    }
+
+    /// The question `op(A) @ op(B)` asks of the block planner here ([`tensor::BlockQuestion`]): its
+    /// route from the operands' formats, its units this session's spread for it. `None` where it
+    /// cannot run as 2-D blocks. A sweep's (`silicon_probe_block_sweep`).
+    pub fn block_question_of(
+        &mut self,
+        (a, a_transposed): (&DramTensor, bool),
+        (b, b_transposed): (&DramTensor, bool),
+        fidelity: Fidelity,
+    ) -> Result<Option<tensor::BlockQuestion>, TensorError> {
+        let Some(route) = SrcRoute::edges(a.format(), b.format()) else {
+            return Ok(None);
+        };
+        let fidelity = match fidelity {
+            Fidelity::HiFi4 if self.derived_fidelity => route.full_precision(),
+            other => other,
+        };
+        let (m, k) = if a_transposed {
+            (a.cols, a.rows)
+        } else {
+            (a.rows, a.cols)
+        };
+        let n = if b_transposed { b.rows } else { b.cols };
+        let units = self.spread_for_product(m.div_ceil(32) * n.div_ceil(32) * k.div_ceil(32));
+        tensor::product_question(
+            [m, k, n],
+            [a_transposed, b_transposed],
+            route,
+            fidelity,
+            units,
+            self.pipeline,
+        )
+    }
+
+    /// What `op(A) @ op(B)` run as `block` with `reuse` costs inside a trace, us: traces of
+    /// `copies` and of twice as many products back to back, each replayed
+    /// ([`MEASURE_WARMUPS`] replays to warm, the median of [`MEASURE_RUNS`], each synced), the
+    /// difference a product. What a replay costs whatever it holds (starting every unit's stream,
+    /// most of a small product's time alone) cancels: a product timed alone favours blocks that
+    /// leave units out, which a model's trace does not pay for (ViT-Tiny's products timed alone
+    /// chose blocks 2-5x "faster" that ran the model 11% slower, F4b.2). In the arena the product
+    /// would plan in now; outside a capture; the session's own block mode and reuse are kept.
+    #[allow(clippy::too_many_arguments)]
+    pub fn time_product(
+        &mut self,
+        a: (&DramTensor, bool),
+        b: (&DramTensor, bool),
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        block: tensor::BlockStream,
+        reuse: tensor::Reuse,
+        copies: usize,
+    ) -> Result<f64, TensorError> {
+        let kept = (self.block_stream, self.reuse);
+        self.block_stream = block;
+        let copies = copies.max(1);
+        let r = self.set_operand_reuse(reuse).and_then(|()| {
+            let once = self.replay_time(a, b, route, fidelity, budget, copies)?;
+            let twice = self.replay_time(a, b, route, fidelity, budget, 2 * copies)?;
+            Ok(((twice - once) / copies as f64).max(f64::MIN_POSITIVE))
+        });
+        self.block_stream = kept.0;
+        self.set_operand_reuse(kept.1)?;
+        r
+    }
+
+    /// The median replay of a trace of `copies` products `op(A) @ op(B)` back to back, us
+    /// ([`Session::time_product`]).
+    fn replay_time(
+        &mut self,
+        (a, a_transposed): (&DramTensor, bool),
+        (b, b_transposed): (&DramTensor, bool),
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        copies: usize,
+    ) -> Result<f64, TensorError> {
+        let arena_end = crate::l1::arena().end;
+        // Stored whole: as layer sub-traces its copies, which repeat, would be one body called
+        // `copies` times, which no model's product is (`Session::set_sub_traces`).
+        let sub_traces = std::mem::replace(&mut self.sub_traces, false);
+        let begun = self.begin_trace();
+        if begun.is_err() {
+            self.sub_traces = sub_traces;
+        }
+        begun?;
+        // Its own capture plans in the whole arena; the products, where they would.
+        crate::l1::set_arena_end(arena_end);
+        let mut outs = Vec::with_capacity(copies);
+        let mut made = Ok(());
+        for _ in 0..copies {
+            match self.matmul_dram(a, a_transposed, b, b_transposed, route, fidelity, budget) {
+                Ok(out) => outs.push(out),
+                Err(e) => {
+                    made = Err(e);
+                    break;
+                }
+            }
+        }
+        let id = self.end_trace();
+        self.sub_traces = sub_traces;
+        let id = match (made, id) {
+            (Ok(()), Ok(id)) => id,
+            (_, id) => {
+                if let Ok(id) = id {
+                    let _ = self.release_trace(id);
+                }
+                for out in outs {
+                    let _ = self.free(out);
+                }
+                return Err(TensorError::Shape(
+                    "a measured candidate did not capture".into(),
+                ));
+            }
+        };
+        let mut times = Vec::with_capacity(MEASURE_RUNS);
+        let ran = (0..MEASURE_WARMUPS + MEASURE_RUNS).try_for_each(|i| {
+            let start = std::time::Instant::now();
+            self.replay(id)?;
+            self.sync()?;
+            if i >= MEASURE_WARMUPS {
+                times.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+            Ok::<(), TensorError>(())
+        });
+        for out in outs {
+            let _ = self.free(out);
+        }
+        let released = self.release_trace(id);
+        ran.and(released)?;
+        times.sort_by(f64::total_cmp);
+        Ok(times[times.len() / 2])
+    }
+
+    /// Under [`tensor::BlockStream::Measured`], time the candidates of `op(A) @ op(B)`'s question
+    /// on `units` units the first time it is planned ([`tensor::block_stream_candidates`], `A`
+    /// pulled from [`tile_op::reuse::AUTO_HOLDERS`] under [`tensor::Reuse::Auto`]), climb from
+    /// the fastest one step at a time while a step gains [`MEASURE_GAIN`]
+    /// ([`tensor::block_stream_neighbours`]), at most [`MEASURE_MOST`] timed, and keep the fastest
+    /// for the process ([`tensor::measured_choice`]). Only in a capture, which is paused for it
+    /// ([`Session::paused`]), and not in one applying a plan: its plan pass measured what it
+    /// plans. An eager product runs `Auto`'s block ([`tensor::BlockStream::Measured`]). Not on ttsim, whose times say nothing (but see
+    /// [`Session::probe_block_scores`]). A measurement that fails keeps `Auto`'s block.
+    #[allow(clippy::too_many_arguments)]
+    fn measure_product(
+        &mut self,
+        a: (&DramTensor, bool),
+        b: (&DramTensor, bool),
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        mkn: [usize; 3],
+        units: usize,
+    ) {
+        let transposed = [a.1, b.1];
+        let Ok(Some(q)) =
+            tensor::product_question(mkn, transposed, route, fidelity, units, self.pipeline)
+        else {
+            return;
+        };
+        if tensor::measured_choice(&q).is_some()
+            || !self.batching
+            || (self.block_scores.is_none() && self.is_simulated())
+            || self.capture.as_ref().is_some_and(|c| c.planned)
+        {
+            return;
+        }
+        let pull = match self.reuse {
+            tensor::Reuse::Off => None,
+            tensor::Reuse::Auto => Some(tensor::Reuse::Pull {
+                holders: crate::tile_op::reuse::AUTO_HOLDERS,
+                b_holders: None,
+            }),
+            r => Some(r),
+        };
+        let candidates = tensor::block_stream_candidates(&q, pull);
+        let Some(&first) = candidates.first() else {
+            tensor::note_measured(q, None, None);
+            return;
+        };
+        let scores = self.block_scores;
+        let timed = self.paused(|s| {
+            // Copies enough that a candidate's trace runs ~[`MEASURE_SPAN_US`]: a small product's
+            // differences are otherwise inside a replay's noise.
+            let kept = (s.block_stream, s.reuse);
+            s.block_stream = tensor::BlockStream::Fixed(first.block);
+            let single = s
+                .set_operand_reuse(first.reuse)
+                .and_then(|()| s.replay_time(a, b, route, fidelity, budget, 1));
+            s.block_stream = kept.0;
+            s.set_operand_reuse(kept.1)?;
+            let copies = single.map_or(1, |us| {
+                ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
+            });
+            // Each candidate, its score and its time, us.
+            type Timed = Vec<(tensor::BlockChoice, f64, f64)>;
+            let mut timed: Timed = Vec::new();
+            let time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
+                if timed.len() >= MEASURE_MOST || timed.iter().any(|(t, ..)| *t == c) {
+                    return Ok(());
+                }
+                let fixed = tensor::BlockStream::Fixed(c.block);
+                let us = s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
+                timed.push((c, scores.map_or(us, |f| f(c.block, c.reuse, us)), us));
+                Ok::<(), TensorError>(())
+            };
+            let best = |timed: &[(tensor::BlockChoice, f64, f64)]| {
+                timed
+                    .iter()
+                    .copied()
+                    .min_by(|x, y| x.1.total_cmp(&y.1))
+                    .expect("one timed")
+            };
+            for &c in &candidates {
+                time(s, &mut timed, c)?;
+            }
+            // Climb: from the fastest so far, one step at a time, while a step gains.
+            let mut at = best(&timed);
+            loop {
+                for n in tensor::block_stream_neighbours(&q, at.0, pull) {
+                    time(s, &mut timed, n)?;
+                }
+                let next = best(&timed);
+                if next.1 >= at.1 * (1.0 - MEASURE_GAIN) {
+                    break;
+                }
+                at = next;
+            }
+            let chosen = best(&timed);
+            Ok::<_, TensorError>((chosen.0, [timed[0].2, chosen.2]))
+        });
+        let (choice, times) = match timed {
+            Ok(Ok((c, t))) => (c, Some(t)),
+            _ => (first, None),
+        };
+        tensor::note_measured(q, Some(choice), times);
+    }
+
+    /// Run `f` with the capture in progress, if any, paused: what `f` runs is not captured, and
+    /// the capture goes on after it as if `f` had not run. It keeps the capture's tensors
+    /// ([`DramAlloc::suspend`]), what it planned in L1 ([`crate::l1::unnoted`]), the arena it
+    /// plans in and its movers' arena; and moves the capture's relative barrier targets and
+    /// generations past what `f` ran ([`trace::Capture::barriers_base`],
+    /// [`trace::UnitCapture::generation_base`]). What `f` left on the tiles is forgotten, so the
+    /// capture's own run sets again every descriptor and tile state its next op needs; its stream
+    /// is as without `f`, which a replay never runs (what the stream set, it still has). Not in a
+    /// capture applying a plan, whose L1 holds tensors between ops.
+    fn paused<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Result<R, TensorError> {
+        let Some(mut c) = self.capture.take() else {
+            return Ok(f(self));
+        };
+        if c.planned {
+            self.capture = Some(c);
+            return Err(TraceError::Capturing.into());
+        }
+        let suspended = self.dram.as_mut().map(|d| d.alloc.suspend());
+        let arena_end = crate::l1::arena().end;
+        let ring_end = crate::l1::set_ring_end(None);
+        let mover_arena = self.mover_arena;
+        let barriers = self.barriers;
+        let generations: Vec<Option<u32>> = self
+            .units
+            .iter()
+            .map(|u| u.resident.as_ref().map(|r| r.generation()))
+            .collect();
+        let restored = self.set_mover_arena(tt_isa::l1::DATA);
+        let out = restored.map(|()| crate::l1::unnoted(|| f(self)));
+        if let (Some(d), Some(s)) = (self.dram.as_mut(), suspended) {
+            d.alloc.resume(s);
+        }
+        crate::l1::set_arena_end(arena_end);
+        crate::l1::set_ring_end(ring_end);
+        let restored = self.set_mover_arena(mover_arena);
+        let rebase = !PROBE_PAUSE_UNREBASED.load(std::sync::atomic::Ordering::Relaxed);
+        if rebase {
+            c.barriers_base = c
+                .barriers_base
+                .wrapping_add(self.barriers.wrapping_sub(barriers));
+        }
+        for ((unit, uc), before) in self.units.iter_mut().zip(&mut c.units).zip(generations) {
+            if let (Some(r), Some(before), true) = (unit.resident.as_mut(), before, rebase) {
+                uc.generation_base = uc
+                    .generation_base
+                    .wrapping_add(r.generation().wrapping_sub(before));
+            }
+            if let Some(r) = unit.resident.as_mut() {
+                r.forget_tile_state();
+                let _ = r.take_setup_run();
+            }
+        }
+        self.capture = Some(c);
+        restored?;
+        out
     }
 
     /// Whether the units of a product of 2-D blocks that read the same strip of `A` share its
     /// reads ([`tensor::Reuse`], `tile_op::reuse`): a few holders read it from GDDR and the
     /// others copy it from their L1. Bit for bit the unshared product. The copies read the
-    /// session's own tiles' `DATA`, so turning it on lets every mover's `op::READ_L1` name it
-    /// ([`crate::dm::L1Writes`]); a capture that keeps a window of its own (planned residency)
-    /// runs its products unshared. `TT_OPERAND_REUSE` at open; off by default.
+    /// session's own tiles' arena (`DATA`, or a capture's `TRACE_ARENA`), so turning it on lets
+    /// every mover's `op::READ_L1` read there ([`crate::dm::L1Writes::reads`]) and lets none
+    /// write there; a planned capture's write window leaves it. `TT_OPERAND_REUSE` at open;
+    /// [`tensor::Reuse::Auto`] by default.
     pub fn set_operand_reuse(&mut self, reuse: tensor::Reuse) -> Result<(), TensorError> {
-        if reuse != tensor::Reuse::Off {
-            let tiles = self
-                .units
-                .iter()
-                .map(|u| (u.tile.x(), u.tile.y()))
-                .collect();
-            self.set_l1_writes(crate::dm::L1Writes {
-                tiles,
-                window: tt_isa::l1::DATA.base..tt_isa::l1::DATA.end,
-            })?;
-        }
+        let listed = tt_isa::l1::LISTED;
+        let tiles = self
+            .units
+            .iter()
+            .map(|u| (u.tile.x(), u.tile.y()))
+            .collect();
+        self.set_l1_writes(crate::dm::L1Writes {
+            tiles,
+            reads: match reuse {
+                tensor::Reuse::Off => 0..0,
+                _ => listed.base..listed.end,
+            },
+            ..self.l1_writes.clone()
+        })?;
         self.reuse = reuse;
         Ok(())
     }
 
     /// The tiles of a product's first `units` units, where it shares its reads
-    /// ([`Session::set_operand_reuse`]) and the movers may copy any of their `DATA`; empty
+    /// ([`Session::set_operand_reuse`]) and the movers may copy from each other's arena; empty
     /// otherwise.
     fn reuse_tiles(&self, units: usize) -> Vec<(u8, u8)> {
-        let data = tt_isa::l1::DATA.base..tt_isa::l1::DATA.end;
-        if self.reuse == tensor::Reuse::Off || self.l1_writes.window != data {
+        if self.reuse == tensor::Reuse::Off || self.l1_writes.reads.is_empty() {
             return Vec::new();
         }
         self.units[..units.min(self.units.len())]
@@ -9530,6 +9914,7 @@ impl<T: Transport> Session<T> {
                 .map(|u| (u.tile.x(), u.tile.y()))
                 .collect(),
             window: base..self.region_top(),
+            reads: self.l1_writes.reads.clone(),
         };
         self.set_l1_writes(writes)?;
         let c = self.capture.as_mut().expect("begun above");

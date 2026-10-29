@@ -213,6 +213,10 @@ fn traced_training_step_updates_weights_in_place_and_reduces_loss() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step40_burn_trace"
+)]
 fn transformer_traced_training_runs_and_loss_decreases() {
     with_device(Config::default(), |device| {
         let weights = tt_mnist::transformer::init(59);

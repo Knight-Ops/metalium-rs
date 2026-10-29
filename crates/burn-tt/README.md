@@ -299,7 +299,7 @@ unparsable value as `0`.
 | `TT_TTSIM_LIB` | `vendor/libttsim_bh.so` | The simulator library ttsim-backed tests load. |
 | `TT_TTSIM_LIB_X2`, `TT_TTSIM_LIB_X4` | `vendor/libttsim_bh_x2.so`, `_x4.so` | The two- and four-chip builds the multi-chip gates load. Pointing one at the single-chip build checks those gates are not vacuous. |
 | `TT_SILICON_DEVICE` | `0` | Which `/dev/tenstorrent/N` the silicon tests use (`cargo xtask silicon --device` sets it). |
-| `TT_BLESS` | unset | `1`: `step12_mnist`'s ttsim run rewrites the loss golden the silicon run must reproduce. |
+| `TT_BLESS` | unset | `1`: `step12_mnist`'s single-tile silicon run rewrites the loss golden every other configuration must reproduce. |
 | `TT_ISA_DOCS` | `vendor/tt-isa-documentation` | A local checkout of the ISA documentation for the `xtask` generators; still checked against the pinned digest. |
 | `STEP26_CASE` | unset | Runs only the named case of `step26_sfpu_isa`. |
 | `STRESS_SECS`, `STRESS_TILES` | 60 s on silicon; `1,8` | The soak tests' length and tile counts. NC ownership is always enabled. |

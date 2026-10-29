@@ -235,6 +235,10 @@ fn footprint_of_passes<T: tt_device::Transport>(
 /// The same pass captured once, twice and four times in one trace: the stream grows with the
 /// ops, the pinned programs do not.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step174_trace_footprint"
+)]
 fn a_repeated_pass_grows_the_stream_and_pins_no_new_programs() {
     for tiles in [1, 2] {
         with_tiles(tiles, |s| {
@@ -262,6 +266,10 @@ fn a_repeated_pass_grows_the_stream_and_pins_no_new_programs() {
 /// The control for the test above: a pass of another shape does pin more programs, so equal
 /// counts there mean shared programs, not a count that cannot move.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step174_trace_footprint"
+)]
 fn a_pass_of_another_shape_pins_more_programs() {
     with_tiles(1, |s| {
         let same = footprint_of_passes(s, 2, 1, &[MNIST]);
@@ -278,6 +286,10 @@ fn a_pass_of_another_shape_pins_more_programs() {
 
 /// A stream long enough to cross chunks pays padding; the small passes above do not.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step174_trace_footprint"
+)]
 fn a_long_section_pays_chunk_padding_in_entries_and_bytes() {
     with_tiles(1, |s| {
         let chunk = tt_isa::dm::TRACE_CHUNK_ENTRIES;

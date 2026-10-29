@@ -52,8 +52,8 @@ fn top(v: &[f32], k: usize) -> Vec<usize> {
 
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step166_vit_tiny"
 )]
 fn vit_tiny_on_the_device_classifies_like_flex() {
     let image = "cats.jpg";

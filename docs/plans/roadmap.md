@@ -802,9 +802,22 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
   - Found: a packed `B` is bound by the block, not reads: at H1 `[6,4,12]` gives BFP8/4/2 34.5-43.0 TFLOPS against
     26.3-26.5, 44.5-45.8 with `A` pulled. The model re-weighed by slot was tried as the default and reverted (it
     regresses other shapes by up to 14-22%).
-  - Next: the winner as F3's reuse pass with a policy for when to pull, and a block chosen by measurement (the model's
-    best candidates timed on the card once a shape, cached), which takes the packed-`B` gains.
-  - Found: `[2048,8192]@[8192,2048]` is 1.7x slower through Burn (10.9-11.0 TFLOPS) than through the session (18.5).
+  - F4b.2 (2026-10-29, cards 0 and 1): **the block and the pull measured on the card, the default** (H9,
+    `TT_MATMUL_BLOCK=measured`, `TT_OPERAND_REUSE=auto` when unset). A capture's first plan of a product question is
+    paused to time `Auto`'s block, 12 listed blocks and a climb, `A` pulled and not. The candidates come from sweeps, not a model, since every
+    model ranked the winners in the hundreds. Results:
+    - 1.02-2.25x `Auto` per product over 50 cases, bit for bit; H1 FP32 / BF16 / BFP4 35.5 / 49.5 / 65.4 TFLOPS.
+    - Through Burn with nothing set, H1 19.2 -> **29.0 TFLOPS** (H1's restated 25.8 met), 1.7B prefill 1.04-1.34x.
+    - Decode, ResNet-18, ViT-Tiny and eager training unchanged. Eager products run `Auto`'s block.
+    - Costs build time: 6.7 s a question on average, the 1.7B's traced build 154 -> 233 s
+    ([log](../learnings/performance-log.md#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1)).
+  - Left: the pull in the batched block-stream path (attention prefill; the items' units numbered globally, credits
+    returned per item); an eager product after its own shape's pulled capture runs 3-10% slower on the host, cause
+    not found.
+  - Closing checks on the final tree: `--smoke` on card 0 passes 1,264 of 1,264 (`1793306388`, `step12_mnist` among
+    them, its golden's losses unchanged); the job goldens unchanged.
+  - Found: `[2048,8192]@[8192,2048]` is 1.7x slower through Burn (10.9-11.0 TFLOPS) than through the session (18.5);
+    14.0-14.2 through Burn with the measured block.
 - [ ] **F4a:** channels instead of barriers in decode (H4).
 - [ ] **F5:** `Dst` subblocks and half-sync (H2).
 - [ ] **F6:** fusion through channels and spatial pipelining (H5).

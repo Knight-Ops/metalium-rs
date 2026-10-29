@@ -37,6 +37,7 @@ flowchart TD
         L7["kernel-fusion-architecture.md (Two-Stage Fusion & Dst/L1)"]
         L8["tt-metal-comparison.md (+ method): where we stand against tt-metal, fixes to investigate"]
         L9["dataflow-compiler.md (Design Principles below Burn, ADRs 0003-0005)"]
+        L10["test-tiers.md (ttsim vs burn-flex vs silicon; where suite time goes)"]
     end
 
     subgraph Done["docs/completed-plans/ (archive)"]

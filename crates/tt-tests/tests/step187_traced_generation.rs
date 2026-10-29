@@ -110,6 +110,10 @@ fn check_llama(model: &Llama<TtBackend>, what: &str, lengths: &[usize], d: &TtDe
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn synthetic_llamas_generate_as_eagerly() {
     with_device(Config::default(), |d| {
         for (what, config) in synthetic_configs() {
@@ -120,6 +124,10 @@ fn synthetic_llamas_generate_as_eagerly() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn one_driver_serves_many_prompts() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[1];
@@ -136,6 +144,10 @@ fn one_driver_serves_many_prompts() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn chunks_over_an_unshared_cache_diverge() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[0];
@@ -160,6 +172,10 @@ fn chunks_over_an_unshared_cache_diverge() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn requests_that_do_not_fit_are_refused_by_name() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[0];
@@ -355,6 +371,10 @@ impl<B: Backend> FixedShapeDecoder<B> for Gpt<B> {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn a_decoder_that_is_not_a_llama_generates_as_eagerly() {
     with_device(Config::default(), |d| {
         let model = Gpt::<TtBackend>::new(2, &d);
@@ -379,6 +399,10 @@ fn long_shapes() -> Shapes {
 /// to the growing cache (a Llama) and to the same schedule attending to the whole cache at every
 /// step (any decoder), so a step that attends to fewer positions changes no bit.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn decode_steps_attend_only_to_the_positions_in_use() {
     with_device(Config::default(), |d| {
         let whole = Shapes::new(LONG, &BUCKETS).with_steps(&[]);
@@ -411,6 +435,10 @@ fn decode_steps_attend_only_to_the_positions_in_use() {
 /// Negative control: the 32-position step replayed at a position past 32 does not see the token
 /// it is given (nor the ones before it past 32), so its logits differ from the step that does.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn a_step_attending_to_too_few_positions_diverges() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[1];
@@ -446,6 +474,10 @@ fn prefix_shapes() -> Shapes {
 /// schedule with every chunk attending to the whole cache (any decoder), so a chunk that attends
 /// to fewer positions changes no bit.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn chunks_attend_only_to_the_positions_in_use() {
     with_device(Config::default(), |d| {
         let shapes = prefix_shapes();
@@ -489,6 +521,10 @@ fn chunks_attend_only_to_the_positions_in_use() {
 /// nor anything before it but the first chunk's rows, so its logits differ from the chunk that
 /// attends to 16, which equal the growing cache's.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
 fn a_chunk_attending_to_too_few_positions_diverges() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[1];
@@ -531,19 +567,11 @@ fn a_chunk_attending_to_too_few_positions_diverges() {
 /// SmolLM2's checkpoint: on silicon all thirty layers over every tile, every prompt length (about
 /// 20 s, part of `--smoke`).
 ///
-/// On the simulator it is opt-in: one layer, and only a padded chunk (3) and two chunks with a
-/// remainder (9). The synthetic shapes above already cover every way a prompt is fed, and each
-/// step's 49,152-token output projection makes this the slowest test here (about 13 minutes at
-/// all seven lengths). Run it with
-/// `cargo test -p tt-tests --features weights --test step187_traced_generation -- --ignored`.
+/// A model workload: it does not run on the simulator (`docs/learnings/test-tiers.md`).
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
-)]
-#[cfg_attr(
-    all(feature = "weights", not(feature = "silicon")),
-    ignore = "slow on the simulator (minutes): run explicitly with -- --ignored"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step187_traced_generation"
 )]
 fn smollm2_generates_as_eagerly() {
     let (layers, lengths, config) = if cfg!(feature = "silicon") {

@@ -39,7 +39,11 @@ burn-tt = { path = "crates/burn-tt" }
 # op traits of exactly this burn-backend, so a caret range would let the
 # generated operation implementations drift from their trait source.
 burn-backend = { version = "=0.21.0", default-features = false, features = ["std"] }
-burn-flex = { version = "=0.21.0", default-features = false, features = ["std"] }
+# `rayon`: the CPU oracle runs on every core (gemm and the per-output splits keep each element's
+# accumulation order, so its bits do not depend on the thread count). Forked gate children get a
+# pool of their own (`tt_ttsim::fork_scope`). `simd` is off: it would make Flex's reduction bits
+# depend on the host CPU.
+burn-flex = { version = "=0.21.0", default-features = false, features = ["std", "rayon"] }
 burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"] }
 # The training half, for the Phase 7 gates only (tt-tests): `burn` re-exports
 # burn-nn, burn-optim and autodiff, and `#[derive(Module)]` expands to `burn::`

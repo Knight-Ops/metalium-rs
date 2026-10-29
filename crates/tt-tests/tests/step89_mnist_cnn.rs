@@ -143,8 +143,8 @@ fn cnn_training(dtype: DType) {
 
 #[test]
 #[cfg_attr(
-    not(feature = "e2e"),
-    ignore = "MNIST CNN training: use --features tt-tests/e2e"
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step89_mnist_cnn"
 )]
 fn convolutional_mnist_learns_with_resident_gradients() {
     cnn_training(DType::F32);
@@ -240,6 +240,10 @@ fn cnn_trace(dtype: DType) {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step89_mnist_cnn"
+)]
 fn convolutional_mnist_trace_matches_fresh_changed_batches() {
     cnn_trace(DType::F32);
 }

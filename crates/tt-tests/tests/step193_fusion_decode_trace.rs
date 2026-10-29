@@ -187,6 +187,10 @@ fn traced_run<B: TracedBackend>(model: &Llama<B>, what: &str, d: &TtDevice) -> R
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step193_fusion_decode_trace"
+)]
 fn a_decoder_on_tt_captures_and_replays_as_eagerly() {
     with_device(Config::default(), |d| {
         for (what, config) in configs() {
@@ -213,6 +217,10 @@ fn a_decoder_on_tt_captures_and_replays_as_eagerly() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step193_fusion_decode_trace"
+)]
 fn tt_and_tt_backend_compared() {
     with_device(Config::default(), |d| {
         // A residual sum and its norm through the merged call (opt-in), compared bit for bit.
@@ -266,6 +274,10 @@ fn tt_and_tt_backend_compared() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step193_fusion_decode_trace"
+)]
 fn a_nudged_weight_on_tt_diverges() {
     with_device(Config::default(), |d| {
         let (what, config) = configs()[0];
@@ -292,8 +304,8 @@ fn a_nudged_weight_on_tt_diverges() {
 /// synthetic models.
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step193_fusion_decode_trace"
 )]
 fn smollm2_on_tt_captures_and_replays_as_eagerly() {
     use tt_models::llama::Precision;

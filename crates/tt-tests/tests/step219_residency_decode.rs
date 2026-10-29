@@ -946,6 +946,10 @@ fn planned_moves_less(plain: &[(String, u64)], planned: &[(String, u64)]) {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step219_residency_decode"
+)]
 fn a_traced_decoder_keeps_its_planned_traces_bit_for_bit() {
     use burn_tt::{Tt, TtDevice};
     use tt_models::generate::{Shapes, TracedGenerator};
@@ -1059,6 +1063,10 @@ fn between(g: &tt_kernels::residency::Graph, writer: &str, reader: &str) -> Vec<
 /// written. The KV cache is the trace's state and stays in GDDR. Bit for bit against the
 /// unplanned traces, moving fewer GDDR bytes.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step219_residency_decode"
+)]
 fn a_decoder_s_attention_operands_stay_in_l1_bit_for_bit() {
     use burn_tt::{Tt, TtDevice};
     use tt_kernels::residency::{Place, Reason};

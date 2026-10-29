@@ -206,6 +206,10 @@ fn replays_against_fresh<T: tt_device::Transport>(
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step223_sub_traces"
+)]
 fn a_chain_of_distinct_layers_replays_as_the_ops_run_fresh() {
     with_tiles(TILES, |s| {
         assert_eq!(replays_against_fresh(s, true), 0);
@@ -213,6 +217,10 @@ fn a_chain_of_distinct_layers_replays_as_the_ops_run_fresh() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step223_sub_traces"
+)]
 fn a_call_given_another_layer_s_table_diverges() {
     with_tiles(TILES, |s| {
         probe_sub_trace_tables(ProbeTables::Rotate);

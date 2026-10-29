@@ -177,13 +177,10 @@ fn weights_that_are_not_bf16_values_do_not_agree() {
 /// SmolLM2-135M's own checkpoint is BF16, widened at load: stored BF16 it is the F32 model.
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step234_bf16_weight_storage"
 )]
-#[cfg_attr(
-    all(feature = "weights", not(feature = "silicon")),
-    ignore = "storing narrows through the BF16 packer mode, which ttsim refuses"
-)]
+// Not on ttsim: storing narrows through the BF16 packer mode, which ttsim refuses.
 fn smollm2_with_bf16_weights_generates_bit_for_bit() {
     let config = Config {
         tiles: Some(burn_tt::TileChoice::All),

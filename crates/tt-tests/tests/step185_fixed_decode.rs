@@ -107,8 +107,8 @@ fn fixed_run(m: &Llama<TtBackend>, rows: &[Vec<f32>], d: &burn_tt::TtDevice) -> 
 
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step185_fixed_decode"
 )]
 fn fixed_steps_equal_the_growing_cache() {
     with_device(Config::default(), |d| {
@@ -201,8 +201,8 @@ fn capture(
 
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step185_fixed_decode"
 )]
 fn a_traced_step_replays_every_position() {
     with_device(Config::default(), |d| {
@@ -273,8 +273,8 @@ fn chunked(
 
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step185_fixed_decode"
 )]
 fn chunked_prefill_equals_the_eager_prefill() {
     with_device(Config::default(), |d| {
@@ -313,8 +313,8 @@ fn chunked_prefill_equals_the_eager_prefill() {
 
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step185_fixed_decode"
 )]
 fn a_traced_chunk_replays_at_the_next_start() {
     with_device(Config::default(), |d| {

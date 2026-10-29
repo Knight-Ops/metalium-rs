@@ -154,6 +154,10 @@ fn check(unfused: &Llama<TtBackend>, what: &str, lengths: &[usize], d: &TtDevice
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step191_fused_projections"
+)]
 fn fused_llamas_equal_unfused_ones_bit_for_bit() {
     with_device(Config::default(), |d| {
         for (what, config) in configs() {
@@ -165,6 +169,10 @@ fn fused_llamas_equal_unfused_ones_bit_for_bit() {
 
 /// The negative control: after fusing, the separate `v_proj` is not what runs.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step191_fused_projections"
+)]
 fn a_fused_model_computes_with_the_fused_matrix() {
     with_device(Config::default(), |d| {
         let (_, config) = configs().swap_remove(1);
@@ -193,10 +201,9 @@ fn a_fused_model_computes_with_the_fused_matrix() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "weights"), ignore = "needs `cargo xtask fetch-weights`")]
 #[cfg_attr(
-    all(feature = "weights", not(feature = "silicon")),
-    ignore = "slow on the simulator (minutes): run explicitly with -- --ignored"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step191_fused_projections"
 )]
 fn smollm2_fused_equals_unfused() {
     let (layers, lengths, config) = if cfg!(feature = "silicon") {

@@ -174,6 +174,7 @@ fn rig(d: &mut Dev<'_>, w: &Window, r: &Ring, sent: u32) -> Rig {
         .set_l1_writes(L1Writes {
             tiles: r.consumers.clone(),
             window: window(),
+            ..Default::default()
         })
         .unwrap();
     producer.set_write_noc(d, w, Niu::Noc1).unwrap();
@@ -184,6 +185,7 @@ fn rig(d: &mut Dev<'_>, w: &Window, r: &Ring, sent: u32) -> Rig {
         b.set_l1_writes(L1Writes {
             tiles: vec![PRODUCER],
             window: window(),
+            ..Default::default()
         })
         .unwrap();
         consumers.push(b);

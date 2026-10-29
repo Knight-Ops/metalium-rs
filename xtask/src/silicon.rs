@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::testrun::{build, list, run_one, Built, Verdict};
+use crate::testrun::{build, list_all, run_one, Built, Verdict};
 use crate::util::workspace_root;
 
 struct Opts {
@@ -360,6 +360,9 @@ pub const SMOKE: &[&str] = &[
     // F4b: operand reuse; a blocked product's readers copy `A` from a holder's L1 under credits,
     // bit for bit the unshared product, eager and replayed, every credit word back at zero.
     "step244_operand_reuse::",
+    // F4b.2: a measured block choice; the chosen candidate runs bit for bit, a question is
+    // timed once, and a capture paused to measure records what it would unpaused.
+    "step245_measured_block::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",
@@ -372,6 +375,13 @@ pub const SMOKE: &[&str] = &[
     "step12_mnist::the_first_forward_pass",
     "step12_mnist::the_mlp_trains_on_a_reduced_dataset",
     "step12_mnist::the_mlp_trains_on_four_tiles",
+    // Model workloads that left the simulator tier (docs/learnings/test-tiers.md): their only
+    // routine run is this one.
+    "step12_mnist::compare_all_four_execution_modes",
+    "step12_mnist::the_mlp_trains_sharded_over_two_chips",
+    "step34_batching::several_lists_per_unit_queued",
+    "step40_burn_trace::transformer_traced_training",
+    "step174_trace_footprint::",
     "step59_burn_transformer::",
     "step60_batched_blocks::",
     "step61_burn_gather::",
@@ -508,7 +518,10 @@ usage: cargo xtask silicon [options]
   --device N|all        which /dev/tenstorrent/N to run against (default 0);
                         `all` runs the whole selection on each card in turn
   --filter S            run only tests whose `binary::test` name contains S;
-                        repeatable, and the selection runs in filter order
+                        repeatable, and the selection runs in filter order. S
+                        selects from the binaries whose name contains its part
+                        before `::` (only those are built); S whose part names
+                        no binary selects from all of them
   --smoke               the everyday smoke test: burn-tt against burn-flex,
                         from single ops up to the reduced training runs
                         (adds the filters in `SMOKE`, after any given)
@@ -670,11 +683,15 @@ type Results = Vec<(u16, String, Verdict, PathBuf)>;
 
 fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
     let root = workspace_root();
-    let binaries = build(&root, o.release, &select(&o.features))?;
+    let binaries = build(
+        &root,
+        o.release,
+        &select(&o.features, &targets(&root, &o.filters)),
+    )?;
 
     let mut selection = Vec::new();
-    for b in &binaries {
-        for test in list(&b.exe, o.include_ignored)? {
+    for (b, tests) in binaries.iter().zip(list_all(&binaries, o.include_ignored)?) {
+        for test in tests {
             let full = format!("{}::{test}", b.name);
             selection.push((full, b.clone(), test));
         }
@@ -786,14 +803,14 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
 /// The cargo selection for the silicon test binaries: `tt-tests` with its `silicon`
 /// feature (and any experiment features the caller asked for), the Burn
 /// conformance suite built for silicon too, whose smoke subset `SMOKE` lists, and
-/// `tt-mnist`'s benchmarks.
-fn select(features: &[String]) -> Vec<String> {
+/// `tt-mnist`'s benchmarks; only the test binaries `targets` names, if it names any.
+fn select(features: &[String], targets: &Option<Vec<String>>) -> Vec<String> {
     let features: Vec<String> = std::iter::once("silicon".to_string())
         .chain(features.iter().cloned())
         .map(|f| format!("tt-tests/{f}"))
         .chain(std::iter::once("burn-tt-conformance/silicon".to_string()))
         .collect();
-    vec![
+    let mut select: Vec<String> = vec![
         "-p".into(),
         "tt-tests".into(),
         "-p".into(),
@@ -804,7 +821,42 @@ fn select(features: &[String]) -> Vec<String> {
         "tt-mnist".into(),
         "--features".into(),
         features.join(","),
-    ]
+    ];
+    for t in targets.iter().flatten() {
+        select.extend(["--test".into(), t.clone()]);
+    }
+    select
+}
+
+/// The test binaries the filters can select from, so a filtered run builds only
+/// those (linking all of them takes minutes). A filter selects from the binaries
+/// whose name contains its first `::`-separated part. `None`, build everything,
+/// when there are no filters or a filter's first part is in no binary's name: it
+/// may be a test path, matched in any binary.
+fn targets(root: &Path, filters: &[String]) -> Option<Vec<String>> {
+    if filters.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = ["tt-tests", "burn-tt-conformance", "tt-mnist"]
+        .iter()
+        .flat_map(|c| std::fs::read_dir(root.join("crates").join(c).join("tests")).into_iter())
+        .flatten()
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            (p.extension()? == "rs").then_some(())?;
+            Some(p.file_stem()?.to_str()?.to_string())
+        })
+        .collect();
+    let mut want = std::collections::BTreeSet::new();
+    for f in filters {
+        let bin = f.split("::").next().unwrap_or_default();
+        let hits: Vec<&String> = names.iter().filter(|n| n.contains(bin)).collect();
+        if bin.is_empty() || hits.is_empty() {
+            return None;
+        }
+        want.extend(hits.into_iter().cloned());
+    }
+    Some(want.into_iter().collect())
 }
 
 /// Binaries whose tests always run on card 0 (`TtDevice::default()`), whatever

@@ -270,6 +270,13 @@ pub struct DramAlloc {
     pool: Option<Pool>,
 }
 
+/// A paused capture's log and pool ([`DramAlloc::suspend`]).
+#[derive(Debug)]
+pub(crate) struct Suspended {
+    log: Option<Vec<Placement>>,
+    pool: Option<Pool>,
+}
+
 /// The slots a capture's own tensors gave back during it (`docs/plans/long-context.md` 1.G):
 /// later allocations of the capture take them first, and the trace keeps what is left of them
 /// when it ends ([`DramAlloc::take_pool`]). Kept apart from the free lists, so nothing allocated
@@ -383,6 +390,21 @@ impl DramAlloc {
     /// [`DramAlloc::take_log`].
     pub(crate) fn start_log(&mut self) {
         self.log = Some(Vec::new());
+    }
+
+    /// Stop keeping the log and the pool for a while, returning them to [`DramAlloc::resume`]:
+    /// what a paused capture keeps (`Session::paused`), while what runs meanwhile is none of its.
+    pub(crate) fn suspend(&mut self) -> Suspended {
+        Suspended {
+            log: self.log.take(),
+            pool: self.pool.take(),
+        }
+    }
+
+    /// Keep again what [`DramAlloc::suspend`] returned.
+    pub(crate) fn resume(&mut self, s: Suspended) {
+        self.log = s.log;
+        self.pool = s.pool;
     }
 
     /// What was allocated since [`DramAlloc::start_log`], so far.
@@ -1675,14 +1697,18 @@ pub enum Reuse {
         holders: usize,
         b_holders: Option<usize>,
     },
+    /// Where a measurement chose it ([`BlockStream::Measured`]); unmeasured, nothing is shared
+    /// (`crate::tile_op::reuse::share`).
+    Auto,
 }
 
 impl Reuse {
-    /// `TT_OPERAND_REUSE`: `off`, or `pull`, `pull:<holders>` (one by default) or
-    /// `pull:<holders>,<b_holders>` (`B` shared too); [`Reuse::Off`] when unset.
+    /// `TT_OPERAND_REUSE`: `off`, `auto`, or `pull`, `pull:<holders>` (one by default) or
+    /// `pull:<holders>,<b_holders>` (`B` shared too); [`Reuse::Auto`] when unset, the session's
+    /// default since F4b.2 (a measured choice pulls `A` where it gains; nothing else shares).
     pub fn from_env() -> Self {
         match std::env::var("TT_OPERAND_REUSE") {
-            Err(_) => Reuse::Off,
+            Err(_) => Reuse::Auto,
             Ok(v) => v
                 .parse()
                 .unwrap_or_else(|e| panic!("TT_OPERAND_REUSE={v}: {e}")),
@@ -1696,6 +1722,7 @@ impl std::str::FromStr for Reuse {
     fn from_str(s: &str) -> std::result::Result<Self, String> {
         match s.split_once(':') {
             None if s == "off" || s == "0" => Ok(Reuse::Off),
+            None if s == "auto" => Ok(Reuse::Auto),
             None if s == "pull" => Ok(Reuse::Pull {
                 holders: 1,
                 b_holders: None,
@@ -1717,7 +1744,8 @@ impl std::str::FromStr for Reuse {
                 }
             }
             _ => Err(format!(
-                "expected `off`, `pull`, `pull:<holders>` or `pull:<holders>,<b_holders>`, not `{s}`"
+                "expected `off`, `auto`, `pull`, `pull:<holders>` or `pull:<holders>,<b_holders>`, \
+                 not `{s}`"
             )),
         }
     }
@@ -1737,13 +1765,22 @@ pub enum BlockStream {
     /// Always where the product allows one, with this `[mb, kq, nb]` (each clamped to the
     /// product): a gate's or a sweep's.
     Fixed([usize; 3]),
+    /// In a trace, where [`BlockStream::Auto`] blocks a product: the block and the operand reuse
+    /// timed fastest on the card the first time a capture plans the product's question
+    /// ([`BlockQuestion`], `Session::matmul_dram`, the capture paused for it), from
+    /// [`block_stream_candidates`] and a climb ([`block_stream_neighbours`]). An eager product,
+    /// and one nothing was measured for, runs [`BlockStream::Auto`]'s: what is timed is a product
+    /// inside a trace, and an eager one also pays its planning every call. Bit for bit
+    /// [`BlockStream::Auto`]'s product: every candidate is.
+    Measured,
 }
 
 impl BlockStream {
-    /// `TT_MATMUL_BLOCK`: `off`, `auto` or `mb,kq,nb`; [`BlockStream::Auto`] when unset.
+    /// `TT_MATMUL_BLOCK`: `off`, `auto`, `measured` or `mb,kq,nb`; [`BlockStream::Measured`] when
+    /// unset, the session's default since F4b.2 (on ttsim and in eager products, `Auto`'s block).
     pub fn from_env() -> Self {
         match std::env::var("TT_MATMUL_BLOCK") {
-            Err(_) => BlockStream::Auto,
+            Err(_) => BlockStream::Measured,
             Ok(v) => v
                 .parse()
                 .unwrap_or_else(|e| panic!("TT_MATMUL_BLOCK={v}: {e}")),
@@ -1758,17 +1795,22 @@ impl std::str::FromStr for BlockStream {
         match s {
             "off" | "0" => Ok(BlockStream::Off),
             "auto" | "1" => Ok(BlockStream::Auto),
+            "measured" => Ok(BlockStream::Measured),
             _ => {
                 let parts: Vec<usize> = s
                     .split(',')
                     .map(|p| p.trim().parse::<usize>())
                     .collect::<std::result::Result<_, _>>()
-                    .map_err(|e| format!("expected `off`, `auto` or `mb,kq,nb`: {e}"))?;
+                    .map_err(|e| {
+                        format!("expected `off`, `auto`, `measured` or `mb,kq,nb`: {e}")
+                    })?;
                 match parts[..] {
                     [mb, kq, nb] if mb > 0 && kq > 0 && nb > 0 => {
                         Ok(BlockStream::Fixed([mb, kq, nb]))
                     }
-                    _ => Err("expected `off`, `auto` or three positive `mb,kq,nb`".into()),
+                    _ => Err(
+                        "expected `off`, `auto`, `measured` or three positive `mb,kq,nb`".into(),
+                    ),
                 }
             }
         }
@@ -1979,25 +2021,8 @@ pub(crate) fn matmul_dram_prefetching(
     }
     let k = ka;
     let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
-    // Pipelined (checklist 9.15): each block in half the arena, consecutive
-    // blocks of a unit alternating halves, so the session can move the next
-    // block in and the last one out while one computes -- if `K` still fits
-    // whole in half the arena.
-    let staging = if pipeline && pipelining_pays([m, k, n], route, fidelity, units) {
-        Staging::SlotsHalf
-    } else {
-        Staging::Slots
-    };
-    let (shape, floor) = matmul::plan_floor([m, k, n], route, fidelity, staging);
-    let shape = shape
-        .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
-    let [mc, kc, nc] = shape.tiles;
-    let kc = max_k_tiles.map_or(kc, |limit| kc.min(limit.get()));
-    let kc = if kc < kt {
-        k_block_size(kc, route, fidelity)?
-    } else {
-        kc
-    };
+    let (staging, floor, [mc, kc, nc]) =
+        chunk_plan([m, k, n], route, fidelity, units, pipeline, max_k_tiles)?;
     // A packed `A` takes a few slots, not `K`'s: its K blocks are as few as fit.
     let kc = match reads.packed_a {
         Some(_) if kc < kt => packed_k_block(kt, max_k_tiles, route, fidelity)?,
@@ -2006,13 +2031,27 @@ pub(crate) fn matmul_dram_prefetching(
     // Several tile rows: 2-D blocks with `K` streamed, where the mode asks for them and the
     // modelled time beats this plan's.
     if reads.packed_a.is_none() && max_k_tiles.is_none() {
-        let [bmc, bnc] = blocks([mt, nt], [mc, nc], units);
-        let other = blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], units);
+        let question = block_question(
+            [mt, kt, nt],
+            [mc, kc, nc],
+            [a_transposed, b_transposed],
+            units,
+            route,
+            fidelity,
+        );
+        // A measured product runs its winner where it fits; one not measured yet, `Auto`'s.
+        let (mode, reuse) = match (reads.block_stream, measured_choice(&question)) {
+            (BlockStream::Measured, Some(Some(c))) if measured_fits(&question, c.block) => {
+                (BlockStream::Fixed(c.block), c.reuse)
+            }
+            (BlockStream::Measured, Some(None)) => (BlockStream::Off, reads.reuse),
+            (mode, _) => (mode, reads.reuse),
+        };
         if let Some((_, layout)) = block_stream_plan(
-            reads.block_stream,
+            mode,
             [mt, kt, nt],
             units,
-            other,
+            question.other_us(),
             route,
             fidelity,
         ) {
@@ -2034,13 +2073,7 @@ pub(crate) fn matmul_dram_prefetching(
                     tiles: layout.tiles,
                 },
             )?;
-            if let (Reuse::Pull { holders, b_holders }, false) = (reads.reuse, tiles.is_empty()) {
-                op.share = Some(crate::tile_op::Share {
-                    holders,
-                    b_holders,
-                    tiles: tiles.into(),
-                });
-            }
+            op.share = crate::tile_op::reuse::share(reuse, tiles);
             let work = op.build(alloc, units, Overlap::Off)?;
             return Ok((work, None, None));
         }
@@ -2426,6 +2459,313 @@ pub fn blocked_paths_model(
     }
 }
 
+/// A GDDR product's chunk plan before a packed `A`'s `K` blocks, as
+/// [`matmul_dram_prefetching`] makes it: its staging, the arena's floor for it
+/// ([`matmul::plan_floor`]) and its `[mc, kc, nc]` tiles.
+fn chunk_plan(
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    pipeline: bool,
+    max_k_tiles: Option<std::num::NonZeroUsize>,
+) -> Result<(Staging, u64, [usize; 3])> {
+    let kt = k.div_ceil(32);
+    // Pipelined (checklist 9.15): each block in half the arena, consecutive
+    // blocks of a unit alternating halves, so the session can move the next
+    // block in and the last one out while one computes -- if `K` still fits
+    // whole in half the arena.
+    let staging = if pipeline && pipelining_pays([m, k, n], route, fidelity, units) {
+        Staging::SlotsHalf
+    } else {
+        Staging::Slots
+    };
+    let (shape, floor) = matmul::plan_floor([m, k, n], route, fidelity, staging);
+    let shape = shape
+        .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
+    let [mc, kc, nc] = shape.tiles;
+    let kc = max_k_tiles.map_or(kc, |limit| kc.min(limit.get()));
+    let kc = if kc < kt {
+        k_block_size(kc, route, fidelity)?
+    } else {
+        kc
+    };
+    Ok((staging, floor, [mc, kc, nc]))
+}
+
+/// What a blocked product's block depends on ([`block_stream_plan`]): its tiles, which operands
+/// are read transposed, units, route (its operands' formats) and fidelity, and the other paths'
+/// modelled time.
+/// [`BlockStream::Measured`] times each question once a process. Not the arena: a residency
+/// plan pass plans in the whole arena and its planned capture below its region, which is placed
+/// above what every op of the pass needed, so a block chosen in the pass is the capture's too;
+/// one that does not fit where it is asked runs `Auto`'s ([`measured_fits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlockQuestion {
+    pub tiles: [usize; 3],
+    /// `A` and `B` read transposed: a gradient's product of the same tiles is another question.
+    pub transposed: [bool; 2],
+    pub units: usize,
+    pub route: SrcRoute,
+    pub fidelity: Fidelity,
+    other_bits: u64,
+}
+
+impl BlockQuestion {
+    /// The other paths' modelled time, us ([`blocked_paths_model`]).
+    pub fn other_us(&self) -> f64 {
+        f64::from_bits(self.other_bits)
+    }
+}
+
+/// What [`BlockStream::Measured`] runs a question's product as: the block, and how its units
+/// share their reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlockChoice {
+    pub block: [usize; 3],
+    pub reuse: Reuse,
+}
+
+/// A question's choice, and the times it was chosen by: `Auto`'s block (unpulled) and the
+/// choice's, us. No times where it was not timed (a measurement that failed keeps `Auto`'s).
+type Measurements =
+    std::collections::HashMap<BlockQuestion, (Option<BlockChoice>, Option<[f64; 2]>)>;
+
+fn measurements() -> std::sync::MutexGuard<'static, Measurements> {
+    static MEASURED: std::sync::OnceLock<std::sync::Mutex<Measurements>> =
+        std::sync::OnceLock::new();
+    MEASURED.get_or_init(Default::default).lock().unwrap()
+}
+
+/// What was measured for `q` in this process: `Some(None)` where nothing blocks it (the other
+/// paths run), `None` where it was not measured yet.
+pub fn measured_choice(q: &BlockQuestion) -> Option<Option<BlockChoice>> {
+    measurements().get(q).map(|m| m.0)
+}
+
+/// Keep `choice` as `q`'s for the rest of the process, with `times`, `[Auto's, the choice's]`
+/// in us, if it was timed.
+pub(crate) fn note_measured(
+    q: BlockQuestion,
+    choice: Option<BlockChoice>,
+    times: Option<[f64; 2]>,
+) {
+    measurements().insert(q, (choice, times));
+}
+
+/// Every question measured in this process, its choice, and `[Auto's, the choice's]` times, us.
+pub fn measured() -> Vec<(BlockQuestion, Option<BlockChoice>, Option<[f64; 2]>)> {
+    measurements()
+        .iter()
+        .map(|(q, (c, t))| (*q, *c, *t))
+        .collect()
+}
+
+/// Forget every measurement: a gate's, to measure again.
+pub fn forget_measured() {
+    measurements().clear();
+}
+
+/// The question of a `[mt, kt, nt]`-tile product whose other paths are `[mc, kc, nc]` chunks
+/// on `units` units, in the current arena.
+fn block_question(
+    [mt, kt, nt]: [usize; 3],
+    [mc, kc, nc]: [usize; 3],
+    transposed: [bool; 2],
+    units: usize,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> BlockQuestion {
+    let [bmc, bnc] = blocks([mt, nt], [mc, nc], units);
+    BlockQuestion {
+        tiles: [mt, kt, nt],
+        transposed,
+        units,
+        route,
+        fidelity,
+        other_bits: blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], units).to_bits(),
+    }
+}
+
+/// Whether `q`'s product can run as `block` here: inside the product, its chunks a job even, its
+/// layout and programs fitting the current arena ([`measured_fits`]). A sweep's filter.
+pub fn block_stream_fits(q: &BlockQuestion, block: [usize; 3]) -> bool {
+    let ([mt, kt, nt], [mb, kq, nb]) = (q.tiles, block);
+    (1..=mt).contains(&mb)
+        && (1..=nt).contains(&nb)
+        && (1..=kt).contains(&kq)
+        && mb.max(nb) <= 63
+        && kt.div_ceil(kq) % 2 == 0
+        && measured_fits(q, block)
+}
+
+/// Whether `q`'s product fits `block` in the current arena, its layout and programs as
+/// [`block_stream_plan`] checks them.
+fn measured_fits(q: &BlockQuestion, block: [usize; 3]) -> bool {
+    let arena = crate::l1::arena();
+    matmul::block_stream_bytes(block, q.route.slots()) + 256 <= arena.len()
+        && crate::l1::unnoted(|| {
+            matmul::block_stream_layout(block, q.route.slots())
+                .is_ok_and(|layout| block_stream_programs_fit(&layout, q.route, q.fidelity))
+        })
+}
+
+/// The question [`matmul_dram_prefetching`] asks of `op(A) @ op(B)`, `[m, k, n]`, `transposed`
+/// saying which operands are, on `units` units, where it may run as 2-D blocks: `None` for one
+/// tile row or one `K` tile.
+pub fn product_question(
+    [m, k, n]: [usize; 3],
+    transposed: [bool; 2],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    pipeline: bool,
+) -> Result<Option<BlockQuestion>> {
+    let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    if tiles[0] < 2 || tiles[1] < 2 {
+        return Ok(None);
+    }
+    let (_, _, chunks) = chunk_plan([m, k, n], route, fidelity, units, pipeline, None)?;
+    Ok(Some(block_question(
+        tiles, chunks, transposed, units, route, fidelity,
+    )))
+}
+
+/// The blocks [`BlockStream::Measured`] times first, `[mb, kq, nb]` and whether `A` is pulled:
+/// the fastest blocks of a sweep of every format at seven prefill shapes on card 1
+/// (`silicon_probe_block_sweep`, 2026-10-29, `1793285475`-`1793291257`), so that with `Auto`'s own
+/// they reach 95% or more of each sweep's best at the four F4b shapes, and the climb from them
+/// ([`block_stream_neighbours`]) more. The analytical models rank none of these near their top: a
+/// format-blind model cannot see a packed `B`'s bytes, and the peaks are narrow (1-9 blocks within
+/// 5% of the best).
+pub const MEASURED_BLOCKS: [([usize; 3], bool); 12] = [
+    ([8, 4, 5], true),
+    ([5, 8, 8], true),
+    ([5, 8, 5], true),
+    ([6, 8, 8], true),
+    ([4, 12, 6], true),
+    ([6, 5, 6], true),
+    ([10, 4, 5], true),
+    ([7, 4, 6], true),
+    ([8, 4, 6], true),
+    ([4, 8, 8], false),
+    // A 512-row prefill's: few block rows over many units.
+    ([4, 4, 18], false),
+    ([8, 2, 9], true),
+];
+
+/// The sides and `K` chunks a measured climb steps between ([`block_stream_neighbours`]).
+const MEASURE_SIDES: [usize; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 24];
+const MEASURE_KQS: [usize; 9] = [1, 2, 3, 4, 5, 6, 8, 12, 16];
+
+/// `c` with `A` pulled as `pull` says, or not.
+fn choice(block: [usize; 3], pulled: bool, pull: Option<Reuse>) -> Option<BlockChoice> {
+    match (pulled, pull) {
+        (false, _) => Some(BlockChoice {
+            block,
+            reuse: Reuse::Off,
+        }),
+        (true, Some(reuse)) => Some(BlockChoice { block, reuse }),
+        (true, None) => None,
+    }
+}
+
+/// What [`BlockStream::Measured`] times first for `q`: [`BlockStream::Auto`]'s block, unpulled
+/// and pulled, then [`MEASURED_BLOCKS`], each `kq` the longest at most its own whose chunks a
+/// job are even here, those that fit ([`block_stream_fits`]). A pulled one runs with `pull`
+/// (`None`: the session shares nothing, and none is pulled). Empty where `Auto` blocks nothing:
+/// the other paths run, measured or not.
+pub fn block_stream_candidates(q: &BlockQuestion, pull: Option<Reuse>) -> Vec<BlockChoice> {
+    let Some((first, _)) = block_stream_plan(
+        BlockStream::Auto,
+        q.tiles,
+        q.units,
+        q.other_us(),
+        q.route,
+        q.fidelity,
+    ) else {
+        return Vec::new();
+    };
+    let kt = q.tiles[1];
+    let listed = MEASURED_BLOCKS
+        .iter()
+        .filter_map(|&([mb, kq, nb], pulled)| {
+            even_chunks(kt, kq)
+                .filter(|&k| k <= kq)
+                .map(|k| ([mb, k, nb], pulled))
+        });
+    let mut out: Vec<BlockChoice> = Vec::new();
+    for (block, pulled) in [(first.tiles, false), (first.tiles, true)]
+        .into_iter()
+        .chain(listed)
+    {
+        if let Some(c) = choice(block, pulled, pull) {
+            if !out.contains(&c) && block_stream_fits(q, block) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// The blocks one step from `c` that fit `q`: the next side or chunk below and above each of
+/// `mb`, `kq` and `nb` ([`MEASURE_SIDES`], [`MEASURE_KQS`]), and `c` with `A` pulled or not.
+pub fn block_stream_neighbours(
+    q: &BlockQuestion,
+    c: BlockChoice,
+    pull: Option<Reuse>,
+) -> Vec<BlockChoice> {
+    let steps = |v: usize, grid: &[usize]| {
+        [
+            grid.iter().rev().find(|&&g| g < v).copied(),
+            grid.iter().find(|&&g| g > v).copied(),
+        ]
+    };
+    let [mb, kq, nb] = c.block;
+    let pulled = c.reuse != Reuse::Off;
+    let mut blocks: Vec<([usize; 3], bool)> = vec![(c.block, !pulled)];
+    for m in steps(mb, &MEASURE_SIDES).into_iter().flatten() {
+        blocks.push(([m, kq, nb], pulled));
+    }
+    for k in steps(kq, &MEASURE_KQS).into_iter().flatten() {
+        blocks.push(([mb, k, nb], pulled));
+    }
+    for n in steps(nb, &MEASURE_SIDES).into_iter().flatten() {
+        blocks.push(([mb, kq, n], pulled));
+    }
+    blocks
+        .into_iter()
+        .filter_map(|(block, pulled)| choice(block, pulled, pull))
+        .filter(|n| block_stream_fits(q, n.block))
+        .collect()
+}
+
+/// Every block of `[mt, kt, nt]` tiles on `units` units that fits the arena with `route`'s
+/// slots, by [`block_stream_model`]'s time, then its bytes; sides up to [`BLOCK_SIDE_MAX`].
+fn model_shapes([mt, kt, nt]: [usize; 3], units: usize, route: SrcRoute) -> Vec<BlockStreamShape> {
+    let arena = crate::l1::arena();
+    let fits_arena = |tiles: [usize; 3]| {
+        // Two semaphores pairs' worth of slack past the slots.
+        matmul::block_stream_bytes(tiles, route.slots()) + 256 <= arena.len()
+    };
+    let mut kqs: Vec<usize> = (1..=kt).filter(|&kq| kt.div_ceil(kq) % 2 == 0).collect();
+    // Of the `kq`s with the same chunks a job, the shortest: the same work and reloads
+    // in fewer slots.
+    kqs.dedup_by_key(|kq| kt.div_ceil(*kq));
+    let mut all = Vec::new();
+    for mb in 1..=mt.min(BLOCK_SIDE_MAX) {
+        for nb in 1..=nt.min(BLOCK_SIDE_MAX) {
+            for &kq in &kqs {
+                if fits_arena([mb, kq, nb]) {
+                    all.extend(block_stream_model([mt, kt, nt], [mb, kq, nb], units));
+                }
+            }
+        }
+    }
+    all.sort_by(|a, b| a.us.total_cmp(&b.us).then(a.bytes.total_cmp(&b.bytes)));
+    all
+}
+
 /// The largest `kq <= limit` whose chunks a job are even, or the smallest above it.
 fn even_chunks(kt: usize, limit: usize) -> Option<usize> {
     let even = |kq: usize| kt.div_ceil(kq) % 2 == 0;
@@ -2481,6 +2821,11 @@ pub(crate) fn block_stream_plan(
 ) -> Option<(BlockStreamShape, matmul::BlockStreamLayout)> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
+    // What is measured is chosen before ([`measured_choice`]); before it is, `Auto`'s.
+    let mode = match mode {
+        BlockStream::Measured => BlockStream::Auto,
+        m => m,
+    };
     if mode == BlockStream::Off || mt < 2 || kt < 2 {
         return None;
     }
@@ -2506,7 +2851,7 @@ pub(crate) fn block_stream_plan(
         matmul::block_stream_bytes(tiles, route.slots()) + 256 <= arena.len()
     };
     let mut candidates: Vec<BlockStreamShape> = match mode {
-        BlockStream::Off => Vec::new(),
+        BlockStream::Off | BlockStream::Measured => Vec::new(),
         BlockStream::Fixed([mb, kq, nb]) => {
             // The program cache's variant holds six bits a side (`tile_op::matmul::Schedule::BlockStream`).
             let (mb, nb) = (mb.min(mt).min(63), nb.min(nt).min(63));
@@ -2515,23 +2860,7 @@ pub(crate) fn block_stream_plan(
                 .into_iter()
                 .collect()
         }
-        BlockStream::Auto => {
-            let mut kqs: Vec<usize> = (1..=kt).filter(|&kq| kt.div_ceil(kq) % 2 == 0).collect();
-            // Of the `kq`s with the same chunks a job, the shortest: the same work and reloads
-            // in fewer slots.
-            kqs.dedup_by_key(|kq| kt.div_ceil(*kq));
-            let mut all = Vec::new();
-            for mb in 1..=mt.min(BLOCK_SIDE_MAX) {
-                for nb in 1..=nt.min(BLOCK_SIDE_MAX) {
-                    for &kq in &kqs {
-                        if fits_arena([mb, kq, nb]) {
-                            all.extend(block_stream_model([mt, kt, nt], [mb, kq, nb], units));
-                        }
-                    }
-                }
-            }
-            all
-        }
+        BlockStream::Auto => model_shapes([mt, kt, nt], units, route),
     };
     candidates.sort_by(|a, b| a.us.total_cmp(&b.us).then(a.bytes.total_cmp(&b.bytes)));
     // The candidates' layouts are measurements: the chosen one is noted where it is placed

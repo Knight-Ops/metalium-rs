@@ -165,6 +165,10 @@ fn inputs(split: &mnist::Split, d: &burn_tt::TtDevice) -> (Tensor<AD, 2>, Tensor
     )
 }
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step96_mixed_bfp_mnist"
+)]
 fn mnist_mlp_policies_keep_f32_training_state_and_replay() {
     let split = mnist::load(true);
     with_device(Config::default(), |d| {
@@ -190,6 +194,10 @@ fn mnist_mlp_policies_keep_f32_training_state_and_replay() {
     });
 }
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step96_mixed_bfp_mnist"
+)]
 fn mnist_cnn_policies_keep_f32_training_state_and_replay() {
     let split = mnist::load(true);
     with_device(Config::default(), |d| {

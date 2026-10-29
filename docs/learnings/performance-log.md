@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [F4b.2: a block measured on the card, `A` pulled where it gains](#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1) | 2026-10-29 | the default since: sweeps of every block x pull at 10 prefill shapes (the best 1.0-2.1x `Auto`'s, ranked low by every model); `Auto`'s, 12 listed blocks and a climb timed in a capture as a difference of traces: 1.02-2.25x `Auto` over 50 cases, H1 FP32 35.5 / BF16 49.5 / BFP4 65.4 TFLOPS a product; through Burn H1 19.2 -> **29.2 TFLOPS**, 1.7B prefill 1.04-1.34x, models and decode unchanged; eager runs `Auto`'s |
 | [D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever](#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1) | 2026-10-29 | three prefill shapes x every `B` format x the schemes: `A` pulled 1.33-1.44x with FP32 `B` (H1 28.38 TFLOPS); `B` pulled loses; a packed `B` is bound by the block (H1 `[6,4,12]` + `A` pulled 44.5-45.8, 1.7x), shape-dependent |
 | [F4b.1: a holder's credits as one run, no gain](#f4b1-a-holders-credits-as-one-run-no-gain-2026-10-29-cards-0-and-1) | 2026-10-29 | `dm::CREDIT_RUN` built and correct on card 0, measured off/on on card 1 within noise (`pull:1` 25.1 / 25.2, `pull:2,1` 15.3 / 14.9): a holder's round trips do not bind; retired |
 | [F4b.1: larger GDDR blocks; the planner's block, not reads, binds a packed `B`](#f4b1-larger-gddr-blocks-the-planners-block-not-reads-binds-a-packed-b-2026-10-29-card-1) | 2026-10-29 | H1's shape: FP32 `B`'s planner block already reads least (larger ones do not fit L1); a packed `B` runs 1.31-1.63x faster at `[6,4,12]` (BFP8 / BFP4 / BFP2 34.4 / 41.1 / 43.1 TFLOPS against 26.3-26.5), BF16 1.13x, FP32 1.05x: the planner's block binds. Two re-weighed models measured at four shapes each lose up to 14-22% somewhere: reverted; a measured block choice is next |
@@ -388,6 +389,119 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## F4b.2: a block measured on the card, `A` pulled where it gains (2026-10-29, card 1)
+
+H9 ([Bible §13](dataflow-compiler.md#13-hypotheses-register), [plan](../plans/dataflow-compiler.md) F4b.2): D5 left the
+block and the pull shape-dependent, and the re-weighed model refuted, so the block is chosen by timing candidates on the
+card. **The default since (2026-10-29):** `TT_MATMUL_BLOCK` unset is `measured`, `TT_OPERAND_REUSE` unset is `auto`.
+
+Before choosing candidates, the landscape: `silicon_probe_block_sweep::block_sweep` times every block of a grid (`mb`
+1-16, `kq` 1-16, `nb` 2-24; from the second shape on `kq` >= 2 and sides >= 2) with and without `A` pulled (`pull:4`), on
+every tile at HiFi4, the fastest and `Auto`'s checked against exact arithmetic (every run PASS). The sweeps timed each
+block as a trace of the product alone (2 warm replays, the median of 5), which favours blocks that leave units out (see
+"How a candidate is timed"): their ranks hold, their TFLOPS are below the per-product rates further down.
+
+**The analytical models cannot propose the candidates.** At H1 the format-blind model ranks the measured winners 25th to
+over 1,000th, and `BLOCK_SIDE_MAX = 16` excludes `[4,2,18]` outright; a reconstruction of the slot-weighed model ranks
+BFP2's winner 222nd to 296th and puts `[2,16,20]` first. Off H1 every ranker puts the winners in the hundreds.
+
+**The landscape at the four F4b shapes** (`1793285475`, `1793288866`, `1793289109`, `1793289486`, `1793289847`), TFLOPS:
+
+| Shape | `B` | `Auto` | Best | Best with nothing pulled | Within 5% |
+|---|---|--:|---|---|--:|
+| `[2048,2048]@[2048,16384]` | FP32 | 20.12 | `[10,4,5]` pulled **32.39** | `[8,4,6]` 20.95 | 2 |
+| | BF16 | 23.99 | `[8,4,6]` pulled **41.89** | `[5,4,12]` 28.06 | 4 |
+| | BFP8 | 26.11 | `[7,8,5]` pulled **44.08** | `[4,4,18]` 37.44 | 9 |
+| | BFP4 | 26.28 | `[6,8,8]` pulled **54.63** | `[4,4,18]` 43.22 | 2 |
+| | BFP2 | 26.52 | `[6,8,8]` pulled **55.45** | `[3,8,20]` 48.57 | 3 |
+| `[1024,2048]@[2048,8192]` | FP32 | 15.83 | `[7,4,6]` pulled 22.78 | `[8,4,6]` 17.42 | 6 |
+| | BFP4 | 21.86 | `[4,8,9]` pulled 31.61 | `[4,4,20]` 30.78 | 10 |
+| `[1024,8192]@[8192,2048]` | FP32 | 16.94 | `[6,5,6]` pulled 22.48 | `[8,4,5]` 19.81 | 3 |
+| | BFP4 | 26.33 | `[4,8,8]` 29.30 | (the best) | 12 |
+| `[2048,8192]@[8192,2048]` | FP32 | 18.43 | `[8,4,6]` pulled 32.08 | `[6,4,8]` 20.23 | 1 |
+| | BFP8 | 29.11 | `[5,8,8]` pulled 44.05 | `[3,8,16]` 38.29 | 2 |
+
+(the other rows in the runs' output files, `target/silicon/out/`.)
+- The best block is 1.02-2.09x `Auto`'s, and in 17 of 20 it pulls `A`, so D5's "a packed `B` gains little from the
+  pull" held only at the default block. The winners stream `K` 4-8 tiles a chunk (`Auto`'s 2-3) in blocks of 32-50
+  outputs. FP32 at 32.4 is above F4b.0's 30.3 "reads-free ceiling", which was the default block's.
+- Repeated (`block_confirm`, 5 interleaved rounds, `1793290511`-`1793290605`): the winners reproduce (H1 FP32 32.60, BF16
+  42.34, BFP4 54.96, BFP2 55.61), every case's rounds within 4.2% (most within 2%).
+
+**What `Measured` times** (`tensor::block_stream_candidates`, `MEASURED_BLOCKS`): `Auto`'s block, unpulled and pulled,
+then 12 listed blocks (the 10 that with `Auto`'s reach 95% of the best at the four shapes, and the two a 512-row
+prefill wanted), each `kq` the longest at most its own with even chunks, those that fit; then a climb from the fastest,
+one grid step in `mb`, `kq` or `nb` or the pull toggled, while a step gains 1% (at most 40 timed). A list alone reached
+82-90% of the best at the 512-row hold-out; climbing from `Auto` alone, 69% (offline, on the sweeps). Only in a capture,
+paused for it (`Session::paused`); a planned capture uses what its plan pass measured.
+
+**How a candidate is timed** (`Session::time_product`). First, as the sweeps: a trace of the product alone. Through the
+models that chose wrong: a replay's fixed cost (starting every unit's stream) is most of a small product's time, so
+blocks that leave units out timed "faster". ViT-Tiny's products chose blocks 2-5x "faster" that ran the model 11.6%
+slower, ResNet-18's 9.7% (A/B with one setting at a time, `TT_TILES=all`, `1793296056`-`1793296547`). Now: traces of
+`R` and of `2R` copies of the product back to back, each replayed (2 warm, the median of 5), the difference over `R` a
+product, `R` such that `R` copies run ~2 ms (at most 16). The fixed cost cancels: ResNet-18 0.997x, ViT-Tiny 0.980x
+(`1793298086`-`1793298439`).
+
+**Two rules the models set.**
+- **An eager product runs `Auto`'s block.** Measured blocks in eager products made eager training 1.48-2.88x slower
+  (`1793298086`-`1793298439`): their planning and enqueue, paid by an eager product every call, is what a trace pays
+  once and what the timing does not count.
+- **Nothing is pulled unmeasured.** A first `Reuse::Auto` pulled `A` from 4 holders wherever `B` was FP32 and nothing
+  was measured (D5's evidence). Through ResNet-18 that cost 9.7% (`1793296056`-`1793296547`), so `Auto` now shares
+  only what a measurement chose (`tile_op::reuse::share`).
+
+**The session's own choice** (`block_measured`: `Measured` with `Reuse::Auto` and real times, then the choice and
+`Auto`'s block timed again in 5 interleaved rounds as `Measured` times them, `1793299232`). The four shapes, three
+held-out shapes the list took from (`[512,2048]@[2048,16384]`, `[2048,2048]@[2048,2048]`, `[2048,576]@[576,1536]`) and
+three fresh ones (`[256,2048]@[2048,8192]`, `[4096,2048]@[2048,2048]`, SmolLM2-360M's `[1024,960]@[960,2560]`), every
+format, 50 cases, each checked against exact arithmetic:
+- **Never below `Auto`: 1.02-2.25x, 1.47x on average.** The least gains are at 256 rows (FP32 1.04x, BF16 1.02x), where
+  `Auto`'s block is near the best already.
+- **2.7-13.9 s a question, 6.7 s on average** (11-27 timed): build time, which the owner does not count; H9's "≤ 1 s"
+  is missed.
+- `A` is pulled in 37 of 50 choices. Unpulled: all five at 256 rows, and BFP4/BFP2 at four shapes (`[4,4,18]`,
+  `[4,5,8]`, `[4,8,8]`).
+
+| Shape | `B` | `Auto` | Measured | Choice |
+|---|---|--:|--:|---|
+| `[2048,2048]@[2048,16384]` (H1) | FP32 | 22.32 | **35.47** | `[10,4,5]` pulled |
+| | BF16 | 26.80 | **49.49** | `[8,4,7]` pulled |
+| | BFP8 | 29.00 | **48.57** | `[8,4,5]` pulled |
+| | BFP4 | 29.34 | **65.45** | `[6,8,8]` pulled |
+| | BFP2 | 29.45 | **66.19** | `[6,8,8]` pulled |
+| `[2048,8192]@[8192,2048]` | FP32 | 21.83 | 36.88 | `[8,4,6]` pulled |
+| | BFP8 | 35.43 | 56.87 | `[5,8,8]` pulled |
+| `[1024,8192]@[8192,2048]` | BFP8 | 34.52 | 40.63 | `[4,12,5]` pulled |
+| `[4096,2048]@[2048,2048]` | FP32 | 21.39 | 29.34 | `[9,2,8]` pulled |
+| `[256,2048]@[2048,8192]` | FP32 | 17.39 | 18.03 | `[4,3,9]` |
+
+(TFLOPS per product with a replay's fixed cost cancelled; the other 40 rows in the run's output file.) The first
+version (a trace of the product alone, `1793292568`) reached 99.2% of each sweep's best on average, in 1.4 s a question.
+
+**End to end** (ABBA, card 1, `TT_TILES=all`, A: nothing set, B: `TT_MATMUL_BLOCK=measured TT_OPERAND_REUSE=auto`, the
+defaults since; `1793299689` A, `1793300429` B, `1793301304` B, `1793302179` A; each the mean of its two runs):
+
+| Workload | A | B | B against A |
+|---|--:|--:|--:|
+| Burn `matmul_throughput` H1 (FP32 `B`), traced replay | 19.19 | **29.17 TFLOPS** | **1.52x** |
+| `[1024,2048]@[2048,8192]` | 14.44 | 18.57 | 1.29x |
+| `[2048,8192]@[8192,2048]` | 10.80 | 14.16 | 1.31x |
+| 1.7B prefill, 32 / 128 / 256-token prompt (`traced_generation`) | 728 / 2,402 / 3,218 | **972 / 2,778 / 3,335 tokens/s** | 1.34x / 1.16x / 1.04x |
+| 1.7B prefill, 256 tokens (`stream_ceiling`) | 181 ms | 137 ms | 1.32x |
+| 1.7B decode step, 32 / 256-token prompt | 11.34 / 12.71 ms | 11.36 / 12.74 ms | 1.00x |
+| ResNet-18 / ViT-Tiny traced | 12.83 / 7.96 ms | 12.70 / 7.79 ms | 1.01x / 1.02x |
+| MNIST 784-128-10 / transformer training (eager) | 1.398 / 8.34 ms | 1.398 / 8.27 ms | 1.00x / 1.01x |
+| 1.7B traced build (chunks 64-256, steps 64-512) | 154 s | 233 s | build time |
+
+Bit for bit throughout (every bench validates its outputs). A prefill chunk's stream is 8-20% smaller (fewer `A` reads).
+**Open: eager after a pulled capture.** In `matmul_throughput`, an eager product run again after its own shape's
+measured, pulled trace takes 3-10% more host time (19.4 -> ~20.7 ms at `[1024,2048]@[2048,8192]`, flat after the first
+capture, `1793303108`, five rounds in a later run); A stays at 19.3. The device spans are identical (8,536 us; profiles
+`1793303230`, `1793303264`); neither setting alone shows it (`1793302993`, `1793303005`); after other shapes' captures
+it goes both ways (-3% to +6%, `1793303125`); and through the session alone (a probe: plain capture, measured or pulled,
+then eager) eager does not slow. Not found; the model workloads above do not show it.
 
 ## D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever (2026-10-29, card 1)
 

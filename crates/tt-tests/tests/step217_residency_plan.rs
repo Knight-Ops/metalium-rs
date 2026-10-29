@@ -74,6 +74,10 @@ fn trace_of<'a>(traces: &'a [Traced], g: &Graph) -> &'a Traced {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step217_residency_plan"
+)]
 fn a_captured_graph_is_planned_and_reported() {
     with_device(Config::default(), |d| {
         burn_tt::set_count_trace_bytes(d, true).unwrap();
@@ -189,6 +193,10 @@ fn a_captured_graph_is_planned_and_reported() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step217_residency_plan"
+)]
 fn a_capture_keeps_its_region_below_every_op() {
     with_device(Config::default(), |d| {
         let model = Llama::<Tt>::new(&config(), &d).fused();

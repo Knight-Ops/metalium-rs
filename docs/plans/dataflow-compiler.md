@@ -406,10 +406,32 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
     - *The planner re-weighed (owner: make it the default), refuted and reverted:* each operand's bytes by its slot,
       with the pair at 0.2 and at 0.15, measured at four shapes on card 1 (`1793240867`, `1793241117`): each gains up
       to 1.4x somewhere and loses up to 14% (slots) or 22% (pair 0.15, FP32 at H1) elsewhere.
-  - [ ] **A measured block choice:** the model's few best candidates (fits, bit-equivalent by construction) timed on the
-    card the first time a shape and format pair is planned, the winner cached per process (and with the program cache).
-    Build time, not step time (owner, 2026-10-26). Gate: the choice is one of the candidates, the product bit for bit
-    whichever is chosen; bench: never slower than the model's choice at the four F4b shapes and every format.
+  - [x] **A measured block choice** (F4b.2, H9; the default since 2026-10-29, card 1,
+    [log](../learnings/performance-log.md#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1)):
+    `BlockStream::Measured` (`TT_MATMUL_BLOCK`, `measured` when unset). The first time a capture plans a product's
+    question (`tensor::BlockQuestion`: tiles, transposes, units, the format pair, fidelity), the capture is paused
+    (`Session::paused`) and the candidates are timed on the card with the real operands; the winner, block and pull
+    together, is kept for the process (`tensor::measured_choice`). Build time, not step time (owner, 2026-10-26).
+    - *Candidates are measured, not modelled:* every model ranked the sweeps' winners in the hundreds, so they are
+      `Auto`'s block unpulled and pulled, 12 listed blocks that won sweeps at ten shapes (`tensor::MEASURED_BLOCKS`),
+      and a one-step climb from the fastest (`tensor::block_stream_neighbours`), at most 40 timed.
+    - *Timing:* the difference of traces of `R` and `2R` copies, over `R` (`Session::time_product`), so a replay's
+      fixed cost cancels; timed alone, blocks that leave units out won and ViT-Tiny ran 11.6% slower.
+    - *Eager products run `Auto`'s block:* measured blocks made eager training 1.5-2.9x slower.
+    - *A measurement's traces are stored whole*, whatever the capture it pauses stores as layer sub-traces: its `R`
+      copies repeat, so as sub-traces they were one body called `R` times. The smoke found it on card 0
+      (`step223_sub_traces` with short tables: the measurement's replay failed, the session recovered, and the paused
+      capture ended `Stale`); gate `step245::a_measurement_under_sub_traces_times_its_copies_whole` (silicon only,
+      fails without the fix).
+    - *Pausing a capture* keeps its tensors (`DramAlloc::suspend`), its L1 plan (`l1::unnoted`), its arena and its
+      movers' arena, and moves its barrier targets and unit generations past what ran
+      (`trace::Capture::barriers_base`, `UnitCapture::generation_base`). A planned capture never pauses: it uses what
+      its plan pass measured. Gates: `step245_measured_block` (the chosen candidate runs bit for bit and is timed
+      once; a capture paused is the capture unpaused word for word; a pause that does not re-base is caught, ttsim).
+    - *Result:* 1.02-2.25x `Auto` over 50 cases (10 shapes x 5 formats), never below; H1 through Burn with nothing set
+      19.2 -> 29.0 TFLOPS; 1.7B prefill 1.04-1.34x; models and decode unchanged; 2.7-13.9 s a question.
+    - *Open:* an eager product run again after its own shape's pulled capture takes 3-10% more host time (device
+      the same), not reproduced through the session alone.
   - [x] Holders' credits without a round trip each (14 a chunk on the holder's B today). `dm::CREDIT_RUN` (word 5
     of `op::CREDIT`), as `MCAST_RUN_ACKS` is a multicast's: a run's first credit waits for the mover's earlier
     requests, none waits for its own response, and the run's responses are counted before the first entry not of it
@@ -429,9 +451,10 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
     reader's last wait one credit past what its holder sends, `reuse::probe_overwait`): the op fails by its
     deadline, and the next shared product is the unshared one bit for bit with every credit word at zero (card 0,
     `1793243728`). Silicon only: ttsim cannot recover a tile whose roles stalled inside a kernel (divergence row 16).
-  - [ ] The planner prefers block shapes whose rows divide over the units (a group of one runs a whole row). Folded
-    into the measured block choice above: with reuse on, its candidates are ranked with the shared deal they get
-    (equal groups when `B` is shared), so a block that leaves groups of one is measured, not assumed.
+  - [x] The planner prefers block shapes whose rows divide over the units (a group of one runs a whole row). Folded
+    into the measured block choice above (2026-10-29): each candidate is timed with the shared deal it gets, so a
+    block that leaves groups of one is measured, not assumed. `B` is never pulled automatically, so equal groups
+    (`B` shared) do not arise by default.
 - [x] Decide D5 by measurement first, on card 1, for one prefill product shape, between:
   - a few holders whose rows or columns are pulled with `READ_L1`;
   - one sender per row or column rectangle multicasting with `WRITE_L1_MCAST` and remote credits;
@@ -444,9 +467,19 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
   pulled reaches 44.5-45.8 TFLOPS (1.7x), but the best block, and whether to pull, depend on the shape.
   Closing checks on the final tree: `--smoke` on card 0 passes 1,252 of 1,252 (`1793244532`); `step12_mnist` 8 of 8 with
   the goldens unchanged; the job goldens unchanged (the default path emits the same records).
-- [ ] Build the winner as F3's reuse pass, so every format and every contraction gets it, with a policy for when it
-  pulls (FP32 operands at prefill shapes gain; packed `B` at the default block does not), and the measured block
-  choice (F4b.1 above), which can choose the block and the pull together.
+- [x] Build the winner as F3's reuse pass, with a policy for when it pulls, and the measured block choice (F4b.1
+  above), which chooses the block and the pull together (F4b.2, 2026-10-29).
+  - The pass: `tile_op::reuse::share(reuse, tiles)` decides an op's `share` from the op and the session's `Reuse`, no
+    client named. `Reuse::Auto` (`TT_OPERAND_REUSE`, `auto` when unset) shares only what a measurement chose; `off`
+    and `pull:<h>[,<hb>]` stay explicit overrides. A static policy (`A` pulled wherever `B` is FP32) was tried and
+    dropped: ResNet-18 ran 9.7% slower.
+  - The pull survives captures: `dm::L1Writes` has a read window (`reads`) beside the write window. A planned capture
+    narrows only the write window, and ending one restores it, so reuse no longer stays off after a planned capture.
+    A planned capture's linked ops (a pulled product's holders and readers) are grouped from the plan-rewritten lists;
+    before, the rewrite was dropped for them.
+  - Every format gets it. Not yet every contraction: the batched block-stream path
+    (`matmul_dram_batched_limited`, attention prefill) builds each item's jobs from unit 0 and concatenates them, so
+    a pull there needs the items' units numbered globally and each unit's credits returned per item.
 - **Prediction (restated after F4b.0, against the measured ceiling):** `[2048,2048]@[2048,16384]` with an FP32 `B`
   from 19.2-19.4 to ≥ 25.8 TFLOPS, reads from 2,062 to ≤ 302 MB; a packed `B` at ≥ 95% of its 28.0 ceiling. As first
   written, ≥ 35 TFLOPS, which is above the 30.3 a product reaches with no reads at all.

@@ -75,6 +75,10 @@ fn train(
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step170_checkpoint_round_trip"
+)]
 fn a_checkpoint_resumes_bit_identically() {
     let weights = init(170);
     let dir = std::env::temp_dir().join(format!("tt-ckpt-{}", std::process::id()));

@@ -206,6 +206,108 @@ fn a_ragged_product_sharing_both_operands_is_the_unshared_one_bit_for_bit() {
     case(4, [72, 232, 300], [2, 2, 3], 1, Some(1));
 }
 
+/// `Reuse::Auto` unmeasured (the block `Auto`'s or fixed, not `Measured`): nothing is shared,
+/// whatever the format (a pull is a measured choice, `step245`), and the product is the unshared
+/// one bit for bit.
+#[test]
+fn auto_unmeasured_shares_nothing_and_gives_the_same_bits() {
+    with_session(8, |s| {
+        s.set_block_stream(BlockStream::Fixed([2, 2, 1]));
+        let [m, k, n] = [64, 256, 416];
+        let a = s.upload(&values(m * k, 1), m, k).unwrap();
+        let b = s.upload(&values(k * n, 2), k, n).unwrap();
+        let (plain, _) = product(s, &a, false, &b, false, Fidelity::HiFi4, Reuse::Off);
+        let (auto, copies) = product(s, &a, false, &b, false, Fidelity::HiFi4, Reuse::Auto);
+        assert_eq!(copies, 0, "Auto unmeasured pulled");
+        same(&plain, &auto, "Auto");
+    });
+}
+
+/// A shared product in a residency-planned capture (its plan pass, then the capture applying the
+/// plan, whose write window is its own region): `|A| @ B`, then `|.|` of the product, so the
+/// planner may keep the product's `A` or its result in L1. Its copies read the holders' slots
+/// through the read window (`dm::L1Writes::reads`), the trace replays as the unshared chain bit
+/// for bit, and once the capture ends the session's next product still shares.
+#[test]
+fn a_planned_capture_shares_and_leaves_the_session_sharing() {
+    fn chain<T: tt_device::Transport>(
+        s: &mut Session<T>,
+        a: &DramTensor,
+        b: &DramTensor,
+    ) -> DramTensor {
+        let abs = tt_kernels::tensor::Eltwise {
+            kind: tt_kernels::sfpu::ops::kind_sfpu::ABS,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let e = s.eltwise(abs, a, None).unwrap();
+        let y = s
+            .matmul_dram(
+                &e,
+                false,
+                b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                BUDGET * 40,
+            )
+            .unwrap();
+        s.free(e).unwrap();
+        let z = s.eltwise(abs, &y, None).unwrap();
+        s.free(y).unwrap();
+        z
+    }
+    with_session(4, |s| {
+        s.set_block_stream(BlockStream::Fixed([2, 2, 3]));
+        let [m, k, n] = [96, 256, 320];
+        let a = s.upload(&values(m * k, 1), m, k).unwrap();
+        let b = s.upload(&values(k * n, 2), k, n).unwrap();
+        s.set_operand_reuse(Reuse::Off).unwrap();
+        let z = chain(s, &a, &b);
+        let plain = s.download(&z).unwrap();
+        s.free(z).unwrap();
+        let pull = Reuse::Pull {
+            holders: 1,
+            b_holders: None,
+        };
+        s.set_operand_reuse(pull).unwrap();
+        s.begin_trace_plan_pass().unwrap();
+        let z = chain(s, &a, &b);
+        let id = s.end_trace().unwrap();
+        s.free(z).unwrap();
+        s.release_trace(id).unwrap();
+        assert!(s.begin_trace_planned().unwrap(), "the chain is planned");
+        let before = reuse::copies();
+        let z = chain(s, &a, &b);
+        let id = s.end_trace().unwrap();
+        assert!(
+            reuse::copies() > before,
+            "the planned capture shared nothing"
+        );
+        for i in 0..2 {
+            s.replay(id).unwrap();
+            same(
+                &plain,
+                &s.download(&z).unwrap(),
+                &format!("planned replay {i}"),
+            );
+        }
+        assert!(
+            credit_words(s).iter().all(|w| w.iter().all(|&x| x == 0)),
+            "planned: a credit word left counted"
+        );
+        s.free(z).unwrap();
+        s.release_trace(id).unwrap();
+        let (plain, _) = product(s, &a, false, &b, false, Fidelity::HiFi4, Reuse::Off);
+        let (after, copies) = product(s, &a, false, &b, false, Fidelity::HiFi4, pull);
+        assert!(
+            copies > 0,
+            "the product after the planned capture shared nothing"
+        );
+        same(&plain, &after, "after the planned capture");
+    });
+}
+
 /// Three block rows over seven units: groups of two and one unit idle, with two holders of
 /// `B` a column group of three.
 #[test]

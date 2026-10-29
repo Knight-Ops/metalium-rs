@@ -106,7 +106,7 @@ flowchart TD
 - **Behavior**:
   All operations stream through Burn's fusion client thread and execute eagerly on `TtBackend`.
 - **Verification Gate**:
-  - `cargo test -p tt-tests --features e2e --test step12_mnist` passes bit-for-bit when run with `Tt = Fusion<TtBackend>`.
+  - `cargo xtask silicon --release --device 0 --filter step12_mnist` passes bit-for-bit when run with `Tt = Fusion<TtBackend>`.
   - Transformer regression `step59_burn_transformer` passes.
   - Step latency and memory usage remain within baseline noise.
 

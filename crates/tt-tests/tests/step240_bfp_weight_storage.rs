@@ -189,6 +189,10 @@ fn assert_stored_is_f32(
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step240_bfp_weight_storage"
+)]
 fn synthetic_llamas_with_bfp_weights_generate_bit_for_bit() {
     with_device(Config::default(), |d| {
         for format in formats() {
@@ -242,6 +246,10 @@ fn with_signed_table(model: Llama<TtBackend>) -> Llama<TtBackend> {
 /// vocab]` in blocks along the vocabulary, and no step widens it (a transposed packed weight
 /// would be decoded to F32 at every call).
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step240_bfp_weight_storage"
+)]
 fn a_tied_head_is_stored_as_its_product_reads_it() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[0];
@@ -264,6 +272,10 @@ fn a_tied_head_is_stored_as_its_product_reads_it() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step240_bfp_weight_storage"
+)]
 fn weights_that_are_not_bfp_values_do_not_agree() {
     with_device(Config::default(), |d| {
         let (_, config) = synthetic_configs()[1];
@@ -286,12 +298,8 @@ fn weights_that_are_not_bfp_values_do_not_agree() {
 /// weights hold the same values, bit for bit.
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
-)]
-#[cfg_attr(
-    all(feature = "weights", not(feature = "silicon")),
-    ignore = "thirty layers: a silicon gate"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step240_bfp_weight_storage"
 )]
 fn smollm2_with_bfp_weights_generates_bit_for_bit() {
     let config = Config {

@@ -144,6 +144,7 @@ fn writes_land_in_each_peers_window_on_both_nocs() {
         nc.set_l1_writes(L1Writes {
             tiles: PEERS.to_vec(),
             window: window(),
+            ..Default::default()
         })
         .unwrap();
         let src = pattern(64 << 10, 0x218);
@@ -208,11 +209,13 @@ fn the_host_refuses_what_its_session_does_not_own() {
         let r = nc.set_l1_writes(L1Writes {
             tiles: vec![(8, GATE_TILE.1)],
             window: window(),
+            ..Default::default()
         });
         assert!(r.is_err(), "the non-memory column named: {r:?}");
         let r = nc.set_l1_writes(L1Writes {
             tiles: PEERS.to_vec(),
             window: 0x1_0000..tt_isa::l1::DATA.end,
+            ..Default::default()
         });
         assert!(r.is_err(), "a window below DATA: {r:?}");
         // A window ending below `DATA`'s end, so a write past it is still inside `DATA`.
@@ -220,6 +223,7 @@ fn the_host_refuses_what_its_session_does_not_own() {
         nc.set_l1_writes(L1Writes {
             tiles: PEERS.to_vec(),
             window: window().start..end,
+            ..Default::default()
         })
         .unwrap();
         let cases = [
@@ -385,6 +389,7 @@ fn a_multicast_lands_in_every_tile_of_its_rectangle() {
         nc.set_l1_writes(L1Writes {
             tiles: ours,
             window: window(),
+            ..Default::default()
         })
         .unwrap();
         nc.set_write_noc(d, &w, Niu::Noc1).unwrap();
@@ -436,6 +441,7 @@ fn a_multicast_lands_in_every_tile_of_its_rectangle() {
         nc.set_l1_writes(L1Writes {
             tiles: rect_tiles(),
             window: window(),
+            ..Default::default()
         })
         .unwrap();
         let to = window().start as u32;
@@ -559,6 +565,7 @@ fn a_read_pulls_a_peers_window() {
         b.set_l1_writes(L1Writes {
             tiles: sources().to_vec(),
             window: window(),
+            ..Default::default()
         })
         .unwrap();
         let span: u32 = LENS.iter().map(|l| l.next_multiple_of(64)).sum();
@@ -622,6 +629,7 @@ fn the_host_refuses_a_read_its_session_does_not_own() {
         b.set_l1_writes(L1Writes {
             tiles: PEERS.to_vec(),
             window: window().start..end,
+            ..Default::default()
         })
         .unwrap();
         let cases = [
@@ -723,6 +731,7 @@ fn a_run_of_multicasts_lands_before_the_next_entry() {
         nc.set_l1_writes(L1Writes {
             tiles: ours,
             window: window(),
+            ..Default::default()
         })
         .unwrap();
         nc.set_write_noc(d, &w, Niu::Noc1).unwrap();

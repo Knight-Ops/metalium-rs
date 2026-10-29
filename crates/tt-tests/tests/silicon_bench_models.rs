@@ -329,6 +329,24 @@ fn traced_image_forward(
     report(key, "ms", "host", Stats::of(ms));
     assert_eq!(got, eager, "a replay is the eager forward");
     assert_eq!(argmax(&got), argmax(host));
+    print_measured(key);
+}
+
+/// Each product question `TT_MATMUL_BLOCK=measured` timed in this process
+/// (`tt_kernels::tensor::measured`): its choice, and `Auto`'s time against the choice's.
+fn print_measured(key: &str) {
+    for (q, choice, times) in tt_kernels::tensor::measured() {
+        let times = times.map_or("not timed".into(), |[auto, chosen]| {
+            format!(
+                "Auto {auto:.1} us, chosen {chosen:.1} us ({:.3}x)",
+                auto / chosen
+            )
+        });
+        println!(
+            "MEASURE {key}: measured {:?} {:?} on {}: {choice:?}; {times}",
+            q.tiles, q.transposed, q.units
+        );
+    }
 }
 
 /// `resnet18_forward` as a trace ([`traced_image_forward`]).

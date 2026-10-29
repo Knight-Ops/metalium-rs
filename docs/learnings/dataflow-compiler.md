@@ -378,7 +378,7 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 | D2 | Partials across K chunks | Packer L1 accumulation | Reload into FP32 `Dst` | **Decided: reload** under the default contract (L1 accumulation changes rounding, G3). L1 accumulation stays available as a named contract |
 | D3 | Decode weight readers | DRAM-sharded, one reader beside each bank | Interleaved `READ_RUN` stream | **Decided 2026-10-27: no gain.** At equal entry sizes, 8 readers a channel equal today's deal; with reads 5× cheaper the step moves only 10.82 → 10.60 ms (F27, [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)) |
 | D4 | Layout search | Greedy (tt-mlir, after removing a solver) | Global solver | **Provisional: greedy** [PUB]. Revisit only on a measured loss |
-| D5 | Operand reuse in products | 2D multicast matmul | A few holders pulled by `READ_L1`; or GDDR re-reads with larger blocks | **Decided 2026-10-29: `A` pulled from a few holders** (1.33-1.44x with an FP32 `B` at three prefill shapes, bit for bit, F4b.1). `B` pulled loses (a holder's L1 fan-out; its credits' round trips do not bind). Multicast deferred, not refuted: on a 12-wide grid `B` down columns caps H1 at ~24.2 TFLOPS (96 units) and `A` along rows at ~1.17x; revisit when a shape's block rows suit the grid or after F5. Equal row groups leave `units % groups` units idle; other work on them needs F4a's channels in place of the op's closing barrier. For a packed `B` the block, not reads, binds (H1 1.7x at `[6,4,12]` with `A` pulled), shape-dependent: a measured block choice is next |
+| D5 | Operand reuse in products | 2D multicast matmul | A few holders pulled by `READ_L1`; or GDDR re-reads with larger blocks | **Decided 2026-10-29: `A` pulled from a few holders** (1.33-1.44x with an FP32 `B` at three prefill shapes, bit for bit, F4b.1). `B` pulled loses (a holder's L1 fan-out; its credits' round trips do not bind). Multicast deferred, not refuted: on a 12-wide grid `B` down columns caps H1 at ~24.2 TFLOPS (96 units) and `A` along rows at ~1.17x; revisit when a shape's block rows suit the grid or after F5. Equal row groups leave `units % groups` units idle; other work on them needs F4a's channels in place of the op's closing barrier. For a packed `B` the block, not reads, binds (H1 1.7x at `[6,4,12]` with `A` pulled), shape-dependent. **F4b.2 (2026-10-29): the block and the pull are measured together, the default** (`BlockStream::Measured`, `Reuse::Auto`, H9): 1.02-2.25x `Auto` a product, H1 through Burn 19.2 -> 29.2 TFLOPS, `A` pulled in 37 of 50 cases of every format once the block is right; eager products run `Auto`'s block, unshared |
 | D6 | Credit granularity | A page (often a tile) | A compute-sized batch (ours) | **Open.** Decided per channel class by the cost model once H4 measures sync cost against overlap. Sync cost measured (H8, 2026-10-28): a cross-core handoff ~1.8 us, a two-unit barrier ~2.6 us |
 | D7 | Replicating rows to many readers | Multicast | Sharded rows | **Decided: sharded.** Replicated rows by contended multicast took 43.9 ms a step against 20.92 (roadmap, residency 2e/2f) |
 | D8 | `Dst` width | BF16 `Dst`, 8 tiles a half, often the default | FP32 `Dst`, 4 a half | **Decided: FP32** in the default contract (S2). 16-bit is an opt-in contract |
@@ -576,6 +576,47 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
   - *Consequence for D6:* per-edge credits are cheaper than the barriers they would replace, but not free. At ~1.8 us a
     handoff, a credit per tile (TT-Metal's default) costs more than a K-tile pair's 0.14-0.23 us of math, so a credit
     stays per page of many tiles or per batch until H4 measures overlap.
+- **H9 A measured block choice** (F4b.2, opened 2026-10-29). D5's winner (`A` pulled) gains only with an FP32 `B`, and a
+  packed `B` is bound by the planner's block, whose best is shape-dependent; a re-weighed analytical model gained 1.4x at
+  some shapes and lost 14-22% at others (F4b.1). Measurement replaces ranking, as in Ansor and MetaSchedule (§14).
+  - *Claim:* the analytical models rank candidates well enough that the winner is among their few best, but cannot
+    order them. Timing those few (block × pull) on the card the first time a shape and format pair is planned, and
+    caching the winner, takes the fixed-block gains at every shape and loses at none. Every candidate is bit-equivalent
+    by construction (ADR 0005), so the choice changes time only.
+  - *Prediction:* at the four F4b shapes (`[2048,2048]@[2048,16384]`, `[1024,2048]@[2048,8192]`,
+    `[1024,8192]@[8192,2048]`, `[2048,8192]@[8192,2048]`) × five `B` formats in `silicon_probe_pair_cost`, never below
+    the model's choice beyond drift (≥ 0.98x); at H1, BFP8/4/2 ≥ 44 TFLOPS, BF16 ≥ 27.5, FP32 ≥ 28.0; through Burn
+    (`matmul_throughput`) an FP32 `B` at H1 ≥ 25.8 TFLOPS with no setting; the first plan of a shape costs ≤ 1 s.
+  - *Measured by:* `silicon_probe_pair_cost::pair_cost` and `matmul_throughput` on card 1, ABBA against the stage's
+    baseline; the time of a first plan from the session.
+  - *Kills it:* any shape and format measurably slower than the model's choice, or a winner that changes between
+    processes (timing noise larger than the gaps it ranks).
+  - *Result (2026-10-29, card 1; [log](performance-log.md#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1)):
+    the claim's first half is refuted, the rest holds but the first-plan cost; `Measured` and `Reuse::Auto` are the
+    defaults since.
+    - The models do not contain the winner: sweeps of every block at ten prefill shapes put the measured winners 25th to
+      over 1,000th by the format-blind model and hundreds deep by a slot-weighed one, and the peaks are narrow (1-12
+      blocks within 5% of the best).
+    - So the candidates are measured blocks, not modelled ones: `Auto`'s, unpulled and pulled, a list of blocks that
+      won the sweeps (`tensor::MEASURED_BLOCKS`), and a one-step climb from the fastest.
+    - What is timed must be what a model pays. A trace of the product alone counts a replay's fixed cost, which
+      favours blocks that leave units out: ViT-Tiny ran 11.6% slower on its "faster" blocks. Timed as the difference
+      of traces of `R` and `2R` copies, the models are unchanged (ResNet-18 0.997x, ViT-Tiny 0.980x).
+    - Two rules follow from the models, not from the products: an eager product runs `Auto`'s block (measured blocks
+      made eager training 1.5-2.9x slower, their planning paid every call), and nothing is pulled unmeasured (a static
+      FP32 pull cost ResNet-18 9.7%).
+    - Over 50 cases (10 shapes x 5 formats, three shapes the list never saw): never below `Auto`, **1.02-2.25x, 1.47x
+      on average**, each checked against exact arithmetic.
+    - H1, per product: FP32 **35.47**, BF16 **49.49**, BFP8 **48.57**, BFP4 **65.45**, BFP2 **66.19** TFLOPS (`Auto`
+      22.3-29.4); every clause holds. Through Burn with nothing set, H1 19.2 -> **29.0-29.2 TFLOPS** (1.52x; the 25.8
+      clause holds); 1.7B prefill 1.04-1.34x; decode, ResNet-18, ViT-Tiny and eager training unchanged; winners
+      reproduce across processes (H1 29.05 / 29.28 in two).
+    - A first plan costs 2.7-13.9 s a question, 6.7 s on average: the ≤ 1 s clause is missed. It is build time, which
+      the owner does not count (the 1.7B's traced build 154 -> 233 s).
+    - `A` pulled wins in 37 of 50 cases, every format, once the block is right: D5's "a packed `B` gains little from the
+      pull" was the default block's.
+    - Open: an eager product run again after its own shape's pulled capture takes 3-10% more host time, the device's
+      the same; not reproduced through the session alone.
 
 ---
 

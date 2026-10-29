@@ -11,6 +11,8 @@ tt-ttsim-sys.workspace = true
 tt-device.workspace = true
 tt-isa.workspace = true
 libc = "0.2"
+# `fork_scope` gives each child a rayon pool of its own (burn-flex runs on rayon).
+rayon = "1.12"
 
 [dev-dependencies]
 tt-ttsim-sys.workspace = true

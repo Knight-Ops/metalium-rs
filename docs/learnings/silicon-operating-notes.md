@@ -1590,6 +1590,29 @@ Rules that held through the Phase 10 close-out; follow them for any new probe.
 - **A worktree needs `vendor/`.** It is git-ignored, so copy it from the main checkout before building
   there (`cargo xtask fetch-ttsim`/`fetch-spec` also work).
 
+## Opening a card costs ~0.7 s, most of it BAR4's page tables (2026-10-29, card 0)
+
+`strace -f -T` of one fast Burn gate under the release silicon build
+(`step63_burn_full_reduce::full_views_and_row_slices_reduce_on_the_device`, 0.79 s wall, 0.66 s of it
+system time, 478 minor faults). The forked child spent:
+
+| Step | Time | Where |
+|---|---|---|
+| `mmap` BAR4 uncached and write-combining, 32 GiB each | 116 + 115 ms | `tt_kmd::Kmd::open` (`RESOURCE2_UC`, `RESOURCE2_WC`) |
+| AICLK busy settle, 14 polls 5 ms apart | ~72 ms | `Device::set_busy` (`arc_msg.rs`) |
+| 1 GiB hugepage host buffer, `MAP_POPULATE` | 52 ms | `HostBuffer::pin` |
+| AICLK idle settle, 7 polls | ~36 ms | `Device` drop |
+| `munmap` of the two BAR4 views | 182 + 190 ms | `Kmd` drop |
+| The gate itself | a few ms | |
+
+- **The cost is proportional to what is mapped.** The driver populates every PTE of a 32 GiB PFN
+  mapping when it is mapped and tears all of them down at `munmap`, about 600 ms of the 0.79 s.
+- **Most smoke gates are this short.** The suite's median of 0.81 s a test is mostly this fixed
+  cost.
+- **Not changed yet.** Mapping BAR4 lazily or a 4 GiB window at a time (`tt-kmd`, shippable) would
+  shorten every process that opens a card, the suite's and an application's. The
+  [test-tier notes](test-tiers.md#where-the-silicon-suites-time-goes) have the proposal.
+
 ## Running tt-metal after this repo's gates (2026-10-13, card 1)
 
 tt-metal (v077, UMD 0.77) will not open a card that this repo's Ethernet gates have touched. The first thing it does is return the

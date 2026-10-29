@@ -117,7 +117,8 @@ pub fn fork_scope<F: FnOnce()>(f: F) -> Result<(), ForkError> {
         0 => {
             // Child. Never return from here: unwinding past a fork point would run
             // the parent's test harness a second time in this address space.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| in_fresh_pool(f)));
             let _ = io::stdout().flush();
             let _ = io::stderr().flush();
             let code = if result.is_ok() { 0 } else { PANIC_EXIT_CODE };
@@ -145,6 +146,25 @@ pub fn fork_scope<F: FnOnce()>(f: F) -> Result<(), ForkError> {
                 Err(ForkError::Exited(-1))
             }
         }
+    }
+}
+
+/// Run `f` with a rayon pool of the child's own.
+///
+/// A child inherits rayon's global pool as the parent left it -- its bookkeeping,
+/// not its threads -- so once the parent has used it (burn-flex does, computing a
+/// host reference on every core), the child's first parallel job waits forever
+/// for workers that do not exist. A fresh pool that takes this thread as its
+/// first worker keeps `f` on this thread, thread-locals and all, and gives every
+/// rayon call inside it live workers. The pool is never torn down: the child
+/// `_exit`s.
+fn in_fresh_pool(f: impl FnOnce()) {
+    match rayon::ThreadPoolBuilder::new().use_current_thread().build() {
+        Ok(_pool) => f(),
+        // This thread already works for the pool a forking ancestor built, whose
+        // other threads are gone. Its own jobs land in its own queue, which it
+        // runs while it waits, so `f` completes on one core.
+        Err(_) => f(),
     }
 }
 

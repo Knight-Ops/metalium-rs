@@ -96,6 +96,7 @@ fn pair(d: &mut Dev<'_>, w: &Window) -> Pair {
     p_nc.set_l1_writes(L1Writes {
         tiles: vec![CONSUMER],
         window: window(),
+        ..Default::default()
     })
     .unwrap();
     p_nc.set_write_noc(d, w, Niu::Noc1).unwrap();
@@ -104,6 +105,7 @@ fn pair(d: &mut Dev<'_>, w: &Window) -> Pair {
     c_b.set_l1_writes(L1Writes {
         tiles: vec![PRODUCER],
         window: window(),
+        ..Default::default()
     })
     .unwrap();
     let c_nc = start(d, w, CONSUMER, Mover::NC);

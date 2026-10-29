@@ -14,11 +14,7 @@
 //!   steps attending to 64 and then 128 positions, bit for bit against the eager schedule and the
 //!   growing cache, at prompt lengths on both sides of a chunk and of a step length.
 //!
-//! On the simulator the Flex comparison is opt-in (`-- --ignored`), at one layer: the 2048 x 49,152
-//! output projection makes it the slowest test of the suite (about 6 minutes). The traced test is
-//! silicon only: the simulator runs on one tile, whose program cache cannot hold a 2048-wide
-//! capture's programs ("a list's programs do not fit an empty program cache", the limit trace
-//! segmentation lifts); `step187` covers the traced path on the simulator.
+//! Model workloads: none runs on the simulator (`docs/learnings/test-tiers.md`).
 
 mod ladder_support;
 
@@ -57,12 +53,8 @@ fn config() -> Config {
 
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
-)]
-#[cfg_attr(
-    all(feature = "weights", not(feature = "silicon")),
-    ignore = "slow on the simulator (minutes): run explicitly with -- --ignored"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step188_smollm2_1_7b"
 )]
 fn device_agrees_with_flex() {
     let (layers, steps) = (layers(), if cfg!(feature = "silicon") { 16 } else { 2 });
@@ -115,8 +107,8 @@ fn traced_generation_equals_the_eager_one() {
 #[cfg(feature = "silicon")]
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step188_smollm2_1_7b"
 )]
 fn the_native_context_agrees_with_flex() {
     use tt_models::generate::{generate_fixed, Shapes};

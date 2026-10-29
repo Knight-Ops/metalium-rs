@@ -79,6 +79,10 @@ fn step_ops(model: &Llama<Tt>, d: &TtDevice) -> Vec<(String, Vec<burn_tt::OpReco
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step197_trace_bytes"
+)]
 fn a_decode_step_reads_each_weight_once() {
     with_device(Config::default(), |d| {
         burn_tt::set_count_trace_bytes(d, true).unwrap();

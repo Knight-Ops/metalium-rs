@@ -70,8 +70,8 @@ fn run(precision: Precision, layers: usize, steps: usize) {
 
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step167_smollm2"
 )]
 fn smollm2_in_f32_on_the_device_agrees_with_flex() {
     run(Precision::F32, layers(), steps());
@@ -82,8 +82,8 @@ fn smollm2_in_f32_on_the_device_agrees_with_flex() {
 #[cfg(feature = "silicon")]
 #[test]
 #[cfg_attr(
-    not(feature = "weights"),
-    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-tests/weights"
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step167_smollm2"
 )]
 fn smollm2_in_bf16_on_the_device_agrees_with_flex() {
     // Six layers and four tokens: through the embedding lookup (15 s a token, more in BF16) the

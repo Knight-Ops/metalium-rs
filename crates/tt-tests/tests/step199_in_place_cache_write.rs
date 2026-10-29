@@ -356,6 +356,10 @@ fn a_transpose_kept_from_before_the_capture_is_not_read() {
 /// A synthetic Llama's traced decode steps write their caches in place, and its generation is
 /// the copying generation's, token for token and bit for bit.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step199_in_place_cache_write"
+)]
 fn a_decoder_s_steps_write_their_caches_in_place() {
     with_device(Config::default(), |d| {
         let config = LlamaConfig {
@@ -453,6 +457,10 @@ impl FixedShapeDecoder<TtBackend> for InLayout<'_> {
 /// positions, a ragged 48 (whose operands are not whole tiles of the cache's rows) and the whole
 /// 128-position cache, and a prefill of two chunks writes through the layout too.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step199_in_place_cache_write"
+)]
 fn a_position_major_cache_writes_the_projection_s_row_as_it_is() {
     with_device(Config::default(), |d| {
         let config = LlamaConfig {

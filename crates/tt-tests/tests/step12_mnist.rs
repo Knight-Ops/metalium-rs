@@ -16,18 +16,18 @@
 //! * **Training works**: the loss falls by a stated factor, and the host run of
 //!   the same setup meets the same factor, so the factor is a property of the
 //!   setup rather than a number chosen to pass.
-//! * **The run is deterministic, and silicon computes what ttsim computes**: the
-//!   reduced run's loss curve is pinned bit for bit in
-//!   `tests/golden/mnist_reduced.txt`, which the simulator run wrote and the
-//!   silicon run must reproduce.
+//! * **The run is deterministic**: the reduced run's loss curve is pinned bit
+//!   for bit in `tests/golden/mnist_reduced.txt`, which the single-tile silicon
+//!   run blesses and every other configuration (four tiles, two chips) must
+//!   reproduce.
 //! * **Not claimed**: that later steps stay within a bound of the host run.
 //!   Two runs whose first steps differ by rounding diverge along chaotic
 //!   trajectories, and a bound that honestly covered that would say nothing.
 //!   The curves are printed side by side instead.
 //!
-//! The training runs are the end-to-end tier (`tt-tests`'s `e2e` feature): on
-//! ttsim they run only with it, on silicon always. The first-forward-pass
-//! bound is cheap and stays in the default tier.
+//! Every test here is a model workload, so none runs on the simulator
+//! (`docs/learnings/test-tiers.md`): `cargo xtask silicon --release --filter
+//! step12_mnist`.
 
 use burn::backend::Autodiff;
 use burn::module::{Module, Param};
@@ -152,7 +152,7 @@ struct Setup {
     lr: f64,
 }
 
-/// The reduced run the simulator gate uses, and silicon repeats bit for bit.
+/// The reduced run the golden pins.
 const REDUCED: Setup = Setup {
     samples: 512,
     batch: 64,
@@ -260,9 +260,9 @@ fn golden_path() -> std::path::PathBuf {
 
 fn render(losses: &[f32]) -> String {
     let mut s = String::from(
-        "# The reduced MNIST run's loss per step, as f32 bits. Written by the ttsim run\n\
-         # of step12_mnist::the_mlp_trains_on_a_reduced_dataset with TT_BLESS=1; the\n\
-         # silicon run must reproduce it exactly.\n",
+        "# The reduced MNIST run's loss per step, as f32 bits. Written by the silicon run\n\
+         # of step12_mnist::the_mlp_trains_on_a_reduced_dataset with TT_BLESS=1; every\n\
+         # other configuration must reproduce it exactly.\n",
     );
     for l in losses {
         s.push_str(&format!("{:08x} {l}\n", l.to_bits()));
@@ -349,8 +349,8 @@ fn assert_steady_state_traffic(
 
 #[test]
 #[cfg_attr(
-    not(feature = "e2e"),
-    ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step12_mnist"
 )]
 fn the_mlp_trains_on_a_reduced_dataset() {
     reduced_run_matches_the_golden(Config {
@@ -364,8 +364,8 @@ fn the_mlp_trains_on_a_reduced_dataset() {
 /// the single-tile golden bit for bit, and the same steady-state traffic.
 #[test]
 #[cfg_attr(
-    not(feature = "e2e"),
-    ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step12_mnist"
 )]
 fn the_mlp_trains_on_four_tiles_matching_the_golden() {
     reduced_run_matches_the_golden(Config {
@@ -430,7 +430,7 @@ fn reduced_run_matches_the_golden(config: Config) {
             "the loss must fall to {DESCENT} of its first value: {tt:?}"
         );
         assert_ne!(tt, host, "the matmuls must have run on the device");
-        if bless && !tt_tests::backend::ON_SILICON {
+        if bless {
             std::fs::create_dir_all(golden_path().parent().unwrap()).unwrap();
             std::fs::write(golden_path(), render(&tt)).unwrap();
             eprintln!("wrote {}", golden_path().display());
@@ -438,7 +438,7 @@ fn reduced_run_matches_the_golden(config: Config) {
         }
         let want = want.unwrap_or_else(|| {
             panic!(
-                "{} is missing: run this gate on the simulator with TT_BLESS=1",
+                "{} is missing: run this gate on silicon with TT_BLESS=1",
                 golden_path().display()
             )
         });
@@ -458,6 +458,10 @@ fn reduced_run_matches_the_golden(config: Config) {
 /// `h W2 + b2` within `bound(h, W2) + |W2|^T beta1`. Bias additions round once
 /// on each side: `2^-24` of each operand, twice.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step12_mnist"
+)]
 fn the_first_forward_pass_is_within_the_derived_bound() {
     let split = mnist::load(true);
     let init = init();
@@ -533,6 +537,10 @@ fn the_first_forward_pass_is_within_the_derived_bound() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step12_mnist"
+)]
 fn the_first_forward_pass_with_fusion_is_within_the_derived_bound() {
     let split = mnist::load(true);
     let init = init();
@@ -615,6 +623,10 @@ fn the_first_forward_pass_with_fusion_is_within_the_derived_bound() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step12_mnist"
+)]
 fn the_first_forward_pass_with_fusion_and_trace_is_within_the_derived_bound() {
     let split = mnist::load(true);
     let init = init();
@@ -698,6 +710,10 @@ fn the_first_forward_pass_with_fusion_and_trace_is_within_the_derived_bound() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step12_mnist"
+)]
 fn compare_all_four_execution_modes_latency_and_traffic() {
     let split = mnist::load(true);
     let init = init();
@@ -862,8 +878,7 @@ fn compare_all_four_execution_modes_latency_and_traffic() {
     });
 }
 
-/// The whole training set, one epoch, then the test set -- silicon only; the
-/// simulator gate above is the reduced run.
+/// The whole training set, one epoch, then the test set.
 #[test]
 #[cfg(feature = "silicon")]
 fn the_mlp_trains_on_full_mnist() {
@@ -968,19 +983,9 @@ fn sharded_training_matches_the_golden(chips: usize) {
 
 #[test]
 #[cfg_attr(
-    not(feature = "e2e"),
-    ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step12_mnist"
 )]
 fn the_mlp_trains_sharded_over_two_chips_matching_the_golden() {
     sharded_training_matches_the_golden(2);
-}
-
-#[cfg(not(feature = "silicon"))]
-#[test]
-#[cfg_attr(
-    not(feature = "e2e"),
-    ignore = "end-to-end training on ttsim: run with --features tt-tests/e2e"
-)]
-fn the_mlp_trains_sharded_round_a_four_chip_ring_matching_the_golden() {
-    sharded_training_matches_the_golden(4);
 }

@@ -228,7 +228,7 @@ jobs:
           cargo test -p tt-tests --features encoded-guard --test step172_encoded_reads --test step173_mover_differential
 
   simulator-full:
-    name: Full simulator & E2E regression
+    name: Full simulator regression
     # Run on scheduled nightly, manual trigger, or push to main
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
@@ -279,7 +279,7 @@ jobs:
       - name: Fetch cfg_defines.h
         run: cargo xtask gen-cfg --check
 
-      # Full simulator gate suite across all 80+ steps
+      # Full simulator validation suite (model workloads are silicon-tier and show as ignored)
       - name: Test (simulator all)
         run: cargo test -p tt-tests
 
@@ -287,10 +287,6 @@ jobs:
       # plain read): the nightly proof that turning it on changes no result.
       - name: Test (simulator all, fast-reads)
         run: cargo test -p tt-tests --features fast-reads
-
-      # The end-to-end tier: Burn training on ttsim against the golden loss curve
-      - name: Test (end-to-end)
-        run: cargo test -p tt-tests --features e2e --test step12_mnist
 
       - name: Cache the pinned Burn test suite
         uses: actions/cache@v4

@@ -75,8 +75,8 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 Run from the repository root. Toolchain/targets are in `rust-toolchain.toml`.
 Pinned inputs live in `vendor/`; fetch missing inputs with `cargo xtask fetch-ttsim`,
 `fetch-spec`, `fetch-mnist` (needed by `tt-mnist`), `fetch-burn-tests` (needed by
-`cargo xtask conformance`), `fetch-weights` (3.8 GB, or `--model <name>`; needed by the `tt-models` tests and the model-ladder
-gates, which are ignored without `--features weights`), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
+`cargo xtask conformance`), `fetch-weights` (3.8 GB, or `--model <name>`; needed by the `tt-models` tests, ignored without `--features tt-models/weights`, and by the
+model-ladder gates, which run on silicon only), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
 
 Choose checks for the changed layer; CI and `prek.toml` define the full set:
 
@@ -113,11 +113,19 @@ step172_encoded_reads --test step173_mover_differential` and the same with `--fe
 (`encoded::Context`); the host's `validate` also runs the independent `guard`; `enqueue_checked` validates every
 `READ_ENCODED`, and only the `#[doc(hidden)] enqueue_raw` sends an entry unchecked (for gates that forge one).
 
-Arithmetic, routing or execution-order changes also need the training regression:
+Arithmetic, routing or execution-order changes also need the training regression, on card 0:
 
 ```bash
-cargo test -p tt-tests --features e2e --test step12_mnist
+cargo xtask silicon --release --device 0 --filter step12_mnist
 ```
+
+**Test tiers** ([test-tiers.md](docs/learnings/test-tiers.md)). ttsim is for validation: encodings,
+single kernels and ops, mover and firmware records, and risky instructions before silicon. Model
+workloads never run on ttsim: MNIST, synthetic or pretrained decoders, training loops, multi-layer
+stacks. Such a gate is `#[cfg_attr(not(feature = "silicon"), ignore = "model workload, ...")]` and
+needs a `SMOKE` entry in `xtask/src/silicon.rs`, which is then its only routine run. burn-flex is
+the CPU oracle for model-scale checks. It runs on every core (rayon); `fork_scope` gives each forked
+child a fresh pool.
 
 Changes to `burn-tt` operations or routing also need Burn's own backend tests, whose result
 must match `crates/burn-tt-conformance/expected-failures.toml` (a fixed test leaves the list):
@@ -197,7 +205,8 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
   mesh/multi-card ops), native Burn routing,
   residency/padding checks and a smoke entry. Follow
   `docs/plans/new-op-definition-of-done.md`. Re-bless `crates/tt-tests/tests/golden/mnist_reduced.txt` with
-  `TT_BLESS=1` only for an explained, deliberate arithmetic change.
+  `TT_BLESS=1` on card 0 (`--filter step12_mnist::the_mlp_trains_on_a_reduced_dataset`) only for an
+  explained, deliberate arithmetic change.
 
 ## Avoid hardware failures
 

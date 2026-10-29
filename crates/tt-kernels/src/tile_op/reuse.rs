@@ -38,7 +38,8 @@ use std::collections::HashMap;
 use tt_isa::dm::{credit_word, op, record};
 
 use super::distribute::Shared;
-use crate::tensor::{Job, Result, Step, TensorError};
+use super::Share;
+use crate::tensor::{Job, Result, Reuse, Step, TensorError};
 
 /// The credit word in which a reader counts the strips of `A` its holder has gathered for it.
 pub const READY: u32 = 0;
@@ -94,6 +95,29 @@ static OVERWAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// negative control: the op must fail, and the session must recover from it).
 pub fn probe_overwait(on: bool) {
     OVERWAIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Holders a group when a measured choice pulls `A` ([`Reuse::Auto`],
+/// `tensor::BlockStream::Measured`): D5's scheme, `A` pulled from four
+/// (`docs/learnings/performance-log.md`, "D5 decided").
+pub const AUTO_HOLDERS: usize = 4;
+
+/// How an op's units share their reads under `reuse` ([`super::TileOp::share`]), each unit's
+/// tile in `tiles`; `None` where they read their own, or where `tiles` is empty (the session does
+/// not let its movers copy). [`Reuse::Auto`] shares only what a measurement chose to pull
+/// (`tensor::BlockStream::Measured` passes its choice's [`Reuse::Pull`] here): unmeasured, it
+/// shares nothing. No rule by format or shape: D5's "pull with an FP32 `B`", from prefill
+/// shapes, ran ResNet-18 and ViT-Tiny 10-11% slower (F4b.2). The deal decides whether two
+/// units share a strip at all ([`super::distribute::shared`]).
+pub fn share(reuse: Reuse, tiles: &[(u8, u8)]) -> Option<Share> {
+    let Reuse::Pull { holders, b_holders } = reuse else {
+        return None;
+    };
+    (!tiles.is_empty()).then(|| Share {
+        holders,
+        b_holders,
+        tiles: tiles.into(),
+    })
 }
 
 /// The flags that say which tiles of the first operand a `GATHER` reads and how: transposed,
@@ -811,6 +835,22 @@ mod tests {
                 run(&shared, &tiles, seed).unwrap_or_else(|e| panic!("{shape:?} seed {seed}: {e}"));
             }
         }
+    }
+
+    /// Unmeasured, `Auto` shares nothing; an explicit scheme is taken as asked; no tiles, no
+    /// sharing.
+    #[test]
+    fn auto_shares_nothing_unmeasured_and_a_scheme_as_asked() {
+        let tiles = [(1, 2), (2, 2)];
+        assert_eq!(super::share(Reuse::Auto, &tiles), None);
+        assert_eq!(super::share(Reuse::Off, &tiles), None);
+        let asked = Reuse::Pull {
+            holders: 2,
+            b_holders: Some(1),
+        };
+        let s = super::share(asked, &tiles).expect("an explicit scheme");
+        assert_eq!((s.holders, s.b_holders), (2, Some(1)));
+        assert_eq!(super::share(asked, &[]), None);
     }
 
     /// The negative control: a holder that gathers into its slots without waiting for its
