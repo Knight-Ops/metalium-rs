@@ -282,6 +282,16 @@ The 1.7B profile shows where this could pay: products start near 634 GB/s and en
     word alone in its 16 bytes). Their lifetimes cover trace holds.
   - The host writes their initial values before either side runs (`channel::prepare`, T9). The card never resets them.
   - TT-Metal's compiler needed a "forge_backdoor" to place global semaphores [PUB]. Here placement belongs to the planner from the start.
+  - **An op's own credits are not its L1** (F4b, 2026-10-28). A channel inside one op, whose units credit each other
+    (operand reuse), cannot keep its counts in the op's L1: other ops overwrite that L1 with tiles between two such
+    ops, so the counts would be zeroed as the op starts, and a peer that credits early races the owner's zeroing.
+    They live in the tile's fixed op-level credit words (`tt_isa::dm::CREDITS`, 64 bytes past B's mailbox, in no
+    arena or capture). The session zeroes them when a tile's movers start; each owner credits its word minus its total
+    after its last wait on it, so the op ends where it began; the barrier after the op orders that before any peer's
+    next credit. A replay ends where it began too.
+  - **The host must not deadlock on a linked op.** The session queues an op in rounds of segments and may wait on one
+    unit mid-round; with units crediting each other, that is safe only if every unit's segments are cut at the same
+    chunks (`session::linked_groups`), a unit sitting a round out as a placeholder.
 - **Barriers remain only** where no channel can express the dependency:
   - a dependency through GDDR whose reader or writer sets are unknown at plan time;
   - a host synchronization point;
@@ -411,7 +421,15 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 Each entry: the claim, the prediction, how it is measured, and what kills it. Results are recorded in place.
 
 - **H1 Operand reuse.** Products at prefill shapes are bound by operand reads, so reading each operand from GDDR about once (D5's winner) lifts them toward the compute bound, for every format at once.
-  - *Prediction:* `[m,2048]@[2048,16384]` at m = 2,048 from 18.2 to ≥ 35 TFLOPS. The BFP8-weight case improves in proportion to its bytes.
+  - *Prediction as first written:* `[m,2048]@[2048,16384]` at m = 2,048 from 18.2 to ≥ 35 TFLOPS. The BFP8-weight case improves in proportion to its bytes.
+  - *The ceiling, measured before the build (F4b.0, 2026-10-28, card 1, `1793224018`, `1793224268`, `1793224072`):*
+    with every gather left out, the shape runs at 30.3 TFLOPS with an FP32 `B` and 28.0 with a BF16 or BFP one, so 35
+    is out of reach for reuse. Today it is 19.2-19.4 through Burn (20.1 in the probe), reading 2,062 MB for 151 MB of
+    operands; a packed `B` already runs at 88-94% of its ceiling, so the BFP8 clause is withdrawn
+    ([log](performance-log.md#f4b0-what-operand-reuse-can-buy-the-reads-free-ceiling-at-prefill-shapes-2026-10-28-card-1)).
+  - *Prediction, restated against the ceiling before the build (owner, 2026-10-28):* with an FP32 `B`, ≥ 25.8 TFLOPS
+    (85% of the ceiling) through `matmul_throughput`, with GDDR reads ≤ 302 MB (twice the operands); with a packed `B`,
+    ≥ 95% of the ceiling (≥ 26.6) in `silicon_probe_pair_cost`.
   - *Measured by:* `matmul_throughput` and the profile's card read rate.
   - *Kills it:* reads drop and TFLOPS do not.
 - **H2 `Dst` subblocks and half-sync.** Once reads stop binding (after H1), the kernel's math utilization rises from ~41-68% of HiFi4 issue toward ~90%. That range is derived from the 0.14-0.23 µs measured per K-tile pair against 128 cycles of `MVMUL`.

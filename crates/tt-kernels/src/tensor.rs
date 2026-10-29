@@ -1546,6 +1546,7 @@ pub fn matmul_dram(
             second_job: false,
             balanced_deal: false,
             block_stream: BlockStream::Off,
+            reuse: Reuse::Off,
         },
     )
 }
@@ -1654,6 +1655,52 @@ pub(crate) struct Reads {
     /// Whether a product of several tile rows runs as 2-D blocks with `K` streamed
     /// ([`BlockStream`]).
     pub block_stream: BlockStream,
+    /// Whether a blocked product's units share their reads of `A` ([`Reuse`]).
+    pub reuse: Reuse,
+}
+
+/// Whether the units of a product of 2-D blocks with `K` streamed ([`BlockStream`]) that read
+/// the same strip of `A` share its reads (X4, H1; `crate::tile_op::reuse`). Bit for bit the
+/// unshared product: the copies only move bytes into the slots a read would fill.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Reuse {
+    /// Each unit reads its own strips.
+    #[default]
+    Off,
+    /// At most `holders` units of a group read a strip from GDDR, and the others copy it from
+    /// one of them (`op::READ_L1`, credited both ways).
+    Pull { holders: usize },
+}
+
+impl Reuse {
+    /// `TT_OPERAND_REUSE`: `off`, or `pull` or `pull:<holders>` (one by default); [`Reuse::Off`]
+    /// when unset.
+    pub fn from_env() -> Self {
+        match std::env::var("TT_OPERAND_REUSE") {
+            Err(_) => Reuse::Off,
+            Ok(v) => v
+                .parse()
+                .unwrap_or_else(|e| panic!("TT_OPERAND_REUSE={v}: {e}")),
+        }
+    }
+}
+
+impl std::str::FromStr for Reuse {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.split_once(':') {
+            None if s == "off" || s == "0" => Ok(Reuse::Off),
+            None if s == "pull" => Ok(Reuse::Pull { holders: 1 }),
+            Some(("pull", h)) => match h.trim().parse::<usize>() {
+                Ok(holders) if holders > 0 => Ok(Reuse::Pull { holders }),
+                _ => Err(format!("`pull:{h}`: expected a positive holder count")),
+            },
+            _ => Err(format!(
+                "expected `off`, `pull` or `pull:<holders>`, not `{s}`"
+            )),
+        }
+    }
 }
 
 /// Whether a GDDR product of at least two tile rows runs as `[mb, nb]` blocks of output tiles,
@@ -1816,6 +1863,7 @@ pub(crate) fn matmul_dram_limited(
         &[],
         units,
         &[],
+        &[],
     )
     .map(|(work, ..)| work)
 }
@@ -1879,6 +1927,7 @@ pub(crate) fn matmul_dram_prefetching(
     prefetch: &[usize],
     spread: usize,
     busy: &[Option<u64>],
+    tiles: &[(u8, u8)],
 ) -> Result<(Work, Option<usize>, Option<Handoff>)> {
     let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
     a.expect("a matmul", edge(route.packed_a()))?;
@@ -1965,6 +2014,12 @@ pub(crate) fn matmul_dram_prefetching(
                     tiles: layout.tiles,
                 },
             )?;
+            if let (Reuse::Pull { holders }, false) = (reads.reuse, tiles.is_empty()) {
+                op.share = Some(crate::tile_op::Share {
+                    holders,
+                    tiles: tiles.into(),
+                });
+            }
             let work = op.build(alloc, units, Overlap::Off)?;
             return Ok((work, None, None));
         }
@@ -6798,6 +6853,7 @@ mod tests {
                 second_job: false,
                 balanced_deal: false,
                 block_stream: super::BlockStream::Off,
+                reuse: super::Reuse::Off,
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,
@@ -6886,6 +6942,7 @@ mod tests {
                         second_job: false,
                         balanced_deal: false,
                         block_stream: super::BlockStream::Off,
+                        reuse: super::Reuse::Off,
                     },
                 )
                 .unwrap();
@@ -6968,10 +7025,12 @@ mod tests {
                     second_job: false,
                     balanced_deal: false,
                     block_stream: super::BlockStream::Off,
+                    reuse: super::Reuse::Off,
                 },
                 &[],
                 units,
                 busy,
+                &[],
             )
             .unwrap()
             .0
@@ -7059,6 +7118,7 @@ mod tests {
                     second_job: false,
                     balanced_deal: false,
                     block_stream: super::BlockStream::Off,
+                    reuse: super::Reuse::Off,
                 },
             )
             .unwrap();
@@ -7141,9 +7201,11 @@ mod tests {
                         second_job: false,
                         balanced_deal: false,
                         block_stream: super::BlockStream::Off,
+                        reuse: super::Reuse::Off,
                     },
                     &prefetch,
                     spread,
+                    &[],
                     &[],
                 )
                 .unwrap();
@@ -7253,9 +7315,11 @@ mod tests {
                     second_job: false,
                     balanced_deal: on,
                     block_stream: super::BlockStream::Off,
+                    reuse: super::Reuse::Off,
                 },
                 &prefetch,
                 spread,
+                &[],
                 &[],
             )
             .unwrap();
@@ -7396,9 +7460,11 @@ mod tests {
                     second_job: false,
                     balanced_deal: false,
                     block_stream: super::BlockStream::Off,
+                    reuse: super::Reuse::Off,
                 },
                 &prefetch,
                 spread,
+                &[],
                 &[],
             )
             .unwrap();
@@ -7834,6 +7900,7 @@ mod block_stream_tests {
             second_job: false,
             balanced_deal: false,
             block_stream: mode,
+            reuse: Reuse::Off,
         }
     }
 

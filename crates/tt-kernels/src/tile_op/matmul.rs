@@ -144,6 +144,7 @@ pub fn matmul(
         contract: NumericContract::Program,
         out: ([m, n], Elem::F32),
         ahead: Vec::new(),
+        share: None,
     })
 }
 

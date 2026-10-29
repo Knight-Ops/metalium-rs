@@ -357,6 +357,9 @@ pub const SMOKE: &[&str] = &[
     // F2: cross-core channels; pages handed over by NoC atomic credits (remote, broadcast and
     // GDDR rings), a missing credit stalls and is cancelled, malformed credits refused.
     "step242_channel_credits::",
+    // F4b: operand reuse; a blocked product's readers copy `A` from a holder's L1 under credits,
+    // bit for bit the unshared product, eager and replayed, every credit word back at zero.
+    "step244_operand_reuse::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

@@ -197,7 +197,7 @@ const fn mailbox_dump(name: &'static str, m: mailbox::role::Mailbox) -> Region {
 
 /// Every block of [`MAILBOXES`] the firmware and the host name by a constant, in address order:
 /// whatever of the region is not in one of these is unused.
-pub const FIXED: [Region; 12] = {
+pub const FIXED: [Region; 13] = {
     use mailbox::role::Mailbox;
     [
         mailbox_words("single-core mailbox", Mailbox::single_core()),
@@ -212,6 +212,11 @@ pub const FIXED: [Region; 12] = {
             name: "B mover mailbox and read endpoints",
             base: dm::MAILBOX_BASE,
             end: dm::encoded::ENDPOINTS + dm::encoded::ENDPOINT_WORDS as u64 * 4,
+        },
+        Region {
+            name: "op-level credit words",
+            base: dm::CREDITS,
+            end: dm::CREDITS_END,
         },
         Region {
             name: "NC mover mailbox and stream words",

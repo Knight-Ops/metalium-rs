@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [F4b.1: `A` pulled from a few holders, the first measured scheme of D5](#f4b1-a-pulled-from-a-few-holders-the-first-measured-scheme-of-d5-2026-10-28-cards-0-and-1) | 2026-10-28 | H1's product with `A` shared, copied from 2-4 holders a group by `READ_L1`: 19.1 -> **25.98 TFLOPS** (86% of the ceiling), bit for bit; reads 2,062 -> 1,346 MB, `B` still read 8 times; a host-queueing deadlock at scale found and fixed (segments cut at the same chunks on every unit) |
+| [F4b.0: what operand reuse can buy, the reads-free ceiling at prefill shapes](#f4b0-what-operand-reuse-can-buy-the-reads-free-ceiling-at-prefill-shapes-2026-10-28-card-1) | 2026-10-28 | H1's shape `[2048,2048]@[2048,16384]` 19.36 / 19.17 TFLOPS through Burn on card 1, reading 2,062 MB for 151 MB of operands; reads-free ceiling 30.3 (FP32 `B`) and 28.0 (packed `B`), so 35 is out of reach: reuse buys up to 1.51x for FP32 operands, at most 1.13x for packed weights; H1 restated (≥ 25.8 TFLOPS, ≤ 302 MB); found: `down` 1.7x slower through Burn than through the session |
 | [F3: the tile-generic op, pointwise and reduction ported, before and after](#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1) | 2026-10-28 | B0 (`050cbbd`) against the pointwise family and the reduction on `TileOp`, word for word: their build stage first 20-50% slower (per-run allocations, up to 3.9% of a call), then within 1.8% of B0 on every call (`8011dc7`, ABBA); traced decode ABBA 0.997-1.005 of B0 against B0's own 1.5% drift; models and MNIST within drift; F3 closed: the matmul, allocation and channels as passes, eager step time (B1) within drift of F3.8's tree, ABBA |
 | [A cross-core credit against the barrier (H8)](#a-cross-core-credit-against-the-barrier-h8-2026-10-28-card-1) | 2026-10-28 | F2: a credited handoff between two units 1.81 us, a two-unit barrier 2.66 / 2.59 us (polled / released); a 4 KiB page at depth 2 with the consumer's copy 9.39 us; H8's 1.5 us prediction missed, its claim held |
 | [The GDDR write benches run again](#the-gddr-write-benches-run-again-2026-10-28-card-0) | 2026-10-28 | broken since the B/NC split (`3c7756b`: a barrier is B's, NC refused the lists); NC's writes now run in B's transfer packets behind B's barrier: NoC #1 writes 403-408 / 385-388 GB/s at 16 / 120 tiles, as before; 235 at 4 (was 299: the handoff on a short run) |
@@ -382,6 +384,101 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## F4b.1: `A` pulled from a few holders, the first measured scheme of D5 (2026-10-28, cards 0 and 1)
+
+The first of D5's schemes, prototyped inside the product, not in a synthetic probe (owner, 2026-10-28; F4b.0 showed
+skipping `A`'s reads alone recovers 92-99% of the ceiling, and `GATHER_A_RESIDENT` already skips `A`). A shared deal
+(`tile_op::distribute::Shared`) keeps the units that read the same strip of `A` in a group, each sub-group's first
+member a holder. A pass over the lowered `GATHER` records (`tile_op::reuse::pull`) makes each reader wait for its
+holder's credit, copy the strip from the holder's L1 (`op::READ_L1`, into the same slots), credit the holder free and
+read only `B`; the credits count in the tile's fixed op-level credit words (`tt_isa::dm::CREDITS`), which each unit
+returns to zero. `TT_OPERAND_REUSE=pull:<holders>`, off by default.
+
+**`[2048,2048]@[2048,16384]` on card 1** (`matmul_throughput`, traced replay, median of 7; each replay bit for bit the
+eager product, which equals exact integer arithmetic on a grid):
+
+| `TT_OPERAND_REUSE` | TFLOPS | GDDR read (`A` / `B`) | Run |
+|---|--:|--:|---|
+| off | 19.18 / 19.06 | 2,061.8 MB (971.2 / 1,090.5) | `1793228844`, `1793228890` |
+| pull:1 | 25.27 | 1,158.7 MB (68.2 / 1,090.5) | `1793228853` |
+| pull:2 | 25.88 | 1,226.8 MB (136.3 / 1,090.5) | `1793228862` |
+| pull:4 | **25.98** | 1,346.1 MB (255.6 / 1,090.5) | `1793228872` |
+| pull:8 | 25.46 | 1,601.7 MB (511.2 / 1,090.5) | `1793228881` |
+
+- **1.36x, 86% of the 30.3 ceiling.** H1's restated TFLOPS clause (≥ 25.8) holds at 2-4 holders a group of 15.
+- **The reads clause (≤ 302 MB) does not yet:** only `A` is shared; `B` is still read 8 times (1,091 MB). Sharing `B`
+  along the other axis needs a `GATHER` that skips `B`, which does not exist (a firmware flag).
+- One holder serves 14 readers' copies and sends 14 credits a chunk, each a NoC round trip on its B; two to four
+  holders spread that, eight read `A` too often again.
+
+**What it took on silicon (card 0, gate `step244_operand_reuse`, `1793226376`; every-tile probe).** Small products
+passed at once. H1's product on every tile stalled (a list timed out after 225 s): every reader waited on its holder's
+next credit, and every holder had finished what it had been queued. The session cuts each unit's lists by entry count,
+and a holder's chunk carries a credit for each reader, so its segments held fewer chunks than its readers'. The
+readers ran ahead into segments that waited on a holder segment the host had yet to queue, while the host waited on
+those readers. The session now cuts an op whose units credit each other at the same chunks on every unit, a hole as a
+placeholder (`session::linked_groups`), and the deal keeps a reader's `t`-th block of a row in the same round as its
+holder's. Then H1's product on every tile is the unshared one bit for bit (13,568 copies).
+
+## F4b.0: what operand reuse can buy, the reads-free ceiling at prefill shapes (2026-10-28, card 1)
+
+Stage F4b of [dataflow-compiler.md](../plans/dataflow-compiler.md) opens with its baseline at `f60b228`. H1's prediction
+(`[2048,2048]@[2048,16384]` from 18.2 to ≥ 35 TFLOPS) used a card-0 number from before P4, and the only reads-free
+ceiling measured was at 1,024 rows. The owner chose to measure that ceiling at H1's own shape first, and to restate the
+prediction against it before anything is built.
+
+**Baseline, through Burn** (`matmul_throughput`, `TT_MATMUL_SHAPES`, F32 `B`, TF32/HiFi4, every tile, traced replay,
+median of 7; `1793224018` and `1793224268`):
+
+| Product | TFLOPS | Units | GDDR read (`A` / `B`) | Read rate |
+|---|--:|--:|--:|--:|
+| `[2048,2048]@[2048,16384]` | **19.36 / 19.17** | 120 | 2,061.8 MB (971.2 / 1,090.5) | 290 GB/s |
+| `[2048,8192]@[8192,2048]` | 10.90 / 11.01 | 80 | 1,226.8 MB (545.3 / 681.6) | 195 GB/s |
+| `[1024,2048]@[2048,8192]` | 14.15 / 14.13 | 116 | 519.7 MB (247.1 / 272.6) | 214 GB/s |
+
+H1's shape reads 2,062 MB for 151 MB of operands (16.8 `A`, 134.2 `B`): `A` about 58 times and `B` about 8 times, the
+`[8,2,9]` block's `nt/nb` and `mt/mb`.
+
+**Today against the reads-free ceiling, by `B`'s format** (`silicon_probe_pair_cost::pair_cost` and `::without_gathers`,
+`TT_PAIR_SHAPES`, the session's own `matmul_dram`, HiFi4, the default pair order; `1793224072`). The ceiling is the same
+product with every gather left out (`tensor::probe_skip_block_gathers`), so it is what the kernel runs at when reads
+cost nothing:
+
+| Product | `B` | Today | `A` reads skipped | Ceiling | Headroom |
+|---|---|--:|--:|--:|--:|
+| `[2048,2048]@[2048,16384]` | FP32 | 20.10 | 29.22 | **30.32** | 1.51x |
+| | BF16 | 24.72 | 27.41 | 27.98 | 1.13x |
+| | BFP8 | 26.30 | 27.74 | 27.99 | 1.06x |
+| | BFP4 | 26.44 | 27.83 | 27.97 | 1.06x |
+| `[2048,8192]@[8192,2048]` | FP32 | 18.54 | 25.42 | 25.65 | 1.38x |
+| | BF16 | 24.38 | 25.53 | 25.73 | 1.06x |
+| | BFP8 | 29.47 | 32.51 | 32.91 | 1.12x |
+| `[1024,2048]@[2048,8192]` | FP32 | 15.78 | 23.02 | 23.15 | 1.47x |
+| | BF16 | 22.38 | 22.17 | 22.29 | 1.00x |
+
+What it says:
+- **35 TFLOPS is above the ceiling.** With every read free, H1's shape runs at 30.3 TFLOPS with an FP32 `B` and 28.0
+  with a packed one. Operand reuse cannot reach 35 at this shape. Lifting the kernel's own ceiling is F5 (`Dst`
+  subblocks, H2).
+- **Reuse pays for FP32 operands, not for packed weights.** An FP32 `B` has 1.38-1.51x to gain. A BF16 or BFP `B`
+  already runs at 88-100% of its ceiling, so at most 1.13x is left: `B`'s fewer bytes already cut the reads that bind.
+  The FP32 x FP32 products are the activations' (attention's `Q K^T` and `P V` at long prompts) and training's.
+- **`A`'s reads are most of the gap.** Skipping only `A`'s gathers recovers 92-99% of the ceiling. `A` is the operand a
+  block row re-reads once a column block (`nt/nb` times).
+- LoFi equals HiFi4 within 3% everywhere, as P4 found.
+
+**Found, not followed here: the `down` shape loses 1.7x through Burn.** `[2048,8192]@[8192,2048]` runs at 10.9-11.0
+TFLOPS through `matmul_throughput` (80 units), against 18.54 through the session's `matmul_dram` in the probe (FP32
+`B`, the same session defaults). The budget burn-tt passes (400,000) is only a per-role timeout. H1's shape agrees
+between the two paths (19.2-19.4 against 20.1), so H1 is measured on it. Open: which choice the Burn path makes
+differently there.
+
+**H1 restated** in the Bible §13, before any build:
+- `[2048,2048]@[2048,16384]` with an FP32 `B` from 19.2-19.4 to **≥ 25.8 TFLOPS** (85% of the 30.3 ceiling) through
+  `matmul_throughput`, its GDDR reads from 2,062 MB to **≤ 302 MB** (twice the operands);
+- packed `B` (BF16, BFP8) at **≥ 95%** of the 28.0 ceiling (≥ 26.6; from 24.7 and 26.3) in `pair_cost`;
+- kill unchanged: reads drop and TFLOPS do not.
 
 ## F3: the tile-generic op, pointwise and reduction ported, before and after (2026-10-28, cards 0 and 1)
 

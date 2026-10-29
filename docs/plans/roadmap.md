@@ -787,7 +787,15 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
     unchanged. B1, eager step time on card 1, is within drift of F3.8's tree, ABBA (1.398 / 2.892-2.903 /
     8.270-8.300 against 1.398 / 2.892 / 8.270-8.290 ms/step)
     ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
-- [ ] **F4b:** operand reuse across cores (H1).
+- [ ] **F4b:** operand reuse across cores (H1). Opened 2026-10-28 (F4b.0, card 1,
+  [log](../learnings/performance-log.md#f4b0-what-operand-reuse-can-buy-the-reads-free-ceiling-at-prefill-shapes-2026-10-28-card-1)).
+  - `[2048,2048]@[2048,16384]` runs at 19.2-19.4 TFLOPS and reads 2,062 MB for 151 MB of operands.
+  - Its reads-free ceiling is 30.3 TFLOPS with an FP32 `B` and 28.0 with a packed one, so H1's 35 is restated:
+    FP32 `B` ≥ 25.8 TFLOPS and ≤ 302 MB read.
+  - Reuse buys up to 1.51x for FP32 operands, but at most 1.13x for packed weights, which already run near the kernel's
+    ceiling (F5's).
+  - Next: D5's delivery probes.
+  - Found: `[2048,8192]@[8192,2048]` is 1.7x slower through Burn (10.9-11.0 TFLOPS) than through the session (18.5).
 - [ ] **F4a:** channels instead of barriers in decode (H4).
 - [ ] **F5:** `Dst` subblocks and half-sync (H2).
 - [ ] **F6:** fusion through channels and spatial pipelining (H5).

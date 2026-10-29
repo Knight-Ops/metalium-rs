@@ -32,6 +32,7 @@ pub mod distribute;
 pub mod lower;
 pub(crate) mod matmul;
 mod reduce;
+pub mod reuse;
 mod sfpu;
 
 pub(crate) use matmul::matmul;
@@ -312,6 +313,19 @@ pub struct TileOp {
     /// data-independent read (a `STREAM`ed contraction operand) at or above it is read ahead
     /// of the unit's barrier ([`lower`]). Empty: nothing is read ahead.
     pub ahead: Vec<Option<u64>>,
+    /// Units that read the same strip of the contraction's first operand share its reads (X4):
+    /// a few holders read it from GDDR, the others copy it from a holder's L1
+    /// ([`distribute::Shared`], [`reuse`]). `None`: each unit reads its own.
+    pub share: Option<Share>,
+}
+
+/// How an op's units share their reads ([`TileOp::share`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Share {
+    /// Most holders in a group of units that read the same strip.
+    pub holders: usize,
+    /// Each unit's tile, as the session names it: where a copy reads and a credit goes.
+    pub tiles: std::sync::Arc<[(u8, u8)]>,
 }
 
 impl TileOp {
@@ -402,7 +416,10 @@ impl TileOp {
         self.check()?;
         let deal = distribute::deal(self, units, overlap)?;
         let depth = channels::check(self, &deal)?;
-        let jobs = lower::jobs(self, &deal, units, first)?;
+        let mut jobs = lower::jobs(self, &deal, units, first)?;
+        if let (Some(shared), Some(share)) = (&deal.shared, &self.share) {
+            reuse::pull(&mut jobs, units, first, shared, &share.tiles)?;
+        }
         // The streams are as deep as the session will make them: two where a job's kernels are
         // staged in halves (`session::streaming_segments`).
         debug_assert!(

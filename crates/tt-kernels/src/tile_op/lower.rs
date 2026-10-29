@@ -495,10 +495,20 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
     // Per unit, the first operand's tiles (rows, terms) and slot its last run left held.
     type Held = (std::ops::Range<usize>, std::ops::Range<usize>, u64);
     let mut held: Vec<Option<Held>> = vec![None; units];
-    let mut jobs = Vec::with_capacity(deal.blocks.len());
-    for (r, [rows, cols]) in deal.blocks.iter().enumerate() {
+    // A shared deal's order, a hole an empty job (`distribute::Shared`).
+    let order: Vec<Option<usize>> = match &deal.shared {
+        Some(shared) => shared.order.clone(),
+        None => (0..deal.blocks.len()).map(Some).collect(),
+    };
+    let mut jobs = Vec::with_capacity(order.len());
+    for (r, block) in order.iter().enumerate() {
         let j = first + r;
         let unit = j % units;
+        let Some(&block) = block.as_ref() else {
+            jobs.push(Vec::new());
+            continue;
+        };
+        let [rows, cols] = &deal.blocks[block];
         let last_row = rows.end == rt && ragged != 0;
         let live = if last_row { ragged as u32 } else { 32 };
         // `A` read to its live rows: one row of each tile for a one-row product.

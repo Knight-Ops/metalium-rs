@@ -786,8 +786,10 @@ impl<N: NocId> DataMover<N> {
                 {
                     return Err(DmError::Invalid(dm::error::RANGE));
                 }
-                // A credit word waited on is this tile's, in what its lists may name.
-                if entries[i][0] == op::WAIT_CREDIT {
+                // A credit word waited on is this tile's, in what its lists may name, or one of
+                // its op-level credit words (`tt_isa::dm::CREDITS`), which no arena holds.
+                let credits = tt_isa::dm::CREDITS..tt_isa::dm::CREDITS_END;
+                if entries[i][0] == op::WAIT_CREDIT && !credits.contains(&(entries[i][1] as u64)) {
                     contained(self.arena, op::WAIT_CREDIT, entries[i][1], 4)?;
                 }
             } else {
@@ -1133,7 +1135,7 @@ impl L1Writes {
     /// Whether [`op::WRITE_L1`] or [`op::WRITE_L1_MCAST`] entry `e` writes inside the window of
     /// the tiles (one of them, or a rectangle all of whose tiles are), [`op::READ_L1`] entry
     /// `e` reads inside the window of one of them, or [`op::CREDIT`] entry `e` credits a word
-    /// inside the window of one of them.
+    /// inside the window of one of them or of its [`tt_isa::dm::CREDITS`].
     pub fn admits(&self, e: [u32; 8]) -> bool {
         let (to, len) = if e[0] == op::CREDIT {
             (e[3] as u64, 4)
@@ -1152,7 +1154,11 @@ impl L1Writes {
             }
             _ => false,
         };
-        tiles && to >= self.window.start && to + len <= self.window.end
+        // The op-level credit words are no op's L1 (`tt_isa::dm::CREDITS`): a credit to one of a
+        // session tile's is admitted whatever the window.
+        let credits =
+            e[0] == op::CREDIT && to >= tt_isa::dm::CREDITS && to + len <= tt_isa::dm::CREDITS_END;
+        tiles && (credits || (to >= self.window.start && to + len <= self.window.end))
     }
 }
 

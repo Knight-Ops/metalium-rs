@@ -208,6 +208,34 @@ pub const BARRIER_RECTS: u64 = MAILBOX_BASE + 0x120;
 /// Most rectangles at [`BARRIER_RECTS`]: `noc::multicast::full_grid_except`'s.
 pub const BARRIER_RECTS_MAX: u32 = 8;
 const _: () = assert!(BARRIER_RECTS + 4 + BARRIER_RECTS_MAX as u64 * 8 <= encoded::ENDPOINTS);
+/// The tile's op-level credit words ([`op::CREDIT`], [`op::WAIT_CREDIT`]): [`CREDIT_WORDS`] words,
+/// each alone in its 16 bytes ([`credit_word`]), past B's mover mailbox and its read endpoints, in
+/// L1 no arena or capture plans into. An op's own L1 is overwritten by other ops' tiles between
+/// two ops that hand data across tiles, so a count kept there would have to be zeroed as the op
+/// starts, which races with a peer that credits early. These words stay put: the host zeroes them
+/// when the tile's movers start, and an op that counts in one returns it to zero after its last
+/// wait on it (a credit of minus its total), so the next op finds them at zero. The barrier
+/// between the two orders that return before any peer's next credit
+/// (`docs/learnings/dataflow-compiler.md` §7).
+pub const CREDITS: u64 = MAILBOX_BASE + 0x400;
+/// How many words [`CREDITS`] holds.
+pub const CREDIT_WORDS: u32 = 4;
+/// The end of [`CREDITS`].
+pub const CREDITS_END: u64 = CREDITS + CREDIT_WORDS as u64 * 16;
+/// Credit word `i` of [`CREDITS`], alone in its 16 bytes.
+pub const fn credit_word(i: u32) -> u32 {
+    assert!(i < CREDIT_WORDS);
+    (CREDITS + i as u64 * 16) as u32
+}
+const _: () = assert!(encoded::ENDPOINTS + encoded::ENDPOINT_WORDS as u64 * 4 <= CREDITS);
+const _: () = assert!(CREDITS_END <= nc::MAILBOX_BASE);
+/// Whether a credit's or a credit wait's word may be at `addr`: a word of
+/// [`crate::l1::LISTED`] (a channel's, in its op's L1) or of [`CREDITS`].
+pub const fn credit_addr(addr: u32) -> bool {
+    addr % 4 == 0
+        && (crate::l1::LISTED.contains(addr as u64, 4)
+            || (addr as u64 >= CREDITS && addr as u64 + 4 <= CREDITS_END))
+}
 
 /// The mover's list queue (`hardware-coverage.md` X4a): the host writes a
 /// list into the ring of entries at [`LIST`] (never across its end), a slot
@@ -458,7 +486,7 @@ pub mod op {
     /// not of it, so a credit after one is after its writes too. RISCV B's goes out on NoC #0, NC's on
     /// the NIU its writes do ([`super::WRITE_NOC`]); each under its own ID ([`super::TXN_CREDIT_B`],
     /// [`super::TXN_CREDIT_NC`]), returning the old value to its [`super::CREDIT_RET`]. `addr` a
-    /// word inside `crate::l1::LISTED`; `(x, y)` a coordinate a Tensix tile could have
+    /// word inside `crate::l1::LISTED` or [`super::CREDITS`] ([`super::credit_addr`]); `(x, y)` a coordinate a Tensix tile could have
     /// (`crate::noc::grid::is_tensix_geometry`), narrowed by the host to its session's tiles; `value`
     /// not zero. Prefetch reads ([`super::TXN_PREFETCH`]) are not waited for. Both movers. Only in a
     /// list entry.
@@ -469,7 +497,8 @@ pub mod op {
     /// wrap. Every poll reads the streams' abort word ([`crate::dataflow::ABORT`]) as a credit wait
     /// does, so a wait that will never end is cancelled, never left running; while it waits, the
     /// mover's wait reason ([`crate::dataflow::WAIT_REASON`]) is [`crate::dataflow::CREDIT_WAIT`].
-    /// `addr` a word inside `crate::l1::LISTED`. Both movers. Only in a list entry.
+    /// `addr` a word inside `crate::l1::LISTED` or [`super::CREDITS`] ([`super::credit_addr`]).
+    /// Both movers. Only in a list entry.
     pub const WAIT_CREDIT: u32 = 0x4E;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
     /// in order. The other descriptor words are unused.
@@ -1089,7 +1118,7 @@ impl Entry {
             if x > 0x3f || y > 0x3f || !crate::noc::grid::is_tensix_geometry(x as u8, y as u8) {
                 return Err(error::RANGE);
             }
-            if addr % 4 != 0 || !crate::l1::LISTED.contains(addr as u64, 4) {
+            if !credit_addr(addr) {
                 return Err(error::ALIGNMENT);
             }
             return Ok(Entry::Credit {
@@ -1104,7 +1133,7 @@ impl Entry {
             if w[3..].iter().any(|&word| word != 0) {
                 return Err(error::OP);
             }
-            if addr % 4 != 0 || !crate::l1::LISTED.contains(addr as u64, 4) {
+            if !credit_addr(addr) {
                 return Err(error::ALIGNMENT);
             }
             return Ok(Entry::WaitCredit { addr, target });
@@ -2066,6 +2095,18 @@ mod tests {
             "a mover's own mailbox, the barrier's counter"
         );
         assert_eq!(with(3, crate::l1::LISTED.end as u32), Err(error::ALIGNMENT));
+        // The op-level credit words, each of them and nothing either side.
+        for i in 0..CREDIT_WORDS {
+            assert!(matches!(with(3, credit_word(i)), Ok(Entry::Credit { .. })));
+            let wait = [op::WAIT_CREDIT, credit_word(i), 1, 0, 0, 0, 0, 0];
+            assert!(matches!(
+                Entry::decode(ALL, wait),
+                Ok(Entry::WaitCredit { .. })
+            ));
+        }
+        assert_eq!(with(3, CREDITS as u32 - 4), Err(error::ALIGNMENT));
+        assert_eq!(with(3, CREDITS_END as u32), Err(error::ALIGNMENT));
+        assert_eq!(with(3, credit_word(0) + 2), Err(error::ALIGNMENT));
         for k in 5..8 {
             assert_eq!(with(k, 1), Err(error::OP));
         }

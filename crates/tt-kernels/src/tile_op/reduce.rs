@@ -85,6 +85,7 @@ pub fn reduce(a: &DramTensor, op: ReduceOp, axis: Axis, then: ReduceThen) -> Res
         }),
         contract: NumericContract::Program,
         ahead: Vec::new(),
+        share: None,
         out: (dims, op.elem()),
     })
 }

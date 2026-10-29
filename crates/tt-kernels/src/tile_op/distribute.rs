@@ -29,12 +29,32 @@ pub struct Deal {
     pub pipelined: bool,
     /// Each operand's one tile read once a run and held (the runs keep inside its rows).
     pub held: Vec<bool>,
+    /// Blocks dealt so that the units reading the same first-operand strip stay together
+    /// ([`TileOp::share`], `tile_op::reuse`); `None`: block `j` to unit `j % units`.
+    pub shared: Option<Shared>,
+}
+
+/// A block deal in which units share their first operand's reads (X4, `tile_op::reuse`).
+///
+/// The units are cut into groups of consecutive units, and each group takes whole block rows
+/// (group `k` rows `k`, `k + G`, ...). Within a group, member `m` takes the row's column blocks
+/// `m`, `m + g`, ..., and each sub-group's first member is its holder: it reads the row's strip
+/// of the first operand from GDDR, and the others copy it from its L1. A member never has more
+/// jobs in a row than its holder, so a member's `t`-th job of a row is its holder's `t`-th.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shared {
+    /// Job position `j` (unit `j % units`) runs block `order[j]` of [`Deal::blocks`], or nothing:
+    /// a unit whose group has fewer column blocks in a row than members sits that round out.
+    pub order: Vec<Option<usize>>,
+    /// Each unit's holder, the unit whose reads it copies; `None` for a holder, or a unit with
+    /// nothing to share.
+    pub holder_of: Vec<Option<usize>>,
 }
 
 pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
     let (items, weight) = (op.items(), op.weight());
     if let Some(cut) = op.body.block() {
-        return blocks(op, cut);
+        return blocks(op, cut, units);
     }
     // Partials through GDDR chain an item's chunks on one unit: a job an item
     // (`lower::chunked_jobs`).
@@ -44,6 +64,7 @@ pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
             blocks: Vec::new(),
             pipelined: false,
             held: vec![false; op.operands.len()],
+            shared: None,
         });
     }
     let group = |half: bool| op.body.group(half);
@@ -97,18 +118,21 @@ pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
             blocks: Vec::new(),
             pipelined,
             held: holdable,
+            shared: None,
         },
         None => Deal {
             runs: plain,
             blocks: Vec::new(),
             pipelined,
             held: vec![false; op.operands.len()],
+            shared: None,
         },
     })
 }
 
-/// The two parallel iterators' tiles in blocks as `cut` says, rows outer.
-fn blocks(op: &TileOp, cut: Blocks<'_>) -> Result<Deal> {
+/// The two parallel iterators' tiles in blocks as `cut` says, rows outer; with the op's
+/// [`TileOp::share`], dealt by [`shared`].
+fn blocks(op: &TileOp, cut: Blocks<'_>, units: usize) -> Result<Deal> {
     let parallel: Vec<usize> = op.parallel().collect();
     let &[outer, inner] = &parallel[..] else {
         return Err(TensorError::Shape(format!(
@@ -133,16 +157,74 @@ fn blocks(op: &TileOp, cut: Blocks<'_>) -> Result<Deal> {
     if mb == 0 {
         return Err(TensorError::Shape("an empty block".into()));
     }
-    let blocks = (0..rt)
+    let blocks: Vec<_> = (0..rt)
         .step_by(mb)
         .flat_map(|i0| cols.iter().map(move |c| [i0..(i0 + mb).min(rt), c.clone()]))
         .collect();
+    let shared = op
+        .share
+        .as_ref()
+        .and_then(|s| shared(rt.div_ceil(mb), cols.len(), units, s.holders));
     Ok(Deal {
         runs: Vec::new(),
         blocks,
         pipelined: cut.pipelined,
         held: vec![false; op.operands.len()],
+        shared,
     })
+}
+
+/// [`Shared`] for `rows x cols` blocks (rows outer, block `r * cols + c`) over `units`, with at
+/// most `holders` holders a group; `None` where no two units would share a row.
+pub fn shared(rows: usize, cols: usize, units: usize, holders: usize) -> Option<Shared> {
+    // As many groups as rows, so the rows spread as they would unshared; a group of one shares
+    // nothing.
+    let groups = rows.min(units);
+    if groups == 0 || units <= groups || cols < 2 {
+        return None;
+    }
+    let (base, extra) = (units / groups, units % groups);
+    let size = |k: usize| base + usize::from(k < extra);
+    let start = |k: usize| k * base + k.min(extra);
+    let mut sequences: Vec<Vec<Option<usize>>> = vec![Vec::new(); units];
+    let mut holder_of = vec![None; units];
+    for k in 0..groups {
+        let g = size(k);
+        let h = holders.clamp(1, g);
+        // A row takes its group as many rounds as its first member has blocks in it; a member
+        // with fewer sits the last out, so every member's `t`-th block of a row runs in the same
+        // round as its holder's.
+        let rounds = cols.div_ceil(g);
+        for m in 0..g {
+            let u = start(k) + m;
+            sequences[u] = (k..rows)
+                .step_by(groups)
+                .flat_map(|r| {
+                    (0..rounds).map(move |t| {
+                        let c = m + t * g;
+                        (c < cols).then_some(r * cols + c)
+                    })
+                })
+                .collect();
+            // Sub-group `m * h / g`; its first member holds.
+            let first = (m * h / g * g).div_ceil(h);
+            if first != m {
+                holder_of[u] = Some(start(k) + first);
+            }
+        }
+    }
+    let longest = sequences.iter().map(Vec::len).max().unwrap_or(0);
+    let mut order = vec![None; longest * units];
+    for (u, sequence) in sequences.iter().enumerate() {
+        for (t, &b) in sequence.iter().enumerate() {
+            order[t * units + u] = b;
+        }
+    }
+    // Trailing holes run nothing: the last round ends with the last unit that has a block.
+    while order.last() == Some(&None) {
+        order.pop();
+    }
+    Some(Shared { order, holder_of })
 }
 
 /// Each operand that reads one tile for a whole row of items: its map does not use the

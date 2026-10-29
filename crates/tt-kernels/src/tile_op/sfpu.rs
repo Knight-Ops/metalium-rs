@@ -153,6 +153,7 @@ pub fn eltwise(
         }),
         contract: NumericContract::Program,
         ahead: Vec::new(),
+        share: None,
         out: ([a.rows, a.cols], out_elem),
     }))
 }

@@ -552,6 +552,7 @@ fn session_reads() -> Reads {
         second_job: false,
         balanced_deal: false,
         block_stream: BlockStream::Auto,
+        reuse: tensor::Reuse::Off,
     }
 }
 
@@ -666,6 +667,7 @@ impl Product {
             &prefetch,
             self.spread,
             &busy,
+            &[],
         );
         match built {
             Ok((work, dealt, handoff)) => {

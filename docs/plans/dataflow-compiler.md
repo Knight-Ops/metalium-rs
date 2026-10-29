@@ -341,12 +341,39 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
 
 ## Stage F4b (compute): operand reuse across cores, H1
 
+- [x] **F4b.0, the baseline and the reads-free ceiling** (2026-10-28, card 1, at `f60b228`;
+  [log](../learnings/performance-log.md#f4b0-what-operand-reuse-can-buy-the-reads-free-ceiling-at-prefill-shapes-2026-10-28-card-1)).
+  - `matmul_throughput` (`1793224018`, `1793224268`): `[2048,2048]@[2048,16384]` 19.36 / 19.17 TFLOPS, 2,062 MB read
+    (`A` 971, `B` 1,091) for 151 MB of operands.
+  - `silicon_probe_pair_cost` with and without gathers (`1793224072`): the ceiling is 30.3 TFLOPS with an FP32 `B`,
+    28.0 with a packed one. Today an FP32 `B` has 1.38-1.51x to gain at the three shapes, a packed one at most 1.13x.
+    Skipping only `A`'s reads recovers 92-99% of the ceiling.
+  - H1 restated in the Bible before the build (owner's choice): FP32 `B` ≥ 25.8 TFLOPS and ≤ 302 MB read; packed
+    `B` ≥ 95% of the ceiling.
+  - Found: `[2048,8192]@[8192,2048]` runs at 10.9-11.0 TFLOPS through Burn (80 units) against 18.5 through the
+    session in the probe. Open, not F4b's.
+- [ ] **F4b.1, D5's schemes inside the product** (owner, 2026-10-28: prototypes in the product, measured by
+  `matmul_throughput`, in place of a synthetic delivery probe).
+  - [x] **Pull** (`TT_OPERAND_REUSE=pull:<h>`, 2026-10-28): the shared deal (`distribute::Shared`), the pass
+    (`tile_op::reuse::pull`), the fixed credit words (`tt_isa::dm::CREDITS`, zeroed at mover start, each owner returns
+    its own to zero), and aligned segments for linked ops (`session::linked_groups`). Gate `step244_operand_reuse`
+    (ttsim; card 0 `1793226376`); model test `tile_op::reuse::tests` (random interleavings, a negative control).
+    H1's shape on card 1: 19.1 -> **25.98 TFLOPS** at four holders a group, reads 2,062 -> 1,346 MB (`1793228872`;
+    [log](../learnings/performance-log.md#f4b1-a-pulled-from-a-few-holders-the-first-measured-scheme-of-d5-2026-10-28-cards-0-and-1)).
+  - [ ] `B` shared too (a `GATHER` that skips `B`: a firmware flag), for the reads clause.
+  - [ ] Multicast: one sender a row rectangle (NC `WRITE_L1_MCAST`, a multicast ready word), against pull.
+  - [ ] Larger GDDR blocks (fixed `TT_MATMUL_BLOCK` sweeps with packed `B`).
+  - [ ] Holders' credits without a round trip each (14 a chunk on the holder's B today).
+  - [ ] Recovery after a failed linked op restarts every unit it ran on (today only the failed ones), and the
+    planner prefers block shapes whose rows divide over the units (a group of one runs a whole row).
 - [ ] Decide D5 by measurement first, on card 1, for one prefill product shape, between:
   - a few holders whose rows or columns are pulled with `READ_L1`;
   - one sender per row or column rectangle multicasting with `WRITE_L1_MCAST` and remote credits;
   - larger blocks re-read from GDDR.
 - [ ] Build the winner as F3's reuse pass, so every format and every contraction gets it.
-- **Prediction:** `[m,2048]@[2048,16384]` at m = 2,048 from 18.2 to ≥35 TFLOPS.
+- **Prediction (restated after F4b.0, against the measured ceiling):** `[2048,2048]@[2048,16384]` with an FP32 `B`
+  from 19.2-19.4 to ≥ 25.8 TFLOPS, reads from 2,062 to ≤ 302 MB; a packed `B` at ≥ 95% of its 28.0 ceiling. As first
+  written, ≥ 35 TFLOPS, which is above the 30.3 a product reaches with no reads at all.
 - **Kill:** GDDR reads drop and TFLOPS do not.
 
 ## Stage F4a (decode): channels instead of barriers, H4

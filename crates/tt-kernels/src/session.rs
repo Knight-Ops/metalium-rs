@@ -787,6 +787,8 @@ pub struct Session<T: Transport> {
     softmax_mode: crate::softmax::Mode,
     /// [`Session::set_block_stream`].
     block_stream: tensor::BlockStream,
+    /// [`Session::set_operand_reuse`].
+    reuse: tensor::Reuse,
     /// [`Session::set_stream_prefetch_units`].
     stream_prefetch_units: usize,
     /// [`Session::set_stream_handoff`]: the chunk a handed column is handed at (`Some(0)`: half).
@@ -1824,6 +1826,12 @@ fn l1_footprint(entries: &[[u32; 8]], gather: bool) -> Option<Vec<std::ops::Rang
                     ranges.push(descriptor.l1 as u64..descriptor.l1 as u64 + len);
                 }
                 Entry::Fill { dst, .. } if gather => ranges.push(slots(dst, 1)),
+                // A copy from another tile lands where a read would (`tile_op::reuse`); a credit
+                // and its wait touch one word of the credit words or a channel's, no slot.
+                Entry::L1Read { to, len, .. } if gather => {
+                    ranges.push(to as u64..to as u64 + len as u64)
+                }
+                Entry::Credit { .. } | Entry::WaitCredit { .. } => {}
                 _ => return None,
             }
         }
@@ -2260,6 +2268,83 @@ enum Item {
 const GROUP_MAX: usize = 40;
 
 /// Compatible gather/compute/scatter batches, including single-buffered ones.
+/// For an op whose units hand each other data by credits (`tile_op::reuse`: a credit wait on
+/// one of the op-level credit words), each unit's jobs cut into groups of the same chunks, in
+/// order, a hole (an empty job) as a placeholder for each group it stands for; `None` for any
+/// other op.
+///
+/// The session queues an op's segments in rounds, every unit's first, then every unit's second,
+/// and waits on a unit for room or a drain in the middle of a round. That wait is safe only if
+/// what the unit's queued segments wait for on other units is in segments those units already
+/// have: no later than its own round. A unit's lists, cut by their own entries, are not: a
+/// holder's chunks carry a credit for each reader, so its segments hold fewer chunks than its
+/// readers', which ran ahead of it into segments that waited on one the host had yet to queue
+/// (H1's product on 120 tiles, card 0, 2026-10-28). Cut at the same chunks, with a hole where a
+/// unit sits a round out ([`crate::tile_op::distribute::Shared`]), a segment waits only on the
+/// same round's or earlier.
+///
+/// A job is a block a chunk (a gather list, a kernel, a scatter list); every job of the op has
+/// as many chunks, and a group is as many chunks as the longest unit's fit one list.
+#[allow(clippy::type_complexity)]
+fn linked_groups(
+    jobs: &[tensor::Job],
+    units: usize,
+) -> Result<Option<Vec<Vec<Option<Vec<Step>>>>>, TensorError> {
+    use tt_isa::dm::{op, CREDITS, CREDITS_END, LIST_MAX};
+    let linked = jobs.iter().flatten().any(|step| match step {
+        Step::List { entries, .. } => entries
+            .iter()
+            .any(|e| e[0] == op::WAIT_CREDIT && (CREDITS..CREDITS_END).contains(&(e[1] as u64))),
+        _ => false,
+    });
+    if !linked {
+        return Ok(None);
+    }
+    let refuse = |why: &str| Err(TensorError::Shape(format!("a linked op: {why}")));
+    let mut chunks = None;
+    let mut widest = 0usize;
+    for job in jobs.iter().filter(|j| !j.is_empty()) {
+        if job.len() % 3 != 0 {
+            return refuse("a job is not whole chunks");
+        }
+        if *chunks.get_or_insert(job.len() / 3) != job.len() / 3 {
+            return refuse("its jobs have different chunk counts");
+        }
+        for block in job.chunks(3) {
+            let (Step::List { entries: g, .. }, Step::Kernel { .. }, Step::List { entries: s, .. }) =
+                (&block[0], &block[1], &block[2])
+            else {
+                return refuse("a chunk is not a gather, a kernel and a scatter");
+            };
+            widest = widest.max(g.len() + s.len());
+        }
+    }
+    let Some(chunks) = chunks else {
+        return Ok(None);
+    };
+    // A block's credits and slot-reuse waits (`execution_groups`), and the packet's header,
+    // launch, last wait, a leading catch-up and a folded barrier.
+    let per = (LIST_MAX as usize - 8) / (widest + 6 + 3);
+    let k = per.clamp(1, GROUP_MAX);
+    let groups = chunks.div_ceil(k);
+    let mut out: Vec<Vec<Option<Vec<Step>>>> = vec![Vec::new(); units];
+    for (j, job) in jobs.iter().enumerate() {
+        let unit = &mut out[j % units];
+        if job.is_empty() {
+            unit.extend(std::iter::repeat_with(|| None).take(groups));
+            continue;
+        }
+        unit.extend(job.chunks(3 * k).map(|g| Some(g.to_vec())));
+    }
+    // Trailing holes stand for nothing.
+    for unit in &mut out {
+        while unit.last().is_some_and(Option::is_none) {
+            unit.pop();
+        }
+    }
+    Ok(Some(out))
+}
+
 fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
     use tt_isa::dm::LIST_MAX;
     let mut items: Vec<Item> = Vec::new();
@@ -2599,6 +2684,7 @@ impl<T: Transport> Session<T> {
             softmax_mode: crate::softmax::Mode::default(),
             // `TT_MATMUL_BLOCK=off|auto|mb,kq,nb` (`docs/plans/prefill-operand-reuse.md`).
             block_stream: tensor::BlockStream::from_env(),
+            reuse: tensor::Reuse::Off,
             // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             stream_prefetch_units: units_from_env("TT_STREAM_PREFETCH_UNITS", PREFETCH_UNITS),
             // `TT_STREAM_HANDOFF=1` turns it on; `TT_STREAM_HANDOFF_AT=<h>` hands at chunk `h`
@@ -2734,6 +2820,13 @@ impl<T: Transport> Session<T> {
                 healthy: session.units.len(),
                 wedged,
             });
+        }
+        // Host state only until a mover starts (`ensure_unit` hands it the window).
+        let reuse = tensor::Reuse::from_env();
+        if reuse != tensor::Reuse::Off {
+            session
+                .set_operand_reuse(reuse)
+                .expect("no mover has started, so the window is the host's alone");
         }
         Ok(session)
     }
@@ -4607,6 +4700,11 @@ impl<T: Transport> Session<T> {
                 b.set_arena(*mover_arena)?;
             }
             unit.nc = Some(nc);
+            // The op-level credit words start at zero, as every op that counts in one leaves it
+            // (`tt_isa::dm::CREDITS`): L1 keeps what an earlier session or a failed op left.
+            for i in 0..tt_isa::dm::CREDIT_WORDS {
+                dev.write32(r.window(), unit.tile, tt_isa::dm::credit_word(i) as u64, 0)?;
+            }
             if profiling.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, trace_word)?;
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
@@ -4704,6 +4802,10 @@ impl<T: Transport> Session<T> {
         // One queue a unit the op can run on, not one a unit of the session: on many
         // tiles the empty ones were most of the host's time laying an op out (a
         // 120-tile session at a spread of 2: 7 us an op against 1.6 on 2 tiles).
+        // An op whose units hand each other data by credits (`tile_op::reuse`) is cut into
+        // segments at the same chunks on every unit, a hole one placeholder a segment
+        // ([`linked_groups`]).
+        let linked = linked_groups(&jobs, spread)?;
         let mut queues: Vec<Vec<Step>> = vec![Vec::new(); spread];
         for (j, job) in jobs.into_iter().enumerate() {
             queues[j % spread].extend(job);
@@ -4777,13 +4879,38 @@ impl<T: Transport> Session<T> {
         let start = self.mark();
         // Every unit's cache has the same bounds (`limit_program_cache`).
         let cache = self.units[0].programs.region().len();
-        let mut per_unit: Vec<std::collections::VecDeque<Segment>> = queues
-            .into_iter()
-            .map(|steps| match steps.is_empty() {
-                true => Ok(Default::default()),
-                false => streaming_segments(steps, cache).map(Into::into),
-            })
-            .collect::<Result<_, _>>()?;
+        let mut per_unit: Vec<std::collections::VecDeque<Option<Segment>>> = match linked {
+            Some(groups) => groups
+                .into_iter()
+                .map(|unit| {
+                    let mut q = std::collections::VecDeque::new();
+                    for group in unit {
+                        match group {
+                            None => q.push_back(None),
+                            Some(steps) => {
+                                let segments = streaming_segments(steps, cache)?;
+                                if segments.len() != 1 {
+                                    return Err(TensorError::Shape(format!(
+                                        "a linked op's chunk group made {} segments, not one",
+                                        segments.len()
+                                    )));
+                                }
+                                q.extend(segments.into_iter().map(Some));
+                            }
+                        }
+                    }
+                    Ok(q)
+                })
+                .collect::<Result<_, TensorError>>()?,
+            None => queues
+                .into_iter()
+                .map(|steps| match steps.is_empty() {
+                    true => Ok(Default::default()),
+                    false => streaming_segments(steps, cache)
+                        .map(|segs| segs.into_iter().map(Some).collect()),
+                })
+                .collect::<Result<_, _>>()?,
+        };
         self.stage(HostStage::Segments, start);
         // With more than one unit, a barrier on each unit this op ran on, after
         // its share, since the next op may read what any of them wrote; a unit
@@ -4818,8 +4945,10 @@ impl<T: Transport> Session<T> {
         // so nothing between touches the slots it reads into.
         if capturing && !self.prefetch_anchor.is_empty() {
             for (u, q) in per_unit.iter_mut().enumerate() {
-                if q.front().is_some_and(|seg| seg.what == tensor::PREFETCH) {
-                    let seg = q.pop_front().expect("a front segment");
+                if q.front()
+                    .is_some_and(|seg| seg.as_ref().is_some_and(|s| s.what == tensor::PREFETCH))
+                {
+                    let seg = q.pop_front().flatten().expect("a front segment");
                     let anchor = self.prefetch_anchor[u].expect("a prefetching unit's anchor");
                     let wait = self.barrier_wait(anchor);
                     let c = self.capture.as_mut().unwrap();
@@ -4835,7 +4964,7 @@ impl<T: Transport> Session<T> {
         }
         while per_unit.iter().any(|q| !q.is_empty()) {
             for (u, q) in per_unit.iter_mut().enumerate() {
-                if let Some(mut seg) = q.pop_front() {
+                if let Some(Some(mut seg)) = q.pop_front() {
                     if what.is_empty() && seg.what != tensor::BUSY_PREFETCH {
                         *what = seg.what;
                     }
@@ -4869,7 +4998,9 @@ impl<T: Transport> Session<T> {
                         }
                     }
                     if let Some(entry) = fold {
-                        if q.is_empty() && seg.entries.len() < tt_isa::dm::LIST_MAX as usize {
+                        if q.iter().all(Option::is_none)
+                            && seg.entries.len() < tt_isa::dm::LIST_MAX as usize
+                        {
                             if seg.streaming {
                                 seg.entries[0][4] = 1;
                             }
@@ -8298,6 +8429,7 @@ impl<T: Transport> Session<T> {
         let second_job = self.prefetch_second_job;
         let balanced_deal = self.balanced_deal;
         let block_stream = self.block_stream;
+        let (reuse, tiles) = (self.reuse, self.reuse_tiles(units));
         // A one-row output over a long `n` also writes its row packed, as an element-wise op's
         // does ([`Session::set_packed_twins`]): the norm after a residual sum reads it.
         let n = if b_transposed { b.rows } else { b.cols };
@@ -8334,10 +8466,12 @@ impl<T: Transport> Session<T> {
                         second_job,
                         balanced_deal,
                         block_stream,
+                        reuse,
                     },
                     &prefetch,
                     spread,
                     &busy,
+                    &tiles,
                 )
             })
             .and_then(|(mut work, dealt, handoff)| {
@@ -9052,6 +9186,42 @@ impl<T: Transport> Session<T> {
     /// open; [`tensor::BlockStream::Auto`] by default.
     pub fn set_block_stream(&mut self, mode: tensor::BlockStream) {
         self.block_stream = mode;
+    }
+
+    /// Whether the units of a product of 2-D blocks that read the same strip of `A` share its
+    /// reads ([`tensor::Reuse`], `tile_op::reuse`): a few holders read it from GDDR and the
+    /// others copy it from their L1. Bit for bit the unshared product. The copies read the
+    /// session's own tiles' `DATA`, so turning it on lets every mover's `op::READ_L1` name it
+    /// ([`crate::dm::L1Writes`]); a capture that keeps a window of its own (planned residency)
+    /// runs its products unshared. `TT_OPERAND_REUSE` at open; off by default.
+    pub fn set_operand_reuse(&mut self, reuse: tensor::Reuse) -> Result<(), TensorError> {
+        if reuse != tensor::Reuse::Off {
+            let tiles = self
+                .units
+                .iter()
+                .map(|u| (u.tile.x(), u.tile.y()))
+                .collect();
+            self.set_l1_writes(crate::dm::L1Writes {
+                tiles,
+                window: tt_isa::l1::DATA.base..tt_isa::l1::DATA.end,
+            })?;
+        }
+        self.reuse = reuse;
+        Ok(())
+    }
+
+    /// The tiles of a product's first `units` units, where it shares its reads
+    /// ([`Session::set_operand_reuse`]) and the movers may copy any of their `DATA`; empty
+    /// otherwise.
+    fn reuse_tiles(&self, units: usize) -> Vec<(u8, u8)> {
+        let data = tt_isa::l1::DATA.base..tt_isa::l1::DATA.end;
+        if self.reuse == tensor::Reuse::Off || self.l1_writes.window != data {
+            return Vec::new();
+        }
+        self.units[..units.min(self.units.len())]
+            .iter()
+            .map(|u| (u.tile.x(), u.tile.y()))
+            .collect()
     }
 
     /// Whether a captured one-row product with a packed `A` and its `K` whole puts its first
