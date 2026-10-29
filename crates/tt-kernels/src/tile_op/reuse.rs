@@ -1,26 +1,30 @@
 //! Operand reuse across cores (X4 of `docs/learnings/dataflow-compiler.md` §6, H1): the units of
 //! a shared deal ([`super::distribute::Shared`]) that read the same strip of a contraction's
-//! first operand read it from GDDR once a holder, and copy it from the holder's L1 otherwise.
+//! first operand read it from GDDR once a holder, and copy it from the holder's L1 otherwise; and
+//! with the deal's column groups, the same for the second operand.
 //!
-//! A lowered job's `GATHER` records name each chunk's strip (its tensor reference, first term,
-//! rows, terms and slots), so the pass works on records alone, as [`super::ahead`] does. A
-//! reader's strips are its holder's in order: its `t`-th job of a row is its holder's `t`-th
-//! (the deal's promise), so each reader gather is paired with the holder's next gather of the
-//! same strip, and an op whose gathers do not pair is refused.
+//! A lowered job's `GATHER` records name each chunk's strips (each operand's tensor reference,
+//! first tile, extent, terms and slots), so the pass works on records alone, as [`super::ahead`]
+//! does. A reader's strips of an operand are its holder's in order: its `t`-th job of a row is
+//! its holder's `t`-th (the deal's promise), so each reader gather is paired with the holder's
+//! next gather of the same strip, and an op whose gathers do not pair is refused.
 //!
 //! Each copy is credited both ways through the tile's op-level credit words
-//! ([`tt_isa::dm::CREDITS`]):
-//! - The holder gathers a strip, then credits each of its readers' [`READY`] word
-//!   ([`op::CREDIT`] waits for the gather's reads first, so the credit follows the data).
-//! - A reader waits for its [`READY`] count, copies the strip into the same slots
-//!   ([`op::READ_L1`]), credits its holder's [`FREED`] word for those slots, and gathers only its
-//!   second operand ([`record::GATHER_A_RESIDENT`]).
+//! ([`tt_isa::dm::CREDITS`]), three an operand ([`READY`] and [`FREED`] for `A`, [`READY_B`]
+//! and [`FREED_B`] for `B`):
+//! - The holder gathers a strip, then credits each of its readers' ready word ([`op::CREDIT`]
+//!   waits for the gather's reads first, so the credit follows the data).
+//! - A reader waits for its ready count, copies the strip into the same slots ([`op::READ_L1`]),
+//!   credits its holder's freed word for those slots, and gathers only what it does not copy
+//!   ([`record::GATHER_A_RESIDENT`], [`record::GATHER_B_RESIDENT`]; both: nothing).
 //! - Before a holder gathers into slots again, it waits for every copy of the strips it gathered
 //!   there before. One count a slot range keeps that sound: a copy of a later strip in the same
 //!   slots needs a credit the holder sends only after that wait.
-//! - A reader's credits come from its one holder, in order; a holder's frees in a slot range come
-//!   only from copies it granted. Every wait is for a credit sent at the same or an earlier
-//!   strip, so the waits cannot cycle.
+//! - A reader's credits of an operand come from its one holder, in order; a holder's frees in a
+//!   slot range come only from copies it granted. A unit may hold one operand and read the other.
+//!   Unit `(k, m)` (member `m` of group `k`) waits for ready credits only from `(k, m')` with
+//!   `m' < m` (its holder of `A`) and `(k', m)` with `k' < k` (of `B`), and a free only for a
+//!   strip before: the waits cannot cycle.
 //!
 //! Each unit leaves its words at zero: once its last wait has counted every credit aimed at a
 //! word, its last list (the writer's) credits the word minus its total. The barrier after the op
@@ -36,11 +40,17 @@ use tt_isa::dm::{credit_word, op, record};
 use super::distribute::Shared;
 use crate::tensor::{Job, Result, Step, TensorError};
 
-/// The credit word in which a reader counts the strips its holder has gathered for it.
+/// The credit word in which a reader counts the strips of `A` its holder has gathered for it.
 pub const READY: u32 = 0;
-/// The credit words in which a holder counts its readers' copies, one for each slot range its
-/// strips land in (a chain's two halves).
+/// The credit words in which a holder of `A` counts its readers' copies, one for each slot range
+/// its strips land in (a chain's two halves).
 pub const FREED: [u32; 2] = [1, 2];
+/// [`READY`] for `B`.
+pub const READY_B: u32 = 3;
+/// [`FREED`] for `B`.
+pub const FREED_B: [u32; 2] = [4, 5];
+/// The credit words the pass counts in.
+const WORDS: usize = 6;
 
 /// A `GATHER` record and its two tensor references, two words each.
 const GATHER_ENTRIES: usize = 5;
@@ -53,20 +63,106 @@ pub fn copies() -> u64 {
     COPIES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A gate's negative control: each copy reads its holder's strip 16 bytes past where it is.
-static MISROUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A gate's negative control, by operand (bit 0 `A`, bit 1 `B`): each copy of that operand reads
+/// its holder's strip 16 bytes past where it is.
+static MISROUTE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Whether [`pull`]'s copies read 16 bytes past their strip (a gate's negative control: the
-/// product must then differ).
+fn set_misroute(bit: u8, on: bool) {
+    if on {
+        MISROUTE.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        MISROUTE.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether [`pull`]'s copies of `A` read 16 bytes past their strip (a gate's negative control:
+/// the product must then differ).
 pub fn probe_misroute(on: bool) {
-    MISROUTE.store(on, std::sync::atomic::Ordering::Relaxed);
+    set_misroute(1, on);
+}
+
+/// [`probe_misroute`] for the copies of `B`.
+pub fn probe_misroute_b(on: bool) {
+    set_misroute(2, on);
+}
+
+/// A gate's negative control: each reader's last wait asks for one credit more than its holder
+/// sends, so the op stalls until its deadline.
+static OVERWAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`pull`]'s readers wait, at their last copy, for a credit that never comes (a gate's
+/// negative control: the op must fail, and the session must recover from it).
+pub fn probe_overwait(on: bool) {
+    OVERWAIT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The flags that say which tiles of the first operand a `GATHER` reads and how: transposed,
 /// live rows, terms and format.
 const A_FLAGS: u32 = 1 | 0x1F << 3 | 0x3FFF << 8 | record::GATHER_A_FORMAT_MASK;
+/// [`A_FLAGS`] for the second operand: transposed, transposed by the unpacker, terms and format.
+const B_FLAGS: u32 =
+    2 | record::GATHER_B_UNPACK_TRANSPOSE | 0x3FFF << 8 | record::GATHER_B_FORMAT_MASK;
 
-/// The strip a gather reads: its first operand's flags, slots, rows and tensor reference.
+/// One of a contraction's two operands, as a `GATHER` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operand {
+    A,
+    B,
+}
+
+impl Operand {
+    /// The flags that say which of its tiles a gather reads and how.
+    fn flags(self) -> u32 {
+        match self {
+            Operand::A => A_FLAGS,
+            Operand::B => B_FLAGS,
+        }
+    }
+
+    /// The flag that says a gather does not read it.
+    fn resident(self) -> u32 {
+        match self {
+            Operand::A => record::GATHER_A_RESIDENT,
+            Operand::B => record::GATHER_B_RESIDENT,
+        }
+    }
+
+    /// Its ready word and its freed words.
+    fn words(self) -> (u32, [u32; 2]) {
+        match self {
+            Operand::A => (READY, FREED),
+            Operand::B => (READY_B, FREED_B),
+        }
+    }
+
+    /// The header words of its slots, first tile and extent (rows of `A`, columns of `B`), and
+    /// the entry of its tensor reference.
+    fn fields(self) -> ([usize; 3], usize) {
+        match self {
+            Operand::A => ([2, 4, 5], 1),
+            Operand::B => ([3, 6, 7], 3),
+        }
+    }
+
+    /// Its slot's bytes under `flags`.
+    fn slot(self, flags: u32) -> std::result::Result<u64, u32> {
+        match self {
+            Operand::A => record::gather_a_tile_format(flags).map(|f| f.slot_bytes()),
+            Operand::B => record::gather_b_tile_format(flags).map(|f| f.slot_bytes()),
+        }
+    }
+
+    fn misrouted(self) -> bool {
+        let bit = match self {
+            Operand::A => 1,
+            Operand::B => 2,
+        };
+        MISROUTE.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
+    }
+}
+
+/// The strip a gather reads of an operand: its flags, slots, first tile, extent and tensor
+/// reference.
 type Strip = (u32, u32, u32, u32, [[u32; 8]; 2]);
 
 /// One `GATHER` of a unit: where it is, and the strip it reads.
@@ -75,13 +171,15 @@ struct Gather {
     step: usize,
     at: usize,
     strip: Strip,
-    /// The first operand's slots, and how many bytes the strip fills from there.
+    /// The operand's slots, and how many bytes the strip fills from there.
     slots: u32,
     bytes: u32,
 }
 
-/// Each unit's gathers, in the order it runs them: jobs `j` with `(first + j) % units == u`.
-fn gathers(jobs: &[Job], units: usize, first: usize) -> Result<Vec<Vec<Gather>>> {
+/// Each unit's gathers that read `operand`, in the order it runs them: jobs `j` with
+/// `(first + j) % units == u`.
+fn gathers(jobs: &[Job], units: usize, first: usize, operand: Operand) -> Result<Vec<Vec<Gather>>> {
+    let ([slots, from, extent], reference) = operand.fields();
     let mut out: Vec<Vec<Gather>> = (0..units).map(|_| Vec::new()).collect();
     for (j, job) in jobs.iter().enumerate() {
         let unit = (first + j) % units;
@@ -99,27 +197,25 @@ fn gathers(jobs: &[Job], units: usize, first: usize) -> Result<Vec<Vec<Gather>>>
                             "operand reuse: a gather read ahead or streamed is not shared".into(),
                         ));
                     }
-                    if flags & record::GATHER_A_RESIDENT == 0 {
-                        let slot = record::gather_a_tile_format(flags)
-                            .map_err(|code| {
-                                TensorError::Shape(format!(
-                                    "operand reuse: a gather's format code ({code})"
-                                ))
-                            })?
-                            .slot_bytes();
-                        let bytes = head[5] as u64 * record::gather_kt(flags) as u64 * slot;
+                    if flags & operand.resident() == 0 {
+                        let slot = operand.slot(flags).map_err(|code| {
+                            TensorError::Shape(format!(
+                                "operand reuse: a gather's format code ({code})"
+                            ))
+                        })?;
+                        let bytes = head[extent] as u64 * record::gather_kt(flags) as u64 * slot;
                         out[unit].push(Gather {
                             job: j,
                             step: s,
                             at,
                             strip: (
-                                flags & A_FLAGS,
-                                head[2],
-                                head[4],
-                                head[5],
-                                [entries[at + 1], entries[at + 2]],
+                                flags & operand.flags(),
+                                head[slots],
+                                head[from],
+                                head[extent],
+                                [entries[at + reference], entries[at + reference + 1]],
                             ),
-                            slots: head[2],
+                            slots: head[slots],
                             bytes: u32::try_from(bytes).map_err(|_| {
                                 TensorError::Shape("operand reuse: a strip past L1".into())
                             })?,
@@ -133,19 +229,20 @@ fn gathers(jobs: &[Job], units: usize, first: usize) -> Result<Vec<Vec<Gather>>>
     Ok(out)
 }
 
-/// What the pass adds around one gather: entries before its record and after it, and whether
-/// the record no longer reads its first operand.
+/// What the pass adds around one gather: entries before its record and after it, and the
+/// operands the record no longer reads (its resident flags).
 #[derive(Default)]
 struct Edit {
     before: Vec<[u32; 8]>,
     after: Vec<[u32; 8]>,
-    resident: bool,
+    resident: u32,
 }
 
 /// Rewrite `jobs` (job `j` on unit `(first + j) % units`) so that each reader of `shared` copies
-/// its strips from its holder's L1 instead of reading them from GDDR. `tiles` names each unit's
-/// tile. Refused where a reader's strips are not its holder's, in order, or a holder's strips
-/// land in more than two slot ranges.
+/// its strips from its holders' L1 instead of reading them from GDDR: of the first operand, and
+/// of the second where the deal has column groups. `tiles` names each unit's tile. Refused where
+/// a reader's strips are not its holder's, in order, or a holder's strips land in more than two
+/// slot ranges.
 pub fn pull(
     jobs: &mut [Job],
     units: usize,
@@ -154,158 +251,48 @@ pub fn pull(
     tiles: &[(u8, u8)],
 ) -> Result<()> {
     let units = units.max(1);
-    if tiles.len() < units || shared.holder_of.len() < units {
+    let b_shared = shared.b_holder_of.iter().any(Option::is_some);
+    if tiles.len() < units
+        || shared.holder_of.len() < units
+        || (b_shared && shared.b_holder_of.len() < units)
+    {
         return Err(TensorError::Shape(format!(
             "operand reuse: {} tiles and {} holders for {units} units",
             tiles.len(),
             shared.holder_of.len()
         )));
     }
-    let gathers = gathers(jobs, units, first)?;
-    // Each holder's gathers' readers, by pairing each reader's strips with its holder's next.
-    let mut readers: Vec<Vec<Vec<usize>>> =
-        gathers.iter().map(|g| vec![Vec::new(); g.len()]).collect();
-    let mut paired: Vec<Vec<usize>> = gathers
-        .iter()
-        .map(|g| Vec::with_capacity(g.len()))
-        .collect();
-    for r in 0..units {
-        let Some(h) = shared.holder_of[r] else {
-            continue;
-        };
-        let mut next = 0;
-        for g in &gathers[r] {
-            let held = &gathers[h];
-            while next < held.len() && held[next].strip != g.strip {
-                next += 1;
-            }
-            if next == held.len() {
-                return Err(TensorError::Shape(format!(
-                    "operand reuse: unit {r} reads a strip its holder {h} does not, in order"
-                )));
-            }
-            readers[h][next].push(r);
-            paired[r].push(next);
-            next += 1;
-        }
-    }
     let mut edits: HashMap<(usize, usize, usize), Edit> = HashMap::new();
     // Per unit, its count in each word, for the return to zero.
-    let mut totals = vec![[0u32; 3]; units];
-    for h in 0..units {
-        if shared.holder_of[h].is_some() || readers[h].iter().all(Vec::is_empty) {
-            continue;
-        }
-        // Each slot range the holder's strips land in, a word of its own.
-        let mut ranges: Vec<u32> = Vec::new();
-        for g in &gathers[h] {
-            if !ranges.contains(&g.slots) {
-                ranges.push(g.slots);
-            }
-        }
-        if ranges.len() > FREED.len() {
-            return Err(TensorError::Shape(format!(
-                "operand reuse: a holder's strips land in {} slot ranges",
-                ranges.len()
-            )));
-        }
-        let mut freed = [0u32; 2];
-        for (i, g) in gathers[h].iter().enumerate() {
-            let q = ranges.iter().position(|&s| s == g.slots).unwrap();
-            let edit = edits.entry((g.job, g.step, g.at)).or_default();
-            if freed[q] > 0 {
-                edit.before.push([
-                    op::WAIT_CREDIT,
-                    credit_word(FREED[q]),
-                    freed[q],
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ]);
-            }
-            for &r in &readers[h][i] {
-                let (x, y) = tiles[r];
-                edit.after.push([
-                    op::CREDIT,
-                    x as u32,
-                    y as u32,
-                    credit_word(READY),
-                    1,
-                    0,
-                    0,
-                    0,
-                ]);
-            }
-            freed[q] += readers[h][i].len() as u32;
-        }
-        totals[h][1] = freed[0];
-        totals[h][2] = freed[1];
-        // Each reader's copies, in its own order.
-        for &r in readers[h].iter().flatten() {
-            if !totals[r].iter().all(|&t| t == 0) {
-                continue;
-            }
-            let (hx, hy) = tiles[h];
-            for (n, (g, &i)) in gathers[r].iter().zip(&paired[r]).enumerate() {
-                let q = ranges
-                    .iter()
-                    .position(|&s| s == gathers[h][i].slots)
-                    .unwrap();
-                let edit = edits.entry((g.job, g.step, g.at)).or_default();
-                edit.before.push([
-                    op::WAIT_CREDIT,
-                    credit_word(READY),
-                    n as u32 + 1,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ]);
-                let max = tt_isa::noc::niu::MAX_REQUEST_BYTES;
-                let skew = 16 * u32::from(MISROUTE.load(std::sync::atomic::Ordering::Relaxed));
-                for off in (0..g.bytes).step_by(max as usize) {
-                    let at = g.slots + off;
-                    edit.before.push([
-                        op::READ_L1,
-                        hx as u32,
-                        hy as u32,
-                        at + skew,
-                        at,
-                        (g.bytes - off).min(max),
-                        0,
-                        0,
-                    ]);
-                }
-                edit.before.push([
-                    op::CREDIT,
-                    hx as u32,
-                    hy as u32,
-                    credit_word(FREED[q]),
-                    1,
-                    0,
-                    0,
-                    0,
-                ]);
-                edit.resident = true;
-            }
-            totals[r][0] = gathers[r].len() as u32;
-            COPIES.fetch_add(
-                gathers[r].len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+    let mut totals = vec![[0u32; WORDS]; units];
+    plan(
+        jobs,
+        units,
+        first,
+        &shared.holder_of,
+        tiles,
+        Operand::A,
+        &mut edits,
+        &mut totals,
+    )?;
+    if b_shared {
+        plan(
+            jobs,
+            units,
+            first,
+            &shared.b_holder_of,
+            tiles,
+            Operand::B,
+            &mut edits,
+            &mut totals,
+        )?;
     }
     for ((j, s, at), edit) in sorted(edits) {
         let Step::List { entries, .. } = &mut jobs[j][s] else {
             unreachable!("a gather is in a list");
         };
         let mut record: Vec<[u32; 8]> = entries[at..at + GATHER_ENTRIES].to_vec();
-        if edit.resident {
-            record[0][1] |= record::GATHER_A_RESIDENT;
-        }
+        record[0][1] |= edit.resident;
         let replacement = edit.before.into_iter().chain(record).chain(edit.after);
         entries.splice(at..at + GATHER_ENTRIES, replacement);
     }
@@ -333,7 +320,7 @@ pub fn pull(
             }
             let word = credit_word(w as u32);
             // A holder's frees come from other tiles: all of them counted before it returns.
-            if w != READY as usize {
+            if w as u32 != READY && w as u32 != READY_B {
                 restore.push([op::WAIT_CREDIT, word, t, 0, 0, 0, 0, 0]);
             }
             restore.push([
@@ -355,6 +342,161 @@ pub fn pull(
     Ok(())
 }
 
+/// The edits that share `operand`'s strips among the units `holder_of` pairs, added to `edits`,
+/// and each unit's counts in its words to `totals`.
+#[allow(clippy::too_many_arguments)]
+fn plan(
+    jobs: &[Job],
+    units: usize,
+    first: usize,
+    holder_of: &[Option<usize>],
+    tiles: &[(u8, u8)],
+    operand: Operand,
+    edits: &mut HashMap<(usize, usize, usize), Edit>,
+    totals: &mut [[u32; WORDS]],
+) -> Result<()> {
+    let (ready, freed_words) = operand.words();
+    let gathers = gathers(jobs, units, first, operand)?;
+    // Each holder's gathers' readers, by pairing each reader's strips with its holder's next.
+    let mut readers: Vec<Vec<Vec<usize>>> =
+        gathers.iter().map(|g| vec![Vec::new(); g.len()]).collect();
+    let mut paired: Vec<Vec<usize>> = gathers
+        .iter()
+        .map(|g| Vec::with_capacity(g.len()))
+        .collect();
+    for r in 0..units {
+        let Some(h) = holder_of[r] else {
+            continue;
+        };
+        let mut next = 0;
+        for g in &gathers[r] {
+            let held = &gathers[h];
+            while next < held.len() && held[next].strip != g.strip {
+                next += 1;
+            }
+            if next == held.len() {
+                return Err(TensorError::Shape(format!(
+                    "operand reuse: unit {r} reads a strip of {operand:?} its holder {h} does \
+                     not, in order"
+                )));
+            }
+            readers[h][next].push(r);
+            paired[r].push(next);
+            next += 1;
+        }
+    }
+    let mut copied = vec![false; units];
+    for h in 0..units {
+        if holder_of[h].is_some() || readers[h].iter().all(Vec::is_empty) {
+            continue;
+        }
+        // Each slot range the holder's strips land in, a word of its own.
+        let mut ranges: Vec<u32> = Vec::new();
+        for g in &gathers[h] {
+            if !ranges.contains(&g.slots) {
+                ranges.push(g.slots);
+            }
+        }
+        if ranges.len() > freed_words.len() {
+            return Err(TensorError::Shape(format!(
+                "operand reuse: a holder's strips of {operand:?} land in {} slot ranges",
+                ranges.len()
+            )));
+        }
+        let mut freed = [0u32; 2];
+        for (i, g) in gathers[h].iter().enumerate() {
+            let q = ranges.iter().position(|&s| s == g.slots).unwrap();
+            let edit = edits.entry((g.job, g.step, g.at)).or_default();
+            if freed[q] > 0 {
+                edit.before.push([
+                    op::WAIT_CREDIT,
+                    credit_word(freed_words[q]),
+                    freed[q],
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]);
+            }
+            for &r in &readers[h][i] {
+                let (x, y) = tiles[r];
+                edit.after.push([
+                    op::CREDIT,
+                    x as u32,
+                    y as u32,
+                    credit_word(ready),
+                    1,
+                    0,
+                    0,
+                    0,
+                ]);
+            }
+            freed[q] += readers[h][i].len() as u32;
+        }
+        totals[h][freed_words[0] as usize] = freed[0];
+        totals[h][freed_words[1] as usize] = freed[1];
+        // Each reader's copies, in its own order.
+        for &r in readers[h].iter().flatten() {
+            if std::mem::replace(&mut copied[r], true) {
+                continue;
+            }
+            let (hx, hy) = tiles[h];
+            for (n, (g, &i)) in gathers[r].iter().zip(&paired[r]).enumerate() {
+                let q = ranges
+                    .iter()
+                    .position(|&s| s == gathers[h][i].slots)
+                    .unwrap();
+                let edit = edits.entry((g.job, g.step, g.at)).or_default();
+                let last = n + 1 == gathers[r].len()
+                    && OVERWAIT.load(std::sync::atomic::Ordering::Relaxed);
+                edit.before.push([
+                    op::WAIT_CREDIT,
+                    credit_word(ready),
+                    n as u32 + 1 + u32::from(last),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]);
+                let max = tt_isa::noc::niu::MAX_REQUEST_BYTES;
+                let skew = 16 * u32::from(operand.misrouted());
+                for off in (0..g.bytes).step_by(max as usize) {
+                    let at = g.slots + off;
+                    edit.before.push([
+                        op::READ_L1,
+                        hx as u32,
+                        hy as u32,
+                        at + skew,
+                        at,
+                        (g.bytes - off).min(max),
+                        0,
+                        0,
+                    ]);
+                }
+                edit.before.push([
+                    op::CREDIT,
+                    hx as u32,
+                    hy as u32,
+                    credit_word(freed_words[q]),
+                    1,
+                    0,
+                    0,
+                    0,
+                ]);
+                edit.resident |= operand.resident();
+            }
+            totals[r][ready as usize] = gathers[r].len() as u32;
+            COPIES.fetch_add(
+                gathers[r].len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `edits` by position, the last of a list first, so each splice leaves the earlier positions
 /// where they were.
 fn sorted(edits: HashMap<(usize, usize, usize), Edit>) -> Vec<((usize, usize, usize), Edit)> {
@@ -371,13 +513,16 @@ mod tests {
     /// each block runs once.
     #[test]
     fn a_shared_deal_runs_every_block_once_in_groups() {
-        for (rows, cols, units, holders) in [
-            (8, 57, 120, 1),
-            (8, 57, 120, 4),
-            (3, 5, 8, 2),
-            (16, 9, 120, 2),
+        for (rows, cols, units, holders, b_holders) in [
+            (8, 57, 120, 1, None),
+            (8, 57, 120, 4, None),
+            (3, 5, 8, 2, None),
+            (16, 9, 120, 2, None),
+            (8, 57, 120, 2, Some(1)),
+            (3, 5, 8, 2, Some(2)),
+            (16, 9, 120, 2, Some(3)),
         ] {
-            let s = shared(rows, cols, units, holders).unwrap();
+            let s = shared(rows, cols, units, holders, b_holders).unwrap();
             let mut seen = vec![0; rows * cols];
             for b in s.order.iter().flatten() {
                 seen[*b] += 1;
@@ -395,16 +540,41 @@ mod tests {
                     }
                 }
             }
+            // A column reader's holder of `B`: a unit of an earlier group that holds `B` itself
+            // and, in every round the reader has a block, has one of the same column.
+            let b_shared = s.b_holder_of.iter().any(Option::is_some);
+            assert_eq!(b_shared, b_holders.is_some_and(|_| rows > 1));
+            for (u, h) in s.b_holder_of.iter().enumerate() {
+                if let Some(h) = *h {
+                    assert!(h < u && s.b_holder_of[h].is_none());
+                    for t in (0..s.order.len()).step_by(units) {
+                        if let Some(b) = s.order.get(t + u).copied().flatten() {
+                            let held = s.order.get(t + h).copied().flatten();
+                            assert_eq!(held.map(|x| x % cols), Some(b % cols), "round {t}");
+                        }
+                    }
+                }
+            }
+            // With `B` shared the groups are one size, and the remainder runs nothing.
+            if b_holders.is_some() {
+                let used = units / rows.min(units) * rows.min(units);
+                for u in used..units {
+                    assert!((u..s.order.len())
+                        .step_by(units)
+                        .all(|j| s.order[j].is_none()));
+                }
+            }
         }
     }
 
     #[test]
     fn nothing_is_shared_where_a_row_has_one_unit_or_one_block() {
-        assert_eq!(shared(120, 57, 120, 1), None);
-        assert_eq!(shared(8, 1, 120, 1), None);
+        assert_eq!(shared(120, 57, 120, 1, None), None);
+        assert_eq!(shared(8, 1, 120, 1, None), None);
+        assert_eq!(shared(120, 57, 120, 1, Some(1)), None);
     }
 
-    use super::{A_FLAGS, GATHER_ENTRIES};
+    use super::{Operand, GATHER_ENTRIES};
     use crate::matmul::{Fidelity, SrcRoute};
     use crate::tensor::{self, BlockStream, DramAlloc, DramTensor, Elem, Reads, Reuse, Step};
     use tt_isa::dm::{credit_word, op, record, CREDIT_WORDS};
@@ -459,19 +629,20 @@ mod tests {
         (work.jobs, tiles)
     }
 
-    /// The strip a `GATHER` at `e[at..]` reads: its first operand's flags, slots, rows and
-    /// tensor reference.
-    fn strip(e: &[[u32; 8]], at: usize) -> Vec<u32> {
+    /// The strip of `operand` a `GATHER` at `e[at..]` reads: its flags, slots, first tile,
+    /// extent and tensor reference.
+    fn strip(e: &[[u32; 8]], at: usize, operand: Operand) -> Vec<u32> {
         let h = e[at];
-        let mut s = vec![h[1] & A_FLAGS, h[2], h[4], h[5]];
-        s.extend(e[at + 1]);
-        s.extend(e[at + 2]);
+        let ([slots, from, extent], reference) = operand.fields();
+        let mut s = vec![h[1] & operand.flags(), h[slots], h[from], h[extent]];
+        s.extend(e[at + reference]);
+        s.extend(e[at + reference + 1]);
         s
     }
 
     /// Run every unit's lists as one program each, interleaved at random by `seed`: credits add
     /// to their tile's words, a credit wait holds its unit until its word reaches the target, a
-    /// gather fills its first operand's slots with its strip (each 16 KiB piece apart), and a
+    /// gather fills each operand's slots with its strip (each 16 KiB piece apart), and a
     /// copy takes the holder's pieces as they are when it runs. Each gather the pass made
     /// resident must find, in every piece, the strip it would have read; nothing may stall; every
     /// word ends at zero.
@@ -543,17 +714,22 @@ mod tests {
                     slots[u].insert(e[4], got);
                 }
                 record::GATHER => {
-                    let (flags, at) = (e[1], e[2]);
-                    let s = strip(p, pc[u]);
-                    let slot = record::gather_a_tile_format(flags).unwrap().slot_bytes();
-                    let bytes = (e[5] as u64 * record::gather_kt(flags) as u64 * slot) as u32;
-                    for off in (0..bytes).step_by(piece as usize) {
-                        if flags & record::GATHER_A_RESIDENT == 0 {
-                            slots[u].insert(at + off, s.clone());
-                        } else if slots[u].get(&(at + off)) != Some(&s) {
-                            return Err(format!(
-                                "unit {u}: a copied strip is not the one it reads"
-                            ));
+                    let flags = e[1];
+                    for operand in [Operand::A, Operand::B] {
+                        let ([at, _, extent], _) = operand.fields();
+                        let (at, s) = (e[at], strip(p, pc[u], operand));
+                        let bytes = (e[extent] as u64
+                            * record::gather_kt(flags) as u64
+                            * operand.slot(flags).unwrap())
+                            as u32;
+                        for off in (0..bytes).step_by(piece as usize) {
+                            if flags & operand.resident() == 0 {
+                                slots[u].insert(at + off, s.clone());
+                            } else if slots[u].get(&(at + off)) != Some(&s) {
+                                return Err(format!(
+                                    "unit {u}: a copied strip of {operand:?} is not the one it reads"
+                                ));
+                            }
                         }
                     }
                 }
@@ -570,21 +746,32 @@ mod tests {
         }
     }
 
-    const CASES: [([usize; 3], usize, [usize; 3], usize); 4] = [
-        ([256, 256, 576], 8, [2, 2, 3], 1),
-        ([256, 256, 576], 8, [4, 2, 3], 2),
-        ([200, 256, 600], 6, [2, 2, 3], 1),
-        ([2048, 2048, 16384], 120, [8, 2, 9], 4),
+    /// Shape, units, block, and the holders of `A` a group and of `B` a column group.
+    #[allow(clippy::type_complexity)]
+    const CASES: [([usize; 3], usize, [usize; 3], usize, Option<usize>); 9] = [
+        ([256, 256, 576], 8, [2, 2, 3], 1, None),
+        ([256, 256, 576], 8, [4, 2, 3], 2, None),
+        ([200, 256, 600], 6, [2, 2, 3], 1, None),
+        ([2048, 2048, 16384], 120, [8, 2, 9], 4, None),
+        // `B` shared too: groups of two, two groups of four, an idle remainder with two holders
+        // a column group, groups of one (only `B` shared), and H1's product.
+        ([256, 256, 576], 8, [2, 2, 3], 1, Some(1)),
+        ([256, 256, 576], 8, [4, 2, 3], 2, Some(1)),
+        ([256, 256, 576], 9, [2, 2, 3], 1, Some(2)),
+        ([200, 256, 600], 6, [2, 2, 3], 1, Some(1)),
+        ([2048, 2048, 16384], 120, [8, 2, 9], 2, Some(1)),
     ];
 
     /// The shared product's copies land what its gathers would have read, under any
     /// interleaving, with no stall and every word back at zero; its kernels are the unshared
-    /// product's, word for word, and each reader reads no `A` from GDDR.
+    /// product's, word for word, and the readers of each shared operand read none of it from
+    /// GDDR.
     #[test]
     fn copies_land_what_the_gathers_read_under_any_interleaving() {
-        for (shape, units, block, holders) in CASES {
+        for (shape, units, block, holders, b_holders) in CASES {
             let (plain, _) = product(shape, units, block, Reuse::Off);
-            let (shared, tiles) = product(shape, units, block, Reuse::Pull { holders });
+            let reuse = Reuse::Pull { holders, b_holders };
+            let (shared, tiles) = product(shape, units, block, reuse);
             let kernels = |jobs: &[tensor::Job]| {
                 let mut k: Vec<_> = jobs
                     .iter()
@@ -594,21 +781,31 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                k.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                k.sort_by_cached_key(|x| format!("{x:?}"));
                 k
             };
             assert_eq!(kernels(&plain), kernels(&shared), "{shape:?}");
-            let resident = shared
-                .iter()
-                .flatten()
-                .filter_map(|s| match s {
-                    Step::List { entries, .. } => Some(entries),
-                    _ => None,
-                })
-                .flatten()
-                .filter(|e| e[0] == record::GATHER && e[1] & record::GATHER_A_RESIDENT != 0)
-                .count();
-            assert!(resident > 0, "{shape:?}: something is shared");
+            let resident = |flag: u32| {
+                shared
+                    .iter()
+                    .flatten()
+                    .filter_map(|s| match s {
+                        Step::List { entries, .. } => Some(entries),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter(|e| e[0] == record::GATHER && e[1] & flag != 0)
+                    .count()
+            };
+            assert!(
+                resident(record::GATHER_A_RESIDENT | record::GATHER_B_RESIDENT) > 0,
+                "{shape:?}: something is shared"
+            );
+            assert_eq!(
+                resident(record::GATHER_B_RESIDENT) > 0,
+                b_holders.is_some(),
+                "{shape:?}: B shared as asked"
+            );
             let seeds = if units > 16 { 1 } else { 64 };
             for seed in 0..seeds {
                 run(&shared, &tiles, seed).unwrap_or_else(|e| panic!("{shape:?} seed {seed}: {e}"));
@@ -620,8 +817,29 @@ mod tests {
     /// readers' copies lets some interleaving copy a later strip.
     #[test]
     fn a_holder_that_does_not_wait_for_its_copies_is_caught() {
-        let (mut jobs, tiles) = product([256, 256, 576], 8, [2, 2, 3], Reuse::Pull { holders: 1 });
-        let freed = [credit_word(super::FREED[0]), credit_word(super::FREED[1])];
+        let reuse = Reuse::Pull {
+            holders: 1,
+            b_holders: None,
+        };
+        caught_without_waits(product([256, 256, 576], 8, [2, 2, 3], reuse), super::FREED);
+    }
+
+    /// [`a_holder_that_does_not_wait_for_its_copies_is_caught`] for a holder of `B`.
+    #[test]
+    fn a_holder_of_b_that_does_not_wait_for_its_copies_is_caught() {
+        let reuse = Reuse::Pull {
+            holders: 1,
+            b_holders: Some(1),
+        };
+        caught_without_waits(
+            product([256, 256, 576], 8, [2, 2, 3], reuse),
+            super::FREED_B,
+        );
+    }
+
+    /// Drop every wait on `freed` before a gather; some interleaving must then fail.
+    fn caught_without_waits((mut jobs, tiles): (Vec<tensor::Job>, Vec<(u8, u8)>), freed: [u32; 2]) {
+        let freed = [credit_word(freed[0]), credit_word(freed[1])];
         let mut dropped = 0;
         for step in jobs.iter_mut().flatten() {
             if let Step::List { entries, .. } = step {

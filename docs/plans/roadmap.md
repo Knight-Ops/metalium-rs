@@ -794,7 +794,16 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
     FP32 `B` ≥ 25.8 TFLOPS and ≤ 302 MB read.
   - Reuse buys up to 1.51x for FP32 operands, but at most 1.13x for packed weights, which already run near the kernel's
     ceiling (F5's).
-  - Next: D5's delivery probes.
+  - F4b.1 (2026-10-29, cards 0 and 1): D5 decided, **`A` pulled from a few holders**: 1.33-1.44x with an FP32 `B` at
+    three prefill shapes, bit for bit (H1 28.38 TFLOPS through the session). `B` pulled too meets H1's reads (205-273
+    MB) but loses the rate (a holder's L1 fan-out); credits as one run gained nothing (retired); multicast deferred, its
+    bound recorded; a failed shared op recovers (gated). Opt-in: `TT_OPERAND_REUSE=pull:<h>[,<hb>]`
+    ([log](../learnings/performance-log.md#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1)).
+  - Found: a packed `B` is bound by the block, not reads: at H1 `[6,4,12]` gives BFP8/4/2 34.5-43.0 TFLOPS against
+    26.3-26.5, 44.5-45.8 with `A` pulled. The model re-weighed by slot was tried as the default and reverted (it
+    regresses other shapes by up to 14-22%).
+  - Next: the winner as F3's reuse pass with a policy for when to pull, and a block chosen by measurement (the model's
+    best candidates timed on the card once a shape, cached), which takes the packed-`B` gains.
   - Found: `[2048,8192]@[8192,2048]` is 1.7x slower through Burn (10.9-11.0 TFLOPS) than through the session (18.5).
 - [ ] **F4a:** channels instead of barriers in decode (H4).
 - [ ] **F5:** `Dst` subblocks and half-sync (H2).

@@ -12,6 +12,10 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever](#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1) | 2026-10-29 | three prefill shapes x every `B` format x the schemes: `A` pulled 1.33-1.44x with FP32 `B` (H1 28.38 TFLOPS); `B` pulled loses; a packed `B` is bound by the block (H1 `[6,4,12]` + `A` pulled 44.5-45.8, 1.7x), shape-dependent |
+| [F4b.1: a holder's credits as one run, no gain](#f4b1-a-holders-credits-as-one-run-no-gain-2026-10-29-cards-0-and-1) | 2026-10-29 | `dm::CREDIT_RUN` built and correct on card 0, measured off/on on card 1 within noise (`pull:1` 25.1 / 25.2, `pull:2,1` 15.3 / 14.9): a holder's round trips do not bind; retired |
+| [F4b.1: larger GDDR blocks; the planner's block, not reads, binds a packed `B`](#f4b1-larger-gddr-blocks-the-planners-block-not-reads-binds-a-packed-b-2026-10-29-card-1) | 2026-10-29 | H1's shape: FP32 `B`'s planner block already reads least (larger ones do not fit L1); a packed `B` runs 1.31-1.63x faster at `[6,4,12]` (BFP8 / BFP4 / BFP2 34.4 / 41.1 / 43.1 TFLOPS against 26.3-26.5), BF16 1.13x, FP32 1.05x: the planner's block binds. Two re-weighed models measured at four shapes each lose up to 14-22% somewhere: reverted; a measured block choice is next |
+| [F4b.1: `B` pulled too, the reads clause met and the rate lost](#f4b1-b-pulled-too-the-reads-clause-met-and-the-rate-lost-2026-10-29-cards-0-and-1) | 2026-10-29 | H1's product with both operands pulled: reads 2,062 -> **205-273 MB** (inside H1's ≤ 302), bit for bit on every tile, but 14-15 TFLOPS with seven readers a `B` holder (kill fires), 25.3-25.7 with one: the cost is a holder's fan-out |
 | [F4b.1: `A` pulled from a few holders, the first measured scheme of D5](#f4b1-a-pulled-from-a-few-holders-the-first-measured-scheme-of-d5-2026-10-28-cards-0-and-1) | 2026-10-28 | H1's product with `A` shared, copied from 2-4 holders a group by `READ_L1`: 19.1 -> **25.98 TFLOPS** (86% of the ceiling), bit for bit; reads 2,062 -> 1,346 MB, `B` still read 8 times; a host-queueing deadlock at scale found and fixed (segments cut at the same chunks on every unit) |
 | [F4b.0: what operand reuse can buy, the reads-free ceiling at prefill shapes](#f4b0-what-operand-reuse-can-buy-the-reads-free-ceiling-at-prefill-shapes-2026-10-28-card-1) | 2026-10-28 | H1's shape `[2048,2048]@[2048,16384]` 19.36 / 19.17 TFLOPS through Burn on card 1, reading 2,062 MB for 151 MB of operands; reads-free ceiling 30.3 (FP32 `B`) and 28.0 (packed `B`), so 35 is out of reach: reuse buys up to 1.51x for FP32 operands, at most 1.13x for packed weights; H1 restated (≥ 25.8 TFLOPS, ≤ 302 MB); found: `down` 1.7x slower through Burn than through the session |
 | [F3: the tile-generic op, pointwise and reduction ported, before and after](#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1) | 2026-10-28 | B0 (`050cbbd`) against the pointwise family and the reduction on `TileOp`, word for word: their build stage first 20-50% slower (per-run allocations, up to 3.9% of a call), then within 1.8% of B0 on every call (`8011dc7`, ABBA); traced decode ABBA 0.997-1.005 of B0 against B0's own 1.5% drift; models and MNIST within drift; F3 closed: the matmul, allocation and channels as passes, eager step time (B1) within drift of F3.8's tree, ABBA |
@@ -384,6 +388,169 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever (2026-10-29, card 1)
+
+F4b.1's schemes side by side ([plan](../plans/dataflow-compiler.md), "Decide D5"), through the session
+(`silicon_probe_pair_cost::pair_cost`, HiFi4, traced replay, median of 7, every product checked against exact
+integer arithmetic, every run PASS). `TT_OPERAND_REUSE` is read when the session opens, so each scheme runs every `B`
+format. TFLOPS:
+
+| Shape | `B` | off | `pull:4` | `pull:2,1` | `pull:2,4` | `[6,4,12]` | `pull:4` + `[6,4,12]` |
+|---|---|--:|--:|--:|--:|--:|--:|
+| `[2048,2048]@[2048,16384]` | FP32 | 20.22 / 20.29 | **28.38** | 16.07 | 28.37 | - | - |
+| | BF16 | 24.37 / 24.98 | **26.47** | 24.86 | 26.31 | - | - |
+| | BFP8 | 26.28 / 26.34 | 26.56 | 25.62 | 26.29 | 34.51 | **44.48** |
+| | BFP4 | 26.44 / 26.45 | 26.66 | 25.67 | 26.30 | 41.06 | **45.32** |
+| | BFP2 | 26.48 / 26.50 | 26.67 | 25.71 | 26.35 | 43.01 | **45.75** |
+| `[1024,2048]@[2048,8192]` | FP32 | 15.86 / 15.83 | **22.80** | 19.80 | 22.36 | - | - |
+| | BF16 | 22.53 / 22.33 | 21.91 | 21.46 | 21.77 | - | - |
+| | BFP8 | 22.60 / 22.37 | 21.89 | 21.45 | 21.72 | **23.08** | 20.42 |
+| | BFP2 | 22.47 / 22.27 | 22.00 | 21.49 | 21.62 | **27.44** | 20.49 |
+| `[2048,8192]@[8192,2048]` | FP32 | 18.70 / 18.79 | **24.83** | 23.42 | 24.27 | - | - |
+| | BF16 | 24.40 / 24.45 | **25.02** | 23.83 | 24.35 | - | - |
+| | BFP8 | 29.37 / 29.58 | **31.63** | 26.47 | 30.90 | 25.31 | 24.60 |
+| | BFP2 | 32.49 / 32.56 | 31.68 | 30.58 | 31.02 | 25.49 | 24.81 |
+
+Runs: off `1793243755`, `1793244204` (first and last); `pull:4` `1793243824`; `pull:2,1` `1793243897`; `pull:2,4`
+`1793243975`; `[6,4,12]` `1793244051`; `pull:4` + `[6,4,12]` `1793244127` ("-": the block does not fit that format and
+the other paths run).
+
+- **D5, decided by measurement: `A` pulled from a few holders.** With an FP32 `B` it is 1.40x, 1.44x and 1.33x at the
+  three shapes (28.38 TFLOPS at H1, 94% of the 30.3 ceiling through the session; 25.2-26.0 through Burn, `matmul_throughput`).
+- `B` pulled loses everywhere a `B` holder serves more than one reader (a holder's L1 fan-out); with one reader each
+  (`pull:2,4`) it is `pull:4`'s rate, less.
+- A packed `B` gains little from reuse at the default block (-3% to +8%): its lever is the block, and the best block is
+  shape-dependent. At H1, `[6,4,12]` and `A` pulled reach 44.5-45.8 TFLOPS (1.69-1.73x); at `[1024,2048]@[2048,8192]`
+  the block helps alone (1.03-1.23x) and `A`'s pull hurts with it; at `down` the default block is best.
+- Multicast: deferred, not built (the plan records the geometric bound). Larger GDDR blocks: for FP32, the default
+  block already reads least; for packed, see the block finding.
+- Next: the winner as F3's reuse pass with a policy for when to pull (FP32 operands at prefill shapes), and a block
+  chosen by measurement among the model's best candidates, which can also choose whether to pull.
+
+## F4b.1: a holder's credits as one run, no gain (2026-10-29, cards 0 and 1)
+
+A holder sends a ready credit to each reader after each gather, each `op::CREDIT` waiting for its atomic's response:
+14 round trips a chunk at `pull:1`, seven for a `B` holder at `pull:2,1`. `dm::CREDIT_RUN` (word 5 of a credit, as
+`MCAST_RUN_ACKS` is a multicast's) let a run's credits issue back to back and count their responses once. Correct on
+card 0 (`step242`, a broadcast ring's credits as one run; `step244`; `step172`/`step173` on the safe and `fast-reads` +
+`encoded-guard` images: `1793242140`, `1793242327`; H1 on every tile, `1793242347`).
+
+**`[2048,2048]@[2048,16384]` on card 1**, `TT_CREDIT_RUNS` off / on, ABBA (`1793242358`-`1793242444`):
+
+| `TT_OPERAND_REUSE` | Off | On |
+|---|--:|--:|
+| pull:1 | 25.07, 25.16 | 25.36, 25.05 |
+| pull:4 | 26.01 | 25.64 |
+| pull:2,1 | 15.20, 15.31 | 14.98, 14.85 |
+
+No gain (the kill was under 1%): the round trips do not bind, so a `B` holder's cost at seven readers is its L1
+serving seven copies of a 72 KiB strip a chunk. The flag was retired: firmware, entry, pass and gate case.
+
+## F4b.1: larger GDDR blocks; the planner's block, not reads, binds a packed `B` (2026-10-29, card 1)
+
+The third of D5's options ([plan](../plans/dataflow-compiler.md) F4b.1): each operand re-read from GDDR fewer times
+by a larger block, no code. `TT_MATMUL_BLOCK=mb,kq,nb` at H1's shape `[2048,2048]@[2048,16384]` (64 x 64 x 512 tiles).
+
+**FP32 `B` through Burn** (`matmul_throughput`, `1793237539`-`1793237622`): the planner's `[8,2,9]` (19.10 TFLOPS, 2,062
+MB) is the largest block that fits. Every larger one tried (`[16,2,9]`, `[8,2,18]`, `[16,2,16]`, `[16,1,16]`,
+`[32,1,8]`, `[8,1,32]`, `[16,4,8]`, `[32,2,8]`, `[16,1,24]`) is refused by name ("no such blocked product ... fits")
+and runs the unblocked paths (5.5 TFLOPS, 10,769 MB). A block keeps its `mb x nb` FP32 outputs twice over, so
+`mb x nb <= 72` here, and over that bound the reads `16.8 MB x 512/nb + 134 MB x 64/mb` are least at `mb ≈ 8.5`: the
+planner's block already reads least. **The prediction held for FP32 `B`**: no block that fits beats it on reads.
+
+**Every format, through the session** (`silicon_probe_pair_cost::pair_cost`, HiFi4, traced, median of 7; every product
+checked against exact integer arithmetic, every run PASS). TFLOPS by block; blank where the block does not fit that
+format:
+
+| Block | FP32 | BF16 | BFP8 | BFP4 | BFP2 | Run |
+|---|--:|--:|--:|--:|--:|---|
+| auto (`[8,2,9]`) | 20.13 | 24.69 | 26.32 | 26.47 | 26.46 | `1793238206` |
+| `[6,2,12]` | 18.75 | 27.62 | 28.82 | 29.18 | 29.29 | `1793238299` |
+| `[5,2,14]` | 17.78 | 26.09 | 27.44 | 27.98 | 28.12 | `1793238942` |
+| `[4,2,18]` | | **27.96** | 29.36 | 29.88 | 30.11 | `1793238847` |
+| `[3,2,24]` | | 22.51 | 26.83 | 27.28 | 27.37 | `1793238895` |
+| `[6,4,8]` | 21.02 | 26.61 | 28.97 | 31.23 | 32.95 | `1793239513` |
+| `[8,4,6]` | **21.09** | 24.75 | 26.68 | 27.76 | 28.44 | `1793239557` |
+| `[4,4,12]` | | 26.66 | 31.57 | 38.99 | 41.55 | `1793239600` |
+| `[6,4,10]` | | 27.72 | 30.89 | 36.76 | 39.20 | `1793239646` |
+| `[8,4,8]` | | | 28.46 | 30.23 | 31.25 | `1793239691` |
+| `[6,4,12]` | | | **34.44** | **41.06** | **43.11** | `1793238988` |
+| `[4,8,8]` | | 23.99 | 29.58 | 32.07 | 33.49 | `1793239737` |
+
+- **A packed `B` is bound by the planner's block, not by reads:** `[6,4,12]` runs BFP8 / BFP4 / BFP2 at 34.4 / 41.1 / 43.1
+  TFLOPS against the default's 26.3-26.5 (1.31-1.63x), above F4b.0's "reads-free ceiling" of 28.0, which was measured at
+  the default block. BF16 gains 1.13x (`[4,2,18]`), FP32 1.05x (`[8,4,6]`).
+- **Why the planner misses it:** `tensor::block_stream_model` charges every tile of both operands FP32's 4 KiB. With an
+  FP32 `A` and a packed `B`, the reads are mostly `A`'s, re-read `nt/nb` times, so a wider `nb` and longer chunks (fewer
+  chunks, each reloading the outputs once) win; the model sees `B`'s bytes as `A`'s and keeps `[8,2,9]`.
+- F4b.0's packed "ceiling" was the default block's, not the kernel's.
+
+**The planner re-weighed, refuted (2026-10-29, card 1, reverted).** Two models were built and measured against the
+default at four shapes (`pair_cost`, HiFi4; before `1793238206`, `1793240330`):
+
+| `B` | Shape | Default | Slots (pair 0.2) | Slots, pair 0.15 |
+|---|---|--:|--:|--:|
+| FP32 | `[2048,2048]@[2048,16384]` | 20.13 | 20.24 | **15.69** |
+| FP32 | `[1024,2048]@[2048,8192]` | 15.86 | 15.86 | **13.97** |
+| FP32 | `[1024,8192]@[8192,2048]` | 16.84 | 16.71 | 18.81 |
+| BF16 | `[2048,2048]@[2048,16384]` | 24.69 | 25.08 | 27.60 |
+| BF16 | `[1024,2048]@[2048,8192]` | 22.47 | **19.36** | **20.07** |
+| BFP8 | `[2048,2048]@[2048,16384]` | 26.32 | 34.65 | 34.54 |
+| BFP8 | `[1024,2048]@[2048,8192]` | 22.56 | 25.19 | **20.72** |
+| BFP8 | `[1024,8192]@[8192,2048]` | 28.88 | **24.96** | 27.06 |
+| BFP2 | `[1024,8192]@[8192,2048]` | 26.95 | **23.92** | 26.57 |
+| BFP2 | `[2048,8192]@[8192,2048]` | 32.51 | 41.50 | 42.01 |
+
+(`1793240867`, `1793241117`; every product exact.) Weighing each operand's bytes by its slot fits H1's 60 points
+eleven times closer, and with the pair at 0.15 the fit picks H1's best block for every packed format, but off H1's
+shape each model loses up to 14% (slots) or 22% (pair 0.15, on FP32) somewhere. Neither is kept: the analytical model
+cannot rank these blocks across shapes by its constants. The gains are real (fixed blocks, bit for bit); what takes them
+is a block chosen by measurement: the model's few best candidates timed on the card the first time a shape is planned,
+the winner cached, which costs build time, not step time.
+
+## F4b.1: `B` pulled too, the reads clause met and the rate lost (2026-10-29, cards 0 and 1)
+
+The second scheme of D5 ([plan](../plans/dataflow-compiler.md) F4b.1): `A`'s pull, and `B` shared along the
+other axis. The row groups are one size (the units past them run nothing), so member `m` of every group takes the
+same column blocks in the same rounds; the members `m` are a column group, and its first members hold `B`'s strips
+(`distribute::Shared::b_holder_of`). A gather that copies `B` is marked `record::GATHER_B_RESIDENT` (bit 2, the retired
+packed BF16 reclaimed; one that copies both reads nothing), and the pass runs once an operand in credit words 3-5
+(`tt_isa::dm::CREDIT_WORDS` 4 -> 8). `TT_OPERAND_REUSE=pull:<h>,<hb>`, off by default.
+
+**Prediction (written before the build):** `pull:2,1` reads about 270 MB, inside H1's ≤ 302, at ≥ 25.98 TFLOPS, predicted
+27-28. **Kill:** reads drop and TFLOPS fall below 25.98.
+
+**Correct (card 0):** `step244_operand_reuse` 10 of 10 (`1793236301`): both operands shared, ragged, an idle remainder
+with two holders of `B` a column group, a traced replay with every credit word back at zero, and a misrouted copy of
+`B` alone changes the product. H1's product on every tile with `pull:2,1` is the unshared one bit for bit, 25,312
+copies, no stall (`1793236763`). The pass's model test interleaves the units at random over both axes, and drops a
+holder of `B`'s waits as its negative control.
+
+**`[2048,2048]@[2048,16384]` on card 1** (`matmul_throughput`, traced replay, median of 7, each replay bit for bit the
+eager product):
+
+| `TT_OPERAND_REUSE` | Readers a `B` holder | TFLOPS | GDDR read (`A` / `B`) | Run |
+|---|--:|--:|--:|---|
+| off | - | 18.96 / 19.15 | 2,061.8 MB (971.2 / 1,090.5) | `1793236778`, `1793236844` |
+| pull:4 | - | 25.19 | 1,346.1 MB (255.6 / 1,090.5) | `1793236786` |
+| pull:1,1 | 7 | 13.97 | **204.5 MB** (68.2 / 136.3) | `1793236796` |
+| pull:2,1 | 7 | 15.18 | **272.6 MB** (136.3 / 136.3) | `1793236805` |
+| pull:4,1 | 7 | 14.48 | 391.9 MB (255.6 / 136.3) | `1793236815` |
+| pull:2,2 | 3 | 22.19 | 408.9 MB (136.3 / 272.6) | `1793236825` |
+| pull:4,2 | 3 | 23.69 | 528.2 MB (255.6 / 272.6) | `1793236834` |
+| pull:4,4 | 1 | 25.25 | 800.8 MB (255.6 / 545.3) | `1793237433` |
+| pull:2,4 | 1 | 25.73 | 681.6 MB (136.3 / 545.3) | `1793237442` |
+
+- **The kill criterion fires for `B` pulled:** reads fall to 205-273 MB, inside H1's reads clause for the first time,
+  and TFLOPS fall to 14-15. The prediction is refuted for this scheme.
+- **The cost is a holder's fan-out:** with seven readers a `B` holder the product runs at 55-60% of `A` alone, with three
+  at 88-94%, with one at 100-102%. A `B` strip (`[2, 9]` tiles, 72 KiB FP32) is copied from one holder's L1 seven times a
+  chunk, and each copy is credited both ways, one NoC round trip a credit (the holder sends seven a chunk). Which of the
+  two binds is what the credit runs (F4b.1, holders' credits without a round trip each) and multicast (one sender to a
+  column rectangle) separate.
+- `pull:4` itself reads 25.19 here against 25.98 on 2026-10-28 (`1793228872`); `off` is within its drift (18.96-19.15
+  against 19.06-19.18).
 
 ## F4b.1: `A` pulled from a few holders, the first measured scheme of D5 (2026-10-28, cards 0 and 1)
 

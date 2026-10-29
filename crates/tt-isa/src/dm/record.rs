@@ -25,7 +25,7 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// `A` is read transposed, bit 1 `B`, bits 8..=21 `kt` ([`gather_kt`]), bits 22-24 `A`'s format
 /// ([`gather_a_format`]), bit 25 [`GATHER_A_RESIDENT`], bit 26 [`GATHER_B_UNPACK_TRANSPOSE`], bit
 /// 27 [`GATHER_PREFETCH`], bit 28 [`GATHER_STREAM`], bits 29-31 `B`'s format ([`gather_b_format`]).
-/// Bit 2 ([`GATHER_BF16`]) is retired: a record with it is refused. A packed operand's tiles
+/// Bit 2 [`GATHER_B_RESIDENT`] (once packed BF16, retired). A packed operand's tiles
 /// are slots of its format in GDDR and L1 alike: `B`'s ([`gather_b_format`]) at
 /// `b_at + (kk * cols + j) * slot`, `A`'s ([`gather_a_format`]) at `a_at + (i * kt + kk) * slot`.
 /// Bits 3-7 ([`gather_rows`], F32, `A` untransposed): `r`, 1..=16, the rows of
@@ -36,11 +36,13 @@ use super::{op, TILE_DATA, TILE_SLOT};
 /// padding; either reaches only the same rows of the output -- its padding,
 /// then undefined. 0: whole tiles.
 pub const GATHER: u32 = 0x10;
-/// [`GATHER`]'s retired bit 2: packed BF16 operands with their ragged lanes filled on the card,
-/// which only the BF16 x BF16 product builder used. Any pair of edge formats is one product now
-/// ([`gather_a_format`], [`gather_b_format`]: `docs/plans/dataflow-compiler.md` F1d), so a record
-/// with this bit is refused.
-pub const GATHER_BF16: u32 = 1 << 2;
+/// [`GATHER`]'s flag for a block whose `B` is already in its slots, [`GATHER_A_RESIDENT`]'s
+/// mirror: only `A` is read, and `B`'s slots keep what they hold (a strip copied there from
+/// another unit's L1 first, `tt_kernels::tile_op::reuse`). With [`GATHER_A_RESIDENT`] the record
+/// reads nothing. Not with [`GATHER_PREFETCH`] or [`GATHER_STREAM`], whose reads are `B`'s.
+/// Bit 2 was packed BF16 with its ragged lanes filled on the card, retired when any pair of edge
+/// formats became one product (`docs/plans/dataflow-compiler.md` F1d).
+pub const GATHER_B_RESIDENT: u32 = 1 << 2;
 /// [`GATHER`]'s flag for a block whose `A` is already in its slots: the same
 /// unit's previous gather of the op read the same `A` block to the same `a_at`,
 /// and nothing since wrote there (a product's later rounds on a unit, under one
@@ -217,7 +219,7 @@ impl PrefetchCursor {
         }
         let [_, flags, _, b_at, _, rows, j0, cols] = h;
         let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(gather_kt(flags))?);
-        if flags & GATHER_BF16 != 0 {
+        if flags & GATHER_B_RESIDENT != 0 {
             return Err(super::error::RANGE);
         }
         let unpacked = flags & GATHER_B_UNPACK_TRANSPOSE != 0;
@@ -694,10 +696,12 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         GATHER => {
             let [_, flags, a_at, b_at, i0, rows, j0, cols] = h;
             let (a_t, b_t, kt) = (flags & 1 != 0, flags & 2 != 0, extent(gather_kt(flags))?);
-            if flags & GATHER_BF16 != 0 {
+            let resident = flags & GATHER_A_RESIDENT != 0;
+            let b_resident = flags & GATHER_B_RESIDENT != 0;
+            // A prefetch or a stream reads `B` with a cap of its own: it has `B` to read.
+            if b_resident && flags & (GATHER_PREFETCH | GATHER_STREAM) != 0 {
                 return Err(super::error::RANGE);
             }
-            let resident = flags & GATHER_A_RESIDENT != 0;
             let b_unpacked = flags & GATHER_B_UNPACK_TRANSPOSE != 0;
             if b_unpacked && !b_t {
                 return Err(super::error::RANGE);
@@ -786,7 +790,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     }
                 }
             }
-            for kk in 0..kt {
+            for kk in (0..kt).filter(|_| !b_resident) {
                 let mut row = if b_t { None } else { Some(b.cursor(kk, j0)?) };
                 for j in 0..cols {
                     let to = b_at + (kk * cols + j) * b_slot as u32;
@@ -1215,21 +1219,43 @@ mod tests {
         assert!(expand_reads(&rec, &mut |_| 0, |_| Ok(())).is_ok());
     }
 
-    /// Packed BF16 operands (bit 2) are retired: one product takes any edge format
-    /// ([`gather_a_format`], [`gather_b_format`]), and a record with the bit is refused.
+    /// A gather with both operands resident reads nothing, and is still a whole record: its
+    /// tensor references are checked as any gather's are, and a prefetch or a weight stream (whose
+    /// reads are `B`'s) is refused with it.
     #[test]
-    fn packed_bf16_gathers_are_refused() {
+    fn a_gather_with_both_operands_resident_reads_nothing() {
         let (a, b) = (t(3, 3), t(3, 2));
         let [a0, a1] = a.encode();
         let [b0, b1] = b.encode();
-        for flags in [GATHER_BF16, GATHER_BF16 | GATHER_A_RESIDENT] {
-            let head = [GATHER, flags | 3 << 8, 0x20000, 0x60000, 0, 2, 0, 2];
+        let both = GATHER_A_RESIDENT | GATHER_B_RESIDENT;
+        let head = |flags: u32| [GATHER, flags | 3 << 8, 0x20000, 0x60000, 0, 2, 0, 2];
+        let mut reads = 0;
+        assert_eq!(
+            expand_reads(
+                &[head(both), a0, a1, b0, b1],
+                |_| 0,
+                |_| {
+                    reads += 1;
+                    Ok(())
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(reads, 0);
+        for flags in [both | GATHER_PREFETCH, both | GATHER_STREAM] {
             assert_eq!(
-                expand_reads(&[head, a0, a1, b0, b1], |_| 0, |_| Ok(())),
+                expand_reads(&[head(flags), a0, a1, b0, b1], |_| 0, |_| Ok(())),
                 Err(super::super::error::RANGE),
                 "{flags:#x}"
             );
         }
+        let [mut x0, x1] = a.encode();
+        x0[0] = 9;
+        assert_eq!(
+            expand_reads(&[head(both), x0, x1, b0, b1], |_| 0, |_| Ok(())),
+            Err(super::super::error::RANGE),
+            "a reference past eight channels is refused, read or not"
+        );
     }
 
     /// Every tile a record names is the one `TensorRef::tile` gives: the
@@ -1476,13 +1502,13 @@ mod tests {
             }
         }
         assert!(cases > 40);
-        // What the expansion refuses: an empty `B`, a transposing read, packed BF16, a weight
+        // What the expansion refuses: an empty `B`, a transposing read, a resident `B`, a weight
         // stream's cap with a prefetch's, `kt` 0.
         let empty = TensorRef::default();
         for (flags, b) in [
             (GATHER_A_RESIDENT, empty),
             (GATHER_A_RESIDENT | 2, t(2, 4)),
-            (GATHER_A_RESIDENT | GATHER_BF16, t(2, 4)),
+            (GATHER_A_RESIDENT | GATHER_B_RESIDENT, t(2, 4)),
             (GATHER_A_RESIDENT | GATHER_STREAM, t(2, 4)),
             (GATHER_A_RESIDENT | GATHER_B_BF16 | 2, t(2, 4)),
             (
@@ -1519,8 +1545,8 @@ mod tests {
     }
 
     /// A gather with `A` resident is the same gather without `A`'s entries -- whole, thin,
-    /// transposed and packed BF16 -- with `B`'s unchanged; `kt` is read past the flag; and a flag
-    /// bit above it is refused.
+    /// transposed and packed BF16 -- with `B`'s unchanged, and one with `B` resident the same
+    /// gather without `B`'s; `kt` is read past the flags; and a flag bit above it is refused.
     #[test]
     fn a_resident_gather_reads_only_b() {
         let mut a = t(3, 5);
@@ -1555,14 +1581,19 @@ mod tests {
             assert_eq!(resident, whole[a_entries..], "flags {flags:#x}");
             assert!(resident.iter().all(|e| e[4] >= 0x6_0000), "only B's slots");
         }
-        // Packed BF16 (bit 2) is retired, resident or not.
-        for flags in [GATHER_BF16, GATHER_BF16 | GATHER_A_RESIDENT] {
+        // `B` resident: `A`'s entries, unchanged, and nothing of `B`'s.
+        for flags in [0, 1, 2, 3, gather_rows(1), gather_rows(16) | 2] {
+            let whole = gather(flags, a0, b0).unwrap();
+            let resident = gather(flags | GATHER_B_RESIDENT, a0, b0).unwrap();
+            assert_eq!(resident, whole[..a_entries], "flags {flags:#x}");
+            assert!(resident.iter().all(|e| e[4] < 0x6_0000), "only A's slots");
             assert_eq!(
-                gather(flags, a0, b0),
-                Err(super::super::error::RANGE),
-                "{flags:#x}"
+                gather(flags | GATHER_A_RESIDENT | GATHER_B_RESIDENT, a0, b0),
+                Ok(Vec::new()),
+                "flags {flags:#x}"
             );
         }
+        assert_eq!(gather_kt(GATHER_B_RESIDENT | 7 << 8), 7);
         assert_eq!(gather_kt(GATHER_A_RESIDENT | 7 << 8 | 0xff), 7);
         // A prefetch reads what the same record reads without the flag (only the ID differs),
         // and only as plain reads: not packed BF16, not a transposing move.
@@ -1579,7 +1610,12 @@ mod tests {
                 "{flags:#x}"
             );
         }
-        for flags in [GATHER_BF16 | GATHER_A_RESIDENT, 1, 2] {
+        for flags in [
+            GATHER_B_RESIDENT | GATHER_A_RESIDENT,
+            GATHER_B_RESIDENT,
+            1,
+            2,
+        ] {
             assert_eq!(
                 gather(flags | GATHER_PREFETCH, a0, b0),
                 Err(super::super::error::RANGE),
@@ -1644,7 +1680,7 @@ mod tests {
                 "{format:?}: resident"
             );
             if format != crate::tile::L1Format::Fp32 {
-                for bad in [1, gather_rows(3), GATHER_BF16] {
+                for bad in [1, gather_rows(3)] {
                     assert_eq!(
                         gather(flags | bad, a0, b0),
                         Err(super::super::error::RANGE),
@@ -1734,7 +1770,6 @@ mod tests {
         for bad in [
             GATHER_B_BF16 | 2,
             GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
-            GATHER_B_BF16 | GATHER_BF16,
         ] {
             assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
         }
@@ -1785,12 +1820,10 @@ mod tests {
             }
             assert_eq!(b_reads, kt * cols);
         }
-        for bad in [
-            GATHER_B_UNPACK_TRANSPOSE,
-            GATHER_B_UNPACK_TRANSPOSE | GATHER_BF16 | 2,
-        ] {
-            assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
-        }
+        assert_eq!(
+            gather(GATHER_B_UNPACK_TRANSPOSE),
+            Err(super::super::error::RANGE)
+        );
     }
 
     const IDX: u32 = 0x2_0000;

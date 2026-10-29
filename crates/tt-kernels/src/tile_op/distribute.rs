@@ -34,21 +34,30 @@ pub struct Deal {
     pub shared: Option<Shared>,
 }
 
-/// A block deal in which units share their first operand's reads (X4, `tile_op::reuse`).
+/// A block deal in which units share their operands' reads (X4, `tile_op::reuse`).
 ///
 /// The units are cut into groups of consecutive units, and each group takes whole block rows
 /// (group `k` rows `k`, `k + G`, ...). Within a group, member `m` takes the row's column blocks
 /// `m`, `m + g`, ..., and each sub-group's first member is its holder: it reads the row's strip
 /// of the first operand from GDDR, and the others copy it from its L1. A member never has more
 /// jobs in a row than its holder, so a member's `t`-th job of a row is its holder's `t`-th.
+///
+/// With the second operand shared too, every group has the same size (the units past
+/// `G x g` run nothing), so member `m` of every group takes the same column blocks in the same
+/// rounds: the members `m` of the groups are a column group, and each of its sub-groups' first
+/// member holds the column's strips of the second operand for the others: a column reader's
+/// strips are its holder's, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shared {
     /// Job position `j` (unit `j % units`) runs block `order[j]` of [`Deal::blocks`], or nothing:
     /// a unit whose group has fewer column blocks in a row than members sits that round out.
     pub order: Vec<Option<usize>>,
-    /// Each unit's holder, the unit whose reads it copies; `None` for a holder, or a unit with
-    /// nothing to share.
+    /// Each unit's holder of the first operand, the unit whose reads it copies; `None` for a
+    /// holder, or a unit with nothing to share.
     pub holder_of: Vec<Option<usize>>,
+    /// Each unit's holder of the second operand, as [`Shared::holder_of`]; all `None` where the
+    /// second operand is not shared.
+    pub b_holder_of: Vec<Option<usize>>,
 }
 
 pub fn deal(op: &TileOp, units: usize, overlap: Overlap) -> Result<Deal> {
@@ -164,7 +173,7 @@ fn blocks(op: &TileOp, cut: Blocks<'_>, units: usize) -> Result<Deal> {
     let shared = op
         .share
         .as_ref()
-        .and_then(|s| shared(rt.div_ceil(mb), cols.len(), units, s.holders));
+        .and_then(|s| shared(rt.div_ceil(mb), cols.len(), units, s.holders, s.b_holders));
     Ok(Deal {
         runs: Vec::new(),
         blocks,
@@ -175,19 +184,34 @@ fn blocks(op: &TileOp, cut: Blocks<'_>, units: usize) -> Result<Deal> {
 }
 
 /// [`Shared`] for `rows x cols` blocks (rows outer, block `r * cols + c`) over `units`, with at
-/// most `holders` holders a group; `None` where no two units would share a row.
-pub fn shared(rows: usize, cols: usize, units: usize, holders: usize) -> Option<Shared> {
+/// most `holders` holders a group, and with `b_holders` the second operand shared too, at most
+/// that many holders a column group; `None` where no two units would share a row.
+pub fn shared(
+    rows: usize,
+    cols: usize,
+    units: usize,
+    holders: usize,
+    b_holders: Option<usize>,
+) -> Option<Shared> {
     // As many groups as rows, so the rows spread as they would unshared; a group of one shares
     // nothing.
     let groups = rows.min(units);
     if groups == 0 || units <= groups || cols < 2 {
         return None;
     }
-    let (base, extra) = (units / groups, units % groups);
+    // Sharing the second operand pairs member `m` of every group, so the groups are one size
+    // and the remainder sits out (`docs/plans/dataflow-compiler.md` F4b.1).
+    let (base, extra) = match b_holders {
+        Some(_) => (units / groups, 0),
+        None => (units / groups, units % groups),
+    };
     let size = |k: usize| base + usize::from(k < extra);
     let start = |k: usize| k * base + k.min(extra);
+    // Sub-group `m * h / g` of a group of `g` with `h` holders; its first member holds.
+    let first = |m: usize, h: usize, g: usize| (m * h / g * g).div_ceil(h);
     let mut sequences: Vec<Vec<Option<usize>>> = vec![Vec::new(); units];
     let mut holder_of = vec![None; units];
+    let mut b_holder_of = vec![None; units];
     for k in 0..groups {
         let g = size(k);
         let h = holders.clamp(1, g);
@@ -206,10 +230,15 @@ pub fn shared(rows: usize, cols: usize, units: usize, holders: usize) -> Option<
                     })
                 })
                 .collect();
-            // Sub-group `m * h / g`; its first member holds.
-            let first = (m * h / g * g).div_ceil(h);
-            if first != m {
-                holder_of[u] = Some(start(k) + first);
+            let f = first(m, h, g);
+            if f != m {
+                holder_of[u] = Some(start(k) + f);
+            }
+            if let Some(hb) = b_holders {
+                let f = first(k, hb.clamp(1, groups), groups);
+                if f != k {
+                    b_holder_of[u] = Some(start(f) + m);
+                }
             }
         }
     }
@@ -224,7 +253,11 @@ pub fn shared(rows: usize, cols: usize, units: usize, holders: usize) -> Option<
     while order.last() == Some(&None) {
         order.pop();
     }
-    Some(Shared { order, holder_of })
+    Some(Shared {
+        order,
+        holder_of,
+        b_holder_of,
+    })
 }
 
 /// Each operand that reads one tile for a whole row of items: its map does not use the

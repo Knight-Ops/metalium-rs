@@ -1655,26 +1655,31 @@ pub(crate) struct Reads {
     /// Whether a product of several tile rows runs as 2-D blocks with `K` streamed
     /// ([`BlockStream`]).
     pub block_stream: BlockStream,
-    /// Whether a blocked product's units share their reads of `A` ([`Reuse`]).
+    /// Whether a blocked product's units share their reads of `A`, and of `B` ([`Reuse`]).
     pub reuse: Reuse,
 }
 
 /// Whether the units of a product of 2-D blocks with `K` streamed ([`BlockStream`]) that read
-/// the same strip of `A` share its reads (X4, H1; `crate::tile_op::reuse`). Bit for bit the
-/// unshared product: the copies only move bytes into the slots a read would fill.
+/// the same strip of `A`, or of `B`, share its reads (X4, H1; `crate::tile_op::reuse`). Bit for
+/// bit the unshared product: the copies only move bytes into the slots a read would fill.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Reuse {
     /// Each unit reads its own strips.
     #[default]
     Off,
-    /// At most `holders` units of a group read a strip from GDDR, and the others copy it from
-    /// one of them (`op::READ_L1`, credited both ways).
-    Pull { holders: usize },
+    /// At most `holders` units of a group read a strip of `A` from GDDR, and the others copy it
+    /// from one of them (`op::READ_L1`, credited both ways). With `b_holders`, `B`'s strips too:
+    /// at most that many units of a column group read one, the groups are one size, and the
+    /// units past them run nothing (`crate::tile_op::distribute::Shared`).
+    Pull {
+        holders: usize,
+        b_holders: Option<usize>,
+    },
 }
 
 impl Reuse {
-    /// `TT_OPERAND_REUSE`: `off`, or `pull` or `pull:<holders>` (one by default); [`Reuse::Off`]
-    /// when unset.
+    /// `TT_OPERAND_REUSE`: `off`, or `pull`, `pull:<holders>` (one by default) or
+    /// `pull:<holders>,<b_holders>` (`B` shared too); [`Reuse::Off`] when unset.
     pub fn from_env() -> Self {
         match std::env::var("TT_OPERAND_REUSE") {
             Err(_) => Reuse::Off,
@@ -1691,13 +1696,28 @@ impl std::str::FromStr for Reuse {
     fn from_str(s: &str) -> std::result::Result<Self, String> {
         match s.split_once(':') {
             None if s == "off" || s == "0" => Ok(Reuse::Off),
-            None if s == "pull" => Ok(Reuse::Pull { holders: 1 }),
-            Some(("pull", h)) => match h.trim().parse::<usize>() {
-                Ok(holders) if holders > 0 => Ok(Reuse::Pull { holders }),
-                _ => Err(format!("`pull:{h}`: expected a positive holder count")),
-            },
+            None if s == "pull" => Ok(Reuse::Pull {
+                holders: 1,
+                b_holders: None,
+            }),
+            Some(("pull", h)) => {
+                let count = |c: &str| match c.trim().parse::<usize>() {
+                    Ok(n) if n > 0 => Ok(n),
+                    _ => Err(format!("`pull:{h}`: expected positive holder counts")),
+                };
+                match h.split_once(',') {
+                    None => Ok(Reuse::Pull {
+                        holders: count(h)?,
+                        b_holders: None,
+                    }),
+                    Some((a, b)) => Ok(Reuse::Pull {
+                        holders: count(a)?,
+                        b_holders: Some(count(b)?),
+                    }),
+                }
+            }
             _ => Err(format!(
-                "expected `off`, `pull` or `pull:<holders>`, not `{s}`"
+                "expected `off`, `pull`, `pull:<holders>` or `pull:<holders>,<b_holders>`, not `{s}`"
             )),
         }
     }
@@ -2014,9 +2034,10 @@ pub(crate) fn matmul_dram_prefetching(
                     tiles: layout.tiles,
                 },
             )?;
-            if let (Reuse::Pull { holders }, false) = (reads.reuse, tiles.is_empty()) {
+            if let (Reuse::Pull { holders, b_holders }, false) = (reads.reuse, tiles.is_empty()) {
                 op.share = Some(crate::tile_op::Share {
                     holders,
+                    b_holders,
                     tiles: tiles.into(),
                 });
             }

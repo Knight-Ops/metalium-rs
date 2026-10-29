@@ -361,20 +361,100 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
     H1's shape on card 1: 19.1 -> **25.98 TFLOPS** at four holders a group, reads 2,062 -> 1,346 MB (`1793228872`;
     [log](../learnings/performance-log.md#f4b1-a-pulled-from-a-few-holders-the-first-measured-scheme-of-d5-2026-10-28-cards-0-and-1)).
   - [ ] `B` shared too (a `GATHER` that skips `B`: a firmware flag), for the reads clause.
+    `TT_OPERAND_REUSE=pull:<h>,<hb>`: `record::GATHER_B_RESIDENT` (bit 2, reclaimed from the
+    retired packed BF16), a column group a member index of equal-sized row groups
+    (`distribute::Shared::b_holder_of`), and the pass run once an operand in credit words 3-5
+    (`CREDIT_WORDS` 4 -> 8).
+    - *Prediction (before the build):* H1's shape at `pull:2,1` reads about 270 MB (`A` 136, `B` about
+      136, from 1,346), inside the ≤ 302 clause, at ≥ 25.98 TFLOPS (pull:4's), predicted 27-28 (the
+      probe's "`A` skipped" ran at 29.2 of a 30.3 ceiling).
+    - *Kill:* reads drop and TFLOPS fall below 25.98: `B`'s copies cost more than the reads they
+      replace.
+    - **Result (2026-10-29): correct, and the kill fires** ([log](../learnings/performance-log.md#f4b1-b-pulled-too-the-reads-clause-met-and-the-rate-lost-2026-10-29-cards-0-and-1)).
+      `step244` 10 of 10 on card 0 (`1793236301`) and H1's product on every tile bit for bit (`1793236763`).
+      On card 1, `pull:2,1` reads **272.6 MB** (inside ≤ 302) at **15.18 TFLOPS** (`1793236805`), against
+      `pull:4`'s 1,346 MB at 25.19 in the same session. The rate follows a `B` holder's readers: seven
+      14.0-15.2, three 22.2-23.7, one 25.3-25.7 (reads 682-801 MB). Kept opt-in: the credit runs and
+      multicast below say whether a holder's credits or its L1's copies bind.
+    - *Open, not built (owner, 2026-10-29):* equal groups leave `units % groups` units idle for the
+      product (none at H1's 120 over 8 rows). They could run data-independent work meanwhile, but
+      every op ends in a barrier across all units, and the credit words' return to zero relies on
+      it, so that needs F4a's channels in place of barriers (or F6's disjoint core sets).
   - [ ] Multicast: one sender a row rectangle (NC `WRITE_L1_MCAST`, a multicast ready word), against pull.
-  - [ ] Larger GDDR blocks (fixed `TT_MATMUL_BLOCK` sweeps with packed `B`).
-  - [ ] Holders' credits without a round trip each (14 a chunk on the holder's B today).
-  - [ ] Recovery after a failed linked op restarts every unit it ran on (today only the failed ones), and the
-    planner prefers block shapes whose rows divide over the units (a group of one runs a whole row).
-- [ ] Decide D5 by measurement first, on card 1, for one prefill product shape, between:
+    **Deferred, not refuted (owner, 2026-10-29): revisit when hunting performance.** Not built; the analysis:
+    - A multicast reaches a rectangle of Tensix tiles that excludes its sender (`channel::Ring` refuses otherwise),
+      and path-reserved multicasts sharing a rectangle serialize (Bible T7), so the safe form is one sender a
+      disjoint rectangle. The deal's groups must then be the grid's rows and columns, not runs of consecutive units.
+    - `B` down grid columns (the scheme that would end `B`'s holder fan-out, F4b.1 above): row groups as wide as the
+      grid (12 tiles on a 120-tile card). H1's 8 block rows fill 8 of 10 grid rows, 96 units, a ceiling of about
+      24.2 TFLOPS (30.3 x 96/120), below `pull:4`'s 25.2-26.0; 10 row groups do not divide 64 tile rows evenly.
+    - `A` along grid rows: each row splits at the non-Tensix columns into two rectangles, and `A` pulled already runs
+      at ~86% of the 30.3 ceiling, so at most ~1.17x.
+    - It is a new protocol on NC inside PAIR packets (NC waits for B's gather on its own tile, then multicasts into
+      the readers' slots before their kernel), where a mistake can hang the NoC.
+    - Revisit when: a product whose block rows divide the grid's rows (or a card whose grid suits the shape), a
+      product whose `B` holder fan-out binds where `A`'s pull leaves headroom, or prefill-scale products after
+      F5 (`Dst` subblocks) lifts the kernel's own ceiling.
+  - [x] Larger GDDR blocks (fixed `TT_MATMUL_BLOCK` sweeps with packed `B`), 2026-10-29, card 1
+    ([log](../learnings/performance-log.md#f4b1-larger-gddr-blocks-the-planners-block-not-reads-binds-a-packed-b-2026-10-29-card-1)).
+    - *Prediction:* no block that fits beats the planner's on reads with an FP32 `B`. **Held:** larger ones are
+      refused by name (`mb x nb <= 72` FP32 outputs, twice over), and `[8,2,9]` reads least under that bound.
+    - *Found:* with a packed `B`, the planner's block binds, not reads: `[6,4,12]` runs BFP8 / BFP4 / BFP2 at 34.4 /
+      41.1 / 43.1 TFLOPS against the default's 26.3-26.5 (`1793238988`, `1793238206`), BF16 27.96 at `[4,2,18]`
+      (24.69), FP32 21.09 at `[8,4,6]` (20.13). `block_stream_model` charges every tile 4 KiB; with an FP32 `A`
+      re-read `nt/nb` times and a packed `B`, a wider `nb` and fewer chunks win.
+    - *The planner re-weighed (owner: make it the default), refuted and reverted:* each operand's bytes by its slot,
+      with the pair at 0.2 and at 0.15, measured at four shapes on card 1 (`1793240867`, `1793241117`): each gains up
+      to 1.4x somewhere and loses up to 14% (slots) or 22% (pair 0.15, FP32 at H1) elsewhere.
+  - [ ] **A measured block choice:** the model's few best candidates (fits, bit-equivalent by construction) timed on the
+    card the first time a shape and format pair is planned, the winner cached per process (and with the program cache).
+    Build time, not step time (owner, 2026-10-26). Gate: the choice is one of the candidates, the product bit for bit
+    whichever is chosen; bench: never slower than the model's choice at the four F4b shapes and every format.
+  - [x] Holders' credits without a round trip each (14 a chunk on the holder's B today). `dm::CREDIT_RUN` (word 5
+    of `op::CREDIT`), as `MCAST_RUN_ACKS` is a multicast's: a run's first credit waits for the mover's earlier
+    requests, none waits for its own response, and the run's responses are counted before the first entry not of it
+    and at the list's end. A holder's credits after a gather are one run.
+    - *Prediction (before the build):* `pull:1` (14 credits a chunk on one holder) rises to at least `pull:4`'s rate
+      (25.19 TFLOPS in the same session), and `pull:2,1` (seven `B` readers a holder) gains measurably over 15.18.
+    - *Kill:* under 1% on both: the round trips do not bind, and the flag is dropped.
+    - **Result (2026-10-29): refuted and retired.** Built (firmware, `Entry::Credit`, the pass), correct on card 0
+      (`step242` with a broadcast ring's credits as one run, `step244`, `step172`/`step173` safe and `fast-reads` +
+      `encoded-guard`: `1793242140`, `1793242327`; H1 on every tile bit for bit, `1793242347`). On card 1, off / on, ABBA:
+      `pull:1` 25.07 / 25.36, 25.05 / 25.16; `pull:4` 26.01 / 25.64; `pull:2,1` 15.20 / 14.98, 14.85 / 15.31
+      (`1793242358`-`1793242444`). No gain: a holder's credits do not bind, so `B`'s fan-out cost is the holder's
+      L1 serving its copies. Code, flag and gate case removed.
+  - [x] Recovery after a failed linked op restarts every unit it ran on (2026-10-29). It already did: a failed
+    `Session::sync` recovers every unit, each mover restarted and its credit words zeroed as it starts; what was
+    missing was the gate. `step244::a_stalled_shared_product_leaves_the_session_usable` (both operands shared, each
+    reader's last wait one credit past what its holder sends, `reuse::probe_overwait`): the op fails by its
+    deadline, and the next shared product is the unshared one bit for bit with every credit word at zero (card 0,
+    `1793243728`). Silicon only: ttsim cannot recover a tile whose roles stalled inside a kernel (divergence row 16).
+  - [ ] The planner prefers block shapes whose rows divide over the units (a group of one runs a whole row). Folded
+    into the measured block choice above: with reuse on, its candidates are ranked with the shared deal they get
+    (equal groups when `B` is shared), so a block that leaves groups of one is measured, not assumed.
+- [x] Decide D5 by measurement first, on card 1, for one prefill product shape, between:
   - a few holders whose rows or columns are pulled with `READ_L1`;
   - one sender per row or column rectangle multicasting with `WRITE_L1_MCAST` and remote credits;
   - larger blocks re-read from GDDR.
-- [ ] Build the winner as F3's reuse pass, so every format and every contraction gets it.
+  **Decided 2026-10-29: `A` pulled from a few holders** (card 1, `1793243755`-`1793244204`,
+  [log](../learnings/performance-log.md#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1)).
+  With an FP32 `B` it is 1.33-1.44x at H1's shape and both confirming shapes (H1 28.38 TFLOPS through the session,
+  94% of the ceiling), bit for bit. `B` pulled loses (a holder's fan-out); multicast is deferred (its bound above);
+  larger GDDR blocks read no less for FP32. A packed `B` is bound by its block, not reads: at H1, `[6,4,12]` with `A`
+  pulled reaches 44.5-45.8 TFLOPS (1.7x), but the best block, and whether to pull, depend on the shape.
+  Closing checks on the final tree: `--smoke` on card 0 passes 1,252 of 1,252 (`1793244532`); `step12_mnist` 8 of 8 with
+  the goldens unchanged; the job goldens unchanged (the default path emits the same records).
+- [ ] Build the winner as F3's reuse pass, so every format and every contraction gets it, with a policy for when it
+  pulls (FP32 operands at prefill shapes gain; packed `B` at the default block does not), and the measured block
+  choice (F4b.1 above), which can choose the block and the pull together.
 - **Prediction (restated after F4b.0, against the measured ceiling):** `[2048,2048]@[2048,16384]` with an FP32 `B`
   from 19.2-19.4 to ≥ 25.8 TFLOPS, reads from 2,062 to ≤ 302 MB; a packed `B` at ≥ 95% of its 28.0 ceiling. As first
   written, ≥ 35 TFLOPS, which is above the 30.3 a product reaches with no reads at all.
 - **Kill:** GDDR reads drop and TFLOPS do not.
+- **Result (2026-10-29):** the TFLOPS clause holds (`A` pulled: 25.2-26.0 through Burn, 28.38 through the session); the
+  reads clause is met only by pulling `B` too (205-273 MB), which loses the rate, so it does not hold with the rate.
+  The kill did not fire: where reads dropped (`A` pulled), TFLOPS rose. For a packed `B` the 95% clause holds at the
+  default block (`pull:4` 26.56-26.67 of 28.0) and was the wrong ceiling: the block, not reads, binds (up to 45.8).
 
 ## Stage F4a (decode): channels instead of barriers, H4
 

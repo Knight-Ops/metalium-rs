@@ -1,15 +1,24 @@
 //! Operand reuse across cores (`docs/plans/dataflow-compiler.md` F4b, H1; `tile_op::reuse`): the
 //! units of a blocked product that read the same strip of `A` share its reads. A holder reads it
 //! from GDDR and credits its readers; each reader copies it from the holder's L1 (`op::READ_L1`)
-//! into the slots its own read would fill, credits the holder free, and reads only `B`.
+//! into the slots its own read would fill, credits the holder free, and reads only `B`. With `B`
+//! shared too, the units that take the same columns share `B`'s strips the same way
+//! (`record::GATHER_B_RESIDENT`), and a unit that copies both reads nothing from GDDR.
 //!
 //! The claims:
 //! - **A shared product is the unshared one bit for bit**, ragged in every dimension, either
 //!   operand transposed, at HiFi4 and LoFi, over signed zeros, subnormals, infinities and NaNs,
-//!   with one holder a group and with two: the copies move bytes only.
+//!   with one holder a group and with two, `A` shared alone or with `B`, and with units left
+//!   idle by `B`'s equal groups: the copies move bytes only.
 //! - **Each unit leaves its credit words at zero** (`tt_isa::dm::CREDITS`), so a trace of a shared
 //!   product replays as the eager product, again and again.
-//! - **The negative control:** copies that read 16 bytes past their strip change the product.
+//! - **The negative control:** copies of either operand that read 16 bytes past their strip
+//!   change the product.
+//! - **A stalled shared product fails and leaves the session usable:** a reader that waits for a
+//!   credit its holder never sends stalls the op until its deadline; the session recovers every
+//!   unit (each mover restarted, its credit words zeroed), and the next shared product is the
+//!   unshared one bit for bit with every credit word at zero. Silicon only: ttsim cannot recover
+//!   a tile whose roles stalled inside a kernel (divergence row 16).
 //!
 //! What ttsim cannot show: its NoC requests complete before the next is issued (divergence row
 //! 72), so a copy cannot race its holder's next read there. The pass's own model test
@@ -127,9 +136,16 @@ fn credit_words<T: tt_device::Transport>(s: &mut Session<T>) -> Vec<[u32; CREDIT
     words
 }
 
-/// `[m, k, n]` on `units` in `[mb, kq, nb]` blocks with at most `holders` holders a group, for
-/// each transpose and fidelity: shared equals unshared, and something was shared.
-fn case(units: usize, [m, k, n]: [usize; 3], block: [usize; 3], holders: usize) {
+/// `[m, k, n]` on `units` in `[mb, kq, nb]` blocks with at most `holders` holders a group (and
+/// `b_holders` a column group, `B` shared too), for each transpose and fidelity: shared equals
+/// unshared, and something was shared.
+fn case(
+    units: usize,
+    [m, k, n]: [usize; 3],
+    block: [usize; 3],
+    holders: usize,
+    b_holders: Option<usize>,
+) {
     with_session(units, |s| {
         s.set_block_stream(BlockStream::Fixed(block));
         for (at, bt, fidelity) in [
@@ -137,14 +153,15 @@ fn case(units: usize, [m, k, n]: [usize; 3], block: [usize; 3], holders: usize) 
             (true, false, Fidelity::HiFi4),
             (false, true, Fidelity::Lo),
         ] {
-            let what = format!("[{m},{k}]@[{k},{n}] {block:?} on {units}, holders {holders}, A^T {at}, B^T {bt}, {fidelity:?}");
+            let what = format!("[{m},{k}]@[{k},{n}] {block:?} on {units}, holders {holders}, {b_holders:?}, A^T {at}, B^T {bt}, {fidelity:?}");
             let (ar, ac) = if at { (k, m) } else { (m, k) };
             let (br, bc) = if bt { (n, k) } else { (k, n) };
             let a = s.upload(&values(ar * ac, 1), ar, ac).unwrap();
             let b = s.upload(&values(br * bc, 2), br, bc).unwrap();
             let (plain, none) = product(s, &a, at, &b, bt, fidelity, Reuse::Off);
             assert_eq!(none, 0, "{what}: unshared copies nothing");
-            let (shared, copies) = product(s, &a, at, &b, bt, fidelity, Reuse::Pull { holders });
+            let reuse_ = Reuse::Pull { holders, b_holders };
+            let (shared, copies) = product(s, &a, at, &b, bt, fidelity, reuse_);
             assert!(copies > 0, "{what}: nothing was shared");
             same(&plain, &shared, &what);
             assert!(
@@ -160,39 +177,67 @@ fn case(units: usize, [m, k, n]: [usize; 3], block: [usize; 3], holders: usize) 
 /// Two block rows over four units: two groups of two, each a holder and a reader.
 #[test]
 fn a_shared_product_is_the_unshared_one_bit_for_bit() {
-    case(4, [96, 256, 320], [2, 2, 3], 1);
+    case(4, [96, 256, 320], [2, 2, 3], 1, None);
 }
 
 /// Ragged in every dimension: the last block row of one tile row, a short last column block, and
 /// `K`'s last tile partly padding.
 #[test]
 fn a_ragged_shared_product_is_the_unshared_one_bit_for_bit() {
-    case(4, [72, 232, 300], [2, 2, 3], 1);
+    case(4, [72, 232, 300], [2, 2, 3], 1, None);
 }
 
 /// Two block rows over six units with two holders a group: each holder a reader of its own.
 #[test]
 fn two_holders_a_group_give_the_same_bits() {
-    case(6, [64, 256, 416], [1, 2, 2], 2);
+    case(6, [64, 256, 416], [1, 2, 2], 2, None);
+}
+
+/// `B` shared too: two block rows over four units, two groups of two, so each unit holds or
+/// copies each operand, and one copies both and reads nothing.
+#[test]
+fn a_product_sharing_both_operands_is_the_unshared_one_bit_for_bit() {
+    case(4, [96, 256, 320], [2, 2, 3], 1, Some(1));
+}
+
+/// Both shared, ragged in every dimension.
+#[test]
+fn a_ragged_product_sharing_both_operands_is_the_unshared_one_bit_for_bit() {
+    case(4, [72, 232, 300], [2, 2, 3], 1, Some(1));
+}
+
+/// Three block rows over seven units: groups of two and one unit idle, with two holders of
+/// `B` a column group of three.
+#[test]
+fn equal_groups_leave_the_remainder_idle_and_give_the_same_bits() {
+    case(7, [160, 256, 416], [2, 2, 2], 1, Some(2));
 }
 
 /// A trace of a shared product replays as its eager product, every time, and leaves every credit
 /// word at zero.
 #[test]
 fn a_shared_product_replays_as_its_eager_product() {
+    replays(Reuse::Pull {
+        holders: 1,
+        b_holders: None,
+    });
+}
+
+/// [`a_shared_product_replays_as_its_eager_product`] with `B` shared too.
+#[test]
+fn a_product_sharing_both_operands_replays_as_its_eager_product() {
+    replays(Reuse::Pull {
+        holders: 1,
+        b_holders: Some(1),
+    });
+}
+
+fn replays(reuse_: Reuse) {
     with_session(4, |s| {
         s.set_block_stream(BlockStream::Fixed([2, 2, 3]));
         let a = s.upload(&values(96 * 256, 3), 96, 256).unwrap();
         let b = s.upload(&values(256 * 320, 4), 256, 320).unwrap();
-        let (eager, copies) = product(
-            s,
-            &a,
-            false,
-            &b,
-            false,
-            Fidelity::HiFi4,
-            Reuse::Pull { holders: 1 },
-        );
+        let (eager, copies) = product(s, &a, false, &b, false, Fidelity::HiFi4, reuse_);
         assert!(copies > 0);
         s.begin_trace().unwrap();
         let c = s
@@ -228,12 +273,22 @@ fn a_shared_product_replays_as_its_eager_product() {
 /// The negative control: copies that read 16 bytes past their strip change the product.
 #[test]
 fn a_misrouted_copy_changes_the_product() {
+    misrouted(None, reuse::probe_misroute);
+}
+
+/// The negative control for `B`: only `B`'s copies misrouted, with both operands shared.
+#[test]
+fn a_misrouted_copy_of_b_changes_the_product() {
+    misrouted(Some(1), reuse::probe_misroute_b);
+}
+
+fn misrouted(b_holders: Option<usize>, probe: fn(bool)) {
     with_session(4, |s| {
         s.set_block_stream(BlockStream::Fixed([2, 2, 3]));
         let a = s.upload(&values(96 * 256, 5), 96, 256).unwrap();
         let b = s.upload(&values(256 * 320, 6), 256, 320).unwrap();
         let (plain, _) = product(s, &a, false, &b, false, Fidelity::HiFi4, Reuse::Off);
-        reuse::probe_misroute(true);
+        probe(true);
         let (shared, copies) = product(
             s,
             &a,
@@ -241,9 +296,12 @@ fn a_misrouted_copy_changes_the_product() {
             &b,
             false,
             Fidelity::HiFi4,
-            Reuse::Pull { holders: 1 },
+            Reuse::Pull {
+                holders: 1,
+                b_holders,
+            },
         );
-        reuse::probe_misroute(false);
+        probe(false);
         assert!(copies > 0);
         assert!(
             plain
@@ -251,6 +309,47 @@ fn a_misrouted_copy_changes_the_product() {
                 .zip(&shared)
                 .any(|(x, y)| x.to_bits() != y.to_bits()),
             "a misrouted copy left the product unchanged"
+        );
+    });
+}
+
+/// A shared product whose readers wait for one credit more than their holders send fails by its
+/// deadline; then the session runs the same product shared, bit for bit, every credit word at zero.
+/// Silicon only: the stalled units' roles wait inside their kernels, and recovering such a tile
+/// takes the backend pulse ttsim does not model (`docs/learnings/ttsim-divergence.md` row 16).
+#[cfg(feature = "silicon")]
+#[test]
+fn a_stalled_shared_product_leaves_the_session_usable() {
+    with_session(4, |s| {
+        s.set_block_stream(BlockStream::Fixed([2, 2, 3]));
+        let a = s.upload(&values(96 * 256, 9), 96, 256).unwrap();
+        let b = s.upload(&values(256 * 320, 10), 256, 320).unwrap();
+        let (plain, _) = product(s, &a, false, &b, false, Fidelity::HiFi4, Reuse::Off);
+        let both = Reuse::Pull {
+            holders: 1,
+            b_holders: Some(1),
+        };
+        s.set_operand_reuse(both).unwrap();
+        reuse::probe_overwait(true);
+        let stalled = s
+            .matmul_dram(
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                BUDGET * 40,
+            )
+            .and_then(|out| s.sync().map(|_| out));
+        reuse::probe_overwait(false);
+        assert!(stalled.is_err(), "a reader waiting past its credits stalls");
+        let (shared, copies) = product(s, &a, false, &b, false, Fidelity::HiFi4, both);
+        assert!(copies > 0);
+        same(&plain, &shared, "after a stalled shared product");
+        assert!(
+            credit_words(s).iter().all(|w| w.iter().all(|&x| x == 0)),
+            "a credit word left counted after recovery"
         );
     });
 }
@@ -277,8 +376,12 @@ fn every_tile_h1_product_is_the_unshared_one() {
         let b = s.upload(&values(k * n, 8), k, n).unwrap();
         let (plain, _) = product(&mut s, &a, false, &b, false, Fidelity::HiFi4, Reuse::Off);
         let holders = std::env::var("TT_REUSE_HOLDERS").map_or(1, |v| v.parse().unwrap());
+        let b_holders = std::env::var("TT_REUSE_B_HOLDERS")
+            .ok()
+            .map(|v| v.parse().unwrap());
         let t0 = std::time::Instant::now();
-        s.set_operand_reuse(Reuse::Pull { holders }).unwrap();
+        s.set_operand_reuse(Reuse::Pull { holders, b_holders })
+            .unwrap();
         let before = reuse::copies();
         let out = s.matmul_dram(
             &a,

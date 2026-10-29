@@ -378,7 +378,7 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 | D2 | Partials across K chunks | Packer L1 accumulation | Reload into FP32 `Dst` | **Decided: reload** under the default contract (L1 accumulation changes rounding, G3). L1 accumulation stays available as a named contract |
 | D3 | Decode weight readers | DRAM-sharded, one reader beside each bank | Interleaved `READ_RUN` stream | **Decided 2026-10-27: no gain.** At equal entry sizes, 8 readers a channel equal today's deal; with reads 5× cheaper the step moves only 10.82 → 10.60 ms (F27, [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)) |
 | D4 | Layout search | Greedy (tt-mlir, after removing a solver) | Global solver | **Provisional: greedy** [PUB]. Revisit only on a measured loss |
-| D5 | Operand reuse in products | 2D multicast matmul | A few holders pulled by `READ_L1`; or GDDR re-reads with larger blocks | **Open.** Contended multicast is slow (T7); pulled rows are measured cheaper for rows. Decided by H1 |
+| D5 | Operand reuse in products | 2D multicast matmul | A few holders pulled by `READ_L1`; or GDDR re-reads with larger blocks | **Decided 2026-10-29: `A` pulled from a few holders** (1.33-1.44x with an FP32 `B` at three prefill shapes, bit for bit, F4b.1). `B` pulled loses (a holder's L1 fan-out; its credits' round trips do not bind). Multicast deferred, not refuted: on a 12-wide grid `B` down columns caps H1 at ~24.2 TFLOPS (96 units) and `A` along rows at ~1.17x; revisit when a shape's block rows suit the grid or after F5. Equal row groups leave `units % groups` units idle; other work on them needs F4a's channels in place of the op's closing barrier. For a packed `B` the block, not reads, binds (H1 1.7x at `[6,4,12]` with `A` pulled), shape-dependent: a measured block choice is next |
 | D6 | Credit granularity | A page (often a tile) | A compute-sized batch (ours) | **Open.** Decided per channel class by the cost model once H4 measures sync cost against overlap. Sync cost measured (H8, 2026-10-28): a cross-core handoff ~1.8 us, a two-unit barrier ~2.6 us |
 | D7 | Replicating rows to many readers | Multicast | Sharded rows | **Decided: sharded.** Replicated rows by contended multicast took 43.9 ms a step against 20.92 (roadmap, residency 2e/2f) |
 | D8 | `Dst` width | BF16 `Dst`, 8 tiles a half, often the default | FP32 `Dst`, 4 a half | **Decided: FP32** in the default contract (S2). 16-bit is an opt-in contract |
@@ -432,6 +432,17 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     ≥ 95% of the ceiling (≥ 26.6) in `silicon_probe_pair_cost`.
   - *Measured by:* `matmul_throughput` and the profile's card read rate.
   - *Kills it:* reads drop and TFLOPS do not.
+  - *F4b.1, `A` pulled (2026-10-28, card 1, `1793228872`):* 25.98 TFLOPS at 1,346 MB: the TFLOPS clause holds, the reads
+    clause does not (`B` read 8 times).
+  - *F4b.1, `B` pulled too (2026-10-29, card 1, `1793236805`):* 272.6 MB, the reads clause met, at 15.18 TFLOPS: the
+    scheme is refuted. The rate follows a `B` holder's readers (seven 14-15, one 25.3-25.7 TFLOPS), so one holder's L1
+    and credits cannot serve a column of seven
+    ([log](performance-log.md#f4b1-b-pulled-too-the-reads-clause-met-and-the-rate-lost-2026-10-29-cards-0-and-1)).
+  - *Result (2026-10-29, D5 decided):* the TFLOPS clause holds with `A` pulled (28.38 through the session, 25.2-26.0
+    through Burn; 1.33-1.44x at three shapes); the reads clause is not met at that rate. The packed clause holds at the
+    default block, whose ceiling was not the kernel's: at `[6,4,12]` with `A` pulled a BFP `B` reaches 44.5-45.8 TFLOPS,
+    above the 35 first predicted
+    ([log](performance-log.md#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1)).
 - **H2 `Dst` subblocks and half-sync.** Once reads stop binding (after H1), the kernel's math utilization rises from ~41-68% of HiFi4 issue toward ~90%. That range is derived from the 0.14-0.23 µs measured per K-tile pair against 128 cycles of `MVMUL`.
   - *Prediction:* ≥ 1.4× on the same shapes, bit-exact.
   - *Kills it:* < 1.1×.

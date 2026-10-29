@@ -219,7 +219,7 @@ const _: () = assert!(BARRIER_RECTS + 4 + BARRIER_RECTS_MAX as u64 * 8 <= encode
 /// (`docs/learnings/dataflow-compiler.md` §7).
 pub const CREDITS: u64 = MAILBOX_BASE + 0x400;
 /// How many words [`CREDITS`] holds.
-pub const CREDIT_WORDS: u32 = 4;
+pub const CREDIT_WORDS: u32 = 8;
 /// The end of [`CREDITS`].
 pub const CREDITS_END: u64 = CREDITS + CREDIT_WORDS as u64 * 16;
 /// Credit word `i` of [`CREDITS`], alone in its 16 bytes.

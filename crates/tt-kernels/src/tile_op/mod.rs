@@ -313,9 +313,10 @@ pub struct TileOp {
     /// data-independent read (a `STREAM`ed contraction operand) at or above it is read ahead
     /// of the unit's barrier ([`lower`]). Empty: nothing is read ahead.
     pub ahead: Vec<Option<u64>>,
-    /// Units that read the same strip of the contraction's first operand share its reads (X4):
-    /// a few holders read it from GDDR, the others copy it from a holder's L1
-    /// ([`distribute::Shared`], [`reuse`]). `None`: each unit reads its own.
+    /// Units that read the same strip of the contraction's first operand, and with
+    /// [`Share::b_holders`] of its second, share its reads (X4): a few holders read it from
+    /// GDDR, the others copy it from a holder's L1 ([`distribute::Shared`], [`reuse`]). `None`:
+    /// each unit reads its own.
     pub share: Option<Share>,
 }
 
@@ -324,6 +325,9 @@ pub struct TileOp {
 pub struct Share {
     /// Most holders in a group of units that read the same strip.
     pub holders: usize,
+    /// Most holders in a column group of units that read the same strip of the second operand;
+    /// `None`: it is not shared.
+    pub b_holders: Option<usize>,
     /// Each unit's tile, as the session names it: where a copy reads and a credit goes.
     pub tiles: std::sync::Arc<[(u8, u8)]>,
 }

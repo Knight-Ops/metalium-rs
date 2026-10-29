@@ -1801,10 +1801,13 @@ fn l1_footprint(entries: &[[u32; 8]], gather: bool) -> Option<Vec<std::ops::Rang
                         let at = head[2] as u64;
                         ranges.push(at..at + head[5] as u64 * kt * a);
                     }
-                    let b =
-                        record::gather_b_tile_format(head[1]).map_or(TILE_SLOT, |f| f.slot_bytes());
-                    let at = head[3] as u64;
-                    ranges.push(at..at + kt * head[7] as u64 * b);
+                    // A resident `B` likewise (`record::GATHER_B_RESIDENT`: copied there).
+                    if head[1] & record::GATHER_B_RESIDENT == 0 {
+                        let b = record::gather_b_tile_format(head[1])
+                            .map_or(TILE_SLOT, |f| f.slot_bytes());
+                        let at = head[3] as u64;
+                        ranges.push(at..at + kt * head[7] as u64 * b);
+                    }
                 }
                 record::SCATTER if !gather => {
                     let outputs = head[4] as u64 * head[6] as u64;
