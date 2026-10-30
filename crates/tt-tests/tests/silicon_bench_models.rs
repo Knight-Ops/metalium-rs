@@ -1507,7 +1507,15 @@ fn qwen35_traced_generation_on<B: tt_models::generate::TracedBackend>(suffix: &s
     let new: usize = env("TT_GEN_NEW", "32").parse().unwrap();
     let samples: usize = env("TT_GEN_SAMPLES", "3").parse().unwrap();
     let name = "qwen3.5-4b";
-    with_device(Config::default(), |d| {
+    // Every tile, as the 1.7B's numbers are taken (`TT_TILES=all`), unless `TT_TILES` says
+    // otherwise.
+    let config = Config {
+        tiles: std::env::var_os("TT_TILES")
+            .is_none()
+            .then_some(burn_tt::TileChoice::All),
+        ..Config::default()
+    };
+    with_device(config, |d| {
         conditions(card());
         println!(
             "BENCH {{\"kind\":\"conditions\",\"weight_storage\":\"bf16\",\"head\":\"f32 table\"}}"
