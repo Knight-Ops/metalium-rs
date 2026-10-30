@@ -189,6 +189,11 @@ Left:
   and each takes 5-7 minutes and 26-40 GB of host memory. They are run by name when this work is tested:
   `cargo xtask silicon --release --device 0 --filter step260_qwen35` (and `step261_gemma4`, `step262_moss_image`),
   each inside a memory cap (`systemd-run --user --scope -p MemoryMax=40G`) so a host-memory fault stays in its run.
+- **Under F4a and F5** (merged tree `68a0463`, card 0, 2026-10-30): `step262_moss_image` (`1793400458`) and
+  `step261_gemma4` (`1793400112`) print the figures they printed before both, digit for digit; `step260_qwen35`
+  (`1793399450`, F32 and BF16-stored weights) prints 7.7931e-2 of 33.1234, the figure the F32 tied head's
+  `last @ table^T` gives (Qwen3.5 traced, below), not one F4a or F5 moved. `step263_qwen35_traced` passes on card 0
+  (`1793400913`).
 - [ ] Performance, after correctness: traced generation (a fixed-shape `HybridCache` for Qwen3.5), the fused
   delta-rule step, the DeltaNet's chunked prefill, a window-sized cache for Gemma 4's sliding layers.
   - [x] **Qwen3.5 traced generation** (branch `qwen35-traced`): `qwen35::HybridCache` (the eight attention layers'

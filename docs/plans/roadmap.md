@@ -691,6 +691,11 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
   ([new-architectures.md](new-architectures.md), branch `models-hybrid`). On the host they reproduce their references
   (2026-10-30); on card 0 all three agree with burn-flex natively (`step260_qwen35` F32 and BF16-stored weights,
   `step261_gemma4`, `step262_moss_image`, 2026-10-30). Eager decode is 3-4 s a token against a 17-38 ms roofline.
+  **Qwen3.5-4B decodes traced** (2026-10-30, `qwen35::HybridCache`, gate `step263_qwen35_traced`, card 1 `1793345534`,
+  not in `--smoke`): **64.2 / 64.6 ms** a step at 32 / 256 tokens with BF16-stored weights (`1793346925`), against ~1.6 s
+  eager and a 17.5 ms roofline. The owner's target is close behind the 1.7B. Next, in order of what it buys: a fused
+  delta-rule step (~25 of a DeltaNet layer's ~34 ops), a BF16 copy of the tied head (1.3 GB a step), the trace build
+  (644-1,487 s, host-bound, cause not found), the chunked (WY) prefill (3.7 s for 256 tokens).
   Found in `burn-tt` on the way (each worked around in the model, none fixed):
   - a BF16 product with a transposed right operand copies it plain, at >40 GB of host bookkeeping for a 248K x 2,560 table;
   - `Precision::Bf16` holds host memory without bound on Qwen3.5's whole model (not located);
@@ -831,15 +836,32 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
     numbered globally, credits returned per item;
   - an eager product run after its own shape's pulled capture takes 3-10% more host time (device the same), cause not
     found.
-- [ ] **F4a:** channels instead of barriers in decode (H4). Opened 2026-10-29 at `9977ad8`
+- [x] **F4a:** channels instead of barriers in decode (H4), closed 2026-10-30: **H4's kill fires**. Opened 2026-10-29 at `9977ad8`
   ([plan](dataflow-compiler.md#stage-f4a-decode-channels-instead-of-barriers-h4)).
   - F4a.0 (card 1): the bound clears H4's kill. A product's tail leaves ~70 units reading nothing, 2.45 ms of capacity a
     1.7B step; with the weights made free the step is 5.33 ms (the profile mode's `tails.tsv` splits each eighth by unit).
   - F4a.2, first lever, **the default**: a product's units read the next weights before their arrival, the barrier
     kept. 1.7B 11.32 / 12.69 -> **10.95 / 12.16 ms** at 32 / 256 tokens (card 1), bit for bit; `Step(64)` 340 GB/s on
     the card ([log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1)).
-  - Left: 1.27 ms of tail slack (F4a.1's credits, idle units' lists pumped), F4a.3's three schedules.
-- [ ] **F5:** `Dst` subblocks and half-sync (H2).
+  - F4a.1-F4a.3 (2026-10-30, lane A, card 1; [log](../learnings/performance-log.md#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1)):
+    idle units' lists pumped (`GATHER_PREFETCH`) and moved before their arrival, 0.24 / 0.17 ms slower, opt-in
+    (`TT_IDLE_AHEAD_EARLY`); kept barriers lowered to per-edge credits (`barriers::credit`, gate `step265`, in `--smoke`),
+    +0.03 / +0.06 ms, opt-in (`TT_EDGE_CREDITS`); the handoff, the second prefetched job and the balanced deal not
+    faster, retired. Close 10.98 / 12.18 against 11.01 / 12.16 ms. The tails are the products' slowest units, not a
+    gap reads ahead or credits fill: the lever left is per-unit work balance (F5, F6).
+- [x] **F5:** `Dst` subblocks and half-sync (H2), closed 2026-10-30: **neither H2's prediction (1.4x) nor its kill
+  (<1.1x)**, the default, bit for bit (lane B, card 0; [log](../learnings/performance-log.md#f5-dst-subblocks-and-half-sync-2026-10-30-card-0)).
+  - Up to four FP32 tiles a `Dst` half, math and pack on alternate halves, `A` held in `SrcB` (`tile_op::dst`, gate
+    `step246`; `TT_DST_SUBBLOCKS=0` off); the measured blocks re-swept. H1 x five formats 1.12x (FP32 32.3 -> 34.4
+    TFLOPS), a 19-shape model set 1.12x (MOSS-Image DiT `qkv` through Burn 15.0 -> 27.3).
+  - What binds now: a continuing chunk's reload of its partials stops the math role (an `UnpackToDst` beside running
+    `MVMUL`s is wrong on silicon, [operating notes](../learnings/silicon-operating-notes.md)). B3 (roles across
+    batches) not built: all but a job's first join reload the chunk before's partials.
+  - Merged with F4a and Qwen3.5's traced generation at `a12dc1e`: the 1.7B decode step 10.93 / 12.14 ms, H1 through
+    Burn 30.6 / 22.5 / 11.4 / 14.3 TFLOPS (card 1, `1793396168`, `1793396429`). `step245`'s paused-capture claim
+    restated (`68a0463`): a pause may leave one `KERNEL` setup run on a unit the paused product left idle. Card 0:
+    `--smoke` 1,265 of 1,265 (`1793397733`, `step12_mnist` and `step245` among them); `step260`-`step263` by name
+    pass, the models' figures unchanged by F4a and F5 ([new-architectures.md](new-architectures.md#phase-b-on-the-card-started-2026-10-30-cards-0-and-1)).
 - [ ] **F6:** fusion through channels and spatial pipelining (H5).
 
 This takes over the open parts of "Use the grid" (G4 subblocks, G7 multicast) and "Prefill P5" below. Their evidence stands.
