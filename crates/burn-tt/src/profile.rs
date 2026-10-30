@@ -25,6 +25,10 @@
 //!   barrier, from its own stamps.
 //! * `channels.tsv`: every trace op's GDDR reads by channel and NoC #0 endpoint, in its span
 //!   and read ahead (`summary.md` has each product label's busiest channel and endpoint).
+//! * `tails.tsv`: every trace op's reads in eighths of its span, its own units' against units
+//!   reading ahead, its own units still at work, and the card's capacity left unused once some
+//!   of them wait at its barrier (`summary.md` has the sum: an upper bound on reading ahead from
+//!   freed units).
 //! * `trace.json`: the same as a Perfetto/Chrome trace, spans named by Burn op, with the card's
 //!   GDDR read rate as a counter beside each trace's ops.
 //! * `entries.tsv` (`TT_PROFILE_DETAIL=full` only): every trace op's entries on unit 0 by kind,
@@ -131,7 +135,8 @@ impl Profile {
         out
     }
 
-    /// Write `summary.md`, `ops.tsv`, `skew.tsv`, `channels.tsv` and `trace.json` into `dir`, creating it.
+    /// Write `summary.md`, `ops.tsv`, `skew.tsv`, `channels.tsv`, `tails.tsv` and `trace.json` into
+    /// `dir`, creating it.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         let name = |id: u64| self.name(id);
         std::fs::create_dir_all(dir)?;
@@ -139,6 +144,7 @@ impl Profile {
         std::fs::write(dir.join("ops.tsv"), self.device.tsv(&name))?;
         std::fs::write(dir.join("skew.tsv"), self.device.skew_tsv(&name))?;
         std::fs::write(dir.join("channels.tsv"), self.device.channels_tsv(&name))?;
+        std::fs::write(dir.join("tails.tsv"), self.device.tails_tsv(&name))?;
         if self
             .device
             .traces

@@ -134,21 +134,24 @@ fn forward<T: tt_device::Transport>(
 /// Each captured op's ranges on units 0-3.
 type Ranges = Vec<Vec<std::ops::Range<usize>>>;
 
-/// Capture [`forward`] with busy prefetch `on`, replay it over `inputs`, and return the replays'
+/// Capture [`forward`] with busy prefetch `on` (and its lists moved to before the arrival at the
+/// product before's barrier with `early`), replay it over `inputs`, and return the replays'
 /// results (the capture's own run first) and each op's ranges on units 0-3.
 fn captured<T: tt_device::Transport>(
     s: &mut Session<T>,
     w: &[DramTensor; 3],
     x: &DramTensor,
-    on: bool,
+    (on, early): (bool, bool),
     inputs: &[u64],
 ) -> (Vec<Vec<f32>>, Ranges) {
     s.write(x, &values(inputs[0], K)).unwrap();
     s.set_busy_prefetch(on);
+    s.set_read_ahead_early(early);
     s.begin_trace().unwrap();
     let y = forward(s, w, x);
     let id = s.end_trace().unwrap();
     s.set_busy_prefetch(true);
+    s.set_read_ahead_early(true);
     let mut runs = vec![s.download(&y).unwrap()];
     for &seed in &inputs[1..] {
         s.write(x, &values(seed, K)).unwrap();
@@ -178,8 +181,8 @@ fn a_products_units_read_their_b_under_the_ops_before_it() {
         let warm = forward(s, &w, &x);
         s.free(warm).unwrap();
         let inputs = [10, 20, 21];
-        let (off, off_ranges) = captured(s, &w, &x, false, &inputs);
-        let (on, on_ranges) = captured(s, &w, &x, true, &inputs);
+        let (off, off_ranges) = captured(s, &w, &x, (false, false), &inputs);
+        let (on, on_ranges) = captured(s, &w, &x, (true, false), &inputs);
         // The ops run fresh on each input: no capture, so no prefetch.
         for (i, &seed) in inputs.iter().enumerate() {
             s.write(&x, &values(seed, K)).unwrap();
@@ -214,6 +217,48 @@ fn a_products_units_read_their_b_under_the_ops_before_it() {
             moved >= 8,
             "each of the two later products' prefetches moved ahead of the op before it on four units"
         );
+        for t in w.into_iter().chain([x]) {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// F4a.2 (`docs/plans/dataflow-compiler.md`): with `Session::set_read_ahead_early`, a unit's list
+/// moves on to just before its arrival at the barrier of the product before, so it reads the next
+/// product's `B` as soon as its own share is done. The claims: the same bits, fresh and replayed;
+/// and on each of units 0-3 the last product's list (the middle one runs four jobs pipelined and
+/// reads nothing ahead) is now the middle product's own (its range holds it), so the ops' ranges
+/// there hold more entries than with the list after the arrival -- exactly the list's. The control
+/// is that count with the list after the arrival: no op holds it.
+#[test]
+fn a_products_units_read_their_b_before_the_product_befores_barrier() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        s.set_weight_prefetch(false);
+        let w = [(1, K), (2, K), (3, 256)]
+            .map(|(seed, n)| s.upload(&values(seed, K * n), K, n).unwrap());
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let warm = forward(s, &w, &x);
+        s.free(warm).unwrap();
+        let inputs = [10, 20, 21];
+        let (after, after_ranges) = captured(s, &w, &x, (true, false), &inputs);
+        let (early, early_ranges) = captured(s, &w, &x, (true, true), &inputs);
+        for (i, &seed) in inputs.iter().enumerate() {
+            s.write(&x, &values(seed, K)).unwrap();
+            let y = forward(s, &w, &x);
+            let want = s.download(&y).unwrap();
+            s.free(y).unwrap();
+            assert_bits(&format!("after the arrival, run {i}"), &after[i], &want);
+            assert_bits(&format!("before the arrival, run {i}"), &early[i], &want);
+        }
+        assert_eq!(after_ranges.len(), early_ranges.len(), "the same ops");
+        let held = |ranges: &Ranges, u: usize| -> usize { ranges.iter().map(|r| r[u].len()).sum() };
+        for u in 0..4 {
+            let (a, e) = (held(&after_ranges, u), held(&early_ranges, u));
+            println!("unit {u}: ops hold {a} entries with the lists after the arrival, {e} before");
+            // A list is its `GATHER` (four entries) and its prefetch's start.
+            assert_eq!(e, a + 5, "unit {u}: the last product's list held by an op");
+        }
         for t in w.into_iter().chain([x]) {
             s.free(t).unwrap();
         }

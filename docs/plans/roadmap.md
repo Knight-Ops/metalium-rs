@@ -14,8 +14,8 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
-  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 88 tokens/s traced against
-  burn-flex's 3.4 (11.32 ms a step with BF16 weights, card 0, 2026-10-27, [log](../learnings/performance-log.md#the-decode-and-prefill-streams-merged-2026-10-27-card-0); 13.6 tokens/s on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 91 tokens/s traced against
+  burn-flex's 3.4 (10.95 ms a step with BF16 weights, card 1, 2026-10-29, [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1); 88 tokens/s on 2026-10-27, 13.6 on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
   5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
@@ -787,7 +787,7 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
     unchanged. B1, eager step time on card 1, is within drift of F3.8's tree, ABBA (1.398 / 2.892-2.903 /
     8.270-8.300 against 1.398 / 2.892 / 8.270-8.290 ms/step)
     ([log](../learnings/performance-log.md#f3-the-tile-generic-op-pointwise-and-reduction-ported-before-and-after-2026-10-28-cards-0-and-1)).
-- [ ] **F4b:** operand reuse across cores (H1). Opened 2026-10-28 (F4b.0, card 1,
+- [x] **F4b:** operand reuse across cores (H1), closed 2026-10-29. Opened 2026-10-28 (F4b.0, card 1,
   [log](../learnings/performance-log.md#f4b0-what-operand-reuse-can-buy-the-reads-free-ceiling-at-prefill-shapes-2026-10-28-card-1)).
   - `[2048,2048]@[2048,16384]` runs at 19.2-19.4 TFLOPS and reads 2,062 MB for 151 MB of operands.
   - Its reads-free ceiling is 30.3 TFLOPS with an FP32 `B` and 28.0 with a packed one, so H1's 35 is restated:
@@ -811,14 +811,24 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
     - Decode, ResNet-18, ViT-Tiny and eager training unchanged. Eager products run `Auto`'s block.
     - Costs build time: 6.7 s a question on average, the 1.7B's traced build 154 -> 233 s
     ([log](../learnings/performance-log.md#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1)).
-  - Left: the pull in the batched block-stream path (attention prefill; the items' units numbered globally, credits
-    returned per item); an eager product after its own shape's pulled capture runs 3-10% slower on the host, cause
-    not found.
+  - Its leftovers are carried as the open item below ("F4b's leftovers").
   - Closing checks on the final tree: `--smoke` on card 0 passes 1,264 of 1,264 (`1793306388`, `step12_mnist` among
     them, its golden's losses unchanged); the job goldens unchanged.
   - Found: `[2048,8192]@[8192,2048]` is 1.7x slower through Burn (10.9-11.0 TFLOPS) than through the session (18.5);
     14.0-14.2 through Burn with the measured block.
-- [ ] **F4a:** channels instead of barriers in decode (H4).
+- [ ] **F4b's leftovers** (carried 2026-10-29 when F4b closed; not on F4a's path):
+  - the pull in the batched block-stream path (`matmul_dram_batched_limited`, attention prefill): the items' units
+    numbered globally, credits returned per item;
+  - an eager product run after its own shape's pulled capture takes 3-10% more host time (device the same), cause not
+    found.
+- [ ] **F4a:** channels instead of barriers in decode (H4). Opened 2026-10-29 at `9977ad8`
+  ([plan](dataflow-compiler.md#stage-f4a-decode-channels-instead-of-barriers-h4)).
+  - F4a.0 (card 1): the bound clears H4's kill. A product's tail leaves ~70 units reading nothing, 2.45 ms of capacity a
+    1.7B step; with the weights made free the step is 5.33 ms (the profile mode's `tails.tsv` splits each eighth by unit).
+  - F4a.2, first lever, **the default**: a product's units read the next weights before their arrival, the barrier
+    kept. 1.7B 11.32 / 12.69 -> **10.95 / 12.16 ms** at 32 / 256 tokens (card 1), bit for bit; `Step(64)` 340 GB/s on
+    the card ([log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1)).
+  - Left: 1.27 ms of tail slack (F4a.1's credits, idle units' lists pumped), F4a.3's three schedules.
 - [ ] **F5:** `Dst` subblocks and half-sync (H2).
 - [ ] **F6:** fusion through channels and spatial pipelining (H5).
 

@@ -1171,6 +1171,20 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
   an overflowing product the extra phases change is not isolated. The derived phases are opt-in
   (`TT_DERIVED_FIDELITY=1`).
 
+## A prefetch placed before a barrier arrival reads under the barrier; an in-line list delays it (2026-10-29, cards 0 and 1)
+
+From [dataflow-compiler.md](../plans/dataflow-compiler.md) F4a.2.
+- **What holds:** B pumps a prefetch's reads (`GATHER_PREFETCH`) in every barrier wait loop (`mover::barrier`,
+  `pump(PUMP_TURN)`), and a unit's own share has landed by the entry before its arrival (each pair ends with NC done,
+  `finish_pair`; `BARRIER` waits for B's own requests). So a prefetch list put just before a unit's arrival reads while
+  the unit waits for the product's slowest units. On a 1.7B decode step that filled half the products' tails
+  (11.32 -> 10.95 ms, bit for bit, card 1).
+- **What it needs:** no other unit of the op may touch the L1 the list's reads land in until the barrier releases
+  (`barriers::others_touch_l1`, on the list's own extent: a capture's residency region above `DATA` takes readers'
+  writes above the ring's base, not in it).
+- **What does not:** a list B runs in line (plain `GATHER`s, the idle units' `PREFETCH` lists) placed before an arrival
+  delays the barrier for every unit: 0.6 ms slower a 1.7B step.
+
 ## An op's recorded L1 top must cover everything it lays out (2026-10-26, card 0 and 1)
 
 Busy prefetch places a unit's next weight ring above the highest `l1_top` the ops since the last product recorded

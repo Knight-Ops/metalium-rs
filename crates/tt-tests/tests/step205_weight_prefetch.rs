@@ -960,6 +960,8 @@ fn forward_skip<T: tt_device::Transport>(
 #[test]
 fn a_busy_unit_reads_ahead_from_its_own_anchor_but_not_across_an_op_in_its_ring() {
     with_session(|s| {
+        // Where the list lands after its anchor's barrier; early, it lands before it (`step216`).
+        s.set_read_ahead_early(false);
         // The 64-row product must plan into the third product's ring: as a 2-D blocked product
         // (`docs/plans/prefill-operand-reuse.md`) it plans low in `DATA`, and the read ahead
         // rightly crosses it (card 0, `1792861197`: the bits agree even with `l1_top` ignored).

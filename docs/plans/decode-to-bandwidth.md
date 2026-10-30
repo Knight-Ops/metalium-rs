@@ -1163,9 +1163,11 @@ one-block slot ring, beside the prefetching units.
   too many requests a channel, crossing the chip and an unfair finish; but every lower cap slows the `fast-reads` decode
   step (B's own cap 2: 11.05 -> 11.51 ms), so neither a card-wide request budget nor a nearest-channel deal is the lever
   for decode's 2 KiB reads. The defaults stay.
-- [ ] **Next: split the tail by unit** (which units read at each eighth: the product's own, or the prefetch), then choose a
-  lever: more units reading `down`, the next prefetch starting where a product's units drop out, or faster reads under
-  the small ops. An order-changing one (split-K for `down`'s 64 columns) stays the user's decision.
+- [x] **Split the tail by unit** (2026-10-29, card 1, the profile mode's `tails.tsv`): the product's own units drop 92 ->
+  20 by its last eighth and nothing reads ahead there, because each unit's next list sits after its arrival. The lever
+  chosen, the next prefetch starting where a product's units drop out, is the default since
+  ([dataflow-compiler.md](dataflow-compiler.md) F4a.2, 1.7B 11.32 -> 10.95 ms). An order-changing one (split-K for
+  `down`'s 64 columns) stays the user's decision.
 
 ## The larger changes compared (2026-10-18)
 

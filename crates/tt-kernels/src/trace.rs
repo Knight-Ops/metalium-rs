@@ -416,7 +416,9 @@ impl Capture {
     /// Every op's range on `u` and every `PAIR_CALL`'s position follow their entries; a range
     /// that held the block keeps the rest of its entries, which are contiguous again. The block
     /// is no op's own afterwards: a prefetch moved to before the ops it runs under, or the
-    /// probe's background moved after them.
+    /// probe's background moved after them. The one place inside an op a block may move to is
+    /// just before the op's last entry, `u`'s arrival at its barrier
+    /// (`Session::set_read_ahead_early`): that op's range then holds the block.
     pub(crate) fn move_block(&mut self, u: usize, block: std::ops::Range<usize>, to: usize) {
         let len = block.len();
         assert!(
@@ -426,10 +428,13 @@ impl Capture {
         if len == 0 || to == block.start || to == block.end {
             return;
         }
+        let stream = &self.units[u].stream;
         debug_assert!(
-            self.ops
-                .iter()
-                .all(|op| !(op.entries[u].start < to && to < op.entries[u].end)),
+            self.ops.iter().all(|rec| {
+                let r = &rec.entries[u];
+                !(r.start < to && to < r.end)
+                    || (to < block.start && to + 1 == r.end && stream[to][0] == op::BARRIER)
+            }),
             "a block moves to the middle of an op"
         );
         let earlier = to < block.start;
@@ -457,6 +462,11 @@ impl Capture {
         for op in &mut self.ops {
             let r = &mut op.entries[u];
             if r.start >= r.end {
+                continue;
+            }
+            // Moved to before the op's arrival: it holds the block now.
+            if earlier && r.start < to && to < r.end {
+                *r = r.start..r.end + len;
                 continue;
             }
             let holds = r.start <= block.start && r.end >= block.end;
@@ -717,6 +727,25 @@ mod tests {
         assert_eq!(read, [9, 10], "the list read ahead follows its entries");
         let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
         assert_eq!(&order[..6], [0, 1, 2, 16, 17, 3]);
+    }
+
+    #[test]
+    fn a_block_moved_before_an_arrival_is_held_by_that_op() {
+        // Ops 0..5, whose last entry is the unit's arrival at its barrier, and 5..12, holding a
+        // block 9..11 with a PAIR_CALL at 10: the block moves to 4, before the arrival
+        // (`Session::set_read_ahead_early`), and the first op's range holds it.
+        let mut c = numbered(12, &[10], &[0..5, 5..12]);
+        c.units[0].stream[4][0] = op::BARRIER;
+        c.move_block(0, 9..11, 4);
+        let (ops, calls) = contents(&c);
+        assert_eq!(ops[0], [0, 1, 2, 3, 9, 10, 4]);
+        assert_eq!(ops[1], [5, 6, 7, 8, 11]);
+        assert_eq!(calls, [10]);
+        assert_eq!(
+            c.units[0].stream[6][0],
+            op::BARRIER,
+            "the arrival still ends it"
+        );
     }
 
     #[test]

@@ -56,6 +56,15 @@ fn chain(x: Tensor<TtBackend, 2>, n: usize) -> Tensor<TtBackend, 2> {
     y
 }
 
+/// Keep a captured chain's barriers. Its ops run on the same units and read only what their own
+/// unit wrote, so a capture would drop every barrier between them (`Session::set_barrier_prune`,
+/// on by default since 2026-10-26) and store the chain as one op; these gates are about a trace of
+/// many ops. Set before the device opens, which reads it; `cargo xtask silicon` runs each gate in
+/// a process of its own.
+fn keep_barriers() {
+    std::env::set_var("TT_BARRIER_PRUNE", "0");
+}
+
 /// A captured chain of `2 n` ops over `x`.
 fn traced_chain(d: &TtDevice, n: usize) -> TracedInference {
     let x = input(d);
@@ -106,7 +115,13 @@ fn eager_ops_are_attributed_to_their_burn_ops() {
         // The files the environment switch writes.
         let dir = std::env::temp_dir().join(format!("tt-profile-{}", std::process::id()));
         p.write(&dir).unwrap();
-        for f in ["summary.md", "ops.tsv", "skew.tsv", "trace.json"] {
+        for f in [
+            "summary.md",
+            "ops.tsv",
+            "skew.tsv",
+            "tails.tsv",
+            "trace.json",
+        ] {
             assert!(dir.join(f).metadata().unwrap().len() > 0, "{f}");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -115,6 +130,7 @@ fn eager_ops_are_attributed_to_their_burn_ops() {
 
 #[test]
 fn a_long_trace_is_covered_window_by_window() {
+    keep_barriers();
     with_device(every_tile(), |d| {
         // 600 ops: their launches' and waits' stamps alone (two an op) outrun one buffer, so every
         // stamp the mover makes must obey the window, not only the entries'.
@@ -190,6 +206,7 @@ fn a_long_trace_is_covered_window_by_window() {
 
 #[test]
 fn windows_stitch_to_the_whole_trace() {
+    keep_barriers();
     with_device(every_tile(), |d| {
         // 24 ops: short enough to stamp whole.
         let trace = traced_chain(&d, 12);
@@ -243,6 +260,7 @@ fn windows_stitch_to_the_whole_trace() {
 /// never fails a run: the replay runs, and the trace is reported as overflowed and uncovered.
 #[test]
 fn without_the_window_a_long_trace_overflows() {
+    keep_barriers();
     with_device(every_tile(), |d| {
         let trace = traced_chain(&d, 60);
         profile_mode(

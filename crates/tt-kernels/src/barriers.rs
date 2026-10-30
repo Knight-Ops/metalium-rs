@@ -368,6 +368,104 @@ impl Memory {
     }
 }
 
+/// The footprint of the stream range `range` of a captured unit `uc`, its pair calls' sections
+/// expanded as the mover expands them.
+fn range_accesses(
+    uc: &crate::trace::UnitCapture,
+    range: std::ops::Range<usize>,
+    coords: &[(u8, u8)],
+    out: &mut Vec<Access>,
+) {
+    let stream = &uc.stream[range.clone()];
+    let mut i = 0;
+    while i < stream.len() {
+        if stream[i][0] == op::PAIR_CALL {
+            match uc.pair_calls.iter().position(|&at| at == range.start + i) {
+                Some(p) => {
+                    for section in uc.pending_sections.iter().skip(2 * p).take(2) {
+                        accesses(section, coords, out);
+                    }
+                }
+                None => out.push(Access::Unknown),
+            }
+            i += 1;
+            continue;
+        }
+        let n = record::len(stream[i][0]).max(1);
+        accesses(&stream[i..(i + n).min(stream.len())], coords, out);
+        i += n;
+    }
+}
+
+/// Where the reads of the entries `entries` (a list read ahead) land in their own unit's L1: from
+/// the lowest byte to the highest, or `None` for an entry that does anything else or cannot be
+/// expanded.
+pub(crate) fn landing(entries: &[[u32; 8]]) -> Option<std::ops::Range<u64>> {
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
+    let mut ok = true;
+    let mut see = |w: [u32; 8]| match w[0] {
+        op::READ | op::READ_TRANSPOSED | op::READ_BROADCAST_COL | op::READ_L1 => {
+            lo = lo.min(u64::from(w[4]));
+            hi = hi.max(u64::from(w[4]) + u64::from(w[5]));
+        }
+        h if local(h) => {}
+        _ => ok = false,
+    };
+    let mut i = 0;
+    while i < entries.len() {
+        let head = entries[i];
+        let n = record::len(head[0]).max(1);
+        if record::is_record(head[0]) {
+            let rec = entries.get(i..i + n)?;
+            record::expand(rec, |w| {
+                see(w);
+                Ok(())
+            })
+            .ok()?;
+        } else {
+            see(head);
+        }
+        i += n;
+    }
+    (ok && lo < hi).then_some(lo..hi)
+}
+
+/// Whether a unit other than `u` touches `u`'s L1 within `ring` in op `k` of capture `c` (whose
+/// units are at `coords`), or moves what the host cannot place. Until op `k`'s barrier releases,
+/// its other units may still be running it, so a list `u` runs after its own share of `k` and
+/// before its arrival may write `ring` of `u`'s L1 only if this is false
+/// (`Session::set_read_ahead_early`).
+pub(crate) fn others_touch_l1(
+    c: &Capture,
+    k: usize,
+    u: usize,
+    ring: std::ops::Range<u64>,
+    coords: &[(u8, u8)],
+) -> bool {
+    let rec = &c.ops[k];
+    let mut out = Vec::new();
+    for (p, (uc, range)) in c.units.iter().zip(&rec.entries).enumerate() {
+        if p != u && !range.is_empty() {
+            range_accesses(uc, range.clone(), coords, &mut out);
+        }
+    }
+    for (p, r) in &rec.ahead {
+        if *p != u {
+            accesses(&c.units[*p].stream[r.clone()], coords, &mut out);
+        }
+    }
+    out.iter().any(|a| match *a {
+        Access::Range {
+            space: Space::L1(v),
+            lo,
+            hi,
+            ..
+        } => usize::from(v) == u && lo < ring.end && ring.start < hi,
+        Access::Range { .. } | Access::AllGddr => false,
+        Access::Unknown => true,
+    })
+}
+
 /// The dependencies and barrier classes of capture `c`, whose units are at `coords`.
 pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
     // Each (op, unit)'s footprint.
@@ -382,26 +480,7 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
                 continue;
             }
             units.push(u as u16);
-            let out = per.entry(u as u16).or_default();
-            let stream = &uc.stream[range.clone()];
-            let mut i = 0;
-            while i < stream.len() {
-                if stream[i][0] == op::PAIR_CALL {
-                    match uc.pair_calls.iter().position(|&at| at == range.start + i) {
-                        Some(p) => {
-                            for section in uc.pending_sections.iter().skip(2 * p).take(2) {
-                                accesses(section, coords, out);
-                            }
-                        }
-                        None => out.push(Access::Unknown),
-                    }
-                    i += 1;
-                    continue;
-                }
-                let n = record::len(stream[i][0]).max(1);
-                accesses(&stream[i..(i + n).min(stream.len())], coords, out);
-                i += n;
-            }
+            range_accesses(uc, range.clone(), coords, per.entry(u as u16).or_default());
         }
         for (u, r) in &rec.ahead {
             if !rec.entries[*u].contains(&r.start) {
@@ -981,6 +1060,66 @@ mod tests {
     }
     fn local() -> [u32; 8] {
         [op::LAUNCH, 1, 0, 0, 0, 0, 0, 0]
+    }
+
+    fn l1(op: u32, unit: u8, at: u32) -> [u32; 8] {
+        [op, u32::from(unit) + 1, 2, at, 0x1000, 64, 0, 0]
+    }
+
+    #[test]
+    fn a_list_may_read_ahead_before_an_arrival_only_where_no_peer_touches_its_l1() {
+        let ring: u32 = 0x10_0000;
+        let c = capture(
+            3,
+            &[vec![
+                Some(vec![local()]),
+                // Unit 1 reads unit 0's L1 below the ring and writes unit 2's at it.
+                Some(vec![
+                    l1(op::READ_L1, 0, ring - 0x1000),
+                    l1(op::WRITE_L1, 2, ring),
+                ]),
+                Some(vec![read(0)]),
+            ]],
+        );
+        let at = coords(3);
+        let r = |lo: u32, hi: u32| u64::from(lo)..u64::from(hi);
+        assert!(
+            !others_touch_l1(&c, 0, 0, r(ring, ring + 0x8000), &at),
+            "above the read"
+        );
+        assert!(
+            others_touch_l1(&c, 0, 0, r(ring - 0x1000, ring), &at),
+            "over the read"
+        );
+        assert!(
+            !others_touch_l1(&c, 0, 2, r(ring - 0x8000, ring), &at),
+            "below the write"
+        );
+        assert!(
+            others_touch_l1(&c, 0, 2, r(ring, ring + 64), &at),
+            "over the write"
+        );
+        assert!(
+            !others_touch_l1(&c, 0, 1, 0..u64::MAX, &at),
+            "its own moves are not a peer's"
+        );
+        // A move the host cannot place keeps every list after the arrival.
+        let c = capture(
+            2,
+            &[vec![
+                Some(vec![local()]),
+                Some(vec![[0x7F, 0, 0, 0, 0, 0, 0, 0]]),
+            ]],
+        );
+        assert!(others_touch_l1(&c, 0, 0, 0..1, &coords(2)));
+        // Where a list's reads land: a `READ` and a `READ_L1`, and a list that does more.
+        let list = [
+            [op::READ, 0, 0, 0x2000, 0x8000, 0x800, 0, 0],
+            [op::WAIT, 0, 0, 0, 0, 0, 0, 0],
+            l1(op::READ_L1, 1, 0x9000),
+        ];
+        assert_eq!(landing(&list), Some(0x1000..0x8800));
+        assert_eq!(landing(&[write(0)]), None, "a write is not a read ahead");
     }
 
     /// The classes of a capture of two or three ops.

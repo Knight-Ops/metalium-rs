@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [F4a.0: what overlap can buy a decode step; the tails split by unit](#f4a0-what-overlap-can-buy-a-decode-step-the-tails-split-by-unit-2026-10-29-card-1) | 2026-10-29 | 1.7B `Step(64)` 10.91 ms at 327 GB/s; a product's own units fall 92 -> 20 by its last eighth and nothing reads ahead in its tail (each unit's next list sits after its arrival): 2.45 ms of capacity unused; weights made free 5.33 ms; H4's kill does not fire. F4a.2: busy lists moved to before the arrival (B pumps them at the barrier), **11.32 / 12.69 -> 10.95 / 12.16 ms**, 340 GB/s, the default; idle lists moved too: 0.6 ms slower than off (their reads are in line), reverted |
 | [F4b.2: a block measured on the card, `A` pulled where it gains](#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1) | 2026-10-29 | the default since: sweeps of every block x pull at 10 prefill shapes (the best 1.0-2.1x `Auto`'s, ranked low by every model); `Auto`'s, 12 listed blocks and a climb timed in a capture as a difference of traces: 1.02-2.25x `Auto` over 50 cases, H1 FP32 35.5 / BF16 49.5 / BFP4 65.4 TFLOPS a product; through Burn H1 19.2 -> **29.2 TFLOPS**, 1.7B prefill 1.04-1.34x, models and decode unchanged; eager runs `Auto`'s |
 | [D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever](#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1) | 2026-10-29 | three prefill shapes x every `B` format x the schemes: `A` pulled 1.33-1.44x with FP32 `B` (H1 28.38 TFLOPS); `B` pulled loses; a packed `B` is bound by the block (H1 `[6,4,12]` + `A` pulled 44.5-45.8, 1.7x), shape-dependent |
 | [F4b.1: a holder's credits as one run, no gain](#f4b1-a-holders-credits-as-one-run-no-gain-2026-10-29-cards-0-and-1) | 2026-10-29 | `dm::CREDIT_RUN` built and correct on card 0, measured off/on on card 1 within noise (`pull:1` 25.1 / 25.2, `pull:2,1` 15.3 / 14.9): a holder's round trips do not bind; retired |
@@ -389,6 +390,74 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## F4a.0: what overlap can buy a decode step; the tails split by unit (2026-10-29, card 1)
+
+H4 ([Bible §13](dataflow-compiler.md#13-hypotheses-register), [plan](../plans/dataflow-compiler.md) F4a): with
+per-edge credits and data-independent reads started as units free up, the 1.7B decode step reads ≥ 400 GB/s and takes
+≤ 9.5 ms on the card (from 328 and 10.9). Sparse waits alone had been measured at 0.070 ms
+([which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0)), so F4a opened by
+bounding the overlap before building anything. SmolLM2-1.7B-Instruct, BF16 weights, `TT_TILES=all`, 512-position
+cache, release, safe image, card 1, `silicon_bench_models::traced_generation_stream_ceiling` (9 samples, medians).
+
+**Baseline at `9977ad8`:** `Step(64)` 10.91 ms on the card, 3,567 MB at 327 GB/s (profile `1793309460`); host-timed
+11.37 / 12.71 ms at 32 / 256 tokens (`1793310992`). The products' reads by eighth of their spans: 581 471 404 342 300 282
+197 68 GB/s; the products' slowest units spend 6.8 of 7.5 ms pushing into a full FIFO.
+
+**The tails split by unit** (the profile mode's new `tails.tsv` and summary table: each eighth's bytes by the op's own
+units and by units reading ahead, and the op's own units still at work; profile `1793310239`):
+
+| `float_matmul`, 96 ops | eighths 1-8 |
+|---|---|
+| own units' GB/s | 462 399 357 337 299 282 198 69 |
+| units reading ahead, GB/s | 119 72 47 5 0 0 0 0 |
+| own units at work (mean an op) | 92.0 91.8 83.0 72.6 61.8 55.2 45.5 20.0 |
+
+In a product's last eighths ~70 of its units have arrived at its barrier and read nothing: each unit's next list
+(`BUSY_PREFETCH`) sits after its arrival (`busy_start` places it at the stream length after the product, its arrival
+included), and the idle units' read ahead is done by the fourth eighth. Capacity unused in tails (512 GB/s less what
+was read, in the eighths after the first unit arrives): **2.45 ms a step**, 2.14 of it the products'.
+
+**The bound:**
+- With every weight read made free (`TT_PROBE_STREAM=skip`, products read no `B`, nothing prefetches) the step takes
+  **5.33 / 6.44 ms** (`1793311234`): a decode product is bound by its weights' reads, not its math (the full FIFO waits
+  on data). The weights' own floor is 3,567 MB at 469 GB/s, 7.61 ms.
+- Reads under the small ops cost them ~3% today: RMSNorm 781.8 us with reads ahead under it against 755.8 with none
+  (profile `1793311447`), not the 1.34-1.61x of 2026-10-20 (before the stream's cap and NC's drain were fixed).
+- (c) ≈ 2.45 - 0.08 ≈ **2.4 ms**: H4's kill (< 0.3 ms) does not fire.
+
+## F4a.2: a product's units read the next weights before their arrival (2026-10-29, cards 0 and 1)
+
+B pumps a prefetch's reads in every barrier wait loop (`mover::barrier`, `pump(PUMP_TURN)`), and each pair ends with
+NC done (`finish_pair`), so a `GATHER_PREFETCH` list placed just before a unit's arrival at a product's barrier reads
+the next product's `B` in the product's tail, with the barrier kept and no firmware change
+(`Session::set_read_ahead_early`, `TT_READ_AHEAD_EARLY`). It moves only where no other unit of the product touches the
+L1 the list's reads land in (`barriers::landing`, `barriers::others_touch_l1`). Gates: `step216`
+`a_products_units_read_their_b_before_the_product_befores_barrier` (ttsim and card 0, `1793314444`), and with it on
+`step188_smollm2_1_7b::traced_generation_equals_the_eager_one` (`1793314453`), `step219` 11 of 11, `step187` 10 of 10.
+
+| 1.7B decode step, host-timed, ms (32 / 256 tokens) | off | on |
+|---|--:|--:|
+| first check: refused wherever a peer touched L1 above the ring's base (744 of 5,568 lists moved) | 11.33 / 12.72, 11.35 / 12.62 | 11.22 / 12.45, 11.34 / 12.53 |
+| the check on the lists' own extent (5,568 of 5,568 moved) | 11.31 / 12.66, 11.33 / 12.71 | **10.95 / 12.15, 10.95 / 12.16** |
+| idle units' lists moved too | 11.34 / 12.65, 11.36 / 12.74 | 12.01 / 13.09, 11.96 / 13.08 |
+
+Runs, ABBA: `1793312690`-`1793313425`; `1793314450`, `1793314684`, `1793314937`, `1793315189`; `1793316239`,
+`1793316482`, `1793316742`, `1793317000`. The first check's refusals were the capture's residency region (the products'
+outputs written into their readers' L1 above `DATA`), above the ring's base but not in the ring.
+
+- **Busy lists early:** 0.37 / 0.53 ms a step, bit for bit. Profile (`1793315450`): `Step(64)` 10.91 -> **10.53 ms** on
+  the card, 327 -> **340 GB/s**; the products' eighths 476 385 359 365 369 365 362 296 GB/s; tail slack 2.45 -> 1.27
+  ms; the small ops 2.50 -> 2.28 ms (the reads that ran under them now run in the tails). **The default since
+  2026-10-29** (owner: default where it gains at real model sizes).
+- **Idle units' lists early: refuted, reverted.** A unit idle since its own anchor product had its `PREFETCH` list moved
+  before its arrival there too: 0.6 ms slower. Those lists are plain `GATHER`s (`tile_op::matmul`, `take_reads(.., false)`)
+  that B runs in line, so before an arrival they hold the product's barrier for every unit; after it, they run under
+  the ops between.
+- **SmolLM2-135M** (card 1, ABBA `1793317320`-`1793317484`): 6.99 / 8.16, 6.98 / 8.18 off; 7.00 / 8.20, 6.95 / 8.22 on:
+  even at 32 tokens, ~0.04 ms slower at 256. Too little moves for its tails to pay.
+- H4 is not met yet (10.53 ms on the card against ≤ 9.5, 340 GB/s against ≥ 400). What is left in the tails, 1.27 ms,
+  is what F4a.1 (credits in place of barriers) and the idle units' reads (pumped, not in line) can still take.
 
 ## F4b.2: a block measured on the card, `A` pulled where it gains (2026-10-29, card 1)
 

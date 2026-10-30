@@ -570,6 +570,9 @@ pub struct UnitReads {
     /// Its barriers' releases: `(the trace's barrier it waited for, when)`. An arrival waits for
     /// its own; a wait standing for `n` waits for the last of them.
     pub releases: Vec<(u32, u64)>,
+    /// Its arrivals: `(the op it ran a share of, when it arrived at the op's barrier)`, the end of
+    /// its work there.
+    pub arrivals: Vec<(u32, u64)>,
     /// When the replay began (its outermost list), for its first op.
     pub begin: u64,
 }
@@ -595,7 +598,7 @@ pub fn unit_reads(
         ..Default::default()
     };
     let mut last_mark = None;
-    let mut ends = Vec::new();
+    let (mut begins, mut ends) = (Vec::new(), Vec::new());
     for &(event, t) in &stamps[start..] {
         match event {
             Event::ReadBytes { bytes } => {
@@ -605,21 +608,45 @@ pub fn unit_reads(
                 last_mark = Some(t);
             }
             Event::Entry {
-                begin: false,
+                begin,
                 op: op::BARRIER,
-            } => ends.push(t),
+            } => {
+                if begin {
+                    begins.push(t);
+                } else {
+                    ends.push(t);
+                }
+            }
             _ => {}
         }
     }
-    let mut ends = ends.into_iter();
+    let (mut begins, mut ends) = (begins.into_iter(), ends.into_iter());
     let mut count = 0u32;
     for b in seq {
         if hi == 0 || (lo <= count && count < hi) {
+            let arrive = begins.next()?;
             out.releases.push((count + b.counts - 1, ends.next()?));
+            if let Some(k) = b.arrival_of {
+                out.arrivals.push((k, arrive));
+            }
         }
         count += b.counts;
     }
-    ends.next().is_none().then_some(out)
+    (begins.next().is_none() && ends.next().is_none()).then_some(out)
+}
+
+/// The card's GDDR reads in one op's span on unit 0, in [`READ_BINS`] equal parts of it
+/// ([`card_reads`]): who issued them, and how many of the op's own units were still working.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadBins {
+    /// Every unit's bytes.
+    pub all: [u64; READ_BINS],
+    /// Of `all`, the bytes of units that ran a share of the op (arrived at its barrier): its own
+    /// reads. The rest is units reading ahead for later ops.
+    pub own: [u64; READ_BINS],
+    /// The op's own units whose arrival lies past the part's start: still at work in it. A
+    /// product's tail is the parts where few are.
+    pub working: [u16; READ_BINS],
 }
 
 /// The card's GDDR reads in one replay: each unit's [`UnitReads`] (by unit, `None` where unknown)
@@ -633,7 +660,7 @@ pub fn card_reads(
     seq0: &[UnitBarrier],
     first: usize,
     lo: u32,
-) -> Vec<(usize, [u64; READ_BINS])> {
+) -> Vec<(usize, ReadBins)> {
     let Some(Some(u0)) = units.first() else {
         return Vec::new();
     };
@@ -662,8 +689,10 @@ pub fn card_reads(
             spans.push((k, begin as i64, end as i64));
         }
     }
-    let mut out: Vec<(usize, [u64; READ_BINS])> =
-        spans.iter().map(|&(k, ..)| (k, [0; READ_BINS])).collect();
+    let mut out: Vec<(usize, ReadBins)> = spans
+        .iter()
+        .map(|&(k, ..)| (k, ReadBins::default()))
+        .collect();
     for u in units.iter().flatten() {
         let mut offsets: Vec<i64> = u
             .releases
@@ -675,14 +704,27 @@ pub fn card_reads(
         }
         offsets.sort_unstable();
         let offset = offsets[offsets.len() / 2];
-        for &(from, to, bytes) in &u.spans {
-            let (a, b) = ((from as i64 - offset) as f64, (to as i64 - offset) as f64);
-            for (&(_, begin, end), (_, bins)) in spans.iter().zip(out.iter_mut()) {
+        let arrivals: BTreeMap<usize, i64> = u
+            .arrivals
+            .iter()
+            .map(|&(k, t)| (k as usize, t as i64 - offset))
+            .collect();
+        for (&(k, begin, end), (_, bins)) in spans.iter().zip(out.iter_mut()) {
+            let width = (end - begin).max(1) as f64 / READ_BINS as f64;
+            let own = arrivals.get(&k).copied();
+            if let Some(arrive) = own {
+                for (i, n) in bins.working.iter_mut().enumerate() {
+                    if arrive as f64 > begin as f64 + i as f64 * width {
+                        *n += 1;
+                    }
+                }
+            }
+            for &(from, to, bytes) in &u.spans {
+                let (a, b) = ((from as i64 - offset) as f64, (to as i64 - offset) as f64);
                 if b < begin as f64 || a > end as f64 {
                     continue;
                 }
-                let width = (end - begin).max(1) as f64 / READ_BINS as f64;
-                for (i, bin) in bins.iter_mut().enumerate() {
+                for i in 0..READ_BINS {
                     let lo = begin as f64 + i as f64 * width;
                     let hi = lo + width;
                     let share = if b > a {
@@ -692,7 +734,11 @@ pub fn card_reads(
                     } else {
                         0.0
                     };
-                    *bin += (bytes as f64 * share).round() as u64;
+                    let part = (bytes as f64 * share).round() as u64;
+                    bins.all[i] += part;
+                    if own.is_some() {
+                        bins.own[i] += part;
+                    }
                 }
             }
         }
@@ -789,8 +835,8 @@ pub struct TraceSamples {
     /// replays that stamped it (`samples[k].len()` of them).
     pub entries: Vec<EntryCosts>,
     /// Per op, once per replay that stamped it, the GDDR bytes every unit's B issued in each of
-    /// [`READ_BINS`] equal parts of the op's span on unit 0 ([`card_reads`]).
-    pub reads: Vec<Vec<[u64; READ_BINS]>>,
+    /// [`READ_BINS`] equal parts of the op's span on unit 0, and whose ([`card_reads`]).
+    pub reads: Vec<Vec<ReadBins>>,
     /// Per unit, its barriers in stream order (empty where unknown).
     unit_barriers: Vec<Vec<UnitBarrier>>,
     pub replays: u32,
@@ -1128,11 +1174,19 @@ impl TraceSamples {
     /// Per op, the card's reads in its span ([`TraceSamples::reads`]) from the replay with the
     /// median total, or `None` for an op none measured.
     pub fn read_medians(&self) -> Vec<Option<[u64; READ_BINS]>> {
+        self.read_bin_medians()
+            .into_iter()
+            .map(|r| r.map(|r| r.all))
+            .collect()
+    }
+
+    /// [`TraceSamples::read_medians`] with who issued the reads and the op's units at work.
+    pub fn read_bin_medians(&self) -> Vec<Option<ReadBins>> {
         self.reads
             .iter()
             .map(|s| {
                 let mut s = s.clone();
-                s.sort_by_key(|b| b.iter().sum::<u64>());
+                s.sort_by_key(|b| b.all.iter().sum::<u64>());
                 s.get(s.len() / 2).copied()
             })
             .collect()
@@ -1547,6 +1601,105 @@ impl ProfileReport {
         }
     }
 
+    /// Each measured op's median span, its read bins and its own units, with the bins' width in
+    /// microseconds: what [`ProfileReport::tails_table`] and [`ProfileReport::tails_tsv`] read.
+    fn read_bins<'a>(
+        &self,
+        t: &'a TraceSamples,
+        medians: &[Option<OpTime>],
+    ) -> Vec<(usize, &'a OpInfo, f64, ReadBins)> {
+        t.ops
+            .iter()
+            .zip(medians)
+            .zip(t.read_bin_medians())
+            .enumerate()
+            .filter_map(|(k, ((o, m), r))| {
+                Some((k, o, self.us(m.as_ref()?.span) / READ_BINS as f64, r?))
+            })
+            .collect()
+    }
+
+    /// The card's read capacity left unused, in microseconds of [`CARD_READ_GBPS`], in a part of an
+    /// op's span where some of its own units have already arrived at its barrier (its tail): the
+    /// most a unit freed there could buy by reading later ops' bytes ahead, if nothing else bound
+    /// them. Zero outside the tail.
+    fn tail_slack(r: &ReadBins, i: usize, part: f64) -> f64 {
+        if r.working[i] >= r.working[0] {
+            return 0.0;
+        }
+        part * (1.0 - gbps(r.all[i], part) / CARD_READ_GBPS).max(0.0)
+    }
+
+    /// A trace's product tails ([`ReadBins`]): by label, the GDDR rate in eighths of the span split
+    /// into the op's own units and units reading ahead, its own units still at work, and the
+    /// capacity unused while some of them wait at its barrier ([`ProfileReport::tail_slack`]).
+    /// Their sum is an upper bound on what starting freed units' reads early could save (H4).
+    fn tails_table(&self, out: &mut String, t: &TraceSamples, medians: &[Option<OpTime>]) {
+        let measured = self.read_bins(t, medians);
+        if measured.is_empty() {
+            return;
+        }
+        #[derive(Default)]
+        struct Label {
+            ops: u64,
+            part: f64,
+            all: [u64; READ_BINS],
+            own: [u64; READ_BINS],
+            working: [u64; READ_BINS],
+            slack: f64,
+        }
+        let mut labels: BTreeMap<&str, Label> = BTreeMap::new();
+        let mut slack = 0.0;
+        for (_, o, part, r) in &measured {
+            let l = labels.entry(o.label).or_default();
+            l.ops += 1;
+            l.part += part;
+            for i in 0..READ_BINS {
+                l.all[i] += r.all[i];
+                l.own[i] += r.own[i];
+                l.working[i] += u64::from(r.working[i]);
+                let s = Self::tail_slack(r, i, *part);
+                l.slack += s;
+                slack += s;
+            }
+        }
+        let _ = writeln!(
+            out,
+            "\nTails (each op's eighths: GB/s of its own units, the units that ran a share of it, and \
+             of units reading ahead for later ops; its own units still at work, a mean an op; and the \
+             card's capacity at {CARD_READ_GBPS} GB/s left unused in the eighths after its first unit \
+             arrived): **{:.1} us unused in tails a replay**, an upper bound on what reading ahead \
+             from freed units could save.\n\n\
+             | label | ops | tail slack us | own GB/s by eighth | ahead GB/s by eighth | \
+             own units at work by eighth |\n|---|--:|--:|---|---|---|",
+            slack
+        );
+        let mut labels: Vec<_> = labels.into_iter().collect();
+        labels.sort_by(|a, b| b.1.slack.total_cmp(&a.1.slack));
+        for (label, l) in labels {
+            let row = |v: &[u64; READ_BINS], f: &dyn Fn(u64) -> String| {
+                v.iter().map(|&x| f(x)).collect::<Vec<_>>().join(" ")
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {:.1} | {} | {} | {} |",
+                if label.is_empty() {
+                    "(unlabelled)"
+                } else {
+                    label
+                },
+                l.ops,
+                l.slack,
+                row(&l.own, &|b| format!("{:.0}", gbps(b, l.part))),
+                row(&std::array::from_fn(|i| l.all[i] - l.own[i]), &|b| format!(
+                    "{:.0}",
+                    gbps(b, l.part)
+                )),
+                row(&l.working, &|n| format!("{:.1}", n as f64 / l.ops as f64)),
+            );
+        }
+    }
+
     /// A trace's math role against its units' work, by label: per op, the slowest unit's work, and
     /// its math role's pushing and its waits after pushing for the coprocessor
     /// ([`ProfileOptions::push`]). A label whose pushing is most of its work, with little drain, is
@@ -1660,6 +1813,35 @@ impl ProfileReport {
                         self.us(m.push),
                         self.us(m.drain),
                         m.words,
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Every measured trace op's reads in each eighth of its span, one line an eighth, tab-separated
+    /// ([`ReadBins`]): the rate of its own units and of units reading ahead, its own units still at
+    /// work, and the capacity left unused in its tail ([`ProfileReport::tail_slack`]).
+    pub fn tails_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
+        let mut out = String::from(
+            "source\tindex\tlabel\twhat\tunits\teighth\tpart_us\tall_gbps\town_gbps\tahead_gbps\tworking\tslack_us\n",
+        );
+        for (&id, t) in &self.traces {
+            let source = name(id);
+            for (k, o, part, r) in self.read_bins(t, &t.medians()) {
+                for i in 0..READ_BINS {
+                    let _ = writeln!(
+                        out,
+                        "{source}\t{k}\t{}\t{}\t{}\t{i}\t{part:.3}\t{:.1}\t{:.1}\t{:.1}\t{}\t{:.3}",
+                        o.label,
+                        o.what,
+                        o.units,
+                        gbps(r.all[i], part),
+                        gbps(r.own[i], part),
+                        gbps(r.all[i] - r.own[i], part),
+                        r.working[i],
+                        Self::tail_slack(&r, i, part),
                     );
                 }
             }
@@ -1792,6 +1974,7 @@ impl ProfileReport {
             self.label_table(&mut out, &rows, "ops");
             self.bytes_tables(&mut out, t, &medians);
             self.reads_table(&mut out, t, &medians);
+            self.tails_table(&mut out, t, &medians);
             self.skew_table(&mut out, t);
             self.push_table(&mut out, t);
             let mut top: Vec<(usize, &OpTime)> = medians
@@ -2226,13 +2409,22 @@ mod tests {
             "a wait releases at its last barrier"
         );
 
+        assert_eq!(r0.arrivals, vec![(0, 140), (1, 240)]);
+        assert!(r1.arrivals.is_empty(), "a wait is no arrival");
+
         let got = card_reads(&[Some(r0), Some(r1)], &seq0, 0, 0);
         let b = 4000 / 64 * 64;
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, 0);
         // 6.25 cycles an eighth of op 0: six whole eighths at 100 B a cycle, then 2.5 cycles.
         let part = b as f64 * 6.25 / 40.0;
-        for (i, &v) in got[0].1.iter().enumerate() {
+        assert_eq!(
+            got[0].1.own, got[0].1.all,
+            "op 0's reads are its own unit's"
+        );
+        // Unit 0 arrives at 140, in op 0's seventh eighth (137.5..143.75).
+        assert_eq!(got[0].1.working, [1, 1, 1, 1, 1, 1, 1, 0]);
+        for (i, &v) in got[0].1.all.iter().enumerate() {
             let want = match i {
                 0..=5 => part,
                 6 => b as f64 * 2.5 / 40.0,
@@ -2244,10 +2436,31 @@ mod tests {
             );
         }
         // Unit 1's prefetch, moved onto unit 0's clock, is the first half of op 1.
-        assert_eq!(got[1], (1, [2000, 2000, 2000, 2000, 0, 0, 0, 0]));
+        assert_eq!(got[1].0, 1);
+        assert_eq!(got[1].1.all, [2000, 2000, 2000, 2000, 0, 0, 0, 0]);
+        assert_eq!(got[1].1.own, [0; READ_BINS], "a prefetch is not op 1's own");
+        // Unit 0 arrives at 240, in op 1's last eighth (237.5..250).
+        assert_eq!(got[1].1.working, [1; READ_BINS]);
 
         // Stamps that do not line up with the stream are refused.
         assert_eq!(unit_reads(&u0, &seq0[..1], 0, 0), None);
+    }
+
+    #[test]
+    fn a_tails_slack_is_the_capacity_unused_after_the_first_unit_arrives() {
+        // Four units: all at work for four eighths, then two, then one. An eighth of 10 us.
+        let mut r = ReadBins {
+            working: [4, 4, 4, 4, 2, 2, 1, 1],
+            ..Default::default()
+        };
+        let full = (CARD_READ_GBPS * 10.0 * 1e3) as u64;
+        r.all = [full, full, 0, 0, full / 2, full, 0, full * 2];
+        let slack: Vec<f64> = (0..READ_BINS)
+            .map(|i| ProfileReport::tail_slack(&r, i, 10.0))
+            .collect();
+        // Nothing before a unit has arrived, however little is read; half an eighth at half the
+        // rate; none at or above it.
+        assert_eq!(slack, [0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 10.0, 0.0]);
     }
 
     #[test]

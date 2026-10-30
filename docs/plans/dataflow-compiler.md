@@ -352,7 +352,7 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
     `B` ≥ 95% of the ceiling.
   - Found: `[2048,8192]@[8192,2048]` runs at 10.9-11.0 TFLOPS through Burn (80 units) against 18.5 through the
     session in the probe. Open, not F4b's.
-- [ ] **F4b.1, D5's schemes inside the product** (owner, 2026-10-28: prototypes in the product, measured by
+- [x] **F4b.1, D5's schemes inside the product** (owner, 2026-10-28: prototypes in the product, measured by
   `matmul_throughput`, in place of a synthetic delivery probe).
   - [x] **Pull** (`TT_OPERAND_REUSE=pull:<h>`, 2026-10-28): the shared deal (`distribute::Shared`), the pass
     (`tile_op::reuse::pull`), the fixed credit words (`tt_isa::dm::CREDITS`, zeroed at mover start, each owner returns
@@ -360,7 +360,7 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
     (ttsim; card 0 `1793226376`); model test `tile_op::reuse::tests` (random interleavings, a negative control).
     H1's shape on card 1: 19.1 -> **25.98 TFLOPS** at four holders a group, reads 2,062 -> 1,346 MB (`1793228872`;
     [log](../learnings/performance-log.md#f4b1-a-pulled-from-a-few-holders-the-first-measured-scheme-of-d5-2026-10-28-cards-0-and-1)).
-  - [ ] `B` shared too (a `GATHER` that skips `B`: a firmware flag), for the reads clause.
+  - [x] `B` shared too (a `GATHER` that skips `B`: a firmware flag), for the reads clause (built; kept opt-in).
     `TT_OPERAND_REUSE=pull:<h>,<hb>`: `record::GATHER_B_RESIDENT` (bit 2, reclaimed from the
     retired packed BF16), a column group a member index of equal-sized row groups
     (`distribute::Shared::b_holder_of`), and the pass run once an operand in credit words 3-5
@@ -380,7 +380,7 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
       product (none at H1's 120 over 8 rows). They could run data-independent work meanwhile, but
       every op ends in a barrier across all units, and the credit words' return to zero relies on
       it, so that needs F4a's channels in place of barriers (or F6's disjoint core sets).
-  - [ ] Multicast: one sender a row rectangle (NC `WRITE_L1_MCAST`, a multicast ready word), against pull.
+  - [-] Multicast: one sender a row rectangle (NC `WRITE_L1_MCAST`, a multicast ready word), against pull.
     **Deferred, not refuted (owner, 2026-10-29): revisit when hunting performance.** Not built; the analysis:
     - A multicast reaches a rectangle of Tensix tiles that excludes its sender (`channel::Ring` refuses otherwise),
       and path-reserved multicasts sharing a rectangle serialize (Bible T7), so the safe form is one sender a
@@ -489,11 +489,66 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
   The kill did not fire: where reads dropped (`A` pulled), TFLOPS rose. For a packed `B` the 95% clause holds at the
   default block (`pull:4` 26.56-26.67 of 28.0) and was the wrong ceiling: the block, not reads, binds (up to 45.8).
 
+**Closed 2026-10-29.** Carried to the roadmap as "F4b's leftovers": the pull in the batched block-stream path, and the
+eager product's 3-10% host time after a pulled capture.
+
 ## Stage F4a (decode): channels instead of barriers, H4
 
-- [ ] Derive per-edge channels from the residency plan (`residency.rs`, `Applied::rewrite`) and barrier analysis (`tt_kernels::barriers::analyse`). Keep barriers only where no channel can express the dependency (Bible §7).
-- [ ] Let units that finish their share start data-independent reads (the next product's weights) at once.
-- [ ] Re-measure the three opt-in decode schedules F3.8 ports, with the dataflow approach (owner, 2026-10-28). Each was
+**Opened 2026-10-29 at `9977ad8`.** Sparse waits alone were measured as worth 0.070 ms on the 1.7B
+([decode-small-ops.md](decode-small-ops.md) A0, A2 not built): a product's consumers need most of its units, so the time
+at its barrier is its slowest unit's work (T10). H4's gain has to come from overlap, units that leave a product early
+reading the next product's weights in its tail, so the stage bounds that before building anything (owner, 2026-10-29).
+If the bound fires the kill, H4 is refuted, the three schedules below stay opt-in, and the stage stops.
+
+- [ ] **F4a.0, the baseline and the overlap bound** (card 1, at the starting commit).
+  - H4's baseline (Stage 0's open item): `TT_TILES=all cargo xtask bench --profile --device 1 --filter
+    silicon_bench_models::traced_generation_stream_ceiling`, and the same without `--profile` for the host-timed step.
+  - The tail split by unit, in the profile mode (`tails.tsv`): each eighth of an op's span, its bytes read by the op's
+    own units, by units reading ahead, and by the rest.
+  - The overlap bound, in the profile mode (`overlap.tsv`): each (op, unit) at its measured work, started (a) when the
+    units it depends on are done; (b) as (a), and each unit's next reads ahead start when its own work ends, at the
+    rate the card has left (469 GB/s less what the tail reads) and within its L1 room; (c) as (b), with the small ops
+    under reads ahead charged T8's measured slowdown.
+  - *Kill before the build:* (c) saves < 0.3 ms a step.
+  - **Result (2026-10-29, card 1, at `9977ad8`): the kill does not fire**
+    ([log](../learnings/performance-log.md#f4a0-what-overlap-can-buy-a-decode-step-the-tails-split-by-unit-2026-10-29-card-1)).
+    - Baseline: `Step(64)` 10.91 ms on the card at 327 GB/s (`1793309460`), host-timed 11.37 / 12.71 ms at 32 / 256
+      tokens (`1793310992`). The products' reads by eighth: 581 471 404 342 300 282 197 68 GB/s.
+    - The tails (`tails.tsv`, `1793310239`): a product's own units still at work fall 92 -> 20 by its last eighth, and
+      the units reading ahead stop by its fourth (119 72 47 5 0 0 0 0 GB/s). In the tail about 70 freed units read
+      nothing: each unit's next list (`BUSY_PREFETCH`) sits after its own arrival at the product's barrier
+      (`busy_start` places it at the stream length after the product, barrier included).
+    - The bound: (b) 2.45 ms of the card's capacity unused in tails a step (2.14 of it the products'); the step with
+      every weight read made free (`TT_PROBE_STREAM=skip`) 5.33 / 6.44 ms (`1793311234`), so the products are bound by
+      their weights, not their math; the reads' own floor (3,567 MB at 469 GB/s) 7.61 ms. (c): reads under the small
+      ops cost them ~3% today (RMSNorm 781.8 against 755.8 us with no reads, `1793311447`), so (c) ≈ 2.4 ms.
+    - Consequence for the order: the overlap needs no channel. B pumps a prefetch's reads while it waits at a
+      barrier (`mover::barrier`), so a list moved to before the unit's arrival reads in the product's tail with the
+      barrier kept. F4a.2's second item is built first, as the cheapest test of H4's mechanism.
+- [ ] **F4a.1, edge credits in place of kept barriers** (only if F4a.0 clears the kill). Derive per-edge channels
+  from the barrier analysis (`tt_kernels::barriers::analyse`, whose `deps` are per edge over every address space, the
+  residency plan's L1 moves included). Keep barriers only where no channel can express the dependency, or where a
+  barrier is the cheaper lowering of an all-to-all edge (Bible §7). Stored streams only, as `prune`.
+- [ ] **F4a.2, reads ahead started by edges, not anchors:** units that finish their share start data-independent reads
+  (the next product's weights) at once.
+  - [x] **A product's units, before their arrival** (2026-10-29, cards 0 and 1;
+    [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1)).
+    `Session::set_read_ahead_early` (`TT_READ_AHEAD_EARLY=0` off): a unit's `BUSY_PREFETCH` list moves to just before
+    its arrival at the product's barrier, the barrier kept, where no other unit of the product touches the L1 its
+    reads land in (`barriers::landing`, `barriers::others_touch_l1`; `Capture::move_block` lets the op hold it). B
+    pumps it while it waits. 1.7B step 11.32 / 12.69 -> **10.95 / 12.16 ms** at 32 / 256 tokens on card 1, bit for
+    bit; `Step(64)` 10.53 ms on the card at 340 GB/s, tail slack 2.45 -> 1.27 ms; the 135M within 0.04 ms. **The
+    default** (owner, 2026-10-29: where it gains at real model sizes). Gates: `step216`, and with it on `step188`,
+    `step187`, `step205`, `step219` on card 0. Closing checks with it the default: `--smoke` on card 0 passes 1,265 of
+    1,265 (`1793318048`), `step12_mnist` 8 of 8 with its goldens unchanged (`1793319760`).
+  - Found on the way and fixed: `silicon_profile_mode`'s chain gates (not in `--smoke`; `--feature profile`) failed
+    since barrier pruning (2026-10-26) stored their 600-op chain as one op; they keep its barriers now (card 0
+    `1793317798`, 4 of 4).
+  - [x] *Idle units' lists before their arrival: refuted, reverted.* 0.6 ms slower: an idle unit's `PREFETCH` list is
+    plain `GATHER`s that B runs in line, so before an arrival it holds the product's barrier.
+  - [ ] Idle units' lists pumped (`GATHER_PREFETCH`, the job waiting for them), so they too can start before an arrival.
+  - [ ] What is left in the tails, 1.27 ms a step: F4a.1's credits, the lists' L1 room (one job's `B` a unit).
+- [ ] **F4a.3,** re-measure the three opt-in decode schedules F3.8 ports, with the dataflow approach (owner, 2026-10-28). Each was
   bit for bit but not faster with a barrier between its ops:
   - the K-chain handoff (`TT_STREAM_HANDOFF`, slower: `1792685519`, `1792686180`), which takes a remote `CREDIT` in
     place of its second op and that op's barrier;

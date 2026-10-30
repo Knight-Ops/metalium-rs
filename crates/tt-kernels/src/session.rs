@@ -396,6 +396,39 @@ fn busy_start(
         .fold(own, usize::max)
 }
 
+/// Where unit `u`'s list read ahead, `list` (its entries), bound for `to` in its stream, goes under
+/// [`Session::set_read_ahead_early`]: to just before the unit's arrival at the barrier of the op
+/// that ends at `to`, if that is the entry before `to` and no other unit of that op touches the L1
+/// the list's reads land in (`barriers::landing`, `barriers::others_touch_l1`); otherwise `to`.
+fn early_start(
+    capture: &trace::Capture,
+    u: usize,
+    list: &[[u32; 8]],
+    to: usize,
+    coords: &[(u8, u8)],
+) -> usize {
+    let stream = &capture.units[u].stream;
+    // An arrival, not a wait for a barrier the unit sat out.
+    let arrival = |e: &[u32; 8]| e[0] == tt_isa::dm::op::BARRIER && e[4] == 0;
+    let Some(at) = to.checked_sub(1).filter(|&at| arrival(&stream[at])) else {
+        return to;
+    };
+    let Some(k) = capture
+        .ops
+        .iter()
+        .position(|op| op.entries[u].start < to && op.entries[u].end == to)
+    else {
+        return to;
+    };
+    let Some(ring) = crate::barriers::landing(list) else {
+        return to;
+    };
+    if crate::barriers::others_touch_l1(capture, k, u, ring.clone(), coords) {
+        return to;
+    }
+    at
+}
+
 /// The tiles a [`ProbeBackground`] unit reads a `READ_RUN`: 532 KB of `DATA`'s top.
 const PROBE_BACKGROUND_WINDOW: usize = 128;
 
@@ -814,6 +847,8 @@ pub struct Session<T: Transport> {
     prefetch_anchor: Vec<Option<u32>>,
     /// [`Session::set_busy_prefetch`].
     busy_prefetch: bool,
+    /// [`Session::set_read_ahead_early`].
+    read_ahead_early: bool,
     /// While a product with `BUSY_PREFETCH` lists is queued in a capture: each unit's stream
     /// length after the last weight-streaming product, and after its own anchor
     /// ([`PrefetchAnchor`]), between which its list moves (`enqueue_work`), and the lists queued
@@ -2737,6 +2772,10 @@ impl<T: Transport> Session<T> {
             // (`docs/plans/planned-l1-residency.md` 3b): a 1.7B step 19.51 -> 18.40 ms at the
             // prefetch cap of 2 (`dm::PREFETCH_CAP_DEFAULT`), nothing measured slower.
             busy_prefetch: std::env::var("TT_BUSY_PREFETCH").map_or(true, |v| v != "0"),
+            // On by default since 2026-10-29 (`docs/plans/dataflow-compiler.md` F4a.2): a 1.7B step
+            // 11.32 / 12.69 -> 10.95 / 12.16 ms at 32 / 256 tokens on card 1, bit for bit;
+            // `TT_READ_AHEAD_EARLY=0` turns it off.
+            read_ahead_early: std::env::var("TT_READ_AHEAD_EARLY").map_or(true, |v| v != "0"),
             busy_anchor: None,
             busy_moves: Vec::new(),
             prefetch_lists: Vec::new(),
@@ -4815,9 +4854,20 @@ impl<T: Transport> Session<T> {
             // as the ops between leave its ring alone ([`busy_start`]): a replay reads that `B`
             // under the ops between.
             if let Some((lens, own)) = &self.busy_anchor {
+                let coords: Vec<(u8, u8)> = if self.read_ahead_early {
+                    self.units
+                        .iter()
+                        .map(|u| (u.tile.x(), u.tile.y()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 for (u, block) in std::mem::take(&mut self.busy_moves) {
                     let len = block.len();
-                    let to = busy_start(c, u, &block, own[u], lens[u]);
+                    let mut to = busy_start(c, u, &block, own[u], lens[u]);
+                    if self.read_ahead_early {
+                        to = early_start(c, u, &c.units[u].stream[block.clone()], to, &coords);
+                    }
                     c.move_block(u, block, to);
                     let op = c.ops.last_mut().expect("the op just recorded");
                     op.ahead.push((u, to..to + len));
@@ -6085,10 +6135,40 @@ impl<T: Transport> Session<T> {
         // In the profile mode, what each op moves through GDDR: its records expanded on the host,
         // as the movers expand them. The streams are not kept once stored.
         if self.profiler.is_some() || self.count_trace_bytes {
-            for op in &mut ops {
+            // Lists read ahead that lie inside another op's entries (a list moved to before a
+            // unit's arrival, `Session::set_read_ahead_early`): their op's, not the holder's.
+            let moved: Vec<(usize, usize, core::ops::Range<usize>)> = ops
+                .iter()
+                .enumerate()
+                .flat_map(|(k, op)| {
+                    op.ahead
+                        .iter()
+                        .filter(|(u, r)| {
+                            let own = &op.entries[*u];
+                            !(own.start <= r.start && r.end <= own.end)
+                        })
+                        .map(move |(u, r)| (k, *u, r.clone()))
+                })
+                .collect();
+            for (k, op) in ops.iter_mut().enumerate() {
                 let mut per_unit = vec![crate::profile_mode::OpBytes::default(); units.len()];
-                for ((uc, range), own) in units.iter().zip(&op.entries).zip(&mut per_unit) {
-                    op_bytes(uc, range.clone(), own);
+                for (u, ((uc, range), own)) in
+                    units.iter().zip(&op.entries).zip(&mut per_unit).enumerate()
+                {
+                    let mut holes: Vec<&core::ops::Range<usize>> = moved
+                        .iter()
+                        .filter(|(j, v, r)| {
+                            *j != k && *v == u && range.start <= r.start && r.end <= range.end
+                        })
+                        .map(|(.., r)| r)
+                        .collect();
+                    holes.sort_by_key(|r| r.start);
+                    let mut from = range.start;
+                    for r in holes {
+                        op_bytes(uc, from..r.start, own);
+                        from = r.end;
+                    }
+                    op_bytes(uc, from..range.end, own);
                 }
                 // What its lists read ahead is its own too: counted again only where a list
                 // lies outside its entries (moved to before the ops it runs under).
@@ -9691,6 +9771,17 @@ impl<T: Transport> Session<T> {
     /// them before its kernel (`tensor::BUSY_PREFETCH`). Off, those units read `B` in the job.
     pub fn set_busy_prefetch(&mut self, on: bool) {
         self.busy_prefetch = on;
+    }
+
+    /// Whether, in a capture, a unit's `BUSY_PREFETCH` list that lands right after its arrival at
+    /// a product's barrier ([`Session::set_busy_prefetch`]) moves to just before it, so the unit
+    /// reads the next product's `B` as soon as its own share is done, in the product's tail, and
+    /// not when its slowest unit is (on by default; `TT_READ_AHEAD_EARLY=0` turns it off;
+    /// `docs/plans/dataflow-compiler.md` F4a.2, H4). B pumps the list's reads while it waits at the barrier. Its own share has
+    /// landed by then (each pair ends with NC done), so it moves only where no other unit of the
+    /// product touches the L1 the list's reads land in (`barriers::others_touch_l1`).
+    pub fn set_read_ahead_early(&mut self, on: bool) {
+        self.read_ahead_early = on;
     }
 
     /// Whether a capture plans into the trace arena (`tt_isa::l1::TRACE_ARENA`: `DATA`, the 88 KiB

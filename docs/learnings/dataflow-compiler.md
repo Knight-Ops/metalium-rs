@@ -496,6 +496,15 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
   - *Prediction:* ≥ 400 GB/s average and step ≤ 9.5 ms (from 10.9), bit-exact.
   - *Measured by:* the profile's card read meter.
   - *Kills it:* the step moves < 0.3 ms, or small ops slow by as much as the products gain (the one-queue effect, T8).
+  - *Opened 2026-10-29 at `9977ad8`* (F4a). Sparse waits alone were worth 0.070 ms (T10), so the gain is overlap, and
+    F4a.0 bounds it on card 1 before any build; the kill is applied to that bound first.
+  - *F4a.0 (2026-10-29): the kill does not fire.* In a product's tail ~70 freed units read nothing, because each unit's
+    next list sits after its arrival: 2.45 ms of capacity unused a step; with the weights made free the step is 5.33 ms,
+    so decode products are bound by their reads; reads under the small ops cost them ~3%.
+  - *F4a.2's first lever (2026-10-29, the default): 0.37 / 0.53 ms.* A product's units read the next weights before
+    their arrival, the barrier kept (B pumps a prefetch at a barrier): `Step(64)` 10.91 -> 10.53 ms, 327 -> 340 GB/s,
+    tail slack 1.27 ms. The mechanism holds; the prediction is not met yet. Lists B runs in line must stay after an
+    arrival (idle units' moved early: 0.6 ms slower).
 - **H5 Spatial pipelining.** Running a layer's ops on disjoint core sets at once beats running them one after another for decode at batch 1.
   - *Prediction:* none until H4 has run.
   - *Kills it:* H4's tails turn out to be GDDR-queue-bound.
