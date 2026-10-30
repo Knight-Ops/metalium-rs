@@ -173,6 +173,50 @@ pub fn choose<B: Backend>(
     order.gather(1, at)
 }
 
+/// Rows wider than this take their greedy token in parts ([`greedy`]).
+const GREEDY_WHOLE: usize = 65_536;
+
+/// The widest part [`greedy`] splits a row into.
+const GREEDY_PART: usize = 32_768;
+
+/// `[1, 1]`: the first largest of `logits` (`[1, vocab]`), `argmax(1)`'s choice, as Burn ops. A
+/// row past [`GREEDY_WHOLE`] is taken in parts of at most [`GREEDY_PART`] columns (whole tiles,
+/// dividing it where some count of parts does, else padded with `-inf`): each part's first
+/// largest, then the first part whose pick is the largest, and so the first largest of all, any
+/// NaN above every number as `argmax` ranks it. On the card the `argmax` of one row is one op that
+/// holds the row in L1, and a 248,320-token vocabulary's (Qwen3.5) does not fit a unit's arena
+/// (`step263_qwen35_traced`, 2026-10-30); each part is such a row. Narrower rows (the Llamas')
+/// take the one `argmax` as before.
+pub fn greedy<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 2, Int> {
+    let n = logits.dims()[1];
+    if n <= GREEDY_WHOLE {
+        return logits.argmax(1);
+    }
+    let (parts, logits) = match (2..=n.div_ceil(32))
+        .find(|&r| n % r == 0 && n / r <= GREEDY_PART && (n / r) % 32 == 0)
+    {
+        Some(parts) => (parts, logits),
+        None => {
+            let parts = n.div_ceil(GREEDY_PART);
+            let device = logits.device();
+            let pad =
+                Tensor::<B, 2>::full([1, parts * GREEDY_PART - n], f32::NEG_INFINITY, &device);
+            (parts, Tensor::cat(vec![logits, pad], 1))
+        }
+    };
+    let width = logits.dims()[1] / parts;
+    let (mut values, mut at) = (Vec::with_capacity(parts), Vec::with_capacity(parts));
+    for j in 0..parts {
+        let part = logits.clone().slice([0..1, j * width..(j + 1) * width]);
+        let i = part.clone().argmax(1);
+        values.push(part.gather(1, i.clone()));
+        at.push(i);
+    }
+    let best = Tensor::cat(values, 1).argmax(1);
+    let column = Tensor::cat(at, 1).gather(1, best.clone());
+    best.mul_scalar(width as i64) + column
+}
+
 /// The widest rows [`largest`] sorts, and so the most candidates a [`Sampler::Sample`] keeps: the
 /// longest axis the device sorts with indices (burn-tt's sort).
 pub const SORT_MAX: usize = 1024;
@@ -828,7 +872,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             // set_residency`), each run over the same inputs.
             sets[0].capture(Key::Step(len), &[&tp, &pp], || {
                 let (y, state) = model.step(token.clone(), position.clone(), len, cache);
-                let next = y.clone().argmax(1);
+                let next = greedy(y.clone());
                 (
                     vec![float(y), B::int_native(next.into_primitive())],
                     state.into_iter().map(float).collect(),
@@ -883,7 +927,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             set.capture(Key::Chunk { c, len }, &[&tp, &sp, &lp], || {
                 let (y, state) =
                     model.chunk(tokens.clone(), start.clone(), last.clone(), len, cache);
-                let next = y.clone().argmax(1);
+                let next = greedy(y.clone());
                 (
                     vec![float(y), B::int_native(next.into_primitive())],
                     state.into_iter().map(float).collect(),
@@ -1110,6 +1154,40 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`greedy`] in parts is [`argmax`]'s choice: on a width some count of rows divides
+    /// (Qwen3.5's 248,320) and one it pads (65,537, a prime), with the largest value tied across
+    /// parts (the first wins), and with NaNs (the first NaN wins).
+    #[test]
+    fn a_wide_row_takes_its_greedy_token_in_parts() {
+        use burn_flex::{Flex, FlexDevice};
+        let pick = |v: &[f32]| -> usize {
+            let t = Tensor::<Flex, 2>::from_data(
+                TensorData::new(v.to_vec(), [1, v.len()]),
+                &FlexDevice,
+            );
+            greedy(t)
+                .into_data()
+                .convert::<i64>()
+                .to_vec::<i64>()
+                .unwrap()[0] as usize
+        };
+        for n in [248_320usize, 65_537, 1000] {
+            let mut v: Vec<f32> = (0..n)
+                .map(|i| ((i * 7919 + 13) % 10_007) as f32 / 1000.0 - 5.0)
+                .collect();
+            assert_eq!(pick(&v), argmax(&v), "{n}");
+            // Tied across parts: the first.
+            v[n - 2] = 100.0;
+            v[n / 3] = 100.0;
+            assert_eq!(pick(&v), n / 3, "{n}");
+            // A NaN ranks above every number, the first of them.
+            v[n - 1] = f32::NAN;
+            v[n / 2] = f32::NAN;
+            assert_eq!(pick(&v), argmax(&v), "{n}");
+            assert_eq!(argmax(&v), n / 2);
+        }
+    }
 
     #[test]
     fn a_prompt_is_fed_by_the_smallest_chunk_that_covers_it() {
