@@ -1178,11 +1178,13 @@ impl<B: Backend> Qwen35<B> {
     }
 
     /// The logits `[1, vocab]` of a normed hidden row `[1, hidden]`, in the head's dtype. A tied
-    /// head is computed as `table @ last^T` (then laid out as a row), the table a plain left
-    /// operand: `last @ table^T` would hand burn-tt a transposed BF16 right operand, which its BF16
-    /// product first copies plain, and for a 248,320 x 2,560 table that copy's host bookkeeping
-    /// exceeds 40 GB (`silicon_probe_qwen35_bf16_memory`, 2026-10-30). The products and their order
-    /// over `hidden` are the same.
+    /// head with a BF16 table is computed as `table @ last^T` (then laid out as a row), the table a
+    /// plain left operand: `last @ table^T` would hand burn-tt a transposed BF16 right operand,
+    /// which its BF16 product first copies plain, and for a 248,320 x 2,560 table that copy's host
+    /// bookkeeping exceeds 40 GB (`silicon_probe_qwen35_bf16_memory`, 2026-10-30). An F32 table
+    /// (the F32 model, and the BF16-stored weights', whose table stays F32) is `last @ table^T`,
+    /// whose F32 product reads the transposed table where it lies: its row is a plain one, which a
+    /// trace can return (the row laid out from `[vocab, 1]` is a transposed view, which it cannot).
     fn project_out(&self, last: Tensor<B, 2>) -> Tensor<B, 2> {
         let to = |x: Tensor<B, 2>, dtype: DType| if x.dtype() == dtype { x } else { x.cast(dtype) };
         match &self.lm_head {
@@ -1194,7 +1196,11 @@ impl<B: Backend> Qwen35<B> {
                 let table = self.embed_tokens.weight.val();
                 let [vocab, _] = table.dims();
                 let last = to(last, table.dtype());
-                table.matmul(last.transpose()).reshape([1, vocab])
+                if table.dtype() == DType::F32 {
+                    last.matmul(table.transpose())
+                } else {
+                    table.matmul(last.transpose()).reshape([1, vocab])
+                }
             }
         }
     }
