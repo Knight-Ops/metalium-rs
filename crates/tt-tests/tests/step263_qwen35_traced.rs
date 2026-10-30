@@ -55,6 +55,16 @@ fn prompts() -> Vec<Vec<i32>> {
     ]
 }
 
+/// The process's resident memory, in GB (`VmRSS`): the gate runs inside a host-memory cap.
+fn rss_gb() -> f64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<f64>().ok())
+        .map_or(0.0, |kb| kb / 1e6)
+}
+
 fn decode_ms(g: &Generation) -> Vec<f64> {
     g.times[1..].iter().map(|t| t.as_secs_f64() * 1e3).collect()
 }
@@ -80,6 +90,7 @@ fn traced_generation_equals_the_eager_one_and_agrees_with_flex() {
             })
             .collect()
     });
+    eprintln!("after burn-flex: {:.1} GB resident", rss_gb());
 
     // Chunks of 8 and 16 attending to the whole cache; decode steps attending to 64, then 128.
     let shapes = Shapes::new(128, &[8, 16]).with_prefixes(&[]);
@@ -91,10 +102,16 @@ fn traced_generation_equals_the_eager_one_and_agrees_with_flex() {
     with_device(config, |d| {
         let (model, _) =
             Qwen35::<TtBackend>::qwen3_5_4b(QWEN3_5_4B.layers, Precision::F32, &d).unwrap();
+        eprintln!("loaded: {:.1} GB resident", rss_gb());
         let model = model.with_bf16_weights();
+        eprintln!("weights stored BF16: {:.1} GB resident", rss_gb());
         let t0 = std::time::Instant::now();
         let g = ladder_support::traced(&model, &shapes, &d);
-        eprintln!("built in {:.1} s", t0.elapsed().as_secs_f64());
+        eprintln!(
+            "built in {:.1} s; {:.1} GB resident",
+            t0.elapsed().as_secs_f64(),
+            rss_gb()
+        );
 
         let mut traced = Vec::new();
         for (p, host) in prompts.iter().zip(&host) {

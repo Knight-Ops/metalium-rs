@@ -38,7 +38,7 @@ use burn::tensor::activation::{sigmoid, silu};
 use burn::tensor::backend::Backend;
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
-use burn::tensor::{Bool, DType, Distribution, Int, Tensor};
+use burn::tensor::{Bool, DType, Distribution, Int, Tensor, TensorData};
 
 use crate::generate::{eager, EagerDecoder, FixedShapeCache, FixedShapeDecoder, Generation};
 use crate::kv_cache::{CacheLayout, FixedCache, FixedWrite};
@@ -779,11 +779,35 @@ fn concat<B: Backend>(parts: &[Linear<B>]) -> Linear<B> {
         parts.iter().all(|p| p.bias.is_none()),
         "projections without a bias"
     );
+    // On the host's data, one matrix at a time: a freshly loaded weight is still host data on the
+    // card's backend, and a device `cat` would upload each part first.
+    let first = parts[0].weight.val();
+    let (device, dtype, rows) = (first.device(), first.dtype(), first.dims()[0]);
+    let datas: Vec<(Vec<f32>, usize)> = parts
+        .iter()
+        .map(|p| {
+            let w = p.weight.val();
+            let [r, cols] = w.dims();
+            assert_eq!(r, rows, "projections of one input width");
+            let v = w.into_data().convert::<f32>().into_vec::<f32>();
+            (v.expect("a float weight"), cols)
+        })
+        .collect();
+    let width: usize = datas.iter().map(|(_, c)| c).sum();
+    let mut out = Vec::with_capacity(rows * width);
+    for r in 0..rows {
+        for (v, cols) in &datas {
+            out.extend_from_slice(&v[r * cols..(r + 1) * cols]);
+        }
+    }
+    drop(datas);
+    let whole = Tensor::<B, 2>::from_data(TensorData::new(out, [rows, width]), &device);
     Linear {
-        weight: Param::from_tensor(Tensor::cat(
-            parts.iter().map(|p| p.weight.val()).collect(),
-            1,
-        )),
+        weight: Param::from_tensor(if dtype == DType::F32 {
+            whole
+        } else {
+            whole.cast(dtype)
+        }),
         bias: None,
     }
 }
