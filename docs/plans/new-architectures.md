@@ -191,3 +191,40 @@ Left:
   each inside a memory cap (`systemd-run --user --scope -p MemoryMax=40G`) so a host-memory fault stays in its run.
 - [ ] Performance, after correctness: traced generation (a fixed-shape `HybridCache` for Qwen3.5), the fused
   delta-rule step, the DeltaNet's chunked prefill, a window-sized cache for Gemma 4's sliding layers.
+  - [x] **Qwen3.5 traced generation** (branch `qwen35-traced`): `qwen35::HybridCache` (the eight attention layers'
+    keys and values in a `FixedCache`, each DeltaNet's carried convolution inputs and recurrent state, the rotary
+    table) and `FixedShapeDecoder for Qwen35`, so `TracedGenerator` serves it as it serves the Llama. A recurrent
+    state cannot be overwritten later as a key can: a padded chunk's rows past the prompt get decay 1 and write
+    strength 0 (exact), and the convolution keeps the inputs ending at the prompt's last token, selected by `last`;
+    a chunk from position 0 starts from zeros. Inside a chunk the recurrence runs a token at a time, unrolled.
+    Gate `step263_qwen35_traced` (card 1, `1793339453`, BF16-stored weights, every tile): traced greedy tokens and
+    logits equal the eager growing state bit for bit at prompts of 17, 5, 16 and 61 tokens (chunks of 8 and 16, the
+    first two padded; decode across the 64-position step's end), top-1 equal to burn-flex everywhere (largest logit
+    difference 7.8e-2 of 33.1); without the padding mask (`qwen35::UnmaskedPadding`) the decode logits move by up
+    to 11.9. Its `the_first_layers_trace_as_they_run_eagerly` is the same claim on four layers in ~85 s.
+  - [x] **The step's constants made once** (`Qwen35::prepared`, applied on load): `1 + w` of the zero-centred
+    norms, `qkv|z|b|a`, `gate|up` and the attention's `q|k|v` as one product each, the taps as rows,
+    `-exp(A_log)`; on the card the norms are `burn_tt::rms_norm`, the queries' and keys' L2 norms an RMS norm with
+    `eps / k_dim` and a scale row, a one-token convolution its window times the taps summed. The eager model's
+    arithmetic changed with it (it shares the code); burn-flex's is unchanged but the decode step's convolution sum.
+  - Measured (bench `silicon_bench_models::qwen35_traced_generation`, card 1, `1793341445`, `Tt`, every tile,
+    512-position cache, chunks of 16): **68.5 / 68.9 ms a decode step at 32 / 256 tokens** (14.6 tokens/s), against
+    eager's ~1.9 s on every tile (~4 s on one) and the 17.5 ms BF16 roofline; 1,009 ops a step, each with a barrier.
+    Profile (`1793343574`): the products 19.6 ms of the 41 ms the profile covers (7.4 GB at 379 GB/s), 748 other ops
+    21.4 ms; the recurrence ~560 us a DeltaNet layer (~13 ms a step), 200 us of it the decay broadcast to the whole
+    state; the head (2.5 GB of F32 table) outside the covered window. With the decay a column of the state
+    (`0547fa4`): **64.2 / 64.6 ms** (`1793346925`, 15.6 tokens/s), `step263` passing again (`1793345534`, eager
+    ~1.6 s a token on every tile, traced 67.0 ms on `TtBackend`).
+  - What it found outside `tt-models`: (6) the argmax of a 248,320-wide row does not fit a unit's L1 arena ("reduce
+    inputs (1010880 bytes) does not fit the 917504-byte L1 arena"); `generate::greedy` takes a row past 65,536
+    columns in single-row parts (the Llamas' traces unchanged; `step187` and `step188`'s traced test pass on card
+    1, `1793344290`, as do `step260`'s BF16-weight test there, largest logit difference 7.79e-2 and eager ~3 s a
+    token on one tile, and `qwen35_host` against `transformers`). (7) A tied
+    head as `table @ last^T` returns a transposed view, which a trace cannot output: an F32 table's head is now
+    `last @ table^T` (the BF16 table keeps the workaround of (1)). (8) **The build is host-bound and
+    superlinear in a trace's ops**: 1,487 s for two steps and two chunks (`step263`), 1,108 s for four steps and a
+    chunk of 16 (7,056 ops), one core at 100%; the four-layer model builds in seconds.
+  - Left, in order of what they buy: the fused delta-rule step (the recurrence, decay and norms of a DeltaNet are
+    ~25 of its ~34 ops a step, a new SFPU op by `new-op-definition-of-done.md`); a BF16 copy of the tied head
+    (2.5 GB of F32 table read a step, ~5 ms at the bandwidth; 1.3 GB more GDDR); the capture's host cost; the
+    DeltaNet's chunked (WY) prefill (a 256-token prompt takes 5.0 s traced).

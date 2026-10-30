@@ -14,6 +14,7 @@ The chronology is the [Change log](#change-log).
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
 | [F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules](#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1) | 2026-10-30 | lane A, card 1: idle units' lists pumped and moved before their anchor's arrival 0.24 / 0.17 ms slower (opt-in); kept barriers lowered to per-edge credits, built and checked, +0.03 / +0.06 at fan 4 (opt-in); the handoff, second job and balanced deal not faster, retired; the lists' L1 room not built (a second job read ahead is slower). Close 10.98 / 12.18 ms against A0's 11.01 / 12.16, `Step(64)` 10.55 ms at 341 GB/s: **H4's kill fires** |
 | [F5: `Dst` subblocks and half-sync](#f5-dst-subblocks-and-half-sync-2026-10-30-card-0) | 2026-10-30 | subblocks of up to four FP32 tiles a `Dst` half, math and pack on alternate halves, `A` held in `SrcB`, and the measured blocks re-swept: bit for bit; H1's shapes x five formats 0.96-1.35x (geometric mean **1.12x**, FP32 `B` 1.08x, H1 32.3 -> 34.4 TFLOPS), the kernel alone up to 1.46x, the model shape set 1.12x; H2's 1.4x not met, its kill not fired: a chunk's reload still stops the math role, and an `UnpackToDst` beside `MVMUL`s is wrong on silicon |
+| [Qwen3.5-4B traced: the first decode step, and where it goes](#qwen35-4b-traced-the-first-decode-step-and-where-it-goes-2026-10-30-card-1) | 2026-10-30 | `TracedGenerator` over a hybrid cache: eager ~1.9 s a token on every tile, traced 68.5 / 68.9 ms at 32 / 256 tokens (`Tt`, BF16-stored weights), **64.2 / 64.6** with the decay a column of the state; the products 19.6 ms at 379 GB/s, the DeltaNet recurrence ~13 ms (a per-head decay expanded to the whole state, then laid as a column); the build host-bound, 1,108-1,487 s |
 | [F4a.0: what overlap can buy a decode step; the tails split by unit](#f4a0-what-overlap-can-buy-a-decode-step-the-tails-split-by-unit-2026-10-29-card-1) | 2026-10-29 | 1.7B `Step(64)` 10.91 ms at 327 GB/s; a product's own units fall 92 -> 20 by its last eighth and nothing reads ahead in its tail (each unit's next list sits after its arrival): 2.45 ms of capacity unused; weights made free 5.33 ms; H4's kill does not fire. F4a.2: busy lists moved to before the arrival (B pumps them at the barrier), **11.32 / 12.69 -> 10.95 / 12.16 ms**, 340 GB/s, the default; idle lists moved too: 0.6 ms slower than off (their reads are in line), reverted |
 | [F4b.2: a block measured on the card, `A` pulled where it gains](#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1) | 2026-10-29 | the default since: sweeps of every block x pull at 10 prefill shapes (the best 1.0-2.1x `Auto`'s, ranked low by every model); `Auto`'s, 12 listed blocks and a climb timed in a capture as a difference of traces: 1.02-2.25x `Auto` over 50 cases, H1 FP32 35.5 / BF16 49.5 / BFP4 65.4 TFLOPS a product; through Burn H1 19.2 -> **29.2 TFLOPS**, 1.7B prefill 1.04-1.34x, models and decode unchanged; eager runs `Auto`'s |
 | [D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever](#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1) | 2026-10-29 | three prefill shapes x every `B` format x the schemes: `A` pulled 1.33-1.44x with FP32 `B` (H1 28.38 TFLOPS); `B` pulled loses; a packed `B` is bound by the block (H1 `[6,4,12]` + `A` pulled 44.5-45.8, 1.7x), shape-dependent |
@@ -517,6 +518,44 @@ pause's bookkeeping.
 **H2: neither the prediction (≥1.4x) nor the kill (<1.1x)** at H1 (1.12x; FP32 `B` 1.08x). B3 (roles across batches) not
 built: a blocked product's batches are its chunks, and all but a job's first reload the chunk before's partials, so
 the joins the brief keeps are all but one a job.
+
+## Qwen3.5-4B traced: the first decode step, and where it goes (2026-10-30, card 1)
+
+`docs/plans/new-architectures.md`, the performance item. Qwen3.5-4B (`qwen35`, 24 Gated DeltaNets and 8 gated
+attention layers) with every matrix but the embedding table stored BF16 (F32 arithmetic; the tied head reads the F32
+table, 2.54 GB), traced through `TracedGenerator` over `qwen35::HybridCache`. Release, safe image, every tile, card 1,
+branch `qwen35-traced`. Gate `step263_qwen35_traced` (`1793339453`) checks the traced tokens and logits bit for bit
+against the eager model and the top-1 against burn-flex.
+
+| Run | What | Decode step, ms (32 / 256 tokens) | Notes |
+|---|---|--:|---|
+| `1793344290` | eager, one tile (`step260`, BF16 weights) | ~3,000 | ~4,000 before `Qwen35::prepared` |
+| `1793339453` | eager, every tile (`step263`, `TtBackend`) | ~1,900 | |
+| `1793339453` | traced, `TtBackend`, 128-position cache, chunks of 8 and 16 | 71.4 | build 1,487 s |
+| `1793341445` | traced, `Tt`, 512-position cache, chunks of 16 (bench `qwen35_traced_generation`, `fa00aae`) | 68.5 / 68.9 | 14.6 tokens/s, 141 GB/s of the step's 9.7 GB; build 1,108 s; prefill 0.63 / 5.0 s |
+| `1793345534` | eager / traced, every tile, `TtBackend` (`step263`, `0547fa4`) | ~1,600 / 67.0 | the decay a column of the state; build 938 s |
+| `1793346925` | traced, `Tt`, as `1793341445` (`762e788`, the decay a column) | **64.2 / 64.6** | 15.6 tokens/s, 151 GB/s; 1,080 ops a step; build 644 s; prefill 0.46 / 3.7 s |
+
+The step is 1,009 ops, each followed by a barrier (the 1.7B's: 283). The profile (`1793343574`: 64-position
+cache, chunks of 4; `Step(64)`, 950 of 1,007 ops in its windows, 41.0 ms on the card) by part:
+
+- **Products: 19.6 ms**, 202 ops, 7.4 GB at 379 GB/s (the 1.7B's at ~340): the weights stream at the rate the
+  Llama's do. Not in the windows: the last layers, the head (2.54 GB of F32 table) and the greedy pick.
+- **Everything else: 21.4 ms**, 748 ops at 28.6 us each. A DeltaNet layer's non-product ops are ~25 a step;
+  its recurrence (ops 49-60 a layer) ~560 us, **~13 ms a step**: the per-head decay broadcast to the whole
+  `[32, 128, 128]` state as a 4,096-row gather (76 us) and a 2 MB expand (124 us), then the product (70 us), three
+  small batched matmuls (25-50 us each), the update and the output. The convolution and the decay's scalars, one
+  merged op, 83 us; the gated norm 60 us; the q/k norms and their head repeats ~105 us.
+- Host: 68.5 ms a step against 41.0 covered on the card (the profile image's replay is 195 ms, so the gap is not
+  measured here); 0.15 ms to write a step's inputs, 0.06 to read its token.
+
+Changed from what the profile showed: the decay multiplies the state as a column of its stored `[4096, 128]` matrix
+(burn-tt broadcasts a column where it lies; a scalar a head was expanded to the whole state first), `0547fa4`:
+**68.5 -> 64.2 ms** a step at 32 tokens (`1793346925`), bit for bit the same values (`step263`, `1793345534`).
+
+The build is host-bound: one core at 100% for 1,108 s (four steps and a chunk of 16, 7,056 ops) to 1,487 s (two
+steps, chunks of 8 and 16); the first four layers build in seconds, so the capture's host cost grows faster than
+its op count (not located: ptrace and perf are not permitted on this host).
 
 ## F4a.0: what overlap can buy a decode step; the tails split by unit (2026-10-29, card 1)
 
