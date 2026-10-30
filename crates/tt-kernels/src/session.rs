@@ -2789,8 +2789,9 @@ impl<T: Transport> Session<T> {
             // 11.32 / 12.69 -> 10.95 / 12.16 ms at 32 / 256 tokens on card 1, bit for bit;
             // `TT_READ_AHEAD_EARLY=0` turns it off.
             read_ahead_early: std::env::var("TT_READ_AHEAD_EARLY").map_or(true, |v| v != "0"),
-            // `TT_IDLE_AHEAD_EARLY=0` turns it off (`docs/plans/dataflow-compiler.md` F4a.2).
-            idle_ahead_early: std::env::var("TT_IDLE_AHEAD_EARLY").map_or(true, |v| v != "0"),
+            // `TT_IDLE_AHEAD_EARLY=1` turns it on (`docs/plans/dataflow-compiler.md` F4a.2: not
+            // faster, so off).
+            idle_ahead_early: std::env::var("TT_IDLE_AHEAD_EARLY").is_ok_and(|v| v == "1"),
             busy_anchor: None,
             busy_moves: Vec::new(),
             prefetch_lists: Vec::new(),
@@ -9857,10 +9858,13 @@ impl<T: Transport> Session<T> {
     /// Whether, in a capture and with [`Session::set_read_ahead_early`] on, an idle unit's
     /// `PREFETCH` list (`tensor::PREFETCH`, its anchor's wait before it) moves to just before the
     /// unit's arrival at its anchor product's barrier, as a busy unit's does, where no other unit
-    /// of that product touches the L1 its reads land in (on by default; `TT_IDLE_AHEAD_EARLY=0`
-    /// turns it off; `docs/plans/dataflow-compiler.md` F4a.2). Its reads are a pumped prefetch
+    /// of that product touches the L1 its reads land in (off by default; `TT_IDLE_AHEAD_EARLY=1`
+    /// at open; `docs/plans/dataflow-compiler.md` F4a.2). Its reads are a pumped prefetch
     /// (`record::GATHER_PREFETCH`), which B issues while it waits at the barrier, and the job waits
-    /// for them before its kernel, so the list does not hold the barrier.
+    /// for them before its kernel, so the list does not hold the barrier. Not faster: a 1.7B step
+    /// 10.93 / 12.11 -> 11.24 / 12.30 ms at 32 / 256 tokens on card 1 (ABBA `1793338877`-
+    /// `1793345003`), its reads moved from under the small ops, which had the room, into the
+    /// anchor's tail, which the product's own units and the busy units' lists already read in.
     pub fn set_idle_ahead_early(&mut self, on: bool) {
         self.idle_ahead_early = on;
     }

@@ -333,7 +333,7 @@ fn captured_idle<T: tt_device::Transport>(
     let y = forward_wide_first(s, w, x);
     let id = s.end_trace().unwrap();
     s.set_busy_prefetch(true);
-    s.set_idle_ahead_early(true);
+    s.set_idle_ahead_early(false);
     let mut runs = vec![s.download(&y).unwrap()];
     for &seed in &inputs[1..] {
         s.write(x, &values(seed, K)).unwrap();
