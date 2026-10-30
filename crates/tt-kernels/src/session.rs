@@ -9632,8 +9632,11 @@ impl<T: Transport> Session<T> {
     /// plans in and its movers' arena; and moves the capture's relative barrier targets and
     /// generations past what `f` ran ([`trace::Capture::barriers_base`],
     /// [`trace::UnitCapture::generation_base`]). What `f` left on the tiles is forgotten, so the
-    /// capture's own run sets again every descriptor and tile state its next op needs; its stream
-    /// is as without `f`, which a replay never runs (what the stream set, it still has). Not in a
+    /// capture's own run sets again every descriptor and tile state its next op needs. Its stream
+    /// is as without `f`, which a replay never runs (what the stream set, it still has), but for
+    /// those settings: a unit that would have carried its tile state from an earlier op of the
+    /// capture into its next one (one `f` ran on, the capture's op left idle) records a setup run
+    /// there, redundant on replay (`step245`). Not in a
     /// capture applying a plan, whose L1 holds tensors between ops.
     fn paused<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Result<R, TensorError> {
         let Some(mut c) = self.capture.take() else {

@@ -18,10 +18,11 @@
 //!   block and times nothing (what is timed is a product inside a trace; an eager one also pays
 //!   its planning every call).
 //! - **A capture paused to measure is the capture unpaused**: a residency plan pass that measures
-//!   inside it records the same ops, the same entries on every unit, and the same streams' sizes
-//!   as the same plan pass once the choice is kept; its trace replays as the eager chain, bit for
-//!   bit; and the planned capture applying its plan holds (it refuses a pass whose ops or tensors
-//!   are not its own).
+//!   inside it records the same ops and barriers, and on every unit the same records as the same
+//!   plan pass once the choice is kept, but for one `op::KERNEL` setup run a pause on a unit
+//!   whose tile state the unpaused pass carries from an earlier op (what the pause ran leaves
+//!   that state unknown); its trace replays as the eager chain, bit for bit; and the planned
+//!   capture applying its plan holds (it refuses a pass whose ops or tensors are not its own).
 //! - **A measurement times its copies stored whole**, under a capture stored as layer sub-traces
 //!   (silicon only).
 //! - **The negative control:** a pause that does not move the capture's barrier targets and
@@ -400,8 +401,52 @@ fn a_capture_paused_to_measure_is_the_capture_unpaused() {
             replays.iter().all(|&x| x),
             "the unpaused pass's run, then its replays: {replays:?}"
         );
-        assert_eq!(paused, unpaused, "the paused pass recorded otherwise");
+        same_but_setup(&paused, &unpaused);
     });
+}
+
+/// The paused pass's record is the unpaused one's, but for the setup runs a pause leaves: what
+/// it ran on a unit leaves the tile's descriptors and semaphores unknown (`Session::paused`), so
+/// a unit whose state the unpaused pass carries into its next op from an earlier one (a unit the
+/// paused product left idle) sets them again there, one `op::KERNEL` setup run a pause. Every
+/// op, barrier and other record is the same, on every unit.
+fn same_but_setup(paused: &Recorded, unpaused: &Recorded) {
+    const PAUSES: u32 = 1;
+    let kernel = tt_isa::dm::op::KERNEL;
+    let (ops, units) = paused;
+    let (ops_u, units_u) = unpaused;
+    assert_eq!(ops.len(), ops_u.len(), "the paused pass recorded other ops");
+    for (o, u) in ops.iter().zip(ops_u) {
+        assert_eq!((o.0, o.1, o.3), (u.0, u.1, u.3), "an op recorded otherwise");
+        assert_eq!(o.2.len(), u.2.len(), "{}: other units", o.0);
+    }
+    assert_eq!(units.len(), units_u.len());
+    for (i, (p, u)) in units.iter().zip(units_u).enumerate() {
+        let (Some((top, p)), Some((top_u, u))) = (p, u) else {
+            assert_eq!(p.is_some(), u.is_some(), "unit {i} used in one pass only");
+            continue;
+        };
+        let count = |c: &tt_kernels::trace::Composition| c.heads.get(&kernel).copied().unwrap_or(0);
+        let extra = count(p)
+            .checked_sub(count(u))
+            .unwrap_or_else(|| panic!("unit {i}: the paused pass has fewer setup runs"));
+        assert!(
+            extra <= PAUSES,
+            "unit {i}: {extra} setup runs for {PAUSES} pause"
+        );
+        assert_eq!(
+            (top - top_u, p.entries - u.entries),
+            (extra, extra),
+            "unit {i}: other entries"
+        );
+        assert_eq!(p.padding, u.padding, "unit {i}: other padding");
+        let others = |c: &tt_kernels::trace::Composition| {
+            let mut h = c.heads.clone();
+            h.remove(&kernel);
+            h
+        };
+        assert_eq!(others(p), others(u), "unit {i}: other records");
+    }
 }
 
 /// The negative control: a pause that leaves the capture's barrier targets and generations where
