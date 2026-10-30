@@ -1218,7 +1218,13 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
         Entry::Credit { x, y, addr, value } => credit(me, (x, y), addr, value)?,
         Entry::WaitCredit { addr, target } => {
             let since = nc_clock();
-            tt_firmware::dataflow::credit(addr as u64, target, if IS_NC { 4 } else { 0 })?;
+            // B issues its queued prefetch while it waits, as at a barrier (`pump` is nothing on NC).
+            tt_firmware::dataflow::credit_with(
+                addr as u64,
+                target,
+                if IS_NC { 4 } else { 0 },
+                || pump(PUMP_TURN),
+            )?;
             nc_waited(tt_isa::dataflow::NcWait::Credits, since);
         }
         Entry::L1Read {

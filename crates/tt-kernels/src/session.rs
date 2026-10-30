@@ -805,6 +805,11 @@ pub struct Session<T: Transport> {
     barrier_prune: bool,
     /// What the last capture's pruning did ([`Session::last_barrier_prune`]).
     last_prune: Option<Result<crate::barriers::Pruned, String>>,
+    /// [`Session::set_edge_credits`]: the most producers a consumer of a lowered barrier waits for,
+    /// and consumers a producer credits; `None` off.
+    edge_credits: Option<usize>,
+    /// What the last capture's edge credits did ([`Session::last_edge_credits`]).
+    last_credits: Option<Result<crate::barriers::Credited, String>>,
     /// [`Session::set_follow_runs`].
     follow_runs: bool,
     /// The last element-wise op's output in a capture, its tiles and the units its runs went to:
@@ -2740,6 +2745,12 @@ impl<T: Transport> Session<T> {
             // `TT_BARRIER_PRUNE=0`: a capture keeps every barrier.
             barrier_prune: std::env::var("TT_BARRIER_PRUNE").map_or(true, |v| v != "0"),
             last_prune: None,
+            // `TT_EDGE_CREDITS=<fan>` turns it on (`docs/plans/dataflow-compiler.md` F4a.1).
+            edge_credits: std::env::var("TT_EDGE_CREDITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&f: &usize| f > 0),
+            last_credits: None,
             // `TT_FOLLOW_RUNS=1`: an element-wise op follows its operand's runs.
             follow_runs: std::env::var("TT_FOLLOW_RUNS").is_ok_and(|v| v == "1"),
             last_runs: None,
@@ -4556,6 +4567,22 @@ impl<T: Transport> Session<T> {
         self.last_prune.clone()
     }
 
+    /// Lower a capture's kept barriers to per-edge credits where a channel expresses them (off by
+    /// default; `TT_EDGE_CREDITS=<fan>` at open; `docs/plans/dataflow-compiler.md` F4a.1, H4): a
+    /// barrier whose next run's units each wait for at most `fan` producers, each crediting at most
+    /// `fan` units ([`crate::barriers::credit`]). `None` keeps every barrier the data needs. Only
+    /// where barriers are pruned ([`Session::set_barrier_prune`]); the capture's own run keeps them.
+    pub fn set_edge_credits(&mut self, fan: Option<usize>) {
+        self.edge_credits = fan.filter(|&f| f > 0);
+    }
+
+    /// What the last capture's edge credits did: `None` off or where nothing was pruned, `Err`
+    /// where a check refused them (the trace then keeps its barriers).
+    #[doc(hidden)]
+    pub fn last_edge_credits(&self) -> Option<Result<crate::barriers::Credited, String>> {
+        self.last_credits.clone()
+    }
+
     /// Wait at a barrier for unit 0's release rather than by polling its counter (on by
     /// default; `dm::op::BARRIER` word 6): unit 0 waits on the counter in its own L1, then
     /// multicasts each target it arrives at to every other unit's `dm::BARRIER_RELEASE`, and each
@@ -6080,17 +6107,27 @@ impl<T: Transport> Session<T> {
             && self.units.len() > 1
             && refused.is_none()
             && capture.ops.len() > 1;
-        let barriers = (prune || crate::barriers::probe_dir().is_some()).then(|| {
-            let coords: Vec<(u8, u8)> = self
-                .units
-                .iter()
-                .map(|u| (u.tile.x(), u.tile.y()))
-                .collect();
-            crate::barriers::analyse(&capture, &coords)
-        });
+        let coords: Vec<(u8, u8)> = self
+            .units
+            .iter()
+            .map(|u| (u.tile.x(), u.tile.y()))
+            .collect();
+        let barriers = (prune || crate::barriers::probe_dir().is_some())
+            .then(|| crate::barriers::analyse(&capture, &coords));
         self.last_prune = None;
+        self.last_credits = None;
         if let (true, Some(a)) = (prune, &barriers) {
-            let keep = crate::barriers::keep_from(a);
+            let mut keep = crate::barriers::keep_from(a);
+            // Kept barriers lowered to credits where they gain (F4a.1): checked before the
+            // capture changes, and on a refusal the barriers stay.
+            if let Some(fan) = self.edge_credits {
+                let mut lowered = keep.clone();
+                let credited = crate::barriers::credit(&mut capture, a, &mut lowered, &coords, fan);
+                if credited.is_ok() {
+                    keep = lowered;
+                }
+                self.last_credits = Some(credited);
+            }
             if keep.iter().any(|&k| !k) {
                 self.last_prune = Some(crate::barriers::prune(&mut capture, &keep));
             }

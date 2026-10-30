@@ -159,6 +159,19 @@ pub fn released(target: u16, which: Release) -> Result<(), u32> {
 /// is cancelled.
 #[inline(never)]
 pub fn credit(address: u64, target: u32, actor: u32) -> Result<(), u32> {
+    credit_with(address, target, actor, || {})
+}
+
+/// [`credit`], calling `turn` once each poll that finds the word short: RISCV B issues its queued
+/// prefetch's reads there, as in a barrier's wait (an edge credit stands where a barrier was,
+/// `docs/plans/dataflow-compiler.md` F4a.1).
+#[inline(always)]
+pub fn credit_with(
+    address: u64,
+    target: u32,
+    actor: u32,
+    mut turn: impl FnMut(),
+) -> Result<(), u32> {
     let reason = dataflow::WAIT_REASON + actor as u64 * 4;
     write(reason, dataflow::CREDIT_WAIT);
     let mut poll = Poll::new();
@@ -169,6 +182,7 @@ pub fn credit(address: u64, target: u32, actor: u32) -> Result<(), u32> {
             publish();
             return Ok(());
         }
+        turn();
     }
 }
 

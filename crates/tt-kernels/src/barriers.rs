@@ -961,6 +961,309 @@ pub(crate) fn prune(c: &mut Capture, keep: &[bool]) -> Result<Pruned, String> {
     Ok(out)
 }
 
+/// The op-level credit words the edge credits count in ([`tt_isa::dm::CREDITS`]), one an epoch
+/// between two barriers kept: past the six the operand-reuse channels use (`tile_op::reuse`).
+pub(crate) const EDGE_WORDS: [u32; 2] = [6, 7];
+
+/// What [`credit`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Credited {
+    /// The barriers kept before (the last one left out, which a trace always keeps), and of them
+    /// those lowered to credits.
+    pub barriers: [usize; 2],
+    /// Credits sent a replay (a producer's to a consumer), and waits (a consumer's, each for
+    /// all of an epoch's credits to it).
+    pub edges: usize,
+    pub waits: usize,
+}
+
+/// One barrier lowered to credits: its op, its word, the credits (a producer's op and unit, and
+/// the units it credits after that op) and the waits (a unit, the op it waits before, how many
+/// credits).
+#[derive(Clone, Debug)]
+struct Epoch {
+    barrier: usize,
+    word: u32,
+    sends: BTreeMap<(u16, u32), Vec<u16>>,
+    waits: BTreeMap<u16, (usize, u32)>,
+}
+
+thread_local! {
+    /// The edge credits' mutations, the calling thread's own (a capture ends on its thread).
+    static PROBE_DROP_EDGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PROBE_UNBALANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A mutation for the edge credits' gate: drop one planned credit (its wait still counts it out),
+/// which the coverage check must refuse. The calling thread's; never for real work.
+#[doc(hidden)]
+pub fn probe_drop_credit_edge(on: bool) {
+    PROBE_DROP_EDGE.set(on);
+}
+
+/// A mutation for the edge credits' gate: one consumer takes two credits a firing from a producer
+/// that sends one, which `channel::Graph::check` must refuse as unbalanced. The calling thread's;
+/// never for real work.
+#[doc(hidden)]
+pub fn probe_unbalance_credit(on: bool) {
+    PROBE_UNBALANCE.set(on);
+}
+
+/// Lower kept barriers of capture `c` (`keep`, from [`keep_from`]) to per-edge credits where a
+/// channel expresses them cheaply (`docs/plans/dataflow-compiler.md` F4a.1, H4): a barrier whose
+/// next run's units each depend on at most `fan` producers, each producer crediting at most `fan`
+/// of them. A producer unit credits each consumer's word ([`EDGE_WORDS`], `op::CREDIT`, after its
+/// own requests have completed, where its arrival was) after the last op of its that consumer
+/// needs; a consumer waits for all of them before its first op of the run (`op::WAIT_CREDIT`), then
+/// credits its own word back to zero. Every dependency since the last barrier kept as a barrier is
+/// lowered, not only the run's own, since a credit, unlike a barrier, orders nothing else; so at
+/// most [`EDGE_WORDS`] barriers in a row are lowered (one word each), and the next is kept. A word
+/// is back at zero before a kept barrier, and no credit is sent to it before that barrier releases.
+/// The credits are checked as a synchronous dataflow graph (`channel::Graph::check`: each unit's
+/// runs in order, every credit an edge) and against the dependencies (each covered by a credit or a
+/// barrier) before anything changes; `keep` then drops the lowered barriers for [`prune`].
+pub(crate) fn credit(
+    c: &mut Capture,
+    a: &Analysis,
+    keep: &mut [bool],
+    coords: &[(u8, u8)],
+    fan: usize,
+) -> Result<Credited, String> {
+    let n = c.ops.len();
+    if keep.len() != n || a.deps.len() != n || coords.len() != c.units.len() {
+        return Err("the analysis is not the capture's".into());
+    }
+    let kept: Vec<usize> = (0..n.saturating_sub(1)).filter(|&k| keep[k]).collect();
+    let arrival = |e: &[u32; 8]| e[0] == op::BARRIER && e[4] == 0;
+    // The run each op is in, between the barriers kept.
+    let mut run_of = Vec::with_capacity(n);
+    let mut r = 0usize;
+    for &kept in keep.iter() {
+        run_of.push(r);
+        r += kept as usize;
+    }
+    let mut epochs: Vec<Epoch> = Vec::new();
+    // The op after the last barrier kept as a barrier; the words used since; the latest op of each
+    // (producer, consumer) credited since.
+    let mut real_start = 0usize;
+    let mut slot = 0usize;
+    let mut credited: BTreeMap<(u16, u16), u32> = BTreeMap::new();
+    for (i, &b) in kept.iter().enumerate() {
+        let end = kept.get(i + 1).copied().unwrap_or(n - 1);
+        let run = b + 1..end + 1;
+        let mut need: BTreeMap<(u16, u16), u32> = BTreeMap::new();
+        for k in run.clone() {
+            for (&u, d) in &a.deps[k] {
+                for (&p, &j) in d {
+                    if (j as usize) >= real_start && (j as usize) <= b {
+                        let e = need.entry((p, u)).or_insert(j);
+                        *e = (*e).max(j);
+                    }
+                }
+            }
+        }
+        need.retain(|pu, j| credited.get(pu).is_none_or(|&had| had < *j));
+        let mut fan_in: BTreeMap<u16, usize> = BTreeMap::new();
+        let mut fan_out: BTreeMap<u16, usize> = BTreeMap::new();
+        for &(p, u) in need.keys() {
+            *fan_in.entry(u).or_default() += 1;
+            *fan_out.entry(p).or_default() += 1;
+        }
+        let ends_in_arrival = need.iter().all(|(&(p, _), &j)| {
+            let r = &c.ops[j as usize].entries[p as usize];
+            r.end > r.start && arrival(&c.units[p as usize].stream[r.end - 1])
+        });
+        let lower = (need.is_empty() || slot < EDGE_WORDS.len())
+            && fan_in.values().chain(fan_out.values()).all(|&f| f <= fan)
+            && ends_in_arrival;
+        if !lower {
+            real_start = b + 1;
+            slot = 0;
+            credited.clear();
+            continue;
+        }
+        keep[b] = false;
+        if need.is_empty() {
+            continue;
+        }
+        let word = tt_isa::dm::credit_word(EDGE_WORDS[slot]);
+        slot += 1;
+        let mut sends: BTreeMap<(u16, u32), Vec<u16>> = BTreeMap::new();
+        let mut waits: BTreeMap<u16, (usize, u32)> = BTreeMap::new();
+        for (&(p, u), &j) in &need {
+            sends.entry((p, j)).or_default().push(u);
+            let first = run
+                .clone()
+                .find(|&k| !c.ops[k].entries[u as usize].is_empty())
+                .ok_or_else(|| format!("unit {u} depends on op {j} and runs nothing after it"))?;
+            let w = waits.entry(u).or_insert((first, 0));
+            w.1 += 1;
+            credited.insert((p, u), j);
+        }
+        epochs.push(Epoch {
+            barrier: b,
+            word,
+            sends,
+            waits,
+        });
+    }
+    if PROBE_DROP_EDGE.get() {
+        if let Some(e) = epochs.iter_mut().find(|e| !e.sends.is_empty()) {
+            let key = *e.sends.keys().next().expect("a send");
+            let us = e.sends.get_mut(&key).expect("its consumers");
+            us.pop();
+            if us.is_empty() {
+                e.sends.remove(&key);
+            }
+        }
+    }
+    // Every dependency across a lowered barrier is a credit to its unit at or before the op that
+    // needs it, from the same producer's op or a later one, since the last barrier kept.
+    let mut real_start = 0usize;
+    for k in 0..n {
+        if k > 0 && keep[k - 1] {
+            real_start = k;
+        }
+        for (&u, d) in &a.deps[k] {
+            for (&p, &j) in d {
+                let j = j as usize;
+                // Ordered by a barrier kept, or inside a run: the analysis' own.
+                if j < real_start || run_of[j] == run_of[k] {
+                    continue;
+                }
+                let covered = epochs.iter().any(|e| {
+                    e.barrier >= j
+                        && e.barrier < k
+                        && e.waits.get(&u).is_some_and(|&(at, _)| at <= k)
+                        && e.sends
+                            .iter()
+                            .any(|(&(q, i), us)| q == p && i as usize >= j && us.contains(&u))
+                });
+                if !covered {
+                    return Err(format!(
+                        "op {k} on unit {u} follows unit {p}'s op {j} with neither a credit nor a barrier"
+                    ));
+                }
+            }
+        }
+    }
+    // The credits as a dataflow graph: a process a unit's run, each unit's runs in order between a
+    // source and a sink, each credit an edge.
+    {
+        use crate::channel::{Channel, End, Graph, Kind, Page};
+        use tt_isa::dataflow::Endpoint;
+        let runs = run_of.last().map_or(0, |&r| r + 1);
+        let id = |u: u16, r: usize| 2 + u as usize * runs + r;
+        let edge = |from: usize, to: usize, taken: u32| Channel {
+            producer: End {
+                unit: from,
+                endpoint: Endpoint::Writer,
+                tokens: 1,
+            },
+            consumers: vec![End {
+                unit: to,
+                endpoint: Endpoint::Reader,
+                tokens: taken,
+            }],
+            depth: 1,
+            initial: 0,
+            page: Page::Batch,
+            kind: Kind::Remote,
+        };
+        let mut channels = Vec::new();
+        for u in 0..c.units.len() {
+            let ran: Vec<usize> = {
+                let mut v: Vec<usize> = (0..n)
+                    .filter(|&k| !c.ops[k].entries[u].is_empty())
+                    .map(|k| run_of[k])
+                    .collect();
+                v.dedup();
+                v
+            };
+            let (Some(&first), Some(&last)) = (ran.first(), ran.last()) else {
+                continue;
+            };
+            channels.push(edge(0, id(u as u16, first), 1));
+            for w in ran.windows(2) {
+                channels.push(edge(id(u as u16, w[0]), id(u as u16, w[1]), 1));
+            }
+            channels.push(edge(id(u as u16, last), 1, 1));
+        }
+        let mut unbalance = PROBE_UNBALANCE.get();
+        for e in &epochs {
+            for (&(p, j), us) in &e.sends {
+                for &u in us {
+                    let (at, _) = e.waits[&u];
+                    channels.push(edge(
+                        id(p, run_of[j as usize]),
+                        id(u, run_of[at]),
+                        if std::mem::take(&mut unbalance) { 2 } else { 1 },
+                    ));
+                }
+            }
+        }
+        Graph::new(channels)
+            .check()
+            .map_err(|e| format!("the credits as a graph: {e}"))?;
+    }
+    // Every check held: emit, producers' credits before their arrivals and consumers' waits at
+    // their ops' starts.
+    let mut out = Credited {
+        barriers: [kept.len(), 0],
+        ..Credited::default()
+    };
+    for e in &epochs {
+        for (&(p, j), us) in &e.sends {
+            let entries: Vec<[u32; 8]> = us
+                .iter()
+                .map(|&u| {
+                    let (x, y) = coords[u as usize];
+                    [op::CREDIT, x as u32, y as u32, e.word, 1, 0, 0, 0]
+                })
+                .collect();
+            out.edges += entries.len();
+            let at = c.ops[j as usize].entries[p as usize].end - 1;
+            c.insert_entries(p as usize, at, j as usize, &entries);
+        }
+        for (&u, &(k, count)) in &e.waits {
+            let (x, y) = coords[u as usize];
+            let at = c.ops[k].entries[u as usize].start;
+            c.insert_entries(
+                u as usize,
+                at,
+                k,
+                &[
+                    [op::WAIT_CREDIT, e.word, count, 0, 0, 0, 0, 0],
+                    [
+                        op::CREDIT,
+                        x as u32,
+                        y as u32,
+                        e.word,
+                        count.wrapping_neg(),
+                        0,
+                        0,
+                        0,
+                    ],
+                ],
+            );
+            out.waits += 1;
+        }
+    }
+    // Lowered barriers with no credits at all (every dependency already credited) count too.
+    out.barriers[1] = kept.iter().filter(|&&b| !keep[b]).count();
+    LOWERED.fetch_add(out.barriers[1], std::sync::atomic::Ordering::Relaxed);
+    Ok(out)
+}
+
+static LOWERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Barriers [`credit`] has lowered in this process, in every capture: a gate's evidence that a
+/// model's traces ran with credits where it cannot reach their session.
+#[doc(hidden)]
+pub fn lowered_barriers() -> usize {
+    LOWERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,5 +1744,226 @@ mod tests {
         let before = c.units[1].stream.clone();
         assert!(prune(&mut c, &[false, true]).is_err());
         assert_eq!(c.units[1].stream, before);
+    }
+
+    /// Steps at which each data entry ran (by unit and address word), and the credit words after.
+    type Interleaving = (BTreeMap<(usize, u32), usize>, Vec<[u32; 8]>);
+
+    /// Run capture `c`'s streams as the movers would, one entry at a time on a unit picked by
+    /// `seed` among those that can go on: a barrier arrival counts and then waits for its target, a
+    /// wait-only barrier waits, a credit adds to its unit's word, a credit wait waits for its word.
+    fn interleave(c: &Capture, coords: &[(u8, u8)], seed: u64) -> Interleaving {
+        let n = c.units.len();
+        let mut pc = vec![0usize; n];
+        let mut words = vec![[0u32; 8]; n];
+        let mut counter = 0u32;
+        let mut arrived = vec![false; n];
+        let mut ran = BTreeMap::new();
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut step = 0usize;
+        let word = |addr: u32| ((u64::from(addr) - tt_isa::dm::CREDITS) / 16) as usize;
+        let unit_at = |x: u32, y: u32| {
+            coords
+                .iter()
+                .position(|&(a, b)| (u32::from(a), u32::from(b)) == (x, y))
+                .expect("a unit's coordinates")
+        };
+        let reached = |v: u32, t: u32| (v.wrapping_sub(t) as i32) >= 0;
+        loop {
+            let ready: Vec<usize> = (0..n)
+                .filter(|&u| {
+                    let Some(e) = c.units[u].stream.get(pc[u]) else {
+                        return false;
+                    };
+                    match e[0] {
+                        op::BARRIER if e[4] == 0 && !arrived[u] => true,
+                        op::BARRIER => reached(counter, e[1]),
+                        op::WAIT_CREDIT => reached(words[u][word(e[1])], e[2]),
+                        _ => true,
+                    }
+                })
+                .collect();
+            if ready.is_empty() {
+                assert!(
+                    (0..n).all(|u| pc[u] == c.units[u].stream.len()),
+                    "a deadlock at {pc:?}"
+                );
+                return (ran, words);
+            }
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ready[(s >> 33) as usize % ready.len()];
+            let e = c.units[u].stream[pc[u]];
+            step += 1;
+            match e[0] {
+                op::BARRIER if e[4] == 0 && !arrived[u] => {
+                    counter += 1;
+                    arrived[u] = true;
+                    continue;
+                }
+                op::BARRIER => arrived[u] = false,
+                op::CREDIT => {
+                    let w = &mut words[unit_at(e[1], e[2])][word(e[3])];
+                    *w = w.wrapping_add(e[4]);
+                }
+                op::READ | op::WRITE => {
+                    ran.insert((u, e[3]), step);
+                }
+                _ => {}
+            }
+            pc[u] += 1;
+        }
+    }
+
+    /// Four units, four ops: each unit writes its own buffer; then each reads one peer's and
+    /// writes its own (one producer each); then each reads another peer's; then unit 0 reads all
+    /// four (a full barrier). Op `k`'s buffer on unit `u` is at `k << 20 | u << 12`.
+    fn sparse_chain() -> Capture {
+        let at = |k: u32, u: u32| k << 20 | u << 12;
+        let w = |k, u| write(at(k, u));
+        let r = |k, u| read(at(k, u));
+        capture(
+            4,
+            &[
+                (0..4).map(|u| Some(vec![w(0, u)])).collect(),
+                (0..4).map(|u| Some(vec![r(0, u ^ 1), w(1, u)])).collect(),
+                (0..4).map(|u| Some(vec![r(1, u ^ 2), w(2, u)])).collect(),
+                vec![Some((0..4).map(|u| r(2, u)).collect()), None, None, None],
+            ],
+        )
+    }
+
+    /// Whether every dependency of the analysis `a` of `before` holds in each of 300 interleavings
+    /// of `after`: the producer's data entries ran before the consumer's. Every credit word ends
+    /// at zero.
+    fn ordered(
+        a: &Analysis,
+        before: &Capture,
+        after: &Capture,
+        at: &[(u8, u8)],
+    ) -> Result<(), String> {
+        let data = |k: usize, u: usize| -> Vec<u32> {
+            before.units[u].stream[before.ops[k].entries[u].clone()]
+                .iter()
+                .filter(|e| matches!(e[0], op::READ | op::WRITE))
+                .map(|e| e[3])
+                .collect()
+        };
+        for seed in 0..300u64 {
+            let (ran, words) = interleave(after, at, seed);
+            assert!(
+                words.iter().flatten().all(|&v| v == 0),
+                "every word back at zero"
+            );
+            for (k, deps) in a.deps.iter().enumerate() {
+                for (&u, d) in deps {
+                    for (&p, &j) in d {
+                        let (p, u) = (p as usize, u as usize);
+                        let last = data(j as usize, p).iter().map(|&x| ran[&(p, x)]).max();
+                        let first = data(k, u).iter().map(|&x| ran[&(u, x)]).min();
+                        if let (Some(l), Some(f)) = (last, first) {
+                            if l >= f {
+                                return Err(format!(
+                                    "seed {seed}: op {k} on unit {u} ran before op {j} on unit {p}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_barriers_lower_to_credits_that_order_every_dependency() {
+        let before = sparse_chain();
+        let at = coords(4);
+        let a = analyse(&before, &at);
+        let mut keep = keep_from(&a);
+        assert_eq!(keep, [true, true, true, true], "every barrier needed");
+        let mut c = sparse_chain();
+        let done = credit(&mut c, &a, &mut keep, &at, 1).unwrap();
+        // Two barriers lowered, a word each; the full one (unit 0 reads all four) kept.
+        assert_eq!(keep, [false, false, true, true]);
+        assert_eq!(
+            done,
+            Credited {
+                barriers: [3, 2],
+                edges: 8,
+                waits: 8
+            }
+        );
+        let word = tt_isa::dm::credit_word(EDGE_WORDS[0]);
+        // Unit 1 credits unit 0 (whose op 1 reads unit 1's op 0 buffer) just before its arrival.
+        let r = c.ops[0].entries[1].clone();
+        let s = &c.units[1].stream;
+        assert_eq!(s[r.end - 1][0], op::BARRIER);
+        assert_eq!(s[r.end - 2], [op::CREDIT, 1, 2, word, 1, 0, 0, 0]);
+        // Unit 0 waits for that one credit at op 1's start, then returns its word to zero.
+        let r = c.ops[1].entries[0].clone();
+        let s = &c.units[0].stream;
+        assert_eq!(s[r.start], [op::WAIT_CREDIT, word, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(s[r.start + 1][..5], [op::CREDIT, 1, 2, word, u32::MAX]);
+        prune(&mut c, &keep).unwrap();
+        ordered(&a, &before, &c, &at).unwrap();
+        // The control: the same barriers pruned with no credits leave a dependency unordered.
+        let mut bare = sparse_chain();
+        prune(&mut bare, &keep).unwrap();
+        assert!(
+            ordered(&a, &before, &bare, &at).is_err(),
+            "pruned alone, some interleaving races"
+        );
+    }
+
+    #[test]
+    fn a_barrier_past_the_fan_or_the_words_is_kept() {
+        let at = coords(4);
+        let a = analyse(&sparse_chain(), &at);
+        // Unit 0's last op reads all four: three producers, past a fan of two.
+        let mut keep = keep_from(&a);
+        credit(&mut sparse_chain(), &a, &mut keep, &at, 2).unwrap();
+        assert!(keep[2], "the full barrier kept");
+        // A fan of four admits it, but both words are taken by then.
+        let mut keep = keep_from(&a);
+        credit(&mut sparse_chain(), &a, &mut keep, &at, 4).unwrap();
+        assert_eq!(
+            keep,
+            [false, false, true, true],
+            "two words, then a barrier"
+        );
+    }
+
+    #[test]
+    fn a_dropped_edge_and_an_unbalanced_credit_are_refused() {
+        let c0 = sparse_chain();
+        let at = coords(4);
+        let a = analyse(&c0, &at);
+        type Probe = (&'static str, fn(bool), &'static str);
+        let probes: [Probe; 2] = [
+            (
+                "dropped",
+                probe_drop_credit_edge,
+                "neither a credit nor a barrier",
+            ),
+            ("unbalanced", probe_unbalance_credit, "as a graph"),
+        ];
+        for (what, probe, why) in probes {
+            let mut keep = keep_from(&a);
+            let mut c = sparse_chain();
+            probe(true);
+            let r = credit(&mut c, &a, &mut keep, &at, 1);
+            probe(false);
+            let e = r.expect_err(what);
+            println!("{what}: {e}");
+            assert!(e.contains(why), "{what}: {e}");
+            for u in 0..4 {
+                assert_eq!(
+                    c.units[u].stream, c0.units[u].stream,
+                    "{what}: nothing changed"
+                );
+            }
+        }
     }
 }

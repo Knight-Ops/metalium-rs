@@ -363,6 +363,9 @@ pub const SMOKE: &[&str] = &[
     // F4b.2: a measured block choice; the chosen candidate runs bit for bit, a question is
     // timed once, and a capture paused to measure records what it would unpaused.
     "step245_measured_block::",
+    // F4a.1: kept barriers lowered to per-edge credits (opt-in); sparse ops and a SmolLM2-135M
+    // decode replay bit for bit, a dropped edge and an unbalanced credit refused.
+    "step265_edge_credits::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

@@ -503,6 +503,53 @@ impl Capture {
     }
 }
 
+impl Capture {
+    /// Insert `entries` into unit `u`'s stream at `at`, held by op `owner`: inside its range on `u`
+    /// (`at` from its start to its end), which grows by them. Every other range, `PAIR_CALL`
+    /// position and list read ahead at or past `at` follows its entries; a range around `at` grows.
+    /// For the edge credits ([`crate::barriers::credit`]): a producer's credits just before its
+    /// arrival, a consumer's wait at its op's start.
+    pub(crate) fn insert_entries(
+        &mut self,
+        u: usize,
+        at: usize,
+        owner: usize,
+        entries: &[[u32; 8]],
+    ) {
+        let n = entries.len();
+        let held = &self.ops[owner].entries[u];
+        assert!(
+            held.start <= at && at <= held.end,
+            "an insertion outside its op's range"
+        );
+        if n == 0 {
+            return;
+        }
+        let uc = &mut self.units[u];
+        uc.stream.splice(at..at, entries.iter().copied());
+        for p in uc.pair_calls.iter_mut() {
+            if *p >= at {
+                *p += n;
+            }
+        }
+        for (k, op) in self.ops.iter_mut().enumerate() {
+            let r = &mut op.entries[u];
+            if k == owner {
+                r.end += n;
+            } else if r.start > at || (r.start == at && r.start < r.end) {
+                *r = r.start + n..r.end + n;
+            } else if r.end > at {
+                r.end += n;
+            }
+        }
+        for (v, r) in self.ops.iter_mut().flat_map(|op| op.ahead.iter_mut()) {
+            if *v == u && r.start >= at {
+                *r = r.start + n..r.end + n;
+            }
+        }
+    }
+}
+
 /// One unit's share of a finished trace.
 pub(crate) struct UnitTrace {
     /// Its stream in GDDR, its sections after it in the same region, and where
