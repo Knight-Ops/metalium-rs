@@ -83,6 +83,9 @@ pub struct WeightFile {
     pub file: &'static str,
     pub bytes: u64,
     pub sha256: &'static str,
+    /// Fetched only by `--model <model>`, never by a bare `fetch-weights`: the multi-gigabyte
+    /// checkpoints of the architectures past Llama, which no routine gate reads.
+    pub on_request: bool,
 }
 
 pub const WEIGHTS_URL: &str = "https://huggingface.co";
@@ -95,6 +98,7 @@ pub const WEIGHT_FILES: &[WeightFile] = &[
         file: "model.safetensors",
         bytes: 46_807_446,
         sha256: "80c49dee3da4822c009c5a7fe591e9223c5a2cfcf95a4067ca4dfb5a7b89c612",
+        on_request: false,
     },
     WeightFile {
         model: "vit-tiny",
@@ -103,6 +107,7 @@ pub const WEIGHT_FILES: &[WeightFile] = &[
         file: "model.safetensors",
         bytes: 22_883_348,
         sha256: "fecf81b492bd13ee7a5297cb74d1d417aac8bf7e1b7d96aed89c4691984587ed",
+        on_request: false,
     },
     WeightFile {
         model: "smollm2-135m",
@@ -111,6 +116,7 @@ pub const WEIGHT_FILES: &[WeightFile] = &[
         file: "model.safetensors",
         bytes: 269_060_552,
         sha256: "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1",
+        on_request: false,
     },
     WeightFile {
         model: "smollm2-1.7b-instruct",
@@ -119,6 +125,112 @@ pub const WEIGHT_FILES: &[WeightFile] = &[
         file: "model.safetensors",
         bytes: 3_422_777_952,
         sha256: "f55217be716b6a997b97b9d8d7eb6fad02e00858f5010ec24f64603c3a98a0e8",
+        on_request: false,
+    },
+    // Qwen3.5-4B: hybrid Gated DeltaNet and gated attention (`tt_models::qwen35`), BF16 on disk.
+    WeightFile {
+        model: "qwen3.5-4b",
+        repo: "Qwen/Qwen3.5-4B",
+        revision: "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        file: "model.safetensors-00001-of-00002.safetensors",
+        bytes: 5_329_398_688,
+        sha256: "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61",
+        on_request: true,
+    },
+    WeightFile {
+        model: "qwen3.5-4b",
+        repo: "Qwen/Qwen3.5-4B",
+        revision: "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        file: "model.safetensors-00002-of-00002.safetensors",
+        bytes: 3_990_429_408,
+        sha256: "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188",
+        on_request: true,
+    },
+    // NVIDIA-Nemotron-3.5-Bolt-E4B: Gemma 4 E4B's text model (`tt_models::gemma4`), BF16 on disk.
+    // The checkpoint's second file, `model-frozen-shared-kv.safetensors`, holds only the key/value
+    // projections of the layers that share another layer's keys and values, which nothing reads.
+    WeightFile {
+        model: "nemotron-3.5-bolt-e4b",
+        repo: "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16",
+        revision: "49843eed8db1f1c616c47af75cfd36e07aec0667",
+        file: "model-00001-of-00001.safetensors",
+        bytes: 15_882_494_698,
+        sha256: "15006dbbfc99dbde9cc3fb5742b08976837b6ddc9db05b1ceb8b223de8cfc520",
+        on_request: true,
+    },
+    // MOSS-Image-Base: a Qwen3.5 text encoder, a diffusion transformer and the FLUX.2 VAE
+    // (`tt_models::moss_image`), each in its subdirectory of the repository.
+    WeightFile {
+        model: "moss-image-base",
+        repo: "OpenMOSS-Team/MOSS-Image-Base",
+        revision: "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",
+        file: "text_encoder/model-00001-of-00004.safetensors",
+        bytes: 4_973_910_744,
+        sha256: "abfaa3d3a8612508c85ee8f6da9c734b862f10298b903765c4ad384177c32b0b",
+        on_request: true,
+    },
+    WeightFile {
+        model: "moss-image-base",
+        repo: "OpenMOSS-Team/MOSS-Image-Base",
+        revision: "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",
+        file: "text_encoder/model-00002-of-00004.safetensors",
+        bytes: 4_988_364_288,
+        sha256: "9112637fa6bf4d07bafd6ae268852b18d3d0c1242f4ee901c5579006e5bd4894",
+        on_request: true,
+    },
+    WeightFile {
+        model: "moss-image-base",
+        repo: "OpenMOSS-Team/MOSS-Image-Base",
+        revision: "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",
+        file: "text_encoder/model-00003-of-00004.safetensors",
+        bytes: 4_954_202_112,
+        sha256: "956f1ef51d0cfe610b0d22987c0b7821c36e3ce228abceccef523518bcf079dc",
+        on_request: true,
+    },
+    WeightFile {
+        model: "moss-image-base",
+        repo: "OpenMOSS-Team/MOSS-Image-Base",
+        revision: "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",
+        file: "text_encoder/model-00004-of-00004.safetensors",
+        bytes: 1_869_001_848,
+        sha256: "9e21d20e8adde88c3e0b65d4a0d251f143d98ee9d52db36b4348361091e4e208",
+        on_request: true,
+    },
+    WeightFile {
+        model: "moss-image-base",
+        repo: "OpenMOSS-Team/MOSS-Image-Base",
+        revision: "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",
+        file: "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+        bytes: 4_991_978_016,
+        sha256: "ae085fba123b6df67daf90aa9698fadee60c73e45bcaf3f3043d15f34e7a1804",
+        on_request: true,
+    },
+    WeightFile {
+        model: "moss-image-base",
+        repo: "OpenMOSS-Team/MOSS-Image-Base",
+        revision: "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",
+        file: "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+        bytes: 4_983_137_016,
+        sha256: "806e876d80c7fba560663a3a95580e6c7033da3f9ea3c52765245ef0e1818f75",
+        on_request: true,
+    },
+    WeightFile {
+        model: "moss-image-base",
+        repo: "OpenMOSS-Team/MOSS-Image-Base",
+        revision: "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",
+        file: "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+        bytes: 189_549_184,
+        sha256: "5f319b72c40324294007c270d78112425627b537fcd8769b3c00f9f070e506a9",
+        on_request: true,
+    },
+    WeightFile {
+        model: "moss-image-base",
+        repo: "OpenMOSS-Team/MOSS-Image-Base",
+        revision: "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",
+        file: "vae/diffusion_pytorch_model.safetensors",
+        bytes: 249_521_372,
+        sha256: "c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a",
+        on_request: true,
     },
 ];
 

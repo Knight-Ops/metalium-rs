@@ -2,12 +2,15 @@
 //!
 //! Dev-only (`xtask/src/ship.rs`): it depends on burn-flex as the host reference.
 
+pub mod gemma4;
 pub mod generate;
 pub mod image_input;
 pub mod kv_cache;
 pub mod llama;
 pub mod load;
+pub mod moss_image;
 pub mod quant;
+pub mod qwen35;
 pub mod resnet;
 pub mod rope;
 pub mod vit;

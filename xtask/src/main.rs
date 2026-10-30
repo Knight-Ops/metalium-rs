@@ -78,9 +78,12 @@ tasks:
                           training gate reads it
   fetch-weights [--model <name>] [--force]
                           download the pinned pretrained weights (resnet18,
-                          vit-tiny, smollm2-135m) and test images (images) into
-                          vendor/weights/<name>/ and verify each against its
-                          pinned length and SHA-256; tt-models reads them
+                          vit-tiny, smollm2-135m, smollm2-1.7b-instruct) and test
+                          images (images) into vendor/weights/<name>/ and verify
+                          each against its pinned length and SHA-256; tt-models
+                          reads them. The larger architectures (qwen3.5-4b,
+                          nemotron-3.5-bolt-e4b, moss-image-base) are
+                          fetched only when named with --model
   fetch-burn-tests [--force]
                           download Burn's backend test suite (the pinned tag's
                           crates/burn-backend-tests/tests) into

@@ -256,6 +256,64 @@ pub trait FixedShapeCache<B: Backend> {
     fn set_state(&mut self, state: Vec<Tensor<B, 4>>);
 }
 
+/// A language model run eagerly, a prompt then a token a step, with a cache it grows: what a gate
+/// compares between two backends whatever the architecture (`tt-tests`'s `ladder_support`).
+pub trait EagerDecoder<B: Backend> {
+    /// Greedy decoding: `steps` tokens after `prompt`, each chosen from the previous step's logits.
+    fn generate(
+        &self,
+        prompt: &[i32],
+        steps: usize,
+        precision: crate::llama::Precision,
+        device: &B::Device,
+    ) -> Generation;
+
+    /// The predictions after `prompt` and after each prefix of `continuation`, feeding the
+    /// continuation's own tokens, so two backends are compared on the same inputs at every step.
+    fn forced(
+        &self,
+        prompt: &[i32],
+        continuation: &[i32],
+        precision: crate::llama::Precision,
+        device: &B::Device,
+    ) -> Generation;
+}
+
+/// The steps of [`EagerDecoder`] over one forward function: the prompt, then each next token,
+/// chosen greedily (`continuation: None`) or fed.
+pub(crate) fn eager<B: Backend>(
+    prompt: &[i32],
+    steps: usize,
+    continuation: Option<&[i32]>,
+    device: &B::Device,
+    mut forward: impl FnMut(Tensor<B, 2, Int>) -> Tensor<B, 2>,
+) -> Generation {
+    let ids = |tokens: &[i32]| {
+        Tensor::<B, 2, Int>::from_data(TensorData::new(tokens.to_vec(), [1, tokens.len()]), device)
+    };
+    let mut out = Generation::new(steps);
+    out.step(|| forward(ids(prompt)));
+    match continuation {
+        None => {
+            assert!(steps >= 1);
+            for step in 0..steps {
+                let next = argmax(out.logits.last().expect("one prediction per step")) as i32;
+                out.tokens.push(next);
+                if step + 1 < steps {
+                    out.step(|| forward(ids(&[next])));
+                }
+            }
+        }
+        Some(fed) => {
+            out.tokens = fed.to_vec();
+            for &token in fed {
+                out.step(|| forward(ids(&[token])));
+            }
+        }
+    }
+    out
+}
+
 /// A decoder whose steps have shapes that depend only on how many tokens they take: see the
 /// module documentation.
 pub trait FixedShapeDecoder<B: Backend> {

@@ -10,8 +10,10 @@ Dev-only (`xtask/src/ship.rs`): `burn-flex` is the host reference. Nothing here 
 ## Fetching what it runs on
 
 ```bash
-cargo xtask fetch-weights                 # everything below, 3.8 GB (SmolLM2-1.7B is 3.4 of it)
+cargo xtask fetch-weights                 # rungs 1-4, 3.8 GB (SmolLM2-1.7B is 3.4 of it)
 cargo xtask fetch-weights --model resnet18
+cargo xtask fetch-weights --model qwen3.5-4b   # rungs 5-7 only by name (on_request): 9.3,
+                                               # 15.9 and 27.2 GB
 ```
 
 Every file is pinned in `PINS.toml` (`[weights]`) by Hugging Face commit, length and SHA-256, and
@@ -25,6 +27,9 @@ read it are ignored unless `--features weights` (the `tt-tests` model ladder run
 | 2 | ViT-Tiny/16, 224 | `timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k` | patch convolution, layer norm, GELU, `attention`, class token, position embedding |
 | 3 | SmolLM2-135M (Llama architecture) | `HuggingFaceTB/SmolLM2-135M` (BF16) | RMSNorm, SiLU, RoPE (`sin`/`cos` on the device), grouped-query attention, `slice_assign` KV cache, embedding of a 49,152-token vocabulary, tied output head |
 | 4 | SmolLM2-1.7B-Instruct (Llama architecture, 3.4 GB) | `HuggingFaceTB/SmolLM2-1.7B-Instruct` (BF16) | the same at 24 layers of width 2048 and 32 heads: the first model past 1B parameters, and the one performance is measured on |
+| 5 | Qwen3.5-4B (`qwen35`, text) | `Qwen/Qwen3.5-4B` (BF16, two shards) | Gated DeltaNet: a depthwise causal convolution with carried inputs, softplus/exp decay, L2-normed q/k, the delta-rule recurrence a token at a time with an F32 state, a SiLU-gated norm; gated full attention with q/k norms and a partial rotary embedding; zero-centred norms |
+| 6 | Nemotron-3.5-Bolt-E4B (`gemma4`, Gemma 4 E4B text) | `nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16` | per-layer embeddings (a 2.8-billion-entry table), sliding-window and full attention of different head widths, "proportional" rotary embedding, layers sharing keys and values, gelu-tanh, norms around every sub-block, soft-capped logits |
+| 7 | MOSS-Image-Base (`moss_image`, text to image) | `OpenMOSS-Team/MOSS-Image-Base` (encoder and DiT BF16, VAE F32) | a Qwen3.5 text encoder; a diffusion transformer (shared adaLN modulation, four-axis rotary embedding, the situ activation, non-causal attention); a flow-matching Euler schedule with guidance; the FLUX.2 VAE decoder (convolutions, group norm, pixel attention, nearest upsampling as a broadcast) |
 
 The test photographs (`vendor/weights/images/`) are five natural images, so a top-1 comparison is
 between real classes and not near-tied logits of noise.
@@ -93,13 +98,17 @@ cache. It runs on Llama shapes SmolLM2 lacks (multi-head attention, GQA 4:1, hea
 untied heads, ragged widths) and on a GPT-2-style decoder, with SmolLM2's checkpoint added once
 `cargo xtask fetch-weights` has run. All of it runs on silicon (`cargo xtask silicon`), not ttsim.
 
-## The `transformers` reference (`reference/llama_reference.py`)
+## The `transformers` reference (`reference/*.py`)
 
 Device against burn-flex checks the backend: both run this crate's `Llama`. Whether that `Llama` *is* the model is
 checked against HuggingFace `transformers`. `reference/llama_reference.py` is a uv script (dev-only) whose header pins
 `transformers` and torch (CPU). It runs a pinned checkpoint from the verified local file and prints, as Rust, its
 `config.json` as a `LlamaConfig` (to compare with the preset), the token ids and top-10 logits of each prompt (raw or
 chat-templated), and a greedy continuation. `tests/llama_1_7b_host.rs` holds the values it printed and the command.
+`qwen35_reference.py`, `gemma4_reference.py` and `moss_image_reference.py` do the same for rungs 5-7
+(`tests/qwen35_host.rs`, `gemma4_host.rs`, `moss_image_host.rs`); the last runs the checkpoint's own
+`pipeline_moss_image.py` at the pinned revision part by part on synthetic latents and prints each
+tensor's mean, RMS and sixteen samples. See `docs/plans/new-architectures.md`.
 
 ## Mixed precision (`quant.rs`)
 

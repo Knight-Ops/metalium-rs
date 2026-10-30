@@ -24,12 +24,31 @@ impl<B: Backend> Rope<B> {
         dtype: DType,
         device: &B::Device,
     ) -> Self {
+        Self::with_frequencies(
+            start,
+            t,
+            &frequencies(head_dim, head_dim / 2, theta),
+            dtype,
+            device,
+        )
+    }
+
+    /// [`Rope::new`] with each rotated pair's frequency given: `freqs[i]` turns dimensions `i` and
+    /// `i + head_dim / 2`, `head_dim` being twice `freqs.len()`. A zero frequency leaves its pair
+    /// as it is (`cos 0 = 1`, `sin 0 = 0`), which is how a partial rotation laid over the whole
+    /// head is written (Gemma 4's "proportional" embedding, [`frequencies`]).
+    pub fn with_frequencies(
+        start: usize,
+        t: usize,
+        freqs: &[f32],
+        dtype: DType,
+        device: &B::Device,
+    ) -> Self {
+        let half = freqs.len();
+        let head_dim = 2 * half;
         let positions: Vec<f32> = (start..start + t).map(|p| p as f32).collect();
-        let freqs: Vec<f32> = (0..head_dim / 2)
-            .map(|i| theta.powf(-(2.0 * i as f64) / head_dim as f64) as f32)
-            .collect();
         let pos = Tensor::<B, 2>::from_data(TensorData::new(positions, [t, 1]), device);
-        let freq = Tensor::<B, 2>::from_data(TensorData::new(freqs, [1, head_dim / 2]), device);
+        let freq = Tensor::<B, 2>::from_data(TensorData::new(freqs.to_vec(), [1, half]), device);
         let angles = pos * freq;
         let sin = angles.clone().sin();
         let sin = Tensor::cat(vec![sin.clone().neg(), sin], 1).reshape([1, 1, t, head_dim]);
@@ -37,6 +56,37 @@ impl<B: Backend> Rope<B> {
         Self {
             cos: angles.cos().cast(dtype),
             sin: sin.cast(dtype),
+        }
+    }
+
+    /// Tables from each position's angles, `angles[p half + i]` turning pair `i` (dimensions `i`
+    /// and `i + half`) of position `p`: for an embedding whose angle is not one position times one
+    /// frequency, such as one over several axes (an image's rows and columns). The angles are host
+    /// data; the `sin` and `cos` run on the device.
+    pub fn from_angles(
+        angles: Vec<f32>,
+        t: usize,
+        half: usize,
+        dtype: DType,
+        device: &B::Device,
+    ) -> Self {
+        assert_eq!(angles.len(), t * half, "{t} positions of {half} pairs");
+        let angles = Tensor::<B, 2>::from_data(TensorData::new(angles, [t, half]), device);
+        let sin = angles.clone().sin();
+        let sin = Tensor::cat(vec![sin.clone().neg(), sin], 1).reshape([1, 1, t, 2 * half]);
+        let angles = Tensor::cat(vec![angles.clone(), angles], 1).reshape([1, 1, t, 2 * half]);
+        Self {
+            cos: angles.cos().cast(dtype),
+            sin: sin.cast(dtype),
+        }
+    }
+
+    /// The tables of positions `from..to` of these.
+    pub fn rows(&self, from: usize, to: usize) -> Self {
+        let [a, b, _, d] = self.cos.dims();
+        Self {
+            cos: self.cos.clone().slice([0..a, 0..b, from..to, 0..d]),
+            sin: self.sin.clone().slice([0..a, 0..b, from..to, 0..d]),
         }
     }
 
@@ -90,4 +140,24 @@ impl<B: Backend> Rope<B> {
         let swapped = Tensor::cat(vec![x2, x1], 3);
         x * self.cos.clone() + swapped * self.sin.clone()
     }
+}
+
+/// The rotary frequencies of a head of `head_dim` whose first `rotated` pairs turn:
+/// `theta^(-2i / head_dim)` for `i < rotated`, zero after. `rotated = head_dim / 2` is the ordinary
+/// embedding; fewer is a partial rotation spread over the whole head, the exponent's denominator
+/// still the head's width (`transformers`' "proportional" RoPE).
+pub fn frequencies(head_dim: usize, rotated: usize, theta: f64) -> Vec<f32> {
+    assert!(
+        head_dim % 2 == 0 && rotated <= head_dim / 2,
+        "{rotated} rotated pairs of a head of {head_dim}"
+    );
+    (0..head_dim / 2)
+        .map(|i| {
+            if i < rotated {
+                theta.powf(-(2.0 * i as f64) / head_dim as f64) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
