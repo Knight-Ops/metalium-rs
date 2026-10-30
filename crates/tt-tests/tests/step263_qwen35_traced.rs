@@ -128,10 +128,24 @@ fn traced_generation_equals_the_eager_one_and_agrees_with_flex() {
             traced.push(got);
         }
 
-        // The eager model, growing state, on the card: bit for bit.
-        for (p, got) in prompts.iter().zip(&traced) {
+        eager_and_control(&model, &shapes, &prompts, &traced, &d);
+    });
+}
+
+/// `traced` (the traced generations of `prompts`) bit for bit against the eager model's growing
+/// state on the card, then the negative control: the first prompt (which pads a chunk) without the
+/// padding mask leaves its own logits and moves the decode steps'.
+fn eager_and_control(
+    model: &Qwen35<TtBackend>,
+    shapes: &Shapes,
+    prompts: &[Vec<i32>],
+    traced: &[Generation],
+    d: &burn_tt::TtDevice,
+) {
+    {
+        for (p, got) in prompts.iter().zip(traced) {
             let t0 = std::time::Instant::now();
-            let eager = model.generate(p, STEPS, Precision::F32, &d);
+            let eager = model.generate(p, STEPS, Precision::F32, d);
             eprintln!(
                 "eager, prompt {}: {:.1} s, decode steps {:.0?} ms",
                 p.len(),
@@ -146,7 +160,8 @@ fn traced_generation_equals_the_eager_one_and_agrees_with_flex() {
         }
 
         // The negative control: the chat prompt's padded chunk without the mask.
-        let unmasked = generate_fixed(&UnmaskedPadding(&model), &CHAT, STEPS, &shapes, &d).unwrap();
+        let unmasked =
+            generate_fixed(&UnmaskedPadding(model), &prompts[0], STEPS, shapes, d).unwrap();
         let want = &traced[0];
         assert_eq!(
             ladder_support::bits(&unmasked.logits[0]),
@@ -167,5 +182,32 @@ fn traced_generation_equals_the_eager_one_and_agrees_with_flex() {
             moved > 1e-2,
             "the padding rows' mask changes nothing ({moved}): the control cannot fail"
         );
+    }
+}
+
+/// The first four layers (three DeltaNets and a full-attention layer), traced against eager on the
+/// card with the negative control, without burn-flex: what the whole gate claims of the traces, in
+/// a minute rather than ten.
+#[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask fetch-weights --model qwen3.5-4b, then cargo xtask silicon --release --filter step263_qwen35_traced"
+)]
+fn the_first_layers_trace_as_they_run_eagerly() {
+    let prompts = vec![CHAT.to_vec(), ladder_support::prompt(5, QWEN3_5_4B.vocab)];
+    let shapes = Shapes::new(64, &[8, 16]).with_prefixes(&[]);
+    let config = Config {
+        tiles: Some(burn_tt::TileChoice::All),
+        ..Config::default()
+    };
+    with_device(config, |d| {
+        let (model, _) = Qwen35::<TtBackend>::qwen3_5_4b(4, Precision::F32, &d).unwrap();
+        let model = model.with_bf16_weights();
+        let g = ladder_support::traced(&model, &shapes, &d);
+        let traced: Vec<Generation> = prompts
+            .iter()
+            .map(|p| ladder_support::generate(&g, p, STEPS))
+            .collect();
+        eager_and_control(&model, &shapes, &prompts, &traced, &d);
     });
 }
