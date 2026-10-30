@@ -72,7 +72,7 @@ fn decode_ms(g: &Generation) -> Vec<f64> {
 #[test]
 #[cfg_attr(
     not(feature = "silicon"),
-    ignore = "model workload, silicon tier: cargo xtask fetch-weights --model qwen3.5-4b, then cargo xtask silicon --release --filter step263_qwen35_traced"
+    ignore = "model workload, silicon tier: cargo xtask fetch-weights --model qwen3.5-4b, then cargo xtask silicon --release --timeout-secs 2400 --filter step263_qwen35_traced"
 )]
 fn traced_generation_equals_the_eager_one_and_agrees_with_flex() {
     let prompts = prompts();
@@ -191,7 +191,7 @@ fn eager_and_control(
 #[test]
 #[cfg_attr(
     not(feature = "silicon"),
-    ignore = "model workload, silicon tier: cargo xtask fetch-weights --model qwen3.5-4b, then cargo xtask silicon --release --filter step263_qwen35_traced"
+    ignore = "model workload, silicon tier: cargo xtask fetch-weights --model qwen3.5-4b, then cargo xtask silicon --release --timeout-secs 2400 --filter step263_qwen35_traced"
 )]
 fn the_first_layers_trace_as_they_run_eagerly() {
     let prompts = vec![CHAT.to_vec(), ladder_support::prompt(5, QWEN3_5_4B.vocab)];
