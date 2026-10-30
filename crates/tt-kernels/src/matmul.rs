@@ -1479,9 +1479,12 @@ thread_local! {
 /// output takes its pairs in ascending `K`, each pair's `MVMUL`s the tiles order's, at its tile's
 /// rows (`DEST_TARGET_REG_CFG_MATH_Offset`), so its bits are [`block_stream_kernel_looped`]'s.
 ///
-/// A half is cleared tile by tile in sixteen-row blocks (`ZEROACC` mode 1, as
+/// A first chunk's half is cleared tile by tile in sixteen-row blocks (`ZEROACC` mode 1, as
 /// `matrix_eltwise` clears an FP32 half; never one-row, divergence rows 51-52). A continuing chunk
-/// reloads each tile's prior at its rows. The pack role packs each tile from its rows
+/// reloads each tile's prior at its rows instead, every row of them, once the math role has handed
+/// the half over (`cleared`; never under running `MVMUL`s, which silicon refuses:
+/// `silicon-operating-notes.md`), switching only the `Config` words the reload changes
+/// ([`reload_switch`]). The pack role packs each tile from its rows
 /// (`DEST_TARGET_REG_CFG_PACK_SEC0_Offset`). The roles' programs repeat one period of block rows
 /// ([`crate::tile_op::dst::RowPlan::rows_a_period`]). `None` for a pair order that is not the tiles
 /// order, or where the loops do not fit the runner's header.
@@ -1594,6 +1597,7 @@ pub(crate) fn block_stream_kernel_subblocked(
     if continuing {
         set(&mut unpack, PRIOR_GPR, units(prior0) - slot);
     }
+    let (to_dst, to_src) = reload_switch(&words, prior0);
     let unpack_row = |r: usize| -> Vec<Instruction> {
         let mut p = vec![
             encode::adddmareg(A_ROW_GPR, A_ROW_STEP_GPR, A_ROW_GPR).unwrap(),
@@ -1603,11 +1607,11 @@ pub(crate) fn block_stream_kernel_subblocked(
             let (w, x) = (sb.w, width_index(sb.w));
             if continuing {
                 p.extend(sync::take(layout.cleared, Before::UNPACKER));
-                p.extend(crate::datapath::thread_config());
+                // Only what differs between the `Src` path and the `Dst` one is written, each way
+                // ([`reload_switch`]).
+                p.push(src_set_ovrd(false));
                 p.extend(crate::datapath::clear_unpacker0_adcs());
-                let mut prior_words = ConfigWords::new();
-                crate::datapath::tile_unpack_config(&mut prior_words, prior0);
-                p.extend(config_program(&prior_words));
+                p.extend(config_program(&to_dst));
                 for t in 0..w {
                     p.extend(crate::datapath::unpack_datums_to_dst_gpr(
                         PRIOR_GPR,
@@ -1617,9 +1621,9 @@ pub(crate) fn block_stream_kernel_subblocked(
                     ));
                 }
                 p.extend(sync::post_after(Unit::Unpacker0, layout.loaded));
-                p.extend(src_thread_config());
+                p.push(src_set_ovrd(true));
                 p.extend(crate::datapath::clear_unpacker0_adcs());
-                p.extend(config_program(&words));
+                p.extend(config_program(&to_src));
                 p.extend(adc.iter().copied());
             }
             // The subblock's first pair: `A`'s row, `B`'s first column; then the next subblock's.
@@ -1718,8 +1722,9 @@ pub(crate) fn block_stream_kernel_subblocked(
                 i(&mut p, &sync::take(layout.sems.free, Before::MATRIX));
                 if mutation == DstMutation::ClearBoth {
                     i(&mut p, &[encode::zeroacc(3, 0, 0, 0).unwrap()]);
-                } else {
+                } else if !continuing {
                     // Each tile's 64 FP32 rows, eight at a time: sixteen 16-bit rows a `ZEROACC`.
+                    // A continuing chunk's reload writes every row of its tiles instead.
                     for t in 0..w {
                         let first = row_of(section, t);
                         for q in 0..dst_tile_blocks() {
@@ -1873,6 +1878,49 @@ pub(crate) fn block_stream_kernel_subblocked(
         })
     });
     fits.then_some((code, loops))
+}
+
+/// The `Config` words a reload changes and changes back, as two minimal programs' words: `to_dst`,
+/// [`datapath::tile_unpack_config`]'s words for a prior at `prior` that the `Src` path's `words`
+/// do not already hold; `to_src`, `words`' own values of every word the reload touched (those,
+/// unpacker 0's base and its `Dst` context address) where they differ. Every other word keeps the
+/// `Src` path's value throughout, so the unpacker sees what a whole rewrite each way gave it, at a
+/// fraction of the words.
+///
+/// [`datapath::tile_unpack_config`]: crate::datapath::tile_unpack_config
+fn reload_switch(words: &ConfigWords, prior: u64) -> (ConfigWords, ConfigWords) {
+    let mut prior_words = ConfigWords::new();
+    crate::datapath::tile_unpack_config(&mut prior_words, prior);
+    let value = |w: &ConfigWords, a: u16| w.words().iter().find(|&&(x, _)| x == a).map(|&(_, v)| v);
+    let mut to_dst = ConfigWords::new();
+    for &(a, v) in prior_words.words() {
+        if value(words, a) != Some(v) {
+            to_dst.seed(a, v).expect("as many words as the prior's");
+        }
+    }
+    // Written past `to_dst` by each tile's reload (`datapath::unpack_datums_to_dst_gpr`).
+    let rewritten = [
+        thcon::THCON_SEC0_REG3_Base_address.addr32(),
+        thcon::THCON_SEC0_REG5_Dest_cntx0_address.addr32(),
+    ];
+    let mut to_src = ConfigWords::new();
+    for &(a, v) in words.words() {
+        let prior_v = value(&prior_words, a);
+        if rewritten.contains(&a) || prior_v.is_some_and(|p| p != v) {
+            to_src.seed(a, v).expect("as many words as the Src path's");
+        }
+    }
+    (to_dst, to_src)
+}
+
+/// The one `ThreadConfig` entry the `Src` path and the `Dst` path set differently
+/// ([`datapath::src_thread_config`], [`datapath::thread_config`]): `SRCA_SET_SetOvrdWithAddr`, set
+/// for `Src` and clear for `UnpackToDst`.
+///
+/// [`datapath::src_thread_config`]: crate::datapath::src_thread_config
+/// [`datapath::thread_config`]: crate::datapath::thread_config
+fn src_set_ovrd(on: bool) -> Instruction {
+    crate::datapath::thread_entry(thread::SRCA_SET_SetOvrdWithAddr, u16::from(on))
 }
 
 /// `ZEROACC` sixteen-row blocks an FP32 tile's 64 rows take (eight FP32 rows each).
