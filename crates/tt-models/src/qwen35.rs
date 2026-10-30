@@ -755,7 +755,10 @@ impl<B: Backend> GatedDeltaNet<B> {
         let v = split(2 * key_dim, 2 * key_dim + value_dim, vh, vd);
         // `[1, v_heads, t, width]`, and the per-token scalars `[1, v_heads, t, 1]`.
         let (q, k, v) = (q.swap_dims(1, 2), k.swap_dims(1, 2), v.swap_dims(1, 2));
-        let decay = decay.swap_dims(1, 2).unsqueeze_dim::<4>(3);
+        // Each token's decay as a column of the state's `[v_heads k_dim, v_dim]` matrix, `[1, t,
+        // v_heads, k_dim]`: the card multiplies the state by a column where it lies, where a
+        // scalar a head would first be expanded to the state's whole size.
+        let decay = decay.unsqueeze_dim::<4>(3).expand([n, t, vh, kd]);
         let beta = beta.swap_dims(1, 2).unsqueeze_dim::<4>(3);
 
         let mut outs = Vec::with_capacity(t);
@@ -763,11 +766,16 @@ impl<B: Backend> GatedDeltaNet<B> {
             let row =
                 |x: &Tensor<B, 4>, width: usize| x.clone().slice([0..n, 0..vh, i..i + 1, 0..width]);
             let (q_i, k_i, v_i) = (row(&q, kd), row(&k, kd), row(&v, vd));
-            let state = s.clone() * row(&decay, 1);
-            // What the state already predicts for this key, and the correction written for it.
+            let decay_i = decay
+                .clone()
+                .slice([0..n, i..i + 1, 0..vh, 0..kd])
+                .reshape([n, vh, kd, 1]);
+            let state = s.clone() * decay_i;
+            // What the state already predicts for this key, and the correction written for it
+            // (the key as a column: `k^T`, the same values).
             let predicted = k_i.clone().matmul(state.clone());
             let delta = (v_i - predicted) * row(&beta, 1);
-            let state = state + k_i.swap_dims(2, 3).matmul(delta);
+            let state = state + k_i.reshape([n, vh, kd, 1]).matmul(delta);
             outs.push(q_i.matmul(state.clone()));
             *s = state;
         }
