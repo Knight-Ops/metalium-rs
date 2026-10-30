@@ -616,6 +616,11 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
     but for its label) and `step205`'s three tests and their unit tests. `step205` 8 of 8 on ttsim.
 - **Prediction:** the 1.7B decode step's card read rate ≥400 GB/s (from 328) and the step ≤9.5 ms (from 10.9), bit-exact.
 - **Kill:** the step moves <0.3 ms, or small ops lose what products gain.
+- **Lane A's close (2026-10-30, card 1, at `8a354a0`): the kill fires.** 10.978 / 12.184 and 10.953 / 12.149 ms
+  (`1793392717`, `1793394056`) against A0's 11.013 / 12.162; `Step(64)` 10,548.2 us at 341 GB/s (`1793392975`).
+  F4a.2's busy lists (A0 already) are what F4a bought; nothing since moves the step. Gates at the close: 30 of 30
+  small (`1793391769`), 21 of 21 models and MNIST with its goldens unchanged (`1793393729`), `step260` / `step261`
+  digit for digit A0's (`1793394314`). The tails are the products' slowest units, which F5 and F6 address.
 
 ## Stage F5 (compute): `Dst` subblocks and half-sync, H2
 

@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules](#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1) | 2026-10-30 | lane A, card 1: idle units' lists pumped and moved before their anchor's arrival 0.24 / 0.17 ms slower (opt-in); kept barriers lowered to per-edge credits, built and checked, +0.03 / +0.06 at fan 4 (opt-in); the handoff, second job and balanced deal not faster, retired; the lists' L1 room not built (a second job read ahead is slower). Close 10.98 / 12.18 ms against A0's 11.01 / 12.16, `Step(64)` 10.55 ms at 341 GB/s: **H4's kill fires** |
 | [F4a.0: what overlap can buy a decode step; the tails split by unit](#f4a0-what-overlap-can-buy-a-decode-step-the-tails-split-by-unit-2026-10-29-card-1) | 2026-10-29 | 1.7B `Step(64)` 10.91 ms at 327 GB/s; a product's own units fall 92 -> 20 by its last eighth and nothing reads ahead in its tail (each unit's next list sits after its arrival): 2.45 ms of capacity unused; weights made free 5.33 ms; H4's kill does not fire. F4a.2: busy lists moved to before the arrival (B pumps them at the barrier), **11.32 / 12.69 -> 10.95 / 12.16 ms**, 340 GB/s, the default; idle lists moved too: 0.6 ms slower than off (their reads are in line), reverted |
 | [F4b.2: a block measured on the card, `A` pulled where it gains](#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1) | 2026-10-29 | the default since: sweeps of every block x pull at 10 prefill shapes (the best 1.0-2.1x `Auto`'s, ranked low by every model); `Auto`'s, 12 listed blocks and a climb timed in a capture as a difference of traces: 1.02-2.25x `Auto` over 50 cases, H1 FP32 35.5 / BF16 49.5 / BFP4 65.4 TFLOPS a product; through Burn H1 19.2 -> **29.2 TFLOPS**, 1.7B prefill 1.04-1.34x, models and decode unchanged; eager runs `Auto`'s |
 | [D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever](#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1) | 2026-10-29 | three prefill shapes x every `B` format x the schemes: `A` pulled 1.33-1.44x with FP32 `B` (H1 28.38 TFLOPS); `B` pulled loses; a packed `B` is bound by the block (H1 `[6,4,12]` + `A` pulled 44.5-45.8, 1.7x), shape-dependent |
@@ -390,6 +391,51 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules (2026-10-30, card 1)
+
+Lane A of the F4a/F5 split ([plan](../plans/dataflow-compiler.md) F4a, H4 in the
+[Bible](dataflow-compiler.md#13-hypotheses-register)), branch `f4a-channels` from `715ef1b`. SmolLM2-1.7B-Instruct,
+BF16 weights, `TT_TILES=all`, release, safe image, card 1 (shared with two other agents; every model-scale run under
+the host-memory lock), `silicon_bench_models::traced_generation_stream_ceiling` (2 warmups, 9 samples, medians);
+host-timed decode step at 32 / 256 tokens. Each comparison is ABBA in one sitting; card 1 drifts ~0.1 ms between
+sittings.
+
+**A0, at `715ef1b`:** 11.013 / 12.162 ms (`1793332665`); profile `Step(64)` 10,544.6 us, 3,585 MB at 340 GB/s, tail
+slack 1,281 us, 1,008 of it the products' (`1793332922`). `step260` / `step261` (card 1, `1793334889`, from a
+pristine `715ef1b` tree): Qwen3.5 F32 and BF16 weights `max |flex - device| 8.8649e-2` against a largest logit of
+33.1233, closest top-1 margin 2.4619; Gemma 4 7.8731e-2 against 29.9118, margin 13.7504.
+
+| step | what | off | on | runs |
+|---|---|---|---|---|
+| A1 | idle units' lists pumped (`GATHER_PREFETCH`) and moved before their anchor's arrival (`TT_IDLE_AHEAD_EARLY`) | 10.932 / 12.110, 10.954 / 12.161 | 11.243 / 12.304, 11.127 / 12.315 | `1793338877`-`1793345003` |
+| A2 | kept barriers lowered to edge credits, fan 4 (`TT_EDGE_CREDITS=4`) | 10.981 / 12.140, 11.013 / 12.143 | 11.042 / 12.195, 11.018 / 12.201 | `1793347800`-`1793349018` |
+| A4 | K-chain handoff (`TT_STREAM_HANDOFF`) | 10.891 / 12.103, 10.938 / 12.140 | 10.900 / 12.164, 10.861 / 12.145 | `1793386897`-`1793390634` |
+| A4 | second prefetched job (`TT_PREFETCH_SECOND`) | (as above) | 11.137 / 12.372, 11.144 / 12.380 | `1793388898`, `1793389659` |
+| A4 | balanced deal (`TT_BALANCED_DEAL`) | (as above) | 11.060 / 12.298, 11.082 / 12.316 | `1793389154`, `1793389405` |
+
+- **A1.** Pumped, an idle list no longer holds the barrier (the in-line version was 0.6 ms slower), but moved early it is
+  still 0.24 / 0.17 ms slower: its reads leave the small ops' window, which had room (ahead 141-337 GB/s under the
+  small ops in A0's tails), for the anchor's tail, which the product's own units and the busy lists already read in.
+  Off by default; the pumped lists stay where they were, bit for bit and within noise of A0.
+- **A2.** Built and correct (`barriers::credit`; unit tests interleave the lowered streams 300 ways and find the
+  control's race; `step265` on card 1, `1793345620`, and a SmolLM2-135M traced decode with 711 barriers lowered equal
+  to its eager one, `1793343055`). What a `Step(64)` admits (`TT_PROBE_BARRIERS`, `1793338608`): of 272 kept
+  barriers, fan 1-4 lowers the 48 after products into their residual adds (64 credits each); fan 8 another 74 for
+  21,366 credits a step; the rest fan in from a product's every unit. Not faster: the add's units still wait for
+  their producing units, whose work is the product's slowest.
+- **A3, not built.** One queued prefetch a unit (`mover.rs`) would bind only if a second job read ahead paid; the
+  second prefetched job, which is exactly that in the trace arena's room, is 0.23 / 0.25 ms slower.
+- **A4.** All three schedules retired (code, setters, knobs, golden cases, `step205` tests).
+- An extra sample of the default schedule at `0148394` (the retired code still there, off): 10.955 / 12.190
+  (`1793391356`).
+
+**Close, at `8a354a0`:** 10.978 / 12.184 and 10.953 / 12.149 ms (`1793392717`, `1793394056`) against A0's 11.013 /
+12.162; profile `Step(64)` 10,548.2 us at 341 GB/s, tail slack 1,414 us (`1793392975`), A0's 10,544.6 / 340 / 1,281.
+**H4's kill fires**: the step moved < 0.3 ms (the prediction was ≤ 9.5 ms at ≥ 400 GB/s). Gates at the close, card 1:
+`step205`, `step215`, `step216`, `step219`, `step242`, `step265` (sparse) 30 of 30 (`1793391769`); `step187`,
+`step188` (traced = eager, device = Flex), `step265` (credited decode), `step12_mnist` 21 of 21, MNIST goldens
+unchanged (`1793393729`); `step260` / `step261` 3 of 3 with A0's figures digit for digit (`1793394314`).
 
 ## F4a.0: what overlap can buy a decode step; the tails split by unit (2026-10-29, card 1)
 

@@ -246,7 +246,7 @@ Each transform states its legality under S2/S3, its expected effect, and the evi
 | X5a | **Register fusion** (prologue/epilogue on `Dst`) | Yes, **if** it replays every rounding the unfused graph does. Where the unfused intermediate was packed narrower than FP32, the fused body rounds to that format in place | [MEAS] compound SFPU kinds (`SILU_MUL`, …) are gated bit-for-bit against their composition |
 | X5b | **L1 channel fusion** (producer and consumer on one core) | Yes, under the same rounding rule | [MEAS] `Requirements::fuse` exists, with no production caller |
 | X5c | **Cross-core channel fusion** (producer writes the consumer's L1) | Yes | [MEAS] residency Phase 3, in captures |
-| X6 | **Barriers become channel edges**: a unit starts when its own inputs are ready | Yes (S1) | [HYP] H4. The evidence cuts both ways (T10): a barrier's time after a product is the slowest unit's work, so removing the barrier alone buys little. The gain has to come from overlap, below |
+| X6 | **Barriers become channel edges**: a unit starts when its own inputs are ready | Yes (S1) | [HYP] H4. The evidence cuts both ways (T10): a barrier's time after a product is the slowest unit's work, so removing the barrier alone buys little. The gain has to come from overlap, below. Built in F4a.1 (`barriers::credit`, opt-in, 2026-10-30): a 1.7B decode step admits it only after products into their residual adds, and is not faster |
 | X7 | **Spatial pipelining**: ops on disjoint core sets at once, linked by channels | Yes (S1) | [HYP] H5. Only on exact resource accounting. tt-mlir brought it back as `d2m.spatial` [PUB] |
 | X8 | **Prefetch** of data-independent operands (weights) | Yes | [MEAS] exists. It competes with small ops for the one GDDR queue (T8) |
 | — | Split-K, flash-attention rescaling, packer L1 accumulation, 16-bit `Dst`, fidelity below exact | **No**: different contracts | Opt-in only, by name. Packer L1 accumulation was rejected as a default because it reorders the sum (G3); split-K and flash-decode are parked ([proposal](../proposals/split-k-and-flash-decode.md)) |
@@ -505,6 +505,20 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     their arrival, the barrier kept (B pumps a prefetch at a barrier): `Step(64)` 10.91 -> 10.53 ms, 327 -> 340 GB/s,
     tail slack 1.27 ms. The mechanism holds; the prediction is not met yet. Lists B runs in line must stay after an
     arrival (idle units' moved early: 0.6 ms slower).
+  - *The rest of F4a (2026-10-30, card 1, lane A): nothing more gains; the kill fires.* Against A0 at `715ef1b`
+    (11.013 / 12.162 ms host, `Step(64)` 10.54 ms at 340 GB/s):
+    - idle units' lists pumped and moved before their anchor's arrival: 0.24 / 0.17 ms *slower* (their reads leave the
+      small ops' window, which had room, for a tail the product's own units and the busy lists already read in);
+    - per-edge credits in place of kept barriers (built, checked as a graph and against every dependency, opt-in):
+      only the 48 product -> residual-add barriers lower cheaply (one producer a consumer); +0.03 / +0.06 ms. A
+      consumer of a product waits for the producing units' work, the slowest unit's (T10), with a credit as with a
+      barrier;
+    - the second prefetched job (what more L1 room for the lists buys), the balanced deal and the K-chain handoff:
+      slower or within noise, retired.
+    - So the tails left (1.28 ms) are not a scheduling gap that reads ahead or credits fill: the products' slowest
+      units bound them. H4's prediction (≤ 9.5 ms, ≥ 400 GB/s) is not met, and the step moved < 0.3 ms. The barrier
+      is not what costs (§7's "barriers remain only where..." holds as a correctness rule, not a performance one at
+      decode); the products' per-unit work balance is the lever left, which is F5's and F6's.
 - **H5 Spatial pipelining.** Running a layer's ops on disjoint core sets at once beats running them one after another for decode at batch 1.
   - *Prediction:* none until H4 has run.
   - *Kills it:* H4's tails turn out to be GDDR-queue-bound.
