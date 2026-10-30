@@ -1594,13 +1594,6 @@ pub(crate) fn block_stream_kernel_subblocked(
     if continuing {
         set(&mut unpack, PRIOR_GPR, units(prior0) - slot);
     }
-    // A continuing chunk's reload, directly ([`dst_reload_direct`]): the unpack role takes a section
-    // from the packer itself and overwrites all of it, so the math role neither clears nor relays it;
-    // once, it waits for the math role's prelude clear.
-    let direct = continuing && dst_reload_direct();
-    if direct {
-        unpack.extend(sync::take(layout.cleared, Before::UNPACKER));
-    }
     let unpack_row = |r: usize| -> Vec<Instruction> {
         let mut p = vec![
             encode::adddmareg(A_ROW_GPR, A_ROW_STEP_GPR, A_ROW_GPR).unwrap(),
@@ -1609,12 +1602,7 @@ pub(crate) fn block_stream_kernel_subblocked(
         for (_, sb, section) in plan.row(r) {
             let (w, x) = (sb.w, width_index(sb.w));
             if continuing {
-                let from = if direct {
-                    layout.sems.free
-                } else {
-                    layout.cleared
-                };
-                p.extend(sync::take(from, Before::UNPACKER));
+                p.extend(sync::take(layout.cleared, Before::UNPACKER));
                 p.extend(crate::datapath::thread_config());
                 p.extend(crate::datapath::clear_unpacker0_adcs());
                 let mut prior_words = ConfigWords::new();
@@ -1719,9 +1707,6 @@ pub(crate) fn block_stream_kernel_subblocked(
     };
     let mut math = math_prelude();
     math.extend(math_mods);
-    if direct {
-        math.extend(sync::post_after(Unit::Matrix, layout.cleared));
-    }
     // A period's subblocks lowered together: the tiles order's unit is recorded once a period and
     // replayed for every pair after.
     let math_rows = |rows: std::ops::Range<usize>| -> Vec<Instruction> {
@@ -1730,12 +1715,10 @@ pub(crate) fn block_stream_kernel_subblocked(
         for r in rows {
             for (_, sb, section) in plan.row(r) {
                 let w = sb.w;
-                if !direct {
-                    i(&mut p, &sync::take(layout.sems.free, Before::MATRIX));
-                }
+                i(&mut p, &sync::take(layout.sems.free, Before::MATRIX));
                 if mutation == DstMutation::ClearBoth {
                     i(&mut p, &[encode::zeroacc(3, 0, 0, 0).unwrap()]);
-                } else if !direct {
+                } else {
                     // Each tile's 64 FP32 rows, eight at a time: sixteen 16-bit rows a `ZEROACC`.
                     for t in 0..w {
                         let first = row_of(section, t);
@@ -1746,10 +1729,11 @@ pub(crate) fn block_stream_kernel_subblocked(
                 }
                 // A continuing chunk's priors: the unpack role reloads the cleared section, and
                 // the math role waits for them.
-                if continuing && !direct {
-                    i(&mut p, &sync::post_after(Unit::Matrix, layout.cleared));
-                }
+                // A continuing chunk's priors: the unpack role reloads the section the math role
+                // cleared, while no `MVMUL` runs: an `UnpackToDst` under another subblock's
+                // `MVMUL`s gave wrong products on silicon (`silicon-operating-notes.md`).
                 if continuing {
+                    i(&mut p, &sync::post_after(Unit::Matrix, layout.cleared));
                     i(&mut p, &sync::take(layout.loaded, Before::MATRIX));
                 }
                 let mut step = Vec::new();
@@ -1891,46 +1875,6 @@ pub(crate) fn block_stream_kernel_subblocked(
     fits.then_some((code, loops))
 }
 
-/// Whether a continuing chunk of the subblocked kernel reloads its priors directly: the unpack role
-/// takes each section from the packer (`free`) and overwrites it, the math role neither clearing nor
-/// relaying it (else the math role takes `free`, clears the section and hands it on through
-/// `cleared`, as the one-tile kernel does). `TT_DST_RELOAD` (`direct`, `relay`; `relay` when unset),
-/// else [`set_dst_reload_direct`]. The program caches key on it.
-static DST_RELOAD_DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
-
-/// Reload directly or through the math role, process-wide ([`dst_reload_direct`]).
-pub fn set_dst_reload_direct(on: bool) {
-    DST_RELOAD_DIRECT.store(u8::from(on), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// See [`DST_RELOAD_DIRECT`].
-pub fn dst_reload_direct() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    #[cfg(test)]
-    if let Some(on) = DIRECT_HERE.get() {
-        return on;
-    }
-    match DST_RELOAD_DIRECT.load(Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = match std::env::var("TT_DST_RELOAD").as_deref() {
-                Ok("direct") => true,
-                Ok("relay") | Err(_) => false,
-                Ok(other) => panic!("TT_DST_RELOAD={other}: direct or relay"),
-            };
-            DST_RELOAD_DIRECT.store(u8::from(on), Relaxed);
-            on
-        }
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// A host test's own [`set_dst_reload_direct`], on its own thread.
-    pub(crate) static DIRECT_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 /// `ZEROACC` sixteen-row blocks an FP32 tile's 64 rows take (eight FP32 rows each).
 const fn dst_tile_blocks() -> u32 {
     TILE_DST_ROWS / 8
@@ -2064,12 +2008,7 @@ pub(crate) fn block_stream_programs(
         u64,
         MatmulSemaphores,
         bool,
-        (
-            PairOrder,
-            Option<crate::tile_op::dst::RowPlan>,
-            DstMutation,
-            bool,
-        ),
+        (PairOrder, Option<crate::tile_op::dst::RowPlan>, DstMutation),
     );
     static CACHE: OnceLock<Mutex<HashMap<Key, BlockPrograms>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
@@ -2091,12 +2030,7 @@ pub(crate) fn block_stream_programs(
         crate::l1::arena().end,
         layout.sems,
         looped,
-        (
-            pair_order(),
-            dst.cloned(),
-            dst_mutation(),
-            dst_reload_direct(),
-        ),
+        (pair_order(), dst.cloned(), dst_mutation()),
     );
     let count = |v: &BlockPrograms| {
         if v.2.is_some() {

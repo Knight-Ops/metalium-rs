@@ -1188,6 +1188,14 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
   always the second of a subblock at the first `K` step after a reload, its terms of that step `B`'s first tile's
   (`step246::probe_wrong_tiles`, card 0 `1793338674`-`1793338787`; 0 in 60 repeats with the settle, `1793338835`).
   The same rule as "A role's addresses from GPRs" below, which ttsim does not show.
+- **An `UnpackToDst` while the Matrix Unit runs `MVMUL`s on other `Dst` rows gives wrong products.** A variant whose
+  unpack role reloaded a continuing chunk's priors into a half as soon as the packer freed it -- the math role still
+  accumulating the subblock before in the other half -- was wrong in thousands of outputs, by whole terms
+  (`14.36` against `35.50`), at every shape and format of `step246` (card 0 `1793339454`, with the settle above),
+  while the host model and ttsim pass it. `UNPACR_Regular.md` says an `UnpackToDst` clobbers `SrcA[Bank]`, rows not
+  characterised; which of that or a shared `Dst` write path does it is not isolated. The kernel keeps the one-tile
+  kernel's order: the math role clears the half and hands it to the unpack role (`cleared`), which reloads it with no
+  `MVMUL` running, and the math role waits for it (`loaded`). The variant was removed.
 
 ## A prefetch placed before a barrier arrival reads under the barrier; an in-line list delays it (2026-10-29, cards 0 and 1)
 

@@ -1208,11 +1208,7 @@ mod tests {
     #[test]
     fn the_subblocked_kernel_packs_the_canonical_order() {
         ORDER_HERE.set(Some(PairOrder::Auto));
-        for direct in [false, true] {
-            DIRECT_HERE.set(Some(direct));
-            subblocked_kernel_packs_the_canonical_order();
-        }
-        DIRECT_HERE.set(None);
+        subblocked_kernel_packs_the_canonical_order();
     }
 
     fn subblocked_kernel_packs_the_canonical_order() {
@@ -1261,11 +1257,7 @@ mod tests {
     #[test]
     fn the_subblock_negative_controls_fail() {
         ORDER_HERE.set(Some(PairOrder::Auto));
-        for direct in [false, true] {
-            DIRECT_HERE.set(Some(direct));
-            subblock_negative_controls_fail();
-        }
-        DIRECT_HERE.set(None);
+        subblock_negative_controls_fail();
     }
 
     fn subblock_negative_controls_fail() {
