@@ -403,10 +403,10 @@ pub fn fetch_weights(only: Option<&str>, force: bool) -> Result<(), String> {
         }
     }
     let root = workspace_root().join("vendor").join("weights");
-    for f in pin::WEIGHT_FILES
-        .iter()
-        .filter(|f| only.is_none_or(|name| f.model == name))
-    {
+    for f in pin::WEIGHT_FILES.iter().filter(|f| match only {
+        Some(name) => f.model == name,
+        None => !f.on_request,
+    }) {
         let url = format!(
             "{}/{}/resolve/{}/{}",
             pin::WEIGHTS_URL,

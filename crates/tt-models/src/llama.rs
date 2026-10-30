@@ -223,7 +223,7 @@ pub struct Layer<B: Backend> {
 }
 
 /// Each key/value head repeated for its group of query heads (`repeat_interleave`).
-fn repeat_kv<B: Backend>(x: Tensor<B, 4>, groups: usize) -> Tensor<B, 4> {
+pub(crate) fn repeat_kv<B: Backend>(x: Tensor<B, 4>, groups: usize) -> Tensor<B, 4> {
     let [n, kv, l, d] = x.dims();
     let mut heads = Vec::with_capacity(kv * groups);
     for h in 0..kv {
@@ -240,7 +240,7 @@ pub type ActFn<B> = std::sync::Arc<dyn Fn(&str, Tensor<B, 3>) -> Tensor<B, 3> + 
 /// `x @ W` for a projection, computed in the weight's own dtype: the activation is cast in and the
 /// result cast back to the residual stream's dtype, so matrices held in different formats (F32,
 /// BF16, F16, block floating point) share one stream.
-fn project<B: Backend>(x: Tensor<B, 3>, linear: &Linear<B>) -> Tensor<B, 3> {
+pub(crate) fn project<B: Backend>(x: Tensor<B, 3>, linear: &Linear<B>) -> Tensor<B, 3> {
     let stream = x.dtype();
     let weight = linear.weight.val().dtype();
     if weight == stream {
@@ -1005,6 +1005,28 @@ impl<B: Backend> Llama<B> {
             out.step(|| self.forward(ids(&[token], device), &mut cache, dtype));
         }
         out
+    }
+}
+
+impl<B: Backend> crate::generate::EagerDecoder<B> for Llama<B> {
+    fn generate(
+        &self,
+        prompt: &[i32],
+        steps: usize,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Generation {
+        Llama::generate(self, prompt, steps, precision, device)
+    }
+
+    fn forced(
+        &self,
+        prompt: &[i32],
+        continuation: &[i32],
+        precision: Precision,
+        device: &B::Device,
+    ) -> Generation {
+        Llama::forced(self, prompt, continuation, precision, device)
     }
 }
 

@@ -5,7 +5,9 @@
 
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::{TtBackend, TtDevice};
-use tt_models::generate::{generate_fixed, FixedShapeDecoder, Generation, Shapes, TracedGenerator};
+use tt_models::generate::{
+    generate_fixed, EagerDecoder, FixedShapeDecoder, Generation, Shapes, TracedGenerator,
+};
 use tt_models::llama::{Llama, Precision};
 use tt_tests::burn_device::{assert_native_model, with_device, Config};
 
@@ -60,13 +62,13 @@ pub fn compare(label: &str, host: &Generation, device: &Generation) {
 /// tokens, under `assert_native_model`. The host model is dropped before the device one loads, so a
 /// large model is in memory once at a time. The claim is the teacher-forced top-1 at every
 /// position; where free-running decoding parts is printed.
-pub fn flex_then_device(
+pub fn flex_then_device<H: EagerDecoder<Flex>, T: EagerDecoder<TtBackend>>(
     config: Config,
     precision: Precision,
     prompt: &[i32],
     steps: usize,
-    load_flex: impl FnOnce() -> Llama<Flex>,
-    load_tt: impl FnOnce(&TtDevice) -> Llama<TtBackend>,
+    load_flex: impl FnOnce() -> H,
+    load_tt: impl FnOnce(&TtDevice) -> T,
 ) {
     let (free_host, forced_host) = {
         let host_model = load_flex();

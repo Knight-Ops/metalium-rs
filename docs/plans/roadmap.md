@@ -687,6 +687,16 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         and attended length; and the row scatter per sequence.
   - BF16 weights (half the bytes a token);
   - Llama-3.2-1B or Qwen2.5-1.5B for grouped-query attention, RoPE scaling and QKV biases.
+- [ ] **Three architectures past Llama: Qwen3.5-4B, Nemotron-3.5-Bolt (Gemma 4 E4B), MOSS-Image**
+  ([new-architectures.md](new-architectures.md), branch `models-hybrid`). On the host they reproduce their references
+  (2026-10-30); on card 0 all three agree with burn-flex natively (`step260_qwen35` F32 and BF16-stored weights,
+  `step261_gemma4`, `step262_moss_image`, 2026-10-30). Eager decode is 3-4 s a token against a 17-38 ms roofline.
+  Found in `burn-tt` on the way (each worked around in the model, none fixed):
+  - a BF16 product with a transposed right operand copies it plain, at >40 GB of host bookkeeping for a 248K x 2,560 table;
+  - `Precision::Bf16` holds host memory without bound on Qwen3.5's whole model (not located);
+  - a BF16 tensor takes an F32 tile's slot in GDDR (`alloc_elem`), so BF16 does not halve capacity;
+  - a cast of a just-loaded tensor uploads the original first, fragmenting GDDR for a later large tensor;
+  - the block copier refuses element-interleaving moves past ~400 K elements, surfacing only at the next download.
 - [ ] **Long context: the 1.7B at its native 8K agrees with burn-flex; 32K works (synthetic)** (found 2026-10-23, card 0; [long-context.md](long-context.md); the split
   flash-decode, Part 2, parked by decision 2026-10-23). The 1.7B now builds and decodes at its native 8,192 positions (17.0 / 26.0 ms a
   step after 32 / 1,000 tokens, `1792793709`). Since: a trace's programs paged into the program cache (only one trace
