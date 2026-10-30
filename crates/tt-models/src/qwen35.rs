@@ -255,9 +255,11 @@ impl<B: Backend> GatedNorm<B> {
 #[derive(Module, Debug)]
 pub struct GatedAttention<B: Backend> {
     /// `[hidden, heads 2 head_dim]`: each head's query, then its gate.
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
+    q_proj: Option<Linear<B>>,
+    k_proj: Option<Linear<B>>,
+    v_proj: Option<Linear<B>>,
+    /// `q|k|v` as one `[hidden, 2 q + 2 kv]` matrix, the three then `None` ([`Qwen35::prepared`]).
+    qkv: Option<Linear<B>>,
     o_proj: Linear<B>,
     q_norm: CenteredNorm<B>,
     k_norm: CenteredNorm<B>,
@@ -355,12 +357,35 @@ impl<B: Backend> GatedAttention<B> {
             cfg.kv_heads * cfg.head_dim,
         );
         Self {
-            q_proj: linear(h, 2 * q, device),
-            k_proj: linear(h, kv, device),
-            v_proj: linear(h, kv, device),
+            q_proj: Some(linear(h, 2 * q, device)),
+            k_proj: Some(linear(h, kv, device)),
+            v_proj: Some(linear(h, kv, device)),
+            qkv: None,
             o_proj: linear(q, h, device),
             q_norm: CenteredNorm::new(cfg.head_dim, cfg.eps, device),
             k_norm: CenteredNorm::new(cfg.head_dim, cfg.eps, device),
+        }
+    }
+
+    /// The queries with their gates, the keys and the values of `x`.
+    fn project_in(&self, cfg: &Qwen35Config, x: Tensor<B, 3>) -> [Tensor<B, 3>; 3] {
+        match (&self.qkv, &self.q_proj, &self.k_proj, &self.v_proj) {
+            (Some(w), ..) => {
+                let (q, kv) = (2 * cfg.heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim);
+                split_columns(project(x, w), [0, q, q + kv])
+            }
+            (None, Some(q), Some(k), Some(v)) => {
+                [project(x.clone(), q), project(x.clone(), k), project(x, v)]
+            }
+            _ => unreachable!("the attention's products, fused or apart"),
+        }
+    }
+
+    fn fuse(&mut self) {
+        if let (Some(q), Some(k), Some(v)) =
+            (self.q_proj.take(), self.k_proj.take(), self.v_proj.take())
+        {
+            self.qkv = Some(concat(&[q, k, v]));
         }
     }
 
@@ -389,13 +414,14 @@ impl<B: Backend> GatedAttention<B> {
     ) -> Tensor<B, 3> {
         let [n, t, _] = x.dims();
         let (heads, kv_heads, d) = (cfg.heads, cfg.kv_heads, cfg.head_dim);
-        let qg = project(x.clone(), &self.q_proj).reshape([n, t, heads, 2 * d]);
+        let [qg, k, v] = self.project_in(cfg, x);
+        let qg = qg.reshape([n, t, heads, 2 * d]);
         let q = qg.clone().slice([0..n, 0..t, 0..heads, 0..d]);
         let gate = qg
             .slice([0..n, 0..t, 0..heads, d..2 * d])
             .reshape([n, t, heads * d]);
-        let k = project(x.clone(), &self.k_proj).reshape([n, t, kv_heads, d]);
-        let v = project(x, &self.v_proj).reshape([n, t, kv_heads, d]);
+        let k = k.reshape([n, t, kv_heads, d]);
+        let v = v.reshape([n, t, kv_heads, d]);
         let q = Self::rotate(cfg, self.q_norm.forward(q).swap_dims(1, 2), rope);
         let k = Self::rotate(cfg, self.k_norm.forward(k).swap_dims(1, 2), rope);
         let v = v.swap_dims(1, 2);
@@ -452,13 +478,14 @@ impl<B: Backend> GatedAttention<B> {
         let [n, t, _] = x.dims();
         let (heads, kv_heads, d) = (cfg.heads, cfg.kv_heads, cfg.head_dim);
         let groups = heads / kv_heads;
-        let qg = project(x.clone(), &self.q_proj).reshape([n, t, heads, 2 * d]);
+        let [qg, k, v] = self.project_in(cfg, x);
+        let qg = qg.reshape([n, t, heads, 2 * d]);
         let q = qg.clone().slice([0..n, 0..t, 0..heads, 0..d]);
         let gate = qg
             .slice([0..n, 0..t, 0..heads, d..2 * d])
             .reshape([n, t, heads * d]);
-        let k = project(x.clone(), &self.k_proj).reshape([n, t, kv_heads, d]);
-        let v = project(x, &self.v_proj).reshape([n, t, kv_heads, d]);
+        let k = k.reshape([n, t, kv_heads, d]);
+        let v = v.reshape([n, t, kv_heads, d]);
         let q = Self::rotate(cfg, self.q_norm.forward(q).swap_dims(1, 2), rope);
         let k = Self::rotate(cfg, self.k_norm.forward(k).swap_dims(1, 2), rope);
         let v = v.swap_dims(1, 2);
@@ -1050,6 +1077,7 @@ impl<B: Backend> Qwen35<B> {
             if let Some(attn) = &mut layer.self_attn {
                 attn.q_norm.shift();
                 attn.k_norm.shift();
+                attn.fuse();
             }
             if let Some(net) = &mut layer.linear_attn {
                 net.prepare(&cfg);
@@ -1721,6 +1749,7 @@ mod tests {
         let want = model.generate(&prompt, 4, Precision::F32, &FlexDevice);
         let prepared = model.clone().prepared();
         assert!(prepared.layers.iter().all(|l| l.mlp.gate_up.is_some()
+            && l.self_attn.as_ref().is_none_or(|a| a.qkv.is_some())
             && l.linear_attn.as_ref().is_none_or(|n| n.in_proj.is_some())));
         let got = prepared.generate(&prompt, 4, Precision::F32, &FlexDevice);
         let w = worst(&want.logits, &got.logits);
