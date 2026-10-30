@@ -1467,3 +1467,139 @@ fn traced_generation_stream_ceiling() {
     probe_space_report(false);
     tt_kernels::residency::probe_residency_plan(false);
 }
+
+/// Qwen3.5-4B's traced generation (`tt_models::qwen35::HybridCache`, gate `step263_qwen35_traced`):
+/// the model of `step260_qwen35` with its matrices stored BF16 (the 1.7B's shipped
+/// configuration), on `burn_tt::Tt` (`TT_GEN_FUSION=0`: `TtBackend`), a `TT_GEN_MAX_LEN`-position
+/// cache (default 512), chunks of `TT_GEN_CHUNKS` (default 16) attending to the whole cache, decode
+/// steps attending to 64, 128, ... positions. Prompts of `TT_GEN_PROMPTS` tokens (default 32 and
+/// 256), `TT_GEN_NEW` tokens each (default 32), `TT_GEN_SAMPLES` timed generations (default 3).
+///
+/// Reported: the build, the program cache the traces hold, each trace's ops, and for each prompt
+/// the prefill (`generate_tokens`' first time) and the median decode step, with the bytes a step
+/// reads at least over its time: every matrix in BF16 and the tied head's F32 table.
+///
+/// Validated outside the timing: the 32-token prompt's first 3 tokens bit for bit against the eager
+/// fixed-shape schedule on the card, and every timed run's tokens against the logits path's.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models::qwen35_traced_generation"]
+fn qwen35_traced_generation() {
+    if std::env::var("TT_GEN_FUSION").is_ok_and(|v| v == "0") {
+        qwen35_traced_generation_on::<TtBackend>(" on TtBackend");
+    } else {
+        qwen35_traced_generation_on::<burn_tt::Tt>("");
+    }
+}
+
+fn qwen35_traced_generation_on<B: tt_models::generate::TracedBackend>(suffix: &str) {
+    use tt_models::generate::{generate_fixed, Shapes, TracedGenerator};
+    use tt_models::qwen35::{Qwen35, QWEN3_5_4B};
+    let env = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
+    let list = |v: String| -> Vec<usize> {
+        v.split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse().unwrap())
+            .collect()
+    };
+    let max_len: usize = env("TT_GEN_MAX_LEN", "512").parse().unwrap();
+    let chunks = list(env("TT_GEN_CHUNKS", "16"));
+    let prompts = list(env("TT_GEN_PROMPTS", "32,256"));
+    let new: usize = env("TT_GEN_NEW", "32").parse().unwrap();
+    let samples: usize = env("TT_GEN_SAMPLES", "3").parse().unwrap();
+    let name = "qwen3.5-4b";
+    with_device(Config::default(), |d| {
+        conditions(card());
+        println!(
+            "BENCH {{\"kind\":\"conditions\",\"weight_storage\":\"bf16\",\"head\":\"f32 table\"}}"
+        );
+        let (m, _) = Qwen35::<B>::qwen3_5_4b(QWEN3_5_4B.layers, Precision::F32, &d).unwrap();
+        // What a step reads at least: every matrix once in BF16, the tied head's F32 table once.
+        let table = m.embed_table().dims().iter().product::<usize>() as f64;
+        let params = burn::module::Module::num_params(&m) as f64;
+        let step_bytes = (params - table) * 2.0 + table * 4.0;
+        let m = m.with_bf16_weights();
+        let shapes = Shapes::new(max_len, &chunks).with_prefixes(&[]);
+        let traces = format!(
+            "chunks {chunks:?}, steps {:?}, {max_len}-position cache{suffix}",
+            shapes.steps
+        );
+        let t0 = Instant::now();
+        let g = TracedGenerator::<_, B>::new(&m, &shapes, &d).unwrap();
+        report(
+            &format!("{name} traced generation, build ({traces})"),
+            "ms",
+            "host",
+            Stats::of([ms(t0.elapsed())]),
+        );
+        for set in g.footprint().unwrap() {
+            let (held, size) = set.cache_held_bytes();
+            eprintln!("{traces}: program cache {held} of {size} bytes on the fullest unit");
+            report(
+                &format!("{name} traced generation, program cache held ({traces})"),
+                "bytes",
+                "count",
+                Stats::of([held as f64]),
+            );
+        }
+        for (key, ops) in g.trace_ops().unwrap() {
+            eprintln!("{key}: {} ops", ops.len());
+            report(
+                &format!("{name} traced generation, {key} ops ({traces})"),
+                "ops",
+                "count",
+                Stats::of([ops.len() as f64]),
+            );
+        }
+        let prompt = |len: usize| gen_prompt(len, QWEN3_5_4B.vocab);
+        // Validation: the eager schedule on the card, bit for bit.
+        let p = prompt(32);
+        let want = generate_fixed(&m, &p, 3, &shapes, &d).unwrap();
+        let got = g.generate(&p, 3).unwrap();
+        assert_eq!(got.tokens, want.tokens, "tokens against the eager schedule");
+        for (i, (a, b)) in got.logits.iter().zip(&want.logits).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "logits {i} against the eager schedule"
+            );
+        }
+        for len in prompts {
+            let p = prompt(len);
+            let want = g.generate(&p, new).unwrap().tokens;
+            let (mut first, mut step) = (Vec::new(), Vec::new());
+            for i in 0..WARMUPS.min(samples) + samples {
+                let out = g.generate_tokens(&p, new).unwrap();
+                assert_eq!(out.tokens, want, "a run's tokens, against the logits path");
+                if i >= WARMUPS.min(samples) {
+                    first.push(ms(out.times[0]));
+                    step.push(median_ms(&out.times[1..]));
+                }
+            }
+            let key = format!("{name} generation, {len}-token prompt, {new} tokens ({traces})");
+            let step_ms = median(&step);
+            report(
+                &format!("{key}, prefill, traced"),
+                "ms",
+                "host",
+                Stats::of(first),
+            );
+            report(
+                &format!("{key}, decode step, traced"),
+                "ms",
+                "host",
+                Stats::of(step),
+            );
+            report(
+                &format!("{key}, decode, traced"),
+                "tokens/s",
+                "host",
+                Stats::of([1e3 / step_ms]),
+            );
+            report(
+                &format!("{key}, decode weight bandwidth, traced"),
+                "GB/s",
+                "host",
+                Stats::of([step_bytes / step_ms / 1e6]),
+            );
+        }
+    });
+}
