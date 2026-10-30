@@ -282,6 +282,7 @@ fn defaults() -> std::sync::MutexGuard<'static, ()> {
         "TT_PAIR_ORDER",
         "TT_BF16_PLANS",
         "TT_MATMUL_BLOCK",
+        "TT_DST_SUBBLOCKS",
         "TT_COL_ONCE",
         "TT_MATH",
     ] {

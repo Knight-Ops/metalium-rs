@@ -279,14 +279,27 @@ impl Microkernel for Mma {
             Schedule::BlockStream { tiles: shape } => {
                 let layout = BlockStreamLayout::placed(*shape, route.slots(), l1);
                 let (chunk, _) = layout.chunk(c, tiles);
-                let (roles, loops) = matmul::block_stream_programs(
-                    &layout, c, tiles, route, fidelity, unpack_b, live,
+                // The `Dst` pass: the block row's subblocks, half-sync (`tile_op::dst`).
+                let dst = matmul::dst_row_plan(cols);
+                let (roles, loops, held) = matmul::block_stream_programs(
+                    &layout,
+                    c,
+                    tiles,
+                    route,
+                    fidelity,
+                    unpack_b,
+                    live,
+                    dst.as_ref(),
                 );
+                let init = match held {
+                    Some(plan) => matmul::subblock_init(&layout.init, layout.sems, plan),
+                    None => layout.init.clone(),
+                };
                 Ok(code(
                     chunk.a_at,
                     chunk.b_at,
                     layout.out_slot(c % 2, cols, 0, 0) + TILE_DATA,
-                    layout.init.clone(),
+                    init,
                     roles,
                     loops,
                     None,

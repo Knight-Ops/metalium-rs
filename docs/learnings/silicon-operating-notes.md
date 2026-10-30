@@ -1171,6 +1171,24 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
   an overflowing product the extra phases change is not isolated. The derived phases are opt-in
   (`TT_DERIVED_FIDELITY=1`).
 
+## `Dst` in two halves: math, pack and reloads side by side (2026-10-30, card 0 and ttsim)
+
+`docs/plans/dataflow-compiler.md` F5 (H2), gate `step246_dst_subblocks`, kernel
+`matmul::block_stream_kernel_subblocked`.
+- **Half-sync works as tt-metal's `SyncHalf` does**: the math role accumulates up to four FP32 tiles in one half of
+  `Dst` while the pack role drains the other, handing them over through `ready`/`free` started at `(0, 2)`. Each
+  tile is reached on the math side by `DEST_TARGET_REG_CFG_MATH_Offset` (one `SETC16` a tile pair, no stall between
+  it and the `MVMUL`s before it), on the pack side by `DEST_TARGET_REG_CFG_PACK_SEC0_Offset` (rows 0-448), and on a
+  reload by `REG5_Dest_cntx0_address` (rows to 448); a half is cleared tile by tile with sixteen-row `ZEROACC`s.
+  Bit for bit the one-tile kernel, and both negative controls (every subblock clearing all of `Dst`; the halves
+  overlapping by three tiles) change thousands of outputs, on ttsim as on card 0.
+- **A `WRCFG` of a base just stepped in its GPR needs the Scalar Unit settled first, between two tiles too.** The
+  subblocked unpack role steps `B`'s base a slot between a subblock's tiles (`ADDDMAREG`, then `WRCFG`); without
+  `datapath::gpr_settled` between them, now and then the next tile unpacked from the old base: one output tile a run,
+  always the second of a subblock at the first `K` step after a reload, its terms of that step `B`'s first tile's
+  (`step246::probe_wrong_tiles`, card 0 `1793338674`-`1793338787`; 0 in 60 repeats with the settle, `1793338835`).
+  The same rule as "A role's addresses from GPRs" below, which ttsim does not show.
+
 ## A prefetch placed before a barrier arrival reads under the barrier; an in-line list delays it (2026-10-29, cards 0 and 1)
 
 From [dataflow-compiler.md](../plans/dataflow-compiler.md) F4a.2.

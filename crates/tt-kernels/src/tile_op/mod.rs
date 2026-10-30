@@ -29,6 +29,7 @@ pub mod ahead;
 pub mod allocate;
 pub mod channels;
 pub mod distribute;
+pub mod dst;
 pub mod lower;
 pub(crate) mod matmul;
 mod reduce;

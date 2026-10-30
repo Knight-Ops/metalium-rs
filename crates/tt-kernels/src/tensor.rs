@@ -2783,8 +2783,9 @@ fn block_stream_programs_fit(
     route: SrcRoute,
     fidelity: Fidelity,
 ) -> bool {
+    let dst = matmul::dst_row_plan(layout.tiles[2]);
     (0..2).all(|c| {
-        let (roles, loops) = matmul::block_stream_programs(
+        let (roles, loops, _) = matmul::block_stream_programs(
             layout,
             c,
             layout.tiles,
@@ -2792,6 +2793,7 @@ fn block_stream_programs_fit(
             fidelity,
             false,
             matmul::LiveRows::All,
+            dst.as_ref(),
         );
         roles.iter().zip(loops.iter()).all(|(p, l)| {
             let code = crate::code::Code {
