@@ -2632,26 +2632,28 @@ pub fn product_question(
 }
 
 /// The blocks [`BlockStream::Measured`] times first, `[mb, kq, nb]` and whether `A` is pulled:
-/// the fastest blocks of a sweep of every format at seven prefill shapes on card 1
-/// (`silicon_probe_block_sweep`, 2026-10-29, `1793285475`-`1793291257`), so that with `Auto`'s own
-/// they reach 95% or more of each sweep's best at the four F4b shapes, and the climb from them
-/// ([`block_stream_neighbours`]) more. The analytical models rank none of these near their top: a
-/// format-blind model cannot see a packed `B`'s bytes, and the peaks are narrow (1-9 blocks within
-/// 5% of the best).
+/// re-swept for the subblocked kernel (`docs/plans/dataflow-compiler.md` F5, B2;
+/// `silicon_probe_block_sweep`, card 0, 2026-10-30, `1793346207`-`1793351145`) over the four F4b
+/// shapes with an FP32, BF16 and BFP8 `B` and three model shapes (the MOSS-Image DiT's qkv and
+/// down projections at 1,024 tokens, Qwen3.5's gate at 512) with an FP32 and BF16 `B`: the fewest
+/// blocks that, with `Auto`'s own, come within 4% of each sweep's best (greedy, every case 96% or
+/// more); the list before reached 79-92% at four of the 18. Two kept from it: the packed formats'
+/// `[6, 4, 12]` (BFP4 and BFP2 were not re-swept) and a 512-row prefill's `[4, 4, 18]`. The
+/// analytical models rank none of these near their top, and the peaks are narrow.
 pub const MEASURED_BLOCKS: [([usize; 3], bool); 12] = [
-    ([8, 4, 5], true),
-    ([5, 8, 8], true),
-    ([5, 8, 5], true),
-    ([6, 8, 8], true),
-    ([4, 12, 6], true),
-    ([6, 5, 6], true),
-    ([10, 4, 5], true),
-    ([7, 4, 6], true),
     ([8, 4, 6], true),
-    ([4, 8, 8], false),
+    ([8, 2, 9], true),
+    ([7, 4, 4], true),
+    ([4, 8, 5], true),
+    ([4, 4, 10], true),
+    ([4, 4, 8], true),
+    ([7, 4, 9], true),
+    ([5, 8, 8], true),
+    ([5, 3, 16], true),
+    ([8, 1, 10], true),
+    ([6, 4, 12], true),
     // A 512-row prefill's: few block rows over many units.
     ([4, 4, 18], false),
-    ([8, 2, 9], true),
 ];
 
 /// The sides and `K` chunks a measured climb steps between ([`block_stream_neighbours`]).
