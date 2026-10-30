@@ -705,7 +705,11 @@ impl Plan {
             let mut one = Vec::new();
             plan.push_jobs(&mut one, refs, transposed)?;
             let mut job = one.pop().expect("a job a block");
-            let b_reads = super::ahead::take_reads(&mut job, ahead, false);
+            // Pumped (`GATHER_PREFETCH`, the job's first gather waiting for them): B issues them in
+            // its wait loops, so the list may run before the unit's arrival at its anchor's
+            // barrier without holding it (`Session::set_read_ahead_early`). In line, it held the
+            // barrier: 0.6 ms a 1.7B step slower (F4a.2).
+            let b_reads = super::ahead::take_reads_pumped(&mut job, ahead);
             assert!(!b_reads.is_empty(), "a block's gather record");
             job.insert(
                 0,

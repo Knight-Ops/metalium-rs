@@ -849,6 +849,8 @@ pub struct Session<T: Transport> {
     busy_prefetch: bool,
     /// [`Session::set_read_ahead_early`].
     read_ahead_early: bool,
+    /// [`Session::set_idle_ahead_early`].
+    idle_ahead_early: bool,
     /// While a product with `BUSY_PREFETCH` lists is queued in a capture: each unit's stream
     /// length after the last weight-streaming product, and after its own anchor
     /// ([`PrefetchAnchor`]), between which its list moves (`enqueue_work`), and the lists queued
@@ -2776,6 +2778,8 @@ impl<T: Transport> Session<T> {
             // 11.32 / 12.69 -> 10.95 / 12.16 ms at 32 / 256 tokens on card 1, bit for bit;
             // `TT_READ_AHEAD_EARLY=0` turns it off.
             read_ahead_early: std::env::var("TT_READ_AHEAD_EARLY").map_or(true, |v| v != "0"),
+            // `TT_IDLE_AHEAD_EARLY=0` turns it off (`docs/plans/dataflow-compiler.md` F4a.2).
+            idle_ahead_early: std::env::var("TT_IDLE_AHEAD_EARLY").map_or(true, |v| v != "0"),
             busy_anchor: None,
             busy_moves: Vec::new(),
             prefetch_lists: Vec::new(),
@@ -4849,6 +4853,35 @@ impl<T: Transport> Session<T> {
                 shape: std::mem::take(&mut self.pending_shape),
                 allocs: std::mem::take(&mut self.pending_allocs),
             });
+            // An idle unit's `PREFETCH` list, queued with the product behind a wait for its
+            // anchor, moves on to just before the unit's arrival at its anchor product's barrier
+            // where that is the entry before the wait ([`early_start`]): a pumped prefetch, read
+            // in that product's tail ([`Session::set_idle_ahead_early`]). The wait stays where it
+            // was; the list is the anchor product's to hold, and still the product's own
+            // (`OpRecord::ahead`, which `move_block` follows).
+            if self.read_ahead_early && self.idle_ahead_early {
+                let lists = c.ops.last().map_or(Vec::new(), |op| op.ahead.clone());
+                let coords: Vec<(u8, u8)> = self
+                    .units
+                    .iter()
+                    .map(|u| (u.tile.x(), u.tile.y()))
+                    .collect();
+                let wait_only = |e: &[u32; 8]| e[0] == tt_isa::dm::op::BARRIER && e[4] != 0;
+                for (u, block) in lists {
+                    let stream = &c.units[u].stream;
+                    let Some(wait) = block
+                        .start
+                        .checked_sub(1)
+                        .filter(|&w| wait_only(&stream[w]))
+                    else {
+                        continue;
+                    };
+                    let to = early_start(c, u, &stream[block.clone()], wait, &coords);
+                    if to != wait {
+                        c.move_block(u, block, to);
+                    }
+                }
+            }
             // A unit's `BUSY_PREFETCH` list, queued with the product, moves back in its stream
             // to just after the last weight-streaming product, or as far towards its own anchor
             // as the ops between leave its ring alone ([`busy_start`]): a replay reads that `B`
@@ -9782,6 +9815,17 @@ impl<T: Transport> Session<T> {
     /// product touches the L1 the list's reads land in (`barriers::others_touch_l1`).
     pub fn set_read_ahead_early(&mut self, on: bool) {
         self.read_ahead_early = on;
+    }
+
+    /// Whether, in a capture and with [`Session::set_read_ahead_early`] on, an idle unit's
+    /// `PREFETCH` list (`tensor::PREFETCH`, its anchor's wait before it) moves to just before the
+    /// unit's arrival at its anchor product's barrier, as a busy unit's does, where no other unit
+    /// of that product touches the L1 its reads land in (on by default; `TT_IDLE_AHEAD_EARLY=0`
+    /// turns it off; `docs/plans/dataflow-compiler.md` F4a.2). Its reads are a pumped prefetch
+    /// (`record::GATHER_PREFETCH`), which B issues while it waits at the barrier, and the job waits
+    /// for them before its kernel, so the list does not hold the barrier.
+    pub fn set_idle_ahead_early(&mut self, on: bool) {
+        self.idle_ahead_early = on;
     }
 
     /// Whether a capture plans into the trace arena (`tt_isa::l1::TRACE_ARENA`: `DATA`, the 88 KiB

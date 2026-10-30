@@ -265,6 +265,176 @@ fn a_products_units_read_their_b_before_the_product_befores_barrier() {
     });
 }
 
+/// [`forward`] with its first product on all eight units, the rest on four: units 4-7 then sit
+/// out the later products, each having arrived at the first one's barrier, so they are the idle
+/// units whose `PREFETCH` lists read the second product's `B` (`tensor::PREFETCH`).
+fn forward_wide_first<T: tt_device::Transport>(
+    s: &mut Session<T>,
+    w: &[DramTensor; 3],
+    x: &DramTensor,
+) -> DramTensor {
+    let mm = |s: &mut Session<T>, a: &DramTensor, b: &DramTensor| {
+        s.matmul_dram(
+            a,
+            false,
+            b,
+            false,
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            1 << 40,
+        )
+        .unwrap()
+    };
+    let ew = |s: &mut Session<T>, kind, scalar, a: &DramTensor| {
+        s.eltwise(
+            Eltwise {
+                kind,
+                scalar,
+                scalar2: 0.0,
+            },
+            a,
+            None,
+        )
+        .unwrap()
+    };
+    s.set_spread(Spread::Fixed(8));
+    let h = mm(s, x, &w[0]);
+    s.set_spread(Spread::Fixed(4));
+    let hs = ew(s, kind::MUL_SCALAR, 0.5, &h);
+    let g = mm(s, &hs, &w[1]);
+    let gr = ew(s, kind::RELU, 0.0, &g);
+    let y = mm(s, &gr, &w[2]);
+    for t in [h, hs, g, gr] {
+        s.free(t).unwrap();
+    }
+    y
+}
+
+/// Each captured op's ranges on every unit, and its lists read ahead.
+type Ops = Vec<(
+    Vec<std::ops::Range<usize>>,
+    Vec<(usize, std::ops::Range<usize>)>,
+)>;
+
+/// Capture [`forward_wide_first`] with the idle units' lists moved before their anchor's arrival
+/// (`early`), the busy units' lists off, replay it over `inputs`, and return the replays' results
+/// (the capture's own run first) and each op's ranges and lists read ahead.
+fn captured_idle<T: tt_device::Transport>(
+    s: &mut Session<T>,
+    w: &[DramTensor; 3],
+    x: &DramTensor,
+    early: bool,
+    inputs: &[u64],
+) -> (Vec<Vec<f32>>, Ops) {
+    s.write(x, &values(inputs[0], K)).unwrap();
+    s.set_busy_prefetch(false);
+    s.set_idle_ahead_early(early);
+    s.begin_trace().unwrap();
+    let y = forward_wide_first(s, w, x);
+    let id = s.end_trace().unwrap();
+    s.set_busy_prefetch(true);
+    s.set_idle_ahead_early(true);
+    let mut runs = vec![s.download(&y).unwrap()];
+    for &seed in &inputs[1..] {
+        s.write(x, &values(seed, K)).unwrap();
+        s.replay(id).unwrap();
+        s.sync().unwrap();
+        runs.push(s.download(&y).unwrap());
+    }
+    let ops = s
+        .trace_ops(id)
+        .unwrap()
+        .iter()
+        .map(|op| (op.entries.clone(), op.ahead.clone()))
+        .collect();
+    s.release_trace(id).unwrap();
+    s.free(y).unwrap();
+    (runs, ops)
+}
+
+/// F4a.2's idle units (`docs/plans/dataflow-compiler.md`): a unit idle since its own anchor
+/// product reads the next product's `B` with a pumped list (`record::GATHER_PREFETCH`, the job's
+/// gather ending with `WAIT_PREFETCH`), which `Session::set_idle_ahead_early` moves to just before
+/// the unit's arrival at the anchor's barrier, so it reads in the anchor's tail without holding
+/// the barrier. The claims: the same bits, fresh and replayed, with the lists before and after the
+/// arrival; with them before, each idle unit's list lies inside the first product's range there
+/// (the anchor holds it), and the ops hold exactly the lists' entries more. The negative control is
+/// the same capture with the move off: no list lies inside the first product's range, and none
+/// is held by an op, so the claims are not met by the layout alone.
+#[test]
+fn an_idle_units_list_reads_its_b_before_its_anchors_barrier() {
+    with_session(|s| {
+        s.set_weight_prefetch(true);
+        let w = [(1, K), (2, K), (3, 256)]
+            .map(|(seed, n)| s.upload(&values(seed, K * n), K, n).unwrap());
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let warm = forward_wide_first(s, &w, &x);
+        s.free(warm).unwrap();
+        let inputs = [10, 20, 21];
+        let (after, after_ops) = captured_idle(s, &w, &x, false, &inputs);
+        let (early, early_ops) = captured_idle(s, &w, &x, true, &inputs);
+        for (i, &seed) in inputs.iter().enumerate() {
+            s.write(&x, &values(seed, K)).unwrap();
+            let y = forward_wide_first(s, &w, &x);
+            let want = s.download(&y).unwrap();
+            s.free(y).unwrap();
+            assert_bits(&format!("after the arrival, run {i}"), &after[i], &want);
+            assert_bits(&format!("before the arrival, run {i}"), &early[i], &want);
+        }
+        assert_eq!(after_ops.len(), early_ops.len(), "the same ops");
+        // Each idle unit's list: (the op it reads for, unit, entries).
+        let idle_lists = |ops: &Ops| -> Vec<(usize, usize, std::ops::Range<usize>)> {
+            ops.iter()
+                .enumerate()
+                .flat_map(|(k, (_, ahead))| {
+                    ahead
+                        .iter()
+                        .filter(|(u, _)| *u >= 4)
+                        .map(move |(u, r)| (k, *u, r.clone()))
+                })
+                .collect()
+        };
+        let (la, le) = (idle_lists(&after_ops), idle_lists(&early_ops));
+        println!("idle units' lists: after the arrival {la:?}, before it {le:?}");
+        assert!(!le.is_empty(), "the idle units read a product's B ahead");
+        let shape = |l: &[(usize, usize, std::ops::Range<usize>)]| -> Vec<(usize, usize, usize)> {
+            l.iter().map(|(k, u, r)| (*k, *u, r.len())).collect()
+        };
+        assert_eq!(shape(&la), shape(&le), "the same lists");
+        let held = |ops: &Ops, u: usize| -> usize { ops.iter().map(|(r, _)| r[u].len()).sum() };
+        for ((k, u, ra), (_, _, re)) in la.iter().zip(&le) {
+            // The op whose range holds a list on its unit.
+            let holder = |ops: &Ops, r: &std::ops::Range<usize>| {
+                ops.iter()
+                    .position(|(e, _)| e[*u].start <= r.start && r.end <= e[*u].end)
+            };
+            // The control: left after the arrival, the list is the product's it reads for,
+            // behind the wait for its anchor.
+            assert_eq!(
+                holder(&after_ops, ra),
+                Some(*k),
+                "unit {u}: with the move off, the product it reads for holds the list {ra:?}"
+            );
+            // Moved, an earlier op holds it -- its anchor -- and it ends at that op's arrival.
+            let j = holder(&early_ops, re);
+            assert!(
+                j.is_some_and(|j| j < *k && re.end + 1 == early_ops[j].0[*u].end),
+                "unit {u}: the list {re:?} is not just before an earlier op's arrival (held by {j:?})"
+            );
+            // The ops hold the same entries either way: the list moved from one op to the other.
+            assert_eq!(
+                held(&after_ops, *u),
+                held(&early_ops, *u),
+                "unit {u}: the same entries"
+            );
+        }
+        s.set_spread(Spread::All);
+        for t in w.into_iter().chain([x]) {
+            s.free(t).unwrap();
+        }
+    });
+}
+
 /// Each captured op's bytes, with busy prefetch `on` (and the idle units' as the session has it).
 fn counted<T: tt_device::Transport>(
     s: &mut Session<T>,
