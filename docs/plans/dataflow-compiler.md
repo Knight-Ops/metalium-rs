@@ -529,6 +529,31 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
   from the barrier analysis (`tt_kernels::barriers::analyse`, whose `deps` are per edge over every address space, the
   residency plan's L1 moves included). Keep barriers only where no channel can express the dependency, or where a
   barrier is the cheaper lowering of an all-to-all edge (Bible §7). Stored streams only, as `prune`.
+  - [x] **Built, opt-in, not faster** (2026-10-30, card 1, lane A2;
+    [log](../learnings/performance-log.md#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1)).
+    - `barriers::credit` (`Session::set_edge_credits`, `TT_EDGE_CREDITS=<fan>`), at the prune point: a kept barrier whose
+      next run's units each depend on at most `fan` producers, each crediting at most `fan`, becomes credits. A producer
+      `op::CREDIT`s each consumer's op-level word (`tt_isa::dm::credit_word` 6 and 7, past `tile_op::reuse`'s six) where
+      its arrival was; a consumer `op::WAIT_CREDIT`s for its count before its first op of the run, then credits its word
+      back to zero. Every dependency since the last barrier kept as a barrier is lowered (a credit orders nothing else),
+      so one word an epoch and at most two epochs, then a barrier, keep any credit from reaching a word before its
+      wait. Checked before the capture changes: every dependency covered by a credit or a barrier, and the credits as
+      a `channel::Graph` (each unit's runs in order between a source and a sink, a credit an edge) by `Graph::check`; a
+      refusal keeps the barriers. B's `WAIT_CREDIT` pumps a queued prefetch as a barrier wait does
+      (`dataflow::credit_with`).
+    - Gates: `barriers`' unit tests run the lowered streams under 300 random interleavings each and check every
+      dependency's order and every word back at zero; their control (the same barriers pruned with no credits)
+      races; the coverage check refuses a dropped edge and `Graph::check` an unbalanced credit. `step265_edge_credits`
+      (ttsim; card 1 `1793345620`): sparse element-wise deals replay bit for bit with credits (3 of 4 barriers, 63
+      credits), both mutations refused at the capture's end, which then keeps its barriers and the same bits; a
+      SmolLM2-135M traced decode with credits (711 barriers lowered) equals its eager one (`1793343055`). In `--smoke`.
+    - What a 1.7B `Step(64)` admits (`TT_PROBE_BARRIERS`, `1793338608`): of 272 kept barriers, fan 1-4 lowers the 48
+      product -> residual-add barriers (64 credits each, one producer a consumer); fan 8 adds 74 more for 21,366
+      credits a step; the rest fan in from all of a product's units.
+    - ABBA at fan 4, off / on: 10.981 / 12.140 and 11.013 / 12.143 against 11.042 / 12.195 and 11.018 / 12.201 ms
+      (`1793347800`-`1793349018`): **not faster** (+0.03 / +0.06). A product's consumer still waits for the producing
+      units' work, which is the product's slowest (T10), and the residual add is all that starts early. Opt-in; the
+      capture's build grows (the coverage check and graph), which is not a target.
 - [ ] **F4a.2, reads ahead started by edges, not anchors:** units that finish their share start data-independent reads
   (the next product's weights) at once.
   - [x] **A product's units, before their arrival** (2026-10-29, cards 0 and 1;
@@ -546,7 +571,23 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
     `1793317798`, 4 of 4).
   - [x] *Idle units' lists before their arrival: refuted, reverted.* 0.6 ms slower: an idle unit's `PREFETCH` list is
     plain `GATHER`s that B runs in line, so before an arrival it holds the product's barrier.
-  - [ ] Idle units' lists pumped (`GATHER_PREFETCH`, the job waiting for them), so they too can start before an arrival.
+  - [x] **Idle units' lists pumped, and before an arrival: refuted again, opt-in** (2026-10-30, card 1, lane A0/A1;
+    [log](../learnings/performance-log.md#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1)).
+    - A0, at `715ef1b`: host 11.013 / 12.162 ms at 32 / 256 tokens (`1793332665`); profile `Step(64)` 10,544.6 us,
+      340 GB/s, tail slack 1,281 us (1,008 of it the products', `1793332922`).
+    - An idle unit's `PREFETCH` list is now a pumped prefetch (`tile_op::ahead::take_reads_pumped`: `GATHER_PREFETCH`,
+      the job's first gather ending in `[WAIT, WAIT_PREFETCH]`), and `Session::set_idle_ahead_early`
+      (`TT_IDLE_AHEAD_EARLY=1`) moves it to just before the unit's arrival at its anchor's barrier, where no other unit
+      of the anchor touches the L1 it lands in (`early_start`). Bit for bit; gate `step216`
+      `an_idle_units_list_reads_its_b_before_its_anchors_barrier` (ttsim; card 1 `1793334281`, `1793345620`), whose
+      control (the move off) fails the move's claims, and which fails with the move broken.
+    - ABBA, on / off: 11.243 / 12.304 and 11.127 / 12.315 against 10.932 / 12.110 and 10.954 / 12.161 ms
+      (`1793338877`, `1793339191`, `1793342802`, `1793345003`): **0.24 / 0.17 ms slower**. Pumped, a list no longer
+      holds the barrier, but its reads leave the small ops' window, which had the room, for the anchor's tail, which
+      the product's own units and the busy lists already read in. Off by default; the pumped lists stay where they
+      were (bit for bit, within noise of A0).
+    - Gates with it: `step215`, `step216`, `step205`, `step219` 27 of 27 (`1793334281`); `step187` and `step188` 13 of 13
+      (`1793335917`).
   - [ ] What is left in the tails, 1.27 ms a step: F4a.1's credits, the lists' L1 room (one job's `B` a unit).
 - [ ] **F4a.3,** re-measure the three opt-in decode schedules F3.8 ports, with the dataflow approach (owner, 2026-10-28). Each was
   bit for bit but not faster with a barrier between its ops:

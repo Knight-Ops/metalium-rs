@@ -4573,6 +4573,9 @@ impl<T: Transport> Session<T> {
     /// barrier whose next run's units each wait for at most `fan` producers, each crediting at most
     /// `fan` units ([`crate::barriers::credit`]). `None` keeps every barrier the data needs. Only
     /// where barriers are pruned ([`Session::set_barrier_prune`]); the capture's own run keeps them.
+    /// Not faster at fan 4 (a 1.7B step's 48 product -> residual-add barriers, a credit a unit):
+    /// 10.98 / 12.14 -> 11.03 / 12.20 ms at 32 / 256 tokens on card 1 (ABBA `1793347800`-
+    /// `1793349018`); a product's consumers wait for its slowest unit either way.
     pub fn set_edge_credits(&mut self, fan: Option<usize>) {
         self.edge_credits = fan.filter(|&f| f > 0);
     }
