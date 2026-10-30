@@ -624,9 +624,61 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
 
 ## Stage F5 (compute): `Dst` subblocks and half-sync, H2
 
-- [ ] Add a `Dst` tiling pass: output subblocks of `h×w ≤ 4` FP32 tiles, and half-sync between math and pack. Relax `retire_batch` (`tt-firmware/src/corpus.rs`) so roles overlap across batches, which needs the configuration to be the same in every batch or fenced.
-- **Prediction:** ≥1.4× on the H1 shapes after F4b, bit-exact.
-- **Kill:** <1.1×.
+- [x] **F5.B0, baselines on card 0 at `715ef1b`** (2026-10-30;
+  [log](../learnings/performance-log.md#f5-dst-subblocks-and-half-sync-2026-10-30-card-0)). H1 through Burn `1793332723`
+  (FP32 `B` 29.0 / 18.3 / 11.1 / 13.8 TFLOPS); every format through the session at the measured default `1793332760`
+  and at `[8,2,9]`, `[8,4,6]`, `[6,4,12]` (`1793335272`, `1793335286`, `1793335298`); a model shape set of 19
+  products through Burn (`1793335314`) and the session (`1793335466`): the MOSS-Image DiT at 1,024 tokens (qkv
+  `[1024,3072]@[3072,9216]`, out, `@[3072,8192]`, down `[1024,8192]@[8192,3072]`, a head's `Q K^T` and `P V`), Qwen3.5
+  and Gemma 4 prefill at 512 tokens (q, gate, down, o; hidden 2560, FF 9216 / 10240), the MOSS text encoder at 512
+  (hidden 4096, FF 12288), and the FLUX.2 VAE's patch products `[4096,3456]@[3456,384]`, `[16384,1728]@[1728,192]`,
+  `[65536,864]@[864,96]`. `step262` `1793343089` (and its profile `1793387199`).
+- [x] **F5.B1, a `Dst` tiling pass and half-sync, the default** (`tile_op::dst`,
+  `matmul::block_stream_kernel_subblocked`; `TT_DST_SUBBLOCKS=0` turns it off).
+  - `DstPlan` (half-sync: four FP32 tiles a section, `free` starting at two), `Subblock` (refused past the section;
+    only one tile row tall, since a `Src` bank holds one tile and `A`, the FP32 operand, is the one worth holding), and
+    `RowPlan::choose`: the fewest subblocks a block row, as even as can be, so a row no width divides takes one narrower
+    one (3 tiles: `[3]`; 9: `[3,3,3]`; 18: `[4,4,4,3,3]`); a row of an odd number of subblocks makes the programs'
+    period two rows, so the sections alternate across the block.
+  - Each `K` step unpacks `A`'s tile into `SrcB` once and holds it across the subblock's `B` tiles (`1 + 1/w` unpacks a
+    pair); each tile's `MVMUL`s are the tiles order's at its rows (`DEST_TARGET_REG_CFG_MATH_Offset`); the packer reads
+    each tile from its rows (`DEST_TARGET_REG_CFG_PACK_SEC0_Offset`); a first chunk's half is cleared tile by tile in
+    sixteen-row `ZEROACC`s; a continuing chunk's priors are reloaded at each tile's rows after the math role hands the
+    half over, switching only the `Config` words the reload changes (`matmul::reload_switch`: 137 -> 88 words a
+    subblock at `[8,2,9]`).
+  - The oracle runs all three roles now (`matmul::order::interpret_roles`: semaphores, the pack role scheduled last,
+    `Dst` as blocks the packer reads, a reload a prior term): every shape packs each output's canonical order, priors
+    first; clearing both halves, overlapping halves, and the one-tile kernel at two sections are caught.
+  - Gate `step246_dst_subblocks` (ttsim; card 0 `1793343573`, 6 of 6): the one-tile kernel bit for bit with the special
+    values, ragged products, odd columns, `A` or `B` transposed, BF16 and BFP8/4/2 weights, model shapes on every tile,
+    exact against host integer sums; both negative controls change thousands of outputs on ttsim and on card 0.
+    On the final tree (card 0 `1793386989`, 33 of 34): `step246` 6, `step229` 7, `step241` 4, `step238` 1, `step158` 7,
+    `step68` 6 and `step245` 2 of 3. `step245::a_capture_paused_to_measure_is_the_capture_unpaused` fails, on ttsim too
+    and with `TT_DST_SUBBLOCKS=0`: the re-swept list (B2) makes its chain choose `[4,4,8]` pulled, on 2 of 8 units, and
+    the paused pass then records one more `KERNEL` entry on the six idle units for the op after the product than the
+    unpaused one (replays bit for bit). It passed with the list before (`1793337864`). Open: the pause's per-unit
+    bookkeeping (`session.rs` / `trace.rs`, F4a's), not this kernel's.
+  - Two silicon findings ([notes](../learnings/silicon-operating-notes.md#dst-in-two-halves-math-pack-and-reloads-side-by-side-2026-10-30-card-0-and-ttsim)):
+    a `B` base stepped between a subblock's tiles needs the Scalar Unit settled before its `WRCFG` (one tile a run
+    wrong without it); and an `UnpackToDst` beside running `MVMUL`s is wrong, so a reload directly from the packer's
+    `free` (tried, opt-in) was retired.
+- [x] **F5.B2, `MEASURED_BLOCKS` re-swept** for the subblocked kernel (`silicon_probe_block_sweep`, card 0,
+  `1793346207`-`1793351145`: the four H1 shapes with FP32, BF16 and BFP8, the DiT's qkv and down and Qwen3.5's gate with
+  FP32 and BF16). Ten blocks, with `Auto`'s own, reach 96% or more of each sweep's best (the list before: 79-92% at four
+  of the 18 cases); `[6,4,12]` and `[4,4,18]` kept.
+- [-] **F5.B3, roles overlapping across batches: not built.** A blocked product's batches are its chunks, and every
+  chunk but a job's first reloads the partials the chunk before packed, so the joins the brief keeps are all but one a
+  job (32 at H1's `[8,2,9]`): what is left to overlap is a job's first chunk, a few percent at most. Overlapping the
+  continuing chunks needs a pack-to-unpack handoff across a `KERNEL` boundary, in the mover's `KERNEL_WAIT`
+  (`mover.rs`, F4a's), so it waits for the merge.
+- **Prediction:** ≥1.4× on the H1 shapes after F4b, bit-exact. **Kill:** <1.1×.
+- **Result (2026-10-30, card 0): bit-exact; neither the prediction nor the kill.** At the measured default over the H1
+  shapes and five formats, 0.96-1.35x, geometric mean **1.12x** (`1793332760` against `1793387665`); with an FP32 `B`
+  1.06 / 1.29 / 0.96 / 1.03x (geometric mean 1.08x, H1 32.3 -> 34.4 TFLOPS, not the 40 predicted); with every gather
+  left out, 1.05-1.46x (`1793339461` against `1793344646`). What still binds a chunk is its reload: the unpacker reloads
+  each subblock's priors while the math role waits, and silicon does not allow it beside `MVMUL`s (above), so the
+  half-sync hides the packer and not the reload. The lever left is fewer chunks (longer `kq`), which L1 bounds for an
+  FP32 `B`, or a handoff that lets a chunk's reloads run under the chunk before (with F4a's channels).
 
 ## Stage F6 (gated on F4a and F5): fusion through channels and spatial pipelining, H5
 

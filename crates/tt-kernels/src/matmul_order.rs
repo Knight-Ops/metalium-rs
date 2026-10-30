@@ -85,7 +85,38 @@ struct Machine {
     rwc: Rwc,
     blocks: BTreeMap<u32, Vec<Term>>,
     outputs: Order,
+    /// [`interpret_roles`]: the semaphores, the pack role, and `Dst` as rows the packer reads
+    /// (`blocks` keyed by absolute 8-row block, cleared block by block).
+    roles: bool,
+    sems: [u8; 8],
+    pack: Pack,
 }
+
+/// The pack role, as [`interpret_roles`] models it: its GPRs and `ThreadConfig`, the input ADC's
+/// `Y`, the tile it is reading and the tiles it has read.
+#[derive(Default)]
+struct Pack {
+    gpr: Vec<u32>,
+    thread: BTreeMap<u16, u16>,
+    y: u32,
+    tile: BTreeMap<u32, Vec<Term>>,
+    out: Order,
+}
+
+impl Pack {
+    fn thread_field(&self, name: &str) -> u32 {
+        let f = ALL_THREAD_CONFIG_FIELDS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no thread field {name}"))
+            .1;
+        u32::from(f.extract(self.thread.get(&f.addr32()).copied().unwrap_or(0)))
+    }
+}
+
+/// The term a reload's prior partial puts in each block of its tile ([`interpret_roles`]): `a` is
+/// the prior's tile (`tile_base_units`), `a_face` this marker.
+pub const PRIOR: u32 = u32::MAX;
 
 #[derive(Default)]
 struct Rwc {
@@ -116,7 +147,104 @@ impl Machine {
             rwc: Rwc::default(),
             blocks: BTreeMap::new(),
             outputs: Vec::new(),
+            roles: false,
+            sems: [0; 8],
+            pack: Pack {
+                gpr: vec![0; 64],
+                ..Pack::default()
+            },
         }
+    }
+
+    /// A semaphore instruction of any role, under [`interpret_roles`]; `None` for another.
+    /// `Some(false)` where a `SEMWAIT` must wait.
+    fn semaphore(&mut self, i: Instruction) -> Option<bool> {
+        let selected = |mask: u32| (0..8).filter(move |s| mask >> s & 1 == 1);
+        match i.def().mnemonic() {
+            "SEMWAIT" => {
+                let (m, cond) = (op(i, "SemaphoreMask"), op(i, "ConditionMask"));
+                let wait = selected(m).any(|s| {
+                    cond & 1 == 1 && self.sems[s] == 0
+                        || cond & 2 == 2 && self.sems[s] >= tt_isa::sync::MAX_VALUE
+                });
+                Some(!wait)
+            }
+            "SEMGET" => {
+                for s in selected(op(i, "SemaphoreMask")) {
+                    self.sems[s] = self.sems[s].saturating_sub(1);
+                }
+                Some(true)
+            }
+            "SEMPOST" => {
+                for s in selected(op(i, "SemaphoreMask")) {
+                    self.sems[s] = (self.sems[s] + 1).min(tt_isa::sync::MAX_VALUE);
+                }
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// One pack-role instruction under [`interpret_roles`]; `false` if it must wait.
+    fn pack(&mut self, i: Instruction) -> bool {
+        if let Some(go) = self.semaphore(i) {
+            return go;
+        }
+        match i.def().key() {
+            "SETDMAREG_Immediate" => {
+                let (half, v) = (op(i, "ResultHalfReg"), op(i, "NewValue"));
+                let (r, shift) = ((half / 2) as usize, 16 * (half % 2));
+                self.pack.gpr[r] = self.pack.gpr[r] & !(0xFFFF << shift) | v << shift;
+            }
+            "ADDDMAREG" => {
+                let (l, r) = (op(i, "LeftReg") as usize, op(i, "RightReg") as usize);
+                self.pack.gpr[op(i, "ResultReg") as usize] =
+                    self.pack.gpr[l].wrapping_add(self.pack.gpr[r]);
+            }
+            "WRCFG" => {
+                assert_eq!(op(i, "Is128Bit"), 0);
+                self.config.insert(
+                    op(i, "CfgIndex") as u16,
+                    self.pack.gpr[op(i, "InputReg") as usize],
+                );
+            }
+            "SETADCXY" => {
+                if op(i, "PK") == 1 && op(i, "Y0") == 1 {
+                    self.pack.y = op(i, "Y0Val");
+                }
+            }
+            "PACR_BH" => {
+                let offset =
+                    self.cfg(tt_isa::cfg::generated::global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset);
+                let mask = op(i, "ReadIntfSel");
+                for k in 0..4 {
+                    if mask >> k & 1 == 1 {
+                        let row = offset + self.pack.y + k;
+                        if let Some(terms) = self.blocks.get(&(row / 8)) {
+                            self.pack.tile.insert((row - offset) / 8, terms.clone());
+                        }
+                    }
+                }
+                let incr = self
+                    .pack
+                    .thread_field(&format!("ADDR_MOD_PACK_SEC{}_YsrcIncr", op(i, "AddrMod")));
+                self.pack.y += incr;
+                if op(i, "Last") == 1 {
+                    let tile = std::mem::take(&mut self.pack.tile);
+                    self.pack.out.push(tile);
+                }
+            }
+            other => match i.def().mnemonic() {
+                "SETC16" => {
+                    self.pack
+                        .thread
+                        .insert(op(i, "CfgIndex") as u16, op(i, "NewValue") as u16);
+                }
+                "SETADCXX" | "STALLWAIT" | "NOP" | "SFPNOP" => {}
+                _ => panic!("the pack role's {other} is not modelled"),
+            },
+        }
+        true
     }
 
     fn cfg(&self, f: tt_isa::cfg::ConfigField) -> u32 {
@@ -134,6 +262,11 @@ impl Machine {
 
     /// One unpack-role instruction; `false` if it must wait for a bank.
     fn unpack(&mut self, i: Instruction) -> bool {
+        if self.roles {
+            if let Some(go) = self.semaphore(i) {
+                return go;
+            }
+        }
         match i.def().key() {
             "SETDMAREG_Immediate" => {
                 let (half, v) = (op(i, "ResultHalfReg"), op(i, "NewValue"));
@@ -160,8 +293,11 @@ impl Machine {
                 }
             }
             "SETADCZW" => {
+                // Channel 1 and `W` only ever back to zero (`clear_unpacker0_adcs`).
                 assert_eq!(
-                    op(i, "Z1") | op(i, "W0") | op(i, "W1"),
+                    (op(i, "Z1") * op(i, "Z1Val"))
+                        | (op(i, "W0") * op(i, "W0Val"))
+                        | (op(i, "W1") * op(i, "W1Val")),
                     0,
                     "only Z0 is modelled"
                 );
@@ -175,6 +311,9 @@ impl Machine {
             other => match i.def().mnemonic() {
                 "SETC16" | "STALLWAIT" | "SEMWAIT" | "SEMPOST" | "SEMGET" | "SEMINIT" | "NOP"
                 | "SFPNOP" => {}
+                // The counters' positions, which the ranges here stand for (`SETADCXX`).
+                "SETADCXY"
+                    if op(i, "X0Val") | op(i, "Y0Val") | op(i, "X1Val") | op(i, "Y1Val") == 0 => {}
                 _ => panic!("the unpack role's {other} is not modelled"),
             },
         }
@@ -196,6 +335,31 @@ impl Machine {
         if to_dst {
             // `UnpackToDst` leaves `SrcA[Bank]` unpredictable (`UNPACR_Regular.md`).
             bank.rows = [None; 64];
+            if self.roles {
+                // The prior's rows: `Dst` row `OutAddr / 16 - 4`, a row each sixteen datums.
+                let row = self.cfg(thcon::THCON_SEC0_REG5_Dest_cntx0_address) / 16 - 4;
+                let adc = self.adc[0];
+                let n = adc.x1 + 1 - adc.x0;
+                assert!(
+                    row % 8 == 0 && n % 128 == 0,
+                    "whole blocks: {n} datums at row {row}"
+                );
+                let base = self.cfg(thcon::THCON_SEC0_REG3_Base_address);
+                for b in row / 8..row / 8 + n / 128 {
+                    self.blocks.insert(
+                        b,
+                        vec![Term {
+                            a: base,
+                            a_face: PRIOR,
+                            a_half: 0,
+                            b: 0,
+                            b_face: 0,
+                            b_transposed: false,
+                            phase: 0,
+                        }],
+                    );
+                }
+            }
             return true;
         }
         if u == 0 {
@@ -239,6 +403,11 @@ impl Machine {
 
     /// One math-role instruction; `false` if it must wait for a bank.
     fn math(&mut self, i: Instruction) -> bool {
+        if self.roles {
+            if let Some(go) = self.semaphore(i) {
+                return go;
+            }
+        }
         match i.def().mnemonic() {
             "MVMUL" => return self.mvmul(i),
             "SETRWC" => {
@@ -269,13 +438,21 @@ impl Machine {
                 self.thread
                     .insert(op(i, "CfgIndex") as u16, op(i, "NewValue") as u16);
             }
-            "ZEROACC" => {
-                assert_eq!(op(i, "Mode"), 3, "only a whole-Dst clear is modelled");
-                let blocks = std::mem::take(&mut self.blocks);
-                if !blocks.is_empty() {
-                    self.outputs.push(blocks);
+            "ZEROACC" => match (op(i, "Mode"), op(i, "UseDst32b")) {
+                (3, _) => {
+                    let blocks = std::mem::take(&mut self.blocks);
+                    if !blocks.is_empty() && !self.roles {
+                        self.outputs.push(blocks);
+                    }
                 }
-            }
+                // Sixteen 16-bit rows: eight FP32 rows, one block.
+                (1, 0) if self.roles => {
+                    let block = op(i, "Imm10");
+                    assert!(block < 64, "a sixteen-row block of Dst");
+                    self.blocks.remove(&block);
+                }
+                (mode, wide) => panic!("ZEROACC mode {mode} (UseDst32b {wide}) is not modelled"),
+            },
             "STALLWAIT" | "SEMWAIT" | "SEMPOST" | "SEMGET" | "SEMINIT" | "NOP" | "SFPNOP" => {}
             other => panic!("the math role's {other} is not modelled"),
         }
@@ -435,6 +612,82 @@ pub fn interpret(unpack: &[Instruction], math: &[Instruction]) -> Order {
         m.outputs.push(blocks);
     }
     m.outputs
+}
+
+/// The terms each output tile holds when the pack role reads it, tile by tile in pack order, from
+/// the three roles' streams (each after the frontend's expanders) and the semaphores' starting
+/// values (`init`): the observable a `Dst` plan is held to. `Dst` is modelled as 8-row blocks of
+/// terms, cleared block by block (`ZEROACC` modes 1 and 3) and written by `MVMUL`s and by a
+/// reload's `UnpackToDst` (a [`PRIOR`] term), and the roles are scheduled adversarially: the pack
+/// role steps only while the other two cannot, so a section the math role clears or overwrites
+/// before the packer has read it shows in what the packer reads.
+pub fn interpret_roles(
+    unpack: &[Instruction],
+    math: &[Instruction],
+    pack: &[Instruction],
+    init: &[crate::runtime::SemaphoreInit],
+) -> Order {
+    let mut m = Machine::new();
+    m.roles = true;
+    for &(s, v, _) in init {
+        m.sems[s.index() as usize] = v;
+    }
+    let (mut u, mut t, mut p) = (0, 0, 0);
+    while u < unpack.len() || t < math.len() || p < pack.len() {
+        let mut moved = false;
+        while t < math.len() && m.math(math[t]) {
+            t += 1;
+            moved = true;
+        }
+        while u < unpack.len() && m.unpack(unpack[u]) {
+            u += 1;
+            moved = true;
+        }
+        if !moved && p < pack.len() && m.pack(pack[p]) {
+            p += 1;
+            moved = true;
+        }
+        assert!(
+            moved,
+            "deadlock: unpack at {u} ({:?}), math at {t} ({:?}), pack at {p} ({:?})",
+            unpack.get(u).map(|i| i.def().key()),
+            math.get(t).map(|i| i.def().key()),
+            pack.get(p).map(|i| i.def().key())
+        );
+    }
+    m.pack.out
+}
+
+/// [`canonical`] for a chunk that continues from priors: each output's blocks (all eight) take
+/// its prior first ([`PRIOR`], `priors[o]`'s tile), then its pairs.
+pub fn canonical_continuing(
+    outputs: &[super::OutputTile],
+    priors: &[u64],
+    phases: u32,
+    b_transposed: bool,
+) -> Order {
+    let units = crate::datapath::tile_base_units;
+    canonical(outputs, phases, super::LiveRows::All, b_transposed)
+        .into_iter()
+        .zip(priors)
+        .map(|(mut blocks, &prior)| {
+            for b in 0..8 {
+                blocks.entry(b).or_default().insert(
+                    0,
+                    Term {
+                        a: units(prior),
+                        a_face: PRIOR,
+                        a_half: 0,
+                        b: 0,
+                        b_face: 0,
+                        b_transposed: false,
+                        phase: 0,
+                    },
+                );
+            }
+            blocks
+        })
+        .collect()
 }
 
 /// The order every kernel must produce: for each output, its pairs in order; for each pair, `k'`
@@ -867,6 +1120,227 @@ mod tests {
             }
             let swapped = interpret(&u, &phases_swapped(&m));
             assert_ne!(swapped, want, "{order:?}: phases swapped");
+        }
+    }
+
+    /// A blocked chunk's three role streams as the runner and the frontend push them, and the
+    /// semaphores its run starts: the subblocked kernel's (`plan` given) or the looped one's.
+    fn block_roles(
+        layout: &BlockStreamLayout,
+        c: usize,
+        tiles: [usize; 3],
+        route: SrcRoute,
+        fidelity: Fidelity,
+        b_transposed: bool,
+        plan: Option<&crate::tile_op::dst::RowPlan>,
+    ) -> ([Vec<Instruction>; 3], Vec<crate::runtime::SemaphoreInit>) {
+        let (code, loops) = match plan {
+            Some(plan) => block_stream_kernel_subblocked(
+                layout,
+                c,
+                tiles,
+                route,
+                fidelity,
+                b_transposed,
+                LiveRows::All,
+                plan,
+            )
+            .expect("fits"),
+            None => block_stream_kernel_looped(
+                layout,
+                c,
+                tiles,
+                route,
+                fidelity,
+                b_transposed,
+                LiveRows::All,
+            )
+            .expect("fits"),
+        };
+        let stream = |t: usize| {
+            let c = crate::code::Code {
+                ins: code[t].clone(),
+                loops: loops[t].clone(),
+            };
+            frontend_stream(&c.expand(), None).expect("a stream the frontend runs")
+        };
+        let init = match plan {
+            Some(p) => subblock_init(&layout.init, layout.sems, p.plan),
+            None => layout.init.clone(),
+        };
+        ([stream(0), stream(1), stream(2)], init)
+    }
+
+    /// What a chunk's packer must read: each output's pairs, after its prior where it continues.
+    fn want(
+        layout: &BlockStreamLayout,
+        c: usize,
+        tiles: [usize; 3],
+        phases: u32,
+        bt: bool,
+    ) -> Order {
+        let (plain, priors) = layout.chunk(c, tiles);
+        match priors {
+            None => canonical(&plain.outputs, phases, LiveRows::All, bt),
+            Some(priors) => canonical_continuing(&plain.outputs, &priors, phases, bt),
+        }
+    }
+
+    /// Block shapes the subblock gates run: odd and even rows, columns that four divides, that no
+    /// width divides (3, 5, 7, 9: the FLUX.2 VAE's 96 channels are 3 tiles), one column, rows a
+    /// period of two.
+    const SUBBLOCK_SHAPES: [[usize; 3]; 9] = [
+        [2, 2, 4],
+        [3, 2, 3],
+        [1, 2, 5],
+        [2, 1, 9],
+        [3, 2, 1],
+        [2, 3, 7],
+        [1, 1, 8],
+        [3, 1, 6],
+        [2, 2, 2],
+    ];
+
+    /// The subblocked kernel (`block_stream_kernel_subblocked`): what its packer reads, under an
+    /// adversarial schedule of the three roles (`interpret_roles`), is each output's canonical
+    /// order -- a first chunk's pairs, a continuing chunk's prior then pairs -- and the looped
+    /// kernel's, for every shape, fidelity, route and `B` transposed or not.
+    #[test]
+    fn the_subblocked_kernel_packs_the_canonical_order() {
+        ORDER_HERE.set(Some(PairOrder::Auto));
+        subblocked_kernel_packs_the_canonical_order();
+    }
+
+    fn subblocked_kernel_packs_the_canonical_order() {
+        for tiles in SUBBLOCK_SHAPES {
+            for fidelity in FIDELITIES {
+                for b_transposed in [false, true] {
+                    for route in ROUTES {
+                        let layout = block_stream_layout(tiles, route.slots()).unwrap();
+                        let plan = crate::tile_op::dst::RowPlan::choose(
+                            tiles[2],
+                            crate::tile_op::dst::DstPlan::HALF,
+                        );
+                        for c in [0, 1, 2] {
+                            let what = format!(
+                                "{tiles:?} {fidelity:?} {route:?} bt {b_transposed} chunk {c}"
+                            );
+                            let want = want(&layout, c, tiles, fidelity.phases(), b_transposed);
+                            let ([u, m, p], init) = block_roles(
+                                &layout,
+                                c,
+                                tiles,
+                                route,
+                                fidelity,
+                                b_transposed,
+                                Some(&plan),
+                            );
+                            assert_eq!(
+                                interpret_roles(&u, &m, &p, &init),
+                                want,
+                                "subblocked, {what}"
+                            );
+                            let ([u, m, p], init) =
+                                block_roles(&layout, c, tiles, route, fidelity, b_transposed, None);
+                            assert_eq!(interpret_roles(&u, &m, &p, &init), want, "looped, {what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The negative controls the subblock gates watch fail: each subblock clearing all of `Dst`
+    /// (the half the packer drains too), the second section overlapping the first, the looped
+    /// kernel run with `free` at two (its whole-`Dst` clear under a packer still reading), and the
+    /// subblocked kernel's `A` tile released after every `B` tile.
+    #[test]
+    fn the_subblock_negative_controls_fail() {
+        ORDER_HERE.set(Some(PairOrder::Auto));
+        subblock_negative_controls_fail();
+    }
+
+    fn subblock_negative_controls_fail() {
+        let route = SrcRoute::Tf32FromFp32;
+        let fidelity = Fidelity::HiFi4;
+        for tiles in [[2, 2, 4], [3, 2, 3], [1, 2, 5], [2, 1, 9]] {
+            let layout = block_stream_layout(tiles, route.slots()).unwrap();
+            let plan =
+                crate::tile_op::dst::RowPlan::choose(tiles[2], crate::tile_op::dst::DstPlan::HALF);
+            for c in [0, 1] {
+                let want = want(&layout, c, tiles, fidelity.phases(), false);
+                for mutation in [DstMutation::ClearBoth, DstMutation::Overlap] {
+                    MUTATION_HERE.set(Some(mutation));
+                    let ([u, m, p], init) =
+                        block_roles(&layout, c, tiles, route, fidelity, false, Some(&plan));
+                    MUTATION_HERE.set(None);
+                    // What the packer read, not a refusal: the mutation runs, and reads wrong.
+                    assert_ne!(
+                        interpret_roles(&u, &m, &p, &init),
+                        want,
+                        "{mutation:?} {tiles:?} chunk {c} not caught"
+                    );
+                }
+                let ([u, m, p], init) =
+                    block_roles(&layout, c, tiles, route, fidelity, false, None);
+                let two = subblock_init(&init, layout.sems, crate::tile_op::dst::DstPlan::HALF);
+                assert_ne!(
+                    interpret_roles(&u, &m, &p, &two),
+                    want,
+                    "the looped kernel at two sections, {tiles:?} chunk {c}, not caught"
+                );
+            }
+        }
+    }
+
+    /// The subblocked kernel's math role has its fused `.ttinsn` form for every shape, and every
+    /// role's program fits its slot.
+    #[test]
+    fn the_subblocked_kernel_keeps_the_fused_form() {
+        ORDER_HERE.set(Some(PairOrder::Auto));
+        for tiles in
+            SUBBLOCK_SHAPES
+                .into_iter()
+                .chain([[8, 2, 9], [6, 4, 12], [4, 2, 18], [8, 4, 6]])
+        {
+            for route in ROUTES {
+                let Ok(layout) = block_stream_layout(tiles, route.slots()) else {
+                    continue;
+                };
+                let plan = crate::tile_op::dst::RowPlan::choose(
+                    tiles[2],
+                    crate::tile_op::dst::DstPlan::HALF,
+                );
+                for c in [0, 1] {
+                    let (code, loops) = block_stream_kernel_subblocked(
+                        &layout,
+                        c,
+                        tiles,
+                        route,
+                        Fidelity::HiFi4,
+                        false,
+                        LiveRows::All,
+                        &plan,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!("{tiles:?} {route:?} chunk {c}: no subblocked programs")
+                    });
+                    let math = crate::code::Code {
+                        ins: code[1].clone(),
+                        loops: loops[1].clone(),
+                    };
+                    assert!(
+                        math.fused().is_ok(),
+                        "{tiles:?} {route:?} chunk {c}: {:?}",
+                        math.fused().err()
+                    );
+                    let sizes: Vec<usize> = code.iter().map(|p| p.len()).collect();
+                    println!(
+                        "{tiles:?} {route:?} chunk {c}: words stored {sizes:?}, pushed {}",
+                        math.expand().len()
+                    );
+                }
+            }
         }
     }
 }

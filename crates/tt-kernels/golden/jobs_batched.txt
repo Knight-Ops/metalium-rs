@@ -1,27 +1,27 @@
 case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 1 pipeline true k None padded [false, false] unpack_b true block Auto
   out 512x128 F32 at [[8, 1985229328, 0, 4, 0, 0, 0, 0], [33280, 33280, 33280, 33280, 33280, 33280, 33280, 33280]] jobs 4
-  jobs 2235c133 e4fb00d2 e490ffec 3c16ef18
+  jobs 0595bc72 f8d6b744 630aebf9 5a239aa3
 case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 1 pipeline true k None padded [true, false] unpack_b true block Auto
   out 512x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [49920, 49920, 49920, 49920, 49920, 49920, 49920, 49920]] jobs 4
-  jobs 2f2f7261 922c00dd 5a85b839 932ccd92
+  jobs 463b83c3 512679cf 1ad0325a fa939c5e
 case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 1 pipeline false k None padded [false, false] unpack_b true block Auto
   out 512x128 F32 at [[8, 1985229328, 0, 4, 0, 0, 0, 0], [33280, 33280, 33280, 33280, 33280, 33280, 33280, 33280]] jobs 4
-  jobs 2235c133 e4fb00d2 e490ffec 3c16ef18
+  jobs 0595bc72 f8d6b744 630aebf9 5a239aa3
 case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 1 pipeline false k None padded [true, false] unpack_b true block Auto
   out 512x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [49920, 49920, 49920, 49920, 49920, 49920, 49920, 49920]] jobs 4
-  jobs 2f2f7261 922c00dd 5a85b839 932ccd92
+  jobs 463b83c3 512679cf 1ad0325a fa939c5e
 case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
   out 512x128 F32 at [[8, 1985229328, 0, 4, 0, 0, 0, 0], [33280, 33280, 33280, 33280, 33280, 33280, 33280, 33280]] jobs 8
-  jobs e58f7df2 515e098e 8c6e4419 ad68d8f7 edba20a8 78c101c1 436da0ab 9e4859c3
+  jobs 69a77a67 db4e6bc5 245d8429 e9f36cce ca41f0c5 43351ab9 c3e59d19 fffca9ec
 case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 8 pipeline true k None padded [true, false] unpack_b true block Auto
   out 512x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [49920, 49920, 49920, 49920, 49920, 49920, 49920, 49920]] jobs 8
-  jobs 7b51ce87 7e5bf086 c4303c12 58acf703 8256c7ea da9eae26 8a3166d6 2016dee6
+  jobs 8c29fbc5 b462fc4c bb649499 9317276f 7bf70c7f 687a2e0d 7dcb9ea0 f90a9205
 case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 8 pipeline false k None padded [false, false] unpack_b true block Auto
   out 512x128 F32 at [[8, 1985229328, 0, 4, 0, 0, 0, 0], [33280, 33280, 33280, 33280, 33280, 33280, 33280, 33280]] jobs 8
-  jobs e58f7df2 515e098e 8c6e4419 ad68d8f7 edba20a8 78c101c1 436da0ab 9e4859c3
+  jobs 69a77a67 db4e6bc5 245d8429 e9f36cce ca41f0c5 43351ab9 c3e59d19 fffca9ec
 case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 8 pipeline false k None padded [true, false] unpack_b true block Auto
   out 512x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [49920, 49920, 49920, 49920, 49920, 49920, 49920, 49920]] jobs 8
-  jobs 7b51ce87 7e5bf086 c4303c12 58acf703 8256c7ea da9eae26 8a3166d6 2016dee6
+  jobs 8c29fbc5 b462fc4c bb649499 9317276f 7bf70c7f 687a2e0d 7dcb9ea0 f90a9205
 case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 120 pipeline true k None padded [false, false] unpack_b true block Auto
   out 512x128 F32 at [[8, 1985229328, 0, 4, 0, 0, 0, 0], [33280, 33280, 33280, 33280, 33280, 33280, 33280, 33280]] jobs 64
   jobs d9920f2b 9e84e71b 198371a2 2eb3042f 8d4295ce b0bf5684 0dd8ec16 1ff5ef39 b221170a 9f0df4a4 716a70ed c5c80f4b 54c79857 82b18fa0 3844ba42 7e870366
@@ -30,8 +30,8 @@ case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]
   jobs 2a87150b c9fe3b29 43ad5e75 970d88d2 0a349597 867da626 a05b402b fa0c290b 87cacf58 024a7180 50e3f4d7 ec88e71d a257c4b2 3e755041 ca0a546e ade9b17e
 case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 120 pipeline true k None padded [true, false] unpack_b true block Auto
   out 512x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [49920, 49920, 49920, 49920, 49920, 49920, 49920, 49920]] jobs 32
-  jobs 32fb5fdc da2ad5e1 b3ab8936 4979f777 5bf03b4f ff02a3da 46b09272 b992a165 f62c64ed 02a0e74e bb3bc41e c19fb1f5 54513fda 1227e8a6 f70cbc13 1b4e2776
-  jobs ad83cd65 70d9c812 01edf5a8 4ec4f0b7 22721e4d 36596ee8 a86ede6d 190cd9c7 c6b56199 00dd9498 b748dce7 b6b1afa1 8080487a 6179cf68 f09229a3 8453c7ae
+  jobs 775f19c9 fa0a7f84 c7da525c e72178b4 b7ce85b6 fcf9a378 8a7d9e47 e8f32a00 9f43f7e9 bb7d5bd6 0e7b43a6 c9f43eb0 4e1902a8 a2b3ae79 e8b4c968 fe22183b
+  jobs 545ddd95 9c2c9c99 849366f7 716ef208 d631cb67 2c815d55 74adc3b6 113d59e3 d72bed18 16a6bd55 1194772a ac1e244e b2e0b74e c1451ba1 a3eef7e0 9afa01b3
 case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 120 pipeline false k None padded [false, false] unpack_b true block Auto
   out 512x128 F32 at [[8, 1985229328, 0, 4, 0, 0, 0, 0], [33280, 33280, 33280, 33280, 33280, 33280, 33280, 33280]] jobs 64
   jobs d9920f2b 9e84e71b 198371a2 2eb3042f 8d4295ce b0bf5684 0dd8ec16 1ff5ef39 b221170a 9f0df4a4 716a70ed c5c80f4b 54c79857 82b18fa0 3844ba42 7e870366
@@ -40,23 +40,23 @@ case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]
   jobs 2a87150b c9fe3b29 43ad5e75 970d88d2 0a349597 867da626 a05b402b fa0c290b 87cacf58 024a7180 50e3f4d7 ec88e71d a257c4b2 3e755041 ca0a546e ade9b17e
 case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 120 pipeline false k None padded [true, false] unpack_b true block Auto
   out 512x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [49920, 49920, 49920, 49920, 49920, 49920, 49920, 49920]] jobs 32
-  jobs 32fb5fdc da2ad5e1 b3ab8936 4979f777 5bf03b4f ff02a3da 46b09272 b992a165 f62c64ed 02a0e74e bb3bc41e c19fb1f5 54513fda 1227e8a6 f70cbc13 1b4e2776
-  jobs ad83cd65 70d9c812 01edf5a8 4ec4f0b7 22721e4d 36596ee8 a86ede6d 190cd9c7 c6b56199 00dd9498 b748dce7 b6b1afa1 8080487a 6179cf68 f09229a3 8453c7ae
+  jobs 775f19c9 fa0a7f84 c7da525c e72178b4 b7ce85b6 fcf9a378 8a7d9e47 e8f32a00 9f43f7e9 bb7d5bd6 0e7b43a6 c9f43eb0 4e1902a8 a2b3ae79 e8b4c968 fe22183b
+  jobs 545ddd95 9c2c9c99 849366f7 716ef208 d631cb67 2c815d55 74adc3b6 113d59e3 d72bed18 16a6bd55 1194772a ac1e244e b2e0b74e c1451ba1 a3eef7e0 9afa01b3
 case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 8 pipeline true k None padded [false, false] unpack_b false block Auto
   out 512x128 F32 at [[8, 1985229328, 0, 4, 0, 0, 0, 0], [33280, 33280, 33280, 33280, 33280, 33280, 33280, 33280]] jobs 8
-  jobs 11e2253b a610da71 2cf848dc a6965780 5a7c6fbd 9a36005b 31df82dc 5f09bb45
+  jobs cee144a9 4cd24f6d c06e46e7 28830c9d a4464d39 b4ea40da 293f758e 9e72b690
 case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 1 pipeline true k None padded [false, false] unpack_b true block Auto
   out 192x35 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [8320, 8320, 8320, 8320, 8320, 8320, 8320, 8320]] jobs 3
   jobs e2d4af0f 387eee63 faf86753
 case [192, 35] [35, 96] [35, 35, 32] items [[0, 0]/[0, 0] [64, 0]/[0, 32] [128, 0]/[0, 64]] units 1 pipeline true k None padded [true, false] unpack_b true block Auto
   out 192x32 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 3
-  jobs e0173b97 e177e597 de456279
+  jobs da0d03ec 283fd16c e2104eae
 case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 1 pipeline false k None padded [false, false] unpack_b true block Auto
   out 192x35 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [8320, 8320, 8320, 8320, 8320, 8320, 8320, 8320]] jobs 3
   jobs e2d4af0f 387eee63 faf86753
 case [192, 35] [35, 96] [35, 35, 32] items [[0, 0]/[0, 0] [64, 0]/[0, 32] [128, 0]/[0, 64]] units 1 pipeline false k None padded [true, false] unpack_b true block Auto
   out 192x32 F32 at [[8, 1985229328, 0, 1, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 3
-  jobs e0173b97 e177e597 de456279
+  jobs da0d03ec 283fd16c e2104eae
 case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
   out 192x35 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [8320, 8320, 8320, 8320, 8320, 8320, 8320, 8320]] jobs 12
   jobs 13ed59ed dd92532a a7fa1f2d 8e5514e2 f169f3ff 5e59103c 0e46ed31 d9661710 78e939a9 4748403c 74fd1a1d f10acf88
@@ -86,43 +86,43 @@ case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0,
   jobs 0430e469 1963682d 9b6a0f56 4a5f1623 f1e59def 8bc5c823 9845a098 10604cfa b64e2b84 32ac0906 22f0941e 1cca96b9
 case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 1 pipeline true k None padded [false, false] unpack_b true block Auto
   out 128x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [16640, 16640, 16640, 16640, 16640, 16640, 16640, 16640]] jobs 2
-  jobs 4f6eb6c4 88873e38
+  jobs 4aab99fd 8f60c2ee
 case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 1 pipeline true k None padded [true, false] unpack_b true block Auto
   out 128x96 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 2
-  jobs 3ff82ca8 dc17aacf
+  jobs d3cf1805 81d8be64
 case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 1 pipeline false k None padded [false, false] unpack_b true block Auto
   out 128x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [16640, 16640, 16640, 16640, 16640, 16640, 16640, 16640]] jobs 2
-  jobs 4f6eb6c4 88873e38
+  jobs 4aab99fd 8f60c2ee
 case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 1 pipeline false k None padded [true, false] unpack_b true block Auto
   out 128x96 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 2
-  jobs 3ff82ca8 dc17aacf
+  jobs d3cf1805 81d8be64
 case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
   out 128x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [16640, 16640, 16640, 16640, 16640, 16640, 16640, 16640]] jobs 8
-  jobs 5cbf93ab 2b9d8331 418d0906 930252cf 84150154 6fa3a2fd adb39c5c 8cf04543
+  jobs f6fffae1 3b20e81b 7ec51ad4 7a83c44f 902a99d5 13df83ce b5cc12af 6b91d975
 case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 8 pipeline true k None padded [true, false] unpack_b true block Auto
   out 128x96 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 6
-  jobs 65b8600a 317808da 7c4b6ce2 06f96b14 3fd883bd c1b739a5
+  jobs 80d93629 a6b02814 2424ae34 07191942 cd229746 ab7aa86a
 case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 8 pipeline false k None padded [false, false] unpack_b true block Auto
   out 128x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [16640, 16640, 16640, 16640, 16640, 16640, 16640, 16640]] jobs 8
-  jobs 5cbf93ab 2b9d8331 418d0906 930252cf 84150154 6fa3a2fd adb39c5c 8cf04543
+  jobs f6fffae1 3b20e81b 7ec51ad4 7a83c44f 902a99d5 13df83ce b5cc12af 6b91d975
 case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 8 pipeline false k None padded [true, false] unpack_b true block Auto
   out 128x96 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 6
-  jobs 65b8600a 317808da 7c4b6ce2 06f96b14 3fd883bd c1b739a5
+  jobs 80d93629 a6b02814 2424ae34 07191942 cd229746 ab7aa86a
 case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 120 pipeline true k None padded [false, false] unpack_b true block Auto
   out 128x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [16640, 16640, 16640, 16640, 16640, 16640, 16640, 16640]] jobs 8
-  jobs 5cbf93ab 2b9d8331 418d0906 930252cf 84150154 6fa3a2fd adb39c5c 8cf04543
+  jobs f6fffae1 3b20e81b 7ec51ad4 7a83c44f 902a99d5 13df83ce b5cc12af 6b91d975
 case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 120 pipeline true k None padded [true, false] unpack_b true block Auto
   out 128x96 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 12
   jobs 89991186 b05f6fd9 9b75cee1 6c444c47 3cd937fa 47a7be24 206772ba d2822d41 c24ccc02 e5ab7b83 21824c59 265eb1a4
 case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 120 pipeline false k None padded [false, false] unpack_b true block Auto
   out 128x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [16640, 16640, 16640, 16640, 16640, 16640, 16640, 16640]] jobs 8
-  jobs 5cbf93ab 2b9d8331 418d0906 930252cf 84150154 6fa3a2fd adb39c5c 8cf04543
+  jobs f6fffae1 3b20e81b 7ec51ad4 7a83c44f 902a99d5 13df83ce b5cc12af 6b91d975
 case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 120 pipeline false k None padded [true, false] unpack_b true block Auto
   out 128x96 F32 at [[8, 1985229328, 0, 3, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 12
   jobs 89991186 b05f6fd9 9b75cee1 6c444c47 3cd937fa 47a7be24 206772ba d2822d41 c24ccc02 e5ab7b83 21824c59 265eb1a4
 case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 8 pipeline true k None padded [false, false] unpack_b false block Auto
   out 128x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [16640, 16640, 16640, 16640, 16640, 16640, 16640, 16640]] jobs 8
-  jobs a8f3d230 ce502dca b47bf023 024042fc 3f137a91 f840b9f7 739d1ea9 347052e5
+  jobs 10e0c7d2 a8406097 58d347b2 9eaff7cb 39dee486 df5d99f6 693fc837 8394b34c
 case [1, 192] [64, 192] [1, 64, 64] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
   out 96x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [12480, 12480, 12480, 12480, 12480, 12480, 12480, 12480]] jobs 6
   jobs 389c375d e9d19769 31a4676d ee0d442e 94453de9 cf4e506a
@@ -150,19 +150,19 @@ case [96, 300] [300, 192] [1, 300, 64] items [[0, 0]/[0, 0] [32, 0]/[0, 64] [64,
   jobs 5d28c70a 13c50b6c 55fdef3b 3a4535ef 548efb3b d44131c8
 case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
   out 1024x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080]] jobs 8
-  jobs 9b3a42d9 f65fdd3b e8da5569 3803a418 704f6b38 c0fa0863 d5874b86 b6f8d62e
+  jobs 440dba48 60410898 1f1cf680 65815941 3e838130 ed213832 1af1b275 4f089a90
 case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 120 pipeline true k None padded [false, false] unpack_b true block Auto
   out 1024x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080]] jobs 64
-  jobs 029fe2f6 8628339f 709dfff1 fbbff074 56f7c7d5 a24cda21 8589f833 daacc501 fa6e0aa2 ca1082fa 9bcc10c5 21137c53 f9cf0ef4 69a4cfb6 109daa7c 932f94c8
-  jobs 13cadfd0 d2d4c560 65958332 8cda2ba5 49098efc bb01d331 664aa4b8 d4400d7e e1e548a5 95c0d490 e522f3e4 5e89b8bb 67181e59 4947829b e6cf26af dcb1a6f2
-  jobs b69d4d67 33bb4de5 b1036500 1f54c6a7 7e67789d 230d510a 4a658922 65d2f1cb 02a5ee01 b3772f9b 3f2a8430 c5329202 7e89ec77 482e39c6 4622fcc9 7922a939
-  jobs 8d7d7b52 3fc286e6 85c774c8 0f4e2498 bb4007af d41241b2 c2650dc8 24a73e2a 739b5132 32372251 04590a61 f78b055a 0c41ca28 4f55dc32 377c1cff adf3a34f
+  jobs 1f762c2a 9a1f83ac 60fb74f8 cc4bd76b fe48916d c72434db c07c71cb fed8b120 fde8fd7e ca49f5cf 9781e403 e5a62513 9501a3e4 56200e0e 7da7310c adf8c148
+  jobs ad1a2497 21bd343d 13d1a41b 7bb68dc7 67e14daf 64ce0ab3 78989b9d c6cd744a 93a0515c ef43551c 2e21f68a 52c62690 5a41aa9c 8b8073fd 9e4226cf e4c2189e
+  jobs 3e1e0427 ef44498e 6e7b07bd 7fe6f136 c5f1624b a7f4a368 3e21c676 cbcb46a9 6c15f5de b4125571 006c39ef 8d97e85f f09cb6ec 94405b7a df6e0bfb eb081cbc
+  jobs 98e0c42b 6251fac6 1f437ce6 7423c200 f4dec0e6 5ff5241e 54cf133b 112af179 18ae03e1 4671adeb 7d1de611 d7187207 c7050f5b 3a7a0c00 7f2273ea cfcbcbbc
 case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 8 pipeline true k None padded [false, false] unpack_b true block Fixed([4, 8, 2])
   out 1024x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080]] jobs 8
-  jobs 4c5d0d53 dc2a9dc5 ce976c65 c678469e 1f424a5f cebdf957 0074f78a 33891f9d
+  jobs 6300f026 a15c40e6 547248a4 af51b4f4 4db1086a 296d273c 6c3fb307 cb3da6f3
 case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 120 pipeline true k None padded [false, false] unpack_b true block Fixed([4, 8, 2])
   out 1024x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080]] jobs 8
-  jobs 4c5d0d53 dc2a9dc5 ce976c65 c678469e 1f424a5f cebdf957 0074f78a 33891f9d
+  jobs 6300f026 a15c40e6 547248a4 af51b4f4 4db1086a 296d273c 6c3fb307 cb3da6f3
 case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 8 pipeline true k None padded [false, false] unpack_b true block Off
   out 1024x64 F32 at [[8, 1985229328, 0, 2, 0, 0, 0, 0], [1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080, 1198080]] jobs 32
   jobs 1fe0afc6 af6a40a9 e7fdeaf4 9a433d58 71729580 b93c6709 e2cd62e7 0f367a5d 317a5666 4cbd4d7c d453b304 0a57055d 5eae5121 98c16b17 0fd199d6 d5cb29de
@@ -187,7 +187,7 @@ case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 
   jobs dc11086b 76e47172 f6f4881b 05b1f41c 12649665 b5c865e4 6238ea47 bf0019fa 9d945506 0b5d446d cd406524 650ee97e 0265f341 9501d365 6897dc21 ffb6a00e
 case [96, 320] [320, 288] [96, 320, 288] items [[0, 0]/[0, 0]] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [66560, 66560, 66560, 66560, 66560, 66560, 66560, 66560]] jobs 5
-  jobs 6065e1d8 c85a8d61 1ccd1c96 04c0e2aa b7a56632
+  jobs a428c42c 6a36ccf6 b0a4922c 288ab957 78746aed
 case [64, 64] [64, 64] [64, 64, 64] items [[0, 32]/[0, 0]] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
   refused: a batched matmul's left operand: a [64, 64] block at [0, 32] of a [64, 64] tensor is not whole tiles inside it
 case [64, 64] [64, 64] [64, 64, 64] items [] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
