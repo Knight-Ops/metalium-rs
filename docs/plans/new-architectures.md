@@ -212,7 +212,9 @@ Left:
     eager's ~1.9 s on every tile (~4 s on one) and the 17.5 ms BF16 roofline; 1,009 ops a step, each with a barrier.
     Profile (`1793343574`): the products 19.6 ms of the 41 ms the profile covers (7.4 GB at 379 GB/s), 748 other ops
     21.4 ms; the recurrence ~560 us a DeltaNet layer (~13 ms a step), 200 us of it the decay broadcast to the whole
-    state (now a column: `0547fa4`); the head (2.5 GB of F32 table) outside the covered window.
+    state; the head (2.5 GB of F32 table) outside the covered window. With the decay a column of the state
+    (`0547fa4`): **64.2 / 64.6 ms** (`1793346925`, 15.6 tokens/s), `step263` passing again (`1793345534`, eager
+    ~1.6 s a token on every tile, traced 67.0 ms on `TtBackend`).
   - What it found outside `tt-models`: (6) the argmax of a 248,320-wide row does not fit a unit's L1 arena ("reduce
     inputs (1010880 bytes) does not fit the 917504-byte L1 arena"); `generate::greedy` takes a row past 65,536
     columns in single-row parts (the Llamas' traces unchanged; `step187` and `step188`'s traced test pass on card
