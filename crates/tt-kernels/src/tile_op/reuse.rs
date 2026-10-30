@@ -625,9 +625,6 @@ mod tests {
             stream_k: true,
             stream_prefetch: true,
             prefetch_units: [crate::session::PREFETCH_UNITS; 2],
-            handoff: None,
-            second_job: false,
-            balanced_deal: false,
             block_stream: BlockStream::Fixed(block),
             reuse,
         };

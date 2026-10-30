@@ -588,8 +588,12 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
       were (bit for bit, within noise of A0).
     - Gates with it: `step215`, `step216`, `step205`, `step219` 27 of 27 (`1793334281`); `step187` and `step188` 13 of 13
       (`1793335917`).
-  - [ ] What is left in the tails, 1.27 ms a step: F4a.1's credits, the lists' L1 room (one job's `B` a unit).
-- [ ] **F4a.3,** re-measure the three opt-in decode schedules F3.8 ports, with the dataflow approach (owner, 2026-10-28). Each was
+  - [x] What is left in the tails, 1.27 ms a step: F4a.1's credits (built, not faster: above), the lists' L1 room
+    (one job's `B` a unit): **not built**, measured first. B queues one prefetch a unit (`mover.rs`, a second
+    `GATHER_PREFETCH` issues the first's reads in line), so more room would buy a second job read ahead; the second
+    prefetched job, which reads exactly that ahead in the trace arena's room, is 0.23 / 0.25 ms slower on this
+    schedule (F4a.3, below). The cap does not bind; `mover.rs` is unchanged for it.
+- [x] **F4a.3,** re-measure the three opt-in decode schedules F3.8 ports, with the dataflow approach (owner, 2026-10-28). Each was
   bit for bit but not faster with a barrier between its ops:
   - the K-chain handoff (`TT_STREAM_HANDOFF`, slower: `1792685519`, `1792686180`), which takes a remote `CREDIT` in
     place of its second op and that op's barrier;
@@ -598,6 +602,18 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
 
   Any that is still not faster under channels is retired completely: code, knob, setter and golden cases, with run
   IDs.
+  - **Measured (2026-10-30, card 1, lane A4) on F4a's schedule** (pumped idle lists, busy lists early, barriers;
+    credits are not faster, so not in it): off H S B B S H off, 1.7B host-timed ms at 32 / 256 tokens:
+    off 10.891 / 12.103 and 10.938 / 12.140 (`1793386897`, `1793390634`); handoff 10.900 / 12.164 and
+    10.861 / 12.145 (`1793387662`, `1793389927`): within noise; second job 11.137 / 12.372 and 11.144 / 12.380
+    (`1793388898`, `1793389659`): 0.23 / 0.25 slower; balanced deal 11.060 / 12.298 and 11.082 / 12.316
+    (`1793389154`, `1793389405`): 0.16 / 0.19 slower.
+  - **All three retired**: `Reads::{handoff, second_job, balanced_deal}`, `tensor::{Handoff, HANDED_AHEAD,
+    balanced_shares}`, `Plan::{second_jobs, push_balanced_jobs}` and the handed columns in
+    `push_prefetched_jobs`, the session's second op for handed columns, the setters `set_stream_handoff`,
+    `set_prefetch_second_job`, `set_balanced_deal`, the knobs `TT_STREAM_HANDOFF(_AT)`, `TT_PREFETCH_SECOND`,
+    `TT_BALANCED_DEAL`, their golden cases (`jobs_matmul.txt`, `planned_matmul.txt`: every case kept is unchanged
+    but for its label) and `step205`'s three tests and their unit tests. `step205` 8 of 8 on ttsim.
 - **Prediction:** the 1.7B decode step's card read rate ≥400 GB/s (from 328) and the step ≤9.5 ms (from 10.9), bit-exact.
 - **Kill:** the step moves <0.3 ms, or small ops lose what products gain.
 

@@ -548,9 +548,6 @@ fn session_reads() -> Reads {
         stream_k: true,
         stream_prefetch: true,
         prefetch_units: [crate::session::PREFETCH_UNITS; 2],
-        handoff: None,
-        second_job: false,
-        balanced_deal: false,
         block_stream: BlockStream::Auto,
         reuse: tensor::Reuse::Off,
     }
@@ -670,21 +667,9 @@ impl Product {
             &[],
         );
         match built {
-            Ok((work, dealt, handoff)) => {
+            Ok((work, dealt)) => {
                 case(out, &name, Ok(Some(work)));
                 writeln!(out, "  dealt {dealt:?}").unwrap();
-                if let Some(h) = handoff {
-                    writeln!(
-                        out,
-                        "  handoff partials {:?} jobs {}",
-                        h.partials.tensor_ref().encode(),
-                        h.jobs.len()
-                    )
-                    .unwrap();
-                    for (k, j) in h.jobs.iter().enumerate() {
-                        job(out, k, j);
-                    }
-                }
             }
             Err(e) => case(out, &name, Err(e)),
         }
@@ -694,16 +679,13 @@ impl Product {
 
 fn reads_label(r: &Reads) -> String {
     format!(
-        "thin {} resident {} unpack_b {} stream_k {} stream_prefetch {} prefetch_units {:?} handoff {:?} second {} balanced {} block {:?}",
+        "thin {} resident {} unpack_b {} stream_k {} stream_prefetch {} prefetch_units {:?} block {:?}",
         r.thin as u8,
         r.resident_a as u8,
         r.unpack_b as u8,
         r.stream_k as u8,
         r.stream_prefetch as u8,
         r.prefetch_units,
-        r.handoff,
-        r.second_job as u8,
-        r.balanced_deal as u8,
         r.block_stream,
     )
 }
@@ -800,29 +782,18 @@ fn matmul_jobs_are_pinned() {
                 }
             }
         }
-        // Capture-time reads ahead: idle units prefetching, a second job each, a balanced deal, a
-        // streamed column handed between two units, and the first job's `B` read while ops run.
+        // Capture-time reads ahead: idle units prefetching, and the first job's `B` read while ops
+        // run.
         for (k, n, stream_k) in [(2048, 6144, false), (8192, 2048, true), (1056, 200, true)] {
-            for (second, balanced, handoff) in [
-                (false, false, None),
-                (true, false, None),
-                (false, true, None),
-                (false, false, Some(0)),
-                (false, false, Some(3)),
-            ] {
-                for busy in [false, true] {
-                    let mut p = Product::new([1, k], [k, n], 64);
-                    p.packed_a = true;
-                    p.reads.stream_k = stream_k;
-                    p.reads.second_job = second;
-                    p.reads.balanced_deal = balanced;
-                    p.reads.handoff = handoff;
-                    p.reads.prefetch_units = [crate::session::PREFETCH_UNITS, 40];
-                    p.prefetch = true;
-                    p.spread = 120;
-                    p.busy = busy;
-                    p.run(out, PairOrder::Auto);
-                }
+            for busy in [false, true] {
+                let mut p = Product::new([1, k], [k, n], 64);
+                p.packed_a = true;
+                p.reads.stream_k = stream_k;
+                p.reads.prefetch_units = [crate::session::PREFETCH_UNITS, 40];
+                p.prefetch = true;
+                p.spread = 120;
+                p.busy = busy;
+                p.run(out, PairOrder::Auto);
             }
         }
         // Packed weights and activations: every edge pair F1 admits, one row and blocked.

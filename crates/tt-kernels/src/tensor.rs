@@ -1564,9 +1564,6 @@ pub fn matmul_dram(
             stream_k: false,
             stream_prefetch: false,
             prefetch_units: [usize::MAX; 2],
-            handoff: None,
-            second_job: false,
-            balanced_deal: false,
             block_stream: BlockStream::Off,
             reuse: Reuse::Off,
         },
@@ -1664,16 +1661,6 @@ pub(crate) struct Reads {
     /// The most prefetching units a product takes, its `K` whole and streamed: a streamed
     /// column reads only its first chunks ahead, so the two kinds want different counts.
     pub prefetch_units: [usize; 2],
-    /// With a streamed product prefetched, each column its own units would read whole is handed
-    /// between two units at this chunk (`Some(0)`: half the chunks; [`Handoff`]).
-    pub handoff: Option<usize>,
-    /// A `K`-whole product's prefetching units each take a second job of one column, its `B` in a
-    /// ring below the first's and read ahead with it (`tile_op::matmul::Plan::push_prefetched_jobs`).
-    pub second_job: bool,
-    /// A `K`-whole product whose own units would run more than a round deals the columns its span
-    /// reads over its prefetching units too, not its own units alone
-    /// (`tile_op::matmul::Plan::push_prefetched_jobs`, [`balanced_shares`]).
-    pub balanced_deal: bool,
     /// Whether a product of several tile rows runs as 2-D blocks with `K` streamed
     /// ([`BlockStream`]).
     pub block_stream: BlockStream,
@@ -1944,34 +1931,11 @@ pub const PREFETCH: &str = "weight prefetch";
 /// captured, read it where the job is.
 pub const BUSY_PREFETCH: &str = "busy weight prefetch";
 
-/// What the first op's list on a unit that takes the rest of a handed column is called
-/// ([`Handoff`]): the packed `A`, and its first two chunks' `B` as a prefetch
-/// ([`record::GATHER_PREFETCH`]), which the op's barrier leaves in flight.
-pub const HANDED_AHEAD: &str = "handed column read ahead";
-
-/// The second op of a streamed product whose columns are handed between two units
-/// (`docs/plans/decode-to-bandwidth.md` Phase 8, "The stream's rate"): in the first op, a unit
-/// that would read a whole column computes its first `h` chunks and writes the FP32 partial to
-/// `partials`, while a unit with no job in the product reads the rest of its `B` ahead
-/// ([`HANDED_AHEAD`]); after the first op's barrier, that unit reloads the partial into the
-/// slot chunk `h` reloads from and computes the rest, writing the column. Each output tile's
-/// `K` chain is the same in the same order, through the same FP32 partial, so bit for bit; no
-/// unit reads a whole column inside the product.
-pub(crate) struct Handoff {
-    /// The second op's jobs, laid out as the first op's: a unit's at its own index.
-    pub jobs: Vec<Job>,
-    /// The handed columns' partials, `C`'s shape: freed once the second op is queued.
-    pub partials: DramTensor,
-    /// The L1 the jobs plan (the first op's stream layout), noted again for the second op.
-    pub planned: crate::l1::Planned,
-}
-
 /// [`matmul_dram_limited`], with `prefetch` (units at or past `units`, below `spread`) each
 /// taking one job of the product whose `B` its own list reads ahead ([`PREFETCH`],
 /// `tile_op::matmul::Plan::push_prefetched_jobs`) -- where the product is one row with a packed `A` and
 /// its `K` whole or streamed (a prefetching unit's one job is in the first half when pipelined). Returns the work, `Some(spread)` when its jobs are dealt over
-/// `spread` units (job `j` to unit `j % spread`), else `None` (over `units`, `prefetch` unused),
-/// and, where `reads.handoff` hands columns, the second op (dealt as the first).
+/// `spread` units (job `j` to unit `j % spread`), else `None` (over `units`, `prefetch` unused).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_dram_prefetching(
     alloc: &mut DramAlloc,
@@ -1990,7 +1954,7 @@ pub(crate) fn matmul_dram_prefetching(
     spread: usize,
     busy: &[Option<u64>],
     tiles: &[(u8, u8)],
-) -> Result<(Work, Option<usize>, Option<Handoff>)> {
+) -> Result<(Work, Option<usize>)> {
     let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
     a.expect("a matmul", edge(route.packed_a()))?;
     b.expect("a matmul", edge(route.packed_b()))?;
@@ -2075,7 +2039,7 @@ pub(crate) fn matmul_dram_prefetching(
             )?;
             op.share = crate::tile_op::reuse::share(reuse, tiles);
             let work = op.build(alloc, units, Overlap::Off)?;
-            return Ok((work, None, None));
+            return Ok((work, None));
         }
     }
     // The plan's block is what runs, so the arena must keep it (`matmul::plan_floor`) -- except
@@ -2128,8 +2092,6 @@ pub(crate) fn matmul_dram_prefetching(
             && staging == Staging::Slots
             && kc < kt,
         busy: busy.to_vec(),
-        second_job: reads.second_job,
-        balanced_deal: reads.balanced_deal,
     };
     let prefetch = &prefetch[..prefetch
         .len()
@@ -2143,18 +2105,6 @@ pub(crate) fn matmul_dram_prefetching(
             kc >= kt
         }
         && prefetch.iter().all(|&u| (units..spread).contains(&u));
-    // The handed columns' partials, if any column may be handed.
-    let partials = match reads.handoff {
-        Some(_) if prefetching && plan.stream_k => match DramTensor::alloc(alloc, m, n) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                alloc.free(&c.placement);
-                return Err(e);
-            }
-        },
-        _ => None,
-    };
-    let handoff = reads.handoff.zip(partials.as_ref().map(|p| p.tensor_ref()));
     let pushed = if prefetching {
         plan.push_prefetched_jobs(
             &mut jobs,
@@ -2162,44 +2112,15 @@ pub(crate) fn matmul_dram_prefetching(
             [a_transposed, b_transposed],
             prefetch,
             spread,
-            handoff,
         )
     } else {
         plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed])
-            .map(|()| Vec::new())
     };
-    let handed = match pushed {
-        Ok(handed) => handed,
-        Err(e) => {
-            alloc.free(&c.placement);
-            if let Some(p) = &partials {
-                alloc.free(&p.placement);
-            }
-            return Err(e);
-        }
-    };
-    let handoff = match partials {
-        Some(partials) if !handed.is_empty() => {
-            // What the jobs planned, left noted for the first op.
-            let planned = crate::l1::take_planned();
-            crate::l1::note_planned(planned);
-            Some(Handoff {
-                jobs: handed,
-                partials,
-                planned,
-            })
-        }
-        Some(partials) => {
-            alloc.free(&partials.placement);
-            None
-        }
-        None => None,
-    };
-    Ok((
-        Work { out: c, jobs },
-        prefetching.then_some(spread),
-        handoff,
-    ))
+    if let Err(e) = pushed {
+        alloc.free(&c.placement);
+        return Err(e);
+    }
+    Ok((Work { out: c, jobs }, prefetching.then_some(spread)))
 }
 
 /// A one-tile-row product's output columns, one run a job, in the order a
@@ -2229,17 +2150,6 @@ pub fn thin_runs(
             .map(|r| full + r.start..full + r.end),
     );
     Some(out)
-}
-
-/// How many of `left` columns each of `deal` units takes ([`Reads::balanced_deal`]): as even as
-/// integer division allows, the remainder to the last units of the deal (a product's prefetching
-/// units, which sit after its own and are served fastest; profile `1792629809`).
-pub fn balanced_shares(left: usize, deal: usize) -> Vec<usize> {
-    let Some(each) = left.checked_div(deal) else {
-        return Vec::new();
-    };
-    let more = deal - left % deal;
-    (0..deal).map(|d| each + usize::from(d >= more)).collect()
 }
 
 /// `A` slots a K block of `count` tiles takes with `A` packed: the packed tiles its `K` range
@@ -3167,8 +3077,6 @@ pub(crate) fn matmul_dram_batched_limited(
         packed_a: None,
         stream_k: false,
         busy: Vec::new(),
-        second_job: false,
-        balanced_deal: false,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -7199,9 +7107,6 @@ mod tests {
                 stream_k: false,
                 stream_prefetch: false,
                 prefetch_units: [usize::MAX; 2],
-                handoff: None,
-                second_job: false,
-                balanced_deal: false,
                 block_stream: super::BlockStream::Off,
                 reuse: super::Reuse::Off,
             };
@@ -7288,9 +7193,6 @@ mod tests {
                         stream_k: false,
                         stream_prefetch: false,
                         prefetch_units: [usize::MAX; 2],
-                        handoff: None,
-                        second_job: false,
-                        balanced_deal: false,
                         block_stream: super::BlockStream::Off,
                         reuse: super::Reuse::Off,
                     },
@@ -7371,9 +7273,6 @@ mod tests {
                     stream_k: false,
                     stream_prefetch: false,
                     prefetch_units: [usize::MAX; 2],
-                    handoff: None,
-                    second_job: false,
-                    balanced_deal: false,
                     block_stream: super::BlockStream::Off,
                     reuse: super::Reuse::Off,
                 },
@@ -7464,9 +7363,6 @@ mod tests {
                     stream_k: true,
                     stream_prefetch: false,
                     prefetch_units: [usize::MAX; 2],
-                    handoff: None,
-                    second_job: false,
-                    balanced_deal: false,
                     block_stream: super::BlockStream::Off,
                     reuse: super::Reuse::Off,
                 },
@@ -7527,7 +7423,7 @@ mod tests {
                 let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
                 let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
                 let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
-                let (work, dealt, _) = super::matmul_dram_prefetching(
+                let (work, dealt) = super::matmul_dram_prefetching(
                     &mut alloc,
                     &a,
                     false,
@@ -7547,9 +7443,6 @@ mod tests {
                         stream_k: true,
                         stream_prefetch: on,
                         prefetch_units: [usize::MAX, 40],
-                        handoff: None,
-                        second_job: false,
-                        balanced_deal: false,
                         block_stream: super::BlockStream::Off,
                         reuse: super::Reuse::Off,
                     },
@@ -7606,319 +7499,6 @@ mod tests {
                     assert!(ahead.is_empty());
                 }
             }
-        }
-    }
-
-    #[test]
-    fn balanced_shares_are_even_with_the_remainder_last() {
-        assert!(super::balanced_shares(5, 0).is_empty());
-        assert_eq!(super::balanced_shares(0, 3), [0, 0, 0]);
-        assert_eq!(super::balanced_shares(7, 3), [2, 2, 3]);
-        assert_eq!(super::balanced_shares(2, 4), [0, 0, 1, 1]);
-        for (left, deal) in [(304, 104), (128, 104), (1, 1), (999, 7)] {
-            let s = super::balanced_shares(left, deal);
-            assert_eq!(s.iter().sum::<usize>(), left);
-            assert!(
-                s.windows(2).all(|w| w[0] <= w[1]),
-                "{left} over {deal}: {s:?}"
-            );
-            assert!(s[deal - 1] - s[0] <= 1, "{left} over {deal}: {s:?}");
-        }
-    }
-
-    /// A `K`-whole prefetched product dealt balanced ([`super::Reads::balanced_deal`]): the
-    /// prefetching units' jobs read ahead and the plan's units' first round as without it, then
-    /// the columns left over both, no unit more than its share and the remainder on the
-    /// prefetching units; every column exactly once. Nothing changes where the plan's own units
-    /// would run one round (`qkv`), or with it off.
-    #[test]
-    fn a_balanced_deal_gives_each_unit_its_in_span_share() {
-        use crate::matmul::{Fidelity, SrcRoute};
-        let (units, spread) = (64, 120);
-        let prefetch: Vec<usize> = (units..spread).collect();
-        let deal = |n: usize, on: bool| {
-            let mut alloc = DramAlloc::new(&Dram::FULL);
-            let a = DramTensor::alloc(&mut alloc, 1, 2048).unwrap();
-            let b = DramTensor::alloc(&mut alloc, 2048, n).unwrap();
-            let p = DramTensor::alloc(&mut alloc, 64, 32).unwrap();
-            let (work, ..) = super::matmul_dram_prefetching(
-                &mut alloc,
-                &a,
-                false,
-                &b,
-                false,
-                SrcRoute::Tf32FromFp32,
-                Fidelity::HiFi4,
-                units,
-                false,
-                false,
-                None,
-                super::Reads {
-                    thin: true,
-                    resident_a: true,
-                    unpack_b: false,
-                    packed_a: Some(p.tensor_ref()),
-                    stream_k: false,
-                    stream_prefetch: true,
-                    prefetch_units: [40, 40],
-                    handoff: None,
-                    second_job: false,
-                    balanced_deal: on,
-                    block_stream: super::BlockStream::Off,
-                    reuse: super::Reuse::Off,
-                },
-                &prefetch,
-                spread,
-                &[],
-                &[],
-            )
-            .unwrap();
-            work.jobs
-        };
-        // Each job's columns, from its gathers' headers, wherever its lists sit.
-        let columns = |job: &Job| -> Vec<usize> {
-            job.iter()
-                .filter_map(|step| match step {
-                    Step::List { entries, .. } => Some(entries),
-                    _ => None,
-                })
-                .flatten()
-                .filter(|e| e[0] == record::GATHER)
-                .flat_map(|e| e[6] as usize..(e[6] + e[7]) as usize)
-                .collect()
-        };
-        for (n, balances) in [(16384, true), (6144, false)] {
-            let nt = n / 32;
-            let (on, off) = (deal(n, true), deal(n, false));
-            for jobs in [&on, &off] {
-                let mut all: Vec<usize> = jobs.iter().flat_map(&columns).collect();
-                all.sort_unstable();
-                assert_eq!(
-                    all,
-                    (0..nt).collect::<Vec<_>>(),
-                    "[2048, {n}]: each column once"
-                );
-            }
-            let same = |x: &[Job], y: &[Job]| format!("{x:?}") == format!("{y:?}");
-            assert!(
-                same(&on[..spread], &off[..spread]),
-                "[2048, {n}]: the first round unchanged"
-            );
-            if !balances {
-                assert!(
-                    same(&on, &off),
-                    "[2048, {n}]: one round of the plan's units: unchanged"
-                );
-                continue;
-            }
-            // Each unit's columns after its first job.
-            let later = |jobs: &[Job]| -> Vec<usize> {
-                (0..spread)
-                    .map(|u| {
-                        jobs.iter()
-                            .skip(spread + u)
-                            .step_by(spread)
-                            .map(|j| columns(j).len())
-                            .sum()
-                    })
-                    .collect()
-            };
-            let (l_on, l_off) = (later(&on), later(&off));
-            // `gate|up`: 80 columns read ahead, 128 in the first round, 304 left.
-            let left = nt - 80 - 128;
-            assert_eq!(l_on.iter().sum::<usize>(), left);
-            assert_eq!(l_off.iter().sum::<usize>(), left);
-            let dealt: Vec<usize> = (0..104).collect();
-            let share = left.div_ceil(dealt.len());
-            assert!(dealt
-                .iter()
-                .all(|&u| l_on[u] + 1 >= share && l_on[u] <= share));
-            assert!(l_on[104..].iter().all(|&c| c == 0), "units past the deal");
-            assert!(
-                l_on[64..104].iter().all(|&c| c == share),
-                "the remainder on the prefetching units: {:?}",
-                &l_on[64..104]
-            );
-            assert_eq!(
-                l_off.iter().max(),
-                Some(&5),
-                "off: the plan's units read 5 more"
-            );
-            assert!(
-                l_off[64..].iter().all(|&c| c == 0),
-                "off: the prefetching units, none"
-            );
-        }
-    }
-
-    /// A streamed, prefetched product's columns its own units would read whole are handed: the
-    /// column's unit computes chunks `0..h` and writes the partial to `partials`, a spare unit
-    /// reads the packed `A` and chunks `h, h + 1` ahead in the first op, and in the second reloads
-    /// that partial into the slot its first chunk reloads from, drains the prefetch, and computes
-    /// the rest, writing the column. Every `B` tile once; nothing handed when off or with no spare
-    /// unit.
-    #[test]
-    fn a_streamed_product_s_whole_columns_are_handed_between_two_units() {
-        use crate::matmul::{Fidelity, SrcRoute};
-        let tiles = |entries: &[[u32; 8]]| {
-            let mut counted = crate::profile_mode::OpBytes::default();
-            counted.count(entries);
-            counted.b / tt_isa::dm::TILE_SLOT
-        };
-        let gathers = |entries: &[[u32; 8]]| -> Vec<u32> {
-            entries
-                .iter()
-                .filter(|e| e[0] == record::GATHER)
-                .map(|e| e[1])
-                .collect()
-        };
-        // `down` (1.7B: 4 chunks, 24 columns on the plan's units, 40 spare), handed at half and
-        // at chunk 1; then 24 units with every other unit prefetching: no spare unit.
-        for (units, spread, at) in [
-            (64, 120, Some(0)),
-            (64, 120, Some(1)),
-            (64, 120, None),
-            (24, 64, Some(0)),
-        ] {
-            let (k, n) = (8192, 2048);
-            let prefetch: Vec<usize> = (units..spread).collect();
-            let mut alloc = DramAlloc::new(&Dram::FULL);
-            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
-            let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
-            let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
-            let (work, dealt, handoff) = super::matmul_dram_prefetching(
-                &mut alloc,
-                &a,
-                false,
-                &b,
-                false,
-                SrcRoute::Tf32FromFp32,
-                Fidelity::HiFi4,
-                units,
-                false,
-                false,
-                None,
-                super::Reads {
-                    thin: true,
-                    resident_a: true,
-                    unpack_b: false,
-                    packed_a: Some(p.tensor_ref()),
-                    stream_k: true,
-                    stream_prefetch: true,
-                    prefetch_units: [usize::MAX, 40],
-                    handoff: at,
-                    second_job: false,
-                    balanced_deal: false,
-                    block_stream: super::BlockStream::Off,
-                    reuse: super::Reuse::Off,
-                },
-                &prefetch,
-                spread,
-                &[],
-                &[],
-            )
-            .unwrap();
-            assert_eq!(dealt, Some(spread));
-            let kt = (k / 32) as u64;
-            let (c, nt) = (work.out.tensor_ref().encode(), n / 32);
-            let regular = nt - prefetch.len().min(40);
-            let Some(handoff) = handoff else {
-                assert!(
-                    at.is_none() || units == regular,
-                    "units {units}, spread {spread}: handed with no spare unit"
-                );
-                assert!(work.jobs.iter().all(|job| !job.iter().any(
-                    |s| matches!(s, Step::List { what, .. } if *what == super::HANDED_AHEAD)
-                )));
-                continue;
-            };
-            let at = at.unwrap();
-            let pr = handoff.partials.tensor_ref().encode();
-            let (chunks, h) = (4, if at == 0 { 2 } else { at });
-            assert_eq!(handoff.jobs.len(), spread);
-            let spare: Vec<usize> = (regular..regular * 2).collect();
-            let mut columns = vec![0u64; nt];
-            for (x, &y) in spare.iter().enumerate() {
-                // The column's unit: chunks `0..h`, the last one's partial out to `partials`.
-                let job = &work.jobs[x];
-                assert_eq!(job.len(), 3 * h, "unit {x}: its first {h} chunks");
-                let Some(Step::List { entries, .. }) = job.last() else {
-                    panic!("a chunk ends with its scatter list");
-                };
-                assert_eq!(entries[0][0], record::SCATTER);
-                assert_eq!(&entries[1..], &pr[..], "unit {x}: the partial, not C");
-                let (j, from) = (entries[0][5] as usize, entries[0][1] as u64);
-                let mut read = 0;
-                for step in job {
-                    if let Step::List { entries, .. } = step {
-                        read += tiles(entries);
-                        assert!(gathers(entries)
-                            .iter()
-                            .all(|f| f & record::GATHER_PREFETCH == 0));
-                    }
-                }
-                // The spare unit, first op: the packed `A`, then two chunks' prefetched gathers.
-                let [Step::List { what, entries }] = &work.jobs[y][..] else {
-                    panic!("unit {y}: one list in the first op");
-                };
-                assert_eq!(*what, super::HANDED_AHEAD);
-                let flags = gathers(entries);
-                assert_eq!(flags.len(), 2.min(chunks - h), "unit {y}");
-                assert!(flags
-                    .iter()
-                    .all(|f| f & record::GATHER_PREFETCH != 0 && f & record::GATHER_STREAM == 0));
-                assert_eq!(
-                    entries[0][0],
-                    record::READ_RUN,
-                    "unit {y}: the packed A first"
-                );
-                read += tiles(entries);
-                // The second op: the partial reloaded where X packed it, the prefetch drained,
-                // then chunks `h..`, the last writing C.
-                let rest = &handoff.jobs[y];
-                assert_eq!(rest.len(), 3 * (chunks - h), "unit {y}: chunks {h}..");
-                let Some(Step::List { entries: lead, .. }) = rest.first() else {
-                    panic!("a chunk starts with its gather list");
-                };
-                assert_eq!(lead[0][0], op::WAIT);
-                assert_eq!(lead[1][0], record::READ_RUN);
-                assert_eq!(lead[1][1] as usize, j, "unit {y}: its column's partial");
-                assert_eq!(
-                    lead[1][3] as u64 + TILE_DATA,
-                    from,
-                    "unit {y}: into the slot X packed into"
-                );
-                assert_eq!(&lead[2..4], &pr[..]);
-                assert_eq!(lead[4][..2], [op::WAIT, tt_isa::dm::WAIT_PREFETCH]);
-                for (q, step) in rest.chunks(3).enumerate() {
-                    let [Step::List { entries: g, .. }, Step::Kernel { half, .. }, Step::List { entries: sc, .. }] =
-                        step
-                    else {
-                        panic!("a chunk is a gather, a kernel and a scatter");
-                    };
-                    assert_eq!(*half, Some(((h + q) % 2) as u8), "unit {y} chunk {}", h + q);
-                    read += tiles(g);
-                    if q + 1 == chunks - h {
-                        assert_eq!(sc[0][5] as usize, j);
-                        assert_eq!(&sc[1..], &c[..], "unit {y}: the column to C");
-                    } else {
-                        assert!(sc.is_empty());
-                    }
-                }
-                assert_eq!(read, kt, "column {j}: its B once");
-                columns[j] += 1;
-            }
-            assert!(columns.iter().filter(|&&c| c > 0).all(|&c| c == 1));
-            assert_eq!(
-                columns.iter().sum::<u64>(),
-                regular as u64,
-                "every regular column handed"
-            );
-            // Nothing else in the second op.
-            assert_eq!(
-                handoff.jobs.iter().filter(|j| !j.is_empty()).count(),
-                regular
-            );
         }
     }
 
@@ -8246,9 +7826,6 @@ mod block_stream_tests {
             stream_k: false,
             stream_prefetch: false,
             prefetch_units: [usize::MAX; 2],
-            handoff: None,
-            second_job: false,
-            balanced_deal: false,
             block_stream: mode,
             reuse: Reuse::Off,
         }
