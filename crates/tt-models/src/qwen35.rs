@@ -174,11 +174,15 @@ pub(crate) fn rms<B: Backend, const D: usize>(x: Tensor<B, D>, eps: f64) -> Tens
     x * mean_square.add_scalar(eps).sqrt().recip()
 }
 
-/// A zero-centred RMSNorm: `rms(x) (1 + weight)` in F32, returned in `x`'s dtype.
+/// A zero-centred RMSNorm: `rms(x) (1 + weight)` in F32, returned in `x`'s dtype. On the card
+/// one op (`burn_tt::rms_norm`, `x / sqrt(mean(x x) + eps) (1 + weight)`) where it takes the row.
 #[derive(Module, Debug)]
 pub struct CenteredNorm<B: Backend> {
     weight: Param<Tensor<B, 1>>,
     eps: f64,
+    /// `weight` already holds `1 + weight` in F32 ([`Qwen35::prepared`]): the sum made once, the
+    /// same F32 addition a step would make.
+    shifted: bool,
 }
 
 impl<B: Backend> CenteredNorm<B> {
@@ -186,18 +190,34 @@ impl<B: Backend> CenteredNorm<B> {
         Self {
             weight: Param::from_tensor(Tensor::zeros([width], device)),
             eps,
+            shifted: false,
+        }
+    }
+
+    /// `1 + weight`, in F32.
+    fn scale(&self) -> Tensor<B, 1> {
+        let w = self.weight.val().cast(DType::F32);
+        if self.shifted {
+            w
+        } else {
+            w.add_scalar(1.0)
+        }
+    }
+
+    fn shift(&mut self) {
+        if !self.shifted {
+            self.weight = Param::from_tensor(self.scale());
+            self.shifted = true;
         }
     }
 
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         let dtype = x.dtype();
-        let scale = self
-            .weight
-            .val()
-            .cast(DType::F32)
-            .add_scalar(1.0)
-            .unsqueeze::<D>();
-        (rms(x, self.eps) * scale).cast(dtype)
+        let scale = self.scale();
+        if let Some(y) = burn_tt::rms_norm(&x, &scale, self.eps) {
+            return y;
+        }
+        (rms(x, self.eps) * scale.unsqueeze::<D>()).cast(dtype)
     }
 }
 
@@ -219,6 +239,13 @@ impl<B: Backend> GatedNorm<B> {
     fn forward(&self, x: Tensor<B, 4>, z: Tensor<B, 4>) -> Tensor<B, 4> {
         let dtype = x.dtype();
         let weight = self.weight.val();
+        // On the card: the scaled norm as one op (`burn_tt::rms_norm`), then the gate as
+        // `silu(z) * normed`, the chain `Tt`'s fuser runs as one op.
+        if dtype == DType::F32 && weight.dtype() == DType::F32 {
+            if let Some(normed) = burn_tt::rms_norm(&x, &weight, self.eps) {
+                return silu(z.cast(DType::F32)) * normed;
+            }
+        }
         let normed = rms(x, self.eps).cast(dtype) * weight.cast(dtype).unsqueeze::<4>();
         (normed.cast(DType::F32) * silu(z.cast(DType::F32))).cast(dtype)
     }
@@ -240,26 +267,40 @@ pub struct GatedAttention<B: Backend> {
 #[derive(Module, Debug)]
 pub struct GatedDeltaNet<B: Backend> {
     /// `[hidden, 2 key_dim + value_dim]`: queries, keys and values, before the convolution.
-    in_proj_qkv: Linear<B>,
+    in_proj_qkv: Option<Linear<B>>,
     /// The output gate, `[hidden, value_dim]`.
-    in_proj_z: Linear<B>,
+    in_proj_z: Option<Linear<B>>,
     /// The write strength and the decay, one per value head.
-    in_proj_b: Linear<B>,
-    in_proj_a: Linear<B>,
+    in_proj_b: Option<Linear<B>>,
+    in_proj_a: Option<Linear<B>>,
+    /// `qkv|z|b|a` as one `[hidden, conv_dim + value_dim + 2 v_heads]` matrix, the four parts then
+    /// `None` ([`Qwen35::prepared`]): one product where there were four.
+    in_proj: Option<Linear<B>>,
     /// The depthwise causal convolution's taps, `[conv_dim, 1, conv_kernel]` (no bias).
     conv1d: Param<Tensor<B, 3>>,
+    /// The taps as rows, `[1, conv_kernel, conv_dim]` ([`Qwen35::prepared`]).
+    taps: Option<Param<Tensor<B, 3>>>,
     /// The decay's rate and bias per value head (`A_log`, `dt_bias`).
     a_log: Param<Tensor<B, 1>>,
     dt_bias: Param<Tensor<B, 1>>,
+    /// `-exp(A_log)` in F32 ([`Qwen35::prepared`]): the same bits as each step's `exp` then the
+    /// product's negation.
+    neg_rate: Option<Param<Tensor<B, 1>>>,
+    /// The scales that make an RMS norm over `k_dim` (with `eps / k_dim`) the L2 norm the queries
+    /// and keys take, `1 / k_dim` and `k_dim^-0.5` ([`Qwen35::prepared`]): one op on the card.
+    q_scale: Option<Param<Tensor<B, 1>>>,
+    k_scale: Option<Param<Tensor<B, 1>>>,
     norm: GatedNorm<B>,
     out_proj: Linear<B>,
 }
 
 #[derive(Module, Debug)]
 pub struct Mlp<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
+    gate_proj: Option<Linear<B>>,
+    up_proj: Option<Linear<B>>,
     down_proj: Linear<B>,
+    /// `gate|up` as one `[hidden, 2 ff]` matrix, the two then `None` ([`Qwen35::prepared`]).
+    gate_up: Option<Linear<B>>,
 }
 
 /// One decoder layer: exactly one of `linear_attn` and `self_attn` is present
@@ -463,10 +504,15 @@ impl<B: Backend> GatedDeltaNet<B> {
     fn new(cfg: &Qwen35Config, device: &B::Device) -> Self {
         let (h, vh) = (cfg.hidden, cfg.linear_v_heads);
         Self {
-            in_proj_qkv: linear(h, cfg.conv_dim(), device),
-            in_proj_z: linear(h, cfg.value_dim(), device),
-            in_proj_b: linear(h, vh, device),
-            in_proj_a: linear(h, vh, device),
+            in_proj_qkv: Some(linear(h, cfg.conv_dim(), device)),
+            in_proj_z: Some(linear(h, cfg.value_dim(), device)),
+            in_proj_b: Some(linear(h, vh, device)),
+            in_proj_a: Some(linear(h, vh, device)),
+            in_proj: None,
+            taps: None,
+            neg_rate: None,
+            q_scale: None,
+            k_scale: None,
             // As PyTorch initialises them: `Conv1d`'s uniform bound for `conv_kernel` inputs a
             // channel, and `A` uniform in `[0.01, 16]` (here its logarithm).
             conv1d: Param::from_tensor(Tensor::random(
@@ -498,8 +544,8 @@ impl<B: Backend> GatedDeltaNet<B> {
         padding: Option<&Padding<B>>,
     ) -> Tensor<B, 3> {
         let [n, t, c] = x.dims();
-        let taps = self.conv1d.val();
-        let [_, _, kernel] = taps.dims();
+        let taps = self.taps();
+        let [_, kernel, _] = taps.dims();
         let dtype = taps.dtype();
         let padded = Tensor::cat(vec![state.clone(), x.cast(dtype)], 1);
         let past = kernel - 1;
@@ -513,17 +559,96 @@ impl<B: Backend> GatedDeltaNet<B> {
                 .select(0, p.conv_rows.clone())
                 .reshape([n, past, c]),
         };
-        // `out[i] = sum_j taps[j] padded[i + j]`, in tap order (a cross-correlation, as `conv1d`).
-        let tap = |j: usize| {
-            taps.clone()
-                .slice([0..c, 0..1, j..j + 1])
-                .reshape([1, 1, c])
-        };
+        // `out[i] = sum_j taps[j] padded[i + j]` (a cross-correlation, as `conv1d`): for one token,
+        // its window times the taps summed over the window, two ops; for more, in tap order.
+        if t == 1 {
+            return silu((padded * taps).sum_dim(1));
+        }
+        let tap = |j: usize| taps.clone().slice([0..1, j..j + 1, 0..c]);
         let mut out = padded.clone().slice([0..n, 0..t, 0..c]) * tap(0);
         for j in 1..kernel {
             out = out + padded.clone().slice([0..n, j..j + t, 0..c]) * tap(j);
         }
         silu(out)
+    }
+
+    /// The taps as rows, `[1, conv_kernel, conv_dim]`.
+    fn taps(&self) -> Tensor<B, 3> {
+        match &self.taps {
+            Some(taps) => taps.val(),
+            None => {
+                let taps = self.conv1d.val();
+                let [c, _, kernel] = taps.dims();
+                taps.reshape([c, kernel])
+                    .swap_dims(0, 1)
+                    .reshape([1, kernel, c])
+            }
+        }
+    }
+
+    /// The products of `x` (`[1, t, hidden]`): the convolution's inputs, the output gate, the
+    /// write strength's and the decay's logits.
+    fn project_in(&self, cfg: &Qwen35Config, x: Tensor<B, 3>) -> [Tensor<B, 3>; 4] {
+        fn part<B: Backend>(p: &Option<Linear<B>>) -> &Linear<B> {
+            p.as_ref().expect("the in-projections, fused or apart")
+        }
+        match &self.in_proj {
+            Some(w) => {
+                let (c, v) = (cfg.conv_dim(), cfg.value_dim());
+                let vh = cfg.linear_v_heads;
+                split_columns(project(x, w), [0, c, c + v, c + v + vh])
+            }
+            None => [
+                project(x.clone(), part(&self.in_proj_qkv)),
+                project(x.clone(), part(&self.in_proj_z)),
+                project(x.clone(), part(&self.in_proj_b)),
+                project(x, part(&self.in_proj_a)),
+            ],
+        }
+    }
+
+    /// `x` (`[1, t, heads, k_dim]`, F32) L2-normed over `k_dim` and times `scale`: one op on the
+    /// card where `gamma` (`scale / k_dim^0.5` as a row) is made (an RMS norm with `1e-6 / k_dim`),
+    /// else the composition.
+    fn unit(x: Tensor<B, 4>, gamma: &Option<Param<Tensor<B, 1>>>, scale: f64) -> Tensor<B, 4> {
+        let width = x.dims()[3];
+        if let Some(gamma) = gamma {
+            if let Some(y) = burn_tt::rms_norm(&x, &gamma.val(), 1e-6 / width as f64) {
+                return y;
+            }
+        }
+        let y = l2norm(x);
+        if scale == 1.0 {
+            y
+        } else {
+            y.mul_scalar(scale)
+        }
+    }
+
+    /// The constants a step would otherwise make again ([`Qwen35::prepared`]).
+    fn prepare(&mut self, cfg: &Qwen35Config) {
+        if let (Some(qkv), Some(z), Some(b), Some(a)) = (
+            self.in_proj_qkv.take(),
+            self.in_proj_z.take(),
+            self.in_proj_b.take(),
+            self.in_proj_a.take(),
+        ) {
+            self.in_proj = Some(concat(&[qkv, z, b, a]));
+        }
+        if self.taps.is_none() {
+            self.taps = Some(Param::from_tensor(self.taps()));
+        }
+        if self.neg_rate.is_none() {
+            let rate = self.a_log.val().cast(DType::F32).exp().neg();
+            self.neg_rate = Some(Param::from_tensor(rate));
+        }
+        let kd = cfg.linear_k_dim;
+        let device = self.a_log.val().device();
+        let row = |v: f64| Param::from_tensor(Tensor::full([kd], v, &device));
+        if self.q_scale.is_none() {
+            self.q_scale = Some(row(1.0 / kd as f64));
+            self.k_scale = Some(row((kd as f64).powf(-0.5)));
+        }
     }
 
     /// The mixer's output `[1, t, hidden]` for the normed `x`, the convolution's inputs and the
@@ -548,14 +673,20 @@ impl<B: Backend> GatedDeltaNet<B> {
             cfg.linear_v_dim,
         );
         let (key_dim, value_dim) = (cfg.key_dim(), cfg.value_dim());
-        let mixed = self.convolve(project(x.clone(), &self.in_proj_qkv), conv, padding);
-        let z = project(x.clone(), &self.in_proj_z).reshape([n, t, vh, vd]);
-        let beta = sigmoid(project(x.clone(), &self.in_proj_b)).cast(DType::F32);
-        let a = project(x, &self.in_proj_a).cast(DType::F32);
-        let rate = self.a_log.val().cast(DType::F32).exp().unsqueeze::<3>();
+        let [qkv, z, b, a] = self.project_in(cfg, x);
+        let mixed = self.convolve(qkv, conv, padding);
+        let z = z.reshape([n, t, vh, vd]);
+        let beta = sigmoid(b).cast(DType::F32);
+        let a = a.cast(DType::F32);
+        let neg_rate = match &self.neg_rate {
+            Some(r) => r.val(),
+            None => self.a_log.val().cast(DType::F32).exp().neg(),
+        }
+        .unsqueeze::<3>();
         let bias = self.dt_bias.val().cast(DType::F32).unsqueeze::<3>();
-        // The decay, in log space, `[1, t, v_heads]`.
-        let g = (rate * softplus(a + bias)).neg();
+        // The decay, in log space, `[1, t, v_heads]`: `-(exp(A_log) softplus)`, the negation on
+        // the rate (the same bits).
+        let g = neg_rate * softplus(a + bias);
         // Per token and head, `[1, t, v_heads]`: the decay factor and the write strength, a
         // padding row's 1 and 0 (exact: `s 1 = s`, and the update it adds is zeros).
         let (decay, beta) = match padding {
@@ -584,8 +715,16 @@ impl<B: Backend> GatedDeltaNet<B> {
                     .reshape([n, t, vh, kd])
             }
         };
-        let q = widen(l2norm(split(0, key_dim, kh, kd))).mul_scalar((kd as f64).powf(-0.5));
-        let k = widen(l2norm(split(key_dim, 2 * key_dim, kh, kd)));
+        let q = widen(Self::unit(
+            split(0, key_dim, kh, kd),
+            &self.q_scale,
+            (kd as f64).powf(-0.5),
+        ));
+        let k = widen(Self::unit(
+            split(key_dim, 2 * key_dim, kh, kd),
+            &self.k_scale,
+            1.0,
+        ));
         let v = split(2 * key_dim, 2 * key_dim + value_dim, vh, vd);
         // `[1, v_heads, t, width]`, and the per-token scalars `[1, v_heads, t, 1]`.
         let (q, k, v) = (q.swap_dims(1, 2), k.swap_dims(1, 2), v.swap_dims(1, 2));
@@ -613,9 +752,49 @@ impl<B: Backend> GatedDeltaNet<B> {
 
 impl<B: Backend> Mlp<B> {
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let hidden = silu(project(x.clone(), &self.gate_proj)) * project(x, &self.up_proj);
-        project(hidden, &self.down_proj)
+        let (gate, up) = match (&self.gate_up, &self.gate_proj, &self.up_proj) {
+            (Some(gate_up), _, _) => {
+                let y = project(x, gate_up);
+                let ff = y.dims()[2] / 2;
+                let [gate, up] = split_columns(y, [0, ff]);
+                (gate, up)
+            }
+            (None, Some(gate), Some(up)) => (project(x.clone(), gate), project(x, up)),
+            _ => unreachable!("the MLP's products, fused or apart"),
+        };
+        project(silu(gate) * up, &self.down_proj)
     }
+
+    /// `gate|up` as one product.
+    fn fuse(&mut self) {
+        if let (Some(gate), Some(up)) = (self.gate_proj.take(), self.up_proj.take()) {
+            self.gate_up = Some(concat(&[gate, up]));
+        }
+    }
+}
+
+/// The projections `parts` (no bias) as one, their weights side by side along the outputs.
+fn concat<B: Backend>(parts: &[Linear<B>]) -> Linear<B> {
+    assert!(
+        parts.iter().all(|p| p.bias.is_none()),
+        "projections without a bias"
+    );
+    Linear {
+        weight: Param::from_tensor(Tensor::cat(
+            parts.iter().map(|p| p.weight.val()).collect(),
+            1,
+        )),
+        bias: None,
+    }
+}
+
+/// `y`'s last dimension cut at the column offsets `at` (ascending, the first 0) into `N` parts.
+fn split_columns<B: Backend, const N: usize>(y: Tensor<B, 3>, at: [usize; N]) -> [Tensor<B, 3>; N] {
+    let [n, t, w] = y.dims();
+    std::array::from_fn(|i| {
+        let end = if i + 1 < N { at[i + 1] } else { w };
+        y.clone().slice([0..n, 0..t, at[i]..end])
+    })
 }
 
 impl<B: Backend> Layer<B> {
@@ -627,9 +806,10 @@ impl<B: Backend> Layer<B> {
             self_attn: full.then(|| GatedAttention::new(cfg, device)),
             post_attention_layernorm: CenteredNorm::new(cfg.hidden, cfg.eps, device),
             mlp: Mlp {
-                gate_proj: linear(cfg.hidden, cfg.ff, device),
-                up_proj: linear(cfg.hidden, cfg.ff, device),
+                gate_proj: Some(linear(cfg.hidden, cfg.ff, device)),
+                up_proj: Some(linear(cfg.hidden, cfg.ff, device)),
                 down_proj: linear(cfg.ff, cfg.hidden, device),
+                gate_up: None,
             },
         }
     }
@@ -829,7 +1009,31 @@ impl<B: Backend> Qwen35<B> {
             Precision::Bf16 => model,
             Precision::F32 => model.map(&mut ToF32),
         };
-        Ok((model, loaded))
+        Ok((model.prepared(), loaded))
+    }
+
+    /// The same model with what each step would otherwise make again made once, the same
+    /// arithmetic: the zero-centred norms' `1 + weight`, each DeltaNet's four in-projections and
+    /// each MLP's two as one product, the convolution's taps as rows, the decay's `-exp(A_log)`
+    /// and the scales that make the queries' and keys' L2 norms one op on the card. A pretrained
+    /// model is loaded prepared; apply before storing weights in another format
+    /// ([`Self::with_bf16_weights`]), so the fused matrices are what is stored.
+    pub fn prepared(mut self) -> Self {
+        let cfg = self.config;
+        for layer in &mut self.layers {
+            layer.input_layernorm.shift();
+            layer.post_attention_layernorm.shift();
+            if let Some(attn) = &mut layer.self_attn {
+                attn.q_norm.shift();
+                attn.k_norm.shift();
+            }
+            if let Some(net) = &mut layer.linear_attn {
+                net.prepare(&cfg);
+            }
+            layer.mlp.fuse();
+        }
+        self.norm.shift();
+        self
     }
 
     /// Qwen3.5-4B ([`QWEN3_5_4B`], `cargo xtask fetch-weights --model qwen3.5-4b`), its first
@@ -1416,19 +1620,24 @@ mod tests {
     fn the_hybrid_cache_steps_as_the_growing_state_does() {
         use crate::generate::{generate_fixed, Shapes};
         let model = Qwen35::<Flex>::new(&TINY, &FlexDevice);
+        let prepared = model.clone().prepared();
         let shapes = Shapes::new(16, &[4, 8]);
         let steps = 4;
-        for len in [3, 4, 5, 9] {
+        let pairs: Vec<(&Qwen35<Flex>, i32)> = [&model, &prepared]
+            .into_iter()
+            .flat_map(|m| [3, 4, 5, 9].map(move |len| (m, len)))
+            .collect();
+        for (model, len) in pairs {
             let prompt: Vec<i32> = (0..len).map(|i| (7 + 13 * i * i) % 64).collect();
             let growing = model.generate(&prompt, steps, Precision::F32, &FlexDevice);
-            let fixed = generate_fixed(&model, &prompt, steps, &shapes, &FlexDevice).unwrap();
+            let fixed = generate_fixed(model, &prompt, steps, &shapes, &FlexDevice).unwrap();
             let w = worst(&growing.logits, &fixed.logits);
             eprintln!("prompt {len}: largest logit difference {w:e}");
             assert!(w < 1e-4, "prompt {len}: {w}");
             assert_eq!(growing.tokens, fixed.tokens, "prompt {len}");
             if len != 4 {
                 let unmasked = generate_fixed(
-                    &UnmaskedPadding(&model),
+                    &UnmaskedPadding(model),
                     &prompt,
                     steps,
                     &shapes,
@@ -1476,6 +1685,24 @@ mod tests {
         let got = run(&mut used, &[9, 8, 7, 6]);
         assert_eq!(got, want);
         assert_ne!(other, want);
+    }
+
+    /// [`Qwen35::prepared`] (the constants made once, the products fused) predicts what the model
+    /// did: on burn-flex the same arithmetic (measured: identical), the products' columns computed
+    /// apart or side by side.
+    #[test]
+    fn a_prepared_model_predicts_what_it_did() {
+        let model = Qwen35::<Flex>::new(&TINY, &FlexDevice);
+        let prompt = [3, 17, 42, 5, 9];
+        let want = model.generate(&prompt, 4, Precision::F32, &FlexDevice);
+        let prepared = model.clone().prepared();
+        assert!(prepared.layers.iter().all(|l| l.mlp.gate_up.is_some()
+            && l.linear_attn.as_ref().is_none_or(|n| n.in_proj.is_some())));
+        let got = prepared.generate(&prompt, 4, Precision::F32, &FlexDevice);
+        let w = worst(&want.logits, &got.logits);
+        eprintln!("prepared: largest logit difference {w:e}");
+        assert!(w < 1e-5, "{w}");
+        assert_eq!(want.tokens, got.tokens);
     }
 
     #[test]

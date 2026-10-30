@@ -1542,7 +1542,18 @@ fn qwen35_traced_generation_on<B: tt_models::generate::TracedBackend>(suffix: &s
             );
         }
         for (key, ops) in g.trace_ops().unwrap() {
-            eprintln!("{key}: {} ops", ops.len());
+            // The ops by the Burn op that queued each, most first.
+            let mut by: std::collections::BTreeMap<String, usize> = Default::default();
+            for o in &ops {
+                *by.entry(format!("{} ({})", o.label, o.what)).or_default() += 1;
+            }
+            let mut by: Vec<_> = by.into_iter().collect();
+            by.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let barriers = ops.iter().filter(|o| o.barrier).count();
+            eprintln!("{key}: {} ops, {barriers} barriers; by label:", ops.len());
+            for (label, n) in by.iter().take(40) {
+                eprintln!("  {n:>6}  {label}");
+            }
             report(
                 &format!("{name} traced generation, {key} ops ({traces})"),
                 "ops",
