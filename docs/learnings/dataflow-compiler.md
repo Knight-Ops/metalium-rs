@@ -240,7 +240,7 @@ Each transform states its legality under S2/S3, its expected effect, and the evi
 | # | Transform | Legal under the default contract? | Status |
 |---|---|---|---|
 | X1 | **L1 blocking**: output block `mb×nb`, K in chunks with FP32 partials reloaded | Yes. K order and groups unchanged (T5) | [MEAS] exists (`block_stream_layout`), modelled per shape. The widest block is not always best: Qwen's `gate\|up` ran faster narrowed ([notes](silicon-operating-notes.md#a-region-at-the-top-of-l1-costs-a-product-only-past-its-plans-floor-2026-10-21-card-0)), so the model is calibrated, not trusted |
-| X2 | **`Dst` subblocks and half-sync**: `h×w ≤ 4` FP32 tiles a half; math fills one half while pack drains the other | Yes. Each output's K order is unchanged | [HYP] H2. Not first: a K-tile pair already runs in 0.14-0.23 µs and products are bound by their reads (scoreboard row 75) |
+| X2 | **`Dst` subblocks and half-sync**: `h×w ≤ 4` FP32 tiles a half; math fills one half while pack drains the other | Yes. Each output's K order is unchanged | [MEAS] the default since F5 (`tile_op::dst`, gate `step246`): bit for bit, 1.12x at H1's shapes (FP32 `B` 1.08x), the kernel alone up to 1.46x; one tile row a subblock (`A` held in `SrcB`); a continuing chunk's reload stays serial (H2) |
 | X3 | **Grid distribution**: parallel dimensions over cores | Yes (S4: never a reduction split) | [MEAS] exists (`Spread`). Generic over a work measure |
 | X4 | **Operand reuse across cores**: one reader per row/column rectangle, multicast or pulled | Yes. Moves bytes only | [HYP] H1. Contended multicast is measured slow (T7). Pulling a row from a few holders measured cheaper than GDDR ([notes](silicon-operating-notes.md#nc-writes-another-tiles-l1-2026-10-20-ttsim-and-card-0)). Which wins for products is decision D5 |
 | X5a | **Register fusion** (prologue/epilogue on `Dst`) | Yes, **if** it replays every rounding the unfused graph does. Where the unfused intermediate was packed narrower than FP32, the fused body rounds to that format in place | [MEAS] compound SFPU kinds (`SILU_MUL`, …) are gated bit-for-bit against their composition |
@@ -446,6 +446,15 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
 - **H2 `Dst` subblocks and half-sync.** Once reads stop binding (after H1), the kernel's math utilization rises from ~41-68% of HiFi4 issue toward ~90%. That range is derived from the 0.14-0.23 µs measured per K-tile pair against 128 cycles of `MVMUL`.
   - *Prediction:* ≥ 1.4× on the same shapes, bit-exact.
   - *Kills it:* < 1.1×.
+  - *Result (F5, 2026-10-30, card 0): bit-exact, between the two.* Subblocks of up to four FP32 tiles a half, `A`'s
+    tile held across a subblock, math and pack on alternate halves (`tile_op::dst`,
+    `matmul::block_stream_kernel_subblocked`), and the measured blocks re-swept: over H1's four shapes and five `B`
+    formats at the measured default 0.96-1.35x, geometric mean 1.12x (`1793332760` -> `1793387665`); an FP32 `B` 1.08x
+    (H1 32.3 -> 34.4 TFLOPS); the kernel alone (every gather left out) 1.05-1.46x. The half-sync hides the packer; a
+    continuing chunk's reload of its partials into `Dst` still stops the math role, and silicon refuses an
+    `UnpackToDst` beside running `MVMUL`s (`silicon-operating-notes.md`), so the reload stays serial. Next levers: fewer
+    chunks a job (L1-bound for FP32), or a chunk's reloads under the chunk before through F4a's channels
+    ([log](performance-log.md#f5-dst-subblocks-and-half-sync-2026-10-30-card-0)).
 - **H3 Exact fidelity. Confirmed for same-format BFP products, 2026-10-28.**
   - *Claim:* running only the phases the operand formats need (T4) gives the same bits as HiFi4 for those formats,
     because the skipped phases' slices are zero and adding +0 to FP32 `Dst` is an identity.

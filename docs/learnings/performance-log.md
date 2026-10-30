@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [F5: `Dst` subblocks and half-sync](#f5-dst-subblocks-and-half-sync-2026-10-30-card-0) | 2026-10-30 | subblocks of up to four FP32 tiles a `Dst` half, math and pack on alternate halves, `A` held in `SrcB`, and the measured blocks re-swept: bit for bit; H1's shapes x five formats 0.96-1.35x (geometric mean **1.12x**, FP32 `B` 1.08x, H1 32.3 -> 34.4 TFLOPS), the kernel alone up to 1.46x, the model shape set 1.12x; H2's 1.4x not met, its kill not fired: a chunk's reload still stops the math role, and an `UnpackToDst` beside `MVMUL`s is wrong on silicon |
 | [F4a.0: what overlap can buy a decode step; the tails split by unit](#f4a0-what-overlap-can-buy-a-decode-step-the-tails-split-by-unit-2026-10-29-card-1) | 2026-10-29 | 1.7B `Step(64)` 10.91 ms at 327 GB/s; a product's own units fall 92 -> 20 by its last eighth and nothing reads ahead in its tail (each unit's next list sits after its arrival): 2.45 ms of capacity unused; weights made free 5.33 ms; H4's kill does not fire. F4a.2: busy lists moved to before the arrival (B pumps them at the barrier), **11.32 / 12.69 -> 10.95 / 12.16 ms**, 340 GB/s, the default; idle lists moved too: 0.6 ms slower than off (their reads are in line), reverted |
 | [F4b.2: a block measured on the card, `A` pulled where it gains](#f4b2-a-block-measured-on-the-card-a-pulled-where-it-gains-2026-10-29-card-1) | 2026-10-29 | the default since: sweeps of every block x pull at 10 prefill shapes (the best 1.0-2.1x `Auto`'s, ranked low by every model); `Auto`'s, 12 listed blocks and a climb timed in a capture as a difference of traces: 1.02-2.25x `Auto` over 50 cases, H1 FP32 35.5 / BF16 49.5 / BFP4 65.4 TFLOPS a product; through Burn H1 19.2 -> **29.2 TFLOPS**, 1.7B prefill 1.04-1.34x, models and decode unchanged; eager runs `Auto`'s |
 | [D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever](#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1) | 2026-10-29 | three prefill shapes x every `B` format x the schemes: `A` pulled 1.33-1.44x with FP32 `B` (H1 28.38 TFLOPS); `B` pulled loses; a packed `B` is bound by the block (H1 `[6,4,12]` + `A` pulled 44.5-45.8, 1.7x), shape-dependent |
@@ -390,6 +391,86 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## F5: `Dst` subblocks and half-sync (2026-10-30, card 0)
+
+[Plan](../plans/dataflow-compiler.md) F5, H2. The blocked product's kernel holds up to four FP32 output tiles a half of
+`Dst`, the math role in one half while the pack role drains the other, `A`'s tile held in `SrcB` across a subblock
+(`tile_op::dst`, `matmul::block_stream_kernel_subblocked`, the default; `TT_DST_SUBBLOCKS=0` off), and the measured
+blocks re-swept for it. Bit for bit the one-tile kernel (`step246`). All on card 0, release, every tile, HiFi4.
+Before (B0) is `715ef1b` built from a source copy; after is the branch's last commit. `silicon_probe_pair_cost` is a
+traced product's replay through the session, median of 7, every product checked against exact integer arithmetic;
+`matmul_throughput` is the same through Burn with an FP32 `B`.
+
+**H1's shapes at the measured default, every format** (`pair_cost` B0 `1793332760`; B1, the kernel with the old block
+list, `1793344423`; B2, the re-swept list, `1793387665`), TFLOPS:
+
+| Shape | `B` | B0 | B1 | B2 | B2 / B0 |
+|---|---|--:|--:|--:|--:|
+| `[2048,2048]@[2048,16384]` | FP32 | 32.32 | 33.94 | 34.35 | 1.06x |
+| | BF16 | 43.54 | 49.32 | 49.41 | 1.13x |
+| | BFP8 | 42.65 | 56.86 | 57.79 | 1.35x |
+| | BFP4 | 54.54 | 56.95 | 61.41 | 1.13x |
+| | BFP2 | 55.19 | 58.19 | 61.36 | 1.11x |
+| `[1024,2048]@[2048,8192]` | FP32 | 22.68 | 29.16 | 29.22 | 1.29x |
+| | BF16 | 26.58 | 33.97 | 34.20 | 1.29x |
+| | BFP8 | 29.91 | 35.12 | 37.48 | 1.25x |
+| | BFP4 | 30.28 | 35.60 | 39.31 | 1.30x |
+| | BFP2 | 30.60 | 39.50 | 39.31 | 1.28x |
+| `[1024,8192]@[8192,2048]` | FP32 | 21.33 | 22.32 | 20.41 | 0.96x |
+| | BF16 | 26.61 | 27.34 | 27.33 | 1.03x |
+| | BFP8 | 27.80 | 28.76 | 28.72 | 1.03x |
+| | BFP4 | 27.93 | 27.54 | 28.98 | 1.04x |
+| | BFP2 | 28.53 | 29.33 | 29.68 | 1.04x |
+| `[2048,8192]@[8192,2048]` | FP32 | 32.09 | 33.67 | 33.13 | 1.03x |
+| | BF16 | 37.32 | 41.25 | 40.81 | 1.09x |
+| | BFP8 | 43.93 | 45.65 | 45.30 | 1.03x |
+| | BFP4 | 46.02 | 47.42 | 47.39 | 1.03x |
+| | BFP2 | 46.14 | 47.30 | 47.29 | 1.02x |
+
+Geometric mean 1.12x (0.96-1.35x); an FP32 `B` 1.08x. Through Burn (`matmul_throughput`, B0 `1793332723`, after
+`1793388902`): 29.02 / 18.35 / 11.06 / 13.79 -> 30.39 / 24.74 / 10.85 / 14.47 TFLOPS (1.05 / 1.35 / 0.98 / 1.05x).
+
+- **Fixed blocks** (B0 `1793335272`, `1793335286`, `1793335298`; first cut `1793339158`,
+  `1793339171`, `1793339184`): at `[8,2,9]` 1.02-1.86x, at `[8,4,6]` 0.92-1.41x, at `[6,4,12]` (packed formats; FP32
+  and BF16 do not fit it) 0.97-2.03x.
+- **The kernel alone** (`without_gathers`, every gather left out; one-tile kernel `1793339461`, subblocked
+  `1793344646`): 1.05-1.46x, H1's shape 67.9 -> 80.1 TFLOPS with an FP32 `B` and 73.4 -> 89.0 with BFP8. What a chunk
+  still waits on is its reload of the partials: the math role stops while the unpack role writes the subblock's priors
+  into its half, and silicon refuses that beside running `MVMUL`s (below).
+- **The reload switch** (`matmul::reload_switch`: only the `Config` words the reload changes, each way; no clear before
+  a reload): 137 -> 88 unpack words a subblock at `[8,2,9]`; +0-3% (`1793338897` -> `1793344423`).
+- **A direct reload, refuted on silicon:** the unpack role taking a half from the packer (`free`) and reloading it while
+  the math role still accumulated the other half was wrong in every `step246` case on card 0 (`1793339454`), right in
+  the host model and on ttsim; retired ([notes](silicon-operating-notes.md#dst-in-two-halves-math-pack-and-reloads-side-by-side-2026-10-30-card-0-and-ttsim)).
+- **A missing settle:** stepping `B`'s base between a subblock's tiles without `gpr_settled` before its `WRCFG` made one
+  tile a run read the tile before's `B` at the first `K` step after a reload (`step246::probe_wrong_tiles`,
+  `1793338674`-`1793338787`; 0 in 60 with it, `1793338835`).
+
+**B2, the measured blocks re-swept** (`silicon_probe_block_sweep`, `1793346207`-`1793351145`, each block timed as a
+difference of traces): the best blocks are pulled, `kq` 2-12; ten blocks with `Auto`'s own reach 96% or more of all 18
+cases' bests, where the list before reached 79-92% at four (Qwen3.5's gate BF16 79%, the DiT's down BF16 86%, its qkv
+FP32 88%, H1 BFP8 90%). `MEASURED_BLOCKS` is now those ten, `[6,4,12]` and `[4,4,18]`.
+
+**The model shape set** (B0 `1793335466`, after `1793389063`; 19 shapes x 5 formats): geometric mean 1.12x
+(0.89-1.70x; 1.10x without a head's attention products). DiT qkv `[1024,3072]@[3072,9216]` 1.11-1.25x, its FFN up
+`@[3072,8192]` 1.25-1.34x, its down `[1024,8192]@[8192,3072]` 1.07-1.61x, a head's `Q K^T` 1.29-1.70x; Qwen3.5 at 512
+tokens 0.96-1.28x, Gemma 4 1.01-1.41x, the MOSS text encoder's up 1.02-1.32x and down 0.89-1.05x; the VAE's
+patch products 1.00-1.27x. Through Burn (B0 `1793335314`, after `1793388948`): 0.93-1.82x (the DiT's qkv 14.98 ->
+27.25 TFLOPS). The full tables are the runs' `.md`.
+
+**Model gates** (bit-exact contract; figures recorded only): step262_moss_image B0 `1793343089`, after `1793390182`: identical, "at most 4.498e-3 / 3.118e-3 / 2.995e-2 / 2.234e-2 of the rms, rms 1.157e-3 / 7.287e-4 / 5.216e-3 / 6.784e-3" (1, 8, 42 blocks, the image). Its profile (B0 `1793387199`, after `1793390901`): 7,808.6 -> 7,791.7 ms of eager ops on the card; `float_matmul` 3,505.7 -> 3,502.6 us each, but only 36 of its 369 ops are attributed (333 outran a unit's stamp buffer), so the profile does not show the DiT's products; the eager step is 1.6% products. `step260_qwen35` (F32 and BF16 weights, B0 `1793387921`, after `1793391614`): identical, max |flex - device| 8.8649e-2 against 33.1233, the 8 tokens identical. `step261_gemma4`: identical, max |flex - device| 7.8731e-2 against 29.9118, the 8 tokens identical.
+
+**Gates on the final tree** (card 0 `1793386989`, 33 of 34; `step12_mnist` 8 of 8, goldens unchanged, `1793389915`):
+`step246` 6, `step229` 7, `step241` 4, `step238` 1, `step158` 7, `step68` 6, `step245` 2 of 3. The failure,
+`step245::a_capture_paused_to_measure_is_the_capture_unpaused`, comes with the re-swept list (ttsim too, and with
+`TT_DST_SUBBLOCKS=0`): its chain now chooses `[4,4,8]` pulled on 2 of 8 units, and the paused pass records one more
+`KERNEL` entry on the six idle units for the next op than the unpaused one; replays are bit for bit. Open, in the
+pause's bookkeeping.
+
+**H2: neither the prediction (≥1.4x) nor the kill (<1.1x)** at H1 (1.12x; FP32 `B` 1.08x). B3 (roles across batches) not
+built: a blocked product's batches are its chunks, and all but a job's first reload the chunk before's partials, so
+the joins the brief keeps are all but one a job.
 
 ## F4a.0: what overlap can buy a decode step; the tails split by unit (2026-10-29, card 1)
 
