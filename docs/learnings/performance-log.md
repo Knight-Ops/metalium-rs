@@ -12,6 +12,9 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [A 64-token prefill chunk: its products on 8-47 units](#a-64-token-prefill-chunk-its-products-on-8-47-units-2026-10-31-card-1) | 2026-10-31 | 1.7B `Chunk { c: 64 }` profiled whole: 45.9 ms on the card, products 36.2 (79%) at 167 GB/s; `o` on 8 units, `qkv` 16, `down` 32, `gate|up` 47; a layer's products 1.50 ms against 0.27 at 512 GB/s; `down` re-reads its 2 MB `A` 34 times |
+| [Qwen3.5-4B's decode step profiled whole, but for nine ops](#qwen35-4bs-decode-step-profiled-whole-but-for-nine-ops-2026-10-31-card-1) | 2026-10-31 | 1,071 of 1,080 ops stamped: 44.0 ms on the card against 64.28 host-timed; the head 5.37 ms at 481 GB/s (a BF16 copy saves ~2.7, not 5); weight products 19.5 ms at 380 GB/s; 776 other ops 16.8 ms; ~20 ms unattributed, ops 1048-1056 never stamped |
+| [H11's bound: a decode product's reads at large entries](#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1) | 2026-10-31 | the dataflow compiler review's top hypothesis, bounded before any build: today's decode deal (2,112-byte entries) already reads ~499 GB/s on 96 units, evenly; each unit's share contiguous at 16 KiB lifts 64 units 395 -> 499 but spreads their ends over 28-90 us; the read stream is not the products' limit, the pipeline inside a product is |
 | [F6.0: register fusion and spatial pipelining bounded on the card](#f60-register-fusion-and-spatial-pipelining-bounded-on-the-card-2026-10-31-card-1) | 2026-10-31 | 1.7B decode with the 48 residual adds made free 10.82-10.85 / 12.05-12.07 ms against 10.94-10.99 / 12.14-12.18, the 24 `silu_mul`s adding ~0.02 more: **H10's decode bound 0.10-0.16 ms, its kill fires**; eager training's removable forward ops 1.7-3.2% of a step on the card; the products' tails 296-365 GB/s (not queue-bound), `gate\|up`'s tail slack 465 us a step: H5's bound clears, but with the barriers around `silu_mul` dropped (today's placement) the step is 0.17-0.23 ms slower. Found and fixed: a planned capture of a product half of whose output nothing reads was refused (`step219`) |
 | [The merged tree, and edge credits on Qwen3.5](#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1) | 2026-10-31 | F4a, F5 and Qwen3.5's traced generation on one tree: 1.7B decode 10.93 / 12.14 ms, H1 through Burn 30.6 / 22.5 / 11.4 / 14.3 TFLOPS; Qwen3.5 traced with `TT_EDGE_CREDITS=4` ABBA: decode unchanged (64.2 / 64.7 ms), prefill 1.4% faster, after the credit lowering's check was made linear (it had run past 40 minutes) |
 | [F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules](#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1) | 2026-10-30 | lane A, card 1: idle units' lists pumped and moved before their anchor's arrival 0.24 / 0.17 ms slower (opt-in); kept barriers lowered to per-edge credits, built and checked, +0.03 / +0.06 at fan 4 (opt-in); the handoff, second job and balanced deal not faster, retired; the lists' L1 room not built (a second job read ahead is slower). Close 10.98 / 12.18 ms against A0's 11.01 / 12.16, `Step(64)` 10.55 ms at 341 GB/s: **H4's kill fires** |
@@ -396,6 +399,111 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## A 64-token prefill chunk: its products on 8-47 units (2026-10-31, card 1)
+
+The [design reference](dataflow-compiler.md)'s review (§15) found no breakdown of a prefill chunk by op class; the
+F6.0 profile stamped only 84 of the chunk trace's 472 ops. Profiled whole: `TT_TILES=all TT_GEN_PROMPTS=64
+TT_GEN_SAMPLES=130 TT_GEN_NEW=2 cargo xtask bench --profile --device 1 --filter
+silicon_bench_models::traced_generation_stream_ceiling` (run `1793466727`, safe image, BF16 weights, chunks of 64,
+512-position cache). `Chunk { c: 64, len: 64 }`: all 472 ops covered in 132 replays, **45.86 ms on the card**.
+
+- **Products are 79% of the chunk:** 96 ops, 36.16 ms, 6.04 GB read at 167 GB/s. 2.53 GB of that is `A`, re-read
+  by every column block. Norms, scatters, attention and the rest are the other 9.7 ms.
+- **They run on few units.** Each product's blocks for `m = 64` (two tile rows) give only as many jobs as:
+
+  | product (a layer) | units | us | `A` MB read | `B` MB |
+  |---|--:|--:|--:|--:|
+  | `o` | 8 | 239 | 4.3 | 8.7 |
+  | `qkv` | 16 | 299 | 8.5 | 26.0 |
+  | `down` | 32 | 667 | 68.2 | 34.6 |
+  | `gate\|up` | 47 | 292 | 25.0 | 69.2 |
+  | the head (once) | 96 | 500 | 0 | 207.6 |
+
+  A layer's products take ~1.50 ms. At 512 GB/s their weights take 0.27 ms, and at the reads' ~5 GB/s a unit,
+  8-47 units read 40-240 GB/s. `down` re-reads its 2 MB FP32 `A` 34 times.
+- **What it says:**
+  - A short chunk's products are bound by how few units their blocks occupy: neither by compute (~5.7 TFLOPS) nor
+    by GDDR.
+  - Narrower blocks, or `A` pulled from a few holders (D5), spread them over the grid at the same `K` order, so bit
+    for bit.
+  - H9's `MEASURED_BLOCKS` came from sweeps at `m` ≥ 512. Not yet checked: whether these captured `m = 64`
+    products ran a measured winner (`tensor::measured_choice`) or `Auto`'s block. Either way, the choice did not
+    weigh the units it leaves idle against the GDDR rate they give up.
+- The host-timed prefill under the profile image is not comparable (143 ms, the image's stamps).
+
+## Qwen3.5-4B's decode step profiled whole, but for nine ops (2026-10-31, card 1)
+
+The [design reference](dataflow-compiler.md)'s review (§15) found a fifth of Qwen3.5's step unattributed. The
+2026-10-30 profile (`1793343574`) covered 950 of 1,007 ops (41.0 ms) against 68.5 ms host-timed, and missed the
+head and the greedy pick. Profiled again with enough replays for every window:
+
+`TT_TILES=all TT_GEN_PROMPTS=32 TT_GEN_NEW=96 TT_GEN_SAMPLES=1 cargo xtask bench --profile --device 1 --filter
+silicon_bench_models::qwen35_traced_generation`, runs `1793463976` and `1793465388`, safe image, 512-position cache,
+chunks of 16, at `3014245` with this review's docs and uncommitted dev-only probes (off). Both runs agree to 0.1 us a replay.
+
+`Step(64)`: 1,071 of 1,080 ops covered in 98 replays (9 overflowed), **43.97 ms on the card** against **64.28 ms**
+host-timed unprofiled on the same tree (`1793409872`).
+
+| part | ops | ms | notes |
+|---|--:|--:|---|
+| the head (op 1046, the tied table read as F32) | 1 | **5.37** | 2.58 GB at **481 GB/s**, at GDDR's rate already |
+| weight products | 199 | 19.52 | 7.42 GB at 380 GB/s in their spans |
+| the recurrence's small products | 72 | 1.54 | |
+| the states' write-back (`copy_into` + repack) | 23 | 0.78 | ~34 us each, 3.5 MB |
+| everything else | 776 | 16.77 | the DeltaNet chain (83 us a layer), norms (177 `rms_norm`, 2.48 ms), `float_mul + float_matmul` (48, 1.96 ms), broadcasts (98, 0.98 ms) |
+
+- **The head is not the 5 ms the estimate gave back.** It already reads at 481 GB/s, so a BF16 copy of the table saves
+  ~2.7 ms (1.29 GB), not ~5.
+- **~20.3 ms of the host-timed step is in no op's span.**
+  - A replay is one `CALL` a unit (`Session::replay`), with no host rounds.
+  - On the 1.7B the spans sum to the host time (10.54 against 10.93 ms), so the gap is not the profile mode's
+    usual loss.
+  - Ops 1048-1056, right after the greedy pick (op 1047), were never stamped in either run. They sit before 23 state
+    write-backs of ~34 us, and if they are the same kind they hold ~0.3 ms, not 20.
+  - So where the 20 ms goes is still open: in those nine ops, between ops on the card, or host-side around a replay.
+  - A trial in the profile mode (an overflowed window split and stamped again) changed neither the overflow count nor
+    the coverage, and was reverted. The overflow is not where those ops are lost.
+- **Next:** a replay's own wall time on the card (unit 0's first stamp to its last) beside the summed spans, in the
+  profile mode. That tells card from host before anything is built for Qwen3.5.
+
+## H11's bound: a decode product's reads at large entries (2026-10-31, card 1)
+
+The [design reference](dataflow-compiler.md)'s review (§15) asked whether the decode products' reads are held by
+their structure. A unit's rate is its bytes in flight over their latency, and every product reads tile-sized entries
+at ~2-3 in flight. F27 tested only the entries' issue cost (`fast-reads`, 0.22 ms a step), never their size.
+
+`silicon_bench_memory::gddr_readers_by_channel` gained `Mix::DecodeContiguous`. It uses today's deal's units, in the
+grid's order, with each unit's share of a weight contiguous in channel `t % 8` (as a load-time layout would store
+it), read front to back in `DECODE_LENS`-byte entries, the port rotating as `GATHER`'s. Every unit reads the deal's
+1.08 MB (510 BF16 slots).
+
+Run `1793463838`: card 1, the `profile` image (the bench's spans need it), safe reads, `DECODE_UNITS=64,96
+BANK_CAPS=1,2,3 BANK_READERS=none`, medians of 9. GB/s is every byte over the first start to the last end; "ends" is
+the spread of the units' list ends.
+
+| units, entries | cap 1 | cap 2 | cap 3 |
+|---|---|---|---|
+| 64, the deal (2 columns a unit, 2,112 B) | 320 GB/s, ends 10.8 us | 377, 4.9 | **395**, 0.9 |
+| 64, contiguous, 2,112 B | 322, 16.4 | 374, 6.1 | 393, 5.1 |
+| 64, contiguous, 16 KiB | **499**, 28.2 | 486, 73.6 | 476, 90.4 |
+| 64, contiguous, 64 KiB | 483, 41.7 | 472, 75.9 | 470, 86.7 |
+| 96, the deal | 454, 13.8 | **499**, 12.5 | 451, 52.4 |
+| 96, contiguous, 2,112 B | 454, 24.1 | 500, 21.1 | 448, 54.7 |
+| 96, contiguous, 16 KiB | 496, 95.6 | 465, 153.6 | 464, 160.0 |
+| 96, contiguous, 64 KiB | 491, 101.9 | 466, 150.0 | 457, 161.1 |
+
+- **The layout alone changes nothing** at tile-sized entries.
+- **Large entries lift 64 units to ~499 GB/s** (+26% over the deal's best there), but serve them unevenly. At 16 KiB
+  and cap 3 a unit's 1.08 MB takes 80-141 us (p10-p90), against 173 us for every unit of the deal at cap 3.
+- **On 96 units the deal already reads ~499 GB/s** at cap 2, every list ending within ~12 us.
+- **H11's prediction is missed** (≥ 490 GB/s and ends within 10% at 16 KiB, cap 2: 486 / 465 GB/s, ends over 55-77% of
+  the run). Its rate clause does not fire, and its evenness clause does.
+
+So the products' 233-306 GB/s in their spans (F27) is not the read stream's structure. The deal reads 395-499 GB/s
+with nothing else running. What binds is inside the product: its reads and kernel together on each unit. The
+review's next decode step is a meter of that from inside the product (H11 in the design reference §13), not a layout
+pass (X9, parked).
+
 ## F6.0: register fusion and spatial pipelining bounded on the card (2026-10-31, card 1)
 
 Stage F6 of [the dataflow-compiler plan](../completed-plans/dataflow-compiler.md) opened at `3613d8f`; its two hypotheses (H10,
@@ -508,7 +616,7 @@ samples, host-timed medians.
 ## F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules (2026-10-30, card 1)
 
 Lane A of the F4a/F5 split ([plan](../completed-plans/dataflow-compiler.md) F4a, H4 in the
-[Bible](dataflow-compiler.md#13-hypotheses-register)), branch `f4a-channels` from `715ef1b`. SmolLM2-1.7B-Instruct,
+[design reference](dataflow-compiler.md#13-hypotheses-register)), branch `f4a-channels` from `715ef1b`. SmolLM2-1.7B-Instruct,
 BF16 weights, `TT_TILES=all`, release, safe image, card 1 (shared with two other agents; every model-scale run under
 the host-memory lock), `silicon_bench_models::traced_generation_stream_ceiling` (2 warmups, 9 samples, medians);
 host-timed decode step at 32 / 256 tokens. Each comparison is ABBA in one sitting; card 1 drifts ~0.1 ms between
@@ -670,7 +778,7 @@ its op count (not located: ptrace and perf are not permitted on this host).
 
 ## F4a.0: what overlap can buy a decode step; the tails split by unit (2026-10-29, card 1)
 
-H4 ([Bible §13](dataflow-compiler.md#13-hypotheses-register), [plan](../completed-plans/dataflow-compiler.md) F4a): with
+H4 ([design reference §13](dataflow-compiler.md#13-hypotheses-register), [plan](../completed-plans/dataflow-compiler.md) F4a): with
 per-edge credits and data-independent reads started as units free up, the 1.7B decode step reads ≥ 400 GB/s and takes
 ≤ 9.5 ms on the card (from 328 and 10.9). Sparse waits alone had been measured at 0.070 ms
 ([which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0)), so F4a opened by
@@ -738,7 +846,7 @@ outputs written into their readers' L1 above `DATA`), above the ring's base but 
 
 ## F4b.2: a block measured on the card, `A` pulled where it gains (2026-10-29, card 1)
 
-H9 ([Bible §13](dataflow-compiler.md#13-hypotheses-register), [plan](../completed-plans/dataflow-compiler.md) F4b.2): D5 left the
+H9 ([design reference §13](dataflow-compiler.md#13-hypotheses-register), [plan](../completed-plans/dataflow-compiler.md) F4b.2): D5 left the
 block and the pull shape-dependent, and the re-weighed model refuted, so the block is chosen by timing candidates on the
 card. **The default since (2026-10-29):** `TT_MATMUL_BLOCK` unset is `measured`, `TT_OPERAND_REUSE` unset is `auto`.
 
@@ -1101,7 +1209,7 @@ TFLOPS through `matmul_throughput` (80 units), against 18.54 through the session
 between the two paths (19.2-19.4 against 20.1), so H1 is measured on it. Open: which choice the Burn path makes
 differently there.
 
-**H1 restated** in the Bible §13, before any build:
+**H1 restated** in the design reference §13, before any build:
 - `[2048,2048]@[2048,16384]` with an FP32 `B` from 19.2-19.4 to **≥ 25.8 TFLOPS** (85% of the 30.3 ceiling) through
   `matmul_throughput`, its GDDR reads from 2,062 MB to **≤ 302 MB** (twice the operands);
 - packed `B` (BF16, BFP8) at **≥ 95%** of the 28.0 ceiling (≥ 26.6; from 24.7 and 26.3) in `pair_cost`;

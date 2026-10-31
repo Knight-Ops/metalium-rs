@@ -1353,6 +1353,15 @@ From decode-to-bandwidth.md Phase 10 (F27), `silicon_bench_memory::gddr_readers_
   channel; one tile a channel reads 63.7 GB/s at 128 KiB (99.6% of 64).
 - **Reading only the channel beside a tile buys nothing at decode's entry size:** 8 such readers a channel equal 64 units
   reading an interleaved weight's columns (`m = 1` products' deal) to within 1 GB/s in both images.
+- **Large entries serve many readers unevenly** (2026-10-31, card 1, `1793463838`, `Mix::DecodeContiguous`). With 64
+  or 96 units, each reading 1.08 MB contiguous in one channel (8-12 a channel, the decode deal's units):
+  - 16 KiB entries give 499 / 496 GB/s at cap 1, but the units' list ends spread over 28 / 96 us of a ~130 / ~200 us
+    run, and 74-160 us at caps 2-3;
+  - the same bytes as the decode deal's 2,112-byte entries end within 1-14 us (52 at 96 units, cap 3);
+  - the deal itself reads 499 GB/s on 96 units at cap 2.
+
+  So long entries buy rate only where few readers would otherwise under-fill the channels (64 units: 395 -> 499),
+  and pay for it in fairness ([log](performance-log.md#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1)).
 - **The NoC #0 endpoint nearest above a tile** (shortest Y leg) is how the bench picks its port; on card 0 the
   nearest tiles to channels 0-3 sit at raw X 1-6 and to 4-7 at raw X 11-16 (`banked_tiles`).
 - **The B mover's list loop is that tight:** one more check per entry there (a barrier test, nothing stamped) cost

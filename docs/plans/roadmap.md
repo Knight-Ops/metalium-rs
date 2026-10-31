@@ -774,8 +774,9 @@ The staged work is [dataflow-compiler.md](../completed-plans/dataflow-compiler.m
   [log](../learnings/performance-log.md#one-matmul-for-every-format-pair-and-bfp-weights-through-the-model-2026-10-28-cards-0-and-1)).
   One builder takes any edge-format pair, and the three old builders are deleted. Models store weights in any packed
   format (`Llama::with_stored_weights`), bit for bit. BFP weights at prefill shapes reach BF16's rate (H7). The default
-  path is unchanged within noise. Refuted: BFP4 weights decode only 1.09x faster than BF16 (one-row products are
-  unpack/math-bound). Derived fidelity is opt-in (`TT_DERIVED_FIDELITY=1`), since it differs from HiFi4 once a product
+  path is unchanged within noise. Refuted: BFP4 weights decode only 1.09x faster than BF16. That was first read as
+  one-row products being unpack/math-bound; corrected 2026-10-31 (design reference §13): they are bound by their
+  reads and kernel together, the kernel ~90 cycles a tile. Derived fidelity is opt-in (`TT_DERIVED_FIDELITY=1`), since it differs from HiFi4 once a product
   overflows FP32.
 - [x] **F2:** typed channels and the cross-core credit (2026-10-28,
   [log](../learnings/performance-log.md#a-cross-core-credit-against-the-barrier-h8-2026-10-28-card-1)).
@@ -795,7 +796,7 @@ The staged work is [dataflow-compiler.md](../completed-plans/dataflow-compiler.m
   - Allocation and channels as passes: a body declares its L1, `tile_op::allocate` alone places and notes it
     (`033fc3f`), and each op's channels pass `channel::Graph::check` before lowering (`c6f426e`). The L1 notes are
     pinned beside the jobs (`5dc2812`); that golden found two defects, both notes too high (`56752e3`, `90b1cd5`).
-  - F3.9, the H6 audit ([Bible §13](../learnings/dataflow-compiler.md#13-hypotheses-register)): the passes name no
+  - F3.9, the H6 audit ([design reference §13](../learnings/dataflow-compiler.md#13-hypotheses-register)): the passes name no
     client. One link form for a partial's reload (`2f9bc5d`). What the passes borrowed moved into them (`d280c46`).
     A chain handed between units is the concept left for F4a.
   - Closed: `--smoke` on card 0 passes 1,241 of 1,241 (`1793221000`). `step12_mnist` passes 8 of 8 with the goldens
@@ -876,6 +877,66 @@ The staged work is [dataflow-compiler.md](../completed-plans/dataflow-compiler.m
   units run on into `silu_mul` and `down` made the step 0.17-0.23 ms slower (reads beside the products' slowest
   units slow them), so **H5 is killed too** and F6.4 is not built. The dataflow-compiler plan is complete. Found and
   fixed: a planned capture of a product half of whose output nothing reads was refused (`step219`).
+
+**Dataflow compiler follow-ups (review of 2026-10-31).** The plan's decisions, checked against tt-metal's tree and the
+literature, are in the [design reference](../learnings/dataflow-compiler.md) §15:
+- the contract (S2-S4), derived fidelity, measured blocks and greedy layout are supported;
+- H4, H5 and H10 are scoped to the read structure they ran under and to the 1.7B;
+- the F1 entry is corrected (decode products are bound by reads, not by unpack and math).
+
+Ranked, in the order to work them (review's suggestion, 2026-10-31):
+- [ ] **1. Short prefill chunks: products on too few units.** Profiled whole 2026-10-31
+  ([log](../learnings/performance-log.md#a-64-token-prefill-chunk-its-products-on-8-47-units-2026-10-31-card-1)).
+  - *The bound:* a 1.7B 64-token chunk is 45.9 ms on the card, 79% of it products, at 167 GB/s. `o` runs on 8 units,
+    `qkv` 16, `down` 32, `gate|up` 47. A layer's products take 1.50 ms against 0.27 ms for their weights at 512 GB/s,
+    and `down` re-reads its 2 MB FP32 `A` 34 times.
+  - *First check:* whether these captured `m = 64` products ran a measured winner (`tensor::measured_choice`) or
+    `Auto`'s block.
+  - *The work:* a block choice for small `m` that weighs the units it leaves idle against the GDDR rate they give up
+    (narrower blocks, `A` pulled from a few holders). It keeps `K` order, so it is bit for bit. Sweep `m` = 64-256 as
+    F4b.2 swept `m` ≥ 512, and add the winners to `MEASURED_BLOCKS`.
+- [ ] **2. A decode product's pipeline, metered from inside.**
+  - *The bound:* H11's bound (`1793463838`, [log](../learnings/performance-log.md#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1)):
+    today's deal reads ~499 GB/s evenly on 96 units with nothing else running, so the products' 233-306 GB/s in their
+    spans is lost inside the product. Every decode hypothesis since F27 was bounded from outside a product.
+  - *The work:* stamp each unit's reads issued and landed, its kernel, its `K`-chunk reloads, its `A` reads and its
+    kernel tail over time, in the profile mode. Then name the transform from what the meter shows; X10's ring depth
+    is the candidate.
+  - *Parked until then:* X9's load-time layout with large entries (it lifts only 64-unit products, 395 -> 499 GB/s,
+    unevenly).
+- [ ] **3. Qwen3.5: a replay's own wall time on the card.** Profiled again 2026-10-31
+  ([log](../learnings/performance-log.md#qwen35-4bs-decode-step-profiled-whole-but-for-nine-ops-2026-10-31-card-1)).
+  - *The gap:* 1,071 of 1,080 ops make 43.97 ms on the card against 64.28 host-timed. ~20 ms is in no op's span.
+    Ops 1048-1056 (after the greedy pick) are never stamped.
+  - *Already ruled out:* a replay is one `CALL` a unit, so it has no host rounds. On the 1.7B the spans sum to host
+    time. Splitting overflowed windows changed nothing (tried, reverted).
+  - *The work:* in the profile mode, report each replay's wall time on the card (unit 0's first stamp to its last)
+    beside its summed spans. That tells card from host before anything is built for Qwen3.5.
+- [ ] **4. Qwen3.5's step, shortened.**
+  - [ ] A BF16 copy of the tied head. The head reads the F32 table, 2.58 GB in 5.37 ms at 481 GB/s, so the copy
+    saves ~2.7 ms.
+  - [ ] The delta-rule step in fewer ops: ~25 non-product ops a DeltaNet layer, 776 non-product ops at 16.8 ms a
+    step. tt-metal does it in about ten (`models/experimental/gated_attention_gated_deltanet/tt/ttnn_delta_rule_ops.py`),
+    FlashInfer in one call.
+  - H10's kill does not transfer (ADR 0001): bound B13c's epilogues on this model separately.
+- [ ] **5. Held in reserve** until item 2 names a read-bound product:
+  - bank-affine placement at 2-3 units a bank (tt-metal's 88-90%, `f2c0b2623fe`);
+  - columns claimed from an atomic counter (legal under S1);
+  - a dedicated prefetcher, worker or DRISC (F10 below).
+- [ ] **6. Bit-exact speculative decode** (H12, a later track, owner 2026-10-31).
+  - A draft proposes `k` tokens and the target verifies them in one `m = k` step: SmolLM2-135M for the 1.7B (same
+    tokenizer), or Qwen3.5's MTP head.
+  - Every op is row-independent, so greedy acceptance gives plain decode's tokens.
+  - Gate: the verify step's rows bit for bit against `k` single-row steps.
+  - Ceiling: 2-3x tokens/s, above the 1.55x that 95% of the bandwidth could give.
+- [ ] **7. A fast-prefill contract, bounded** (H13 in the design reference §13; after item 1, so it does not measure
+  idle units). The question: what giving up bit-exactness buys.
+  - *The contract:* named, opt-in, deterministic: BF16 activations, packer L1 accumulation, HiFi2.
+  - *Bound first:* a probe on H1's four shapes with an FP32 `B` and on a 1.7B 512-token chunk, against the exact
+    default. Prediction ≥ 1.3x; kill < 1.15x on the chunk, or a derived error bound too loose for the model gates.
+  - *Why decode is not in it:* split-K is ~0.2 ms of a 1.7B step
+    ([proposal](../proposals/split-k-and-flash-decode.md)), and derived fidelity moved decode by nothing. Decode is
+    bound inside its products (item 2), so speculative decode (item 6) is its bit-exact lever.
 
 This takes over the open parts of "Use the grid" (G4 subblocks, G7 multicast) and "Prefill P5" below. Their evidence stands.
 
@@ -1535,7 +1596,7 @@ of these closes. Not scheduled; in the order the review suggests, evidence first
   a prefill only where it pays.
 - [ ] **F6** replay plus `SFPLOADMACRO` for `exp` and reciprocal, against our staged row loops and `.ttinsn`
   (is their accurate path bit-exact?). **F9** separate fidelity from structure in prefill (our products at
-  HiFi2 and LoFi) before more multicast work. **F10** the Blackhole DRISC tensor prefetcher. **F16** split the
+  HiFi2 and LoFi) before more multicast work. **F10** the Blackhole DRISC tensor prefetcher (held in reserve: "Dataflow compiler follow-ups" item 5; tt-metal's single-p150 gains are 47-156 GB/s an op, `69e43ba9dea`). **F16** split the
   per-op control cost (about 4.1 us against tt-metal's 1.3 us traced minimum).
 - [ ] **F7** native top-k and trace-compatible on-card sampling (112 ms a token today; tt-metal samples in a
   separate trace, top-k at most 32). **F8** BFP8 and BFP4 weights and a BFP8 KV cache as opt-in decode modes, with

@@ -1,7 +1,7 @@
 # Plan: the dataflow compiler, staged
 
 **Status:** complete 2026-10-31 (stages F1-F6 closed); approved and scheduled 2026-10-28 (owner). Its design principles are in
-[dataflow-compiler.md](../learnings/dataflow-compiler.md) (the Bible), and its binding decisions in ADRs
+[dataflow-compiler.md](../learnings/dataflow-compiler.md) (the design reference), and its binding decisions in ADRs
 [0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md),
 [0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and
 [0005](../adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md).
@@ -10,7 +10,7 @@
 default; benches stay on card 1, where Stage 0's baselines were taken, and a before/after pair always uses one card. No
 `--device all`, and no mesh, multi-card or Ethernet gate.
 
-Every stage opens by writing its hypothesis, prediction and kill criterion into the Bible's register (§13), then
+Every stage opens by writing its hypothesis, prediction and kill criterion into the design reference's register (§13), then
 measures its baseline on card 1 at the stage's starting commit. A stage is kept only if its gates are bit-exact and the
 prediction holds. Otherwise the refutation is recorded and the stage stops.
 
@@ -95,7 +95,7 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 
 ## Stage F2: typed channels and the cross-core credit
 
-- **H8** (Bible §13, opened 2026-10-28): a credited handoff between two units costs less than a barrier, ≤ 1.5 us on card 1;
+- **H8** (design reference §13, opened 2026-10-28): a credited handoff between two units costs less than a barrier, ≤ 1.5 us on card 1;
   the in-core streams re-expressed as `Local` channels emit today's words.
 - [x] **F2.1, the packet golden first** (`d2024f3`): `session::tests::streamed_packet_words_are_pinned` dumps every
   streamed packet's words for depth-1 and depth-2 regions (apart and shared footprints, past one group), transfers
@@ -150,7 +150,7 @@ track's order follows the evidence: products are bound by operand reads (scorebo
   - Each refusal has a unit test, beside a double-buffered two-unit pipeline that passes.
 - [x] **F2.6, H8 measured** (`2f29d9f`, `silicon_bench_channel_credit`, card 1 `1793200301`):
   - a credited handoff is 1.81 us, against a two-unit barrier's 2.66 us polled and 2.59 us released;
-  - the prediction (<= 1.5 us) is missed, and the claim (cheaper than a barrier) holds. See the Bible's H8.
+  - the prediction (<= 1.5 us) is missed, and the claim (cheaper than a barrier) holds. See the design reference's H8.
 - [x] Close-out: `--smoke` on card 0, 1,241 of 1,241 (`1793200324`); `step12_mnist` 8 of 8 on ttsim, goldens unchanged.
 - **Not yet built:** no op uses a cross-core channel. F4b (operand reuse) and F4a (channels instead of barriers) are
   the first. `channel::Graph` runs on each op's in-core graph since F3 (`tile_op::channels`); a `Gddr` ring's GDDR
@@ -158,7 +158,7 @@ track's order follows the evidence: products are bound by operand reads (scorebo
 
 ## Stage F3: the tile-generic op (L1) and transforms written once
 
-**Opened 2026-10-28.** H6's prediction and kill criterion are in the Bible's register. The method:
+**Opened 2026-10-28.** H6's prediction and kill criterion are in the design reference's register. The method:
 - a job golden pins every job the three old builders emit;
 - each client is ported word for word;
 - each old builder is then deleted.
@@ -318,7 +318,7 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
 
     The depth is checked against the lowered kernels' halves. Planted faults: a chain without its first page
     deadlocks, and pipelined runs claimed one page deep fail the goldens.
-- [x] **F3.9: the H6 audit, `--smoke` on card 0, and the close-out** (2026-10-28). H6 holds; the result is in the Bible
+- [x] **F3.9: the H6 audit, `--smoke` on card 0, and the close-out** (2026-10-28). H6 holds; the result is in the design reference
   (§13 H6), and D1 is decided: staged.
   - Item 2, the reload order: one link form, with wait, reads, then reload (`2f9bc5d`). The reduction's chunked
     fallback was re-blessed: four cases, the same entries reordered. `step31/55/67/68/69` pass 25 of 25 on ttsim.
@@ -330,14 +330,14 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
     - `block_reads` into `lower`;
     - the read-ahead split into `ahead::split`.
 
-    The exceptions left are named in the Bible.
+    The exceptions left are named in the design reference.
   - `step12_mnist` on ttsim passes 8 of 8 with the goldens unchanged. `--smoke` on card 0 passes 1,241 of 1,241
     (`1793221000`). `cargo xtask conformance` was not rerun, because nothing under `burn-tt` changed.
   - B1 (`bench_training`, card 1, ABBA against F3.8's tree `a984fa2`): the closing tree gives 1.398 / 2.892-2.903 /
     8.270-8.300 ms/step (`1793222702`, `1793222744`, `1793223083`); F3.8's tree gives 1.398 / 2.892 / 8.270-8.290
     (`1793223007`, `1793223049`). Within drift.
   - `step243` was not needed: the session's capture-time choice of prefetching units did not move.
-- **H6 prediction:** no pass contains code specific to one of the three clients. If one does, the description gets the missing concept and the Bible records it. **Held** (the Bible's H6).
+- **H6 prediction:** no pass contains code specific to one of the three clients. If one does, the description gets the missing concept and the design reference records it. **Held** (the design reference's H6).
 
 ## Stage F4b (compute): operand reuse across cores, H1
 
@@ -348,7 +348,7 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
   - `silicon_probe_pair_cost` with and without gathers (`1793224072`): the ceiling is 30.3 TFLOPS with an FP32 `B`,
     28.0 with a packed one. Today an FP32 `B` has 1.38-1.51x to gain at the three shapes, a packed one at most 1.13x.
     Skipping only `A`'s reads recovers 92-99% of the ceiling.
-  - H1 restated in the Bible before the build (owner's choice): FP32 `B` ≥ 25.8 TFLOPS and ≤ 302 MB read; packed
+  - H1 restated in the design reference before the build (owner's choice): FP32 `B` ≥ 25.8 TFLOPS and ≤ 302 MB read; packed
     `B` ≥ 95% of the ceiling.
   - Found: `[2048,8192]@[8192,2048]` runs at 10.9-11.0 TFLOPS through Burn (80 units) against 18.5 through the
     session in the probe. Open, not F4b's.
@@ -383,7 +383,7 @@ spread. B0 was taken at F3.0 and the pointwise/reduction subset after `8011dc7`.
   - [-] Multicast: one sender a row rectangle (NC `WRITE_L1_MCAST`, a multicast ready word), against pull.
     **Deferred, not refuted (owner, 2026-10-29): revisit when hunting performance.** Not built; the analysis:
     - A multicast reaches a rectangle of Tensix tiles that excludes its sender (`channel::Ring` refuses otherwise),
-      and path-reserved multicasts sharing a rectangle serialize (Bible T7), so the safe form is one sender a
+      and path-reserved multicasts sharing a rectangle serialize (design reference T7), so the safe form is one sender a
       disjoint rectangle. The deal's groups must then be the grid's rows and columns, not runs of consecutive units.
     - `B` down grid columns (the scheme that would end `B`'s holder fan-out, F4b.1 above): row groups as wide as the
       grid (12 tiles on a 120-tile card). H1's 8 block rows fill 8 of 10 grid rows, 96 units, a ceiling of about
@@ -528,7 +528,7 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
 - [x] **F4a.1, edge credits in place of kept barriers** (only if F4a.0 clears the kill). Derive per-edge channels
   from the barrier analysis (`tt_kernels::barriers::analyse`, whose `deps` are per edge over every address space, the
   residency plan's L1 moves included). Keep barriers only where no channel can express the dependency, or where a
-  barrier is the cheaper lowering of an all-to-all edge (Bible §7). Stored streams only, as `prune`.
+  barrier is the cheaper lowering of an all-to-all edge (design reference §7). Stored streams only, as `prune`.
   - [x] **Built, opt-in, not faster** (2026-10-30, card 1, lane A2;
     [log](../learnings/performance-log.md#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1)).
     - `barriers::credit` (`Session::set_edge_credits`, `TT_EDGE_CREDITS=<fan>`), at the prune point: a kept barrier whose
@@ -697,7 +697,7 @@ name pass, the models' figures unchanged ([new-architectures.md](../plans/new-ar
 ## Stage F6 (gated on F4a and F5): fusion through channels and spatial pipelining, H5 and H10
 
 Opened 2026-10-31 at `3613d8f`, the merged F4a/F5 tree. H4's verdict leaves per-unit work balance and the ops between
-products as the levers. Two hypotheses (Bible §13): **H10**, register fusion (a product's consumer applied in `Dst`
+products as the levers. Two hypotheses (design reference §13): **H10**, register fusion (a product's consumer applied in `Dst`
 before the pack, X5a), and **H5**, spatial pipelining (`down` consuming `gate|up` through a cross-core channel on a
 disjoint core set). Each is bounded on the card before it is built, and its kill applied to that bound first, as F4a.0
 did.

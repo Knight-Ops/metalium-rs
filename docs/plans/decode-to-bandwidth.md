@@ -1145,6 +1145,10 @@ would close that. Measured first, with the decision rules set before each run
   binds a product, was checked with the `fast-reads` image (reads ~5x cheaper, profile `1793131649`): `down` 120.8 ->
   114.9 us, `gate|up` 125.4 -> 120.1, the step 10.82 -> 10.60 ms. A `down` unit moves its span's bytes at ~5.6 GB/s
   against the 20-35 it reads at alone.
+  - **Bounded again 2026-10-31** (H11 in [dataflow-compiler.md](../learnings/dataflow-compiler.md) §13; `1793463838`,
+    card 1). That check tested the entries' issue cost; this one tests their size. With the deal's units and bytes,
+    each unit's share contiguous in one channel at 16 KiB lifts 64 units 395 -> 499 GB/s, but unevenly. The 96-unit
+    deal already reads ~499 GB/s evenly. A3 stays unbuilt: the read stream is not what holds the products.
 
 **What it leaves:** neither a unit's reads (above) nor compute alone (6.26 ms a step with the weights free) binds a
 product's span; the two together under the card's whole traffic do: each unit's reads and its `m = 1` kernel through a

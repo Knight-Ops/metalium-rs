@@ -1,7 +1,16 @@
-# The Dataflow Compiler: Design Principles
+# Dataflow compiler: design reference
+
+**This is the source of truth for the dataflow compiler.** It holds:
+- the machine's measured truths;
+- the semantics that never change;
+- the transforms and the hypotheses register;
+- the external research and references on dataflow systems, compilers and LLM inference that each decision is
+  checked against (§10, §14, §15).
+
+When a review or experiment finds evidence for or against a principle, it is recorded here.
 
 **Crates:** `tt-isa`, `tt-kernels`, `tt-firmware`, `burn-tt`
-**Classification:** Tier 1. A living architecture document, the reference that every optimization below Burn builds on. Its binding decisions are ADRs [0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md), [0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and [0005](../adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md). The staged work is in [the plan](../completed-plans/dataflow-compiler.md).
+**Classification:** Tier 1. A living architecture document, the reference that every optimization below Burn builds on. Its binding decisions are ADRs [0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md), [0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and [0005](../adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md). The staged work is in [the plan](../completed-plans/dataflow-compiler.md) (F1-F6, closed 2026-10-31); the review of its decisions against external evidence is §15.
 **Hardware target:** Blackhole A0, 120 Tensix tiles a card on ours (12 of 14 columns).
 **Written:** 2026-10-28. Card numbers are from card 0 unless a run says otherwise.
 
@@ -123,7 +132,25 @@ So **an output's bits depend on how its K terms are grouped and in what order th
 **T8. GDDR is one queue, and service is unfair** [MEAS] ([notes](silicon-operating-notes.md#gddr-reads-are-one-queue-prefetch-traffic-is-paid-by-the-small-ops-2026-10-20-cards-0-and-1))
 - Prefetch traffic is paid for by the small ops that wait behind it.
 - Units reading together are served by position. Two reads in flight per unit evens it out.
-- A unit's read rate is set by its entry size: ~6.5 GB/s for 2 KiB entries on the safe image, 20-35 with `fast-reads`. Bank-local readers add nothing (F27, 2026-10-27).
+- A unit's read rate is set by its entry size: ~6.5 GB/s for 2 KiB entries on the safe image, 20-35 with `fast-reads`. Bank-local readers add nothing (F27, 2026-10-27), **at equal 2 KiB entries** (§15).
+- **A unit's read rate is Little's law** (§15, 2026-10-31): reads in flight × entry bytes ÷ latency.
+  - A read lands ~1 us after issue ([notes](silicon-operating-notes.md#gddr-reads-are-one-queue-prefetch-traffic-is-paid-by-the-small-ops-2026-10-20-cards-0-and-1)).
+  - So a decode unit at ~2 tile entries in flight (`dm::STREAM_CAP`, kept low for fairness) reads ~4-6 GB/s, and a
+    product needs 64-96 such units to approach 512 GB/s. With that many, unfair service by position becomes the
+    tails (`down`'s units 113-154 us).
+  - Raising the count in flight past ~32 requests a channel costs bandwidth (the knee, `1793144632`). The free axis is
+    the entry size: 16 KiB entries hold **500-506 GB/s at caps 1-3** with 8 readers a channel ([log](performance-log.md#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0)).
+  - **But reads alone are not what holds a decode product** (H11's bound, card 1, `1793463838`). Today's deal at
+    2,112-byte entries, reading a product's bytes a unit and nothing else:
+    - **499 GB/s on 96 units at cap 2**, every unit's list ending within ~12 us;
+    - 395 GB/s on 64 units at cap 3, within ~1 us.
+
+    Each unit's share contiguous in one channel at 16 KiB entries lifts 64 units to 499 GB/s, but spreads their
+    ends over 28-90 us of a ~130 us run. So the products' 233-306 GB/s in their spans (F27) is lost inside the
+    product, to its reads and kernel together, not to the read stream's structure.
+  - [PUB] Tenstorrent sees the same unfairness on Wormhole. Readers whose routes overlap congest; within one virtual
+    channel the NoC serves first come, first served. Their fix is one reader a bank one hop from it, and two readers
+    in a row on different VCs (`Saturating_DRAM_bandwidth.md`).
 
 **T9. Silicon keeps state; harvested tiles hang the NoC** [HW] [MEAS]. L1 and configuration survive between programs and processes. A program establishes every piece of state it relies on. Grids come from ARC (`ENABLED_TENSIX_COL`). An access to a harvested tile can reboot the host ([notes](silicon-operating-notes.md)).
 
@@ -142,6 +169,13 @@ So **an output's bits depend on how its K terms are grouped and in what order th
 - Atomics carry credit counts only, never data.
 
 Kahn's theorem then gives every channel the same history under any schedule, any speed and any placement (Kahn 1974; proved by Faustini 1982 and Stark 1995). **This is the guarantee that lets the compiler schedule freely without touching bits.** Increments commute, so counting credits atomically is deterministic. Accumulating data atomically is not, and is forbidden. *Overturned by:* nothing short of giving up bit-exactness.
+
+**Assigning parallel work at run time is legal under S1** (2026-10-31). A unit may claim its next output column
+from an atomic counter, and which unit computes a column may vary. Its values cannot, because each output's whole
+reduction stays on one unit in its contract's order and lands at a fixed address. What S1 forbids is choosing *data*
+by arrival, not choosing *work*. A completion count for the consumers is a credit (increments commute). Claiming is a
+fallback for H11 (§15), not a default. Hazy's measurements put a claim's cost at about the size of a small work item
+(§15).
 
 **S2. Every op has a numeric contract.** It is part of the algorithm, not of the schedule [MEAS: the stack's standing rule, `tt-metal-concepts-review.md` §4; [PUB] Stream-K and FlashAttention show that splits change bits]. A contract states:
 - **Reduction order:** for each reduction dimension, its chunk size and combine tree. Default: K in ascending tiles, `MVMUL` groups as the hardware forms them, partials carried through FP32 `Dst`.
@@ -202,7 +236,12 @@ TileOp {
   contract: NumericContract,
 }
 ```
-Indexing maps plus iterator kinds are what `linalg.generic` and tt-mlir's `d2m.generic` use [PUB]. Tiling, fusion and distribution are written once against this interface. The body is the only op-specific part, and its microkernels are the only arch-specific part. That is BLIS's split [PUB], and it holds here because formats stop at the boundary (T3).
+Indexing maps plus iterator kinds are what `linalg.generic` and tt-mlir's `d2m.generic` use [PUB].
+
+**What L1 lacks:** an operand's *storage* layout. Every GDDR operand is row-major tiles, interleaved a tile a channel,
+whatever order its consumer reads it in. A static operand (a weight) could instead be stored for its consumer: each
+unit's share contiguous within one channel, in slot format and in consumption order. That is X9 (§6, §15).
+tt-metal does this by hand as DRAM-sharded and "receiver-contiguous" weights [PUB]. Tiling, fusion and distribution are written once against this interface. The body is the only op-specific part, and its microkernels are the only arch-specific part. That is BLIS's split [PUB], and it holds here because formats stop at the boundary (T3).
 
 **L2, the dataflow graph.**
 ```
@@ -249,6 +288,8 @@ Each transform states its legality under S2/S3, its expected effect, and the evi
 | X6 | **Barriers become channel edges**: a unit starts when its own inputs are ready | Yes (S1) | [HYP] H4. The evidence cuts both ways (T10): a barrier's time after a product is the slowest unit's work, so removing the barrier alone buys little. The gain has to come from overlap, below. Built in F4a.1 (`barriers::credit`, opt-in, 2026-10-30): a 1.7B decode step admits it only after products into their residual adds, and is not faster |
 | X7 | **Spatial pipelining**: ops on disjoint core sets at once, linked by channels | Yes (S1) | [HYP] H5. Only on exact resource accounting. tt-mlir brought it back as `d2m.spatial` [PUB] |
 | X8 | **Prefetch** of data-independent operands (weights) | Yes | [MEAS] exists. It competes with small ops for the one GDDR queue (T8) |
+| X9 | **Static-operand storage layout chosen for its consumer**: a weight stored at load time with each unit's share contiguous in one channel, in slot format and consumption order | Yes. Moves bytes only; `K` order unchanged | [MEAS] H11's bound (`1793463838`): large entries lift 64 readers from 395 to ~499 GB/s, unevenly; the 96-unit deal already reads ~499. Parked until a product meter shows a 64-unit product read-bound. tt-metal: DRAM-sharded, receiver-contiguous weights [PUB] |
+| X10 | **A unit's read pipeline**: entry size, reads in flight, ring depth, all owned by the cost model | Yes. Changes timing only | [HYP] Today: 2 KiB entries, ~2 in flight, a ring of one block, so a unit's next gather waits for its compute. The ring's depth is the candidate the product meter (H11's next step) confirms or rules out. tt-metal: 16 KB pages, 3 rotating transaction IDs, triple buffering [PUB] |
 | — | Split-K, flash-attention rescaling, packer L1 accumulation, 16-bit `Dst`, fidelity below exact | **No**: different contracts | Opt-in only, by name. Packer L1 accumulation was rejected as a default because it reorders the sum (G3); split-K and flash-decode are parked ([proposal](../proposals/split-k-and-flash-decode.md)) |
 
 **X5's rounding rule makes fusion format-generic.** A fused body equals the unfused graph exactly when every pack of the unfused graph that narrows is replayed as an explicit rounding to that edge's `TileFormat`. Fusion then never depends on which format the intermediate had.
@@ -359,6 +400,9 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 | SambaNova SN40L | Cores in proportion to work; static lifetime memory planning; a static bandwidth model | [PUB] |
 | Graphcore Poplar | Running out of memory is a compile error | [PUB]; matches `PlanError` |
 | Cerebras | Keep a layer-at-a-time fallback for graphs that do not fit spatially | [PUB] layer-pipelined mode only fits models under ~1B parameters |
+| tt-metal DRAM-sharded decode matmul | Weights stored per bank for their readers; 16 KB pages; 3 rotating transaction IDs; 2-3 readers a bank on Blackhole | [PUB] 88-90% of 512 GB/s on one product (`f2c0b2623fe`, BFP8/HiFi2, M=32), 53% at one reader a bank. Our X9/X10, H11 |
+| Megakernels (Hazy, MPK, Cohere) | Static per-core instruction lists, fine-grained counters, next weights loaded under the current op | [PUB] 62-80% of bandwidth at batch 1. Our traces already have no launch gaps, so their gains are mostly ours already (H4); after prefetch, weight waits are 5% of a B200 step |
+| Deterministic inference (Thinking Machines, SGLang) | Fixed split *size*, never a split count fixed by the machine | [PUB] the same rule as S4; a batch-invariant matmul costs ~20%, deterministic serving +24-55% |
 
 **Avoid, with evidence:**
 - Discovering backend limits by retrying (Buda) [PUB].
@@ -376,7 +420,7 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 |---|---|---|---|---|
 | D1 | Lowering | Staged (D2M pipeline) | One builder per op (ours before F3) | **Decided 2026-10-28: staged.** Information-preserving lowering is what makes transforms generic. H6 held: the three clients (matmul, the pointwise SFPU family, a reduction) run through passes that name none of them, and the one concept the description still lacks, a chain handed between units, goes to F4a as a channel (§13 H6) |
 | D2 | Partials across K chunks | Packer L1 accumulation | Reload into FP32 `Dst` | **Decided: reload** under the default contract (L1 accumulation changes rounding, G3). L1 accumulation stays available as a named contract |
-| D3 | Decode weight readers | DRAM-sharded, one reader beside each bank | Interleaved `READ_RUN` stream | **Decided 2026-10-27: no gain.** At equal entry sizes, 8 readers a channel equal today's deal; with reads 5× cheaper the step moves only 10.82 → 10.60 ms (F27, [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)) |
+| D3 | Decode weight readers | DRAM-sharded, one reader beside each bank | Interleaved `READ_RUN` stream | **Decided 2026-10-27: no gain** at equal entry sizes: 8 readers a channel equal today's deal; with reads 5× cheaper the step moves only 10.82 → 10.60 ms (F27, [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)). **Re-opened 2026-10-31 (§15):** it was decided only at 2 KiB entries. tt-metal's form stores weights per bank and reads 16 KB pages, with 2-3 readers a bank (88-90%). H11's bound (`1793463838`): the deal itself reads ~499 GB/s on 96 units, evenly, so stays decided for 96-unit products; open only for 64-unit ones |
 | D4 | Layout search | Greedy (tt-mlir, after removing a solver) | Global solver | **Provisional: greedy** [PUB]. Revisit only on a measured loss |
 | D5 | Operand reuse in products | 2D multicast matmul | A few holders pulled by `READ_L1`; or GDDR re-reads with larger blocks | **Decided 2026-10-29: `A` pulled from a few holders** (1.33-1.44x with an FP32 `B` at three prefill shapes, bit for bit, F4b.1). `B` pulled loses (a holder's L1 fan-out; its credits' round trips do not bind). Multicast deferred, not refuted: on a 12-wide grid `B` down columns caps H1 at ~24.2 TFLOPS (96 units) and `A` along rows at ~1.17x; revisit when a shape's block rows suit the grid or after F5. Equal row groups leave `units % groups` units idle; other work on them needs F4a's channels in place of the op's closing barrier. For a packed `B` the block, not reads, binds (H1 1.7x at `[6,4,12]` with `A` pulled), shape-dependent. **F4b.2 (2026-10-29): the block and the pull are measured together, the default** (`BlockStream::Measured`, `Reuse::Auto`, H9): 1.02-2.25x `Auto` a product, H1 through Burn 19.2 -> 29.2 TFLOPS, `A` pulled in 37 of 50 cases of every format once the block is right; eager products run `Auto`'s block, unshared |
 | D6 | Credit granularity | A page (often a tile) | A compute-sized batch (ours) | **Open.** Decided per channel class by the cost model once H4 measures sync cost against overlap. Sync cost measured (H8, 2026-10-28): a cross-core handoff ~1.8 us, a two-unit barrier ~2.6 us |
@@ -501,6 +545,16 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
   - *Consequence:* at batch 1, fewer weight bytes buy little until the one-row product's unpack/math cost falls. That
     is a kernel question (what a product does per tile for one live row), and it bears on H4: the 1.7B step's read rate
     is not the only bound.
+  - *Corrected 2026-10-31 (§15): the bound was reads, not unpack and math.*
+    - F4a.0 reread the "full FIFO": the math role's pushes wait on gathered data. With every weight read skipped, the
+      step is 5.33 ms.
+    - The `m = 1` kernel computes a weight tile in ~90 cycles (`LiveRows::Eight`; 64 pairs 15.0 -> 4.8 us,
+      [notes](silicon-operating-notes.md)), against ~360 cycles of mover work an entry.
+    - What a quarter of the bytes did not buy is a product's per-unit pipeline: a unit's reads and its kernel through
+      a one-block ring, at tile-sized entries. A BFP4 tile is fewer bytes in the same entry count, and the entries,
+      not the bytes, pace the unit (T8). H11's bound shows the read stream alone is not the limit, so what binds is
+      the pipeline's overlap, which nothing meters over time yet (F27's open item).
+    - tt-metal saw the same: at one reader a bank, BFP4/LoFi was only 18% faster than BFP8 (`f2c0b2623fe`).
 - **H4 Channels instead of barriers.** With per-edge credits and data-independent reads started as units free up, a 1.7B decode step's card read rate rises from 328 GB/s (64%).
   - *Prediction:* ≥ 400 GB/s average and step ≤ 9.5 ms (from 10.9), bit-exact.
   - *Measured by:* the profile's card read meter.
@@ -528,6 +582,13 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
       units bound them. H4's prediction (≤ 9.5 ms, ≥ 400 GB/s) is not met, and the step moved < 0.3 ms. The barrier
       is not what costs (§7's "barriers remain only where..." holds as a correctness rule, not a performance one at
       decode); the products' per-unit work balance is the lever left, which is F5's and F6's.
+  - *Scope (2026-10-31, §15):* the verdict holds under the read structure every F4a schedule kept:
+    - tile-sized (2 KiB) entries, about 2-3 in flight a unit;
+    - 64-96 units each reading its own weights through its own B;
+    - a ring of one block a unit.
+    Under that structure a slowest unit is a slowly served one (T8), and any read added beside it slows it. A
+    structure with larger entries and fewer, faster readers (H11) changes what binds, so H4's mechanism is not
+    refuted for it.
   - *Credits on Qwen3.5-4B (2026-10-31, card 1):* a step of ~1,000 small ops; decode unchanged at 64.2 / 64.7 ms,
     the 5,688-op prefill chunk 1.4% faster, bit for bit
     ([log](performance-log.md#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1)).
@@ -554,6 +615,8 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     same reads.
   - *Result (2026-10-31): killed by measurement, not built* (owner's decision on F6.4a's probe). Spatial
     pipelining at batch-1 decode adds reads beside the slowest units, which bound each product.
+  - *Scope (§15):* the same read structure as H4's scope. Spatial *role* separation (dedicated readers feeding
+    compute units through channels, tt-metal's prefetcher) was not tested; it is H11's last fallback.
 - **H10 Register fusion** (F6, opened 2026-10-31 at `3613d8f`). A product's consumer applied in `Dst` before the pack
   (X5a) removes the consumer's op, its barrier and its round trip through L1 or GDDR, bit for bit under X5's rounding
   rule. The consumers: a bias row, a residual tile, an activation, and `silu(gate) * up` over a fused projection's
@@ -574,6 +637,10 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     1.7-3.2% of a step on the card (their unprofiled host cost unmeasured), and the training bench runs `TtBackend`,
     which a burn-fusion fuser would not reach. F6.1-F6.3 are not built on this evidence. B13c stays open in
     [kernel-fusion.md](../plans/kernel-fusion.md) for models whose consumers do not hide under a stream.
+  - *Scope (§15):* the kill is the SmolLM2-1.7B's, at 283 ops a step and with the weight stream running under its
+    small ops. It does not transfer to a model class by ADR 0001. Qwen3.5-4B's step is 1,080 ops and 1,080
+    barriers, with 16.8 ms in 776 non-product ops of 43.97 ms on the card (`1793465388`). It needs its own bound before fusion there
+    is judged (§15).
 - **H6 Generic ops** (F3, opened 2026-10-28). The L1 description covers matmul, the 121 pointwise SFPU kinds and a row reduction with no transform code specific to any of them.
   - *Prediction:*
     - the passes (distribute, block, allocate, channels, roles, lower) contain no line that names a client; only the
@@ -692,6 +759,69 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
       pull" was the default block's.
     - Open: an eager product run again after its own shape's pulled capture takes 3-10% more host time, the device's
       the same; not reproduced through the session alone.
+- **H11 Large-entry weight streams** (opened 2026-10-31, §15). A decode unit's rate is its bytes in flight over their
+  latency (T8), not its entries' issue cost. F27 tested the issue cost with `fast-reads` (0.22 ms a step), never the
+  bytes in flight.
+  - *Claim:* a weight stored for its reader (X9: each unit's share contiguous in one channel, in slot format and
+    consumption order), read in 16-64 KiB entries through a ring deep enough to overlap them with compute (X10), lets
+    a product reach the channels' long-entry rate on fewer, evenly served units, bit for bit (bytes move, `K` order
+    does not).
+  - *Bound before any build (P1):* `silicon_bench_memory::gddr_readers_by_channel`'s `Mix::DecodeContiguous`. These
+    are today's decode deal's units and bytes a unit, each unit's share contiguous in channel `t % 8`, in entries of
+    2,112 B, 16 KiB and 64 KiB at caps 1-3, on 64 and 96 units, against the deal's own row (F27: 424 / 449 GB/s safe).
+  - *Prediction:* at 16 KiB and cap 2, ≥ 490 GB/s, with each tile's rate and the list ends evenly spread (within 10%).
+  - *Kills it:* < 470 GB/s at every large entry and cap, or ends spread like the deal's (`down`'s 113-154 us).
+  - *Then, before the layout pass is built:* the `m = 1` product over a relaid weight on card 1 (reads and kernel
+    together, which F27 left unmetered). Kill: a product's span not ≥ 1.2x closer to its stream's time.
+  - *Bound (2026-10-31, card 1, `1793463838`, `profile` image, safe reads, each unit 1.08 MB, medians of 9): the
+    prediction is missed; the read stream is not the products' limit.*
+
+    | units | today's deal, 2,112 B, caps 1 / 2 / 3 | contiguous, 2,112 B | contiguous, 16 KiB | contiguous, 64 KiB |
+    |---|---|---|---|---|
+    | 64 | 320 / 377 / **395** GB/s; ends within 11 / 5 / 1 us | 322 / 374 / 393 | **499** / 486 / 476; ends over 28 / 74 / 90 us | 483 / 472 / 470; 42 / 76 / 87 us |
+    | 96 | 454 / **499** / 451; ends within 14 / 12 / 52 us | 454 / 500 / 448 | 496 / 465 / 464; 96 / 154 / 160 us | 491 / 466 / 457; 102 / 150 / 161 us |
+
+    - The layout alone, at tile-sized entries, changes nothing.
+    - Large entries lift 64 units to ~499 GB/s (+26% over the deal's best) but serve them unevenly: a unit's 1.08 MB
+      takes 80-141 us at 16 KiB and cap 3, against 173 us for every unit of the deal.
+    - On 96 units the deal already reads ~499 GB/s, evenly.
+    - So X9 with large entries could lift only the 64-unit products (`o`, `down`), and only if their spans were
+      read-bound, which they are not: `down` reads 233 GB/s in its span (F27), under the deal's own 395.
+    - What binds is inside the product, its reads and kernel together (F27's open item).
+  - *What is next instead:* meter a product's per-unit pipeline over time, before any transform: when each unit's
+    reads issue and land, when its kernel runs, its `K`-chunk reloads (`down`, ~3 us a chunk), its `A` reads and its
+    kernel tail. Use the profile mode, extending its stamps if needed. X10's ring depth is the candidate a meter would
+    confirm or rule out. H11 stays open on that measurement, its layout half (X9) parked.
+- **H12 Bit-exact speculative decode** (recorded 2026-10-31, a later track; owner: after the bandwidth items).
+  - *Mechanism:* a draft (SmolLM2-135M for the 1.7B, same tokenizer; Qwen3.5's MTP head) proposes `k` tokens, and the
+    target verifies them in one `m = k` step.
+  - *Why it is exact:* every op the decoder runs is row-independent: products (`LiveRows` trims rows without changing
+    bits), norms, RoPE, and attention per query row over the cache. So each verified row equals the single-row step's
+    bits, and greedy acceptance gives plain decode's tokens.
+  - *Why it pays:* at batch 1 it is the only lever that spends idle compute. Its ceiling (2-3x tokens/s at typical
+    acceptance) is above 61% -> 95% of the bandwidth (1.55x).
+  - *Gate:* the `k`-row verify step's rows bit for bit against `k` single-row steps, with the negative control a row's
+    `K` order perturbed.
+  - *Prior art:* tt-metal's Qwen3.5 demo runs MTP speculative decode by default (`models/demos/blackhole/qwen36`).
+- **H13 A fast-prefill contract** (recorded 2026-10-31; bounded after the small-`m` block choice, roadmap follow-ups
+  item 1, so it does not measure idle units).
+  - *Claim:* a named, opt-in, deterministic contract for prefill products buys more than its error costs:
+    - BF16 activations (halving `A`'s bytes and L1, so longer `K` chunks);
+    - packer L1 accumulation (no partial reloaded into `Dst`, F5's remaining stall);
+    - HiFi2.
+
+    The products' bound today is data movement, not phases. They run 30-50 TFLOPS against HiFi4's ~166, and LoFi
+    gave one H7 shape only 10%. So most of the gain should come from the first two.
+  - *Contract, not schedule (S3):* the split points stay fixed by the contract, never by the grid (S4), so results are
+    reproducible. The bits differ from the default's, and the gates check against a specification model of the new
+    order, with an error bound derived beside them, never guessed (AGENTS.md).
+  - *Prediction:* ≥ 1.3x on H1's four shapes with an FP32 `B` and on a 1.7B 512-token prefill chunk, through the
+    session, against the exact default on the same tree.
+  - *Kills it:* < 1.15x on the chunk, or a derived bound too loose for the model gates' top-1 checks against
+    burn-flex.
+  - *Prior art:* tt-metal's prefill runs BF16 activations, `packer_l1_acc`, HiFi2 (FP32 accumulation kept for `O`),
+    and LoFi for BFP4 MLP weights (`models/tt_transformers/tt/model_config.py`). Thinking Machines and SGLang show a
+    deterministic contract costs ~20-35% on GPUs, against a default that is not deterministic at all.
 
 ---
 
@@ -746,3 +876,78 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
 - D2M pipeline: https://github.com/tenstorrent/tt-mlir/blob/main/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
 - TTNN optimizer spec: https://github.com/tenstorrent/tt-mlir/blob/main/docs/src/specs/ttnn-optimizer.md
 - TT-Lang specification: https://github.com/tenstorrent/tt-lang/blob/main/docs/sphinx/specs/TTLangSpecification.md
+- Weight prefetchers (worker-core and DRISC), global circular buffers, receiver-contiguous layout: `tt_metal/impl/buffers/prefetcher_matmul_design.md` (local checkout)
+- DRAM-sharded decode matmul, readers a bank, 16 KB pages, VC choice: `ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_dram_sharded_program_factory.cpp`; commit `f2c0b2623fe` (2-3 readers a bank on Blackhole, 88-90%)
+- GEMM peaks on P150 by fidelity (BF16 HiFi4 168.55 TFLOPS on 13x10): `tech_reports/GEMM_FLOPS/GEMM_FLOPS.md`
+- Qwen3.5/3.6 on Blackhole (Gated DeltaNet decode, MTP speculative decode): `models/demos/blackhole/qwen36`, `models/experimental/gated_attention_gated_deltanet/tt/ttnn_delta_rule_ops.py`
+
+**LLM inference systems (added 2026-10-31, §15)**
+- Hazy Research, "Look Ma, No Bubbles" (low-latency megakernel, Llama-1B): https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles
+- Hazy Research, throughput megakernel (dynamic work queue): https://hazyresearch.stanford.edu/blog/2025-09-28-tp-llama-main
+- Mirage Persistent Kernel: https://arxiv.org/html/2512.22219v1
+- Cohere, megakernels: https://cohere.com/blog/megakernels
+- PyTorch gpt-fast (memory-bandwidth utilization at batch 1): https://pytorch.org/blog/accelerating-generative-ai-2/
+- Thinking Machines, "Defeating Nondeterminism in LLM Inference": https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+- SGLang deterministic inference: https://lmsys.org/blog/2025-09-22-sglang-deterministic/
+- vLLM, Qwen3-Next: https://vllm.ai/blog/2025-09-11-qwen3-next
+- FlashInfer fused Gated DeltaNet decode step: https://docs.flashinfer.ai/generated/flashinfer.gdn_fused_decode_step.html
+
+---
+
+## 15. Review of 2026-10-31: the decisions against external evidence
+
+Written when the plan (F1-F6) closed. Its inputs:
+- this document;
+- the plan and the roadmap;
+- tt-metal's tree (local checkout at `a11d86c`);
+- the literature in §14.
+
+Each verdict is applied where its section lives; this table is the index.
+
+| Decision | Verdict | Evidence |
+|---|---|---|
+| S2-S4: bit-exact contract, splits fixed by the contract | **Supported** | Thinking Machines and SGLang make inference deterministic with a fixed split *size*, never a count set by the machine (S4). A batch-invariant matmul costs ~20% |
+| D9, F6: fidelity from formats, HiFi4 the default | **Supported** | HiFi4 is not what caps prefill: tt-metal reaches 168.55 TFLOPS BF16 at HiFi4 on 130 tiles of a P150 (94%). Their own prefill keeps FP32 accumulation for `O` ("important"). Ours is 30-50 |
+| H9, §8: measure blocks, do not trust the model | **Supported** | Cohere and vLLM tune by measurement; tt-metal's formula configs leave 10-18% of bandwidth |
+| D4: greedy layout choice | **Supported**, unchanged | |
+| H4, H5, H10: barriers, small ops and idle units do not bind a 1.7B decode | **Supported, scoped** to tile-sized entries and 64-96 self-reading units (§13) | Megakernels gain mostly what traces already have: no launch gaps, next weights under the current op. Tenstorrent's own report confirms NoC-position unfairness (T8) |
+| D3: bank-local readers give nothing | **Re-opened, then mostly re-confirmed** | Decided at 2 KiB entries only, and tt-metal's form (weights stored per bank, 16 KB pages, 2-3 readers a bank) reaches 88-90% on one product. H11's bound: today's deal already reads ~499 GB/s on 96 units, evenly; large entries help only 64 units, unevenly |
+| F1's decode refutation: "bound by unpack and math" | **Corrected** | The kernel is ~90 cycles a tile; the bound is a unit's bytes in flight (T8, §13) |
+| H10's kill closing register fusion | **Scoped to the 1.7B** | ADR 0001: Qwen3.5 runs 1,080 ops a step |
+
+**What the compiler lacked, and what the card said.**
+- *The review's hypothesis:* a decode unit's rate is Little's law, bytes in flight over latency (T8). Every F4a and F6
+  schedule moved *when* reads were issued, never *how many bytes* a unit has in flight. Static operands had no
+  storage-layout transform (X9) to make large entries possible, and a unit's read pipeline was no schedule parameter
+  (X10).
+- *The bound (H11, `1793463838`):* today's deal already reads ~499 GB/s evenly on 96 units with nothing else
+  running. Large entries help only 64-unit products, and serve them unevenly. So the read stream's structure is not
+  the decode products' limit. The pipeline inside a product is, its reads and kernel together on each unit, and no
+  meter shows it over time.
+- *What is missing is that meter, not a transform.* Every decode hypothesis since F27 (H4, H5, H10, H11) was bounded
+  from outside the product: spans, tails, bytes by eighth. The next decode step instruments a product's units from
+  inside, and names the transform from what it shows (X10's ring depth, the `K`-chunk reloads, `A`'s reads, the
+  kernel tail).
+
+**Held in reserve until that meter names a bound:**
+1. X9 large entries for 64-unit products, and bank-affine placement at 2-3 units a bank (D3 at large entries);
+2. columns claimed at run time from an atomic counter (legal, §3 S1). Hazy's throughput kernel found claiming worth it
+   only for coarse work, and static schedules within 2% at small batch;
+3. role separation: tt-metal's worker or DRISC prefetcher feeding a ring of compute units through global circular
+   buffers (roadmap F10). On one p150 its published gains are modest (47-156 GB/s an op, `69e43ba9dea`).
+
+**Other gaps:**
+- Qwen3.5's step is a third unattributed. Profiled whole (`1793465388`), 1,071 of 1,080 ops make 43.97 ms on the
+  card against 64.28 ms host-timed:
+  - the head 5.37 ms, already at 481 GB/s;
+  - weight products 19.5 ms at 380 GB/s;
+  - 776 other ops 16.8 ms.
+
+  ~20 ms is in no op's span. The 1.7B's spans sum to its host time, so a replay's own wall time on the card is the
+  next meter.
+- A short prefill chunk is its products, on too few units (`1793466727`).
+  - A 1.7B 64-token chunk is 45.9 ms on the card, 79% of it products at 167 GB/s.
+  - `o` runs on 8 units, `qkv` 16, `down` 32 and `gate|up` 47.
+  - H9's block list was swept only at `m` ≥ 512, so the block choice for small `m` should weigh the units it
+    leaves idle. That keeps `K` order, so it is bit for bit.
+- Speculative decode (H12) is the batch-1 lever that spends idle compute.

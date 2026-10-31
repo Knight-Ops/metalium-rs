@@ -604,6 +604,13 @@ enum Mix {
     Decode {
         nc: u8,
     },
+    /// [`Mix::Decode`]'s units, each reading as many bytes, but from a weight laid out for its
+    /// reader at load time (X9 of `docs/learnings/dataflow-compiler.md`, H11): tile `t`'s share is
+    /// contiguous in channel `t % 8`, the tiles sharing a channel stacked by `t / 8`, read front to
+    /// back in entries of the shape's length, the port rotating `i % 3` as `record::GATHER`'s
+    /// does. Whether a decode product's reads, at the same units and bytes, reach the channels'
+    /// long-entry rate (F27's 505-511 at 2+ readers a channel) when its entries are large.
+    DecodeContiguous,
 }
 
 /// The subchannel (our port) tt-metal's `dram_views` give NoC #0 on each
@@ -858,6 +865,23 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
                     ));
                     i += 1;
                 }
+            }
+            return list;
+        }
+        Mix::DecodeContiguous => {
+            assert_eq!(nc, 8, "the layout assumes all eight channels");
+            let ch = chans[tile % 8];
+            let share = (entries * len) as u64;
+            let first = BASE + (tile / 8) as u64 * share;
+            for i in 0..entries {
+                list.push(entry(
+                    op::READ,
+                    ch,
+                    i % 3,
+                    first + (i * len) as u64,
+                    ring_slot(i, len),
+                    len,
+                ));
             }
             return list;
         }
@@ -1723,7 +1747,13 @@ fn gddr_adjacent_banks() {
 /// - **Decode** first (the fleet in the grid's order, as a session deals units): `DECODE_UNITS`
 ///   (default `64,96`) units, `DECODE_NC` columns a unit (default 2, `gate|up`'s), one BF16 tile
 ///   slot (2,112 B) an entry.
-/// - **Banked**: `BANK_READERS` (default `1,2,4,8`) tiles a channel ([`banked_tiles`]), each
+/// - **Decode contiguous** (H11's bound, 2026-10-31): the same units and bytes a unit, each unit's
+///   share contiguous in one channel ([`Mix::DecodeContiguous`]), at `DECODE_LENS` (default
+///   `2112,16384,65536`) bytes an entry. Prediction: at 16 KiB and cap 2, ≥ 490 GB/s with list ends
+///   within 10% of the run; kill: < 470 GB/s, or ends spread like the deal's. Result (`1793463838`,
+///   card 1): missed; 64 units 395 -> 499 GB/s at 16 KiB but ends over 28-90 us, and the 96-unit
+///   deal already reads ~499 evenly (`docs/learnings/performance-log.md`, "H11's bound").
+/// - **Banked** (`BANK_READERS=none` skips it): `BANK_READERS` (default `1,2,4,8`) tiles a channel ([`banked_tiles`]), each
 ///   streaming its own share of its channel through its nearest NoC #0 endpoint, at
 ///   `BANK_LENS` (default `2112,16384,131072`) bytes an entry.
 ///
@@ -1787,6 +1817,26 @@ fn gddr_readers_by_channel() {
                 shape,
                 &format!("decode {units} units {nc} columns {len} B"),
             );
+            // H11's bound: the same units and bytes a unit, each unit's share contiguous in one
+            // channel, read in `DECODE_LENS`-byte entries.
+            let bytes = shape.bytes() as u32;
+            for len in list("DECODE_LENS", "2112,16384,65536") {
+                let shape = Shape {
+                    entries: (bytes / len).clamp(1, dm::LIST_MAX - 2),
+                    len,
+                };
+                run(
+                    d,
+                    &mut f,
+                    units,
+                    Mix::DecodeContiguous,
+                    shape,
+                    &format!("decode contiguous {units} units {len} B"),
+                );
+            }
+        }
+        if std::env::var("BANK_READERS").is_ok_and(|v| v == "none") {
+            return;
         }
         for r in list("BANK_READERS", "1,2,4,8") {
             let tiles = banked_tiles(&f, r as usize);
