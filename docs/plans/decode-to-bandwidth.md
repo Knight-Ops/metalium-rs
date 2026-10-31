@@ -1166,7 +1166,7 @@ one-block slot ring, beside the prefetching units.
 - [x] **Split the tail by unit** (2026-10-29, card 1, the profile mode's `tails.tsv`): the product's own units drop 92 ->
   20 by its last eighth and nothing reads ahead there, because each unit's next list sits after its arrival. The lever
   chosen, the next prefetch starting where a product's units drop out, is the default since
-  ([dataflow-compiler.md](dataflow-compiler.md) F4a.2, 1.7B 11.32 -> 10.95 ms). An order-changing one (split-K for
+  ([dataflow-compiler.md](../completed-plans/dataflow-compiler.md) F4a.2, 1.7B 11.32 -> 10.95 ms). An order-changing one (split-K for
   `down`'s 64 columns) stays the user's decision.
 
 ## The larger changes compared (2026-10-18)

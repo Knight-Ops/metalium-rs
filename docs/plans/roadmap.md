@@ -768,7 +768,7 @@ Track 1 model. Evidence and bottlenecks:
 - Schedules choose only among bit-equivalent options under each op's numeric contract.
 - Every step is a hypothesis with a kill criterion.
 
-The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `traced-generation`, with silicon on cards 0 and 1 (gates on card 0, benches on card 1):
+The staged work is [dataflow-compiler.md](../completed-plans/dataflow-compiler.md), on branch `traced-generation`, with silicon on cards 0 and 1 (gates on card 0, benches on card 1):
 - [x] **Stage 0:** card-1 baselines (2026-10-28).
 - [x] **F1:** `TileFormat`, and one matmul for every format pair, with exact fidelity (H3) (2026-10-28,
   [log](../learnings/performance-log.md#one-matmul-for-every-format-pair-and-bfp-weights-through-the-model-2026-10-28-cards-0-and-1)).
@@ -837,7 +837,7 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
   - an eager product run after its own shape's pulled capture takes 3-10% more host time (device the same), cause not
     found.
 - [x] **F4a:** channels instead of barriers in decode (H4), closed 2026-10-30: **H4's kill fires**. Opened 2026-10-29 at `9977ad8`
-  ([plan](dataflow-compiler.md#stage-f4a-decode-channels-instead-of-barriers-h4)).
+  ([plan](../completed-plans/dataflow-compiler.md#stage-f4a-decode-channels-instead-of-barriers-h4)).
   - F4a.0 (card 1): the bound clears H4's kill. A product's tail leaves ~70 units reading nothing, 2.45 ms of capacity a
     1.7B step; with the weights made free the step is 5.33 ms (the profile mode's `tails.tsv` splits each eighth by unit).
   - F4a.2, first lever, **the default**: a product's units read the next weights before their arrival, the barrier
@@ -865,7 +865,17 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
     restated (`68a0463`): a pause may leave one `KERNEL` setup run on a unit the paused product left idle. Card 0:
     `--smoke` 1,265 of 1,265 (`1793397733`, `step12_mnist` and `step245` among them); `step260`-`step263` by name
     pass, the models' figures unchanged by F4a and F5 ([new-architectures.md](new-architectures.md#phase-b-on-the-card-started-2026-10-30-cards-0-and-1)).
-- [ ] **F6:** fusion through channels and spatial pipelining (H5).
+- [x] **F6:** fusion through channels and spatial pipelining (H5, H10), opened and closed 2026-10-31 at `3613d8f`
+  ([plan](../completed-plans/dataflow-compiler.md#stage-f6-gated-on-f4a-and-f5-fusion-through-channels-and-spatial-pipelining-h5-and-h10)).
+  F6.0 bounds both on card 1 before any build: register epilogues (B13c's matmul + bias + activation, and a product's
+  residual add, in `Dst` before the pack) by the step with those ops made free; `down` consuming `gate|up` on disjoint
+  units by the tails' read rate and the overlap they give. **F6.0 done** (card 1,
+  [log](../learnings/performance-log.md#f60-register-fusion-and-spatial-pipelining-bounded-on-the-card-2026-10-31-card-1)):
+  every residual add and `silu_mul` of a 1.7B step removed outright saves 0.10-0.16 ms, so **H10's kill fires** and
+  the epilogues are not built; the tails are not GDDR-queue-bound and `gate|up`'s leave 465 us a step, but letting
+  units run on into `silu_mul` and `down` made the step 0.17-0.23 ms slower (reads beside the products' slowest
+  units slow them), so **H5 is killed too** and F6.4 is not built. The dataflow-compiler plan is complete. Found and
+  fixed: a planned capture of a product half of whose output nothing reads was refused (`step219`).
 
 This takes over the open parts of "Use the grid" (G4 subblocks, G7 multicast) and "Prefill P5" below. Their evidence stands.
 

@@ -2542,7 +2542,7 @@ pub fn product_question(
 }
 
 /// The blocks [`BlockStream::Measured`] times first, `[mb, kq, nb]` and whether `A` is pulled:
-/// re-swept for the subblocked kernel (`docs/plans/dataflow-compiler.md` F5, B2;
+/// re-swept for the subblocked kernel (`docs/completed-plans/dataflow-compiler.md` F5, B2;
 /// `silicon_probe_block_sweep`, card 0, 2026-10-30, `1793346207`-`1793351145`) over the four F4b
 /// shapes with an FP32, BF16 and BFP8 `B` and three model shapes (the MOSS-Image DiT's qkv and
 /// down projections at 1,024 tokens, Qwen3.5's gate at 512) with an FP32 and BF16 `B`: the fewest

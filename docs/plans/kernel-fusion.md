@@ -157,6 +157,12 @@ flowchart TD
 ---
 
 ### Milestone B13c: Matmul Epilogue Fuser (Unified FPU + SFPU)
+
+**Bounded 2026-10-31 (dataflow-compiler F6.0, H10): not built.** On the 1.7B decode step every residual add and
+`silu_mul` removed outright saves 0.10-0.16 ms (they run under the weight stream); eager training's forward bias adds and
+activations are 1.7-3.2% of a step on the card, and the training bench runs `TtBackend`, which a burn-fusion fuser does
+not reach. The design below stands for a workload whose consumers do not hide under a stream
+([log](../learnings/performance-log.md#f60-register-fusion-and-spatial-pipelining-bounded-on-the-card-2026-10-31-card-1)).
 **Objective**: Fuse Matrix Multiplication with Bias Addition and Activation functions into a single pass through Tensix `Dst` registers, sharing the exact same SFPU micro-op engine.
 
 - **Dependencies**: B13b, [`tt_kernels::matmul`](../../crates/tt-kernels/src/matmul.rs).

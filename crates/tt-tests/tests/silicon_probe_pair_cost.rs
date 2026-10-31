@@ -5,7 +5,7 @@
 //!   pair is not bound by the Matrix Unit.
 //! - **`B` in FP32 against `B` stored BF16** (`Session::store_bf16`): half the bytes each of `B`'s
 //!   eight face unpacks a pair moves. If the rate moves, the unpacker binds. And `B` stored BFP8,
-//!   BFP4 and BFP2 (`DramTensor::from_bfp`, `docs/plans/dataflow-compiler.md` F1c), each checked
+//!   BFP4 and BFP2 (`DramTensor::from_bfp`, `docs/completed-plans/dataflow-compiler.md` F1c), each checked
 //!   against the values its storage decodes to: at one-row decode shapes (`TT_PAIR_SHAPES=1,...`) a
 //!   product is bound by its weight's bytes, which these hold in ~0.28 / 0.15 / 0.09 of FP32's.
 //! - **No drain** (`matmul::probe_no_drain`, its own test, so its own process): each pair's step

@@ -223,7 +223,7 @@ fn a_products_units_read_their_b_under_the_ops_before_it() {
     });
 }
 
-/// F4a.2 (`docs/plans/dataflow-compiler.md`): with `Session::set_read_ahead_early`, a unit's list
+/// F4a.2 (`docs/completed-plans/dataflow-compiler.md`): with `Session::set_read_ahead_early`, a unit's list
 /// moves on to just before its arrival at the barrier of the product before, so it reads the next
 /// product's `B` as soon as its own share is done. The claims: the same bits, fresh and replayed;
 /// and on each of units 0-3 the last product's list (the middle one runs four jobs pipelined and
@@ -352,7 +352,7 @@ fn captured_idle<T: tt_device::Transport>(
     (runs, ops)
 }
 
-/// F4a.2's idle units (`docs/plans/dataflow-compiler.md`): a unit idle since its own anchor
+/// F4a.2's idle units (`docs/completed-plans/dataflow-compiler.md`): a unit idle since its own anchor
 /// product reads the next product's `B` with a pumped list (`record::GATHER_PREFETCH`, the job's
 /// gather ending with `WAIT_PREFETCH`), which `Session::set_idle_ahead_early` moves to just before
 /// the unit's arrival at the anchor's barrier, so it reads in the anchor's tail without holding

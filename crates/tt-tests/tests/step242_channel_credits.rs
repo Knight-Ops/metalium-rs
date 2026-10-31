@@ -1,6 +1,6 @@
 //! Cross-core channels: a producer tile hands pages to consumer tiles through a ring, each page
 //! granted by a NoC atomic credit (`op::CREDIT`) and each slot freed by one back, every wait a
-//! fenced poll of a credit word (`op::WAIT_CREDIT`) (`docs/plans/dataflow-compiler.md` F2,
+//! fenced poll of a credit word (`op::WAIT_CREDIT`) (`docs/completed-plans/dataflow-compiler.md` F2,
 //! `tt_kernels::channel::Ring`).
 //!
 //! The claims:

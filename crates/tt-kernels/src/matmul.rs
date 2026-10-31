@@ -1471,7 +1471,7 @@ thread_local! {
 }
 
 /// [`block_stream_kernel_looped`] with its outputs held in `Dst` subblocks under half-sync
-/// (`docs/plans/dataflow-compiler.md` F5, H2; [`crate::tile_op::dst`]): each block row is cut into
+/// (`docs/completed-plans/dataflow-compiler.md` F5, H2; [`crate::tile_op::dst`]): each block row is cut into
 /// `plan`'s subblocks of `w` <= 4 output tiles; the math role accumulates a subblock in one half of
 /// `Dst` while the pack role drains the one before from the other (`ready`/`free` start at `(0,
 /// 2)`, the run's `init` says so: [`subblock_init`]); each `K` step unpacks `A`'s tile into `SrcB`

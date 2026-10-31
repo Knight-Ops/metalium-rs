@@ -671,10 +671,26 @@ pub(crate) fn write_probe(id: u64, a: &Analysis) {
 /// barrier but the last is dropped, needed or not.
 pub(crate) fn keep_from(a: &Analysis) -> Vec<bool> {
     let all = PRUNE_ALL.load(std::sync::atomic::Ordering::Relaxed);
+    let unordered = UNORDERED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let free = |k: usize| a.ops.get(k).is_some_and(|op| unordered.contains(&op.0));
     let n = a.ops.len();
     (0..n)
-        .map(|k| k + 1 == n || (!all && a.classes[k] != Class::Unneeded))
+        .map(|k| {
+            k + 1 == n || (!all && a.classes[k] != Class::Unneeded && !free(k) && !free(k + 1))
+        })
         .collect()
+}
+
+static UNORDERED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// A timing bound (`docs/completed-plans/dataflow-compiler.md` F6.4, H5): the barriers on either side of
+/// every captured op labelled in `labels` are dropped, needed or not, so each unit runs into the
+/// op, and on into the next, as soon as its own earlier work is done: how much a pipeline of those
+/// ops could overlap with today's placement. **Timing only: the results are wrong.**
+/// Process-wide; empty turns it off. Never for real work.
+#[doc(hidden)]
+pub fn probe_unorder(labels: &[&'static str]) {
+    *UNORDERED.lock().unwrap_or_else(|e| e.into_inner()) = labels.to_vec();
 }
 
 static PRUNE_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1010,7 +1026,7 @@ pub fn probe_unbalance_credit(on: bool) {
 }
 
 /// Lower kept barriers of capture `c` (`keep`, from [`keep_from`]) to per-edge credits where a
-/// channel expresses them cheaply (`docs/plans/dataflow-compiler.md` F4a.1, H4): a barrier whose
+/// channel expresses them cheaply (`docs/completed-plans/dataflow-compiler.md` F4a.1, H4): a barrier whose
 /// next run's units each depend on at most `fan` producers, each producer crediting at most `fan`
 /// of them. A producer unit credits each consumer's word ([`EDGE_WORDS`], `op::CREDIT`, after its
 /// own requests have completed, where its arrival was) after the last op of its that consumer

@@ -1,4 +1,4 @@
-//! F4a.1 (`docs/plans/dataflow-compiler.md`, H4): a capture's kept barriers lowered to per-edge
+//! F4a.1 (`docs/completed-plans/dataflow-compiler.md`, H4): a capture's kept barriers lowered to per-edge
 //! credits (`Session::set_edge_credits`, `tt_kernels::barriers::credit`). Where a barrier's next
 //! run's units each depend on a few producers, each producer credits each consumer's word
 //! (`op::CREDIT`, after its own requests) where its arrival was, and each consumer waits for its

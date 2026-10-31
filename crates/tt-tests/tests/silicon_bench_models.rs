@@ -1273,6 +1273,15 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
 /// With `TT_PROBE_ATTENTION_SPLIT=1`, each head's attention runs as two halves of its positions on
 /// two units with no exchange ([`tt_kernels::attention::probe_split`]; flash-decode's P0, timing only).
 ///
+/// With `TT_PROBE_FREE` (`adds`, `silu_mul` or `adds,silu_mul`), the model leaves those ops out
+/// ([`tt_models::llama::probe_free_consumers`]): the step with them made free, H10's bound
+/// (`docs/completed-plans/dataflow-compiler.md` F6.0). Timing only.
+///
+/// With `TT_PROBE_UNORDER` (comma-separated op labels, e.g. `tt_silu_mul`), captures drop the
+/// barriers on either side of those ops ([`tt_kernels::barriers::probe_unorder`]): each unit runs
+/// on into them as soon as its own work before is done, the overlap H5's pipeline could take with
+/// today's placement (F6.4). Timing only.
+///
 /// Every capture also prints its space report (`SPACE` lines, [`tt_kernels::session::probe_space_report`]):
 /// what its ops take of a unit's `DATA`, the program cache and the stream. With `TT_PROBE_RESIDENCY=1`,
 /// its residency plan too (`RESIDENCY` lines, [`tt_kernels::residency::probe_residency_plan`]: what
@@ -1355,13 +1364,41 @@ fn traced_generation_stream_ceiling() {
     probe_space_report(true);
     let split = std::env::var("TT_PROBE_ATTENTION_SPLIT").is_ok_and(|v| v == "1");
     tt_kernels::attention::probe_split(split);
+    let dropped: Vec<String> = std::env::var("TT_PROBE_FREE").map_or(Vec::new(), |v| {
+        v.split(',').map(|l| l.trim().to_string()).collect()
+    });
+    if let Some(other) = dropped
+        .iter()
+        .find(|l| !["adds", "silu_mul"].contains(&l.as_str()))
+    {
+        panic!("TT_PROBE_FREE={other}: adds, silu_mul or both");
+    }
+    tt_models::llama::probe_free_consumers(
+        dropped.iter().any(|l| l == "adds"),
+        dropped.iter().any(|l| l == "silu_mul"),
+    );
+    // The labels outlive the run: the probe holds them process-wide.
+    let unordered: Vec<&'static str> = std::env::var("TT_PROBE_UNORDER").map_or(Vec::new(), |v| {
+        v.split(',')
+            .map(|l| &*Box::leak(l.trim().to_string().into_boxed_str()))
+            .collect()
+    });
+    tt_kernels::barriers::probe_unorder(&unordered);
+    let mut dropped = dropped;
+    dropped.extend(unordered.iter().map(|l| format!("{l} unordered")));
+    let tag = if dropped.is_empty() {
+        mode.clone()
+    } else {
+        format!("{mode}, {} free", dropped.join("+"))
+    };
     let residency = std::env::var("TT_PROBE_RESIDENCY").is_ok_and(|v| v == "1");
     let nc_waits = std::env::var("TT_PROBE_NC_WAITS").is_ok_and(|v| v == "1");
     tt_kernels::residency::probe_residency_plan(residency);
     with_device(Config::default(), |d| {
         conditions(card());
         println!(
-            "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split}}}"
+            "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split},\"free\":\"{}\"}}",
+            dropped.join(",")
         );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = m.fused();
@@ -1394,7 +1431,7 @@ fn traced_generation_stream_ceiling() {
             let t = std::time::Instant::now();
             let g = TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap();
             report(
-                &format!("{name} stream ceiling ({mode}), {what} build"),
+                &format!("{name} stream ceiling ({tag}), {what} build"),
                 "ms",
                 "host",
                 Stats::of(vec![t.elapsed().as_secs_f64() * 1e3]),
@@ -1402,13 +1439,15 @@ fn traced_generation_stream_ceiling() {
             // What the weights, the cache and the traces leave of GDDR (`long-context.md` 1.G).
             let (fullest, all) = burn_tt::gddr_free_bytes(d).unwrap();
             report(
-                &format!("{name} stream ceiling ({mode}), {what} build, GDDR free"),
+                &format!("{name} stream ceiling ({tag}), {what} build, GDDR free"),
                 "GB",
                 "host",
                 Stats::of([all as f64 / 1e9]),
             );
             report(
-                &format!("{name} stream ceiling ({mode}), {what} build, GDDR free on the fullest channel"),
+                &format!(
+                    "{name} stream ceiling ({tag}), {what} build, GDDR free on the fullest channel"
+                ),
                 "GB",
                 "host",
                 Stats::of([fullest as f64 / 1e9]),
@@ -1443,19 +1482,19 @@ fn traced_generation_stream_ceiling() {
             }
             // The prompt's chunks and the first token read back (`generate_tokens`' first time).
             report(
-                &format!("{name} stream ceiling ({mode}), {len}-token prompt, prefill"),
+                &format!("{name} stream ceiling ({tag}), {len}-token prompt, prefill"),
                 "ms",
                 "host",
                 Stats::of(prefill.clone()),
             );
             report(
-                &format!("{name} stream ceiling ({mode}), {len}-token prompt, prefill rate"),
+                &format!("{name} stream ceiling ({tag}), {len}-token prompt, prefill rate"),
                 "tokens/s",
                 "host",
                 Stats::of([len as f64 * 1e3 / median(&prefill)]),
             );
             report(
-                &format!("{name} stream ceiling ({mode}), {len}-token prompt, decode step"),
+                &format!("{name} stream ceiling ({tag}), {len}-token prompt, decode step"),
                 "ms",
                 "host",
                 Stats::of(step),
@@ -1465,6 +1504,8 @@ fn traced_generation_stream_ceiling() {
     probe_skip_weight_reads(false);
     probe_background_stream(None);
     probe_space_report(false);
+    tt_models::llama::probe_free_consumers(false, false);
+    tt_kernels::barriers::probe_unorder(&[]);
     tt_kernels::residency::probe_residency_plan(false);
 }
 

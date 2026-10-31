@@ -1,4 +1,4 @@
-//! One matmul builder for every pair of edge formats (F1d of `docs/plans/dataflow-compiler.md`,
+//! One matmul builder for every pair of edge formats (F1d of `docs/completed-plans/dataflow-compiler.md`,
 //! ADR 0004): `Session::matmul_dram` takes each operand in its own format -- FP32, BF16 or BFP8/4/2,
 //! `A` or `B` -- and multiplies the values it decodes to through the block-stream path
 //! (`SrcRoute::Edges`), where BF16 x BF16 and same-format BFP products had builders of their own.

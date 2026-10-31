@@ -1,5 +1,5 @@
 //! A weight stored in any packed format multiplies as its own values in FP32, bit for bit, on
-//! every path a product takes (F1c of `docs/plans/dataflow-compiler.md`): the generic form of
+//! every path a product takes (F1c of `docs/completed-plans/dataflow-compiler.md`): the generic form of
 //! `step233`, whose BF16 weight is one case of [`Elem::Packed`]. A BFP8/4/2 weight
 //! ([`DramTensor::from_bfp`]) is read whole from its own slots (`record::gather_b_format`) and
 //! unpacked in its own format into `SrcA` (`SrcRoute::Tf32WithB`), where it converts to BF16

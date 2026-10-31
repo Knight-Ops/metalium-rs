@@ -200,7 +200,7 @@ pub fn shared(
         return None;
     }
     // Sharing the second operand pairs member `m` of every group, so the groups are one size
-    // and the remainder sits out (`docs/plans/dataflow-compiler.md` F4b.1).
+    // and the remainder sits out (`docs/completed-plans/dataflow-compiler.md` F4b.1).
     let (base, extra) = match b_holders {
         Some(_) => (units / groups, 0),
         None => (units / groups, units % groups),

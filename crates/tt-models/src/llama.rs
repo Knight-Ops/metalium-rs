@@ -237,6 +237,34 @@ pub(crate) fn repeat_kv<B: Backend>(x: Tensor<B, 4>, groups: usize) -> Tensor<B,
 /// so a precision plan can hold an activation in another format ([`crate::quant`]).
 pub type ActFn<B> = std::sync::Arc<dyn Fn(&str, Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>;
 
+/// What [`probe_free_consumers`] removes: bit 0 the residual adds after `o` and `down`, bit 1
+/// `silu(gate) * up`.
+static PROBE_FREE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// A timing bound (`docs/completed-plans/dataflow-compiler.md` F6.0, H10): with `adds`, a layer's residual
+/// adds return the projection alone; with `silu_mul`, the MLP's hidden state is `up` alone. The
+/// step then runs as if those ops were free, its graph whole otherwise, so captures, residency
+/// plans and prefetches see a consistent model. **Timing only: the logits are wrong.**
+/// Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_free_consumers(adds: bool, silu_mul: bool) {
+    let bits = u8::from(adds) | u8::from(silu_mul) << 1;
+    PROBE_FREE.store(bits, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn probing_free(bit: u8) -> bool {
+    PROBE_FREE.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
+}
+
+/// `x + y`, or `y` alone under [`probe_free_consumers`].
+fn residual<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor<B, 3> {
+    if probing_free(1) {
+        y
+    } else {
+        x + y
+    }
+}
+
 /// `x @ W` for a projection, computed in the weight's own dtype: the activation is cast in and the
 /// result cast back to the residual stream's dtype, so matrices held in different formats (F32,
 /// BF16, F16, block floating point) share one stream.
@@ -382,7 +410,7 @@ impl<B: Backend> Layer<B> {
             "attn_ctx",
             out.swap_dims(1, 2).reshape([n, t, cfg.heads * head_dim]),
         );
-        let x = x + project(context, &a.o_proj);
+        let x = residual(x, project(context, &a.o_proj));
 
         let h = normed(&self.post_attention_layernorm, x.clone());
         let m = &self.mlp;
@@ -390,8 +418,14 @@ impl<B: Backend> Layer<B> {
             Some(gate_up) => project_split(h, gate_up, [cfg.ff, cfg.ff]),
             None => [project(h.clone(), &m.gate_proj), project(h, &m.up_proj)],
         };
-        let hidden = hook("mlp_hidden", silu(gate) * up);
-        (x + project(hidden, &m.down_proj), new_k, new_v)
+        let hidden = if probing_free(2) {
+            drop(gate);
+            up
+        } else {
+            silu(gate) * up
+        };
+        let hidden = hook("mlp_hidden", hidden);
+        (residual(x, project(hidden, &m.down_proj)), new_k, new_v)
     }
 }
 
@@ -1045,7 +1079,7 @@ impl<B: burn_tt::storage::StorageBackend> Llama<B> {
     /// head untied first ([`crate::quant::Plan::stored_weights`]). Each product reads its weight in
     /// that format where it lies and computes the values it decodes to in F32, so the logits equal
     /// the F32 model's whose weights hold those values, bit for bit
-    /// (`docs/plans/dataflow-compiler.md` F1c). Apply after [`Llama::fused`].
+    /// (`docs/completed-plans/dataflow-compiler.md` F1c). Apply after [`Llama::fused`].
     pub fn with_stored_weights(self, format: crate::quant::Format) -> Self {
         crate::quant::apply(
             self.untied(),

@@ -1,4 +1,4 @@
-//! `Dst` subblocks and half-sync (`docs/plans/dataflow-compiler.md` F5, H2;
+//! `Dst` subblocks and half-sync (`docs/completed-plans/dataflow-compiler.md` F5, H2;
 //! `tt_kernels::tile_op::dst`): a blocked product whose outputs are accumulated `w` <= 4 tiles at a
 //! time in one half of `Dst` while the packer drains the other, `A`'s tile held across the
 //! subblock's tiles of `B` (`matmul::block_stream_kernel_subblocked`), is the one-tile kernel

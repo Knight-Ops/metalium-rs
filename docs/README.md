@@ -93,7 +93,6 @@ Actionable technical specifications, interface contracts, and execution checklis
   - [`mixed-bfp-storage.md`](plans/mixed-bfp-storage.md): Delivered BFP8/4/2 storage and training contract, acceptance checklist, PRNG diagnostics and remaining application RNG work.
   - [`traced-execution.md`](plans/traced-execution.md): Comprehensive implementation plan for generalized multi-input inference and whole training step hardware traces (`TracedInference`, `TracedTrainingStep`).
   - [`kernel-fusion.md`](plans/kernel-fusion.md): Actionable specification and execution checklist for Burn backend kernel fusion milestones B12 and B13a–B13c.
-  - [`dataflow-compiler.md`](plans/dataflow-compiler.md): the staged dataflow compiler (2026-10-28): card-1 baselines, `TileFormat` and one matmul for every format pair, typed channels with cross-core credits, the tile-generic op, operand reuse (compute) and channels instead of barriers (decode), `Dst` subblocks, then fusion and spatial pipelining; each stage a hypothesis with a kill criterion.
   - [`decode-matmul-bandwidth.md`](plans/decode-matmul-bandwidth.md): an LLM decode step's `m = 1` products against GDDR's bandwidth (P0-P3 done: thin activation reads, an even last round, fused projections; P5 open: one channel a column).
   - [`decode-to-bandwidth.md`](plans/decode-to-bandwidth.md): the umbrella plan for single-user decode at 90-95% of GDDR's bandwidth, ordering the decode plans below; with [`decode-attention.md`](plans/decode-attention.md) (attention reading the cache in place).
   - [`decode-small-ops.md`](plans/decode-small-ops.md): the decode step's non-matmul half (RMSNorm, RoPE, attention, SiLU): repack fixes first, then where fusion lives.
@@ -114,6 +113,7 @@ Unscheduled design proposals and exploratory RFCs evaluating trade-offs before i
 Plans whose checklists are closed move here as a record, with their evidence. They are not updated; current behaviour lives in `docs/learnings/` and the active plans, and any item still open is carried in [`roadmap.md`](plans/roadmap.md).
 - [`phases-0-10-roadmap.md`](completed-plans/phases-0-10-roadmap.md): architecture and phase rationale for Phases 0-10.
 - [`phases-0-10-checklist.md`](completed-plans/phases-0-10-checklist.md): the Phase 0-10 tick-list and evidence.
+- [`dataflow-compiler.md`](completed-plans/dataflow-compiler.md): the staged dataflow compiler (2026-10-28, complete 2026-10-31): card-1 baselines, `TileFormat` and one matmul for every format pair, typed channels with cross-core credits, the tile-generic op, operand reuse (compute) and channels instead of barriers (decode), `Dst` subblocks, then fusion and spatial pipelining; each stage a hypothesis with a kill criterion.
 - [`hardware-coverage.md`](completed-plans/hardware-coverage.md): the Phase 10 tracker (instruction inventory, items X/P/F/S/M/R/D, hazards). Source comments cite its item ids.
 - [`hardware-coverage-closeout.md`](completed-plans/hardware-coverage-closeout.md): the Phase 10 close-out.
 - [`tensix-next-features.md`](completed-plans/tensix-next-features.md): the 2026-10-05 sprint record.

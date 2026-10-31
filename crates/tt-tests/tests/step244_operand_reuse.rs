@@ -1,4 +1,4 @@
-//! Operand reuse across cores (`docs/plans/dataflow-compiler.md` F4b, H1; `tile_op::reuse`): the
+//! Operand reuse across cores (`docs/completed-plans/dataflow-compiler.md` F4b, H1; `tile_op::reuse`): the
 //! units of a blocked product that read the same strip of `A` share its reads. A holder reads it
 //! from GDDR and credits its readers; each reader copies it from the holder's L1 (`op::READ_L1`)
 //! into the slots its own read would fill, credits the holder free, and reads only `B`. With `B`

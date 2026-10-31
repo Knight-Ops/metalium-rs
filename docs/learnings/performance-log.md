@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [F6.0: register fusion and spatial pipelining bounded on the card](#f60-register-fusion-and-spatial-pipelining-bounded-on-the-card-2026-10-31-card-1) | 2026-10-31 | 1.7B decode with the 48 residual adds made free 10.82-10.85 / 12.05-12.07 ms against 10.94-10.99 / 12.14-12.18, the 24 `silu_mul`s adding ~0.02 more: **H10's decode bound 0.10-0.16 ms, its kill fires**; eager training's removable forward ops 1.7-3.2% of a step on the card; the products' tails 296-365 GB/s (not queue-bound), `gate\|up`'s tail slack 465 us a step: H5's bound clears, but with the barriers around `silu_mul` dropped (today's placement) the step is 0.17-0.23 ms slower. Found and fixed: a planned capture of a product half of whose output nothing reads was refused (`step219`) |
 | [The merged tree, and edge credits on Qwen3.5](#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1) | 2026-10-31 | F4a, F5 and Qwen3.5's traced generation on one tree: 1.7B decode 10.93 / 12.14 ms, H1 through Burn 30.6 / 22.5 / 11.4 / 14.3 TFLOPS; Qwen3.5 traced with `TT_EDGE_CREDITS=4` ABBA: decode unchanged (64.2 / 64.7 ms), prefill 1.4% faster, after the credit lowering's check was made linear (it had run past 40 minutes) |
 | [F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules](#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1) | 2026-10-30 | lane A, card 1: idle units' lists pumped and moved before their anchor's arrival 0.24 / 0.17 ms slower (opt-in); kept barriers lowered to per-edge credits, built and checked, +0.03 / +0.06 at fan 4 (opt-in); the handoff, second job and balanced deal not faster, retired; the lists' L1 room not built (a second job read ahead is slower). Close 10.98 / 12.18 ms against A0's 11.01 / 12.16, `Step(64)` 10.55 ms at 341 GB/s: **H4's kill fires** |
 | [F5: `Dst` subblocks and half-sync](#f5-dst-subblocks-and-half-sync-2026-10-30-card-0) | 2026-10-30 | subblocks of up to four FP32 tiles a `Dst` half, math and pack on alternate halves, `A` held in `SrcB`, and the measured blocks re-swept: bit for bit; H1's shapes x five formats 0.96-1.35x (geometric mean **1.12x**, FP32 `B` 1.08x, H1 32.3 -> 34.4 TFLOPS), the kernel alone up to 1.46x, the model shape set 1.12x; H2's 1.4x not met, its kill not fired: a chunk's reload still stops the math role, and an `UnpackToDst` beside `MVMUL`s is wrong on silicon |
@@ -30,7 +31,7 @@ The chronology is the [Change log](#change-log).
 | [Why card-wide reads plateau at 469, and what it means for decode](#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0) | 2026-10-28 | `fast-reads`: the 120-tile read loses ~30 GB/s of steady state to too many requests in flight a channel (knee ~32), ~15 to crossing the chip (each tile on its half's channels: ~505 steady, 495 overall) and the rest to an unfair finish; decode's caps re-swept: lowering any of them slows the step (B's own cap 2: +0.45 ms), the defaults stay; `fast-reads` decode 11.05 / 12.39-12.42 ms against the safe image's 11.38 / 12.55 |
 | [One matmul for every format pair, and BFP weights through the model](#one-matmul-for-every-format-pair-and-bfp-weights-through-the-model-2026-10-28-cards-0-and-1) | 2026-10-28 | F1 closed: one builder for every edge-format pair (F1d), BFP weights from burn-tt (F1c), whole tiles for packed formats (H7: pair cost BFP 14.9 -> **22.4** and 11.7 -> **26.6-29.1 TFLOPS** at HiFi4, bit for bit); the default path unchanged within noise (1.7B BF16 decode 11.25 / 11.89 / 12.64 ms); BFP4 weights decode **10.31 / 10.86 / 11.46 ms**, 1.09x BF16: the 1.5x prediction refuted (a one-row product is unpack/math-bound); a tied BFP head widened at every step (37 ms), fixed |
 | [Packed weights on the block-stream path: what bytes buy](#packed-weights-on-the-block-stream-path-what-bytes-buy-2026-10-28-card-1) | 2026-10-28 | BFP8/4/2 weights on BF16's product path, bit for bit (`step239`, card 1); one-row products take ~400-470 us whatever the weight's bytes in the probe's session (entry-bound, not the decode configuration): the 1.5x prediction not borne out there; at prefill BFP is 14.8 TFLOPS against BF16's 22.3 (face order, fidelity-bound), HiFi3 derived and exact 1.17x; next: whole tiles for packed formats (H7) |
-| [Card-1 baselines for the dataflow compiler, and exact fidelity](#card-1-baselines-for-the-dataflow-compiler-and-exact-fidelity-2026-10-28-card-1) | 2026-10-28 | Stage 0 of `docs/plans/dataflow-compiler.md` on card 1: matmul at prefill shapes, ResNet-18 / ViT-Tiny traced (host 38.45 / 26.77 ms), SmolLM2-135M decode **6.92 / 7.46 / 8.13 ms** and 1.7B **11.20 / 11.83 / 12.62** at the scoreboard's conditions (`TT_SPREAD=work:64:4` makes decode 9.9-11.1 and 18.7-21.4: not the decode condition), MNIST 1.398 / 2.882 / 8.290 ms/step; H3 confirmed: BFP8 at 2 phases and BFP4/BFP2 at 1 equal HiFi4 bit for bit (`step238`, `1793150259`) |
+| [Card-1 baselines for the dataflow compiler, and exact fidelity](#card-1-baselines-for-the-dataflow-compiler-and-exact-fidelity-2026-10-28-card-1) | 2026-10-28 | Stage 0 of `docs/completed-plans/dataflow-compiler.md` on card 1: matmul at prefill shapes, ResNet-18 / ViT-Tiny traced (host 38.45 / 26.77 ms), SmolLM2-135M decode **6.92 / 7.46 / 8.13 ms** and 1.7B **11.20 / 11.83 / 12.62** at the scoreboard's conditions (`TT_SPREAD=work:64:4` makes decode 9.9-11.1 and 18.7-21.4: not the decode condition), MNIST 1.398 / 2.882 / 8.290 ms/step; H3 confirmed: BFP8 at 2 phases and BFP4/BFP2 at 1 equal HiFi4 bit for bit (`step238`, `1793150259`) |
 | [The card's GDDR reads over a decode step](#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0) | 2026-10-27 | the profile mode now sums every unit's issued GDDR reads into the card's rate in eighths of each op's span (`READ_BYTES` marks), held against the card's 512 GB/s peak (not 469): the 1.7B `Step(64)` reads 3,568 MB at 328 GB/s (64%), at 90%+ for only 1.9 of 10.9 ms; every product starts near the peak and ends in a tail (`gate\|up` 634 -> 89 GB/s, `down` 617 -> 68), `down`'s middle half ~300, the small ops 319; the marks cost tile-sized plain reads ~1% in a `profile` image (~4% while a check sat in the list loop) and the decode step nothing |
 | [F27 probed: bank-local reads, and what does not bind a decode product](#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0) | 2026-10-27 | the profile mode counts each op's reads by channel and NoC #0 endpoint (`channels.tsv`): the 1.7B's products read every channel evenly (busiest 1.00 of an even share), one endpoint 1.33x; `gddr_readers_by_channel`: a tile reads 2,112-byte entries at ~6.5 GB/s (safe) or ~35 (`fast-reads`), 1-8 tiles a channel at that size reach 51-425 / 89-466 GB/s, today's decode deal 364-449 / 429-491, long entries 505-510 at 2+ readers a channel: **bank-local reads add nothing**; with reads 5x cheaper a step moves 10.82 -> 10.60 ms (`down` 120.8 -> 114.9 us): **a unit's read rate does not bind a product**; F27 stopped, A2 and A3 not built |
 | [The tt-mnist regression found, and RMSNorm's scale in its op](#the-tt-mnist-regression-found-and-rmsnorms-scale-in-its-op-2026-10-27-cards-0-and-1) | 2026-10-27 | the scoreboard's MNIST and transformer rows were 2026-10-03/04 numbers, MNIST since on a 5.3x larger model; the transformer's 9.2 -> 92 ms/step bisected to `c4255c7` (9.2 -> 22.6) and `6d979e7` (-> 329: the embedding gradient's ~20 ops an index); that gradient as one op, **92.5 -> 10.9 ms/step**, the same losses; cross-entropy's gather and scatter-add as one and a few ops: MNIST 784-128-10 **2.0 -> 1.39 ms/step** (`3344db6` 1.4), the transformer **-> 8.21** (`3344db6` 9.2); tt-mnist in `cargo xtask bench`; RMSNorm's scale inside the norm's op, a 1.7B step **11.31 -> 11.18 ms**; a residual sum and its norm as one op, bit for bit but slower (11.18 -> 11.26), opt-in; a ragged RMS statistic of 18-31 rows at 2048 columns hung (its unrolled programs past a program slot), fixed |
@@ -395,6 +396,79 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## F6.0: register fusion and spatial pipelining bounded on the card (2026-10-31, card 1)
+
+Stage F6 of [the dataflow-compiler plan](../completed-plans/dataflow-compiler.md) opened at `3613d8f`; its two hypotheses (H10,
+register fusion; H5, spatial pipelining) bounded before any build, as F4a.0 bounded H4. Release, safe image, card 1,
+every tile, SmolLM2-1.7B-Instruct with BF16-stored weights, 512-position cache, chunks of 64, 2 warmups and 9 samples,
+host-timed medians.
+
+**Baselines.** `traced_generation`: decode 10.939 / 11.471 / 12.145 ms at 32 / 128 / 256 tokens (`1793422516`).
+`bench_training`: MNIST 784-128-10 1.430 ms/step (burn-flex 0.474), 784-512-256-10 2.935 (2.647), the transformer
+8.440 (3.850) (`1793425995`).
+
+**H10's bound: the consumers made free.** `traced_generation_stream_ceiling` with `TT_PROBE_FREE`
+(`tt_models::llama::probe_free_consumers`: a residual add returns the projection alone, the MLP's hidden state is `up`
+alone; the graph is otherwise whole, so captures, residency plans and prefetches see a consistent model; timing only).
+An earlier form dropped the ops' lists from the capture and broke the residency plan's ownership rules; not kept.
+
+| free | decode step ms, 32 / 256 | run ID |
+|---|---|---|
+| nothing | 10.983 / 12.179 | `1793422516` |
+| the 48 residual adds | 10.845 / 12.074 | `1793423943` |
+| nothing | 10.973 / 12.142 | `1793423541` |
+| adds and the 24 `silu_mul`s | 10.807 / 12.053 | `1793424958` |
+| the 24 `silu_mul`s | 10.937 / 12.203 | `1793425206` |
+| the 48 residual adds | 10.821 / 12.053 | `1793425458` |
+| nothing | 10.985 / 12.184 | `1793425709` |
+
+- Every candidate consumer of a decode product, removed outright, is worth **0.10-0.16 ms** a step (1-1.5%): the adds
+  ~0.14 / 0.10, `silu_mul` ~0.02 more. An epilogue costs its product's slowest unit something, so a built one gains less.
+  H10's decode kill (< 0.3 ms) fires; F6.3's condition ((b) - (a) ≥ 0.15 ms) is not met.
+- Why so little: in the profile below an add spans 8.0 us and `silu_mul` 11.7, and the weight stream runs under both
+  (the card reads 260 / 278 GB/s in their spans, the prefetch's), so removing them mostly moves the stream's reads.
+
+**Eager training** (profile `1793426049`, device spans): the forward ops an epilogue would remove, a step:
+
+| workload | removed a step | device us | of a step |
+|---|---|--:|--:|
+| MNIST 784-128-10 | 2 bias adds (7.9 us), 1 relu (9.0) | 24.8 | 1.7% |
+| MNIST 784-512-256-10 | 3 bias adds (17.6), 2 relus (20.9) | 94.5 | 3.2% |
+| transformer | 8 bias adds (11.1), 1 GELU (169.2) | 257.7 | 3.0% |
+
+Their host cost unprofiled is not measured (the profile mode syncs every op), so these are lower bounds. The training
+bench runs `TtBackend` without fusion, so a burn-fusion epilogue fuser (B13c) would not reach it.
+
+**H5's bound** (profile `1793426212`, `Step(64)`, 10,538.5 us a replay, 341 GB/s on the card): the products read 433
+GB/s over their spans; the card reads 493 381 359 365 370 349 336 296 GB/s by eighth of a product's span, under 90% of
+the 469 our movers reach after the first eighth, so the tails are not GDDR-queue-bound. Tail slack 1,167 us a replay
+over the 96 products; `gate|up`'s 465, `down`'s 395. `own units at work by eighth` 92.0 -> 19.7. H5's kill does not
+fire on either clause; `gate|up`'s 465 us is the overlap `down` could take at most.
+
+**F6.4's first probe: the overlap today's placement takes** (`tt_kernels::barriers::probe_unorder`,
+`TT_PROBE_UNORDER=tt_silu_mul`: the barriers on both sides of each `silu_mul` dropped, so each unit runs from `gate|up`
+into `silu_mul` and `down` as soon as its own work is done; timing only):
+
+| barriers around `silu_mul` | decode step ms, 32 / 256 | run ID |
+|---|---|---|
+| dropped | 11.114 / 12.355 | `1793458026` |
+| kept | 10.930 / 12.127 | `1793458285` |
+| dropped | 11.098 / 12.326 | `1793458542` |
+
+**0.17-0.23 ms slower.** Profile `1793458836`: the weights read ahead are unchanged (1,771 MB a step), so F4a.2's pump
+is not what was lost; the merged `gate|up` + `silu_mul` + `down` run takes 262 us a layer against ~253 for the three
+with their barriers, and the products' rate falls from 433 to 415 GB/s. The units that start `down` early put its reads
+in the queue beside `gate|up`'s slowest units, which then take longer: T8's one-queue effect, as F4a.1's idle lists
+moved early were 0.24 ms slower.
+
+**Found and fixed on the way:** a planned capture (residency, on by default) of a product half of whose output no op
+reads was refused, "captured `matmul gather` breaks the ownership rules: mover error 1". A resident output tile with no
+reader is written nowhere, so a unit whose tiles were all in the unread half had every write of its scatter list
+dropped, and `apply_plan`'s placeholder `WAIT` for such a list landed in NC's writer section, which only writes. The
+writer's credits keep the batch's place, so `streaming_segments` leaves the placeholder out. Gate
+`step219_residency_decode::a_product_half_never_read_is_bit_for_bit` (failing before on ttsim, 12 of 12 after on ttsim
+and card 0, `1793424934`). A fused projection with a part nothing reads, or F6.3's `silu_mul` epilogue, makes that graph.
+
 ## The merged tree, and edge credits on Qwen3.5 (2026-10-31, card 1)
 
 **The merged tree** (`traced-generation` with F4a, F5 and Qwen3.5's traced generation, `84f45fe` / `a12dc1e` /
@@ -433,7 +507,7 @@ samples, host-timed medians.
 
 ## F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules (2026-10-30, card 1)
 
-Lane A of the F4a/F5 split ([plan](../plans/dataflow-compiler.md) F4a, H4 in the
+Lane A of the F4a/F5 split ([plan](../completed-plans/dataflow-compiler.md) F4a, H4 in the
 [Bible](dataflow-compiler.md#13-hypotheses-register)), branch `f4a-channels` from `715ef1b`. SmolLM2-1.7B-Instruct,
 BF16 weights, `TT_TILES=all`, release, safe image, card 1 (shared with two other agents; every model-scale run under
 the host-memory lock), `silicon_bench_models::traced_generation_stream_ceiling` (2 warmups, 9 samples, medians);
@@ -478,7 +552,7 @@ unchanged (`1793393729`); `step260` / `step261` 3 of 3 with A0's figures digit f
 
 ## F5: `Dst` subblocks and half-sync (2026-10-30, card 0)
 
-[Plan](../plans/dataflow-compiler.md) F5, H2. The blocked product's kernel holds up to four FP32 output tiles a half of
+[Plan](../completed-plans/dataflow-compiler.md) F5, H2. The blocked product's kernel holds up to four FP32 output tiles a half of
 `Dst`, the math role in one half while the pack role drains the other, `A`'s tile held in `SrcB` across a subblock
 (`tile_op::dst`, `matmul::block_stream_kernel_subblocked`, the default; `TT_DST_SUBBLOCKS=0` off), and the measured
 blocks re-swept for it. Bit for bit the one-tile kernel (`step246`). All on card 0, release, every tile, HiFi4.
@@ -596,7 +670,7 @@ its op count (not located: ptrace and perf are not permitted on this host).
 
 ## F4a.0: what overlap can buy a decode step; the tails split by unit (2026-10-29, card 1)
 
-H4 ([Bible §13](dataflow-compiler.md#13-hypotheses-register), [plan](../plans/dataflow-compiler.md) F4a): with
+H4 ([Bible §13](dataflow-compiler.md#13-hypotheses-register), [plan](../completed-plans/dataflow-compiler.md) F4a): with
 per-edge credits and data-independent reads started as units free up, the 1.7B decode step reads ≥ 400 GB/s and takes
 ≤ 9.5 ms on the card (from 328 and 10.9). Sparse waits alone had been measured at 0.070 ms
 ([which barriers a decode step needs](#which-barriers-a-decode-step-needs-2026-10-26-card-0)), so F4a opened by
@@ -664,7 +738,7 @@ outputs written into their readers' L1 above `DATA`), above the ring's base but 
 
 ## F4b.2: a block measured on the card, `A` pulled where it gains (2026-10-29, card 1)
 
-H9 ([Bible §13](dataflow-compiler.md#13-hypotheses-register), [plan](../plans/dataflow-compiler.md) F4b.2): D5 left the
+H9 ([Bible §13](dataflow-compiler.md#13-hypotheses-register), [plan](../completed-plans/dataflow-compiler.md) F4b.2): D5 left the
 block and the pull shape-dependent, and the re-weighed model refuted, so the block is chosen by timing candidates on the
 card. **The default since (2026-10-29):** `TT_MATMUL_BLOCK` unset is `measured`, `TT_OPERAND_REUSE` unset is `auto`.
 
@@ -777,7 +851,7 @@ then eager) eager does not slow. Not found; the model workloads above do not sho
 
 ## D5 decided: `A` pulled from a few holders; a packed `B`'s block is the next lever (2026-10-29, card 1)
 
-F4b.1's schemes side by side ([plan](../plans/dataflow-compiler.md), "Decide D5"), through the session
+F4b.1's schemes side by side ([plan](../completed-plans/dataflow-compiler.md), "Decide D5"), through the session
 (`silicon_probe_pair_cost::pair_cost`, HiFi4, traced replay, median of 7, every product checked against exact
 integer arithmetic, every run PASS). `TT_OPERAND_REUSE` is read when the session opens, so each scheme runs every `B`
 format. TFLOPS:
@@ -835,7 +909,7 @@ serving seven copies of a 72 KiB strip a chunk. The flag was retired: firmware, 
 
 ## F4b.1: larger GDDR blocks; the planner's block, not reads, binds a packed `B` (2026-10-29, card 1)
 
-The third of D5's options ([plan](../plans/dataflow-compiler.md) F4b.1): each operand re-read from GDDR fewer times
+The third of D5's options ([plan](../completed-plans/dataflow-compiler.md) F4b.1): each operand re-read from GDDR fewer times
 by a larger block, no code. `TT_MATMUL_BLOCK=mb,kq,nb` at H1's shape `[2048,2048]@[2048,16384]` (64 x 64 x 512 tiles).
 
 **FP32 `B` through Burn** (`matmul_throughput`, `1793237539`-`1793237622`): the planner's `[8,2,9]` (19.10 TFLOPS, 2,062
@@ -897,7 +971,7 @@ the winner cached, which costs build time, not step time.
 
 ## F4b.1: `B` pulled too, the reads clause met and the rate lost (2026-10-29, cards 0 and 1)
 
-The second scheme of D5 ([plan](../plans/dataflow-compiler.md) F4b.1): `A`'s pull, and `B` shared along the
+The second scheme of D5 ([plan](../completed-plans/dataflow-compiler.md) F4b.1): `A`'s pull, and `B` shared along the
 other axis. The row groups are one size (the units past them run nothing), so member `m` of every group takes the
 same column blocks in the same rounds; the members `m` are a column group, and its first members hold `B`'s strips
 (`distribute::Shared::b_holder_of`). A gather that copies `B` is marked `record::GATHER_B_RESIDENT` (bit 2, the retired
@@ -976,7 +1050,7 @@ holder's. Then H1's product on every tile is the unshared one bit for bit (13,56
 
 ## F4b.0: what operand reuse can buy, the reads-free ceiling at prefill shapes (2026-10-28, card 1)
 
-Stage F4b of [dataflow-compiler.md](../plans/dataflow-compiler.md) opens with its baseline at `f60b228`. H1's prediction
+Stage F4b of [dataflow-compiler.md](../completed-plans/dataflow-compiler.md) opens with its baseline at `f60b228`. H1's prediction
 (`[2048,2048]@[2048,16384]` from 18.2 to ≥ 35 TFLOPS) used a card-0 number from before P4, and the only reads-free
 ceiling measured was at 1,024 rows. The owner chose to measure that ceiling at H1's own shape first, and to restate the
 prediction against it before anything is built.
@@ -1035,7 +1109,7 @@ differently there.
 
 ## F3: the tile-generic op, pointwise and reduction ported, before and after (2026-10-28, cards 0 and 1)
 
-Stage F3 of [dataflow-compiler.md](../plans/dataflow-compiler.md). The pointwise SFPU family (`tile_op::eltwise`,
+Stage F3 of [dataflow-compiler.md](../completed-plans/dataflow-compiler.md). The pointwise SFPU family (`tile_op::eltwise`,
 `33d3562`) and the reduction (`tile_op::reduce`, `0bfb79e`) are built through `TileOp`, and their old builders are
 deleted. Both reproduce their job goldens word for word (`tile_op::golden`, `050cbbd`), so their device work is
 unchanged by construction; what the port can change is the host's time to build the jobs.
@@ -1117,7 +1191,7 @@ profile can come out unbalanced. The sweep now falls back to host time there, as
 
 ## A cross-core credit against the barrier (H8) (2026-10-28, card 1)
 
-F2 of [dataflow-compiler.md](../plans/dataflow-compiler.md): what a channel's credit (`op::CREDIT`, a NoC atomic
+F2 of [dataflow-compiler.md](../completed-plans/dataflow-compiler.md): what a channel's credit (`op::CREDIT`, a NoC atomic
 increment after the mover's own requests have completed, and `op::WAIT_CREDIT`, a fenced local poll) costs against the
 op barrier, on the same two units. `cargo xtask bench --device 1 --filter silicon_bench_channel_credit`, run
 `1793200301` at `22bf51f` plus the bench (`2f29d9f`), release, AICLK 1,350 MHz, one warm-up and nine samples.
@@ -1200,7 +1274,7 @@ From 16 tiles up the same within noise; at 4 tiles the packet's credit handoff a
 
 ## One matmul for every format pair, and BFP weights through the model (2026-10-28, cards 0 and 1)
 
-F1 of [dataflow-compiler.md](../plans/dataflow-compiler.md), closed: one matmul builder whose operand formats are edge
+F1 of [dataflow-compiler.md](../completed-plans/dataflow-compiler.md), closed: one matmul builder whose operand formats are edge
 data (F1d), BFP weights routed from burn-tt (F1c), and whole tiles for packed formats (H7). Every gate ran on card 0. The
 benches ran on card 1, the same set before (`aa04c20`) and after (`28ed325`; the BFP decode rows at `7daa887`), release,
 validated output, warmups, medians.
@@ -1248,7 +1322,7 @@ step was 296-329 ms in both sets.
 
 ## Card-1 baselines for the dataflow compiler, and exact fidelity (2026-10-28, card 1)
 
-Stage 0 of [dataflow-compiler.md](../plans/dataflow-compiler.md): the numbers its stages are held to, on card 1 (the
+Stage 0 of [dataflow-compiler.md](../completed-plans/dataflow-compiler.md): the numbers its stages are held to, on card 1 (the
 owner's card for this work), release, at `4f545b2`-`b9ba4c2` (format plumbing that changes no product's bits, gated
 bit-for-bit on ttsim and card 1 before the runs it shares).
 
@@ -1274,7 +1348,7 @@ reloads. BFP8 at 1 phase differs (the control).
 
 ## Packed weights on the block-stream path: what bytes buy (2026-10-28, card 1)
 
-F1c of [dataflow-compiler.md](../plans/dataflow-compiler.md) puts a BFP8/4/2 weight on the product path a BF16 weight
+F1c of [dataflow-compiler.md](../completed-plans/dataflow-compiler.md) puts a BFP8/4/2 weight on the product path a BF16 weight
 takes (`SrcRoute::Tf32WithB`). Gate `step239_packed_weight_products` passes on ttsim and card 1 (`1793152118`): eight
 product paths for each format, bit for bit the FP32 product of the decoded values, and TF32 beside BFP at the derived phase
 count (three) equal to HiFi4. That is H3 for mixed pairs.

@@ -358,7 +358,7 @@ pack/unpack works. The BFP2 matrix arm is silicon-only and passes both cards
 (`1791299490`), including ragged shapes and K accumulator reloads.
 
 **Also a BFP2 weight beside TF32 (2026-10-28).** Since burn-tt reads a stored weight where it lies
-(`SrcRoute::Tf32WithB`, `docs/plans/dataflow-compiler.md` F1c), a BFP2 weight times an F32
+(`SrcRoute::Tf32WithB`, `docs/completed-plans/dataflow-compiler.md` F1c), a BFP2 weight times an F32
 activation is `tensix_matmul_op: bf16 src_a_fmt=15 src_b_fmt=4` on ttsim (it was widened to F32
 before). Since F1d (one product for every pair of edge formats) the same holds for a BFP2 activation
 or a mixed BFP pair (`src_a_fmt=6 src_b_fmt=15`, `src_a_fmt=15 src_b_fmt=7`), which were widened.

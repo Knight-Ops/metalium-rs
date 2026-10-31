@@ -1,7 +1,7 @@
 # The Dataflow Compiler: Design Principles
 
 **Crates:** `tt-isa`, `tt-kernels`, `tt-firmware`, `burn-tt`
-**Classification:** Tier 1. A living architecture document, the reference that every optimization below Burn builds on. Its binding decisions are ADRs [0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md), [0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and [0005](../adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md). The staged work is in [the plan](../plans/dataflow-compiler.md).
+**Classification:** Tier 1. A living architecture document, the reference that every optimization below Burn builds on. Its binding decisions are ADRs [0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md), [0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and [0005](../adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md). The staged work is in [the plan](../completed-plans/dataflow-compiler.md).
 **Hardware target:** Blackhole A0, 120 Tensix tiles a card on ours (12 of 14 columns).
 **Written:** 2026-10-28. Card numbers are from card 0 unless a run says otherwise.
 
@@ -492,7 +492,7 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     At LoFi, where the face order was not fidelity-bound, the first shape gains 10% and the second is unchanged. BFP
     weights now run at BF16's rate or above at HiFi4, so the prediction holds.
 - **F1's decode prediction. Refuted, 2026-10-28.** A BFP4-weight product beats BF16 at decode shapes in proportion to
-  its bytes, ≥1.5× at m = 1 ([plan](../plans/dataflow-compiler.md) F1).
+  its bytes, ≥1.5× at m = 1 ([plan](../completed-plans/dataflow-compiler.md) F1).
   - *Result:* through the model's own traced decode (burn-tt routing a BFP weight to the block-stream path, F1c), a 1.7B
     step is 1.09× faster with BFP4 weights than BF16 (10.31 against 11.25 ms at a 32-token prompt, card 1 `1793175898`).
     The products' card time falls 7.64 -> 6.45 ms while reading only 145 GB/s; the slowest unit's math role spends 5.7
@@ -532,8 +532,48 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     the 5,688-op prefill chunk 1.4% faster, bit for bit
     ([log](performance-log.md#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1)).
 - **H5 Spatial pipelining.** Running a layer's ops on disjoint core sets at once beats running them one after another for decode at batch 1.
-  - *Prediction:* none until H4 has run.
-  - *Kills it:* H4's tails turn out to be GDDR-queue-bound.
+  - *Prediction:* none until H4 has run. H4 has run (its kill fired: the tails are the products' slowest units), so
+    F6.0 writes it from a bound before any build: the overlap a step has to give, `gate|up`'s tail and `down`'s head a
+    layer (the units of `down` could start its first `K` chunks while `gate|up`'s last columns land), times 24 layers.
+  - *Measured by:* the profile's `tails.tsv` and `channels.tsv` on card 1 for the bound; host-timed 1.7B steps, ABBA,
+    for the build.
+  - *Kills it:* H4's tails turn out to be GDDR-queue-bound: their aggregate read rate ≥ 90% of the 469 GB/s our movers
+    reach. Or the overlap a step has to give is < 0.3 ms (H4's threshold).
+  - *Opened 2026-10-31 at `3613d8f`* (F6).
+  - *F6.0 (2026-10-31, card 1): the kill does not fire.* Profile `1793426212`: the card reads 493 381 359 365 370 349
+    336 296 GB/s by eighth of a product's span, under 90% of 469 after the first eighth, so the tails are not
+    GDDR-queue-bound; `gate|up`'s tail slack is 465 us a step (24 layers), `down`'s 395, all products' 1,167. The
+    prediction: overlapping `down`'s first `K` chunks with `gate|up`'s tail saves at most 0.47 ms, and the step
+    falls by ≥ 0.25 ms (to ≤ 10.7 ms at 32 tokens), bit-exact. `down` reads `silu(gate) * up`, so its pipeline carries
+    `silu_mul` too.
+  - *F6.4's first probe (2026-10-31, card 1): overlap with today's placement loses.* With the barriers on both sides
+    of each `silu_mul` dropped (timing only), each unit runs on into `down` as soon as its own work is done: the step
+    is 0.17-0.23 ms *slower* (11.11 / 12.34 against 10.93 / 12.13 ms, ABA), the weights read ahead unchanged, the
+    products' rate 433 -> 415 GB/s. Early `down` reads slow `gate|up`'s slowest units (T8). The tail's unused capacity
+    is not capacity those units can be given by adding reads beside them; a disjoint core set for `down` would add the
+    same reads.
+  - *Result (2026-10-31): killed by measurement, not built* (owner's decision on F6.4a's probe). Spatial
+    pipelining at batch-1 decode adds reads beside the slowest units, which bound each product.
+- **H10 Register fusion** (F6, opened 2026-10-31 at `3613d8f`). A product's consumer applied in `Dst` before the pack
+  (X5a) removes the consumer's op, its barrier and its round trip through L1 or GDDR, bit for bit under X5's rounding
+  rule. The consumers: a bias row, a residual tile, an activation, and `silu(gate) * up` over a fused projection's
+  column pair.
+  - *Claim:* the epilogue costs the product's slowest unit less than the op it removes, so a 1.7B decode step and an
+    eager training step both get shorter by about what the removed ops cost inside them.
+  - *Prediction:* written by F6.0 from the step with the candidate consumers made free (their lists dropped, timing
+    only): (a) the 48 residual adds after `o` and `down`, (b) those and the 24 `silu_mul`s. A removed small op is
+    worth ~2.5 us inside the step (T10) and an add with its barrier ~12 us, so the bound lies near 0.12-0.6 ms.
+  - *Measured by:* host-timed 1.7B steps and `bench_training` on card 1, ABBA against F6.0's baseline; job counts a
+    step.
+  - *Kills it (before the build):* the decode bound < 0.3 ms and the training bound < 5% of a step. *After the
+    build:* the step moves less than half its bound, or the products lose what the removed ops gave.
+  - *F6.0 (2026-10-31, card 1; [log](performance-log.md#f60-register-fusion-and-spatial-pipelining-bounded-on-the-card-2026-10-31-card-1)):
+    the kill fires.* The 1.7B step with every candidate removed outright: the 48 residual adds 0.10-0.14 ms, with the
+    24 `silu_mul`s 0.11-0.18 ms (10.81 / 12.05 against 10.94-10.99 / 12.14-12.18 ms), below 0.3. The weight stream runs
+    under those ops, so removing them mostly moves its reads. Eager training's forward bias adds and activations are
+    1.7-3.2% of a step on the card (their unprofiled host cost unmeasured), and the training bench runs `TtBackend`,
+    which a burn-fusion fuser would not reach. F6.1-F6.3 are not built on this evidence. B13c stays open in
+    [kernel-fusion.md](../plans/kernel-fusion.md) for models whose consumers do not hide under a stream.
 - **H6 Generic ops** (F3, opened 2026-10-28). The L1 description covers matmul, the 121 pointwise SFPU kinds and a row reduction with no transform code specific to any of them.
   - *Prediction:*
     - the passes (distribute, block, allocate, channels, roles, lower) contain no line that names a client; only the

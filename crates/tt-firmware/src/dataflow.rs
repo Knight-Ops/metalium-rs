@@ -164,7 +164,7 @@ pub fn credit(address: u64, target: u32, actor: u32) -> Result<(), u32> {
 
 /// [`credit`], calling `turn` once each poll that finds the word short: RISCV B issues its queued
 /// prefetch's reads there, as in a barrier's wait (an edge credit stands where a barrier was,
-/// `docs/plans/dataflow-compiler.md` F4a.1).
+/// `docs/completed-plans/dataflow-compiler.md` F4a.1).
 #[inline(always)]
 pub fn credit_with(
     address: u64,

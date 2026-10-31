@@ -1,7 +1,7 @@
 //! A model whose weights are stored in a block-floating-point format
 //! (`Llama::with_stored_weights`: BFP8, BFP4 or BFP2, a quarter to a sixteenth of F32's bytes)
 //! generates, traced and eager, the tokens and logits of the F32 model whose weights hold the
-//! values that storage decodes to, **bit for bit** (`docs/plans/dataflow-compiler.md` F1c: a
+//! values that storage decodes to, **bit for bit** (`docs/completed-plans/dataflow-compiler.md` F1c: a
 //! packed weight is a product's `B` edge, read where it lies, `SrcRoute::Tf32WithB`). The generic
 //! form of `step234`, whose BF16 weights are one stored format.
 //!

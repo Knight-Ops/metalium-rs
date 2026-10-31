@@ -1,4 +1,4 @@
-//! A measured block choice (`docs/plans/dataflow-compiler.md` F4b.2, H9;
+//! A measured block choice (`docs/completed-plans/dataflow-compiler.md` F4b.2, H9;
 //! `tensor::BlockStream::Measured`): the first time a product's question is planned
 //! (`tensor::BlockQuestion`), the session times its candidates (`tensor::block_stream_candidates`:
 //! `Auto`'s block, unpulled and pulled, and the blocks measured fastest at prefill shapes), climbs

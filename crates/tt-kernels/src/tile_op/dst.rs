@@ -1,4 +1,4 @@
-//! The `Dst` tiling pass (`docs/plans/dataflow-compiler.md` F5, H2; the G4 sketch in
+//! The `Dst` tiling pass (`docs/completed-plans/dataflow-compiler.md` F5, H2; the G4 sketch in
 //! `docs/learnings/tt-metal-concepts-review.md`): how a block's output tiles are held in `Dst` while
 //! their `K` chains accumulate, and how the math and pack roles hand `Dst` over.
 //!

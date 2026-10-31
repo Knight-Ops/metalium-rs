@@ -1,6 +1,6 @@
 # Plan: the dataflow compiler, staged
 
-**Status:** approved and scheduled 2026-10-28 (owner). Its design principles are in
+**Status:** complete 2026-10-31 (stages F1-F6 closed); approved and scheduled 2026-10-28 (owner). Its design principles are in
 [dataflow-compiler.md](../learnings/dataflow-compiler.md) (the Bible), and its binding decisions in ADRs
 [0003](../adr/0003-a-tile-level-dataflow-compiler-below-burn.md),
 [0004](../adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md) and
@@ -495,7 +495,7 @@ eager product's 3-10% host time after a pulled capture.
 ## Stage F4a (decode): channels instead of barriers, H4
 
 **Opened 2026-10-29 at `9977ad8`.** Sparse waits alone were measured as worth 0.070 ms on the 1.7B
-([decode-small-ops.md](decode-small-ops.md) A0, A2 not built): a product's consumers need most of its units, so the time
+([decode-small-ops.md](../plans/decode-small-ops.md) A0, A2 not built): a product's consumers need most of its units, so the time
 at its barrier is its slowest unit's work (T10). H4's gain has to come from overlap, units that leave a product early
 reading the next product's weights in its tail, so the stage bounds that before building anything (owner, 2026-10-29).
 If the bound fires the kill, H4 is refuted, the three schedules below stay opt-in, and the stage stops.
@@ -692,12 +692,90 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
 `step245`'s restated claim at `68a0463`): the 1.7B decode step 10.93 / 12.14 ms (card 1, `1793396168`; F5's kernel
 adds nothing measurable to F4a's schedule, the step being bound by its weights' reads), H1 through Burn 30.6 / 22.5 /
 11.4 / 14.3 TFLOPS (card 1, `1793396429`); `--smoke` 1,265 of 1,265 on card 0 (`1793397733`); `step260`-`step263` by
-name pass, the models' figures unchanged ([new-architectures.md](new-architectures.md)). F6 opens on this tree.
+name pass, the models' figures unchanged ([new-architectures.md](../plans/new-architectures.md)). F6 opens on this tree.
 
-## Stage F6 (gated on F4a and F5): fusion through channels and spatial pipelining, H5
+## Stage F6 (gated on F4a and F5): fusion through channels and spatial pipelining, H5 and H10
 
-- [ ] Fusion through channels: register epilogues and prologues that replay every narrowing rounding (Bible X5), the B13c matmul epilogue fuser, and fusion of L1 and cross-core channels.
-- [ ] Spatial pipelining of a decode layer on disjoint core sets, only if H4's tails are not GDDR-queue-bound.
+Opened 2026-10-31 at `3613d8f`, the merged F4a/F5 tree. H4's verdict leaves per-unit work balance and the ops between
+products as the levers. Two hypotheses (Bible §13): **H10**, register fusion (a product's consumer applied in `Dst`
+before the pack, X5a), and **H5**, spatial pipelining (`down` consuming `gate|up` through a cross-core channel on a
+disjoint core set). Each is bounded on the card before it is built, and its kill applied to that bound first, as F4a.0
+did.
+
+What exists to build on:
+- the only epilogue is a reduction's exact `then` (`tensor::finishing`);
+- no burn-fusion fuser takes a `Matmul` (the bias `Add` opens `add_relu`'s block);
+- `l1::Requirements::fuse` has no production caller;
+- every op runs on units `0..k`;
+- a product's `SCATTER` already writes into its readers' L1 (residency Phase 3, X5c's write side).
+
+- [x] **F6.0, open the stage (card 1, measure and bound before any build).** Done 2026-10-31
+  ([log](../learnings/performance-log.md#f60-register-fusion-and-spatial-pipelining-bounded-on-the-card-2026-10-31-card-1)):
+  **H10's kill fires** (decode bound 0.10-0.16 ms; training 1.7-3.2% on the card), **H5's does not** (tails 296-365
+  GB/s, `gate|up`'s tail slack 465 us a step). No `Cast` between a decode product and its add (BF16-stored weights).
+  Found and fixed: a planned capture of a product half of whose output nothing reads was refused (`step219`).
+  - Baselines at `3613d8f`: the 1.7B decode (`traced_generation`, 32 / 256 tokens, and a profile), `bench_training`,
+    `qwen35_traced_generation` (information).
+  - H10's bound: the 1.7B step with the candidate consumers made free (their lists dropped, timing only), (a) the 48
+    residual adds after `o` and `down`, (b) those and the 24 `silu_mul`s; for eager training, the jobs a step that
+    matmul + bias (+ relu) as one job saves, priced from the profile.
+  - H5's bound: the tails' aggregate read rate against 469 GB/s (`tails.tsv`, `channels.tsv`), and the overlap
+    `gate|up`'s tail and `down`'s head give a layer.
+  - Check that a BF16-stored weight puts no `Cast` between a decode `Matmul` and its residual `Add` in the IR.
+  - *Kill before the build:* H10's decode bound < 0.3 ms and its training bound < 5% (then F6.1-F6.3 are not built);
+    H5's tails ≥ 90% of 469 GB/s or its overlap < 0.3 ms (then F6.4 is not built).
+- [-] **F6.1, the register epilogue in the contraction lowering** (H10's mechanism; ttsim, then card 0). Not built:
+  H10's kill fired at F6.0.
+  - An `Epilogue` on the matmul `TileOp`: an optional third operand (a bias row, `rows: Fixed`, or a residual tile),
+    SFPU kinds, the result's edge `TileFormat`. It enters `Mma`'s memo shape and the program keys; its operand's slot
+    enters `Mma::needs` and the contraction's gathers.
+  - `Chunk::last`, the chain's final chunk (the chunk order can be reversed); the epilogue runs on it alone.
+  - The math role: after the last `MVMUL` of an output or subblock, wait for the matrix unit, run the SFPU program on
+    the output's `Dst` rows, post `ready` after the SFPU. Three sites: the single-output kernel, the looped block, the
+    subblocked half-sync kernel. Row loops unrolled (the replay buffer holds the `MVMUL` unit; `.ttinsn` depth ≤ 2);
+    staged kinds refused (their rows overlap section 1).
+  - The unpack role: the operand to `Dst` by `UnpackToDst`, only after the math role hands the half over (never beside
+    running `MVMUL`s, F5's finding); a subblock with no free row refuses an operand or narrows.
+  - X5's rounding rule: a fused intermediate is rounded in place to the edge format the unfused graph packed it to.
+    FP32 needs nothing; BF16 and FP16 by the SFPU's exact narrowing, through `TileFormat` so the epilogue names no
+    format; BFP refused by name (no SFPU replay of the packer's rounding exists).
+  - A residual is `(Σ terms) + R`, an SFPU `ADD` after the last term, never a reloaded prior.
+  - Oracle: `matmul_order` models the epilogue as an event after the last term and before the pack; values against
+    `sfpu::ops::reference_op`. Every job golden unchanged without an epilogue; new pinned cases with one.
+  - Gate `step266_matmul_epilogue`: every schedule × {bias + relu, residual, silu, a BF16 edge} bit for bit the product
+    and then the op, with the special values, ragged shapes, reversed chunks and a replay; negative controls (the
+    epilogue on a non-last chunk, a residual as a prior, the rounding skipped) fail on ttsim and card 0. `SMOKE` entry.
+- [-] **F6.2, routing**, each route measured against its F6.0 bound. Not built: H10's kill fired at F6.0.
+  - `MatmulEpilogueFuser` (B13c) on `Fusion<TtBackend>`: `Matmul`, then an `Add` of a row or a same-shape tensor, then
+    an optional activation; `ChainFuser`'s rules (longest complete match, scalars bound at execution, `run_unfused`).
+    `add_relu`'s block stays when it does not match (`step12_mnist`'s counts).
+  - Decode on `Tt`: `o` + add and `down` + add, the residual a reader of its resident slot in the residency plan.
+  - Training: MNIST's and the transformer's biased linears.
+  - Default only where the prediction holds, bit for bit; otherwise opt-in (`TT_MATMUL_EPILOGUE`) or retired, with run
+    IDs.
+- [-] **F6.3, `silu(gate) * up` in `gate|up`'s epilogue** (only if F6.0's (b) - (a) ≥ 0.15 ms; it was ~0.02, not built): a column pair (`gate`'s
+  tile `j`, `up`'s `j + ff/32`) dealt to one job as a constraint of the deal, not a model's relayout; one `SILU_MUL`
+  tile packed.
+- [x] **F6.4a, the overlap today's placement takes** (2026-10-31, card 1, `tt_kernels::barriers::probe_unorder`): the
+  barriers around each `silu_mul` dropped, timing only: **0.17-0.23 ms slower** (`1793458026`, `1793458285`,
+  `1793458542`; profile `1793458836`: read-ahead unchanged, products 433 -> 415 GB/s). Early `down` reads slow
+  `gate|up`'s slowest units (T8).
+- [-] **F6.4, H5: `down` consuming `gate|up` through a cross-core channel** (not built: F6.4a's probe, owner's
+  decision 2026-10-31) (only if F6.0's H5 bound clears): `down`
+  on a core set disjoint from `gate|up`'s (a placement range beside `Spread`'s count), waiting per `K` chunk on a
+  `channel::Ring` credited as `gate|up`'s columns land, checked by `Graph::check`; chunks in increasing `k`, so bit for
+  bit. Gate `step267`; ttsim if it takes the credits, else silicon-only with a divergence entry.
+- [x] **F6.5, close** (2026-10-31): verdicts in §13, the roadmap, `kernel-fusion.md` (B13c) and the log. No
+  arithmetic or schedule changed; the residency fix's gate is `step219` (card 0 `1793424934`).
+- **Prediction:** set by F6.0's bounds (H10, H5). **Kill:** both bounds below their thresholds, or a built step
+  moving less than half its bound.
+- **Result (2026-10-31, card 1): both killed, nothing built.** H10's bound is 0.10-0.16 ms a 1.7B step (every
+  residual add and `silu_mul` removed outright) and 1.7-3.2% of an eager training step on the card. H5's bound
+  cleared (the tails are not GDDR-queue-bound, `gate|up`'s leave 465 us a step), but the overlap probe made the step
+  0.17-0.23 ms slower: reads issued beside a product's slowest units slow them (T8). With F4a's and F5's, the
+  evidence is that a 1.7B decode step is bound by the slowest units of its products and by GDDR as one queue, not by
+  barriers, small ops or idle capacity. **The plan is complete**: every stage is closed; F4b's leftovers are carried in
+  the roadmap.
 
 ## Not in scope
 

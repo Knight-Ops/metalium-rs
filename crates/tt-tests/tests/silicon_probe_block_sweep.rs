@@ -1,5 +1,5 @@
 //! The time of every block on a coarse grid, with and without `A` pulled, for a blocked prefill
-//! product and each `B` format (`docs/plans/dataflow-compiler.md` F4b.2, H9): the landscape a
+//! product and each `B` format (`docs/completed-plans/dataflow-compiler.md` F4b.2, H9): the landscape a
 //! measured block choice (`tensor::BlockStream::Measured`) picks from, so its candidates
 //! (`tensor::block_stream_candidates`) can be judged against the best there is, not against the
 //! model that proposes them.

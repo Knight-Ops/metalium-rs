@@ -14,6 +14,8 @@
 //!   read is refused by `Plan::check`, and, applied anyway, gives other bits than the ops run fresh.
 //! - **Never-read writes dropped** (2g): the tensors the step makes and never reads are written
 //!   nowhere, bit for bit, fewer GDDR bytes written; a plan dropping a read tensor is refused.
+//! - **A product half never read:** a resident product's output tiles that no op reads are written
+//!   nowhere; a unit that made only those writes nothing, and the planned trace is bit for bit.
 //! - **A row read whole, held by two of its readers** (2f, `Rows::Held(2)`): a multiply's packed
 //!   twin, read by the one-row product on each of its units, is held by two of them; the planned
 //!   trace equals the ops run fresh bit for bit and moves fewer GDDR bytes. A reader sent to a unit
@@ -833,6 +835,73 @@ fn a_cached_plan_is_applied_once_and_forgotten_for_another_graph() {
             s.release_trace(id).unwrap();
         }
         for t in [out, planned_out, cached_out, other, x, a, gamma] {
+            s.free(t).unwrap();
+        }
+    });
+}
+
+/// `into_product`'s product, then only its right half read (`p[:, K/2..] + p[:, K/2..]`): what a
+/// fused projection leaves when one of its parts is never read.
+fn half_read<T: tt_device::Transport>(
+    s: &mut Session<T>,
+    x: &DramTensor,
+    a: &DramTensor,
+    gamma: &DramTensor,
+    w: &DramTensor,
+) -> DramTensor {
+    use tt_kernels::kind;
+    use tt_kernels::tensor::BlockOperand;
+    let p = into_product(s, x, a, gamma, w);
+    let right = BlockOperand {
+        tensor: &p,
+        at: [0, K / 2],
+        dims: [1, K / 2],
+    };
+    let out = s
+        .eltwise_blocks(op(kind::ADD), right, Some(right), None)
+        .unwrap();
+    s.free(p).unwrap();
+    out
+}
+
+/// A resident product's output tile that no op reads is written nowhere, so a unit whose output
+/// tiles are all in the unread half writes nothing: its streamed pair's writer section keeps only
+/// its credits, and the planned trace equals the ops run fresh, bit for bit. Found by F6.0's
+/// probe (`docs/completed-plans/dataflow-compiler.md`), where such a unit's scatter left `apply_plan`'s
+/// `WAIT` in NC's writer section and the capture was refused ("breaks the ownership rules").
+#[test]
+fn a_product_half_never_read_is_bit_for_bit() {
+    with_session(|s| {
+        let seeds = [70u64, 71, 72];
+        let a = s.upload(&values(2, K), 1, K).unwrap();
+        let gamma = s.upload(&values(3, K), 1, K).unwrap();
+        let w = s.upload(&values(4, K * K), K, K).unwrap();
+        let x = s.upload(&values(seeds[0], K), 1, K).unwrap();
+        let mut fresh = Vec::new();
+        for &seed in &seeds {
+            s.write(&x, &values(seed, K)).unwrap();
+            let out = half_read(s, &x, &a, &gamma, &w);
+            fresh.push(bits(&s.download(&out).unwrap()));
+            s.free(out).unwrap();
+        }
+        s.set_residency(tt_kernels::session::RESIDENCY_REGION);
+        s.write(&x, &values(seeds[0], K)).unwrap();
+        s.begin_trace_plan_pass().unwrap();
+        let out = half_read(s, &x, &a, &gamma, &w);
+        let plain = s.end_trace().unwrap();
+        let mut resident = 0;
+        assert!(s.probe_mutate_plan(|g, plan| resident = product_outputs(g, plan).len()));
+        assert_eq!(resident, 1, "the product's output is resident");
+        s.write(&x, &values(seeds[0], K)).unwrap();
+        assert!(s.begin_trace_planned().unwrap());
+        let planned_out = half_read(s, &x, &a, &gamma, &w);
+        let planned = s.end_trace().unwrap();
+        let (got, _) = run_trace(s, planned, &x, &planned_out, &seeds);
+        assert_eq!(got, fresh, "the planned trace");
+        for id in [plain, planned] {
+            s.release_trace(id).unwrap();
+        }
+        for t in [out, planned_out, x, a, gamma, w] {
             s.free(t).unwrap();
         }
     });

@@ -41,7 +41,7 @@ pub const GATHER: u32 = 0x10;
 /// another unit's L1 first, `tt_kernels::tile_op::reuse`). With [`GATHER_A_RESIDENT`] the record
 /// reads nothing. Not with [`GATHER_PREFETCH`] or [`GATHER_STREAM`], whose reads are `B`'s.
 /// Bit 2 was packed BF16 with its ragged lanes filled on the card, retired when any pair of edge
-/// formats became one product (`docs/plans/dataflow-compiler.md` F1d).
+/// formats became one product (`docs/completed-plans/dataflow-compiler.md` F1d).
 pub const GATHER_B_RESIDENT: u32 = 1 << 2;
 /// [`GATHER`]'s flag for a block whose `A` is already in its slots: the same
 /// unit's previous gather of the op read the same `A` block to the same `a_at`,

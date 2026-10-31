@@ -1,7 +1,7 @@
 //! The tile-generic op (L1 of `docs/learnings/dataflow-compiler.md` §5): an op described by its
 //! iteration domain, its operands' tile maps and edges, a body of microkernel calls and its
 //! numeric contract, so that distribution, blocking, allocation, channels, the role split and
-//! lowering are written once for every op (Stage F3 of `docs/plans/dataflow-compiler.md`, H6).
+//! lowering are written once for every op (Stage F3 of `docs/completed-plans/dataflow-compiler.md`, H6).
 //!
 //! - [`TileOp`] is the description. Its constructors ([`eltwise`], [`reduce`], [`matmul()`]) check what a client accepts
 //!   and build it; nothing past them names a client.

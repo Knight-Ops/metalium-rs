@@ -252,7 +252,7 @@ pub fn probe_row_misroute(on: bool) {
 static PROBE_PAUSE_UNREBASED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// A negative control (`docs/plans/dataflow-compiler.md` F4b.2): with it on, a paused capture
+/// A negative control (`docs/completed-plans/dataflow-compiler.md` F4b.2): with it on, a paused capture
 /// ([`Session::paused`]) goes on without moving its barrier targets and generations past what
 /// ran while it was paused, so its replay waits for barriers and generations it does not reach.
 /// Process-wide; dev-facing.
@@ -2169,7 +2169,16 @@ fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, Tens
             reader.extend(block.gather.1);
             reader.push(input.credit(Action::Push));
             writer.push(output.credit(Action::Wait));
-            writer.extend(block.scatter.1);
+            // A planned capture keeps a list whose every write it dropped as a `WAIT`
+            // (`Session::apply_plan`); NC's section only writes, and its credits keep the
+            // batch's place.
+            writer.extend(
+                block
+                    .scatter
+                    .1
+                    .into_iter()
+                    .filter(|e| *e != [op::WAIT, 0, 0, 0, 0, 0, 0, 0]),
+            );
             writer.push(output.credit(Action::Pop));
             segment.steps += 3;
         }
@@ -2739,7 +2748,7 @@ impl<T: Transport> Session<T> {
             // `TT_BARRIER_PRUNE=0`: a capture keeps every barrier.
             barrier_prune: std::env::var("TT_BARRIER_PRUNE").map_or(true, |v| v != "0"),
             last_prune: None,
-            // `TT_EDGE_CREDITS=<fan>` turns it on (`docs/plans/dataflow-compiler.md` F4a.1).
+            // `TT_EDGE_CREDITS=<fan>` turns it on (`docs/completed-plans/dataflow-compiler.md` F4a.1).
             edge_credits: std::env::var("TT_EDGE_CREDITS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -2758,7 +2767,7 @@ impl<T: Transport> Session<T> {
             stream_prefetch: std::env::var("TT_STREAM_PREFETCH").map_or(true, |v| v != "0"),
             softmax_mode: crate::softmax::Mode::default(),
             // `TT_MATMUL_BLOCK=off|auto|measured|mb,kq,nb`, `measured` when unset
-            // (`docs/plans/prefill-operand-reuse.md`, `docs/plans/dataflow-compiler.md` F4b.2).
+            // (`docs/plans/prefill-operand-reuse.md`, `docs/completed-plans/dataflow-compiler.md` F4b.2).
             block_stream: tensor::BlockStream::from_env(),
             reuse: tensor::Reuse::Off,
             block_scores: None,
@@ -2773,11 +2782,11 @@ impl<T: Transport> Session<T> {
             // (`docs/plans/planned-l1-residency.md` 3b): a 1.7B step 19.51 -> 18.40 ms at the
             // prefetch cap of 2 (`dm::PREFETCH_CAP_DEFAULT`), nothing measured slower.
             busy_prefetch: std::env::var("TT_BUSY_PREFETCH").map_or(true, |v| v != "0"),
-            // On by default since 2026-10-29 (`docs/plans/dataflow-compiler.md` F4a.2): a 1.7B step
+            // On by default since 2026-10-29 (`docs/completed-plans/dataflow-compiler.md` F4a.2): a 1.7B step
             // 11.32 / 12.69 -> 10.95 / 12.16 ms at 32 / 256 tokens on card 1, bit for bit;
             // `TT_READ_AHEAD_EARLY=0` turns it off.
             read_ahead_early: std::env::var("TT_READ_AHEAD_EARLY").map_or(true, |v| v != "0"),
-            // `TT_IDLE_AHEAD_EARLY=1` turns it on (`docs/plans/dataflow-compiler.md` F4a.2: not
+            // `TT_IDLE_AHEAD_EARLY=1` turns it on (`docs/completed-plans/dataflow-compiler.md` F4a.2: not
             // faster, so off).
             idle_ahead_early: std::env::var("TT_IDLE_AHEAD_EARLY").is_ok_and(|v| v == "1"),
             busy_anchor: None,
@@ -4557,7 +4566,7 @@ impl<T: Transport> Session<T> {
     }
 
     /// Lower a capture's kept barriers to per-edge credits where a channel expresses them (off by
-    /// default; `TT_EDGE_CREDITS=<fan>` at open; `docs/plans/dataflow-compiler.md` F4a.1, H4): a
+    /// default; `TT_EDGE_CREDITS=<fan>` at open; `docs/completed-plans/dataflow-compiler.md` F4a.1, H4): a
     /// barrier whose next run's units each wait for at most `fan` producers, each crediting at most
     /// `fan` units ([`crate::barriers::credit`]). `None` keeps every barrier the data needs. Only
     /// where barriers are pruned ([`Session::set_barrier_prune`]); the capture's own run keeps them.
@@ -9772,7 +9781,7 @@ impl<T: Transport> Session<T> {
     /// a product's barrier ([`Session::set_busy_prefetch`]) moves to just before it, so the unit
     /// reads the next product's `B` as soon as its own share is done, in the product's tail, and
     /// not when its slowest unit is (on by default; `TT_READ_AHEAD_EARLY=0` turns it off;
-    /// `docs/plans/dataflow-compiler.md` F4a.2, H4). B pumps the list's reads while it waits at the barrier. Its own share has
+    /// `docs/completed-plans/dataflow-compiler.md` F4a.2, H4). B pumps the list's reads while it waits at the barrier. Its own share has
     /// landed by then (each pair ends with NC done), so it moves only where no other unit of the
     /// product touches the L1 the list's reads land in (`barriers::others_touch_l1`).
     pub fn set_read_ahead_early(&mut self, on: bool) {
@@ -9783,7 +9792,7 @@ impl<T: Transport> Session<T> {
     /// `PREFETCH` list (`tensor::PREFETCH`, its anchor's wait before it) moves to just before the
     /// unit's arrival at its anchor product's barrier, as a busy unit's does, where no other unit
     /// of that product touches the L1 its reads land in (off by default; `TT_IDLE_AHEAD_EARLY=1`
-    /// at open; `docs/plans/dataflow-compiler.md` F4a.2). Its reads are a pumped prefetch
+    /// at open; `docs/completed-plans/dataflow-compiler.md` F4a.2). Its reads are a pumped prefetch
     /// (`record::GATHER_PREFETCH`), which B issues while it waits at the barrier, and the job waits
     /// for them before its kernel, so the list does not hold the barrier. Not faster: a 1.7B step
     /// 10.93 / 12.11 -> 11.24 / 12.30 ms at 32 / 256 tokens on card 1 (ABBA `1793338877`-

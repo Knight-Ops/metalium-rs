@@ -1156,7 +1156,7 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
 
 ## A packed operand's tile in `Src`, and fewer fidelity phases (2026-10-28, ttsim and card 0)
 
-`docs/plans/dataflow-compiler.md` F1 (H7, F1d), gates `step239`, `step241`.
+`docs/completed-plans/dataflow-compiler.md` F1 (H7, F1d), gates `step239`, `step241`.
 - **A BFP8, BFP4 or BFP2 tile unpacks whole into `SrcA`** (one `UNPACR` of its 1,024 datums, the exponent section
   with them, rows then through the RWCs): bit for bit the face order, with `A` whole or by faces, at HiFi4 and at three
   phases (`step239::whole_tile_orders_give_a_packed_weights_bits`, run alone first on card 0 `1793160473`). The unpack
@@ -1173,7 +1173,7 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
 
 ## `Dst` in two halves: math, pack and reloads side by side (2026-10-30, card 0 and ttsim)
 
-`docs/plans/dataflow-compiler.md` F5 (H2), gate `step246_dst_subblocks`, kernel
+`docs/completed-plans/dataflow-compiler.md` F5 (H2), gate `step246_dst_subblocks`, kernel
 `matmul::block_stream_kernel_subblocked`.
 - **Half-sync works as tt-metal's `SyncHalf` does**: the math role accumulates up to four FP32 tiles in one half of
   `Dst` while the pack role drains the other, handing them over through `ready`/`free` started at `(0, 2)`. Each
@@ -1199,7 +1199,7 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
 
 ## A prefetch placed before a barrier arrival reads under the barrier; an in-line list delays it (2026-10-29, cards 0 and 1)
 
-From [dataflow-compiler.md](../plans/dataflow-compiler.md) F4a.2.
+From [dataflow-compiler.md](../completed-plans/dataflow-compiler.md) F4a.2.
 - **What holds:** B pumps a prefetch's reads (`GATHER_PREFETCH`) in every barrier wait loop (`mover::barrier`,
   `pump(PUMP_TURN)`), and a unit's own share has landed by the entry before its arrival (each pair ends with NC done,
   `finish_pair`; `BARRIER` waits for B's own requests). So a prefetch list put just before a unit's arrival reads while
