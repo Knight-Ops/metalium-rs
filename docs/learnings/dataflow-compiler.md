@@ -487,6 +487,10 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     default block, whose ceiling was not the kernel's: at `[6,4,12]` with `A` pulled a BFP `B` reaches 44.5-45.8 TFLOPS,
     above the 35 first predicted
     ([log](performance-log.md#d5-decided-a-pulled-from-a-few-holders-a-packed-bs-block-is-the-next-lever-2026-10-29-card-1)).
+  - *Batched products (2026-10-31, card 0, F4b's leftovers):* not extended to attention's batched products. Their
+    `A` re-reads made free save 2.0% of the 1.7B's 7,992-token prefill and 0.4% at 256 (`1793465553` against
+    `1793463500`); `pv` reads its `P` once already, so the pull has nothing to share there
+    ([log](performance-log.md#f4bs-leftovers-the-batched-pull-bounded-the-eager-slowdown-located-2026-10-31-card-0)).
 - **H2 `Dst` subblocks and half-sync.** Once reads stop binding (after H1), the kernel's math utilization rises from ~41-68% of HiFi4 issue toward ~90%. That range is derived from the 0.14-0.23 µs measured per K-tile pair against 128 cycles of `MVMUL`.
   - *Prediction:* ≥ 1.4× on the same shapes, bit-exact.
   - *Kills it:* < 1.1×.

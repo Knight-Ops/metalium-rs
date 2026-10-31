@@ -832,11 +832,21 @@ The staged work is [dataflow-compiler.md](../completed-plans/dataflow-compiler.m
     them, its golden's losses unchanged); the job goldens unchanged.
   - Found: `[2048,8192]@[8192,2048]` is 1.7x slower through Burn (10.9-11.0 TFLOPS) than through the session (18.5);
     14.0-14.2 through Burn with the measured block.
-- [ ] **F4b's leftovers** (carried 2026-10-29 when F4b closed; not on F4a's path):
-  - the pull in the batched block-stream path (`matmul_dram_batched_limited`, attention prefill): the items' units
-    numbered globally, credits returned per item;
-  - an eager product run after its own shape's pulled capture takes 3-10% more host time (device the same), cause not
-    found.
+- [x] **F4b's leftovers** (carried 2026-10-29 when F4b closed), closed 2026-10-31 on card 0 at `e97bc0e`, nothing built
+  ([log](../learnings/performance-log.md#f4bs-leftovers-the-batched-pull-bounded-the-eager-slowdown-located-2026-10-31-card-0)):
+  - **The pull in the batched block-stream path: bounded, kill fired, not built.** With `A`'s re-reads in attention's
+    batched products made free (`TT_PROBE_BATCHED_A=rereads`), the 1.7B prefill at 256 / 1,000 / 7,992 tokens is 0.4 /
+    0.7 / 2.0% faster (kill < 3%). `pv` already reads `P` once a head (`[4,2,2]` blocks over its two column tiles);
+    only `qk`'s small `Q` is re-read. Every `A` read free gives 3.4 / 4.9 / 9.8%: `P`'s one read, which only an
+    attention that keeps the scores out of GDDR removes (an order change, the owner's call). Qwen3.5's grouped
+    attention re-reads `A` 2-32 times and could share it (`batched_attention_questions`); not measured on the card.
+  - **The eager slowdown after a pulled capture: located, not fixed.** Reproduced (19.5-19.8 -> 20.4-21.6 ms at
+    `[1024,2048]@[2048,8192]`). It is all in the host's build of the eager product's jobs (`lower::jobs`, the new
+    `HostStage::Build`: 10.8 -> 11.4-12.1 ms, the same jobs), and follows what the *measurement* leaves live in the
+    process (+85 MB measured with pulled candidates, +50 without, +41 for a capture not measured, which does not slow
+    it), not the trace, the device or freed heap (`malloc_trim` changes nothing). Traced products and the models do
+    not pay it; without `perf` (locked here) the locality cause is not shown.
+  - Found: an eager product's host build is 10.8 of its 19.7 ms at that shape, the larger lever for eager work.
 - [x] **F4a:** channels instead of barriers in decode (H4), closed 2026-10-30: **H4's kill fires**. Opened 2026-10-29 at `9977ad8`
   ([plan](../completed-plans/dataflow-compiler.md#stage-f4a-decode-channels-instead-of-barriers-h4)).
   - F4a.0 (card 1): the bound clears H4's kill. A product's tail leaves ~70 units reading nothing, 2.45 ms of capacity a

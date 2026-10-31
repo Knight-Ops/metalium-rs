@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [F4b's leftovers: the batched pull bounded, the eager slowdown located](#f4bs-leftovers-the-batched-pull-bounded-the-eager-slowdown-located-2026-10-31-card-0) | 2026-10-31 | attention's batched products with `A`'s re-reads made free: the 1.7B prefill 0.4 / 0.7 / 2.0% faster at 256 / 1,000 / 7,992 tokens (every `A` read free 3.4 / 4.9 / 9.8%), so the batched pull is not built; the eager product's 3-12% after a measured, pulled capture is all in its host build (`lower::jobs` 10.8 -> 11.4-12.1 ms) and follows the memory the measurement leaves live (+85 MB), not the trace or the device |
 | [A 64-token prefill chunk: its products on 8-47 units](#a-64-token-prefill-chunk-its-products-on-8-47-units-2026-10-31-card-1) | 2026-10-31 | 1.7B `Chunk { c: 64 }` profiled whole: 45.9 ms on the card, products 36.2 (79%) at 167 GB/s; `o` on 8 units, `qkv` 16, `down` 32, `gate|up` 47; a layer's products 1.50 ms against 0.27 at 512 GB/s; `down` re-reads its 2 MB `A` 34 times |
 | [Qwen3.5-4B's decode step profiled whole, but for nine ops](#qwen35-4bs-decode-step-profiled-whole-but-for-nine-ops-2026-10-31-card-1) | 2026-10-31 | 1,071 of 1,080 ops stamped: 44.0 ms on the card against 64.28 host-timed; the head 5.37 ms at 481 GB/s (a BF16 copy saves ~2.7, not 5); weight products 19.5 ms at 380 GB/s; 776 other ops 16.8 ms; ~20 ms unattributed, ops 1048-1056 never stamped |
 | [H11's bound: a decode product's reads at large entries](#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1) | 2026-10-31 | the dataflow compiler review's top hypothesis, bounded before any build: today's decode deal (2,112-byte entries) already reads ~499 GB/s on 96 units, evenly; each unit's share contiguous at 16 KiB lifts 64 units 395 -> 499 but spreads their ends over 28-90 us; the read stream is not the products' limit, the pipeline inside a product is |
@@ -398,6 +399,63 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## F4b's leftovers: the batched pull bounded, the eager slowdown located (2026-10-31, card 0)
+
+The roadmap's "F4b's leftovers", bounded before any build ([plan record](../plans/roadmap.md), Track 2). Card 0 only,
+release, safe image, `TT_TILES=all`, the tree `3014245` plus the probes (committed as `e97bc0e`).
+
+**1. The pull in attention's batched products.** `matmul_dram_batched_limited` gives each item its jobs from unit 0
+and never shares `A`. First the host's view of what each batched product runs as
+(`cargo test -p tt-kernels batched_attention_questions -- --ignored --nocapture`, `Auto`'s block on 120 units):
+
+| product | items | `[m, k, n]` | units an item | block `[mb, kq, nb]` | `A` read |
+|---|--:|---|--:|---|--:|
+| 1.7B `qk`, prefix 512 / 8,192 | 32 | `[512, 64, prefix]` | 4 | `[8,1,8]` / `[8,1,10]` | 2x / 26x |
+| 1.7B `pv`, any prefix | 32 | `[512, prefix, 64]` | 4 | `[4,2,2]` | once |
+| Qwen3.5 `qk`, chunk 512, prefix 8,192 | 4 | `[2048, 256, 8192]` | 30 | `[5,4,8]` | 32x |
+| Qwen3.5 `pv`, chunk 512 | 4 | `[2048, prefix, 256]` | 30 | `[5,4,4]` | 2x |
+
+Then the bound on the card: `traced_generation_stream_ceiling` with `TT_GEN_MAX_LEN=8192 TT_GEN_CHUNKS=512
+TT_GEN_PROMPTS=256,1000,7992 TT_GEN_NEW=4 TT_GEN_SAMPLES=3`, BF16 weights, the 1.7B. `TT_PROBE_BATCHED_A=1` skips every
+`A` gather of a batched product, `rereads` those past each row strip's first column block (what a pull at best
+saves, its copies made free); both give wrong products, timed only.
+
+| prompt | baseline (`1793463500`) | every `A` read free (`1793464507`) | re-reads free (`1793465553`) |
+|--:|--:|--:|--:|
+| 256 | 123.66 ms | 119.48 (-3.4%) | 123.21 (-0.4%) |
+| 1,000 | 275.18 | 261.76 (-4.9%) | 273.14 (-0.7%) |
+| 7,992 | 5,893.7 | 5,314.1 (-9.8%) | 5,773.2 (**-2.0%**) |
+
+- **The kill (< 3% at 7,992 and at 256) fires: the batched pull is not built.** What is left is `P`'s one read in
+  `pv` (0.46 s of the 7,992-token prefill), which only an attention that keeps the scores out of GDDR removes.
+- The decode step at 7,992 positions also moves with every `A` read free (46.85 -> 41.73 ms): a long cache's decode
+  attention runs as the batched composition.
+- The 7,992-token prefill on this tree, card 0: 5.89 s (5.98 on card 1 at `1793039593`).
+
+**2. The eager product after its own shape's measured, pulled capture.** `matmul_throughput` with
+`TT_MATMUL_SHAPES=1024,2048,8192 TT_MATMUL_EAGER_AFTER=<rounds>`: as many eager rounds before the capture as after it,
+each round 7 samples after 2 warmups, checked bit for bit, with the session's host stages and the process's RSS.
+
+| run | eager before, each round | eager after, each round | RSS after the capture | host build before / after |
+|---|--:|--:|--:|--:|
+| default, the measured block and pull (`1793466602`, `1793467085`) | 19.48-19.84 ms | 20.39-21.30 | +85 MB | 10.74-10.79 / 12.07-12.15 ms |
+| the first trace dropped (`1793466620`) | 19.49-20.08 | 20.38-20.67 | | |
+| `TT_OPERAND_REUSE=off` (`1793466638`, `1793466916`) | 19.57-19.91 | 19.80-20.14 | +50 MB | |
+| `TT_MATMUL_BLOCK=auto`, nothing measured (`1793467205`) | 19.55-19.73 | 19.69-19.82 | +41 MB | 10.66-10.78 / 10.86-10.88 |
+| `TT_MATMUL_TRIM=1`, `malloc_trim` after the capture (`1793466972`) | 19.51-19.66 | 20.11-20.22 | +64-68 MB | |
+
+- **It is the host's build of the eager product's jobs.** The card's span is the same (7,971 us on unit 0, profile
+  `1793466701`); the session's queueing grows ~0.2 ms (`Place`, `Segments`); the new `HostStage::Build` (a product's
+  plan and jobs, before it queues) grows ~1.3 ms, and inside it all of it is `lower::jobs` (temporary timers, removed),
+  emitting the same jobs.
+- **It follows what the measurement leaves live**, not the capture: a capture not measured leaves the trace's 41 MB
+  and no slowdown; a measured one with pulled candidates (twice the candidates) the most. Neither the trace (dropped)
+  nor freed heap (`malloc_trim` returns ~20 MB of the 85, the slowdown stays) explains it. Likely the locality of the
+  build's allocations among the candidates' process-wide memos; not shown (`perf` is locked on this host,
+  `perf_event_paranoid` 4).
+- Traced products and the model workloads do not pay it (F4b.2). **The larger fact:** at this shape the eager
+  product's host build is 10.8 of its 19.7 ms.
 
 ## A 64-token prefill chunk: its products on 8-47 units (2026-10-31, card 1)
 
