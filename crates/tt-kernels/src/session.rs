@@ -1181,10 +1181,13 @@ pub enum HostStage {
     Barrier,
     /// Waiting for a unit to drain, for programs or descriptors.
     Drain,
+    /// A product's work built before it queues: its plan and its jobs
+    /// (`tensor::matmul_dram_prefetching`).
+    Build,
 }
 
 impl HostStage {
-    pub const ALL: [HostStage; 10] = [
+    pub const ALL: [HostStage; 11] = [
         HostStage::Enqueue,
         HostStage::Segments,
         HostStage::Ensure,
@@ -1195,6 +1198,7 @@ impl HostStage {
         HostStage::List,
         HostStage::Barrier,
         HostStage::Drain,
+        HostStage::Build,
     ];
 }
 
@@ -8666,6 +8670,7 @@ impl<T: Transport> Session<T> {
             None
         };
         let mut twinned = false;
+        let built = self.mark();
         let out = self
             .dram_state()
             .and_then(|d| {
@@ -8699,6 +8704,7 @@ impl<T: Transport> Session<T> {
                 )
             })
             .and_then(|(mut work, dealt)| {
+                self.stage(HostStage::Build, built);
                 if let Some(twin) = &out_twin {
                     twinned = tensor::twin_one_row_scatters(&mut work.jobs, &work.out, twin);
                 }

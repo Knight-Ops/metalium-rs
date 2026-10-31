@@ -491,7 +491,7 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
     let (rt, ragged) = (op.domain[p].tiles(), op.domain[p].elems % 32);
     let ct = op.domain[q].tiles();
     let reversed = tensor::probing_reverse_chunks();
-    let skip_a = tensor::probing_skip_a();
+    let (skip_all_a, skip_a_rereads) = (tensor::probing_skip_a(), tensor::probing_skip_a_rereads());
     // Per unit, the first operand's tiles (rows, terms) and slot its last run left held.
     type Held = (std::ops::Range<usize>, std::ops::Range<usize>, u64);
     let mut held: Vec<Option<Held>> = vec![None; units];
@@ -509,6 +509,7 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
             continue;
         };
         let [rows, cols] = &deal.blocks[block];
+        let skip_a = skip_all_a || (skip_a_rereads && cols.start != 0);
         let last_row = rows.end == rt && ragged != 0;
         let live = if last_row { ragged as u32 } else { 32 };
         // `A` read to its live rows: one row of each tile for a one-row product.

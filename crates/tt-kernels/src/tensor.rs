@@ -1599,8 +1599,46 @@ pub(crate) fn probing_skip_block_gathers() -> bool {
     PROBE_SKIP_BLOCK_GATHERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// [`PROBE_SKIP_A`] for the products of [`matmul_dram_batched`] alone (attention's `Q K^T` and
+/// `P V`): the bound on sharing a batched product's `A` reads (`roadmap.md`, "F4b's leftovers").
+/// **The products are wrong**; only their time means anything.
+static PROBE_SKIP_BATCHED_A: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BATCHED_A`] on or off, process-wide. Dev-facing: a timing bound, never a
+/// result.
+#[doc(hidden)]
+pub fn probe_skip_batched_a_reads(on: bool) {
+    PROBE_SKIP_BATCHED_A.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+thread_local! {
+    /// Whether this thread is lowering a batched product's jobs ([`matmul_dram_batched_limited`]).
+    static LOWERING_BATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`PROBE_SKIP_BATCHED_A`] for a batched product's re-reads alone: `A` gathered by the first
+/// column block of each row strip, skipped by the rest. What a pull of `A` could save at best (its
+/// copies made free); the products are wrong.
+static PROBE_SKIP_BATCHED_A_REREADS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BATCHED_A_REREADS`] on or off, process-wide. Dev-facing: a timing bound,
+/// never a result.
+#[doc(hidden)]
+pub fn probe_skip_batched_a_rereads(on: bool) {
+    PROBE_SKIP_BATCHED_A_REREADS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn probing_skip_a_rereads() -> bool {
+    PROBE_SKIP_BATCHED_A_REREADS.load(std::sync::atomic::Ordering::Relaxed)
+        && LOWERING_BATCHED.with(std::cell::Cell::get)
+}
+
 pub(crate) fn probing_skip_a() -> bool {
     PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
+        || (PROBE_SKIP_BATCHED_A.load(std::sync::atomic::Ordering::Relaxed)
+            && LOWERING_BATCHED.with(std::cell::Cell::get))
 }
 
 /// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the stream fully ahead of the
@@ -2971,6 +3009,15 @@ pub(crate) fn matmul_dram_batched_limited(
     unpack_b: bool,
     block_stream: BlockStream,
 ) -> Result<Work> {
+    // [`PROBE_SKIP_BATCHED_A`] applies to what is lowered here, and only here.
+    struct Lowering;
+    impl Drop for Lowering {
+        fn drop(&mut self) {
+            LOWERING_BATCHED.with(|b| b.set(false));
+        }
+    }
+    LOWERING_BATCHED.with(|b| b.set(true));
+    let _lowering = Lowering;
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
     let batch = items.len();
@@ -8011,6 +8058,107 @@ mod block_stream_tests {
                     let s = choice.expect("a long prefill's products block");
                     assert!(s.us < other);
                 }
+            }
+        }
+    }
+}
+
+/// The bound's host side (`roadmap.md`, "F4b's leftovers"): what each batched attention product
+/// of a prefill chunk runs as, and whether its units could share `A` at all.
+#[cfg(test)]
+mod batched_questions {
+    use super::*;
+
+    /// `cargo test -p tt-kernels batched_attention_questions -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a table for the bound, not a claim"]
+    fn batched_attention_questions() {
+        let route = SrcRoute::Tf32FromFp32;
+        let fidelity = Fidelity::HiFi4;
+        // (what, items, [m, k, n])
+        let mut cases: Vec<(&str, usize, [usize; 3])> = Vec::new();
+        for prefix in [512, 1024, 4096, 8192] {
+            // SmolLM2-1.7B: 32 heads of 64, chunks of 512 attending to `prefix`.
+            cases.push(("1.7B qk", 32, [512, 64, prefix]));
+            cases.push(("1.7B pv", 32, [512, prefix, 64]));
+            // Qwen3.5-4B's attention layers, grouped-query folded: 4 key/value heads of 256, 4
+            // query heads a group, chunks of 16 (the bench's) and 512.
+            for chunk in [16, 512] {
+                cases.push(("Qwen3.5 qk", 4, [4 * chunk, 256, prefix]));
+                cases.push(("Qwen3.5 pv", 4, [4 * chunk, prefix, 256]));
+            }
+        }
+        println!(
+            "| product | items | [m, k, n] | units | per item | path | block [mb, kq, nb] | A read x | \
+             shared at per item | per item, floor | shared at floor |"
+        );
+        for units in [120usize, 64] {
+            for &(what, batch, [m, k, n]) in &cases {
+                let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+                let per_item = units.div_ceil(batch).max(1);
+                let floor = (units / batch).max(1);
+                let staging = if pipelining_pays([m, k, n], route, fidelity, per_item) {
+                    Staging::SlotsHalf
+                } else {
+                    Staging::Slots
+                };
+                let Some(shape) = matmul::plan_in([m, k, n], route, fidelity, staging) else {
+                    println!(
+                        "| {what} | {batch} | {:?} | {units} | fits no chunk |",
+                        [m, k, n]
+                    );
+                    continue;
+                };
+                let [mc, kc, nc] = shape.tiles;
+                let kc = if kc < kt {
+                    k_block_size(kc, route, fidelity).unwrap_or(kc)
+                } else {
+                    kc
+                };
+                let [bmc, bnc] = blocks([mt, nt], [mc, nc], per_item);
+                let other = blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], per_item);
+                let plan = block_stream_plan(
+                    BlockStream::Auto,
+                    [mt, kt, nt],
+                    per_item,
+                    other,
+                    route,
+                    fidelity,
+                );
+                let share = |u: usize, [mb, nb]: [usize; 2]| {
+                    crate::tile_op::distribute::shared(
+                        mt.div_ceil(mb),
+                        nt.div_ceil(nb),
+                        u,
+                        crate::tile_op::reuse::AUTO_HOLDERS,
+                        None,
+                    )
+                    .is_some()
+                };
+                let (path, block, reads, at_item, at_floor) = match plan {
+                    Some((s, _)) => {
+                        let [mb, kq, nb] = s.tiles;
+                        (
+                            "block stream",
+                            format!("[{mb}, {kq}, {nb}]"),
+                            nt.div_ceil(nb),
+                            share(per_item, [mb, nb]),
+                            share(floor, [mb, nb]),
+                        )
+                    }
+                    None => (
+                        "blocks",
+                        format!("[{bmc}, {kc}, {bnc}]"),
+                        nt.div_ceil(bnc),
+                        false,
+                        false,
+                    ),
+                };
+                println!(
+                    "| {what} | {batch} | {:?} | {units} | {per_item} | {path} | {block} | {reads} \
+                     | {at_item} | {floor} | {at_floor} |",
+                    [m, k, n]
+                );
             }
         }
     }

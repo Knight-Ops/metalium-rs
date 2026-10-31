@@ -616,6 +616,12 @@ pub trait Engine {
     fn gddr_free_bytes(&mut self) -> Result<(u64, u64), TtError> {
         Err(no_traces())
     }
+    /// The session's host stages so far (`Session::host_times`): each stage's name, its time
+    /// in ms, its count and its write calls. A diagnosis's snapshot.
+    #[doc(hidden)]
+    fn host_stage_times(&mut self) -> Result<Vec<(String, f64, u64, u64)>, TtError> {
+        Err(no_traces())
+    }
     /// Count what each op of every trace captured from here on moves through GDDR
     /// (`Session::set_count_trace_bytes`), read back with [`Engine::trace_ops`].
     #[doc(hidden)]
@@ -4309,6 +4315,22 @@ impl Engine for KmdEngine {
         let was = self.session.capture_reuse();
         self.session.set_capture_reuse(on);
         Ok(was)
+    }
+    fn host_stage_times(&mut self) -> Result<Vec<(String, f64, u64, u64)>, TtError> {
+        Ok(self
+            .session
+            .host_times()
+            .stages
+            .iter()
+            .map(|(stage, t)| {
+                (
+                    format!("{stage:?}"),
+                    t.time.as_secs_f64() * 1e3,
+                    t.count,
+                    t.traffic.write_calls,
+                )
+            })
+            .collect())
     }
     fn gddr_free_bytes(&mut self) -> Result<(u64, u64), TtError> {
         self.session.sync().map_err(TtError::from)?;

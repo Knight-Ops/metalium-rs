@@ -803,6 +803,60 @@ fn matmul_throughput() {
                     }
                 }
                 report(&format!("{key}/eager"), "us", "host", Stats::of(eager));
+                // The eager product timed again, 7 samples after 2 warmups, each checked.
+                // The session's host stages over the timed runs, ms an op (a diagnosis's split).
+                let stages = || burn_tt::host_stage_times(d).unwrap();
+                let eager_again = |label: String| {
+                    let mut times = Vec::new();
+                    let mut before = Vec::new();
+                    for repetition in 0..9 {
+                        if repetition == 2 {
+                            before = stages();
+                        }
+                        let start = Instant::now();
+                        let c = a.clone().matmul(b.clone());
+                        TtBackend::sync(&d).unwrap();
+                        let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                        let got = c.into_data().to_vec::<f32>().unwrap();
+                        assert_eq!(bits(&got), bits(&want), "{key}: {label}, {repetition}");
+                        if repetition >= 2 {
+                            times.push(elapsed);
+                        }
+                    }
+                    let split: Vec<String> = stages()
+                        .iter()
+                        .zip(&before)
+                        .filter(|(after, before)| after.2 > before.2)
+                        .map(|(after, before)| {
+                            format!(
+                                "{} {:.3} ms x{} w{}",
+                                after.0,
+                                (after.1 - before.1) / 7.0,
+                                (after.2 - before.2) / 7,
+                                (after.3 - before.3) / 7
+                            )
+                        })
+                        .collect();
+                    // The process's resident memory, a footprint the capture may leave.
+                    let rss = std::fs::read_to_string("/proc/self/status")
+                        .ok()
+                        .and_then(|st| {
+                            st.lines()
+                                .find(|l| l.starts_with("VmRSS:"))
+                                .map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string())
+                        })
+                        .unwrap_or_default();
+                    eprintln!("STAGES {key}/{label}: RSS {rss} kB, {}", split.join(", "));
+                    report(&format!("{key}/{label}"), "us", "host", Stats::of(times));
+                };
+                // The control of the rounds after the capture (below): as many rounds before it.
+                let rounds: usize = std::env::var("TT_MATMUL_EAGER_AFTER")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                for round in 0..rounds {
+                    eager_again(format!("eager before capture, round {round}"));
+                }
                 // Traced: `A` is the input, `B` stays resident.
                 let TensorPrimitive::Float(ap) = a.clone().into_primitive() else {
                     unreachable!()
@@ -877,6 +931,38 @@ fn matmul_throughput() {
                     "count",
                     Stats::of([moved.reads as f64]),
                 );
+                // The eager product again after its own shape's capture, `TT_MATMUL_EAGER_AFTER`
+                // rounds of it, each round capturing once more after it (roadmap, "F4b's
+                // leftovers": 3-10% more host time once a measured, pulled capture ran).
+                // `TT_MATMUL_DROP_TRACE=1`: the first capture freed before the rounds, a toggle
+                // of the diagnosis.
+                let trace =
+                    (std::env::var("TT_MATMUL_DROP_TRACE").as_deref() != Ok("1")).then_some(trace);
+                // `TT_MATMUL_TRIM=1`: the heap the capture freed handed back to the system first
+                // (glibc's `malloc_trim`), a toggle of the diagnosis: freed memory against live.
+                if std::env::var("TT_MATMUL_TRIM").as_deref() == Ok("1") {
+                    extern "C" {
+                        fn malloc_trim(pad: usize) -> i32;
+                    }
+                    // SAFETY: glibc's `malloc_trim` takes a byte count and touches only free
+                    // heap.
+                    unsafe { malloc_trim(0) };
+                }
+                for round in 0..rounds {
+                    eager_again(format!("eager after capture, round {round}"));
+                    let (again, first) = TracedInference::capture(&[&ap], || {
+                        let TensorPrimitive::Float(c) =
+                            a.clone().matmul(b.clone()).into_primitive()
+                        else {
+                            unreachable!()
+                        };
+                        vec![c]
+                    })
+                    .unwrap_or_else(|e| panic!("{key}: capture again: {e}"));
+                    assert_eq!(bits(&out(&first)), bits(&want), "{key}: capture {round}");
+                    drop(again);
+                }
+                drop(trace);
             }
         },
     );

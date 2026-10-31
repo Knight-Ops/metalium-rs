@@ -1360,6 +1360,13 @@ fn traced_generation_stream_ceiling() {
     };
     let (max_len, new) = (env("TT_GEN_MAX_LEN", 512), env("TT_GEN_NEW", 64));
     probe_skip_weight_reads(mode != "off");
+    // The bound on sharing attention's batched products' `A` reads (`roadmap.md`, "F4b's
+    // leftovers"): their `A` gathers skipped, the products wrong.
+    // `TT_PROBE_BATCHED_A=1` skips every `A` read, `rereads` only those past each row strip's
+    // first column block (what a pull could save).
+    let batched_a = std::env::var("TT_PROBE_BATCHED_A").unwrap_or_default();
+    tt_kernels::tensor::probe_skip_batched_a_reads(batched_a == "1");
+    tt_kernels::tensor::probe_skip_batched_a_rereads(batched_a == "rereads");
     probe_background_stream(background);
     probe_space_report(true);
     let split = std::env::var("TT_PROBE_ATTENTION_SPLIT").is_ok_and(|v| v == "1");
@@ -1391,13 +1398,18 @@ fn traced_generation_stream_ceiling() {
     } else {
         format!("{mode}, {} free", dropped.join("+"))
     };
+    let tag = match batched_a.as_str() {
+        "1" => format!("{tag}, batched A skipped"),
+        "rereads" => format!("{tag}, batched A re-reads skipped"),
+        _ => tag,
+    };
     let residency = std::env::var("TT_PROBE_RESIDENCY").is_ok_and(|v| v == "1");
     let nc_waits = std::env::var("TT_PROBE_NC_WAITS").is_ok_and(|v| v == "1");
     tt_kernels::residency::probe_residency_plan(residency);
     with_device(Config::default(), |d| {
         conditions(card());
         println!(
-            "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split},\"free\":\"{}\"}}",
+            "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split},\"batched_a_skipped\":\"{batched_a}\",\"free\":\"{}\"}}",
             dropped.join(",")
         );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
@@ -1502,6 +1514,8 @@ fn traced_generation_stream_ceiling() {
         }
     });
     probe_skip_weight_reads(false);
+    tt_kernels::tensor::probe_skip_batched_a_reads(false);
+    tt_kernels::tensor::probe_skip_batched_a_rereads(false);
     probe_background_stream(None);
     probe_space_report(false);
     tt_models::llama::probe_free_consumers(false, false);

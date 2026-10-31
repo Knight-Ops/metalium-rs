@@ -863,6 +863,14 @@ pub fn gddr_free_bytes(device: TtDevice) -> Result<(u64, u64), TtError> {
     server::run(device, move |e, _| e.gddr_free_bytes())
 }
 
+/// `device`'s session host stages so far (`Session::host_times`): each stage's name, its time in
+/// ms, its count and its write calls. Dev-facing: snapshots around a run tell which stage a
+/// slowdown is in.
+#[doc(hidden)]
+pub fn host_stage_times(device: TtDevice) -> Result<Vec<(String, f64, u64, u64)>, TtError> {
+    server::run(device, move |e, _| e.host_stage_times())
+}
+
 /// Give `device`'s timestamper `bytes` of L1 per tile, taken from the top of the program
 /// cache (`Session::set_profile_buffer`; `None` restores the fixed 1,024-event buffer), so
 /// [`TracedInference::run_profiled`] can stamp a larger replay. Call it before the capture:
