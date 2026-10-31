@@ -363,6 +363,9 @@ pub const SMOKE: &[&str] = &[
     // F4b.2: a measured block choice; the chosen candidate runs bit for bit, a question is
     // timed once, and a capture paused to measure records what it would unpaused.
     "step245_measured_block::",
+    // F5: `Dst` subblocks under half-sync (the default product kernel) are the one-tile kernel
+    // bit for bit, every format and model shape; clearing both halves or overlapping them fails.
+    "step246_dst_subblocks::",
     // F4a.1: kept barriers lowered to per-edge credits (opt-in); sparse ops and a SmolLM2-135M
     // decode replay bit for bit, a dropped edge and an unbalanced credit refused.
     "step265_edge_credits::",

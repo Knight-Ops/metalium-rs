@@ -519,13 +519,15 @@ impl Graph {
     /// iteration runs to the end from each channel's initial pages, with its depth as its room.
     pub fn check(&self) -> Result<Schedule, ChannelError> {
         let key = |e: &End| (e.unit, e.endpoint);
+        // Linear in the graph throughout: a trace's credits make a process of every unit's every
+        // run (Qwen3.5's prefill chunk: hundreds of thousands).
         let mut processes: Vec<(usize, Endpoint)> = Vec::new();
-        let mut index = |p: (usize, Endpoint)| match processes.iter().position(|&q| q == p) {
-            Some(i) => i,
-            None => {
+        let mut seen: std::collections::HashMap<(usize, u8), usize> = Default::default();
+        let mut index = |p: (usize, Endpoint)| {
+            *seen.entry((p.0, p.1 as u8)).or_insert_with(|| {
                 processes.push(p);
                 processes.len() - 1
-            }
+            })
         };
         // (channel, from, to, produced a firing, consumed a firing, depth), and the initial pages.
         let mut edges = Vec::new();
@@ -561,53 +563,69 @@ impl Graph {
                 initial.push(channel.initial as u64);
             }
         }
-        let firings = repetitions(processes.len(), &edges)?;
-        // One iteration, self-timed: any process with its inputs' tokens and its outputs' room
-        // fires, until each has fired its count or none can.
-        let mut tokens = initial;
-        let mut fired = vec![0u64; processes.len()];
-        loop {
-            let mut progress = false;
-            for p in 0..processes.len() {
-                while fired[p] < firings[p]
-                    && edges
-                        .iter()
-                        .zip(&tokens)
-                        .all(|(&(_, from, to, made, taken, depth), &t)| {
-                            (to != p || t >= taken) && (from != p || depth - t >= made)
-                        })
-                {
-                    for (e, &(_, from, to, made, taken, _)) in edges.iter().enumerate() {
-                        if to == p {
-                            tokens[e] -= taken;
-                        }
-                        if from == p {
-                            tokens[e] += made;
-                        }
-                    }
-                    fired[p] += 1;
-                    progress = true;
-                }
-            }
-            if fired == firings {
-                return Ok(Schedule { processes, firings });
-            }
-            if !progress {
-                let blocked = (0..processes.len())
-                    .filter(|&p| fired[p] < firings[p])
-                    .map(|p| processes[p])
-                    .collect();
-                return Err(ChannelError::Deadlock { blocked });
+        // Each process's edges in, out, and either way (in edge order, a self-loop once).
+        let mut ins = vec![Vec::new(); processes.len()];
+        let mut outs = vec![Vec::new(); processes.len()];
+        let mut adjacent = vec![Vec::new(); processes.len()];
+        for (e, &(_, from, to, ..)) in edges.iter().enumerate() {
+            outs[from].push(e);
+            ins[to].push(e);
+            adjacent[from].push(e);
+            if to != from {
+                adjacent[to].push(e);
             }
         }
+        let firings = repetitions(&adjacent, &edges)?;
+        // One iteration, self-timed: any process with its inputs' tokens and its outputs' room
+        // fires, until each has fired its count or none can. Each edge has one producer and one
+        // consumer, so a firing never disables another process and the order cannot change the
+        // outcome: a process is looked at again only when a neighbour's firing gave it tokens or
+        // room.
+        let mut tokens = initial;
+        let mut fired = vec![0u64; processes.len()];
+        let mut queued = vec![true; processes.len()];
+        let mut queue: std::collections::VecDeque<usize> = (0..processes.len()).collect();
+        while let Some(p) = queue.pop_front() {
+            queued[p] = false;
+            while fired[p] < firings[p]
+                && ins[p].iter().all(|&e| tokens[e] >= edges[e].4)
+                && outs[p]
+                    .iter()
+                    .all(|&e| edges[e].5 - tokens[e] >= edges[e].3)
+            {
+                for &e in &ins[p] {
+                    tokens[e] -= edges[e].4;
+                }
+                for &e in &outs[p] {
+                    tokens[e] += edges[e].3;
+                }
+                fired[p] += 1;
+                let woken = outs[p].iter().map(|&e| edges[e].2);
+                for q in woken.chain(ins[p].iter().map(|&e| edges[e].1)) {
+                    if q != p && !queued[q] {
+                        queued[q] = true;
+                        queue.push_back(q);
+                    }
+                }
+            }
+        }
+        if fired == firings {
+            return Ok(Schedule { processes, firings });
+        }
+        let blocked = (0..processes.len())
+            .filter(|&p| fired[p] < firings[p])
+            .map(|p| processes[p])
+            .collect();
+        Err(ChannelError::Deadlock { blocked })
     }
 }
 
 /// The least positive firings `q` with `q[from] x made == q[to] x taken` on every edge.
 fn repetitions(
-    processes: usize,
+    adjacent: &[Vec<usize>],
     edges: &[(usize, usize, usize, u64, u64, u64)],
 ) -> Result<Vec<u64>, ChannelError> {
+    let processes = adjacent.len();
     fn gcd(a: u64, b: u64) -> u64 {
         if b == 0 {
             a
@@ -626,7 +644,7 @@ fn repetitions(
         let mut queue = vec![start];
         while let Some(p) = queue.pop() {
             let (n, d) = rate[p].unwrap();
-            for &(c, from, to, made, taken, _) in edges {
+            for &(c, from, to, made, taken, _) in adjacent[p].iter().map(|&e| &edges[e]) {
                 // q[to] = q[from] x made / taken, and the reverse.
                 let (other, num, den) = if from == p {
                     (to, n * made, d * taken)
@@ -1102,6 +1120,36 @@ mod tests {
             })
         );
         assert_eq!(pages(2).check().unwrap().firings, [1, 2]);
+    }
+
+    #[test]
+    fn a_traces_worth_of_runs_checks_in_linear_time() {
+        use Endpoint::*;
+        // `barriers::credit`'s shape: each of 120 units' 1,000 runs a process, in order on its unit,
+        // and a credit from each run to the next unit's next run. Checked by scanning every edge
+        // for every process this took hours (Qwen3.5's prefill chunk).
+        let (units, runs) = (120, 1000);
+        let id = |u: usize, r: usize| u * runs + r;
+        let mut channels = Vec::new();
+        for u in 0..units {
+            for r in 0..runs - 1 {
+                channels.push(edge((id(u, r), Writer, 1), (id(u, r + 1), Writer, 1), 1));
+                channels.push(edge(
+                    (id(u, r), Writer, 1),
+                    (id((u + 1) % units, r + 1), Writer, 1),
+                    1,
+                ));
+            }
+        }
+        let schedule = Graph::new(channels.clone()).check().unwrap();
+        assert_eq!(schedule.firings.len(), units * runs);
+        assert!(schedule.firings.iter().all(|&f| f == 1));
+        // One credit back from a unit's last run to its first deadlocks the lot.
+        channels.push(edge((id(7, runs - 1), Writer, 1), (id(7, 0), Writer, 1), 1));
+        assert!(matches!(
+            Graph::new(channels).check(),
+            Err(ChannelError::Deadlock { blocked }) if blocked.len() > runs
+        ));
     }
 
     #[test]

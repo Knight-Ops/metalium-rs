@@ -1131,14 +1131,17 @@ pub(crate) fn credit(
                 if j < real_start || run_of[j] == run_of[k] {
                     continue;
                 }
-                let covered = epochs.iter().any(|e| {
-                    e.barrier >= j
-                        && e.barrier < k
-                        && e.waits.get(&u).is_some_and(|&(at, _)| at <= k)
-                        && e.sends
-                            .iter()
-                            .any(|(&(q, i), us)| q == p && i as usize >= j && us.contains(&u))
-                });
+                // The epochs are in barrier order: only those from `j` to `k` are looked at.
+                let from = epochs.partition_point(|e| e.barrier < j);
+                let covered = epochs[from..]
+                    .iter()
+                    .take_while(|e| e.barrier < k)
+                    .any(|e| {
+                        e.waits.get(&u).is_some_and(|&(at, _)| at <= k)
+                            && e.sends
+                                .range((p, j as u32)..=(p, u32::MAX))
+                                .any(|(_, us)| us.contains(&u))
+                    });
                 if !covered {
                     return Err(format!(
                         "op {k} on unit {u} follows unit {p}'s op {j} with neither a credit nor a barrier"
