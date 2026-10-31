@@ -84,6 +84,10 @@ The generation path is written for decoders in general, not for SmolLM2 (a test 
 - **`Llama`** implements the trait for every `LlamaConfig`. SmolLM2-135M is the preset
   `SMOLLM2_135M`, loaded by `Llama::smollm2_135m`; other checkpoints load through
   `Llama::pretrained(config, weights, ..)`.
+- **`Qwen35`** implements it too, over a `qwen35::HybridCache`: the attention layers' keys and values
+  in a `FixedCache`, and each Gated DeltaNet layer's carried convolution inputs and recurrent state. A
+  padded chunk's rows past the prompt leave that state as it was (decay 1, write strength 0).
+  `step263_qwen35_traced` checks it bit for bit against the eager schedule.
 - **`TracedGenerator`** captures what a `Shapes` names, as traces over one cache on the card
   (`burn_tt::SharedStateTraces`): a chunk of each size, and a step for each attended length (64,
   128, 256, ..., then the cache's length). It then serves any prompt: token ids in, logits out, each

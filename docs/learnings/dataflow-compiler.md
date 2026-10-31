@@ -528,6 +528,9 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
       units bound them. H4's prediction (≤ 9.5 ms, ≥ 400 GB/s) is not met, and the step moved < 0.3 ms. The barrier
       is not what costs (§7's "barriers remain only where..." holds as a correctness rule, not a performance one at
       decode); the products' per-unit work balance is the lever left, which is F5's and F6's.
+  - *Credits on Qwen3.5-4B (2026-10-31, card 1):* a step of ~1,000 small ops; decode unchanged at 64.2 / 64.7 ms,
+    the 5,688-op prefill chunk 1.4% faster, bit for bit
+    ([log](performance-log.md#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1)).
 - **H5 Spatial pipelining.** Running a layer's ops on disjoint core sets at once beats running them one after another for decode at batch 1.
   - *Prediction:* none until H4 has run.
   - *Kills it:* H4's tails turn out to be GDDR-queue-bound.

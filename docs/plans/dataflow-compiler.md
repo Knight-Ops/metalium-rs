@@ -500,7 +500,7 @@ at its barrier is its slowest unit's work (T10). H4's gain has to come from over
 reading the next product's weights in its tail, so the stage bounds that before building anything (owner, 2026-10-29).
 If the bound fires the kill, H4 is refuted, the three schedules below stay opt-in, and the stage stops.
 
-- [ ] **F4a.0, the baseline and the overlap bound** (card 1, at the starting commit).
+- [x] **F4a.0, the baseline and the overlap bound** (card 1, at the starting commit).
   - H4's baseline (Stage 0's open item): `TT_TILES=all cargo xtask bench --profile --device 1 --filter
     silicon_bench_models::traced_generation_stream_ceiling`, and the same without `--profile` for the host-timed step.
   - The tail split by unit, in the profile mode (`tails.tsv`): each eighth of an op's span, its bytes read by the op's
@@ -525,7 +525,7 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
     - Consequence for the order: the overlap needs no channel. B pumps a prefetch's reads while it waits at a
       barrier (`mover::barrier`), so a list moved to before the unit's arrival reads in the product's tail with the
       barrier kept. F4a.2's second item is built first, as the cheapest test of H4's mechanism.
-- [ ] **F4a.1, edge credits in place of kept barriers** (only if F4a.0 clears the kill). Derive per-edge channels
+- [x] **F4a.1, edge credits in place of kept barriers** (only if F4a.0 clears the kill). Derive per-edge channels
   from the barrier analysis (`tt_kernels::barriers::analyse`, whose `deps` are per edge over every address space, the
   residency plan's L1 moves included). Keep barriers only where no channel can express the dependency, or where a
   barrier is the cheaper lowering of an all-to-all edge (Bible §7). Stored streams only, as `prune`.
@@ -554,7 +554,13 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
       (`1793347800`-`1793349018`): **not faster** (+0.03 / +0.06). A product's consumer still waits for the producing
       units' work, which is the product's slowest (T10), and the residual add is all that starts early. Opt-in; the
       capture's build grows (the coverage check and graph), which is not a target.
-- [ ] **F4a.2, reads ahead started by edges, not anchors:** units that finish their share start data-independent reads
+    - On Qwen3.5-4B (2026-10-31, card 1, on the merged tree; [log](../learnings/performance-log.md#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1)), whose step is ~1,000 small ops a
+      barrier each: the build first timed out (the checks were quadratic in a trace's runs; now linear, unit test
+      `channel::tests::a_traces_worth_of_runs_checks_in_linear_time`, `step265` and `step246` on card 0
+      `1793413336`). ABBA at fan 4: decode unchanged (64.28 / 64.65 and 64.33 / 64.69 off, 64.19 / 64.69 and
+      64.24 / 64.71 on), prefill **1.4% faster** in both pairs (3,709 -> 3,656 ms for 256 tokens), bit for bit. Still
+      opt-in: a prefill-only gain on a model behind the 1.7B, the decode unmoved.
+- [x] **F4a.2, reads ahead started by edges, not anchors:** units that finish their share start data-independent reads
   (the next product's weights) at once.
   - [x] **A product's units, before their arrival** (2026-10-29, cards 0 and 1;
     [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1)).
@@ -656,8 +662,10 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
     `step68` 6 and `step245` 2 of 3. `step245::a_capture_paused_to_measure_is_the_capture_unpaused` fails, on ttsim too
     and with `TT_DST_SUBBLOCKS=0`: the re-swept list (B2) makes its chain choose `[4,4,8]` pulled, on 2 of 8 units, and
     the paused pass then records one more `KERNEL` entry on the six idle units for the op after the product than the
-    unpaused one (replays bit for bit). It passed with the list before (`1793337864`). Open: the pause's per-unit
-    bookkeeping (`session.rs` / `trace.rs`, F4a's), not this kernel's.
+    unpaused one (replays bit for bit). It passed with the list before (`1793337864`). Resolved at the merge
+    (`68a0463`): the pause forgets each unit's tile state, so a unit the paused product left idle runs its next
+    op's setup once more; the gate's claim is restated as that, at most one `KERNEL` setup entry a pause a unit and
+    every other entry equal (ttsim 3 of 3; card 0 in `--smoke`, `1793397733`).
   - Two silicon findings ([notes](../learnings/silicon-operating-notes.md#dst-in-two-halves-math-pack-and-reloads-side-by-side-2026-10-30-card-0-and-ttsim)):
     a `B` base stepped between a subblock's tiles needs the Scalar Unit settled before its `WRCFG` (one tile a run
     wrong without it); and an `UnpackToDst` beside running `MVMUL`s is wrong, so a reload directly from the packer's
@@ -679,6 +687,12 @@ If the bound fires the kill, H4 is refuted, the three schedules below stay opt-i
   each subblock's priors while the math role waits, and silicon does not allow it beside `MVMUL`s (above), so the
   half-sync hides the packer and not the reload. The lever left is fewer chunks (longer `kq`), which L1 bounds for an
   FP32 `B`, or a handoff that lets a chunk's reloads run under the chunk before (with F4a's channels).
+
+**F4a and F5 merged** (2026-10-30, `traced-generation` at `84f45fe`, with Qwen3.5's traced generation at `a12dc1e` and
+`step245`'s restated claim at `68a0463`): the 1.7B decode step 10.93 / 12.14 ms (card 1, `1793396168`; F5's kernel
+adds nothing measurable to F4a's schedule, the step being bound by its weights' reads), H1 through Burn 30.6 / 22.5 /
+11.4 / 14.3 TFLOPS (card 1, `1793396429`); `--smoke` 1,265 of 1,265 on card 0 (`1793397733`); `step260`-`step263` by
+name pass, the models' figures unchanged ([new-architectures.md](new-architectures.md)). F6 opens on this tree.
 
 ## Stage F6 (gated on F4a and F5): fusion through channels and spatial pipelining, H5
 

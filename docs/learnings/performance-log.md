@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The merged tree, and edge credits on Qwen3.5](#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1) | 2026-10-31 | F4a, F5 and Qwen3.5's traced generation on one tree: 1.7B decode 10.93 / 12.14 ms, H1 through Burn 30.6 / 22.5 / 11.4 / 14.3 TFLOPS; Qwen3.5 traced with `TT_EDGE_CREDITS=4` ABBA: decode unchanged (64.2 / 64.7 ms), prefill 1.4% faster, after the credit lowering's check was made linear (it had run past 40 minutes) |
 | [F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules](#f4a1-f4a3-the-idle-lists-pumped-edge-credits-and-the-three-schedules-2026-10-30-card-1) | 2026-10-30 | lane A, card 1: idle units' lists pumped and moved before their anchor's arrival 0.24 / 0.17 ms slower (opt-in); kept barriers lowered to per-edge credits, built and checked, +0.03 / +0.06 at fan 4 (opt-in); the handoff, second job and balanced deal not faster, retired; the lists' L1 room not built (a second job read ahead is slower). Close 10.98 / 12.18 ms against A0's 11.01 / 12.16, `Step(64)` 10.55 ms at 341 GB/s: **H4's kill fires** |
 | [F5: `Dst` subblocks and half-sync](#f5-dst-subblocks-and-half-sync-2026-10-30-card-0) | 2026-10-30 | subblocks of up to four FP32 tiles a `Dst` half, math and pack on alternate halves, `A` held in `SrcB`, and the measured blocks re-swept: bit for bit; H1's shapes x five formats 0.96-1.35x (geometric mean **1.12x**, FP32 `B` 1.08x, H1 32.3 -> 34.4 TFLOPS), the kernel alone up to 1.46x, the model shape set 1.12x; H2's 1.4x not met, its kill not fired: a chunk's reload still stops the math role, and an `UnpackToDst` beside `MVMUL`s is wrong on silicon |
 | [Qwen3.5-4B traced: the first decode step, and where it goes](#qwen35-4b-traced-the-first-decode-step-and-where-it-goes-2026-10-30-card-1) | 2026-10-30 | `TracedGenerator` over a hybrid cache: eager ~1.9 s a token on every tile, traced 68.5 / 68.9 ms at 32 / 256 tokens (`Tt`, BF16-stored weights), **64.2 / 64.6** with the decay a column of the state; the products 19.6 ms at 379 GB/s, the DeltaNet recurrence ~13 ms (a per-head decay expanded to the whole state, then laid as a column); the build host-bound, 1,108-1,487 s |
@@ -393,6 +394,42 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The merged tree, and edge credits on Qwen3.5 (2026-10-31, card 1)
+
+**The merged tree** (`traced-generation` with F4a, F5 and Qwen3.5's traced generation, `84f45fe` / `a12dc1e` /
+`68a0463`): SmolLM2-1.7B-Instruct decode 10.934 / 12.143 ms at 32 / 256 tokens (card 1, `1793396168`; F4a's close
+10.978 / 12.184), so F5's kernel adds nothing measurable to a decode step bound by its weights' reads; H1 through Burn
+30.557 / 22.460 / 11.402 / 14.347 TFLOPS (card 1, `1793396429`; F5's close on card 0 30.4 / 24.7 / 10.9 / 14.5). Card
+0: `--smoke` 1,265 of 1,265 (`1793397733`); `step260` (`1793399450`), `step261` (`1793400112`), `step262`
+(`1793400458`) and `step263` (`1793400913`) pass by name with the figures they printed before.
+
+**Edge credits on Qwen3.5** (F4a.1's `TT_EDGE_CREDITS=4`, opt-in): a model whose step has many small ops a barrier
+each, where credits might pay where they did not on the 1.7B. `silicon_bench_models::qwen35_traced_generation`,
+release, safe image, card 1, every tile, BF16-stored weights, chunks of 16, 512-position cache, 2 warmups and 9
+samples, host-timed medians.
+
+- The first credited run timed out at 2,400 s in the trace build (`1793410706`; 605 s without credits). The lowering's
+  checks were quadratic: `channel::Graph::check` found each process by a linear search and scanned every edge for
+  every process's rates and firings, and `barriers::credit`'s coverage check scanned every epoch for every
+  dependency. Credits make a process of every unit's every run, hundreds of thousands for the 5,688-op prefill chunk.
+  Now a hashed index, each process's own edges, a worklist (each edge has one producer and one consumer, so a firing
+  disables nothing and the order cannot change the outcome), and only the epochs between a dependency's ops; unit
+  test `a_traces_worth_of_runs_checks_in_linear_time` (120 units x 1,000 runs, 0.6 s in debug). `step265` and
+  `step246` on card 0 (`1793413336`, 8 of 8).
+
+| run | credits | build s | decode step ms, 32 / 256 | prefill ms, 32 / 256 | run ID |
+|---|---|--:|---|---|---|
+| 1 | off | 605 | 64.280 / 64.648 | 463.8 / 3,708.7 | `1793409872` |
+| 2 | fan 4 | 665 | 64.192 / 64.689 | 456.7 / 3,655.1 | `1793413366` |
+| 3 | off | 593 | 64.334 / 64.689 | 463.5 / 3,709.6 | `1793414260` |
+| 4 | fan 4 | 666 | 64.241 / 64.713 | 457.0 / 3,656.7 | `1793415082` |
+
+- **Decode: unchanged** (-0.09 / +0.03 ms), as on the 1.7B. Credits take a decode step's traces from 1,080 to 687 ops
+  (lowered barriers let pruning merge runs), but each consumer of a product still waits for its slowest unit.
+- **Prefill: 1.4% faster**, the same in both pairs (-6.8 / -53 ms; the chunk 5,688 -> 3,590 ops). Every run was bit
+  for bit the eager schedule (the bench's own check). Still opt-in: the decode, the target, does not move, and the
+  1.7B's was 0.03 / 0.06 ms slower; the trace build takes ~10% longer, which is not a target.
 
 ## F4a.1-F4a.3: the idle lists pumped, edge credits, and the three schedules (2026-10-30, card 1)
 

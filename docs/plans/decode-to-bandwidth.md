@@ -836,7 +836,7 @@ the host ~0.8).
     reads a whole column in the span (built and measured slower, below); and the window before `o` (~50 us a layer of
     GDDR idle: `o`'s 17 MB lands in ~35 us of a 64 us window, and `gate|up`'s prefetch starts only at `o`'s barrier).
 - [x] **A column's `K` chain handed between two units: built, bit for bit, slower; opt-in** (2026-10-22;
-  `Session::set_stream_handoff`, off; `TT_STREAM_HANDOFF=1`, `TT_STREAM_HANDOFF_AT=<h>`). With a streamed product
+  `Session::set_stream_handoff`, off; `TT_STREAM_HANDOFF=1`, `TT_STREAM_HANDOFF_AT=<h>`; retired 2026-10-30, F4a.3). With a streamed product
   prefetched, each column its own units would read whole is handed while a unit of the deal has no job: the column's
   unit computes chunks `0..h` (default half) and writes the FP32 partial to a scratch tensor; the spare unit reads the
   packed `A` and the next two chunks' `B` in the same op as a prefetch (`GATHER_PREFETCH`, which the op's barrier
@@ -1022,7 +1022,7 @@ with nothing left for the small ops. The room is elsewhere in L1: `MAILBOXES` is
     (`1792719944`). Neutral: the ring moved up, but a unit's busy prefetch was already bounded by what it holds, one
     job. **Opt-in until R2** uses the room.
 - [x] **R1-R2, idle units take a second job: built, bit for bit, slower; opt-in** (2026-10-23; host;
-  `Session::set_prefetch_second_job`, `TT_PREFETCH_SECOND=1`). R1 needed no new layout code: a second ring is the same
+  `Session::set_prefetch_second_job`, `TT_PREFETCH_SECOND=1`; retired 2026-10-30, F4a.3). R1 needed no new layout code: a second ring is the same
   top-`B` layout built while `l1::ring_end` is lowered by the first ring, and every memo of a ring's layout or programs
   is keyed by the ring's end (P3). R2 (`BlockPlan::second_jobs`): each prefetching unit of a `K`-whole product whose `B`
   sits against its ring's end (`Staging::Slots`) takes a one-column second job in round 1, its `B` in ring 2 and read
@@ -1064,7 +1064,7 @@ inside its span ([log](../learnings/performance-log.md#a-products-units-metered-
   units 0-47 read 5 columns each (1.33 MB at ~6.0 GB/s) while the 40 prefetching units finish in 13 us; `down` 172.0
   against 99.9, units 0-23 reading whole columns; the head 830.5 against 767.3.
 - [x] **The balanced deal: built, bit for bit, not faster; opt-in** (`Session::set_balanced_deal`,
-  `TT_BALANCED_DEAL=1`; `BlockPlan::push_balanced_jobs`, `tensor::balanced_shares`). Where a `K`-whole `Slots` product's
+  `TT_BALANCED_DEAL=1`; `BlockPlan::push_balanced_jobs`, `tensor::balanced_shares`; retired 2026-10-30, F4a.3). Where a `K`-whole `Slots` product's
   own units would run more than a round, every unit keeps its job read ahead (the prefetching units' and the first
   round), and the columns left are dealt over the plan's units and the prefetching ones, the remainder on the latter.
   Gates: unit `a_balanced_deal_gives_each_unit_its_in_span_share` (each column once, the first round unchanged, no unit

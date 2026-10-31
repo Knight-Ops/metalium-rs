@@ -85,7 +85,7 @@ Measured, not assumed (A0): the vendored Blackhole unpacker page is a stub, and 
   - **Measured** (card 0, stream-ceiling bench, 32 / 256 tokens): the commit before 11.78 / 12.96 ms (`1793028095`);
     compact at FP32 widths **11.68 / 12.90** (`1793027730`; traced generation, tokens checked, 11.73 / 12.23 / 12.95,
     `1793030086`); `ring` 11.81 / 12.99 (`1793029006`); `wide` 13.10 / 14.12 (`1793026815`); compact with the second
-    ring (`TT_TRACE_ARENA=1 TT_PREFETCH_SECOND=1`) 11.88 / 13.08 (`1793027910`).
+    ring (`TT_TRACE_ARENA=1 TT_PREFETCH_SECOND=1`, the latter retired 2026-10-30) 11.88 / 13.08 (`1793027910`).
   - **Why the room does not pay:** `wide`'s 4-column rings reach below the tops of the ops between products, so busy
     units stop reading them ahead (`qkv` 26.0 -> 3.2 MB ahead, `gate|up` 32.4 -> 3.2; profile `1793028276`). `ring` reads
     `gate|up` 48.7 MB ahead (was 32.4) and its span stays 125 us, its barrier 10.9 -> 27.9 us (profile `1793029342`): a

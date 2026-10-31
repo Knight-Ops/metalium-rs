@@ -455,7 +455,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         135M, ResNet-18 and ViT-Tiny unchanged. **Then** (same day): a column's `K` chain handed between two units
         (`down`'s 24 busy units each read a whole column at one unit's rate), as a second op, no firmware change: bit
         for bit (`step205`, card 0 `1792685194` with `step188`), but **slower**, 16.88 / 18.32 -> 17.07 / 18.51 ms
-        (`1792685519`, `1792686180`), so opt-in (`TT_STREAM_HANDOFF=1`). Inside `down`'s span the step is bound by
+        (`1792685519`, `1792686180`), so opt-in (`TT_STREAM_HANDOFF=1`, since retired, F4a.3). Inside `down`'s span the step is bound by
         GDDR's aggregate rate (the halves took up to 137 us beside the spare units' reads, not ~88), and the spare
         units start `qkv`'s read ahead later (`qkv` 51 -> 72 us; profile `1792686773`). The in-op firmware signal would
         save only the second op's ~17 us a layer: not built. **Then** (same day): the GDDR idle before `o`, each unit's
@@ -469,7 +469,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         from the arena); bit for bit, `--smoke` 1,188 of 1,188, the step unchanged (16.76 / 18.17 ms, `1792711476`). Then
         (2026-10-23) a capture's region at the top of `PROGRAMS` and its products' `B` rings past `DATA` (P1-P3, opt-in,
         `TT_TRACE_ARENA=1`: 16.78 / 18.15 ms, unchanged), and idle units taking a second job's `B` in a second ring (R2,
-        opt-in, `TT_PREFETCH_SECOND=1`): bit for bit, but **slower**, 17.18 / 18.54 ms (`1792723098`): `gate|up`'s span
+        opt-in, `TT_PREFETCH_SECOND=1`, since retired, F4a.3): bit for bit, but **slower**, 17.18 / 18.54 ms (`1792723098`): `gate|up`'s span
         is its busy units' column count, which 40 more columns on idle units do not lower. **Room for `B` is not what
         binds the window now**; the firmware half (R3-R4) is not built on that evidence. Next: what the profile points at,
         a product's longest unit (the column deal) and the aggregate rate inside its span. `gamma`'s product is
@@ -482,7 +482,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         often as the layer was. Not the default; its Phase 5 (the body resident in L1) is worth at most the ~0.23 ms of
         fetches and is not built. **A product's longest unit, metered** (2026-10-23, gates `step216`, `step205`): each unit's
         bytes in a product's span against its time (`skew.tsv`). `gate|up`'s units 0-47 read 5 columns in its span while
-        its 40 prefetching units finish in 13 us; dealing those columns over all 104 (opt-in, `TT_BALANCED_DEAL=1`) is bit
+        its 40 prefetching units finish in 13 us; dealing those columns over all 104 (opt-in, `TT_BALANCED_DEAL=1`, since retired, F4a.3) is bit
         for bit but **not faster** (16.81 / 18.21 -> 16.86 / 18.21 ms, `1792763914`, `1792764065`): a unit reads slower as
         more read, so the span's aggregate rate (~350-390 GB/s) does not move, and the head is slower (830 -> 925 us).
         The longest unit does not bind; `down`'s firmware stream cap is not built on that evidence. Phase 8's levers are
@@ -849,6 +849,9 @@ The staged work is [dataflow-compiler.md](dataflow-compiler.md), on branch `trac
     +0.03 / +0.06 ms, opt-in (`TT_EDGE_CREDITS`); the handoff, the second prefetched job and the balanced deal not
     faster, retired. Close 10.98 / 12.18 against 11.01 / 12.16 ms. The tails are the products' slowest units, not a
     gap reads ahead or credits fill: the lever left is per-unit work balance (F5, F6).
+  - Credits on Qwen3.5-4B's traced generation (2026-10-31, card 1, [log](../learnings/performance-log.md#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1)): decode
+    unchanged (64.2 / 64.7 ms), prefill 1.4% faster, bit for bit; still opt-in. Their build check was quadratic in a
+    trace's runs (a Qwen3.5 build past 40 minutes) and is now linear.
 - [x] **F5:** `Dst` subblocks and half-sync (H2), closed 2026-10-30: **neither H2's prediction (1.4x) nor its kill
   (<1.1x)**, the default, bit for bit (lane B, card 0; [log](../learnings/performance-log.md#f5-dst-subblocks-and-half-sync-2026-10-30-card-0)).
   - Up to four FP32 tiles a `Dst` half, math and pack on alternate halves, `A` held in `SrcB` (`tile_op::dst`, gate

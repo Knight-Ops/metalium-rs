@@ -189,6 +189,8 @@ Left:
   and each takes 5-7 minutes and 26-40 GB of host memory. They are run by name when this work is tested:
   `cargo xtask silicon --release --device 0 --filter step260_qwen35` (and `step261_gemma4`, `step262_moss_image`),
   each inside a memory cap (`systemd-run --user --scope -p MemoryMax=40G`) so a host-memory fault stays in its run.
+  `step263_qwen35_traced` is under the same decision, and needs `--timeout-secs 2400` (its traces take 10-25 minutes
+  to build).
 - **Under F4a and F5** (merged tree `68a0463`, card 0, 2026-10-30): `step262_moss_image` (`1793400458`) and
   `step261_gemma4` (`1793400112`) print the figures they printed before both, digit for digit; `step260_qwen35`
   (`1793399450`, F32 and BF16-stored weights) prints 7.7931e-2 of 33.1234, the figure the F32 tied head's
@@ -233,3 +235,6 @@ Left:
     ~25 of its ~34 ops a step, a new SFPU op by `new-op-definition-of-done.md`); a BF16 copy of the tied head
     (2.5 GB of F32 table read a step, ~5 ms at the bandwidth; 1.3 GB more GDDR); the capture's host cost; the
     DeltaNet's chunked (WY) prefill (a 256-token prompt takes 5.0 s traced).
+  - Measured since (2026-10-31, card 1, merged F4a/F5 tree): 64.28 / 64.65 ms (`1793409872`); F4a.1's edge credits
+    (`TT_EDGE_CREDITS=4`, opt-in) leave the decode unchanged and make the prefill 1.4% faster (3,709 -> 3,656 ms for 256
+    tokens; [log](../learnings/performance-log.md#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1)).
