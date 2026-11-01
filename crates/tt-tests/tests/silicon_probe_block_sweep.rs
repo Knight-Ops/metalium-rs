@@ -53,9 +53,11 @@ fn values(n: usize, seed: usize) -> Vec<f32> {
 /// The grid. At H1's shape every format's fastest blocks streamed `K` 4 to 8 tiles a chunk with
 /// sides of 5 to 12, and no block with `kq = 1` or a side of 1 or 2 came within 30% of them
 /// (`1793285475`); the grid keeps a margin around that.
-const MBS: [usize; 10] = [2, 3, 4, 5, 6, 7, 8, 10, 12, 16];
-const KQS: [usize; 7] = [2, 3, 4, 6, 8, 12, 16];
-const NBS: [usize; 13] = [3, 4, 5, 6, 8, 9, 10, 12, 14, 16, 18, 20, 24];
+// One-row blocks and one- and two-column ones for short chunks' products (2-8 tile rows, H14:
+// unprofiled, a 64-row `down` measured `[1, 5, 2]` and `o` `[1, 4, 2]`, `1793472869`).
+const MBS: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16];
+const KQS: [usize; 8] = [2, 3, 4, 5, 6, 8, 12, 16];
+const NBS: [usize; 15] = [1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 14, 16, 18, 20, 24];
 
 /// `TT_SWEEP_FORMATS` (`fp32,bf16,bfp8,bfp4,bfp2`, any of them; default all): the `B` formats a
 /// run sweeps, so one format a run stays inside a bench's time limit.

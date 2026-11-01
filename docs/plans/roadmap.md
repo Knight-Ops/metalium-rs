@@ -895,16 +895,25 @@ literature, are in the [design reference](../learnings/dataflow-compiler.md) §1
 - the F1 entry is corrected (decode products are bound by reads, not by unpack and math).
 
 Ranked, in the order to work them (review's suggestion, 2026-10-31):
-- [ ] **1. Short prefill chunks: products on too few units.** Profiled whole 2026-10-31
-  ([log](../learnings/performance-log.md#a-64-token-prefill-chunk-its-products-on-8-47-units-2026-10-31-card-1)).
-  - *The bound:* a 1.7B 64-token chunk is 45.9 ms on the card, 79% of it products, at 167 GB/s. `o` runs on 8 units,
-    `qkv` 16, `down` 32, `gate|up` 47. A layer's products take 1.50 ms against 0.27 ms for their weights at 512 GB/s,
-    and `down` re-reads its 2 MB FP32 `A` 34 times.
-  - *First check:* whether these captured `m = 64` products ran a measured winner (`tensor::measured_choice`) or
-    `Auto`'s block.
-  - *The work:* a block choice for small `m` that weighs the units it leaves idle against the GDDR rate they give up
-    (narrower blocks, `A` pulled from a few holders). It keeps `K` order, so it is bit for bit. Sweep `m` = 64-256 as
-    F4b.2 swept `m` ≥ 512, and add the winners to `MEASURED_BLOCKS`.
+- [x] **1. Short prefill chunks: products on too few units** (H14), closed 2026-10-31
+  ([log](../learnings/performance-log.md#h14-short-chunks-products-and-the-profile-modes-measured-blocks-2026-10-31-cards-0-and-1)).
+  - *The first check found the profile mode's own schedule.* Under `--profile` a measured block choice timed its
+    replays with their stamps and drains, so the profiled chunk (`1793466727`) ran the 8-47 units it chose;
+    unprofiled, the same products ran on 64 units, and its 36.2 ms of products are ~20.3 ms. Fixed:
+    `Session::unprofiled` suspends the profile mode around a measurement, and a failed measurement now says so
+    (gate `silicon_profile_mode`, card 0). Profiles since F4b.2 of captures with products of two rows or more
+    (prefill chunks, ViT-Tiny, ResNet-18) measured other blocks; decode profiles stand.
+  - *H14:* the climb from `Auto`'s block stopped at `K` chunks of 4-5, and no listed block fit below four rows. Swept at
+    64-256 rows (the 1.7B, Qwen3.5-4B's MLP): `tensor::SHORT_MEASURED_BLOCKS`, eleven blocks for products of at most
+    eight tile rows. The 1.7B's 64-row products 1.19x, prefill **1.11x** at 64 / 256 tokens (29.63 / 124.03 ms),
+    decode unchanged, bit for bit (card 1, `1793477637`; gates `step245`, `step229`, `step187`, `step12_mnist` on
+    card 0, `1793477869`). Kill not fired; the prediction, set on the profile's numbers, missed.
+    On the default buckets (64 / 128 / 256), A/B/A with tokens checked: prefill at 32 / 128 / 256 tokens 1.10 /
+    1.08 / 1.04x (`1793477910`, `1793479849`, `1793480541`); `--smoke` on card 0 1,272 of 1,272 (`1793478095`).
+  - *Left:* the products still run on 64 of 120 units at ~190 GB/s, and `down` re-reads its FP32 `A` once a
+    block; BF16 activations (item 7, H13) halve that `A`.
+  - *Found, not located:* before the list, prefill at 128 / 256 tokens had drifted 15-21% below F4b.2's 2,778 /
+    3,335 tokens/s (2,370 / 2,629); 32 tokens had not.
 - [ ] **2. A decode product's pipeline, metered from inside.**
   - *The bound:* H11's bound (`1793463838`, [log](../learnings/performance-log.md#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1)):
     today's deal reads ~499 GB/s evenly on 96 units with nothing else running, so the products' 233-306 GB/s in their

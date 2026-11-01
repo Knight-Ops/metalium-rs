@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [H14: short chunks' products, and the profile mode's measured blocks](#h14-short-chunks-products-and-the-profile-modes-measured-blocks-2026-10-31-cards-0-and-1) | 2026-10-31 | the profile mode timed measured blocks with its own stamps and chose 8-47 units where the default build runs 64 (fixed: `Session::unprofiled`); short-chunk blocks listed: the 1.7B's 64-row products 1.19x, prefill 1.11x at 64 / 256 tokens, decode unchanged; H14's kill does not fire, its prediction (set on the profile's numbers) is missed |
 | [F4b's leftovers: the batched pull bounded, the eager slowdown located](#f4bs-leftovers-the-batched-pull-bounded-the-eager-slowdown-located-2026-10-31-card-0) | 2026-10-31 | attention's batched products with `A`'s re-reads made free: the 1.7B prefill 0.4 / 0.7 / 2.0% faster at 256 / 1,000 / 7,992 tokens (every `A` read free 3.4 / 4.9 / 9.8%), so the batched pull is not built; the eager product's 3-12% after a measured, pulled capture is all in its host build (`lower::jobs` 10.8 -> 11.4-12.1 ms) and follows the memory the measurement leaves live (+85 MB), not the trace or the device |
 | [A 64-token prefill chunk: its products on 8-47 units](#a-64-token-prefill-chunk-its-products-on-8-47-units-2026-10-31-card-1) | 2026-10-31 | 1.7B `Chunk { c: 64 }` profiled whole: 45.9 ms on the card, products 36.2 (79%) at 167 GB/s; `o` on 8 units, `qkv` 16, `down` 32, `gate|up` 47; a layer's products 1.50 ms against 0.27 at 512 GB/s; `down` re-reads its 2 MB `A` 34 times |
 | [Qwen3.5-4B's decode step profiled whole, but for nine ops](#qwen35-4bs-decode-step-profiled-whole-but-for-nine-ops-2026-10-31-card-1) | 2026-10-31 | 1,071 of 1,080 ops stamped: 44.0 ms on the card against 64.28 host-timed; the head 5.37 ms at 481 GB/s (a BF16 copy saves ~2.7, not 5); weight products 19.5 ms at 380 GB/s; 776 other ops 16.8 ms; ~20 ms unattributed, ops 1048-1056 never stamped |
@@ -400,6 +401,105 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## H14: short chunks' products, and the profile mode's measured blocks (2026-10-31, cards 0 and 1)
+
+Roadmap Track 2 follow-ups item 1 ([design reference](dataflow-compiler.md) §13, H14). The
+[64-token chunk's profile](#a-64-token-prefill-chunk-its-products-on-8-47-units-2026-10-31-card-1) put its
+products on 8-47 units. Its first check, whether those products ran a measured winner or `Auto`'s
+block, found that **the profile mode was measuring a different schedule from the one the default
+build runs**.
+
+**The profile mode chose its own blocks.** `print_measured` in the generation benches reports each
+product question's choice. The 1.7B (BF16 weights, chunks of 64, 120 units, card 1):
+
+| product | tiles | unprofiled (`1793472869`) | under `--profile` (`1793473164`) |
+|---|---|---|---|
+| `o` | [2, 64, 64] | `[1,4,2]`, 64 blocks; `Auto` 155.0, chosen 98.1 us | `[2,4,8]`, **8 blocks**; `Auto` 20,694, chosen 2,326 us |
+| `qkv` | [2, 64, 192] | `[2,4,3]`, 64; 191.0 / 144.0 us | `[2,4,12]`, **16**; 24,134 / 4,491 us |
+| `gate\|up` | [2, 64, 512] | `[2,4,8]`, 64; 310.6 / 232.0 us | `[2,4,11]`, **47**; 19,784 / 11,615 us |
+| `down` | [2, 256, 64] | `[1,5,2]`, 64; 614.2 / 371.6 us | `[2,2,2]`, **32**; 0.0 / 0.0 us |
+
+- A measurement (`Session::measure_product`) times replays. Under the profile mode each replay also
+  paid its stamps, drains and attribution, so the times were the profiler's (`down`'s difference of
+  two traces came out negative and clamped to zero). They chose exactly the 8 / 16 / 47 / 32 units
+  the profile reported.
+- So **the chunk profile `1793466727` measured blocks the default build never runs**: its 36.2 ms of
+  products and 167 GB/s are the profile's, not the model's. Unprofiled, the 64-token prefill is
+  32.97 ms host-timed, and a layer's four products 846 us (20.3 ms a chunk).
+- Affected: any profile, since F4b.2 made measured blocks the default (2026-10-29), of a capture
+  holding products of two tile rows or more (prefill chunks, ViT-Tiny, ResNet-18). Decode
+  products are one row and ask no question, so the decode profiles (H11, F6.0, Qwen3.5's step)
+  stand.
+- **Fixed:** `Session::unprofiled` suspends the profile mode (or a bare profile) around a
+  measurement: what was stamped is drained first, nothing the measurement runs is stamped, synced
+  op by op or attributed, and every unit stamps again after it. A measurement that fails now says
+  so and names the product, where it fell back to `Auto`'s block silently. Gate
+  `silicon_profile_mode::a_measured_block_choice_times_what_an_unprofiled_build_runs` (card 0,
+  `--feature profile`, `1793473921`, 5 of 5 in the file): `Auto`'s block of a 64-row product 159.5
+  us unprofiled, 159.2 profiled, the same choice `[1,4,2]`; its control
+  (`session::probe_profiled_measurement`, stamped as before) 16,190 us and `[2,4,8]`.
+
+**H14: the kill does not fire; the prediction, set against the profile's numbers, is missed.**
+- *Why the measured choice stopped short:* every `MEASURED_BLOCKS` entry is four rows or more and
+  `block_stream_fits` refuses a block taller than the product, so a 64-row product timed only
+  `Auto`'s block (pulled and not) and a climb from it. The climb stops at `K` chunks of 4-5.
+- *The sweep* (`silicon_probe_block_sweep`, card 1, BF16 `B`, its grid widened to one-row blocks,
+  one- and two-column ones and `kq = 5`): the 1.7B's four products at 64, 128 and 256 rows
+  (`1793473918`, `1793474596`; the latter cut by the bench limit in Qwen3.5's `down`) and Qwen3.5-4B's
+  `gate|up` and `down` at 64 and 128 (`1793475537`, `1793475578`, `1793475681`). Short products
+  stream `K` 8-16 tiles a chunk; `A` pulled never wins at 64 rows (`o`'s best, `[1,16,2]`, takes
+  110.8 us pulled against 68.7). Within the 64-row sweep, today's choices against the best:
+
+  | product | today's choice | best | gain |
+  |---|---|---|--:|
+  | `o` | `[1,4,2]` 98.9 us | `[1,16,2]` 68.7 | 1.44x |
+  | `qkv` | `[2,4,3]` 134.7 | `[2,8,3]` 119.7 | 1.13x |
+  | `gate\|up` | `[2,4,8]` 225.5 | `[2,8,8]` 220.8 | 1.02x |
+  | `down` | `[1,5,2]` 376.1 | `[1,16,2]` 281.6 | 1.34x |
+  | a layer | 835.2 | 690.8 | **1.21x** (kill < 1.1x) |
+
+- *Built:* `tensor::SHORT_MEASURED_BLOCKS`, eleven blocks timed after `MEASURED_BLOCKS` for products
+  of at most eight tile rows (`SHORT_ROWS`), chosen as F5 chose the list: the fewest that, with
+  `Auto`'s own, come within 4% of every sweep's best (all 16 within 1.4%). Products of more rows
+  time what they timed before. Gate `step245_measured_block` (a 64-row shape; ttsim, its control
+  the list emptied: only `Auto`'s `[2,2,2]` is offered).
+- *End to end* (card 1, `TT_TILES=all`, BF16 weights, chunks of 64, 512-position cache; `1793472869`
+  before, `1793477637` after, the trees differing by the list and the profile fix):
+
+  | | before | after | |
+  |---|--:|--:|--:|
+  | `o` | 98.1 us | 73.5 `[1,16,2]` | 1.33x |
+  | `qkv` | 144.0 | 123.3 `[2,12,4]` | 1.17x |
+  | `gate\|up` | 232.0 | 222.8 `[2,12,9]` | 1.04x |
+  | `down` | 371.6 | 291.6 `[1,16,2]` | 1.27x |
+  | 64-token prefill | 32.97 ms | **29.63** | 1.11x |
+  | 256-token prefill | 137.31 | **124.03** | 1.11x |
+  | decode step at 64 / 256 | 11.08 / 12.16 | 11.05 / 12.14 | unchanged |
+
+- *A/B/A on the default buckets* (card 1, `silicon_bench_models::traced_generation`, chunks of 64,
+  128 and 256, tokens checked against the eager schedule and the logits path every run; `B` this
+  tree with the short list emptied): `1793477910` / `1793479849` / `1793480541`.
+
+  | prefill | list | no list | list again | |
+  |---|--:|--:|--:|--:|
+  | 32 tokens (a 64-row chunk) | 1,077 tokens/s | 973 | 1,074 | 1.10x |
+  | 128 tokens | 2,590 | 2,370 | 2,533 | 1.08x |
+  | 256 tokens | 2,733 | 2,629 | 2,725 | 1.04x |
+  | 64 / 256 tokens in chunks of 64 | 29.1 / 122.0 ms | 33.0 / 137.0 | 29.2 / 122.7 | 1.13x / 1.12x |
+  | decode step at 32 / 128 / 256 | 10.84 / 11.38 / 12.14 ms | 10.88 / 11.51 / 12.19 | 10.96 / 11.46 / 12.14 | unchanged |
+
+- *Found, not located:* without the list, prefill at 128 / 256 tokens is 2,370 / 2,629 tokens/s against
+  2,778 / 3,335 on 2026-10-29 (F4b.2, `1793299689`-`1793302179`); 32 tokens is unchanged (973 against
+  972). Something between F4b.2 and this tree costs the 128- and 256-row chunks 15-21%.
+- Closing checks: `--smoke` on card 0, 1,272 of 1,272 (`1793478095`); `step245`, `step229`, `step187`,
+  `step12_mnist` 28 of 28 (`1793477869`).
+- *Against the prediction:* it was written against the profile's 36.2 ms of products on 8-47
+  units (≥ 1.5x on them, ≥ 1.35x on the chunk). Against the real 20.3 ms on 64 units, products
+  gain 1.19x and prefill 1.11x (the prediction's 1.15x at 256 tokens is missed too).
+- *What is left:* the products still read 134 MB of weights a layer at ~190 GB/s, on 64 of 120
+  units (each product's blocks are 64, a power of two the grid does not divide), and `down`
+  re-reads its FP32 `A` row once a block. BF16 activations (H13) halve that `A`.
+
 ## F4b's leftovers: the batched pull bounded, the eager slowdown located (2026-10-31, card 0)
 
 The roadmap's "F4b's leftovers", bounded before any build ([plan record](../plans/roadmap.md), Track 2). Card 0 only,
@@ -488,6 +588,7 @@ silicon_bench_models::traced_generation_stream_ceiling` (run `1793466727`, safe 
     products ran a measured winner (`tensor::measured_choice`) or `Auto`'s block. Either way, the choice did not
     weigh the units it leaves idle against the GDDR rate they give up.
 - The host-timed prefill under the profile image is not comparable (143 ms, the image's stamps).
+- **Corrected the same day:** these products ran the blocks the profile mode's own measurement chose, not the default build's ([H14](#h14-short-chunks-products-and-the-profile-modes-measured-blocks-2026-10-31-cards-0-and-1)); unprofiled, they ran on 64 units, a layer's products 846 us.
 
 ## Qwen3.5-4B's decode step profiled whole, but for nine ops (2026-10-31, card 1)
 

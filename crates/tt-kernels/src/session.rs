@@ -261,6 +261,17 @@ pub fn probe_pause_unrebased(on: bool) {
     PROBE_PAUSE_UNREBASED.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+static PROBE_PROFILED_MEASUREMENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A negative control (roadmap Track 2 follow-ups, H14): with it on, a measured block choice
+/// ([`Session::measure_product`]) times its candidates with the profile mode still stamping
+/// ([`Session::unprofiled`] does not suspend it), as before 2026-10-31. Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_profiled_measurement(on: bool) {
+    PROBE_PROFILED_MEASUREMENT.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 static PROBE_STALE_B: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A negative control (`docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`"):
@@ -9584,61 +9595,138 @@ impl<T: Transport> Session<T> {
             return;
         };
         let scores = self.block_scores;
+        // Unprofiled: the profile mode's stamping and syncs would be what is timed.
         let timed = self.paused(|s| {
-            // Copies enough that a candidate's trace runs ~[`MEASURE_SPAN_US`]: a small product's
-            // differences are otherwise inside a replay's noise.
-            let kept = (s.block_stream, s.reuse);
-            s.block_stream = tensor::BlockStream::Fixed(first.block);
-            let single = s
-                .set_operand_reuse(first.reuse)
-                .and_then(|()| s.replay_time(a, b, route, fidelity, budget, 1));
-            s.block_stream = kept.0;
-            s.set_operand_reuse(kept.1)?;
-            let copies = single.map_or(1, |us| {
-                ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
-            });
-            // Each candidate, its score and its time, us.
-            type Timed = Vec<(tensor::BlockChoice, f64, f64)>;
-            let mut timed: Timed = Vec::new();
-            let time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
-                if timed.len() >= MEASURE_MOST || timed.iter().any(|(t, ..)| *t == c) {
-                    return Ok(());
+            s.unprofiled(|s| {
+                // Copies enough that a candidate's trace runs ~[`MEASURE_SPAN_US`]: a small product's
+                // differences are otherwise inside a replay's noise.
+                let kept = (s.block_stream, s.reuse);
+                s.block_stream = tensor::BlockStream::Fixed(first.block);
+                let single = s
+                    .set_operand_reuse(first.reuse)
+                    .and_then(|()| s.replay_time(a, b, route, fidelity, budget, 1));
+                s.block_stream = kept.0;
+                s.set_operand_reuse(kept.1)?;
+                let copies = single.map_or(1, |us| {
+                    ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
+                });
+                // Each candidate, its score and its time, us.
+                type Timed = Vec<(tensor::BlockChoice, f64, f64)>;
+                let mut timed: Timed = Vec::new();
+                let time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
+                    if timed.len() >= MEASURE_MOST || timed.iter().any(|(t, ..)| *t == c) {
+                        return Ok(());
+                    }
+                    let fixed = tensor::BlockStream::Fixed(c.block);
+                    let us =
+                        s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
+                    timed.push((c, scores.map_or(us, |f| f(c.block, c.reuse, us)), us));
+                    Ok::<(), TensorError>(())
+                };
+                let best = |timed: &[(tensor::BlockChoice, f64, f64)]| {
+                    timed
+                        .iter()
+                        .copied()
+                        .min_by(|x, y| x.1.total_cmp(&y.1))
+                        .expect("one timed")
+                };
+                for &c in &candidates {
+                    time(s, &mut timed, c)?;
                 }
-                let fixed = tensor::BlockStream::Fixed(c.block);
-                let us = s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
-                timed.push((c, scores.map_or(us, |f| f(c.block, c.reuse, us)), us));
-                Ok::<(), TensorError>(())
-            };
-            let best = |timed: &[(tensor::BlockChoice, f64, f64)]| {
-                timed
-                    .iter()
-                    .copied()
-                    .min_by(|x, y| x.1.total_cmp(&y.1))
-                    .expect("one timed")
-            };
-            for &c in &candidates {
-                time(s, &mut timed, c)?;
-            }
-            // Climb: from the fastest so far, one step at a time, while a step gains.
-            let mut at = best(&timed);
-            loop {
-                for n in tensor::block_stream_neighbours(&q, at.0, pull) {
-                    time(s, &mut timed, n)?;
+                // Climb: from the fastest so far, one step at a time, while a step gains.
+                let mut at = best(&timed);
+                loop {
+                    for n in tensor::block_stream_neighbours(&q, at.0, pull) {
+                        time(s, &mut timed, n)?;
+                    }
+                    let next = best(&timed);
+                    if next.1 >= at.1 * (1.0 - MEASURE_GAIN) {
+                        break;
+                    }
+                    at = next;
                 }
-                let next = best(&timed);
-                if next.1 >= at.1 * (1.0 - MEASURE_GAIN) {
-                    break;
-                }
-                at = next;
-            }
-            let chosen = best(&timed);
-            Ok::<_, TensorError>((chosen.0, [timed[0].2, chosen.2]))
+                let chosen = best(&timed);
+                Ok::<_, TensorError>((chosen.0, [timed[0].2, chosen.2]))
+            })
         });
-        let (choice, times) = match timed {
-            Ok(Ok((c, t))) => (c, Some(t)),
-            _ => (first, None),
+        let (choice, times) = match timed.and_then(|r| r).and_then(|r| r) {
+            Ok((c, t)) => (c, Some(t)),
+            Err(e) => {
+                // Not silent: the product then runs `Auto`'s block for the rest of the process.
+                eprintln!(
+                    "TT_MATMUL_BLOCK=measured: {:?} on {} units not measured ({e}); it runs \
+                     Auto's block {:?}",
+                    q.tiles, q.units, first.block
+                );
+                (first, None)
+            }
         };
         tensor::note_measured(q, Some(choice), times);
+    }
+
+    /// Run `f` with the profile mode, or a bare profile, suspended: nothing `f` runs is stamped,
+    /// synced op by op or attributed, so what `f` times is what an unprofiled build runs. A
+    /// measured block choice ([`Session::measure_product`]) times replays: under the profile
+    /// mode each replay paid its stamping and its drains, and the times chose blocks the default
+    /// build never runs (2026-10-31, card 1: a 64-row `o` timed at 20.7 ms for `Auto`'s block
+    /// and 2.3 ms for one of 8 units, where unprofiled it is 155 against 98 us on 64 units, runs
+    /// `1793473164` and `1793472869`). What was stamped before `f` is drained into the profile
+    /// first; each unit's stream starts empty after it. The firmware's own `profile` build stays.
+    fn unprofiled<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Result<R, TensorError> {
+        if (self.profiler.is_none() && self.profiling.is_none())
+            || PROBE_PROFILED_MEASUREMENT.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(f(self));
+        }
+        self.sync()?;
+        for u in 0..self.units.len() {
+            self.drain(u)?;
+        }
+        self.profile_collect();
+        let trace_word = self.trace_word();
+        let profiler = self.profiler.take();
+        let profiling = self.profiling.take();
+        let stamping = |s: &mut Self, on: bool| -> Result<(), TensorError> {
+            let (buffer, bytes) = s.profile_buffer;
+            let (roles, push) = (
+                s.profile_roles,
+                profiler.as_ref().is_some_and(|p| p.options.push),
+            );
+            let Session { dev, units, .. } = s;
+            for unit in units.iter_mut() {
+                let Some(r) = unit.resident.as_mut() else {
+                    continue;
+                };
+                r.set_profiling(on);
+                if on {
+                    dev.configure_trace(r.window(), unit.tile, buffer, bytes)?;
+                    r.set_profile_roles(roles);
+                    r.set_profile_push(push);
+                }
+                if unit.mover.is_some() {
+                    dev.write32(
+                        r.window(),
+                        unit.tile,
+                        tt_isa::dm::TRACE,
+                        if on { trace_word } else { 0 },
+                    )?;
+                    dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
+                }
+            }
+            Ok(())
+        };
+        let off = stamping(self, false);
+        let out = off.map(|()| f(self));
+        // What `f` queued finishes before stamping resumes, and every unit started meanwhile
+        // stamps too.
+        let synced = self.sync();
+        let on = stamping(self, true);
+        self.profiler = profiler;
+        self.profiling = profiling;
+        let out = out?;
+        synced?;
+        on?;
+        Ok(out)
     }
 
     /// Run `f` with the capture in progress, if any, paused: what `f` runs is not captured, and

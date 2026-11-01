@@ -826,6 +826,33 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
   - *Prior art:* tt-metal's prefill runs BF16 activations, `packer_l1_acc`, HiFi2 (FP32 accumulation kept for `O`),
     and LoFi for BFP4 MLP weights (`models/tt_transformers/tt/model_config.py`). Thinking Machines and SGLang show a
     deterministic contract costs ~20-35% on GPUs, against a default that is not deterministic at all.
+- **H14 Short-chunk products over the grid** (opened 2026-10-31, roadmap Track 2 follow-ups item 1).
+  - *Claim:* a short prefill chunk's products (2-8 tile rows) are bound by the units their blocks occupy, not by
+    compute or GDDR. Narrower blocks, and `A` pulled from a few holders (D5), spread them over the grid at the same
+    `K` order, so bit for bit.
+  - *Why it is open:* the 1.7B's 64-token chunk ran `o`, `qkv`, `down` and `gate|up` on 8, 16, 32 and 47 units
+    (`1793466727`): `nt / nb` with `mb = mt = 2`, block-stream blocks a unit each. Every `MEASURED_BLOCKS` entry
+    has `mb ≥ 4`, and `block_stream_fits` refuses `mb > mt`, so below 128 rows the measured choice times only
+    `Auto`'s block and a one-step climb from it.
+  - *Measured by:* `silicon_probe_block_sweep` at the products' shapes for `m` = 64-256 against the choice the
+    capture made (`print_measured` in the generation benches), then the profiled chunk and prefill on the card.
+  - *Prediction:* the chunk's products 36.2 -> ≤ 24 ms (≥ 1.5x), the 64-token chunk on the card 45.9 -> ≤ 34 ms;
+    1.7B prefill at 256 / 1,000 tokens ≥ 1.15x host-timed.
+  - *Kills it:* the sweep's best blocks at `m = 64`, weighted by a layer's products, < 1.1x over the captured
+    choices.
+  - *Found first (2026-10-31, cards 0 and 1): the "why it is open" was the profile mode's.* Under `--profile` a
+    measured choice timed replays with their stamps and drains, and chose the 8-47 units; unprofiled, the same
+    products ran on 64 units, `Auto`'s block beaten 1.33-1.65x by the climb (`1793472869` against `1793473164`).
+    Fixed (`Session::unprofiled`, gate `silicon_profile_mode`); every profile since F4b.2 of a capture with products
+    of two rows or more measured other blocks than the default build runs.
+  - *Result: the kill does not fire, the prediction is missed.* Against the real choices the sweep's best gain
+    1.21x a 1.7B layer at 64 rows (`1793473918`); the climb stops at `K` chunks of 4-5 where short products stream
+    8-16. `tensor::SHORT_MEASURED_BLOCKS` (eleven blocks, for products of at most eight tile rows, swept over the
+    1.7B at 64-256 rows and Qwen3.5-4B's MLP at 64-128) gives the 1.7B's 64-row products 1.19x and its prefill
+    1.11x at 64 and 256 tokens (32.97 -> 29.63, 137.31 -> 124.03 ms), decode unchanged, bit for bit
+    (`1793477637`). The prediction (≥ 1.5x on products, ≥ 1.15x on prefill) was set on the profile's 36.2 ms of
+    products; the real 20.3 ms left less to gain. `A` pulled never won at 64 rows.
+    ([log](performance-log.md#h14-short-chunks-products-and-the-profile-modes-measured-blocks-2026-10-31-cards-0-and-1))
 
 ---
 
@@ -949,9 +976,7 @@ Each verdict is applied where its section lives; this table is the index.
 
   ~20 ms is in no op's span. The 1.7B's spans sum to its host time, so a replay's own wall time on the card is the
   next meter.
-- A short prefill chunk is its products, on too few units (`1793466727`).
-  - A 1.7B 64-token chunk is 45.9 ms on the card, 79% of it products at 167 GB/s.
-  - `o` runs on 8 units, `qkv` 16, `down` 32 and `gate|up` 47.
-  - H9's block list was swept only at `m` ≥ 512, so the block choice for small `m` should weigh the units it
-    leaves idle. That keeps `K` order, so it is bit for bit.
+- A short prefill chunk is its products, on too few units (`1793466727`). **Corrected (H14):** the 8-47 units were
+  the profile mode's own measured choice; the default build ran them on 64. Short-chunk blocks are now listed
+  (H14, 1.11x prefill at 64-256 tokens).
 - Speculative decode (H12) is the batch-1 lever that spends idle compute.

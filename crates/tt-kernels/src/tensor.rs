@@ -2604,6 +2604,33 @@ pub const MEASURED_BLOCKS: [([usize; 3], bool); 12] = [
     ([4, 4, 18], false),
 ];
 
+/// Products of at most this many tile rows also time [`SHORT_MEASURED_BLOCKS`]: a short prefill
+/// chunk's (64-256 rows).
+pub const SHORT_ROWS: usize = 8;
+
+/// The blocks [`BlockStream::Measured`] times first for a product of at most [`SHORT_ROWS`] tile
+/// rows, after [`MEASURED_BLOCKS`] (H14, `docs/learnings/dataflow-compiler.md` §13): swept with a
+/// BF16 `B` (`silicon_probe_block_sweep`, card 1, 2026-10-31, `1793473918`, `1793474596`,
+/// `1793475537`, `1793475578`, `1793475681`) over the SmolLM2-1.7B's four products at 64, 128 and
+/// 256 rows and Qwen3.5-4B's `gate|up` and `down` at 64 and 128: the fewest blocks that, with
+/// `Auto`'s own, come within 4% of each sweep's best (greedy; every case within 1.4%). Every block
+/// of [`MEASURED_BLOCKS`] is four rows or more, so at 64 rows none fitted and only
+/// `Auto`'s block and a climb from it were timed: the climb stops at `K` chunks of 4-5 where these
+/// stream 8-16, and a 1.7B layer's four 64-row products ran 835 us against these blocks' 691.
+pub const SHORT_MEASURED_BLOCKS: [([usize; 3], bool); 11] = [
+    ([2, 8, 9], false),
+    ([2, 16, 3], false),
+    ([1, 16, 2], false),
+    ([2, 8, 4], false),
+    ([2, 8, 3], false),
+    ([2, 8, 2], false),
+    ([2, 16, 5], false),
+    ([2, 16, 2], false),
+    ([4, 8, 4], false),
+    ([4, 4, 10], false),
+    ([4, 4, 9], true),
+];
+
 /// The sides and `K` chunks a measured climb steps between ([`block_stream_neighbours`]).
 const MEASURE_SIDES: [usize; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 24];
 const MEASURE_KQS: [usize; 9] = [1, 2, 3, 4, 5, 6, 8, 12, 16];
@@ -2621,8 +2648,8 @@ fn choice(block: [usize; 3], pulled: bool, pull: Option<Reuse>) -> Option<BlockC
 }
 
 /// What [`BlockStream::Measured`] times first for `q`: [`BlockStream::Auto`]'s block, unpulled
-/// and pulled, then [`MEASURED_BLOCKS`], each `kq` the longest at most its own whose chunks a
-/// job are even here, those that fit ([`block_stream_fits`]). A pulled one runs with `pull`
+/// and pulled, then [`MEASURED_BLOCKS`] (and [`SHORT_MEASURED_BLOCKS`] for a short chunk's),
+/// each `kq` the longest at most its own whose chunks a job are even here, those that fit ([`block_stream_fits`]). A pulled one runs with `pull`
 /// (`None`: the session shares nothing, and none is pulled). Empty where `Auto` blocks nothing:
 /// the other paths run, measured or not.
 pub fn block_stream_candidates(q: &BlockQuestion, pull: Option<Reuse>) -> Vec<BlockChoice> {
@@ -2637,8 +2664,14 @@ pub fn block_stream_candidates(q: &BlockQuestion, pull: Option<Reuse>) -> Vec<Bl
         return Vec::new();
     };
     let kt = q.tiles[1];
+    let short: &[([usize; 3], bool)] = if q.tiles[0] <= SHORT_ROWS {
+        &SHORT_MEASURED_BLOCKS
+    } else {
+        &[]
+    };
     let listed = MEASURED_BLOCKS
         .iter()
+        .chain(short)
         .filter_map(|&([mb, kq, nb], pulled)| {
             even_chunks(kt, kq)
                 .filter(|&k| k <= kq)

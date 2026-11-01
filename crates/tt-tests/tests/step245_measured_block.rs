@@ -210,8 +210,14 @@ fn modelled<T: tt_device::Transport>(s: &mut Session<T>) {
     s.probe_block_scores(None);
 }
 
-/// Products `Auto` blocks with several candidates on eight units, ragged ones among them.
-const SHAPES: [[usize; 3]; 3] = [[256, 512, 512], [300, 320, 416], [128, 768, 512]];
+/// Products `Auto` blocks with several candidates on eight units, ragged ones among them, and a
+/// short prefill chunk's (two tile rows, H14), whose listed blocks must include narrow ones.
+const SHAPES: [[usize; 3]; 4] = [
+    [256, 512, 512],
+    [300, 320, 416],
+    [128, 768, 512],
+    [64, 512, 512],
+];
 
 /// [`chain`]'s product: blocked with four candidates on eight units, and the residency planner
 /// keeps some of the chain in L1 (it keeps nothing of `SHAPES[0]`'s).
@@ -228,6 +234,14 @@ fn a_measured_product_runs_its_chosen_candidate_bit_for_bit_and_times_once() {
             modelled(s);
             let want = product(s, &a, &b);
             let (q, listed) = measuring(s, &a, &b).expect("a blocked product");
+            if q.tiles[0] <= 2 {
+                // H14: past `Auto`'s own two, a block no taller than the product (none of the
+                // list before was below four rows, so a short chunk timed only `Auto`'s).
+                assert!(
+                    listed.iter().skip(2).any(|c| c.block[0] <= q.tiles[0]),
+                    "{what}: no listed block for a short chunk: {listed:?}"
+                );
+            }
             let before = scored().len();
             // Eager: `Auto`'s block, nothing timed.
             same(&product(s, &a, &b), &want, &format!("{what}, eager"));

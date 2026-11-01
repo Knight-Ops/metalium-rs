@@ -1128,6 +1128,8 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
             "host",
             Stats::of([ms(t0.elapsed())]),
         );
+        // Which block each product question chose in the build (roadmap Track 2 follow-up 1, H14).
+        print_measured(&format!("{name} traced generation ({traces})"));
         // What the traces hold together: the program cache bounds which chunk sizes fit.
         for set in g.footprint().unwrap() {
             let (held, size) = set.cache_held_bytes();
@@ -1468,6 +1470,8 @@ fn traced_generation_stream_ceiling() {
         };
         drop(build("first"));
         let g = build("second");
+        // Which block each product question chose in the builds (roadmap Track 2 follow-up 1, H14).
+        print_measured(&format!("{name} stream ceiling ({tag})"));
         let prompts: Vec<usize> = std::env::var("TT_GEN_PROMPTS").map_or(vec![32, 256], |v| {
             v.split(',').map(|n| n.trim().parse().unwrap()).collect()
         });
@@ -1594,6 +1598,8 @@ fn qwen35_traced_generation_on<B: tt_models::generate::TracedBackend>(suffix: &s
             "host",
             Stats::of([ms(t0.elapsed())]),
         );
+        // Which block each product question chose in the build (roadmap Track 2 follow-up 1, H14).
+        print_measured(&format!("{name} traced generation ({traces})"));
         for set in g.footprint().unwrap() {
             let (held, size) = set.cache_held_bytes();
             eprintln!("{traces}: program cache {held} of {size} bytes on the fullest unit");
