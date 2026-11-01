@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The 128 / 256-token prefill drift located: F5's programs paged through the cache](#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1) | 2026-11-01 | F5's subblocked kernel is faster alone (a 256-token chunk 77.9 against 79.8 ms) but its programs do not fit the units' caches beside the generator's other traces: 0.6 / 2.0 MB restored a 128 / 256-token generation, ~8 ms a MB; with `TT_DST_SUBBLOCKS=0` prefill 3,061 / 3,875 tokens/s (F4b.2 2,778 / 3,335); fix open |
 | [H14: short chunks' products, and the profile mode's measured blocks](#h14-short-chunks-products-and-the-profile-modes-measured-blocks-2026-10-31-cards-0-and-1) | 2026-10-31 | the profile mode timed measured blocks with its own stamps and chose 8-47 units where the default build runs 64 (fixed: `Session::unprofiled`); short-chunk blocks listed: the 1.7B's 64-row products 1.19x, prefill 1.11x at 64 / 256 tokens, decode unchanged; H14's kill does not fire, its prediction (set on the profile's numbers) is missed |
 | [F4b's leftovers: the batched pull bounded, the eager slowdown located](#f4bs-leftovers-the-batched-pull-bounded-the-eager-slowdown-located-2026-10-31-card-0) | 2026-10-31 | attention's batched products with `A`'s re-reads made free: the 1.7B prefill 0.4 / 0.7 / 2.0% faster at 256 / 1,000 / 7,992 tokens (every `A` read free 3.4 / 4.9 / 9.8%), so the batched pull is not built; the eager product's 3-12% after a measured, pulled capture is all in its host build (`lower::jobs` 10.8 -> 11.4-12.1 ms) and follows the memory the measurement leaves live (+85 MB), not the trace or the device |
 | [A 64-token prefill chunk: its products on 8-47 units](#a-64-token-prefill-chunk-its-products-on-8-47-units-2026-10-31-card-1) | 2026-10-31 | 1.7B `Chunk { c: 64 }` profiled whole: 45.9 ms on the card, products 36.2 (79%) at 167 GB/s; `o` on 8 units, `qkv` 16, `down` 32, `gate|up` 47; a layer's products 1.50 ms against 0.27 at 512 GB/s; `down` re-reads its 2 MB `A` 34 times |
@@ -401,6 +402,51 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## The 128 / 256-token prefill drift located: F5's programs paged through the cache (2026-11-01, card 1)
+
+H14 found the 1.7B's prefill at 128 / 256 tokens 15-21% below F4b.2's 2,778 / 3,335 tokens/s, with 32 tokens
+unchanged. Every run below: `silicon_bench_models::traced_generation`, card 1, release, every tile, default buckets
+(chunks 64 / 128 / 256, steps 64-512), 64 new tokens, 2 warmups, 9 samples, tokens and logits checked against eager.
+
+**Where it landed.** The bench outputs since F4b.2 put it between `9977ad8` and `3613d8f` (`1793422516`: 2,372 /
+2,747). Chunks of 64 held at ~137 ms for a 256-token prompt in every run, so only the 128- and 256-row chunks lost.
+
+**Which change.** With blocks fixed (`TT_MATMUL_BLOCK=auto TT_OPERAND_REUSE=off`, F4b.2's "A"), first token, ms:
+
+| run | 32 | 128 | 256 tokens |
+|---|--:|--:|--:|
+| F4b.2's A (`1793299689`, `1793302179`) | 43.94 | 53.31 | 79.54 |
+| today (`1793498111`) | 43.71 | 52.91 | **95.48** |
+| today, `TT_READ_AHEAD_EARLY=0` (F4a.2 off, `1793498826`) | 43.70 | 52.94 | 95.52 |
+| today, `TT_DST_SUBBLOCKS=0` (F5 off, `1793499471`) | 44.14 | 53.53 | **79.76** |
+
+The capture's bytes are the same with and without (within 0.7%). F5's subblocked kernel (`c11adfb`) is the change.
+It is not slower: one 256-token chunk alone (`stream_ceiling`, `TT_GEN_CHUNKS=256`) takes **77.93 ms** subblocked and
+79.80 without (`1793501129`, `1793501331`), and profiled its ops sum to 78.24 against 80.01 ms (`1793500187`,
+`1793500637`). It loses only beside the generator's other ten traces.
+
+**The mechanism: program paging.** A unit's program cache (240 KB, `program_cache.rs`) need only hold each trace's
+programs alone; a replay puts back what another trace evicted (`ProgramCache::restore`), on the host, unit by unit,
+before the replay's `CALL`s are queued. The subblocked kernel's programs are larger and specific to a chunk's shape,
+so the generator's traces no longer fit together. New dev-facing counter `burn_tt::probe_restored_bytes`
+(`Session::restored_bytes`), reported a generation:
+
+| blocks | subblocks | restored / first token at 128 | at 256 tokens | run |
+|---|---|--:|--:|---|
+| `Auto` | on | 21,908 B / 52.96 ms | **1,066,016 B / 95.29 ms** | `1793501642` |
+| `Auto` | off | 0 / 53.54 ms | 0 / 79.76 ms | `1793502322` |
+| measured (the default, H14's list) | on | 642,840 B / 50.28 ms | **1,964,548 B / 93.30 ms** | `1793503011` |
+| measured | off | 52,304 B / **41.81 ms** | 92,872 B / **66.06 ms** | `1793503737` |
+
+About 8 ms a MB restored, the card idle meanwhile. The 128-token half of the drift is the same cause under the
+measured blocks: they add programs, and the subblocked ones page. With subblocks off, today's default prefills at
+**3,061 / 3,875 tokens/s** at 128 / 256 tokens (F4b.2: 2,778 / 3,335); 32 tokens and the decode step are unchanged
+(29.79 / 30.05 ms; 10.97 / 10.98 ms). F5's own tables timed single products and one trace, where nothing pages.
+
+**Open:** the fix. Fewer or smaller subblocked programs (a chunk's shape in registers, not in the words), restores
+that do not stall the card (the mover copying programs from GDDR, or uploads batched and overlapped), or a measured
+choice that counts the programs it adds. Until then the default pays 8-27 ms a prefill of 128-256 tokens.
+
 ## H14: short chunks' products, and the profile mode's measured blocks (2026-10-31, cards 0 and 1)
 
 Roadmap Track 2 follow-ups item 1 ([design reference](dataflow-compiler.md) §13, H14). The
@@ -488,9 +534,10 @@ product question's choice. The 1.7B (BF16 weights, chunks of 64, 120 units, card
   | 64 / 256 tokens in chunks of 64 | 29.1 / 122.0 ms | 33.0 / 137.0 | 29.2 / 122.7 | 1.13x / 1.12x |
   | decode step at 32 / 128 / 256 | 10.84 / 11.38 / 12.14 ms | 10.88 / 11.51 / 12.19 | 10.96 / 11.46 / 12.14 | unchanged |
 
-- *Found, not located:* without the list, prefill at 128 / 256 tokens is 2,370 / 2,629 tokens/s against
+- *Found, located the next day:* without the list, prefill at 128 / 256 tokens is 2,370 / 2,629 tokens/s against
   2,778 / 3,335 on 2026-10-29 (F4b.2, `1793299689`-`1793302179`); 32 tokens is unchanged (973 against
-  972). Something between F4b.2 and this tree costs the 128- and 256-row chunks 15-21%.
+  972). It is F5's subblocked programs paging through the program cache
+  ([below](#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1)).
 - Closing checks: `--smoke` on card 0, 1,272 of 1,272 (`1793478095`); `step245`, `step229`, `step187`,
   `step12_mnist` 28 of 28 (`1793477869`).
 - *Against the prediction:* it was written against the profile's 36.2 ms of products on 8-47

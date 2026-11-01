@@ -925,6 +925,14 @@ pub fn probe_captures(device: TtDevice) -> Result<u64, TtError> {
     server::run(device, |e, _| e.probe_captures())
 }
 
+/// Program bytes `device`'s trace replays have put back in the units' program caches since the
+/// session opened (`Session::restored_bytes`): what paging the traces' programs costs a replay
+/// when they do not fit the cache together. Dev-facing.
+#[doc(hidden)]
+pub fn probe_restored_bytes(device: TtDevice) -> Result<u64, TtError> {
+    server::run(device, |e, _| e.probe_restored_bytes())
+}
+
 /// Every unit's NC waits since they were last taken, in tile cycles, zeroed: what B's waits for
 /// its writer core are made of (`tt_kernels::session::Session::probe_nc_waits`; counted only by
 /// firmware built with the profile feature). Dev-facing.

@@ -1207,7 +1207,9 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
             // (`TracedGenerator::generate_tokens`); the logits path's tokens are the check.
             let want = g.generate(&p, new).unwrap().tokens;
             let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
+            let mut restored = Vec::new();
             for i in 0..WARMUPS + SAMPLES {
+                let r0 = burn_tt::probe_restored_bytes(d).unwrap();
                 let t0 = Instant::now();
                 let out = g.generate_tokens(&p, new).unwrap();
                 let all = t0.elapsed();
@@ -1216,9 +1218,18 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
                     first.push(ms(out.times[0]));
                     step.push(median_ms(&out.times[1..]));
                     total.push(ms(all));
+                    restored.push((burn_tt::probe_restored_bytes(d).unwrap() - r0) as f64);
                 }
             }
             let key = format!("{name} generation, {len}-token prompt, {new} tokens ({traces})");
+            // Program bytes the replays put back a generation: the traces' programs paged through
+            // the units' caches when they do not fit together (`Session::restored_bytes`).
+            report(
+                &format!("{key}, restored program bytes a generation, traced"),
+                "bytes",
+                "count",
+                Stats::of(restored),
+            );
             let step_ms = median(&step);
             report(
                 &format!("{key}, prefill, traced"),

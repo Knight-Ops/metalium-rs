@@ -912,8 +912,21 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     1.08 / 1.04x (`1793477910`, `1793479849`, `1793480541`); `--smoke` on card 0 1,272 of 1,272 (`1793478095`).
   - *Left:* the products still run on 64 of 120 units at ~190 GB/s, and `down` re-reads its FP32 `A` once a
     block; BF16 activations (item 7, H13) halve that `A`.
-  - *Found, not located:* before the list, prefill at 128 / 256 tokens had drifted 15-21% below F4b.2's 2,778 /
-    3,335 tokens/s (2,370 / 2,629); 32 tokens had not.
+  - *Found:* before the list, prefill at 128 / 256 tokens had drifted 15-21% below F4b.2's 2,778 /
+    3,335 tokens/s (2,370 / 2,629); 32 tokens had not. Located 2026-11-01: item 1a.
+- [ ] **1a. Prefill: F5's subblocked programs paged through the program cache** (located 2026-11-01,
+  [log](../learnings/performance-log.md#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1)).
+  - *What:* F5's kernel (`c11adfb`) is faster alone (a 256-token chunk 77.9 against 79.8 ms), but its programs are
+    larger and per chunk shape, so the generator's eleven traces no longer fit a unit's 240 KB cache together. Each
+    replay puts back on the host what the others evicted (`ProgramCache::restore`), ~8 ms a MB with the card idle:
+    0.64 / 1.96 MB a 128 / 256-token generation under the default (`1793503011`). With `TT_DST_SUBBLOCKS=0` the
+    default prefills at 3,061 / 3,875 tokens/s against 2,546 / 2,744 (`1793503737`), 32 tokens and decode unchanged.
+  - *The work:* stop the paging without losing F5's gain at long chunks. Candidates: a chunk's shape in registers
+    rather than in the program words (fewer, shared programs); restores that do not stall the card (the mover
+    copying programs from GDDR, or uploads batched and overlapped with the replay before); a measured choice that
+    counts the programs it adds. Meter: `burn_tt::probe_restored_bytes`, reported a generation by the bench.
+  - *Gate for the fix:* restored bytes a generation near 0 on the default buckets, prefill ≥ the subblocks-off figures
+    above, the 7,992-token prefill and H1 not slower than with subblocks on, bit for bit.
 - [ ] **2. A decode product's pipeline, metered from inside.**
   - *The bound:* H11's bound (`1793463838`, [log](../learnings/performance-log.md#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1)):
     today's deal reads ~499 GB/s evenly on 96 units with nothing else running, so the products' 233-306 GB/s in their

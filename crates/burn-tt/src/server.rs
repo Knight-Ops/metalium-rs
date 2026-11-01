@@ -556,6 +556,11 @@ pub trait Engine {
     fn probe_nc_waits(&mut self) -> Result<Vec<[u32; 8]>, TtError> {
         Err(no_traces())
     }
+    /// Program bytes replays have put back in the units' caches (`Session::restored_bytes`).
+    #[doc(hidden)]
+    fn probe_restored_bytes(&mut self) -> Result<u64, TtError> {
+        Err(no_traces())
+    }
     /// Overwrite `input`'s values, replay `trace`, and read `output` back:
     /// one round trip.
     fn run_trace(
@@ -4253,6 +4258,9 @@ impl Engine for KmdEngine {
     }
     fn probe_nc_waits(&mut self) -> Result<Vec<[u32; 8]>, TtError> {
         Ok(self.session.probe_nc_waits()?)
+    }
+    fn probe_restored_bytes(&mut self) -> Result<u64, TtError> {
+        Ok(self.session.restored_bytes())
     }
     fn has_pending_plan(&mut self) -> Result<bool, TtError> {
         Ok(self.session.has_pending_plan())
