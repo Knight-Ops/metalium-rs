@@ -428,6 +428,8 @@ and kernel over time.
 - Safe image: `1793637811` and `1793638678`, which agree within 0.5 us a product.
 - `fast-reads`: `1793639446`.
 - `Step(64)`: 330,836 pairs told and 1,800 dropped (0.5%, zero-batch tables); 15,980 repeated stamps skipped.
+- Unprofiled, on the default image after the change: 10.980 / 12.167 ms a step at 32 / 256 tokens (`1793640316`),
+  against 10.983 / 12.179 at F6.0's baseline. The meter is compiled only into `profile` images.
 
 **`Step(64)`'s products, each a share of the slowest unit's work** (B's columns and the roles' run at once):
 
