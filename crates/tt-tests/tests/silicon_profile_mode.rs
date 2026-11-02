@@ -21,6 +21,16 @@
 //!   mode off. Its negative control (`session::probe_profiled_measurement`) times them stamped, as
 //!   before 2026-10-31, and must miss by more than 3x (it chose 8 units for a 64-row product
 //!   that unprofiled ran on 64, `1793473164`).
+//! * **A streamed pair's batches, unit by unit** (`Detail::Pipeline`,
+//!   `docs/plans/decode-product-meter.md`). Two one-row products over every tile, each its own
+//!   trace: `down`'s shape with `K` streamed (a ring of two batches) and `gate|up`'s with `K`
+//!   whole (a ring of one). Every batch on every unit is told (B's credits joined with T0's and T2's
+//!   tables, none dropped), and its times show the credit protocol's own order: B reserves, is
+//!   granted, issues and lands in turn; T0 sees a batch only after it landed and T2 pushes it after;
+//!   and with a ring of `c` batches, batch `i + c`'s grant comes after T0 popped batch `i` (each
+//!   comparison across cores within the stamps' own resolution, `CROSS_CORE_SLACK`). The
+//!   detail costs a product's span at most 1.5x `Ops`'s. Its control: the same traces under `Ops`
+//!   tell no batches.
 //! * **Negative control:** with the window off, the long trace overflows the stamp buffer. The run
 //!   goes on (profiling never fails one), and the trace is reported as overflowed and uncovered. That
 //!   is what the window exists to avoid.
@@ -362,4 +372,166 @@ fn a_measured_block_choice_times_what_an_unprofiled_build_runs() {
         stamped / plain > 3.0,
         "the control: timed stamped, {stamped:.1} us against {plain:.1} unprofiled"
     );
+}
+
+/// How far a role's time and one of B's may stand out of the protocol's order, in cycles, though
+/// the events were in order. A role's time is stamped as a count of 32-cycle units back from B's
+/// base (`mailbox::trace::BATCH_UNIT_SHIFT`), floored, so it reads up to 31 cycles late; and B
+/// stamps a credit's end after publishing it, so the role it frees may act before that stamp
+/// (by 6 cycles on card 0, `1793635382`). Two units cover both.
+const CROSS_CORE_SLACK: u64 = 2 << tt_isa::mailbox::trace::BATCH_UNIT_SHIFT;
+
+/// A streamed pair's batches on every unit, against the credit protocol's own order.
+#[test]
+fn a_streamed_pairs_batches_keep_the_credit_protocols_order() {
+    use tt_kernels::matmul::{Fidelity, SrcRoute};
+    use tt_kernels::profile_mode::{Detail, ProfileOptions as Options, TraceSamples};
+    use tt_kernels::session::{Session, TileChoice};
+    let mut s = Session::open_card(
+        tt_tests::backend::device_index(),
+        tt_firmware_images::ROLES,
+        TileChoice::All,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+        .unwrap();
+    let floats =
+        |n: usize, m: usize| -> Vec<f32> { (0..n).map(|i| (i % m) as f32 / m as f32).collect() };
+    // `down`'s shape (`K` streamed, two batches a ring), then `gate|up`'s (`K` whole, one).
+    let shapes = [(8192usize, 2048usize, 2usize), (2048, 8192, 1)];
+    let pipeline = Options {
+        detail: Detail::Pipeline,
+        ..Options::default()
+    };
+    // On before the captures: a trace stored in the profile mode keeps each unit's barriers.
+    s.profile_mode(Some(pipeline)).unwrap();
+    let mut traces = Vec::new();
+    for &(k, n, _) in &shapes {
+        let a = s.upload(&floats(k, 89), 1, k).unwrap();
+        let b = s.upload(&floats(k * n, 97), k, n).unwrap();
+        s.begin_trace().unwrap();
+        let out = s
+            .matmul_dram(
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                tt_tests::harness::BUDGET * 40,
+            )
+            .unwrap();
+        let id = s.end_trace().unwrap();
+        traces.push((id, [a, b, out]));
+    }
+    let replays = 5;
+    let run = |s: &mut Session<tt_kmd::Kmd>, options| {
+        s.profile_mode(Some(options)).unwrap();
+        for _ in 0..replays {
+            for (id, _) in &traces {
+                s.replay(*id).unwrap();
+            }
+        }
+        s.sync().unwrap();
+        s.profile_mode(None).unwrap().expect("the mode was on")
+    };
+    // The capture's own profile is dropped: its replays are the ones measured.
+    s.profile_mode(None).unwrap();
+    let report = run(&mut s, pipeline);
+    let ops_report = run(&mut s, Options::default());
+    let product_span = |t: &TraceSamples| -> u64 {
+        t.medians()
+            .into_iter()
+            .flatten()
+            .map(|m| m.span)
+            .max()
+            .unwrap_or(0)
+    };
+    assert_eq!(report.traces.len(), shapes.len());
+    for ((t, o), &(k, n, ring)) in report
+        .traces
+        .values()
+        .zip(ops_report.traces.values())
+        .zip(&shapes)
+    {
+        let what = format!("[1, {k}] @ [{k}, {n}], a ring of {ring}");
+        assert_eq!((t.overflowed, t.unit_mismatches), (0, 0), "{what}");
+        assert_eq!(t.pipe_dropped, 0, "{what}: a pair's batches not told");
+        let units: Vec<_> = t.pipe_batches.iter().flatten().collect();
+        assert!(units.len() > 8, "{what}: {} units told", units.len());
+        let (mut batches, mut ahead) = (0, 0);
+        for (u, since, arrive, b) in &units {
+            let at = |i: usize| format!("{what}: unit {u} batch {i} of {}", b.len());
+            for (i, x) in b.iter().enumerate() {
+                assert!(
+                    since <= &x.reserve
+                        && x.reserve <= x.granted
+                        && x.granted <= x.issued
+                        && x.issued <= x.landed,
+                    "{}: B {x:?}",
+                    at(i)
+                );
+                assert!(
+                    x.t0[0] <= x.t0[1] && x.t0[1] <= x.t0[2],
+                    "{}: T0 {x:?}",
+                    at(i)
+                );
+                assert!(
+                    x.t2[0] <= x.t2[1] && x.t2[1] <= x.t2[2],
+                    "{}: T2 {x:?}",
+                    at(i)
+                );
+                assert!(
+                    x.landed <= x.t0[1] + CROSS_CORE_SLACK,
+                    "{}: T0 saw it before it landed {x:?}",
+                    at(i)
+                );
+                assert!(x.t0[1] <= x.t2[2] && x.t2[2] <= *arrive, "{}: {x:?}", at(i));
+                if let Some(later) = b.get(i + ring) {
+                    assert!(
+                        later.granted + CROSS_CORE_SLACK >= x.t0[2],
+                        "{}: batch {}'s slot granted before T0 popped this one",
+                        at(i),
+                        i + ring
+                    );
+                }
+                if b.get(i + 1)
+                    .is_some_and(|next| next.granted + CROSS_CORE_SLACK < x.t0[2])
+                {
+                    ahead += 1;
+                }
+            }
+            batches += b.len();
+        }
+        let samples: usize = t.pipes.iter().map(Vec::len).sum();
+        assert!(samples > 0, "{what}: no op sampled");
+        let (with, without) = (product_span(t), product_span(o));
+        eprintln!(
+            "{what}: {} units, {batches} batches, {ahead} granted before the batch ahead was \
+             popped; product span {:.1} us under the pipeline detail, {:.1} under Ops",
+            units.len(),
+            with as f64 / 1350.0,
+            without as f64 / 1350.0,
+        );
+        if ring == 1 {
+            assert_eq!(ahead, 0, "{what}: a ring of one grants nothing ahead");
+        }
+        assert!(
+            (with as f64) <= 1.5 * without as f64,
+            "{what}: the detail's cost, {with} cycles against {without}"
+        );
+        // The control: under `Ops`, no batches are told.
+        assert!(
+            o.pipes.iter().all(Vec::is_empty),
+            "{what}: Ops told batches"
+        );
+        assert!(o.pipe_batches.iter().all(Vec::is_empty));
+    }
+    eprintln!("{}", report.summary(&|id| id.to_string()));
+    for (id, tensors) in traces {
+        s.release_trace(id).unwrap();
+        for t in tensors {
+            s.free(t).unwrap();
+        }
+    }
 }

@@ -73,6 +73,10 @@ pub mod trace_word {
     /// stamp at the kernel's end (`super::trace::ROLE_PUSH`). Set for the math
     /// role by the profile mode.
     pub const PUSH: u32 = 2;
+    /// Record each batch of a streamed run in [`super::BATCH_TIMES`], for the data mover
+    /// to stamp at the kernel's end (`super::trace::BATCH_BASE`). Acted on by T0 and T2;
+    /// set for them by the profile mode's pipeline detail.
+    pub const BATCHES: u32 = 4;
 }
 
 /// Non-zero `n`: after every `n` instruction words pushed, the firmware waits
@@ -156,6 +160,30 @@ pub const DRAIN_CYCLES: u64 = MAILBOX_BASE + 0x84;
 pub const PUSH_WORDS: u64 = MAILBOX_BASE + 0x88;
 const _: () = assert!(PUSH_CYCLES >= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(PUSH_WORDS + 4 <= MAILBOX_BASE + guard::OFFSET);
+
+/// A streamed run's batch table, written by a `profile` image's T0 and T2 runners when their
+/// [`TRACE`] has [`trace_word::BATCHES`], before they acknowledge; the data mover stamps it after
+/// the kernel's `ROLES_DONE` (`trace::BATCH_BASE`) and then clears its count.
+///
+/// Word 0 is the run's batch count (all of them, even past [`BATCH_TIMES_MAX`]); then, for each
+/// of the first [`BATCH_TIMES_MAX`] batches, [`BATCH_TIME_WORDS`] reads of the timestamper's
+/// counter (`tensix::timestamper::WALL_CLOCK_L`, the low word of the counter the timestamper
+/// stamps events with):
+/// - T0: entering its input wait, the wait returning (the batch's data is in L1), and its pop
+///   (the batch unpacked);
+/// - T2: entering its output reserve, the reserve returning (NC freed a slot), and its push (the
+///   batch packed).
+///
+/// Between the guard block and the dump, so neither `POKE`s nor a descriptor reach it.
+pub const BATCH_TIMES: u64 = MAILBOX_BASE + 0x180;
+/// Batches a [`BATCH_TIMES`] table holds: a pair's most (`tt_kernels`'s `GROUP_MAX`).
+pub const BATCH_TIMES_MAX: u32 = 40;
+/// Clock reads a batch in [`BATCH_TIMES`].
+pub const BATCH_TIME_WORDS: u32 = 3;
+/// Bytes of [`BATCH_TIMES`].
+pub const BATCH_TIMES_BYTES: u64 = 4 * (1 + BATCH_TIMES_MAX * BATCH_TIME_WORDS) as u64;
+const _: () = assert!(BATCH_TIMES >= MAILBOX_BASE + guard::OFFSET + guard::Guard::BYTES);
+const _: () = assert!(BATCH_TIMES + BATCH_TIMES_BYTES <= DUMP);
 
 /// A program's block repeats: with [`loops::LOOPED`] set in its length
 /// ([`PROGRAM_LEN`], a `KERNEL` entry's), the program's first word is how
@@ -272,6 +300,24 @@ pub mod trace {
     pub const READ_BYTES: u32 = 26;
     /// Bytes a [`READ_BYTES`] detail counts: 64, so a detail holds ~8.4 MB.
     pub const READ_UNIT_SHIFT: u32 = 6;
+    /// After a stamped `ROLES_DONE` whose kernel was a streamed run with batch tables
+    /// (`super::BATCH_TIMES`, `super::trace_word::BATCHES`): the stamp is the base the
+    /// [`BATCH_TIME`]s that follow count back from. The detail is the batches stamped (at
+    /// most `super::BATCH_TIMES_MAX`), with [`BATCH_TRUNCATED`] if the run had more and
+    /// [`BATCH_MISMATCHED`] if T0's and T2's counts differ (the lesser is stamped).
+    pub const BATCH_BASE: u32 = 27;
+    /// One clock read of a batch table, in order: each batch's three T0 reads, then its
+    /// three T2 reads. The detail is the cycles from the read to the [`BATCH_BASE`] stamp,
+    /// in units of `1 << BATCH_UNIT_SHIFT`, at most [`DETAIL_MAX`] (then saturated: the
+    /// read lies further back than the detail can say).
+    pub const BATCH_TIME: u32 = 28;
+    /// Cycles a [`BATCH_TIME`] detail counts: 32 (~24 ns), so a detail reaches ~4.2 million
+    /// cycles (~3.1 ms) back.
+    pub const BATCH_UNIT_SHIFT: u32 = 5;
+    /// [`BATCH_BASE`]'s flag: the run had more batches than were stamped.
+    pub const BATCH_TRUNCATED: u32 = 1 << 15;
+    /// [`BATCH_BASE`]'s flag: T0's and T2's batch counts differ.
+    pub const BATCH_MISMATCHED: u32 = 1 << 16;
 
     /// The source of the data mover's events. Role runners use their Tensix
     /// thread, 0..3.
@@ -493,6 +539,15 @@ pub mod role {
         }
         pub const fn push_words(self) -> u64 {
             self.base + (super::PUSH_WORDS - super::MAILBOX_BASE)
+        }
+        /// [`super::BATCH_TIMES`]'s count word.
+        pub const fn batch_count(self) -> u64 {
+            self.base + (super::BATCH_TIMES - super::MAILBOX_BASE)
+        }
+        /// [`super::BATCH_TIMES`]'s clock read `k` (0..3) of batch `batch`.
+        pub const fn batch_time(self, batch: u32, k: u32) -> u64 {
+            assert!(k < super::BATCH_TIME_WORDS);
+            self.batch_count() + 4 * (1 + batch * super::BATCH_TIME_WORDS + k) as u64
         }
         /// This mailbox's program slot in [`super::PROGRAM_REGION`].
         pub const fn program(self) -> u64 {

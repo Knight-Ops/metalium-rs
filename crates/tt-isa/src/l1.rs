@@ -198,18 +198,29 @@ const fn mailbox_dump(name: &'static str, m: mailbox::role::Mailbox) -> Region {
     }
 }
 
+/// A role's batch table (`mailbox::BATCH_TIMES`): T0's and T2's, in a `profile` image.
+const fn batch_times(name: &'static str, m: mailbox::role::Mailbox) -> Region {
+    Region {
+        name,
+        base: m.batch_count(),
+        end: m.batch_count() + mailbox::BATCH_TIMES_BYTES,
+    }
+}
+
 /// Every block of [`MAILBOXES`] the firmware and the host name by a constant, in address order:
 /// whatever of the region is not in one of these is unused.
-pub const FIXED: [Region; 13] = {
+pub const FIXED: [Region; 15] = {
     use mailbox::role::Mailbox;
     [
         mailbox_words("single-core mailbox", Mailbox::single_core()),
         mailbox_dump("single-core dump", Mailbox::single_core()),
         mailbox_words("role 0 mailbox", Mailbox::of(0)),
+        batch_times("role 0 batch times", Mailbox::of(0)),
         mailbox_dump("role 0 dump", Mailbox::of(0)),
         mailbox_words("role 1 mailbox", Mailbox::of(1)),
         mailbox_dump("role 1 dump", Mailbox::of(1)),
         mailbox_words("role 2 mailbox", Mailbox::of(2)),
+        batch_times("role 2 batch times", Mailbox::of(2)),
         mailbox_dump("role 2 dump", Mailbox::of(2)),
         Region {
             name: "B mover mailbox and read endpoints",

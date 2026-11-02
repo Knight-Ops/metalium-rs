@@ -30,6 +30,14 @@
 //! in [`READ_BINS`] parts of it. Counted at issue, not landing, so a read is charged up to its
 //! latency early (an op's first part can read above the card's rate); what B fetches of the
 //! trace's own stream is counted too, and reads of other tiles' L1 are not.
+//!
+//! **A streamed pair's batches, unit by unit** ([`Detail::Pipeline`], [`unit_pipes`]): B's input
+//! credits, which [`Detail::Ops`] already stamps (a pair's reader runs them as Reserve, Push,
+//! Reserve, Push), give each batch's wait for a slot, its gather's issue and its wait for the reads
+//! to land; T0's and T2's batch tables (`tt_isa::mailbox::BATCH_TIMES`), which B stamps after the
+//! kernel, give when T0 waited for the batch, saw it and popped it, and when T2 waited for an
+//! output slot, got it and pushed. Every time is on the unit's own clock, so no two tiles' clocks
+//! are compared ([`PipeStats`]).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -52,10 +60,14 @@ pub const READ_BINS: usize = 8;
 pub enum Detail {
     /// Only what bounds an op's phases (`tt_isa::dm::trace_mode::OPS`): ~8 events an op.
     #[default]
-    Ops,
+    Ops = 0,
     /// Every entry (`trace_mode::FULL`): data entries timed one by one, ~25 events an op, so a
     /// window holds about a third as many ops.
-    Full,
+    Full = 1,
+    /// [`Detail::Ops`], and each streamed pair's batches on every unit ([`unit_pipes`]): T0 and T2
+    /// keep batch tables (`tt_isa::mailbox::trace_word::BATCHES`) that B stamps after the kernel,
+    /// six events a batch, so a window holds fewer ops. The movers stamp as in `Ops`.
+    Pipeline = 2,
 }
 
 /// The profile mode's settings ([`crate::session::Session::profile_mode`]).
@@ -89,7 +101,7 @@ impl ProfileOptions {
     /// The mover's `tt_isa::dm::TRACE` word for this detail.
     pub fn trace_mode(&self) -> u32 {
         match self.detail {
-            Detail::Ops => tt_isa::dm::trace_mode::OPS,
+            Detail::Ops | Detail::Pipeline => tt_isa::dm::trace_mode::OPS,
             Detail::Full => tt_isa::dm::trace_mode::FULL,
         }
     }
@@ -98,13 +110,16 @@ impl ProfileOptions {
     /// launch (`KICK`) or a kernels' wait (`ROLES_DONE`) adds inside it, and after a wait the math
     /// role's two totals ([`ProfileOptions::push`]).
     /// A `BARRIER` adds its two `READ_BYTES` marks (as does a prefetch `GATHER`, which the
-    /// caller counts: [`PREFETCH_MARKS`]).
+    /// caller counts: [`PREFETCH_MARKS`]). In [`Detail::Pipeline`] a wait adds its batch tables'
+    /// base (`BATCH_BASE`); the caller counts their times, six a batch.
     pub fn stamps(&self, op: u32) -> u32 {
         let waits = matches!(op, op::KERNEL | op::KERNEL_WAIT);
         let marks = if op == op::BARRIER { 2 } else { 0 };
+        let base = u32::from(waits && self.detail == Detail::Pipeline);
         marks
+            + base
             + match self.detail {
-                Detail::Ops if !tt_isa::dm::trace_mode::ops_stamped(op) => 0,
+                Detail::Ops | Detail::Pipeline if !tt_isa::dm::trace_mode::ops_stamped(op) => 0,
                 _ if waits && self.push => 6,
                 _ => 3,
             }
@@ -306,7 +321,7 @@ impl OpTime {
         let known =
             self.barrier + self.kernels + self.control + self.fetch + self.writer + self.prefetch;
         match detail {
-            Detail::Ops => self.data = self.span.saturating_sub(known),
+            Detail::Ops | Detail::Pipeline => self.data = self.span.saturating_sub(known),
             Detail::Full => {
                 self.data = data;
                 self.other = self.span.saturating_sub(known + data);
@@ -746,6 +761,271 @@ pub fn card_reads(
     out
 }
 
+/// One batch of a streamed pair on one unit ([`unit_pipes`]): when each step of it happened, in
+/// tile cycles on the unit's own clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Batch {
+    /// B began its input reserve: it wanted a slot for the batch.
+    pub reserve: u64,
+    /// The reserve returned: a slot was free (T0 had popped the batch that held it).
+    pub granted: u64,
+    /// B began its input push: the gather had issued the batch's last read (each waited for room
+    /// under the stream's in-flight cap, so the earlier ones have landed).
+    pub issued: u64,
+    /// The push returned: the batch's reads had landed, and T0 may see it.
+    pub landed: u64,
+    /// T0 entering its input wait, the wait returning, and its pop (the batch unpacked).
+    pub t0: [u64; 3],
+    /// T2 entering its output reserve, the reserve returning, and its push (the batch packed).
+    pub t2: [u64; 3],
+}
+
+impl Batch {
+    /// B's reads of the batch: from its grant to their landing.
+    pub fn read(&self) -> (u64, u64) {
+        (self.granted, self.landed)
+    }
+
+    /// The batch's kernel: from T0 seeing it to T2 pushing it.
+    pub fn kernel(&self) -> (u64, u64) {
+        (self.t0[1], self.t2[2])
+    }
+}
+
+/// One unit's share of one op in a replay, from its streamed batches ([`unit_pipes`]), in tile
+/// cycles. B's figures (`ring`, `issue`, `land`) and the roles' (`starve`, `kernel`, `out_wait`)
+/// run on different cores at once, so the shares of `work` do not sum to one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PipeStats {
+    pub batches: u64,
+    /// From the unit's previous barrier's release to its arrival at the op's.
+    pub work: u64,
+    /// Before the first batch's reserve: the op's control and anything before its pair.
+    pub head: u64,
+    /// B waiting for a slot ([`Batch::reserve`] to `granted`): its next reads not issued, the
+    /// ring full of batches T0 had not popped.
+    pub ring: u64,
+    /// B running the gather (`granted` to `issued`): issuing the batch's reads, each waiting for
+    /// room under the stream's in-flight cap (`dm::STREAM_CAP`), so most of the reads' flight is
+    /// here, not in `land`.
+    pub issue: u64,
+    /// B waiting for the batch's last reads to land (`issued` to `landed`).
+    pub land: u64,
+    /// T0 waiting for a batch's data (its input wait).
+    pub starve: u64,
+    /// The batches' kernels, T0 seeing each to T2 pushing it ([`Batch::kernel`]).
+    pub kernel: u64,
+    /// T2 waiting for an output slot: NC behind on its writes.
+    pub out_wait: u64,
+    /// After the last batch's push to the barrier: the kernels' wait, NC's last writes.
+    pub tail: u64,
+    /// Reads in flight while a kernel ran: the overlap of the batches' [`Batch::read`] and
+    /// [`Batch::kernel`] intervals.
+    pub overlap: u64,
+    /// From the first batch's grant to the last batch's push.
+    pub pipe: u64,
+    /// `pipe` had every batch's reads overlapped the kernel before (`r0 + Σ max(r_i, k_(i-1)) +
+    /// k_last`): what a deeper ring could reach at the same read and kernel times.
+    pub ideal: u64,
+}
+
+impl PipeStats {
+    /// A unit's batches for an op it worked on from `since` to `arrive`.
+    pub fn of(since: u64, arrive: u64, batches: &[Batch]) -> PipeStats {
+        let (Some(first), Some(last)) = (batches.first(), batches.last()) else {
+            return PipeStats {
+                work: arrive.saturating_sub(since),
+                ..Default::default()
+            };
+        };
+        let len = |(a, b): (u64, u64)| b.saturating_sub(a);
+        let mut s = PipeStats {
+            batches: batches.len() as u64,
+            work: arrive.saturating_sub(since),
+            head: first.reserve.saturating_sub(since),
+            tail: arrive.saturating_sub(last.t2[2]),
+            pipe: last.t2[2].saturating_sub(first.granted),
+            ..Default::default()
+        };
+        let mut ideal = len(first.read());
+        for (i, b) in batches.iter().enumerate() {
+            s.ring += b.granted.saturating_sub(b.reserve);
+            s.issue += b.issued.saturating_sub(b.granted);
+            s.land += b.landed.saturating_sub(b.issued);
+            s.starve += b.t0[1].saturating_sub(b.t0[0]);
+            s.kernel += len(b.kernel());
+            s.out_wait += b.t2[1].saturating_sub(b.t2[0]);
+            if i > 0 {
+                ideal += len(b.read()).max(len(batches[i - 1].kernel()));
+            }
+            for k in batches {
+                let (r, q) = (b.read(), k.kernel());
+                s.overlap += r.1.min(q.1).saturating_sub(r.0.max(q.0));
+            }
+        }
+        s.ideal = ideal + len(last.kernel());
+        s
+    }
+
+    pub fn add(&mut self, o: &PipeStats) {
+        self.batches += o.batches;
+        self.work += o.work;
+        self.head += o.head;
+        self.ring += o.ring;
+        self.issue += o.issue;
+        self.land += o.land;
+        self.starve += o.starve;
+        self.kernel += o.kernel;
+        self.out_wait += o.out_wait;
+        self.tail += o.tail;
+        self.overlap += o.overlap;
+        self.pipe += o.pipe;
+        self.ideal += o.ideal;
+    }
+}
+
+/// One unit's batches on one op: `(unit, since, arrive, batches)`, on the unit's clock (`since`
+/// its previous barrier's release, `arrive` its arrival at the op's).
+pub type UnitBatches = (u16, u64, u64, Vec<Batch>);
+
+/// One op's [`PipeStats`] in one replay: its slowest unit's (most `work`), and the sum over the
+/// `units` that streamed batches for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PipeSample {
+    pub slowest: PipeStats,
+    pub sum: PipeStats,
+    pub units: u64,
+}
+
+/// What [`unit_pipes`] found on one unit in one replay: each op it streamed batches for, as `(op,
+/// since, arrive, batches)` on the unit's clock; and the pairs whose batches it could not tell
+/// (`dropped`: a table truncated, mismatched or saturated, or a reader's credits that do not
+/// pair with its table).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnitPipes {
+    pub ops: Vec<(usize, u64, u64, Vec<Batch>)>,
+    pub dropped: u32,
+}
+
+/// [`Detail::Pipeline`]: one replay's stamps on a unit whose barriers are `seq`, stamped within the
+/// window `lo..hi` (as [`unit_times`]), as each op's streamed batches. A pair's reader stamps its
+/// input credits as `CB` entries, a reserve then a push for each batch, after its `LAUNCH`; after
+/// its kernel B stamps the roles' batch tables (`Event::BatchBase`, then six `Event::BatchTime`s a
+/// batch: T0's three, then T2's), which pair with those credits in order. `None` if the barrier
+/// stamps and `seq` do not line up.
+pub fn unit_pipes(
+    events: &[TraceEvent],
+    seq: &[UnitBarrier],
+    lo: u32,
+    hi: u32,
+) -> Option<UnitPipes> {
+    let stamps: Vec<(Event, u64)> = events.iter().filter_map(mover).collect();
+    let Some(start) = stamps
+        .iter()
+        .rposition(|(e, _)| matches!(e, Event::List { begin: true, .. }))
+    else {
+        return Some(UnitPipes::default());
+    };
+    let words = tt_isa::mailbox::BATCH_TIME_WORDS as usize;
+    let mut out = UnitPipes::default();
+    // The current pair's credits, `(begin, end)`, and the batches since the last barrier.
+    let mut credits: Vec<(u64, u64)> = Vec::new();
+    let mut open_credit = None;
+    let mut batches: Vec<Batch> = Vec::new();
+    // A table being read: its base, its batches, whether it can be used, and its times so far.
+    let mut table: Option<(u64, usize, bool, Vec<u64>)> = None;
+    let mut pairs = Vec::new();
+    let mut open = None;
+    for &(event, t) in &stamps[start..] {
+        match event {
+            Event::Entry {
+                begin: true,
+                op: op::LAUNCH,
+            } => credits.clear(),
+            Event::Entry {
+                begin: true,
+                op: op::CB,
+            } => open_credit = Some(t),
+            Event::Entry {
+                begin: false,
+                op: op::CB,
+            } => {
+                if let Some(b) = open_credit.take() {
+                    credits.push((b, t));
+                }
+            }
+            Event::BatchBase {
+                batches: n,
+                truncated,
+                mismatched,
+            } => {
+                if table.take().is_some() {
+                    out.dropped += 1;
+                }
+                let usable = !truncated && !mismatched && credits.len() == 2 * n as usize;
+                table = Some((t, n as usize, usable, Vec::new()));
+            }
+            Event::BatchTime { cycles, saturated } => {
+                let Some((base, n, usable, times)) = table.as_mut() else {
+                    continue;
+                };
+                *usable &= !saturated;
+                times.push(base.saturating_sub(cycles));
+                if times.len() == 2 * words * *n {
+                    let (_, n, usable, times) = table.take().expect("just matched");
+                    if usable {
+                        for i in 0..n {
+                            let (r, p) = (credits[2 * i], credits[2 * i + 1]);
+                            let at = |k: usize| times[2 * words * i + k];
+                            batches.push(Batch {
+                                reserve: r.0,
+                                granted: r.1,
+                                issued: p.0,
+                                landed: p.1,
+                                t0: [at(0), at(1), at(2)],
+                                t2: [at(3), at(4), at(5)],
+                            });
+                        }
+                    } else {
+                        out.dropped += 1;
+                    }
+                    credits.clear();
+                }
+            }
+            Event::Entry {
+                begin: true,
+                op: op::BARRIER,
+            } => open = Some((t, std::mem::take(&mut batches))),
+            Event::Entry {
+                begin: false,
+                op: op::BARRIER,
+            } => {
+                let (arrive, b) = open.take()?;
+                pairs.push((arrive, t, b));
+            }
+            _ => {}
+        }
+    }
+    let mut pairs = pairs.into_iter();
+    let mut since = (lo == 0).then_some(stamps[start].1);
+    let mut count = 0u32;
+    for b in seq {
+        if hi == 0 || (lo <= count && count < hi) {
+            let (arrive, release, batches) = pairs.next()?;
+            if let (Some(k), Some(s)) = (b.arrival_of, since) {
+                if !batches.is_empty() {
+                    out.ops.push((k as usize, s, arrive, batches));
+                }
+            }
+            since = Some(release);
+        } else {
+            since = None;
+        }
+        count += b.counts;
+    }
+    pairs.next().is_none().then_some(out)
+}
+
 /// One eager op's profile.
 #[derive(Clone, Debug)]
 pub struct EagerSample {
@@ -837,6 +1117,14 @@ pub struct TraceSamples {
     /// Per op, once per replay that stamped it, the GDDR bytes every unit's B issued in each of
     /// [`READ_BINS`] equal parts of the op's span on unit 0, and whose ([`card_reads`]).
     pub reads: Vec<Vec<ReadBins>>,
+    /// [`Detail::Pipeline`]: per op, once per replay that stamped it, its units' streamed batches
+    /// ([`unit_pipes`]).
+    pub pipes: Vec<Vec<PipeSample>>,
+    /// [`Detail::Pipeline`]: per op, the first replay's batches on every unit that streamed some,
+    /// `(unit, since, arrive, batches)`.
+    pub pipe_batches: Vec<Vec<UnitBatches>>,
+    /// [`Detail::Pipeline`]: pairs whose batches could not be told ([`UnitPipes::dropped`]).
+    pub pipe_dropped: u32,
     /// Per unit, its barriers in stream order (empty where unknown).
     unit_barriers: Vec<Vec<UnitBarrier>>,
     pub replays: u32,
@@ -912,6 +1200,8 @@ impl Profiler {
                 samples: vec![Vec::new(); ops.len()],
                 units: vec![Vec::new(); ops.len()],
                 reads: vec![Vec::new(); ops.len()],
+                pipes: vec![Vec::new(); ops.len()],
+                pipe_batches: vec![Vec::new(); ops.len()],
                 entries: vec![EntryCosts::new(); ops.len()],
                 ops,
                 stamps,
@@ -1046,6 +1336,9 @@ impl Profiler {
                             }
                         }
                     }
+                    if detail == Detail::Pipeline {
+                        t.pipelines(units, lo, hi);
+                    }
                     for (u, events) in units.iter().enumerate() {
                         let Some(seq) = t.unit_barriers.get(u).filter(|s| !s.is_empty()) else {
                             continue;
@@ -1116,6 +1409,39 @@ fn median(mut v: Vec<u64>) -> u64 {
 }
 
 impl TraceSamples {
+    /// [`Detail::Pipeline`]: one replay's streamed batches on every unit, by op ([`unit_pipes`]).
+    fn pipelines(&mut self, units: &[Vec<TraceEvent>], lo: u32, hi: u32) {
+        let mut by_op: BTreeMap<usize, (PipeSample, Vec<UnitBatches>)> = BTreeMap::new();
+        for (u, events) in units.iter().enumerate() {
+            let Some(seq) = self.unit_barriers.get(u).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            // A unit whose barriers do not line up is counted by `unit_times`.
+            let Some(found) = unit_pipes(events, seq, lo, hi) else {
+                continue;
+            };
+            self.pipe_dropped += found.dropped;
+            for (k, since, arrive, batches) in found.ops {
+                let stats = PipeStats::of(since, arrive, &batches);
+                let (sample, kept) = by_op.entry(k).or_default();
+                sample.sum.add(&stats);
+                sample.units += 1;
+                if stats.work >= sample.slowest.work {
+                    sample.slowest = stats;
+                }
+                kept.push((u as u16, since, arrive, batches));
+            }
+        }
+        for (k, (sample, kept)) in by_op {
+            if let Some(s) = self.pipes.get_mut(k) {
+                s.push(sample);
+            }
+            if let Some(b) = self.pipe_batches.get_mut(k).filter(|b| b.is_empty()) {
+                *b = kept;
+            }
+        }
+    }
+
     /// Each op's median time over the replays that stamped it (component by component), or `None`
     /// for an op no replay covered yet.
     pub fn medians(&self) -> Vec<Option<OpTime>> {
@@ -1786,6 +2112,118 @@ impl ProfileReport {
         }
     }
 
+    /// [`Detail::Pipeline`]: a trace's streamed batches by label. Per op, its slowest unit (most work)
+    /// in each replay, its time split by the pipeline's steps as shares of its work; and its units'
+    /// mean. B's columns (ring, issue, land) and the roles' (starve, kernel, out wait) run at once
+    /// on different cores, so a row does not sum to 100%. *What-if saves* is the slowest unit's
+    /// pipe less its batches perfectly overlapped ([`PipeStats::ideal`]), a share of its work.
+    fn pipeline_table(&self, out: &mut String, t: &TraceSamples) {
+        if t.pipes.iter().all(Vec::is_empty) {
+            return;
+        }
+        #[derive(Default)]
+        struct Row {
+            ops: u64,
+            samples: u64,
+            units: u64,
+            slowest: PipeStats,
+            sum: PipeStats,
+        }
+        let mut rows: Vec<(&str, Row)> = Vec::new();
+        for (o, samples) in t.ops.iter().zip(&t.pipes) {
+            if samples.is_empty() {
+                continue;
+            }
+            let at = match rows.iter().position(|(l, _)| *l == o.label) {
+                Some(i) => i,
+                None => {
+                    rows.push((o.label, Row::default()));
+                    rows.len() - 1
+                }
+            };
+            let r = &mut rows[at].1;
+            r.ops += 1;
+            for s in samples {
+                r.samples += 1;
+                r.units += s.units;
+                r.slowest.add(&s.slowest);
+                r.sum.add(&s.sum);
+            }
+        }
+        rows.sort_by_key(|(_, r)| std::cmp::Reverse(r.slowest.work / r.samples.max(1) * r.ops));
+        let _ = writeln!(
+            out,
+            "\nStreamed batches by label (`Detail::Pipeline`): per op, its slowest unit's work and its \
+             shares of it; B's columns and the roles' overlap in time. {} pairs not told apart.\n\n\
+             | label | ops | units | batches a unit | slowest unit us | head | ring | issue | land | \
+             starve | kernel | out wait | tail | overlap | what-if saves | mean unit us | its ring | \
+             its starve |\n|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
+            t.pipe_dropped
+        );
+        let share = |part: u64, whole: u64| 100.0 * part as f64 / whole.max(1) as f64;
+        for (label, r) in rows {
+            let (w, m) = (&r.slowest, &r.sum);
+            let _ = writeln!(
+                out,
+                "| {label} | {} | {:.0} | {:.1} | {:.2} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | \
+                 {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.2} | {:.0}% | {:.0}% |",
+                r.ops,
+                r.units as f64 / r.samples.max(1) as f64,
+                m.batches as f64 / r.units.max(1) as f64,
+                self.us(w.work) / r.samples.max(1) as f64,
+                share(w.head, w.work),
+                share(w.ring, w.work),
+                share(w.issue, w.work),
+                share(w.land, w.work),
+                share(w.starve, w.work),
+                share(w.kernel, w.work),
+                share(w.out_wait, w.work),
+                share(w.tail, w.work),
+                share(w.overlap, w.work),
+                share(w.pipe.saturating_sub(w.ideal), w.work),
+                self.us(m.work) / r.units.max(1) as f64,
+                share(m.ring, m.work),
+                share(m.starve, m.work),
+            );
+        }
+    }
+
+    /// [`Detail::Pipeline`]: every trace op's streamed batches from the first replay that stamped
+    /// it, one line a batch on each unit, tab-separated: each step's time in microseconds from the
+    /// unit's previous barrier's release ([`Batch`]), and the unit's work on the op.
+    pub fn pipeline_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
+        let mut out = String::from(
+            "source\tindex\tlabel\twhat\tunit\tbatch\twork_us\treserve_us\tgranted_us\tissued_us\t\
+             landed_us\tt0_wait_us\tt0_ready_us\tt0_pop_us\tt2_wait_us\tt2_reserved_us\tt2_push_us\n",
+        );
+        for (&id, t) in &self.traces {
+            let source = name(id);
+            for (i, (o, units)) in t.ops.iter().zip(&t.pipe_batches).enumerate() {
+                for (u, since, arrive, batches) in units {
+                    let at = |c: u64| self.us(c) - self.us(*since);
+                    for (b, x) in batches.iter().enumerate() {
+                        let _ = write!(
+                            out,
+                            "{source}\t{i}\t{}\t{}\t{u}\t{b}\t{:.3}",
+                            o.label,
+                            o.what,
+                            self.us(arrive.saturating_sub(*since)),
+                        );
+                        for c in [x.reserve, x.granted, x.issued, x.landed]
+                            .into_iter()
+                            .chain(x.t0)
+                            .chain(x.t2)
+                        {
+                            let _ = write!(out, "\t{:.3}", at(c));
+                        }
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Every trace op's units, one line each, tab-separated: each unit's median work (from its last
     /// barrier's release to its arrival at the op's) and wait there, in microseconds.
     pub fn skew_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
@@ -1977,6 +2415,7 @@ impl ProfileReport {
             self.tails_table(&mut out, t, &medians);
             self.skew_table(&mut out, t);
             self.push_table(&mut out, t);
+            self.pipeline_table(&mut out, t);
             let mut top: Vec<(usize, &OpTime)> = medians
                 .iter()
                 .enumerate()
@@ -2325,6 +2764,148 @@ mod tests {
             counts: n,
         };
         vec![arrive(0), wait(2), arrive(3), wait(1)]
+    }
+
+    /// One op on a unit: a pair of two batches through a one-batch ring, its credits stamped as
+    /// `CB` entries, and after its kernel the roles' tables (`BATCH_BASE` at 416, each time a
+    /// multiple of 32 cycles before it); then the unit's arrival at 430.
+    fn pair_of_two(base_detail: u32, times: &[u64]) -> Vec<TraceEvent> {
+        let mut v = vec![e(ev::LIST_BEGIN, 1, 100)];
+        v.extend(entry(op::LAUNCH, 101, 103));
+        v.extend(entry(op::CB, 104, 108));
+        v.extend(entry(op::CB, 140, 170));
+        v.extend(entry(op::CB, 172, 224));
+        v.extend(entry(op::CB, 260, 290));
+        v.push(e(ev::ENTRY_BEGIN, op::KERNEL_WAIT, 291));
+        v.push(e(ev::ROLES_DONE, 7, 410));
+        v.push(e(ev::BATCH_BASE, base_detail, 416));
+        for &t in times {
+            v.push(e(
+                ev::BATCH_TIME,
+                ((416 - t) >> ev::BATCH_UNIT_SHIFT) as u32,
+                417,
+            ));
+        }
+        v.push(e(ev::ENTRY_END, op::KERNEL_WAIT, 420));
+        v.extend(entry(op::BARRIER, 430, 440));
+        v.push(e(ev::LIST_END, 1, 441));
+        v
+    }
+
+    /// The two batches' role times: T0's wait, ready and pop, then T2's wait, reserved and push.
+    const ROLE_TIMES: [u64; 12] = [128, 192, 224, 128, 160, 256, 256, 320, 352, 256, 288, 384];
+
+    /// A pair's credits (reserve, then push, per batch) join the roles' tables in order, each
+    /// table time counted back from its base; the op's stats follow from the batches.
+    #[test]
+    fn a_pairs_credits_join_the_roles_batch_tables() {
+        let seq = [UnitBarrier {
+            arrival_of: Some(0),
+            counts: 1,
+        }];
+        let found = unit_pipes(&pair_of_two(2, &ROLE_TIMES), &seq, 0, 0).unwrap();
+        assert_eq!(found.dropped, 0);
+        let batches = vec![
+            Batch {
+                reserve: 104,
+                granted: 108,
+                issued: 140,
+                landed: 170,
+                t0: [128, 192, 224],
+                t2: [128, 160, 256],
+            },
+            Batch {
+                reserve: 172,
+                granted: 224,
+                issued: 260,
+                landed: 290,
+                t0: [256, 320, 352],
+                t2: [256, 288, 384],
+            },
+        ];
+        assert_eq!(found.ops, vec![(0, 100, 430, batches.clone())]);
+        // The credit protocol's own order holds in them: a batch lands before T0 sees it, and with
+        // a ring of one batch, the next batch's grant comes after T0's pop of this one.
+        assert!(batches.iter().all(|b| b.landed <= b.t0[1]));
+        assert!(batches[1].granted >= batches[0].t0[2]);
+        assert_eq!(
+            PipeStats::of(100, 430, &batches),
+            PipeStats {
+                batches: 2,
+                work: 330,
+                head: 4,
+                ring: 4 + 52,
+                issue: 32 + 36,
+                land: 30 + 30,
+                starve: 64 + 64,
+                kernel: 64 + 64,
+                out_wait: 32 + 32,
+                tail: 430 - 384,
+                // Batch 1's reads, 224..290, beside batch 0's kernel, 192..256.
+                overlap: 32,
+                pipe: 384 - 108,
+                // 62 for batch 0's reads, then max(66, 64), then batch 1's kernel.
+                ideal: 62 + 66 + 64,
+            }
+        );
+    }
+
+    /// A table that cannot be joined is dropped and counted, not misattributed: its count against
+    /// the pair's credits, a time past what a detail can say, the roles' counts differing, or more
+    /// batches than the table held.
+    #[test]
+    fn a_batch_table_that_does_not_join_is_dropped() {
+        let seq = [UnitBarrier {
+            arrival_of: Some(0),
+            counts: 1,
+        }];
+        let dropped = |v: Vec<TraceEvent>| {
+            let found = unit_pipes(&v, &seq, 0, 0).unwrap();
+            assert!(found.ops.is_empty());
+            found.dropped
+        };
+        assert_eq!(
+            dropped(pair_of_two(1, &ROLE_TIMES[..6])),
+            1,
+            "one batch for two"
+        );
+        let mut far = pair_of_two(2, &ROLE_TIMES);
+        let at = far
+            .iter()
+            .position(|x| ev::split(x.token).1 == ev::BATCH_TIME)
+            .unwrap();
+        far[at] = e(ev::BATCH_TIME, ev::DETAIL_MAX, 417);
+        assert_eq!(dropped(far), 1, "saturated");
+        assert_eq!(
+            dropped(pair_of_two(2 | ev::BATCH_MISMATCHED, &ROLE_TIMES)),
+            1
+        );
+        assert_eq!(
+            dropped(pair_of_two(2 | ev::BATCH_TRUNCATED, &ROLE_TIMES)),
+            1
+        );
+        // And barriers that do not line up with the stream refuse the replay.
+        let two = [seq[0], seq[0]];
+        assert_eq!(unit_pipes(&pair_of_two(2, &ROLE_TIMES), &two, 0, 0), None);
+    }
+
+    /// The pipeline detail stamps as `Ops` does, and one base more after each kernel's wait.
+    #[test]
+    fn the_pipeline_detail_adds_a_base_to_each_wait() {
+        let (ops, pipeline) = (
+            ProfileOptions::default(),
+            ProfileOptions {
+                detail: Detail::Pipeline,
+                ..ProfileOptions::default()
+            },
+        );
+        assert_eq!(pipeline.trace_mode(), tt_isa::dm::trace_mode::OPS);
+        for o in [op::KERNEL, op::KERNEL_WAIT] {
+            assert_eq!(pipeline.stamps(o), ops.stamps(o) + 1);
+        }
+        for o in [op::BARRIER, op::CB, op::LAUNCH, op::READ] {
+            assert_eq!(pipeline.stamps(o), ops.stamps(o));
+        }
     }
 
     #[test]

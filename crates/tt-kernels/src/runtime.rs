@@ -632,6 +632,10 @@ pub struct Resident<N: NocId> {
     /// Whether a profile has the math role total its pushing for the mover to
     /// stamp (`Resident::set_profile_push`).
     profile_push: bool,
+    /// Whether a profile has T0 and T2 keep their batch tables (`Resident::set_profile_batches`).
+    profile_batches: bool,
+    /// Whether T0 and T2 keep their batch tables with no profile (`Resident::set_batch_tables`).
+    batch_tables: bool,
     /// The last setup run's generation and program, until taken: a trace's
     /// capture records it as a kernel of its own (`crate::trace`).
     last_setup: Option<(u32, Vec<Instruction>)>,
@@ -666,6 +670,8 @@ impl<N: NocId> Resident<N> {
             profiling: false,
             profile_roles: true,
             profile_push: false,
+            profile_batches: false,
+            batch_tables: false,
             reservations: Default::default(),
         };
         for thread in 0..3 {
@@ -720,6 +726,20 @@ impl<N: NocId> Resident<N> {
         self.profile_push = on;
     }
 
+    /// Whether a profile has T0 and T2 record each streamed batch's times, which the mover
+    /// stamps after the kernel (`mailbox::trace_word::BATCHES`,
+    /// `crate::profile_mode::Detail::Pipeline`). Off by default.
+    pub fn set_profile_batches(&mut self, on: bool) {
+        self.profile_batches = on;
+    }
+
+    /// Whether T0 and T2 keep their batch tables with no profile running, for a gate to read them
+    /// back (`mailbox::BATCH_TIMES`): on the simulator, which refuses the stamp stream, nothing
+    /// else reads them. A `profile` image's roles only.
+    pub fn set_batch_tables(&mut self, on: bool) {
+        self.batch_tables = on;
+    }
+
     fn roles_traced(&self) -> bool {
         self.profiling && self.profile_roles
     }
@@ -728,8 +748,14 @@ impl<N: NocId> Resident<N> {
     /// math role's push totals in a profile that asks for them.
     fn trace_word(&self, thread: usize, runs: bool) -> u32 {
         let push = self.profiling && self.profile_push && thread == 1;
+        let batches = (self.profiling && self.profile_batches || self.batch_tables) && thread != 1;
         (if runs { mailbox::trace_word::RUNS } else { 0 })
             | if push { mailbox::trace_word::PUSH } else { 0 }
+            | if batches {
+                mailbox::trace_word::BATCHES
+            } else {
+                0
+            }
     }
 
     /// The window this tile is reached through. A [`crate::dm::DataMover`] on

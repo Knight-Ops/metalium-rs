@@ -502,6 +502,7 @@ where
     };
     let tracing = trace_word & mailbox::trace_word::RUNS != 0;
     let mut totals = Totals::new(trace_word & mailbox::trace_word::PUSH != 0);
+    let batches = Batches::new(mb, trace_word & mailbox::trace_word::BATCHES != 0, Thread::INDEX);
     let mut push_window = unsafe { l1_read32(mb.push_window()) };
     let program_addr = unsafe { l1_read32(mb.program_addr()) } as u64;
     // SAFETY: as above.
@@ -586,9 +587,14 @@ where
             fail_in(mb, panic_code::EXPLICIT);
         }
         trace(tracing, Thread::INDEX, mailbox::trace::START);
-        if let Err(code) =
-            run_stream::<Riscv, Thread>(program, program_len, push_window, tracing, &mut totals)
-        {
+        if let Err(code) = run_stream::<Riscv, Thread>(
+            program,
+            program_len,
+            push_window,
+            tracing,
+            &mut totals,
+            &batches,
+        ) {
             crate::dataflow::abort_with(code);
             fail_in(mb, code);
         }
@@ -819,6 +825,7 @@ fn run_stream<Riscv, Thread>(
     push_window: u32,
     tracing: bool,
     totals: &mut Totals,
+    batches: &Batches,
 ) -> Result<(), u32>
 where
     Thread: TensixThread,
@@ -866,12 +873,14 @@ where
     let capacity = capacity as u16;
     for index in 0..count {
         crate::dataflow::check()?;
+        batches.record(index, 0);
         if Thread::INDEX == 0 {
             crate::dataflow::buffer(Stream::Input, Action::Wait, capacity, Endpoint::Unpack, 1)?;
         }
         if Thread::INDEX == 2 {
             crate::dataflow::buffer(Stream::Output, Action::Reserve, capacity, Endpoint::Pack, 3)?;
         }
+        batches.record(index, 1);
         let offset = 4 + index as u64 * dataflow::STEP_WORDS as u64;
         push_body::<Riscv, Thread>(
             read(offset),
@@ -886,6 +895,7 @@ where
         if Thread::INDEX == 2 {
             crate::dataflow::buffer(Stream::Output, Action::Push, capacity, Endpoint::Pack, 3)?;
         }
+        batches.record(index, 2);
         // The roles share configuration and semaphores, so each batch starts
         // only once all three have retired the one before. After the last,
         // nothing follows in this region: the mover's `KERNEL_WAIT` joins.
@@ -895,6 +905,7 @@ where
             crate::dataflow::record_batch(Thread::INDEX, count);
         }
     }
+    batches.publish(count);
     Ok(())
 }
 
@@ -954,6 +965,49 @@ impl Totals {
                 l1_write32(mb.drain_cycles(), self.drain);
                 l1_write32(mb.push_words(), self.words);
             }
+        }
+    }
+}
+
+/// A streamed run's batch table (`mailbox::BATCH_TIMES`), in a `profile` image whose T0 or T2
+/// runner was asked for it (`mailbox::trace_word::BATCHES`); a no-op otherwise, and compiled out
+/// without the feature. The count is cleared at the run's start, so a run that is not streamed
+/// leaves none for the data mover to stamp.
+struct Batches {
+    table: Option<Mailbox>,
+}
+
+impl Batches {
+    fn new(mb: Mailbox, asked: bool, thread: u32) -> Self {
+        let table = (cfg!(feature = "profile") && asked && thread != 1).then_some(mb);
+        if let Some(mb) = table {
+            // SAFETY: this runner's own aligned mailbox word, which only it and the data mover
+            // (after this run's acknowledgement) touch.
+            unsafe { l1_write32(mb.batch_count(), 0) };
+        }
+        Self { table }
+    }
+
+    /// Batch `index`'s clock read `k`, if the table holds it.
+    #[inline(always)]
+    fn record(&self, index: u32, k: u32) {
+        if let Some(mb) = self.table {
+            if index < mailbox::BATCH_TIMES_MAX {
+                // SAFETY: the timestamper's counter, a documented aligned register (ttsim models
+                // it, divergence row 54); a word of this runner's own table.
+                unsafe {
+                    let now = l1_read32(tt_isa::tensix::timestamper::WALL_CLOCK_L);
+                    l1_write32(mb.batch_time(index, k), now);
+                }
+            }
+        }
+    }
+
+    /// The run's batch count, written last, before the run is acknowledged.
+    fn publish(&self, count: u32) {
+        if let Some(mb) = self.table {
+            // SAFETY: as in `new`.
+            unsafe { l1_write32(mb.batch_count(), count) };
         }
     }
 }

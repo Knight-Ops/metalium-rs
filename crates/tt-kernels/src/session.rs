@@ -2572,34 +2572,51 @@ fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
 }
 
 /// The events unit stream `uc`'s entries `range` could stamp in the profile mode, at most, in
-/// [`crate::profile_mode::Detail::Ops`] and in `Full`: three a stamped entry (its begin and end and a
+/// [`crate::profile_mode::Detail::Ops`], `Full` and `Pipeline`: three a stamped entry (its begin and end and a
 /// `KICK` or `ROLES_DONE` inside), and for a `PAIR_CALL`, its reader section's entries (B runs them;
 /// NC, which runs the writer's, does not stamp). B also stamps each fetch of a chunk of the stream
 /// or of a reader section, its wait for its writer and each prefetch `WAIT`
 /// (`tt_isa::dm::trace_mode::FETCH`, `WRITER_WAIT`, `PREFETCH_WAIT`): two events each, and `range`
 /// may touch one chunk more than it fills. A prefetch `GATHER` adds its two `READ_BYTES` marks
 /// (`crate::profile_mode::PREFETCH_MARKS`), here though the second may fall under a later op.
-fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 2] {
+/// `Pipeline` stamps as `Ops` does, and after a kernel its batch tables
+/// ([`crate::profile_mode::ProfileOptions::stamps`] counts the base): six for each batch, one input
+/// `CB` reserve each.
+fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
         detail,
         ..ProfileOptions::default()
     };
-    let (ops, full) = (options(Detail::Ops), options(Detail::Full));
-    let mut count = [0u32; 2];
+    let details = [
+        options(Detail::Ops),
+        options(Detail::Full),
+        options(Detail::Pipeline),
+    ];
+    let mut count = [0u32; 3];
     let mut add = |entries: &[[u32; 8]]| {
         let mut i = 0;
         while i < entries.len() {
             let head = entries[i][0];
-            count[0] += ops.stamps(head);
-            count[1] += full.stamps(head);
+            for (c, d) in count.iter_mut().zip(&details) {
+                *c += d.stamps(head);
+            }
             if head == tt_isa::dm::op::WAIT && entries[i][1] == tt_isa::dm::WAIT_PREFETCH {
                 count[0] += 2;
+                count[2] += 2;
+            }
+            use tt_isa::dataflow::{Action, Stream};
+            if head == tt_isa::dm::op::CB
+                && Stream::decode(entries[i][1]) == Some(Stream::Input)
+                && Action::decode(entries[i][2]) == Some(Action::Reserve)
+            {
+                count[2] += tt_isa::mailbox::BATCH_TIME_WORDS * 2;
             }
             use tt_isa::dm::record;
             if head == record::GATHER && entries[i][1] & record::GATHER_PREFETCH != 0 {
-                count[0] += crate::profile_mode::PREFETCH_MARKS;
-                count[1] += crate::profile_mode::PREFETCH_MARKS;
+                for c in &mut count {
+                    *c += crate::profile_mode::PREFETCH_MARKS;
+                }
             }
             i += (tt_isa::dm::record::len(head) as usize).max(1);
         }
@@ -2981,6 +2998,7 @@ impl<T: Transport> Session<T> {
 
     fn prepare_unit(&mut self, u: usize) -> Result<(), RunError> {
         let profile_roles = self.profile_roles;
+        let profile_batches = self.profile_batches();
         let Session {
             dev,
             units,
@@ -3028,12 +3046,21 @@ impl<T: Transport> Session<T> {
             r.set_profiling(true);
             r.set_profile_roles(profile_roles);
             r.set_profile_push(self.profiler.as_ref().is_some_and(|p| p.options.push));
+            r.set_profile_batches(profile_batches);
             // The buffer the profile reads (`set_profile_buffer` may have moved it).
             let (buffer, bytes) = self.profile_buffer;
             dev.configure_trace(r.window(), unit.tile, buffer, bytes)?;
         }
         unit.resident = Some(r);
         Ok(())
+    }
+
+    /// Whether the profile mode asks T0 and T2 for their batch tables
+    /// (`crate::profile_mode::Detail::Pipeline`).
+    fn profile_batches(&self) -> bool {
+        self.profiler
+            .as_ref()
+            .is_some_and(|p| p.options.detail == crate::profile_mode::Detail::Pipeline)
     }
 
     /// Record what every unit's data mover and role runners do from now on,
@@ -3087,6 +3114,7 @@ impl<T: Transport> Session<T> {
             }
             let profile_roles = self.profile_roles;
             let profile_push = self.profiler.as_ref().is_some_and(|p| p.options.push);
+            let profile_batches = self.profile_batches();
             let Session { dev, units: us, .. } = self;
             let unit = &mut us[u];
             let r = unit.resident.as_mut().expect("prepared above");
@@ -3094,6 +3122,13 @@ impl<T: Transport> Session<T> {
             r.set_profiling(true);
             r.set_profile_roles(profile_roles);
             r.set_profile_push(profile_push);
+            r.set_profile_batches(profile_batches);
+            // A batch table left by an earlier process (L1 outlives one) is never stamped as
+            // this profile's: the mover stamps a table whose count is not zero.
+            for role in [0, 2] {
+                let count = tt_isa::mailbox::role::Mailbox::of(role).batch_count();
+                dev.write32(r.window(), unit.tile, count, 0)?;
+            }
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, trace_word)?;
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
@@ -4920,7 +4955,7 @@ impl<T: Transport> Session<T> {
                     .map(|(u, s)| s..u.stream.len())
                     .collect(),
                 barrier: self.units.len() > 1,
-                stamps: [0; 2],
+                stamps: [0; 3],
                 bytes: Default::default(),
                 unit_bytes: Vec::new(),
                 ahead: std::mem::take(&mut self.prefetch_lists),
@@ -6242,10 +6277,10 @@ impl<T: Transport> Session<T> {
         // What each op could stamp in each detail of the profile mode, on its busiest unit: what
         // sizes a profiled replay's window (`profile_mode`).
         for op in &mut ops {
-            let mut most = [0u32; 2];
+            let mut most = [0u32; 3];
             for (uc, range) in units.iter().zip(&op.entries) {
                 let s = op_stamps(uc, range.clone());
-                most = [most[0].max(s[0]), most[1].max(s[1])];
+                most = core::array::from_fn(|d| most[d].max(s[d]));
             }
             op.stamps = most;
         }
@@ -6979,10 +7014,10 @@ impl<T: Transport> Session<T> {
     /// The window of trace `id`'s ops its next replay stamps (`tt_isa::dm::TRACE_WINDOW`), its ops
     /// made known to the profile mode on its first replay.
     fn profile_window(&mut self, id: TraceId) -> u32 {
-        let detail = match self.profiler.as_ref().map(|p| p.options.detail) {
-            Some(crate::profile_mode::Detail::Full) => 1,
-            _ => 0,
-        };
+        let detail = self
+            .profiler
+            .as_ref()
+            .map_or(0, |p| p.options.detail as usize);
         let (ops, unit_barriers) = self
             .traces
             .get(&id.0)
@@ -9840,9 +9875,12 @@ impl<T: Transport> Session<T> {
         let profiling = self.profiling.take();
         let stamping = |s: &mut Self, on: bool| -> Result<(), TensorError> {
             let (buffer, bytes) = s.profile_buffer;
-            let (roles, push) = (
+            let (roles, push, batches) = (
                 s.profile_roles,
                 profiler.as_ref().is_some_and(|p| p.options.push),
+                profiler
+                    .as_ref()
+                    .is_some_and(|p| p.options.detail == crate::profile_mode::Detail::Pipeline),
             );
             let Session { dev, units, .. } = s;
             for unit in units.iter_mut() {
@@ -9854,6 +9892,7 @@ impl<T: Transport> Session<T> {
                     dev.configure_trace(r.window(), unit.tile, buffer, bytes)?;
                     r.set_profile_roles(roles);
                     r.set_profile_push(push);
+                    r.set_profile_batches(batches);
                 }
                 if unit.mover.is_some() {
                     dev.write32(
@@ -10838,6 +10877,52 @@ impl<T: Transport> Session<T> {
         Ok(out)
     }
 
+    /// Have every started unit's T0 and T2 keep their batch tables (`mailbox::BATCH_TIMES`) with
+    /// no profile running, or stop. With no profile the mover never stamps or clears them, so each
+    /// holds its last streamed run's batches for [`Session::probe_batch_tables`]. Only a `profile`
+    /// image's roles keep them. Dev-facing: the pipeline detail's ttsim gate.
+    #[doc(hidden)]
+    pub fn probe_keep_batch_tables(&mut self, on: bool) {
+        for unit in &mut self.units {
+            if let Some(r) = unit.resident.as_mut() {
+                r.set_batch_tables(on);
+            }
+        }
+    }
+
+    /// Every unit's T0 and T2 batch tables (`mailbox::BATCH_TIMES`), after what is queued: each
+    /// role's batch count and the clock reads of the batches its table holds. Dev-facing.
+    #[doc(hidden)]
+    pub fn probe_batch_tables(&mut self) -> Result<Vec<[BatchTable; 2]>, TensorError> {
+        use tt_isa::mailbox::{role::Mailbox, BATCH_TIMES_MAX, BATCH_TIME_WORDS};
+        self.sync()?;
+        let mut out = Vec::with_capacity(self.units.len());
+        for unit in &self.units {
+            let Some(r) = unit.resident.as_ref() else {
+                out.push([(0, Vec::new()), (0, Vec::new())]);
+                continue;
+            };
+            let mut roles = [(0, Vec::new()), (0, Vec::new())];
+            for (slot, role) in roles.iter_mut().zip([0, 2]) {
+                let mb = Mailbox::of(role);
+                let count = self.dev.read32(r.window(), unit.tile, mb.batch_count())?;
+                let mut times = Vec::new();
+                for b in 0..count.min(BATCH_TIMES_MAX) {
+                    let mut t = [0u32; 3];
+                    for (k, w) in t.iter_mut().enumerate().take(BATCH_TIME_WORDS as usize) {
+                        *w = self
+                            .dev
+                            .read32(r.window(), unit.tile, mb.batch_time(b, k as u32))?;
+                    }
+                    times.push(t);
+                }
+                *slot = (count, times);
+            }
+            out.push(roles);
+        }
+        Ok(out)
+    }
+
     pub fn into_device(mut self) -> Device<T> {
         let _ = self.sync();
         for u in &mut self.units {
@@ -10848,6 +10933,11 @@ impl<T: Transport> Session<T> {
         self.dev
     }
 }
+
+/// One role's batch table ([`Session::probe_batch_tables`]): its count, and the clock reads of
+/// the batches it holds.
+#[doc(hidden)]
+pub type BatchTable = (u32, Vec<[u32; 3]>);
 
 impl Session<tt_kmd::Kmd> {
     /// Open `/dev/tenstorrent/{index}` for compute, holding the card's driver

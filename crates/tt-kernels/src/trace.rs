@@ -160,8 +160,9 @@ pub struct OpRecord {
     /// Whether a barrier followed it, on the units it ran on.
     pub barrier: bool,
     /// The events it could stamp in the profile mode on its busiest unit, at most:
-    /// `[Detail::Ops, Detail::Full]` (`crate::profile_mode`). Set when the trace is stored.
-    pub stamps: [u32; 2],
+    /// `[Detail::Ops, Detail::Full, Detail::Pipeline]` (`crate::profile_mode`), indexed by the
+    /// detail. Set when the trace is stored.
+    pub stamps: [u32; 3],
     /// What it moves through GDDR on all its units. Counted when the trace is stored, in the
     /// profile mode only; zero otherwise.
     pub bytes: crate::profile_mode::OpBytes,
@@ -682,7 +683,7 @@ mod tests {
                     label: "",
                     entries: vec![r.clone()],
                     barrier: true,
-                    stamps: [0; 2],
+                    stamps: [0; 3],
                     bytes: Default::default(),
                     unit_bytes: Vec::new(),
                     ahead: Vec::new(),

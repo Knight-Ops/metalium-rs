@@ -1331,7 +1331,7 @@ mod tests {
                     .map(|(u, s)| s..u.stream.len())
                     .collect(),
                 barrier: true,
-                stamps: [0; 2],
+                stamps: [0; 3],
                 bytes: Default::default(),
                 unit_bytes: Vec::new(),
                 ahead: Vec::new(),

@@ -33,8 +33,13 @@
 //!   GDDR read rate as a counter beside each trace's ops.
 //! * `entries.tsv` (`TT_PROFILE_DETAIL=full` only): every trace op's entries on unit 0 by kind,
 //!   their time and the gaps before them (`tt_kernels::profile_mode::attribute_entries`).
+//! * `pipeline.tsv` (`TT_PROFILE_DETAIL=pipeline` only): every trace op's streamed batches on each
+//!   unit, from the first replay that stamped it: when B waited for a slot, issued the gather and
+//!   saw it land, and when T0 and T2 waited, got and finished each batch
+//!   (`tt_kernels::profile_mode::unit_pipes`; `summary.md` has a table by label).
 //!
-//! `TT_PROFILE_DETAIL=full` stamps every data entry too (fewer ops per replay window). A
+//! `TT_PROFILE_DETAIL=full` stamps every data entry too (fewer ops per replay window);
+//! `TT_PROFILE_DETAIL=pipeline` adds each streamed batch's steps on every unit. A
 //! `TT_PROFILE` ending in `.json` keeps the raw timestamp trace of every entry instead
 //! (`tt_kernels::profile`). Programs can turn the mode on and read it without the environment:
 //! [`profile_mode`], [`profile_report`].
@@ -136,7 +141,7 @@ impl Profile {
     }
 
     /// Write `summary.md`, `ops.tsv`, `skew.tsv`, `channels.tsv`, `tails.tsv` and `trace.json` into
-    /// `dir`, creating it.
+    /// `dir`, creating it, and `entries.tsv` and `pipeline.tsv` when their detail recorded them.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         let name = |id: u64| self.name(id);
         std::fs::create_dir_all(dir)?;
@@ -152,6 +157,14 @@ impl Profile {
             .any(|t| t.entries.iter().any(|e| !e.is_empty()))
         {
             std::fs::write(dir.join("entries.tsv"), self.device.entries_tsv(&name))?;
+        }
+        if self
+            .device
+            .traces
+            .values()
+            .any(|t| t.pipes.iter().any(|p| !p.is_empty()))
+        {
+            std::fs::write(dir.join("pipeline.tsv"), self.device.pipeline_tsv(&name))?;
         }
         std::fs::write(dir.join("trace.json"), self.device.chrome_trace(&name))
     }
@@ -199,11 +212,13 @@ pub(crate) fn session_text<T: tt_device::Transport>(s: &tt_kernels::session::Ses
 }
 
 /// The profile mode's settings from the environment: `TT_PROFILE_DETAIL=full` for every entry,
-/// `TT_PROFILE_PUSH=0` for no math-role push totals (`ProfileOptions::push`).
+/// `pipeline` for each streamed batch's steps, `TT_PROFILE_PUSH=0` for no math-role push totals
+/// (`ProfileOptions::push`).
 pub fn options_from_env() -> ProfileOptions {
     ProfileOptions {
         detail: match std::env::var("TT_PROFILE_DETAIL").as_deref() {
             Ok("full") => Detail::Full,
+            Ok("pipeline") => Detail::Pipeline,
             _ => Detail::Ops,
         },
         push: std::env::var("TT_PROFILE_PUSH").as_deref() != Ok("0"),

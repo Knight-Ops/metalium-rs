@@ -791,8 +791,44 @@ fn await_roles(generation: u32) -> Result<(), u32> {
             trace(true, ev::ROLE_DRAIN, unit(drain));
             trace(true, ev::ROLE_WORDS, unit(rd(math.push_words())));
         }
+        stamp_batches();
     }
     Ok(())
+}
+
+/// After a stamped `ROLES_DONE`: T0's and T2's batch tables (`mailbox::BATCH_TIMES`), if the
+/// kernel was a streamed run that kept them (`mailbox::trace_word::BATCHES`), stamped as a
+/// `BATCH_BASE` and a `BATCH_TIME` a clock read, each counted back from the base; then the
+/// counts cleared, so a table is stamped once. The roles wrote them before acknowledging, which
+/// [`await_roles`] read through a fence. Cold: only the profile mode's pipeline detail asks.
+#[cold]
+#[inline(never)]
+fn stamp_batches() {
+    use tt_isa::mailbox::{trace as ev, BATCH_TIMES_MAX, BATCH_TIME_WORDS};
+    let (t0, t2) = (Mailbox::of(0), Mailbox::of(2));
+    let (n0, n2) = (rd(t0.batch_count()), rd(t2.batch_count()));
+    if n0 == 0 && n2 == 0 {
+        return;
+    }
+    let n = n0.min(n2).min(BATCH_TIMES_MAX);
+    let flags = if n0.max(n2) > BATCH_TIMES_MAX {
+        ev::BATCH_TRUNCATED
+    } else {
+        0
+    } | if n0 != n2 { ev::BATCH_MISMATCHED } else { 0 };
+    let base = wall_clock();
+    trace(true, ev::BATCH_BASE, n | flags);
+    for batch in 0..n {
+        for mb in [t0, t2] {
+            for k in 0..BATCH_TIME_WORDS {
+                let ago = base.wrapping_sub(rd(mb.batch_time(batch, k))) >> ev::BATCH_UNIT_SHIFT;
+                trace(true, ev::BATCH_TIME, ago.min(ev::DETAIL_MAX));
+            }
+        }
+    }
+    wr(t0.batch_count(), 0);
+    wr(t2.batch_count(), 0);
+    publish();
 }
 
 /// Record `event` through the tile's timestamper, if this list is traced

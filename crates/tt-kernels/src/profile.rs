@@ -65,6 +65,19 @@ pub enum Event {
     RolePush { what: RoleTotal, amount: u64 },
     /// RISCV B's GDDR read bytes issued since its last such mark (`tt_isa::mailbox::trace::READ_BYTES`).
     ReadBytes { bytes: u64 },
+    /// After a kernel's `ROLES_DONE`: T0's and T2's batch tables follow, `batches` of them
+    /// (`tt_isa::mailbox::trace::BATCH_BASE`); `truncated` if the run had more, `mismatched` if
+    /// the two roles counted different numbers. The [`Event::BatchTime`]s count back from this
+    /// stamp.
+    BatchBase {
+        batches: u32,
+        truncated: bool,
+        mismatched: bool,
+    },
+    /// One clock read of a batch table, `cycles` before the [`Event::BatchBase`] it follows
+    /// (to a multiple of `1 << BATCH_UNIT_SHIFT`); `saturated` if it lay further back than a
+    /// detail can say.
+    BatchTime { cycles: u64, saturated: bool },
     /// Anything else: a token no firmware of this build writes.
     Unknown(u32),
 }
@@ -116,6 +129,15 @@ impl Event {
             },
             (ev::MOVER, ev::READ_BYTES) => Event::ReadBytes {
                 bytes: (detail as u64) << ev::READ_UNIT_SHIFT,
+            },
+            (ev::MOVER, ev::BATCH_BASE) => Event::BatchBase {
+                batches: detail & (ev::BATCH_TRUNCATED - 1),
+                truncated: detail & ev::BATCH_TRUNCATED != 0,
+                mismatched: detail & ev::BATCH_MISMATCHED != 0,
+            },
+            (ev::MOVER, ev::BATCH_TIME) => Event::BatchTime {
+                cycles: (detail as u64) << ev::BATCH_UNIT_SHIFT,
+                saturated: detail == ev::DETAIL_MAX,
             },
             (ev::MOVER, ev::KICK | ev::ROLES_DONE) => Event::Kick {
                 done: event == ev::ROLES_DONE,
@@ -307,7 +329,10 @@ impl UnitProfile {
                     end: e.cycles,
                 }),
                 // Totals, not moments: the profile mode attributes them.
-                Event::RolePush { .. } | Event::ReadBytes { .. } => {}
+                Event::RolePush { .. }
+                | Event::ReadBytes { .. }
+                | Event::BatchBase { .. }
+                | Event::BatchTime { .. } => {}
                 Event::Role {
                     thread,
                     what: RoleEvent::Woke,
