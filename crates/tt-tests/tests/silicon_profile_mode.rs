@@ -374,12 +374,9 @@ fn a_measured_block_choice_times_what_an_unprofiled_build_runs() {
     );
 }
 
-/// How far a role's time and one of B's may stand out of the protocol's order, in cycles, though
-/// the events were in order. A role's time is stamped as a count of 32-cycle units back from B's
-/// base (`mailbox::trace::BATCH_UNIT_SHIFT`), floored, so it reads up to 31 cycles late; and B
-/// stamps a credit's end after publishing it, so the role it frees may act before that stamp
-/// (by 6 cycles on card 0, `1793635382`). Two units cover both.
-const CROSS_CORE_SLACK: u64 = 2 << tt_isa::mailbox::trace::BATCH_UNIT_SHIFT;
+/// How far a role's time and one of B's may stand out of the protocol's order though the events
+/// were in order (B stamps a credit's end after publishing it).
+use tt_kernels::profile_mode::CROSS_CORE_SLACK;
 
 /// A streamed pair's batches on every unit, against the credit protocol's own order.
 #[test]
@@ -456,7 +453,7 @@ fn a_streamed_pairs_batches_keep_the_credit_protocols_order() {
     {
         let what = format!("[1, {k}] @ [{k}, {n}], a ring of {ring}");
         assert_eq!((t.overflowed, t.unit_mismatches), (0, 0), "{what}");
-        assert_eq!(t.pipe_dropped, 0, "{what}: a pair's batches not told");
+        assert_eq!(t.pipe_dropped, [0; 7], "{what}: a pair's batches not told");
         let units: Vec<_> = t.pipe_batches.iter().flatten().collect();
         assert!(units.len() > 8, "{what}: {} units told", units.len());
         let (mut batches, mut ahead) = (0, 0);

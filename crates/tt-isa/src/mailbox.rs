@@ -74,7 +74,7 @@ pub mod trace_word {
     /// role by the profile mode.
     pub const PUSH: u32 = 2;
     /// Record each batch of a streamed run in [`super::BATCH_TIMES`], for the data mover
-    /// to stamp at the kernel's end (`super::trace::BATCH_BASE`). Acted on by T0 and T2;
+    /// to log at the kernel's end (`super::trace::BATCH_BASE`). Acted on by T0 and T2;
     /// set for them by the profile mode's pipeline detail.
     pub const BATCHES: u32 = 4;
 }
@@ -162,8 +162,8 @@ const _: () = assert!(PUSH_CYCLES >= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(PUSH_WORDS + 4 <= MAILBOX_BASE + guard::OFFSET);
 
 /// A streamed run's batch table, written by a `profile` image's T0 and T2 runners when their
-/// [`TRACE`] has [`trace_word::BATCHES`], before they acknowledge; the data mover stamps it after
-/// the kernel's `ROLES_DONE` (`trace::BATCH_BASE`) and then clears its count.
+/// [`TRACE`] has [`trace_word::BATCHES`], before they acknowledge; the data mover copies it into
+/// its batch log after the kernel's `ROLES_DONE` (`trace::BATCH_BASE`) and then clears its count.
 ///
 /// Word 0 is the run's batch count (all of them, even past [`BATCH_TIMES_MAX`]); then, for each
 /// of the first [`BATCH_TIMES_MAX`] batches, [`BATCH_TIME_WORDS`] reads of the timestamper's
@@ -301,23 +301,32 @@ pub mod trace {
     /// Bytes a [`READ_BYTES`] detail counts: 64, so a detail holds ~8.4 MB.
     pub const READ_UNIT_SHIFT: u32 = 6;
     /// After a stamped `ROLES_DONE` whose kernel was a streamed run with batch tables
-    /// (`super::BATCH_TIMES`, `super::trace_word::BATCHES`): the stamp is the base the
-    /// [`BATCH_TIME`]s that follow count back from. The detail is the batches stamped (at
-    /// most `super::BATCH_TIMES_MAX`), with [`BATCH_TRUNCATED`] if the run had more and
-    /// [`BATCH_MISMATCHED`] if T0's and T2's counts differ (the lesser is stamped).
+    /// (`super::BATCH_TIMES`, `super::trace_word::BATCHES`): RISCV B copied T0's and T2's
+    /// tables into its batch log (`crate::dm::BATCH_LOG`) as one record, and the detail is
+    /// the record's word offset there, or [`BATCH_LOG_FULL`] if it did not fit. The stamp's
+    /// counter anchors the record's clock reads, which are the same counter's low word.
+    ///
+    /// Only this one stamp goes through the timestamper: stamped back to back after a
+    /// kernel, the tables' times came out repeated and lost on card 0 and card 1 (the same
+    /// event four times 64 cycles apart, later ones missing; `1793636433` and the pipeline
+    /// gate's debugging runs), while plain stores to L1 are not.
     pub const BATCH_BASE: u32 = 27;
-    /// One clock read of a batch table, in order: each batch's three T0 reads, then its
-    /// three T2 reads. The detail is the cycles from the read to the [`BATCH_BASE`] stamp,
-    /// in units of `1 << BATCH_UNIT_SHIFT`, at most [`DETAIL_MAX`] (then saturated: the
-    /// read lies further back than the detail can say).
-    pub const BATCH_TIME: u32 = 28;
-    /// Cycles a [`BATCH_TIME`] detail counts: 32 (~24 ns), so a detail reaches ~4.2 million
-    /// cycles (~3.1 ms) back.
-    pub const BATCH_UNIT_SHIFT: u32 = 5;
-    /// [`BATCH_BASE`]'s flag: the run had more batches than were stamped.
+    /// The host's, never stamped: in place of a [`BATCH_BASE`], its record from the batch log
+    /// (`tt_kernels::profile_mode::splice_batch_log`). The detail is the record's header: its
+    /// batches, with [`BATCH_TRUNCATED`] and [`BATCH_MISMATCHED`]. [`BATCH_TIME`]s follow.
+    pub const BATCH_TABLE: u32 = 28;
+    /// The host's, never stamped: one clock read of a [`BATCH_TABLE`], whose counter is the
+    /// read itself; in order, each batch's three T0 reads, then its three T2 reads.
+    pub const BATCH_TIME: u32 = 29;
+    /// The host's, never stamped: in place of a [`BATCH_BASE`] naming a record an earlier base
+    /// of the same drain already named, a copy the timestamper repeated (a record is named once).
+    pub const BATCH_REPEAT: u32 = 30;
+    /// A batch log record's header flag: the run had more batches than the record holds.
     pub const BATCH_TRUNCATED: u32 = 1 << 15;
-    /// [`BATCH_BASE`]'s flag: T0's and T2's batch counts differ.
+    /// A batch log record's header flag: T0's and T2's batch counts differ.
     pub const BATCH_MISMATCHED: u32 = 1 << 16;
+    /// [`BATCH_BASE`]'s flag: the record did not fit the batch log, so it was not kept.
+    pub const BATCH_LOG_FULL: u32 = 1 << 16;
 
     /// The source of the data mover's events. Role runners use their Tensix
     /// thread, 0..3.

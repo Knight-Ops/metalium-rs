@@ -335,7 +335,9 @@ fn account(
             | Event::RolePush { .. }
             | Event::ReadBytes { .. }
             | Event::BatchBase { .. }
-            | Event::BatchTime { .. }
+            | Event::BatchTable { .. }
+            | Event::BatchTime
+            | Event::BatchRepeat
             | Event::Role { .. }
             | Event::Unknown(_) => {
                 if open.is_none() {

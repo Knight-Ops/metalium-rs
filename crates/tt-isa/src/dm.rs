@@ -222,6 +222,19 @@ pub const CREDITS: u64 = MAILBOX_BASE + 0x400;
 pub const CREDIT_WORDS: u32 = 8;
 /// The end of [`CREDITS`].
 pub const CREDITS_END: u64 = CREDITS + CREDIT_WORDS as u64 * 16;
+/// RISCV B's batch log, in a `profile` image: T0's and T2's batch tables
+/// (`crate::mailbox::BATCH_TIMES`) copied after each kernel that kept them, one record each,
+/// for the host to read with the stamps (`crate::mailbox::trace::BATCH_BASE` names a record).
+/// Word 0 is the words used after it, which the host zeroes when it reads the log; a record
+/// is a header (its batches, with `trace::BATCH_TRUNCATED` and `trace::BATCH_MISMATCHED`), then
+/// each batch's three T0 clock reads and three T2 reads.
+pub const BATCH_LOG: u64 = CREDITS_END;
+/// The end of [`BATCH_LOG`]: NC's mailbox.
+pub const BATCH_LOG_END: u64 = nc::MAILBOX_BASE;
+/// Words of [`BATCH_LOG`], its count word included.
+pub const BATCH_LOG_WORDS: u32 = ((BATCH_LOG_END - BATCH_LOG) / 4) as u32;
+const _: () = assert!(BATCH_LOG_WORDS >= 1 + 1 + 6 * crate::mailbox::BATCH_TIMES_MAX);
+
 /// Credit word `i` of [`CREDITS`], alone in its 16 bytes.
 pub const fn credit_word(i: u32) -> u32 {
     assert!(i < CREDIT_WORDS);

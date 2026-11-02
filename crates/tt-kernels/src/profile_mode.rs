@@ -897,22 +897,129 @@ pub struct PipeSample {
     pub units: u64,
 }
 
+/// Why [`unit_pipes`] could not tell a pair's batches, an index into [`UnitPipes::dropped`]: its
+/// reader stamped fewer input credits than two a batch of its table, or more; its table was
+/// truncated (more batches than `mailbox::BATCH_TIMES_MAX`) or its roles' counts differed; it was
+/// not in B's batch log (the log was full); another table began before its times were all read;
+/// or the join broke the credit protocol's order ([`in_protocol_order`]).
+pub const DROP_REASONS: [&str; 7] = [
+    "fewer credits",
+    "more credits",
+    "truncated",
+    "mismatched",
+    "not in the log",
+    "interrupted",
+    "disordered",
+];
+
+/// How far apart two cores' times may stand against the credit protocol's order and still be
+/// taken as in order, in cycles. B stamps a credit's end after publishing it, so the role it
+/// frees may act before that stamp: by 6 cycles on card 0 (`1793635382`); the roles' own times
+/// are exact reads of the same counter. 64 cycles (~47 ns) is a tenth of a stamp's spacing.
+pub const CROSS_CORE_SLACK: u64 = 64;
+
+/// The host's half of the batch log (`tt_isa::dm::BATCH_LOG`): unit `u`'s stamps since its last
+/// drain, each `BATCH_BASE` replaced by its record from `log` (the log's words after its count)
+/// as a `BATCH_TABLE` and its `BATCH_TIME`s. A record's clock reads are the low word of the
+/// counter the base was stamped with, so each is placed on the full counter exactly, counting back
+/// from the base. A base whose record `log` lacks stays, and is dropped as not in the log. A
+/// base naming a record already spliced is a copy the timestamper repeated (each record is
+/// named once a drain): it becomes a `BATCH_REPEAT`, which [`unit_pipes`] counts.
+pub fn splice_batch_log(events: Vec<TraceEvent>, log: &[u32]) -> Vec<TraceEvent> {
+    use tt_isa::mailbox::{trace as ev, BATCH_TIME_WORDS};
+    let mut out = Vec::with_capacity(events.len());
+    let mut named = std::collections::BTreeSet::new();
+    for e in events {
+        let record = match Event::decode(e.token) {
+            Event::BatchBase {
+                record,
+                log_full: false,
+            } if (e.token >> 8) & 0xF == ev::MOVER => record as usize,
+            _ => {
+                out.push(e);
+                continue;
+            }
+        };
+        if !named.insert(record) {
+            out.push(TraceEvent {
+                token: ev::token_with(ev::MOVER, ev::BATCH_REPEAT, 0),
+                cycles: e.cycles,
+            });
+            continue;
+        }
+        let Some(&header) = log.get(record) else {
+            out.push(e);
+            continue;
+        };
+        let n = (header & (ev::BATCH_TRUNCATED - 1)) as usize;
+        let Some(times) = log.get(record + 1..record + 1 + 2 * BATCH_TIME_WORDS as usize * n)
+        else {
+            out.push(e);
+            continue;
+        };
+        out.push(TraceEvent {
+            token: ev::token_with(ev::MOVER, ev::BATCH_TABLE, header),
+            cycles: e.cycles,
+        });
+        let low = e.cycles as u32;
+        out.extend(times.iter().map(|&t| TraceEvent {
+            token: ev::token_with(ev::MOVER, ev::BATCH_TIME, 0),
+            cycles: e.cycles.saturating_sub(u64::from(low.wrapping_sub(t))),
+        }));
+    }
+    out
+}
+
+/// What a pair's batch log record costs a window, in stamps: its `words`, scaled so a window's
+/// records fit the log as its stamps fit the buffer (`tt_isa::dm::BATCH_LOG_WORDS` against
+/// [`WINDOW_EVENTS`]).
+pub fn batch_log_cost(words: u32) -> u32 {
+    (u64::from(words) * u64::from(WINDOW_EVENTS))
+        .div_ceil(u64::from(tt_isa::dm::BATCH_LOG_WORDS - 1)) as u32
+}
+
+/// Whether a pair's joined batches keep the credit protocol's order, which they always do if the
+/// join is right ([`CROSS_CORE_SLACK`] across cores): each core's own steps in turn; a batch
+/// landed before T0 saw it, and T0 saw it before T2 pushed it; each batch's T0 and T2 began after
+/// they finished the one before (every role retires a batch before the next).
+pub fn in_protocol_order(batches: &[Batch]) -> bool {
+    let slack = CROSS_CORE_SLACK;
+    batches.iter().all(|b| {
+        b.reserve <= b.granted
+            && b.granted <= b.issued
+            && b.issued <= b.landed
+            && b.t0[0] <= b.t0[1]
+            && b.t0[1] <= b.t0[2]
+            && b.t2[0] <= b.t2[1]
+            && b.t2[1] <= b.t2[2]
+            && b.landed <= b.t0[1] + slack
+            && b.t0[1] <= b.t2[2] + slack
+    }) && batches.windows(2).all(|w| {
+        w[0].t0[2] <= w[1].t0[0] && w[0].t2[2] <= w[1].t2[0] && w[0].landed <= w[1].reserve
+    })
+}
+
 /// What [`unit_pipes`] found on one unit in one replay: each op it streamed batches for, as `(op,
-/// since, arrive, batches)` on the unit's clock; and the pairs whose batches it could not tell
-/// (`dropped`: a table truncated, mismatched or saturated, or a reader's credits that do not
-/// pair with its table).
+/// since, arrive, batches)` on the unit's clock; and the pairs whose batches it could not tell,
+/// by reason ([`DROP_REASONS`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnitPipes {
     pub ops: Vec<(usize, u64, u64, Vec<Batch>)>,
-    pub dropped: u32,
+    /// Pairs told: their batches are in `ops`.
+    pub told: u32,
+    /// Bases the timestamper repeated ([`splice_batch_log`]), not pairs.
+    pub repeats: u32,
+    pub dropped: [u32; DROP_REASONS.len()],
+    /// Of `dropped`, those within an op's work on the unit: `(op, pairs)`.
+    pub dropped_ops: Vec<(usize, u32)>,
 }
 
 /// [`Detail::Pipeline`]: one replay's stamps on a unit whose barriers are `seq`, stamped within the
 /// window `lo..hi` (as [`unit_times`]), as each op's streamed batches. A pair's reader stamps its
 /// input credits as `CB` entries, a reserve then a push for each batch, after its `LAUNCH`; after
-/// its kernel B stamps the roles' batch tables (`Event::BatchBase`, then six `Event::BatchTime`s a
-/// batch: T0's three, then T2's), which pair with those credits in order. `None` if the barrier
-/// stamps and `seq` do not line up.
+/// its kernel B logs the roles' batch tables, which [`splice_batch_log`] has put in the stream
+/// (`Event::BatchTable`, then six `Event::BatchTime`s a batch: T0's three, then T2's) and which
+/// pair with those credits in order. `None` if the barrier stamps and `seq` do not line up.
 pub fn unit_pipes(
     events: &[TraceEvent],
     seq: &[UnitBarrier],
@@ -932,8 +1039,9 @@ pub fn unit_pipes(
     let mut credits: Vec<(u64, u64)> = Vec::new();
     let mut open_credit = None;
     let mut batches: Vec<Batch> = Vec::new();
-    // A table being read: its base, its batches, whether it can be used, and its times so far.
-    let mut table: Option<(u64, usize, bool, Vec<u64>)> = None;
+    let mut drops = 0u32;
+    // A table being read: its batches, why it cannot be used (if it cannot), and its times so far.
+    let mut table: Option<(usize, Option<usize>, Vec<u64>)> = None;
     let mut pairs = Vec::new();
     let mut open = None;
     for &(event, t) in &stamps[start..] {
@@ -954,30 +1062,55 @@ pub fn unit_pipes(
                     credits.push((b, t));
                 }
             }
-            Event::BatchBase {
+            Event::BatchBase { .. } => {
+                // Not replaced by its record: not in the log.
+                out.dropped[4] += 1;
+                drops += 1;
+            }
+            Event::BatchRepeat => out.repeats += 1,
+            Event::BatchTable {
                 batches: n,
                 truncated,
                 mismatched,
             } => {
                 if table.take().is_some() {
-                    out.dropped += 1;
+                    out.dropped[5] += 1;
+                    drops += 1;
                 }
-                let usable = !truncated && !mismatched && credits.len() == 2 * n as usize;
-                table = Some((t, n as usize, usable, Vec::new()));
+                let want = 2 * n as usize;
+                if n == 0 {
+                    // No times follow: one role logged none (its count was zero).
+                    out.dropped[3] += 1;
+                    drops += 1;
+                    credits.clear();
+                    continue;
+                }
+                let why = if truncated {
+                    Some(2)
+                } else if mismatched {
+                    Some(3)
+                } else if credits.len() < want {
+                    Some(0)
+                } else if credits.len() > want {
+                    Some(1)
+                } else {
+                    None
+                };
+                table = Some((n as usize, why, Vec::new()));
             }
-            Event::BatchTime { cycles, saturated } => {
-                let Some((base, n, usable, times)) = table.as_mut() else {
+            Event::BatchTime => {
+                let Some((n, _, times)) = table.as_mut() else {
                     continue;
                 };
-                *usable &= !saturated;
-                times.push(base.saturating_sub(cycles));
+                times.push(t);
                 if times.len() == 2 * words * *n {
-                    let (_, n, usable, times) = table.take().expect("just matched");
-                    if usable {
+                    let (n, why, times) = table.take().expect("just matched");
+                    let mut pair = Vec::with_capacity(n);
+                    if why.is_none() {
                         for i in 0..n {
                             let (r, p) = (credits[2 * i], credits[2 * i + 1]);
                             let at = |k: usize| times[2 * words * i + k];
-                            batches.push(Batch {
+                            pair.push(Batch {
                                 reserve: r.0,
                                 granted: r.1,
                                 issued: p.0,
@@ -986,8 +1119,14 @@ pub fn unit_pipes(
                                 t2: [at(3), at(4), at(5)],
                             });
                         }
+                    }
+                    let why = why.or_else(|| (!in_protocol_order(&pair)).then_some(6));
+                    if let Some(why) = why {
+                        out.dropped[why] += 1;
+                        drops += 1;
                     } else {
-                        out.dropped += 1;
+                        out.told += 1;
+                        batches.extend(pair);
                     }
                     credits.clear();
                 }
@@ -995,13 +1134,13 @@ pub fn unit_pipes(
             Event::Entry {
                 begin: true,
                 op: op::BARRIER,
-            } => open = Some((t, std::mem::take(&mut batches))),
+            } => open = Some((t, std::mem::take(&mut batches), std::mem::take(&mut drops))),
             Event::Entry {
                 begin: false,
                 op: op::BARRIER,
             } => {
-                let (arrive, b) = open.take()?;
-                pairs.push((arrive, t, b));
+                let (arrive, b, d) = open.take()?;
+                pairs.push((arrive, t, b, d));
             }
             _ => {}
         }
@@ -1011,10 +1150,13 @@ pub fn unit_pipes(
     let mut count = 0u32;
     for b in seq {
         if hi == 0 || (lo <= count && count < hi) {
-            let (arrive, release, batches) = pairs.next()?;
+            let (arrive, release, batches, drops) = pairs.next()?;
             if let (Some(k), Some(s)) = (b.arrival_of, since) {
                 if !batches.is_empty() {
                     out.ops.push((k as usize, s, arrive, batches));
+                }
+                if drops > 0 {
+                    out.dropped_ops.push((k as usize, drops));
                 }
             }
             since = Some(release);
@@ -1123,8 +1265,15 @@ pub struct TraceSamples {
     /// [`Detail::Pipeline`]: per op, the first replay's batches on every unit that streamed some,
     /// `(unit, since, arrive, batches)`.
     pub pipe_batches: Vec<Vec<UnitBatches>>,
-    /// [`Detail::Pipeline`]: pairs whose batches could not be told ([`UnitPipes::dropped`]).
-    pub pipe_dropped: u32,
+    /// [`Detail::Pipeline`]: pairs whose batches could not be told, by reason
+    /// ([`UnitPipes::dropped`], [`DROP_REASONS`]).
+    pub pipe_dropped: [u32; DROP_REASONS.len()],
+    /// [`Detail::Pipeline`]: per op, of `pipe_dropped`, the pairs within its units' work.
+    pub pipe_dropped_ops: Vec<u32>,
+    /// [`Detail::Pipeline`]: pairs told, summed over units and replays ([`UnitPipes::told`]).
+    pub pipe_told: u64,
+    /// [`Detail::Pipeline`]: batch bases the timestamper repeated ([`UnitPipes::repeats`]).
+    pub pipe_repeats: u64,
     /// Per unit, its barriers in stream order (empty where unknown).
     unit_barriers: Vec<Vec<UnitBarrier>>,
     pub replays: u32,
@@ -1202,6 +1351,7 @@ impl Profiler {
                 reads: vec![Vec::new(); ops.len()],
                 pipes: vec![Vec::new(); ops.len()],
                 pipe_batches: vec![Vec::new(); ops.len()],
+                pipe_dropped_ops: vec![0; ops.len()],
                 entries: vec![EntryCosts::new(); ops.len()],
                 ops,
                 stamps,
@@ -1420,7 +1570,16 @@ impl TraceSamples {
             let Some(found) = unit_pipes(events, seq, lo, hi) else {
                 continue;
             };
-            self.pipe_dropped += found.dropped;
+            self.pipe_told += u64::from(found.told);
+            self.pipe_repeats += u64::from(found.repeats);
+            for (d, n) in self.pipe_dropped.iter_mut().zip(found.dropped) {
+                *d += n;
+            }
+            for (k, n) in found.dropped_ops {
+                if let Some(d) = self.pipe_dropped_ops.get_mut(k) {
+                    *d += n;
+                }
+            }
             for (k, since, arrive, batches) in found.ops {
                 let stats = PipeStats::of(since, arrive, &batches);
                 let (sample, kept) = by_op.entry(k).or_default();
@@ -2151,14 +2310,50 @@ impl ProfileReport {
             }
         }
         rows.sort_by_key(|(_, r)| std::cmp::Reverse(r.slowest.work / r.samples.max(1) * r.ops));
+        let mut dropped: Vec<String> = DROP_REASONS
+            .iter()
+            .zip(t.pipe_dropped)
+            .filter(|(_, n)| *n > 0)
+            .map(|(why, n)| format!("{n} {why}"))
+            .collect();
+        let mut by_label: Vec<(&str, u32)> = Vec::new();
+        for (o, &n) in t.ops.iter().zip(&t.pipe_dropped_ops) {
+            if n == 0 {
+                continue;
+            }
+            match by_label.iter_mut().find(|(l, _)| *l == o.label) {
+                Some((_, m)) => *m += n,
+                None => by_label.push((o.label, n)),
+            }
+        }
+        by_label.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        if !by_label.is_empty() {
+            dropped.push(format!(
+                "by label {}",
+                by_label
+                    .iter()
+                    .take(8)
+                    .map(|(l, n)| format!("`{l}` {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let dropped = if dropped.is_empty() {
+            "none".to_string()
+        } else {
+            dropped.join("; ")
+        };
         let _ = writeln!(
             out,
             "\nStreamed batches by label (`Detail::Pipeline`): per op, its slowest unit's work and its \
-             shares of it; B's columns and the roles' overlap in time. {} pairs not told apart.\n\n\
+             shares of it; B's columns and the roles' overlap in time. Pairs told: {}; not told: {}; \
+             bases the timestamper repeated: {}.\n\n\
              | label | ops | units | batches a unit | slowest unit us | head | ring | issue | land | \
              starve | kernel | out wait | tail | overlap | what-if saves | mean unit us | its ring | \
              its starve |\n|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
-            t.pipe_dropped
+            t.pipe_told,
+            dropped,
+            t.pipe_repeats
         );
         let share = |part: u64, whole: u64| 100.0 * part as f64 / whole.max(1) as f64;
         for (label, r) in rows {
@@ -2399,9 +2594,11 @@ impl ProfileReport {
             let _ = writeln!(
                 out,
                 "Windows sized from at most {} stamps for the whole trace on its busiest unit \
-                 (largest op {}), {WINDOW_EVENTS} a window.\n",
+                 (largest op {}), {WINDOW_EVENTS} a window. Units' replays whose barriers did not \
+                 line up: {}.\n",
                 t.stamps.iter().sum::<u32>(),
-                t.stamps.iter().max().copied().unwrap_or(0)
+                t.stamps.iter().max().copied().unwrap_or(0),
+                t.unit_mismatches,
             );
             let rows = by_label(
                 t.ops
@@ -2767,9 +2964,9 @@ mod tests {
     }
 
     /// One op on a unit: a pair of two batches through a one-batch ring, its credits stamped as
-    /// `CB` entries, and after its kernel the roles' tables (`BATCH_BASE` at 416, each time a
-    /// multiple of 32 cycles before it); then the unit's arrival at 430.
-    fn pair_of_two(base_detail: u32, times: &[u64]) -> Vec<TraceEvent> {
+    /// `CB` entries, and after its kernel the roles' tables as the host splices them from the log
+    /// (`BATCH_TABLE` with `header`, a `BATCH_TIME` a clock read); then the unit's arrival at 430.
+    fn pair_of_two(header: u32, times: &[u64]) -> Vec<TraceEvent> {
         let mut v = vec![e(ev::LIST_BEGIN, 1, 100)];
         v.extend(entry(op::LAUNCH, 101, 103));
         v.extend(entry(op::CB, 104, 108));
@@ -2778,14 +2975,8 @@ mod tests {
         v.extend(entry(op::CB, 260, 290));
         v.push(e(ev::ENTRY_BEGIN, op::KERNEL_WAIT, 291));
         v.push(e(ev::ROLES_DONE, 7, 410));
-        v.push(e(ev::BATCH_BASE, base_detail, 416));
-        for &t in times {
-            v.push(e(
-                ev::BATCH_TIME,
-                ((416 - t) >> ev::BATCH_UNIT_SHIFT) as u32,
-                417,
-            ));
-        }
+        v.push(e(ev::BATCH_TABLE, header, 416));
+        v.extend(times.iter().map(|&t| e(ev::BATCH_TIME, 0, t)));
         v.push(e(ev::ENTRY_END, op::KERNEL_WAIT, 420));
         v.extend(entry(op::BARRIER, 430, 440));
         v.push(e(ev::LIST_END, 1, 441));
@@ -2804,7 +2995,8 @@ mod tests {
             counts: 1,
         }];
         let found = unit_pipes(&pair_of_two(2, &ROLE_TIMES), &seq, 0, 0).unwrap();
-        assert_eq!(found.dropped, 0);
+        assert_eq!(found.dropped, [0; DROP_REASONS.len()]);
+        assert_eq!((found.told, found.repeats), (1, 0));
         let batches = vec![
             Batch {
                 reserve: 104,
@@ -2850,6 +3042,49 @@ mod tests {
         );
     }
 
+    /// The host puts each logged table in place of its base: the header as a `BATCH_TABLE`, each
+    /// clock read on the full counter, counting back from the base's (across a wrap of the low
+    /// word too); a base without a record, or with the log full, stays.
+    #[test]
+    fn a_logged_table_takes_its_bases_place() {
+        let base = (7u64 << 32) + 100;
+        let log = [
+            0xdead,
+            1 | ev::BATCH_MISMATCHED,
+            50,
+            80,
+            90,
+            u32::MAX - 9, // 110 cycles before the base, across the low word's wrap
+            60,
+            95,
+        ];
+        let stream = vec![
+            e(ev::KICK, 1, base - 500),
+            e(ev::BATCH_BASE, 1, base),
+            e(ev::BATCH_BASE, 1, base + 2), // the timestamper's repeat
+            e(ev::BATCH_BASE, ev::BATCH_LOG_FULL, base + 10),
+            e(ev::BATCH_BASE, 40, base + 20),
+        ];
+        let out = splice_batch_log(stream.clone(), &log);
+        let at = |t: u64| e(ev::BATCH_TIME, 0, t);
+        assert_eq!(
+            out,
+            vec![
+                stream[0],
+                e(ev::BATCH_TABLE, 1 | ev::BATCH_MISMATCHED, base),
+                at((7 << 32) + 50),
+                at((7 << 32) + 80),
+                at((7 << 32) + 90),
+                at(base - 110),
+                at((7 << 32) + 60),
+                at((7 << 32) + 95),
+                e(ev::BATCH_REPEAT, 0, base + 2),
+                stream[3],
+                stream[4],
+            ]
+        );
+    }
+
     /// A table that cannot be joined is dropped and counted, not misattributed: its count against
     /// the pair's credits, a time past what a detail can say, the roles' counts differing, or more
     /// batches than the table held.
@@ -2862,28 +3097,50 @@ mod tests {
         let dropped = |v: Vec<TraceEvent>| {
             let found = unit_pipes(&v, &seq, 0, 0).unwrap();
             assert!(found.ops.is_empty());
-            found.dropped
+            assert_eq!(
+                found.dropped_ops.iter().map(|d| d.1).sum::<u32>(),
+                1,
+                "op 0's"
+            );
+            found
+                .dropped
+                .iter()
+                .position(|&n| n == 1)
+                .filter(|_| found.dropped.iter().sum::<u32>() == 1)
+                .map(|why| DROP_REASONS[why])
         };
         assert_eq!(
             dropped(pair_of_two(1, &ROLE_TIMES[..6])),
-            1,
+            Some("more credits"),
             "one batch for two"
         );
-        let mut far = pair_of_two(2, &ROLE_TIMES);
-        let at = far
+        // A base the host found no record for stays in the stream.
+        let mut unlogged = pair_of_two(2, &ROLE_TIMES);
+        let at = unlogged
             .iter()
-            .position(|x| ev::split(x.token).1 == ev::BATCH_TIME)
+            .position(|x| ev::split(x.token).1 == ev::BATCH_TABLE)
             .unwrap();
-        far[at] = e(ev::BATCH_TIME, ev::DETAIL_MAX, 417);
-        assert_eq!(dropped(far), 1, "saturated");
+        unlogged.truncate(at);
+        unlogged.push(e(ev::BATCH_BASE, ev::BATCH_LOG_FULL, 416));
+        unlogged.push(e(ev::ENTRY_END, op::KERNEL_WAIT, 420));
+        unlogged.extend(entry(op::BARRIER, 430, 440));
+        assert_eq!(dropped(unlogged), Some("not in the log"));
         assert_eq!(
             dropped(pair_of_two(2 | ev::BATCH_MISMATCHED, &ROLE_TIMES)),
-            1
+            Some("mismatched")
         );
         assert_eq!(
             dropped(pair_of_two(2 | ev::BATCH_TRUNCATED, &ROLE_TIMES)),
-            1
+            Some("truncated")
         );
+        // A join out of the protocol's order: T2 pushing batch 0 (at 96) before T0 saw it (192),
+        // further apart than the stamps' resolution.
+        let mut early = ROLE_TIMES;
+        early[3..6].copy_from_slice(&[64, 96, 96]);
+        assert_eq!(dropped(pair_of_two(2, &early)), Some("disordered"));
+        // Three batches' tables against the pair's two batches of credits.
+        let three: Vec<u64> = ROLE_TIMES.iter().chain(&ROLE_TIMES[..6]).copied().collect();
+        assert_eq!(dropped(pair_of_two(3, &three)), Some("fewer credits"));
         // And barriers that do not line up with the stream refuse the replay.
         let two = [seq[0], seq[0]];
         assert_eq!(unit_pipes(&pair_of_two(2, &ROLE_TIMES), &two, 0, 0), None);

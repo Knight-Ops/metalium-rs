@@ -2579,9 +2579,10 @@ fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
 /// (`tt_isa::dm::trace_mode::FETCH`, `WRITER_WAIT`, `PREFETCH_WAIT`): two events each, and `range`
 /// may touch one chunk more than it fills. A prefetch `GATHER` adds its two `READ_BYTES` marks
 /// (`crate::profile_mode::PREFETCH_MARKS`), here though the second may fall under a later op.
-/// `Pipeline` stamps as `Ops` does, and after a kernel its batch tables
-/// ([`crate::profile_mode::ProfileOptions::stamps`] counts the base): six for each batch, one input
-/// `CB` reserve each.
+/// `Pipeline` stamps as `Ops` does and one base after a kernel
+/// ([`crate::profile_mode::ProfileOptions::stamps`]), and logs its batch tables in B's batch log:
+/// a header and six words a batch, one input `CB` reserve each, charged to the window at the log's
+/// rate ([`crate::profile_mode::batch_log_cost`]).
 fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
@@ -2594,6 +2595,7 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
         options(Detail::Pipeline),
     ];
     let mut count = [0u32; 3];
+    let mut log_words = 0u32;
     let mut add = |entries: &[[u32; 8]]| {
         let mut i = 0;
         while i < entries.len() {
@@ -2610,7 +2612,10 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
                 && Stream::decode(entries[i][1]) == Some(Stream::Input)
                 && Action::decode(entries[i][2]) == Some(Action::Reserve)
             {
-                count[2] += tt_isa::mailbox::BATCH_TIME_WORDS * 2;
+                log_words += tt_isa::mailbox::BATCH_TIME_WORDS * 2;
+            }
+            if matches!(head, tt_isa::dm::op::KERNEL | tt_isa::dm::op::KERNEL_WAIT) {
+                log_words += 1;
             }
             use tt_isa::dm::record;
             if head == record::GATHER && entries[i][1] & record::GATHER_PREFETCH != 0 {
@@ -2640,6 +2645,7 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
         }
         i += (tt_isa::dm::record::len(head) as usize).max(1);
     }
+    count[2] += crate::profile_mode::batch_log_cost(log_words);
     count.map(|c| c + fetches + waits)
 }
 
@@ -3129,6 +3135,7 @@ impl<T: Transport> Session<T> {
                 let count = tt_isa::mailbox::role::Mailbox::of(role).batch_count();
                 dev.write32(r.window(), unit.tile, count, 0)?;
             }
+            dev.write32(r.window(), unit.tile, tt_isa::dm::BATCH_LOG, 0)?;
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, trace_word)?;
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
@@ -3301,6 +3308,29 @@ impl<T: Transport> Session<T> {
                 Vec::new()
             }
             (events, _) => events?,
+        };
+        // The pipeline detail's batch log (`dm::BATCH_LOG`), read with the stamps that name its
+        // records and emptied for the next.
+        let events = match profiler.as_ref() {
+            Some(pr)
+                if pr.options.detail == crate::profile_mode::Detail::Pipeline
+                    && units[u].mover.is_some() =>
+            {
+                let used = dev
+                    .read32(r.window(), tile, tt_isa::dm::BATCH_LOG)?
+                    .min(tt_isa::dm::BATCH_LOG_WORDS - 1);
+                let mut bytes = vec![0u8; used as usize * 4];
+                if used > 0 {
+                    dev.read(r.window(), tile, tt_isa::dm::BATCH_LOG + 4, &mut bytes)?;
+                    dev.write32(r.window(), tile, tt_isa::dm::BATCH_LOG, 0)?;
+                }
+                let log: Vec<u32> = bytes
+                    .chunks_exact(4)
+                    .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                    .collect();
+                crate::profile_mode::splice_batch_log(events, &log)
+            }
+            _ => events,
         };
         if profiler.is_some() {
             // The profile mode attributes them ([`Session::profile_collect`]) and keeps no raw stream.
