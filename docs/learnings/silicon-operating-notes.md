@@ -1621,6 +1621,28 @@ is not enough. `SETDMAREG` then `WRCFG` (every `config_program`) has always work
 `gpr_step` (`ADDDMAREG`, `ADDDMAREG`, `WRCFG`, `WRCFG`) has none and passes; it is not known to be safe by
 construction. ttsim divergence row 104.
 
+## The timestamper repeats and drops events in a burst (2026-11-02, cards 0 and 1)
+
+The tile's debug timestamper (`tensix::timestamper`, `RISCV_DEBUG_REG_TIMESTAMP`) is not a reliable channel
+for a burst of events. RISCV B stamped each pair's batch tables back to back after a kernel's `ROLES_DONE`: six
+`BATCH_TIME`s a batch, ~25 per pair. On a 1.7B decode step (card 1, `1793635538`, `1793636433`), those streams
+held one event repeated four times, 64 cycles apart, with later events missing. That is faster than B's own
+loop could stamp: ~1,400 cycles a stamp once each was paced and fenced, in the card-0 debugging runs of the
+pipeline gate.
+- Pacing each stamp until the buffer position (`STATUS`) moved did not stop it.
+- Neither did a fence before every read of the tables.
+- The tables themselves were right: the host read them back clean (`step266_batch_tables`), and the plain
+  stores that copy them to L1 are.
+
+Stamps issued one at a time between other work (entries, credits, barriers) paired as expected in the same runs.
+Even a single stamp after a kernel is repeated now and then: about 5% of the `BATCH_BASE`s in that position came
+back two or more times (15,980 of ~347,000 on `Step(64)`, `1793638678`).
+
+**The rule:** send at most one event a moment through the timestamper. Put anything bulky in L1 with plain stores,
+and stamp one event naming it (`dm::BATCH_LOG`, `profile_mode::splice_batch_log`). A consumer must tolerate a
+repeated stamp: a record named twice in one drain is a repeat. The profile mode's existing three-stamp burst after
+a kernel (`ROLE_PUSH`, `ROLE_DRAIN`, `ROLE_WORDS`) is exposed to the same behaviour and has not been checked for it.
+
 ## Handling silicon runs
 
 Rules that held through the Phase 10 close-out; follow them for any new probe.

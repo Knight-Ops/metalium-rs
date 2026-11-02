@@ -22,7 +22,7 @@
 //!   before 2026-10-31, and must miss by more than 3x (it chose 8 units for a 64-row product
 //!   that unprofiled ran on 64, `1793473164`).
 //! * **A streamed pair's batches, unit by unit** (`Detail::Pipeline`,
-//!   `docs/plans/decode-product-meter.md`). Two one-row products over every tile, each its own
+//!   `docs/completed-plans/decode-product-meter.md`). Two one-row products over every tile, each its own
 //!   trace: `down`'s shape with `K` streamed (a ring of two batches) and `gate|up`'s with `K`
 //!   whole (a ring of one). Every batch on every unit is told (B's credits joined with T0's and T2's
 //!   tables, none dropped), and its times show the credit protocol's own order: B reserves, is

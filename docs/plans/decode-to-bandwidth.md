@@ -1153,6 +1153,13 @@ would close that. Measured first, with the decision rules set before each run
 **What it leaves:** neither a unit's reads (above) nor compute alone (6.26 ms a step with the weights free) binds a
 product's span; the two together under the card's whole traffic do: each unit's reads and its `m = 1` kernel through a
 one-block slot ring, beside the prefetching units.
+**Metered from inside since** (2026-11-02, the profile mode's `Detail::Pipeline`,
+[log](../learnings/performance-log.md#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1)).
+The two do not combine through the ring: its wait is 1-2% of a product's slowest unit. The unit's reads hold it:
+- T0 waits for data 52-86% of the unit's work, and B's gather is 49-88%.
+- At three 2 KiB reads in flight a read takes ~1.3 us under the card's load, which `fast-reads` does not change.
+- So "a unit's read rate does not bind" (above) holds for its issue cost, not for its bytes in flight. Larger
+  entries are the lever left (roadmap Track 2 follow-ups, item 2b).
 
 - [x] **A4, the card's GDDR reads over a step** (the profile mode: B's `READ_BYTES` marks summed over every unit into each
   op's span in eighths; `summary.md`, `ops.tsv`'s `card_read_*`, a `trace.json` counter; held against the card's 512 GB/s

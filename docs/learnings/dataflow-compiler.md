@@ -289,7 +289,7 @@ Each transform states its legality under S2/S3, its expected effect, and the evi
 | X7 | **Spatial pipelining**: ops on disjoint core sets at once, linked by channels | Yes (S1) | [HYP] H5. Only on exact resource accounting. tt-mlir brought it back as `d2m.spatial` [PUB] |
 | X8 | **Prefetch** of data-independent operands (weights) | Yes | [MEAS] exists. It competes with small ops for the one GDDR queue (T8) |
 | X9 | **Static-operand storage layout chosen for its consumer**: a weight stored at load time with each unit's share contiguous in one channel, in slot format and consumption order | Yes. Moves bytes only; `K` order unchanged | [MEAS] H11's bound (`1793463838`): large entries lift 64 readers from 395 to ~499 GB/s, unevenly; the 96-unit deal already reads ~499. Parked until a product meter shows a 64-unit product read-bound. tt-metal: DRAM-sharded, receiver-contiguous weights [PUB] |
-| X10 | **A unit's read pipeline**: entry size, reads in flight, ring depth, all owned by the cost model | Yes. Changes timing only | [HYP] Today: 2 KiB entries, ~2 in flight, a ring of one block, so a unit's next gather waits for its compute. The ring's depth is the candidate the product meter (H11's next step) confirms or rules out. tt-metal: 16 KB pages, 3 rotating transaction IDs, triple buffering [PUB] |
+| X10 | **A unit's read pipeline**: entry size, reads in flight, ring depth, all owned by the cost model | Yes. Changes timing only | [MEAS] The product meter (`Detail::Pipeline`, 2026-11-02, card 1, `1793638678`): the ring is not what binds a decode product (its wait 1-2% of the slowest unit's work; perfect overlap saves 0-11%), its reads in flight are (T0 starves 52-86%; ~1.3 us a 2 KiB read under load, unchanged by `fast-reads`). Entry size and bytes in flight are the lever, with X9. tt-metal: 16 KB pages, 3 rotating transaction IDs, triple buffering [PUB] |
 | — | Split-K, flash-attention rescaling, packer L1 accumulation, 16-bit `Dst`, fidelity below exact | **No**: different contracts | Opt-in only, by name. Packer L1 accumulation was rejected as a default because it reorders the sum (G3); split-K and flash-decode are parked ([proposal](../proposals/split-k-and-flash-decode.md)) |
 
 **X5's rounding rule makes fusion format-generic.** A fused body equals the unfused graph exactly when every pack of the unfused graph that narrows is replayed as an explicit rounding to that edge's `TileFormat`. Fusion then never depends on which format the intermediate had.
@@ -796,6 +796,20 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     reads issue and land, when its kernel runs, its `K`-chunk reloads (`down`, ~3 us a chunk), its `A` reads and its
     kernel tail. Use the profile mode, extending its stamps if needed. X10's ring depth is the candidate a meter would
     confirm or rule out. H11 stays open on that measurement, its layout half (X9) parked.
+  - *Metered from inside (2026-11-02, card 1, `1793637811`, `1793638678`, `fast-reads` `1793639446`;
+    [log](performance-log.md#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1)):
+    the products are read-bound, by each unit's bytes in flight.*
+    - The meter is the profile mode's `Detail::Pipeline`: each streamed batch on every unit, B's credits joined with
+      T0's and T2's batch tables.
+    - On the 1.7B's `Step(64)`, the slowest unit of `qkv`, `o`, `gate|up` and `down` has T0 starve for 76 / 52 / 86 /
+      82% of its work. B's gather takes 75 / 49 / 83 / 88%, the kernel 11-18% and the ring wait 1-2%. The same
+      batches perfectly overlapped would save 0-11%.
+    - `fast-reads` changes none of it: the slowest units take ~3% less, a unit still reads ~4-5 GB/s in its span.
+    - At three 2,112-byte entries in flight that is ~1.3 us a read under the card's load, against ~0.3 us alone. So
+      the claim's mechanism (T8, bytes in flight over latency) is what binds, not the entries' issue cost or the ring.
+    - **X10's ring depth is ruled out. The reads-in-flight half is named**: larger entries, which need X9's layout.
+    - The "then" step above is unblocked: the `m = 1` product over a relaid weight, with the same kill
+      (a span not ≥ 1.2x closer to its stream's time).
 - **H12 Bit-exact speculative decode** (recorded 2026-10-31, a later track; owner: after the bandwidth items).
   - *Mechanism:* a draft (SmolLM2-135M for the 1.7B, same tokenizer; Qwen3.5's MTP head) proposes `k` tokens, and the
     target verifies them in one `m = k` step.
@@ -991,8 +1005,11 @@ Each verdict is applied where its section lives; this table is the index.
   from outside the product: spans, tails, bytes by eighth. The next decode step instruments a product's units from
   inside, and names the transform from what it shows (X10's ring depth, the `K`-chunk reloads, `A`'s reads, the
   kernel tail).
+- *The meter (2026-11-02, H11 in §13):* read-bound, by each unit's bytes in flight. Not the ring (its wait 1-2%), not
+  `down`'s reloads (~1%), not the kernel (11-18%). So item 1 below is released, with large entries first.
 
-**Held in reserve until that meter names a bound:**
+**Held in reserve until that meter names a bound** (it named one, 2026-11-02: read-bound by bytes in flight, which item 1
+addresses):
 1. X9 large entries for 64-unit products, and bank-affine placement at 2-3 units a bank (D3 at large entries);
 2. columns claimed at run time from an atomic counter (legal, §3 S1). Hazy's throughput kernel found claiming worth it
    only for coarse work, and static schedules within 2% at small batch;

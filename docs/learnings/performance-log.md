@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [A decode product's pipeline metered from inside: read-bound by its reads in flight](#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1) | 2026-11-02 | `Detail::Pipeline` times each streamed batch on every unit (B's credits, T0's and T2's tables through an L1 log); the 1.7B's decode products are read-bound, not ring-bound: T0 starves 52-86% of the slowest unit's work, the ring waits 1-2%, perfect overlap saves 0-11%, `fast-reads` changes nothing; a unit reads ~4-5 GB/s, ~1.3 us a 2 KiB read under load: bytes in flight (H11) is the lever; found: the timestamper repeats and drops events in a burst |
 | [Program restores on the card: paged programs copied back by the B movers](#program-restores-on-the-card-paged-programs-copied-back-by-the-b-movers-2026-11-01-cards-0-and-1) | 2026-11-01 | traces keep their programs in GDDR and a replay's B mover copies back what another trace evicted (H15); the host's restore was its cache bookkeeping more than its PCIe writes (410 us a unit, now ~55). 1.7B prefill 2,546 / 2,744 -> **3,040 / 3,827 tokens/s** at 128 / 256 tokens, within 1.2% of subblocks off; decode and the 7,992-token prefill unchanged, bit for bit; found and fixed: a measurement's capture unprotected the paused capture's programs |
 | [The 128 / 256-token prefill drift located: F5's programs paged through the cache](#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1) | 2026-11-01 | F5's subblocked kernel is faster alone (a 256-token chunk 77.9 against 79.8 ms) but its programs do not fit the units' caches beside the generator's other traces: 0.6 / 2.0 MB restored a 128 / 256-token generation, ~8 ms a MB; with `TT_DST_SUBBLOCKS=0` prefill 3,061 / 3,875 tokens/s (F4b.2 2,778 / 3,335); fix open |
 | [H14: short chunks' products, and the profile mode's measured blocks](#h14-short-chunks-products-and-the-profile-modes-measured-blocks-2026-10-31-cards-0-and-1) | 2026-10-31 | the profile mode timed measured blocks with its own stamps and chose 8-47 units where the default build runs 64 (fixed: `Session::unprofiled`); short-chunk blocks listed: the 1.7B's 64-row products 1.19x, prefill 1.11x at 64 / 256 tokens, decode unchanged; H14's kill does not fire, its prediction (set on the profile's numbers) is missed |
@@ -402,6 +403,59 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## A decode product's pipeline metered from inside: read-bound by its reads in flight (2026-11-02, cards 0 and 1)
+
+Roadmap Track 2 follow-ups, item 2; plan and decision rules in [decode-product-meter.md](../completed-plans/decode-product-meter.md),
+fixed before the measurement. The design reference's H11 had shown the deal's reads alone reach ~499 GB/s on 96 units, so
+the products' 233-306 GB/s in their spans (F27) is lost inside the product. Until now no meter showed a unit's reads
+and kernel over time.
+
+**The meter: `Detail::Pipeline`** (`TT_PROFILE_DETAIL=pipeline`, `b1cb441`, `40ee1c9`).
+- B's input credits, which `OPS` already stamps, time each batch's wait for a slot (*ring*), its gather (*issue*:
+  reads issued under the stream's in-flight cap, so most of their flight is here) and its last reads landing (*land*).
+- T0 and T2 keep a batch table in a `profile` image: T0's wait, sight and pop of each batch; T2's wait, slot and push.
+  B copies them into an L1 log after the kernel, and the host splices them in, exact to the cycle.
+- `summary.md` splits each label's slowest unit, and `pipeline.tsv` keeps every batch of every unit for one replay.
+- Its gates: the credit protocol's own order shows in every batch on card 0, and a ring of two is told from a ring of
+  one (192 of 256 batches granted ahead, against 0). The detail costs a product's span 0.3% on card 0.
+- Found while building it: the timestamper repeats and drops events in a burst ([operating
+  notes](silicon-operating-notes.md#the-timestamper-repeats-and-drops-events-in-a-burst-2026-11-02-cards-0-and-1)), so
+  the tables go through L1, not stamps.
+
+**The runs.** SmolLM2-1.7B-Instruct, BF16 weights, every tile, 512-position cache, release, card 1,
+`traced_generation_stream_ceiling` under `--profile`; every op of every trace covered, none overflowed.
+- Safe image: `1793637811` and `1793638678`, which agree within 0.5 us a product.
+- `fast-reads`: `1793639446`.
+- `Step(64)`: 330,836 pairs told and 1,800 dropped (0.5%, zero-batch tables); 15,980 repeated stamps skipped.
+
+**`Step(64)`'s products, each a share of the slowest unit's work** (B's columns and the roles' run at once):
+
+| product | units | batches | slowest unit, us | ring | issue | land | T0 starves | kernel | tail | what-if saves |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `qkv` | 119 | 1.3 | 51.5 | 1% | 75% | 1% | 76% | 13% | 8% | 3% |
+| `o` | 64 | 1.0 | 16.4 | 2% | 49% | 2% | 52% | 18% | 21% | 0% |
+| `gate\|up` | 120 | 3.0 | 123.0 | 1% | 83% | 1% | 86% | 11% | 1% | 11% |
+| `down` | 64 | 4.0 | 117.1 | 1% | 88% | 1% | 82% | 11% | 3% | 1% |
+
+- `Step(512)` gives the same shares. In `fast-reads` (entries 3-5x cheaper to issue) the split is unchanged within a
+  point, and the slowest units take 113.8 / 121.3 us (`down` / `gate|up`) against 117.1 / 123.0.
+- A unit reads 3.9-4.9 GB/s in its span (median; 241-306 GB/s card-wide) in both images.
+- At the BF16 stream's cap of three 2,112-byte entries in flight, that is ~1.3 us a read under the card's load,
+  against ~0.3 us alone (6.5 GB/s, F27).
+- `down`'s continuation batches' kernels are 3.2 us against 2.9 for its first: its reloads are ~1% of its span.
+
+**The verdict, by the rules fixed beforehand.**
+- **Ring-bound** (rule 1): no. The ring wait is 1-2% on every product, and perfect overlap of each unit's batches would
+  save 0-11% (`gate|up`'s 11% is the most).
+- **Read-bound** (rule 2): yes, on all four products. T0 waits for data 52-86% of the slowest unit's work, with the
+  ring wait under 10%. B's gather is 49-88% and the kernel 11-18%.
+- Since cheaper issue changes nothing, what binds is each unit's bytes in flight against the reads' latency under the
+  card's load. That is H11's claim (T8), now seen from inside the product.
+- Rules 3 and 4 are not reached: `down`'s reloads are ~1%, and the tail is above 15% only on `o`.
+- So the next decode lever is more bytes in flight a unit: larger entries, the reads-in-flight half of X10, which needs
+  X9's layout. The reserve of roadmap item 5 is released.
+- A deeper ring (X10's ring depth) is ruled out as a lever by this meter.
 
 ## Program restores on the card: paged programs copied back by the B movers (2026-11-01, cards 0 and 1)
 

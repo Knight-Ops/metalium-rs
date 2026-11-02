@@ -1,7 +1,7 @@
 //! The roles' batch tables (`tt_isa::mailbox::BATCH_TIMES`), the half of the profile mode's
 //! pipeline detail (`tt_kernels::profile_mode::Detail::Pipeline`) that runs on ttsim: the stamp
 //! stream that carries them to the host does not (divergence row 54), but the clock the roles read
-//! is modelled. Plan: `docs/plans/decode-product-meter.md`.
+//! is modelled. Plan: `docs/completed-plans/decode-product-meter.md`.
 //!
 //! The claims, for a one-row product with `K` streamed in chunks (`down`'s schedule and `K`, a ring
 //! of two batches) and one with `K` whole in several column blocks (`gate|up`'s, a ring of one):

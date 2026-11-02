@@ -935,15 +935,32 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
   - *Left:* 2.2 / 5.5 ms of host restore a generation (~55 us a unit restore, walking a trace's programs once
     its cache changed).
   - *Opened by it:* see "A smaller program cache" in Track 2 below.
-- [ ] **2. A decode product's pipeline, metered from inside.**
-  - *The bound:* H11's bound (`1793463838`, [log](../learnings/performance-log.md#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1)):
-    today's deal reads ~499 GB/s evenly on 96 units with nothing else running, so the products' 233-306 GB/s in their
-    spans is lost inside the product. Every decode hypothesis since F27 was bounded from outside a product.
-  - *The work:* stamp each unit's reads issued and landed, its kernel, its `K`-chunk reloads, its `A` reads and its
-    kernel tail over time, in the profile mode. Then name the transform from what the meter shows; X10's ring depth
-    is the candidate.
-  - *Parked until then:* X9's load-time layout with large entries (it lifts only 64-unit products, 395 -> 499 GB/s,
-    unevenly).
+- [x] **2. A decode product's pipeline, metered from inside**, closed 2026-11-02
+  ([plan](../completed-plans/decode-product-meter.md),
+  [log](../learnings/performance-log.md#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1)).
+  - *The meter:* the profile mode's `Detail::Pipeline` (`TT_PROFILE_DETAIL=pipeline`). Each streamed batch on every
+    unit: B's credits (ring wait, gather, landing), and T0's and T2's batch tables (starve, kernel, output wait).
+    - The tables go through B's L1 batch log (`dm::BATCH_LOG`), since the timestamper repeats and drops events in a
+      burst ([operating notes](../learnings/silicon-operating-notes.md#the-timestamper-repeats-and-drops-events-in-a-burst-2026-11-02-cards-0-and-1)).
+    - Gates: `silicon_profile_mode`'s pipeline test, which checks the credit protocol's order and tells a ring of two
+      from one, and `step266_batch_tables` (ttsim and card 0). The detail costs 0.3% of a product's span.
+  - *The verdict (rules fixed beforehand; card 1, `1793637811` and `1793638678` agree, `fast-reads` `1793639446`):*
+    **read-bound by each unit's bytes in flight.**
+    - On the 1.7B's `Step(64)`, the slowest unit of each product has T0 starving 52-86% of its work and B's gather
+      49-88%, with the ring wait 1-2% and the kernel 11-18%.
+    - Perfect overlap would save 0-11%, so a deeper ring (X10's ring depth) is ruled out.
+    - `fast-reads` changes nothing, so the entries' issue cost is not it either: a unit reads ~4-5 GB/s, ~1.3 us a
+      2 KiB read under load.
+  - *Next:* item 2b.
+- [ ] **2b. More bytes in flight for a decode product** (named by item 2, 2026-11-02; H11's "then" step in the
+  [design reference](../learnings/dataflow-compiler.md) §13).
+  - *The bound first:* the `m = 1` product over a relaid weight on card 1, each unit's share contiguous in one channel
+    in 16-64 KiB entries (X9's layout, built only as a probe), against today's deal. Measure with the pipeline
+    detail, reads and kernel together.
+  - *Kill:* a product's span not ≥ 1.2x closer to its stream's time.
+  - *H11's evenness caveat holds:* large entries served 64 units unevenly (80-141 us a unit at 16 KiB, cap 3), so the
+    bound must time the slowest unit, not the aggregate.
+  - *Only then:* X9's load-time layout pass, and X10's entry size and reads in flight in the cost model.
 - [ ] **3. Qwen3.5: a replay's own wall time on the card.** Profiled again 2026-10-31
   ([log](../learnings/performance-log.md#qwen35-4bs-decode-step-profiled-whole-but-for-nine-ops-2026-10-31-card-1)).
   - *The gap:* 1,071 of 1,080 ops make 43.97 ms on the card against 64.28 host-timed. ~20 ms is in no op's span.
@@ -959,7 +976,8 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     step. tt-metal does it in about ten (`models/experimental/gated_attention_gated_deltanet/tt/ttnn_delta_rule_ops.py`),
     FlashInfer in one call.
   - H10's kill does not transfer (ADR 0001): bound B13c's epilogues on this model separately.
-- [ ] **5. Held in reserve** until item 2 names a read-bound product:
+- [ ] **5. Released by item 2** (2026-11-02: every decode product read-bound by its bytes in flight). Work these after
+  item 2b's bound, which tells whether larger entries alone suffice:
   - bank-affine placement at 2-3 units a bank (tt-metal's 88-90%, `f2c0b2623fe`);
   - columns claimed from an atomic counter (legal under S1);
   - a dedicated prefetcher, worker or DRISC (F10 below).

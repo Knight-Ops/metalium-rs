@@ -46,9 +46,15 @@ every image without the `profile` feature, and the default detail, are unchanged
   - T0 entering its input wait, its wait returning, and its pop;
   - T2 entering its output reserve, the reserve returning, and its push.
 
-  B stamps them after the kernel's `ROLES_DONE`: a `BATCH_BASE`, then one `BATCH_TIME` each, as cycles before the base.
-  No role stamps live, since role and mover stamps arriving together lose events. The roles' clock is the
-  timestamper's own counter, low word.
+  B copies them into its batch log after the kernel's `ROLES_DONE` (`dm::BATCH_LOG`, plain L1 stores) and stamps one
+  `BATCH_BASE` naming the record. The host reads and empties the log at each drain and splices the record into the
+  stream (`profile_mode::splice_batch_log`). The roles' clock is the timestamper's own counter, low word, so each time
+  is placed exactly against the base's.
+  - No role stamps live, since role and mover stamps arriving together lose events.
+  - The first form stamped each time (`b1cb441`). On the 1.7B those bursts came out repeated and lost, so ~13k pairs a
+    trace were mis-joined ([operating notes](../learnings/silicon-operating-notes.md#the-timestamper-repeats-and-drops-events-in-a-burst-2026-11-02-cards-0-and-1)).
+  - A join that breaks the credit protocol's order is dropped by name (`in_protocol_order`), as is every other pair the
+    host cannot tell, and the summary counts them.
 - **Attribution** (`profile_mode::unit_pipes`). For each op, unit and batch:
   - ring wait, issue and landing (B);
   - starve (T0 waiting for data), unpack, kernel (T0 ready to T2 push), and output wait (T2 waiting for NC);
@@ -123,7 +129,28 @@ A meter whose verdict two runs disagree on is reported as not reproducible and i
   - ttsim, the roles' tables alone (ttsim refuses the event stream, divergence row 54; its clock is modelled);
   - card 0, `silicon_profile_mode`'s pipeline test. It checks that the meter shows the credit protocol's own order:
     a batch's landing before T0 sees it, and with a ring of `c` batches, batch `i + c`'s grant after batch `i`'s pop.
-- [ ] Measure on card 1, apply the rules, and record:
+- [x] Measure on card 1, apply the rules, and record (2026-11-02, below):
   - the performance log;
   - H11 and X10 in the design reference;
   - roadmap item 2, with its next item named.
+
+## The result (2026-11-02, card 1)
+
+[Log](../learnings/performance-log.md#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1).
+
+- Runs: `1793637811` and `1793638678` (safe image), which agree within 0.5 us a product; `1793639446` (`fast-reads`).
+- Coverage: every op of every trace is covered, and on `Step(64)` 330,836 pairs are told and 1,800 dropped (0.5%).
+
+| `Step(64)` product | slowest unit, us | ring | gather | T0 starves | kernel | tail | what-if saves |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `qkv` | 51.5 | 1% | 75% | 76% | 13% | 8% | 3% |
+| `o` | 16.4 | 2% | 49% | 52% | 18% | 21% | 0% |
+| `gate\|up` | 123.0 | 1% | 83% | 86% | 11% | 1% | 11% |
+| `down` | 117.1 | 1% | 88% | 82% | 11% | 3% | 1% |
+
+**Rule 2, read-bound, names the next item.**
+- Rule 1 fails: the ring wait is 1-2% and the what-if at most 11%.
+- `fast-reads` leaves the split within a point, so the entries' issue cost is not the bound. A unit's ~4-5 GB/s at
+  three 2 KiB reads in flight is ~1.3 us a read under load: its bytes in flight.
+- Next: roadmap item 2b, the `m = 1` product over a relaid weight with larger entries (H11's "then" step). The reserve
+  of item 5 is released.
