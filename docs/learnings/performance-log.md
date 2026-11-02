@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Program restores on the card: paged programs copied back by the B movers](#program-restores-on-the-card-paged-programs-copied-back-by-the-b-movers-2026-11-01-cards-0-and-1) | 2026-11-01 | traces keep their programs in GDDR and a replay's B mover copies back what another trace evicted (H15); the host's restore was its cache bookkeeping more than its PCIe writes (410 us a unit, now ~55). 1.7B prefill 2,546 / 2,744 -> **3,040 / 3,827 tokens/s** at 128 / 256 tokens, within 1.2% of subblocks off; decode and the 7,992-token prefill unchanged, bit for bit; found and fixed: a measurement's capture unprotected the paused capture's programs |
 | [The 128 / 256-token prefill drift located: F5's programs paged through the cache](#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1) | 2026-11-01 | F5's subblocked kernel is faster alone (a 256-token chunk 77.9 against 79.8 ms) but its programs do not fit the units' caches beside the generator's other traces: 0.6 / 2.0 MB restored a 128 / 256-token generation, ~8 ms a MB; with `TT_DST_SUBBLOCKS=0` prefill 3,061 / 3,875 tokens/s (F4b.2 2,778 / 3,335); fix open |
 | [H14: short chunks' products, and the profile mode's measured blocks](#h14-short-chunks-products-and-the-profile-modes-measured-blocks-2026-10-31-cards-0-and-1) | 2026-10-31 | the profile mode timed measured blocks with its own stamps and chose 8-47 units where the default build runs 64 (fixed: `Session::unprofiled`); short-chunk blocks listed: the 1.7B's 64-row products 1.19x, prefill 1.11x at 64 / 256 tokens, decode unchanged; H14's kill does not fire, its prediction (set on the profile's numbers) is missed |
 | [F4b's leftovers: the batched pull bounded, the eager slowdown located](#f4bs-leftovers-the-batched-pull-bounded-the-eager-slowdown-located-2026-10-31-card-0) | 2026-10-31 | attention's batched products with `A`'s re-reads made free: the 1.7B prefill 0.4 / 0.7 / 2.0% faster at 256 / 1,000 / 7,992 tokens (every `A` read free 3.4 / 4.9 / 9.8%), so the batched pull is not built; the eager product's 3-12% after a measured, pulled capture is all in its host build (`lower::jobs` 10.8 -> 11.4-12.1 ms) and follows the memory the measurement leaves live (+85 MB), not the trace or the device |
@@ -401,6 +402,93 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Program restores on the card: paged programs copied back by the B movers (2026-11-01, cards 0 and 1)
+
+Roadmap Track 2 follow-ups item 1a, H15 in the [design reference](dataflow-compiler.md) §13. The
+[entry below](#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1)
+found that F5's subblocked programs page through the units' 240 KB caches beside the generator's other traces.
+Each replay's `Session::restore_programs` put the evicted programs back from the host, unit by unit, with the
+card idle. Every run below: `silicon_bench_models::traced_generation`, card 1, release, safe image,
+`TT_TILES=all`, the 1.7B with BF16 weights, default buckets (chunks 64 / 128 / 256, steps 64-512), 64 new
+tokens, 2 warmups, 9 samples, tokens checked against the logits path and the logits against eager.
+
+**The change.**
+- At a capture's end each unit keeps its trace's programs in GDDR, once each. Each sits at an offset with its
+  L1 address's 64-byte residue, so one plain `READ` moves it (`UnitTrace::program_store`).
+- A replay queues those `READ`s on the unit's B mover, ahead of its `CALL`, for the programs the cache
+  bookkeeping says must go back.
+- The host's check admits a `READ` into `PROGRAM_CACHE` only through that one list
+  (`dm::check_program_restore`), and never encodes it.
+- Nothing changed in the firmware: `KERNEL` and `LAUNCH` wait for B's reads before posting the generation,
+  and T1 invalidates its instruction cache at each run that calls fused code.
+- On by default; `TT_MOVER_RESTORE=0` (`Session::set_mover_restore`) restores from the host as before.
+
+**The bound first (H15).** New host stages `Restore`, `RestoreDrain` and `RestoreQueue`, reported a
+generation by the bench:
+
+| run | restored a generation, 128 / 256 tokens | host restore, ms | prefill, tokens/s (32 / 128 / 256) |
+|---|--:|--:|--:|
+| subblocks off, host restores (`1793503737`) | 52 / 93 KB | (not metered) | 1,065 / 3,061 / 3,875 |
+| the default, host restores (`1793546264`) | 550 KB / 1.84 MB | 12.9 / **49.1** (drains 0.03 / 0.06) | 1,072 / 2,584 / 2,754 |
+| mover restores (`1793547848`) | 367 KB / 1.36 MB by the movers, 0 by the host | 8.1 / **34.7** | 1,091 / 2,747 / 3,017 |
+| the same, split (`1793548662`) | 485 KB / 1.66 MB, 60 / 96 unit restores | 9.9 / 39.3, queueing 0.09 / 0.22 | 1,093 / 2,671 / 2,911 |
+| **bookkeeping mended** (`1793549551`) | 638 KB / 1.75 MB, 70 / 100 unit restores | **2.2 / 5.5** | **1,075 / 3,040 / 3,827** |
+
+- **The kill did not fire.** The host spent 49 ms a 256-token generation restoring, against the first token's
+  27 ms gap.
+- **But the PCIe writes were not most of it.** With the movers doing the copies, the host still spent about
+  410 us a unit restore, and queueing the copies took 0.2 ms of that.
+- **The rest was `ProgramCache` bookkeeping.** Every eviction rebuilt the hash index (a `Vec` a resident),
+  and a hit scanned every resident and compared its words. A host model of three ~100 KB traces taking
+  turns (`program_cache::restore_cost`, ignored) restored a trace in **611 us; 43 us** with the index mended
+  in place and hits looked up through it, the same 15,276 evictions. So the "8 ms a MB" of the entry below
+  was mostly host bookkeeping, and the movers alone would have bought only a third of the gap.
+- **Against the gate** (roadmap item 1a):
+  - restored host bytes are 0;
+  - prefill at 128 / 256 tokens is 1.19x / 1.39x the old default, **0.7% / 1.2% below subblocks off**
+    (within two runs' spread at 32 tokens, 1,065-1,093). H15's prediction (at or above subblocks off) is
+    met within noise, not shown above it;
+  - the decode step is unchanged at every length (10.99 / 11.50 / 12.18 ms against 10.97 / 11.47 / 12.17
+    with subblocks off; the length is the cache, not the restores).
+- **What is left:** 2.2 / 5.5 ms of host restore a generation, about 55 us a unit restore. That is mostly
+  walking the trace's resident programs once its cache changed.
+
+**The long prompt.** `traced_generation_stream_ceiling`, `TT_GEN_MAX_LEN=8192 TT_GEN_CHUNKS=512
+TT_GEN_PROMPTS=7992 TT_GEN_NEW=4 TT_GEN_SAMPLES=3`. The 7,992-token prefill takes **5,896 ms** with mover
+restores (`1793550488`) against 5,887 with the host's (`1793551470`). The decode step is 46.91 ms in both.
+One chunk size pages little. H1 is a single product and does not page.
+
+**Found and fixed on the way: a measurement unprotected the capture it paused.** The first mover run failed in
+the 1.7B's build (`1793547269`, "a capture's programs stay until it ends").
+- A measured block choice pauses the capture in progress (`Session::paused`) and captures its candidates.
+- Each candidate's `end_trace` ran `ProgramCache::unprotect_all`, which unprotected the paused capture's
+  programs as well. A later placement in the measurement could then evict them.
+- Nothing in this mechanism depends on how restores are done. It surfaced in this run, with block choices
+  that are timed and so vary from run to run.
+- Fixed: a paused capture's protected addresses are kept (`Session::paused_protected`) and protected again
+  after any capture ends inside it. The next three builds passed.
+
+**Gates.**
+- ttsim:
+  - `step226` passes in all three mover modes (safe, `fast-reads`, `encoded-guard`): mover restores by
+    default (host bytes 0), the host path with `TT_MOVER_RESTORE=0`, and two negative controls. Without
+    restoring, the replays are wrong or refused. With the GDDR copies zeroed, the run fails at the first
+    kernel of the restored program (mover code 8).
+  - Unit tests: the host check's refusals, and the cache's hash index whole under random placements and
+    restores.
+  - Passing: `step39`, `step174`, `step222`, `step223`, `step228`, `step231`, `step245`.
+- Card 0:
+  - Passing: `step226`, `step245`, `step187` (11 of 11), `step231`, `step222`, `step228`, and both `step224`
+    long-context gates.
+  - `step224_long_context::traced_generation_equals_the_eager_one_at_long_context` takes 383 s, so it had
+    always timed out at the default 120 s. It is now in xtask's `LONG`.
+  - That timeout's forked child still held the card when the next gate attached. xtask now waits for the
+    test's whole process group to go after a timeout.
+  - `--smoke` (`1793552462`): 1,270 of 1,272, `step12_mnist` among them with its goldens unchanged. The two
+    failures were `step174`'s bound on a trace's GDDR bytes, which the first version broke by counting the
+    program store in `gddr_bytes`. It is now its own footprint field, `UnitFootprint::program_store_bytes`,
+    which `step174` bounds too. All three `step174` gates pass on card 0 (`1793554245`), and `step226` with them.
 
 ## The 128 / 256-token prefill drift located: F5's programs paged through the cache (2026-11-01, card 1)
 

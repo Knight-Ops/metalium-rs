@@ -127,6 +127,12 @@ const LONG: &[(&str, u64)] = &[
     // 116-135 s on card 0 (`1793030672`, `1793123716`): about the default, so it timed out at
     // 120.16 s in a run that otherwise passed (`1793216912`).
     ("step188_smollm2_1_7b::device_agrees_with_flex", 240),
+    // 383 s on card 0 (`1793550834`), beside a bench on card 1: it timed out at the default 120 s,
+    // and its child, still holding the card, failed the next gate's attach (`1793550535`).
+    (
+        "step224_long_context::traced_generation_equals_the_eager_one_at_long_context",
+        660,
+    ),
 ];
 
 pub const SMOKE: &[&str] = &[

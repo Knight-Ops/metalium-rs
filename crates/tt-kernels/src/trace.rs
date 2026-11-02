@@ -253,6 +253,9 @@ pub struct UnitFootprint {
     pub called_layers: u32,
     /// GDDR bytes of the stream and the sections, as allocated (whole slots).
     pub gddr_bytes: u64,
+    /// GDDR bytes of the copy of its programs a replay's B mover restores from, as allocated (whole
+    /// slots; 0 with mover restores off, `Session::set_mover_restore`).
+    pub program_store_bytes: u64,
     /// Distinct programs this trace holds in the unit's program cache, and their bytes.
     pub programs: u32,
     pub program_bytes: u64,
@@ -565,6 +568,12 @@ pub(crate) struct UnitTrace {
     /// Every program the stream names, once each: its address and words, which a replay puts
     /// back where another trace's took the room (`ProgramCache::restore`), and their hash.
     pub(crate) programs: Vec<(u64, std::sync::Arc<[u32]>, u64)>,
+    /// The programs' words in GDDR, each once, at an offset whose 64-byte residue is its L1
+    /// address's (a `READ` keeps the two equal), and for each of [`UnitTrace::programs`] the `READ`
+    /// with which the B mover puts it back (`Session::restore_programs`). `None` and empty with
+    /// mover restores off (`TT_MOVER_RESTORE=0`): the host writes them back instead.
+    pub(crate) program_store: Option<Placement>,
+    pub(crate) restore_reads: Vec<[u32; 8]>,
     /// The program cache's generation and change count when the programs were last known
     /// resident, so a replay that finds them unchanged restores nothing.
     pub(crate) restored: Option<(u64, u64)>,

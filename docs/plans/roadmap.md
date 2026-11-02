@@ -914,19 +914,27 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     block; BF16 activations (item 7, H13) halve that `A`.
   - *Found:* before the list, prefill at 128 / 256 tokens had drifted 15-21% below F4b.2's 2,778 /
     3,335 tokens/s (2,370 / 2,629); 32 tokens had not. Located 2026-11-01: item 1a.
-- [ ] **1a. Prefill: F5's subblocked programs paged through the program cache** (located 2026-11-01,
-  [log](../learnings/performance-log.md#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1)).
-  - *What:* F5's kernel (`c11adfb`) is faster alone (a 256-token chunk 77.9 against 79.8 ms), but its programs are
-    larger and per chunk shape, so the generator's eleven traces no longer fit a unit's 240 KB cache together. Each
-    replay puts back on the host what the others evicted (`ProgramCache::restore`), ~8 ms a MB with the card idle:
-    0.64 / 1.96 MB a 128 / 256-token generation under the default (`1793503011`). With `TT_DST_SUBBLOCKS=0` the
-    default prefills at 3,061 / 3,875 tokens/s against 2,546 / 2,744 (`1793503737`), 32 tokens and decode unchanged.
-  - *The work:* stop the paging without losing F5's gain at long chunks. Candidates: a chunk's shape in registers
-    rather than in the program words (fewer, shared programs); restores that do not stall the card (the mover
-    copying programs from GDDR, or uploads batched and overlapped with the replay before); a measured choice that
-    counts the programs it adds. Meter: `burn_tt::probe_restored_bytes`, reported a generation by the bench.
-  - *Gate for the fix:* restored bytes a generation near 0 on the default buckets, prefill ≥ the subblocks-off figures
-    above, the 7,992-token prefill and H1 not slower than with subblocks on, bit for bit.
+- [x] **1a. Prefill: F5's subblocked programs paged through the program cache** (located 2026-11-01,
+  [log](../learnings/performance-log.md#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1)),
+  closed 2026-11-01 with **H15: restores on the card**
+  ([log](../learnings/performance-log.md#program-restores-on-the-card-paged-programs-copied-back-by-the-b-movers-2026-11-01-cards-0-and-1)).
+  - *What it was:* F5's programs are per chunk shape, so the generator's traces no longer fit a unit's 240 KB
+    cache together, and each replay put back on the host what the others evicted, with the card idle.
+  - *The change:*
+    - Each trace keeps its programs in GDDR, and a replay's B mover copies back the evicted ones ahead of its
+      `CALL` (`Session::restore_programs`, `dm::check_program_restore`; `TT_MOVER_RESTORE=0` off).
+    - The host's restore cost was mostly `ProgramCache` bookkeeping, not PCIe: an index rebuilt every
+      eviction. It is now mended in place, 611 -> 43 us a trace in a host model.
+  - *Result (card 1, `1793549551`):* the host writes 0 bytes, and its restore time a generation is 49.1 -> 5.5 ms
+    at 256 tokens. Prefill at 128 / 256 tokens is 2,546 / 2,744 -> **3,040 / 3,827 tokens/s**, 0.7 / 1.2% below
+    subblocks off (3,061 / 3,875), so within noise rather than above it. Decode and the 7,992-token prefill are
+    unchanged (5,896 against 5,887 ms), bit for bit.
+  - *Found and fixed:* a measurement's capture unprotected the programs of the capture it paused
+    (`Session::paused_protected`); `step224`'s traced gate timed out at the default limit (now in `LONG`), and
+    xtask now waits for a timed-out test's whole process group.
+  - *Left:* 2.2 / 5.5 ms of host restore a generation (~55 us a unit restore, walking a trace's programs once
+    its cache changed).
+  - *Opened by it:* see "A smaller program cache" in Track 2 below.
 - [ ] **2. A decode product's pipeline, metered from inside.**
   - *The bound:* H11's bound (`1793463838`, [log](../learnings/performance-log.md#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1)):
     today's deal reads ~499 GB/s evenly on 96 units with nothing else running, so the products' 233-306 GB/s in their
@@ -1230,6 +1238,13 @@ the 1.7B's long prefill ("Fused `.ttinsn` push" below).
   - **Retired:** the custom `smollm2_replay_profile`.
   - **Left:** prefill chunks replay too few times in the bench to be covered whole (32-46%); mesh engines refuse
     the mode.
+- [ ] **A smaller program cache, its L1 given to buffers** (opened 2026-11-01 by item 1a; unscheduled). With
+  restores on the card, the cache need hold only the largest single trace's programs on a unit, not every trace
+  together: the 1.7B's largest is a 256-row chunk at 108 KB a unit against the 240 KB region (190 KB held
+  together, `1793549551`). Shrinking `tt_isa::l1::PROGRAM_CACHE` would give the rest to `l1::Requirements` (H13's
+  longer `K` chunks, larger residency plans) for more restores a replay. Worth doing only once a consumer is shown
+  L1-bound. A trace's programs must still be resident together (its stream names their addresses), so F5's
+  half-cache admission bounds one trace's program near 120 KB.
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8). Related, built and opt-in (2026-10-23):

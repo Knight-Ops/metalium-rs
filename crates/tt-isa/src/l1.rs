@@ -112,7 +112,10 @@ pub const TRACE_ARENA: Region = Region {
 /// What a mover list may name in a tile's L1, as the card checks it
 /// (`dm::Entry::decode`): [`TRACE_ARENA`], never the images, the movers' lists,
 /// the mailboxes or the program cache. The host keeps an eager list to [`DATA`]
-/// (`tt_kernels::dm`).
+/// (`tt_kernels::dm`). The one exception is a program restore: B's plain `READ`s of a trace's
+/// programs from GDDR into [`PROGRAM_CACHE`], at ranges the host's cache bookkeeping chose
+/// (`tt_kernels::dm::check_program_restore`, `Session::restore_programs`). A `READ`'s card-side
+/// decode bounds it by L1 alone, so the host's check is the whole of that rule.
 pub const LISTED: Region = TRACE_ARENA;
 
 /// The single-core, role and mover mailboxes, with their `Dst` dumps, the

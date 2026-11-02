@@ -200,6 +200,10 @@ pub fn run_one(
             // The test leads its own group, so this kills it too.
             kill_group(pid);
             let _ = rx.recv();
+            // The leader's exit is not the group's: a forked child still tearing down its
+            // mappings holds the card, and the next gate's attach found it "in use"
+            // (`1793550655`).
+            wait_group_gone(pid, Duration::from_secs(30));
             Verdict::Timeout
         }
         Err(RecvTimeoutError::Disconnected) => return Err("the test's waiter thread died".into()),
@@ -216,6 +220,23 @@ fn kill_group(pgid: u32) {
         .args(["-KILL", "--"])
         .arg(format!("-{pgid}"))
         .status();
+}
+
+/// Wait until no process of group `pgid` is left (`kill -0` on the group fails), or `most`.
+fn wait_group_gone(pgid: u32, most: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < most {
+        let alive = Command::new("kill")
+            .args(["-0", "--"])
+            .arg(format!("-{pgid}"))
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]
@@ -260,8 +281,8 @@ mod tests {
             .parse()
             .unwrap();
         // `kill -0` succeeds only for a live process (a reaped one has no entry; a zombie of ours
-        // would, but the child's parent was the script, which is gone, so init reaps it).
-        std::thread::sleep(Duration::from_millis(300));
+        // would, but the child's parent was the script, which is gone, so init reaps it). No
+        // grace period: `run_one` returns only once the group is gone.
         let alive = Command::new("kill")
             .args(["-0", &child.to_string()])
             .stderr(Stdio::null())

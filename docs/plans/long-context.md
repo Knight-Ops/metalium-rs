@@ -114,6 +114,10 @@ Part 2's unsplit baseline and fallback.
     switched off (ttsim), the mover refuses the stale program's list (code 8).
   - `step224` budgets each trace alone (half the cache). All four builds pass on card 0 (`1792796637`): `head_dim`
     128 at 8,192 in 2.8 s and at 32,768 in 7.9 s (refused before), `head_dim` 256 in 1.9 / 4.1 s.
+  - Since 2026-11-01 the restore runs on the card: a trace keeps its programs in GDDR, and the replay's B mover
+    copies back what was evicted ahead of its `CALL` (`TT_MOVER_RESTORE=0` restores from the host). The host's
+    bookkeeping per restore is now a mended index rather than a rebuilt one (roadmap Track 2 follow-ups item 1a,
+    [log](../learnings/performance-log.md#program-restores-on-the-card-paged-programs-copied-back-by-the-b-movers-2026-11-01-cards-0-and-1)).
 - [x] **1.F GDDR held by nothing** (2026-10-24; found by `step224`'s 32K eager reference, which ran a card's 31 GB out).
   - A free waited for a sync while any unit had queued lists, and an eager chain that never syncs (255 prefill
     chunks, each a new 128 MB copy of the cache) kept every one: a free now syncs when more waits to be freed than is

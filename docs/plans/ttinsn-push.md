@@ -18,7 +18,10 @@ translator on the card; this does it on the **host**:
   time: every word a table instruction with its fixed fields, or the loop skeleton's word at its place,
   one return at the end), then runs it on the host (`tt_isa::ttinsn::execute`) against the program's own
   expansion, word for word;
-- it places the code in the program cache like any program, its length flagged `tt_isa::ttinsn::FUSED`;
+- it places the code in the program cache like any program, its length flagged `tt_isa::ttinsn::FUSED`
+  (a trace keeps a copy of those same words in GDDR, and a replay's B mover copies them back when another
+  trace evicted them: `Session::restore_programs`, 2026-11-01; the mover lands them before the run's
+  `KERNEL`, so the run's invalidation below follows them);
 - the runner (`corpus.rs`, both `run_once` and the streamed `push_body`) **invalidates its instruction
   cache** once a run (`tt_firmware::fused`, the documented sequence, ~330 cycles) and **calls** the code.
 

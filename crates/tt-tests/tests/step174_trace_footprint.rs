@@ -187,6 +187,17 @@ fn footprint_of_passes<T: tt_device::Transport>(
         assert!(fp.program_bytes <= fp.cache_held_bytes, "unit {u}: {fp:?}");
         assert!(fp.cache_held_bytes <= fp.cache_bytes, "unit {u}: {fp:?}");
         assert!(fp.programs > 0 && fp.program_bytes > 0, "unit {u}");
+        // A replay's movers restore its programs from a copy of each in GDDR, each from a 64-byte
+        // boundary plus its address's residue, rounded up to whole slots once.
+        let most = fp.program_bytes + 128 * fp.programs as u64;
+        assert!(
+            fp.program_store_bytes >= fp.program_bytes
+                && fp.program_store_bytes <= most.next_multiple_of(tt_isa::dm::TILE_SLOT),
+            "unit {u}: {} GDDR bytes for {} program bytes in {} programs",
+            fp.program_store_bytes,
+            fp.program_bytes,
+            fp.programs
+        );
     }
     let what = if shapes.len() > 1 {
         "layer-forward (mixed shapes)"

@@ -220,20 +220,30 @@ impl ProgramCache {
         Ok(Placed::Upload(at))
     }
 
+    /// Evict resident `i`. The last resident takes its index, and the hash index is mended for
+    /// both, rather than rebuilt (a restore evicts many; a rebuild a time cost a 120-unit
+    /// generation tens of milliseconds, `docs/plans/roadmap.md` item 1a).
     fn evict(&mut self, i: usize) {
+        let last = self.resident.len() - 1;
         let r = self.resident.swap_remove(i);
+        if let Some(v) = self.by_hash.get_mut(&r.hash) {
+            v.retain(|&j| j != i);
+            if v.is_empty() {
+                self.by_hash.remove(&r.hash);
+            }
+        }
+        if i != last {
+            let moved = self.resident[i].hash;
+            for j in self.by_hash.get_mut(&moved).into_iter().flatten() {
+                if *j == last {
+                    *j = i;
+                }
+            }
+        }
         let bytes = (r.words.len() as u64 * 4).next_multiple_of(ALIGN);
         release(&mut self.free, r.at, bytes);
         self.stats.evictions += 1;
         self.changes += 1;
-        self.reindex();
-    }
-
-    fn reindex(&mut self) {
-        self.by_hash.clear();
-        for (i, r) in self.resident.iter().enumerate() {
-            self.by_hash.entry(r.hash).or_default().push(i);
-        }
     }
 
     /// A trace names the program at `at`: it stays resident, whatever is
@@ -314,11 +324,14 @@ impl ProgramCache {
     ) -> Result<Placed, CacheError> {
         let bytes = (words.len() as u64 * 4).next_multiple_of(ALIGN);
         self.clock += 1;
-        if let Some(r) = self
-            .resident
-            .iter_mut()
-            .find(|r| r.at == at && r.hash == h && *r.words == **words)
-        {
+        let hit = self.by_hash.get(&h).and_then(|v| {
+            v.iter().copied().find(|&i| {
+                let r = &self.resident[i];
+                r.at == at && (Arc::ptr_eq(&r.words, words) || *r.words == **words)
+            })
+        });
+        if let Some(i) = hit {
+            let r = &mut self.resident[i];
             r.last_use = self.clock;
             r.pinned = true;
             r.held = r.held.max(1);
@@ -340,7 +353,13 @@ impl ProgramCache {
         {
             return Err(CacheError::Full { bytes });
         }
-        while let Some(i) = self.resident.iter().position(across) {
+        // Highest index first: each eviction moves the last resident into its index, which is
+        // then never one still to evict.
+        let mut evicted: Vec<usize> = (0..self.resident.len())
+            .filter(|&i| across(&self.resident[i]))
+            .collect();
+        evicted.sort_unstable_by(|a, b| b.cmp(a));
+        for i in evicted {
             self.evict(i);
         }
         // Every byte across it is free now, in one coalesced range.
@@ -585,14 +604,31 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) % n
         };
+        let mut seen: Vec<(u64, Vec<u32>)> = Vec::new();
         for step in 0..3000 {
             let p = prog(next(40) as u32, 1 + next(600) as usize);
             match c.place(&p) {
                 Ok(Placed::Hit(at)) | Ok(Placed::Upload(at)) => {
                     assert!(at % ALIGN == 0 && c.region.contains(at, p.len() as u64 * 4));
+                    seen.push((at, p));
                 }
                 Ok(Placed::Bypass) | Err(CacheError::Full { .. }) => {}
             }
+            // Now and then a program put back where it once was, as a replay does.
+            if next(3) == 0 && !seen.is_empty() {
+                let (at, w) = &seen[next(seen.len() as u64) as usize];
+                let _ = c.restore(&Arc::from(&w[..]), hash(w), *at, next(2) == 0);
+            }
+            // The hash index names every resident once, at its index.
+            let mut rebuilt: HashMap<u64, Vec<usize>> = HashMap::new();
+            for (i, r) in c.resident.iter().enumerate() {
+                rebuilt.entry(r.hash).or_default().push(i);
+            }
+            let mut index = c.by_hash.clone();
+            for v in index.values_mut().chain(rebuilt.values_mut()) {
+                v.sort_unstable();
+            }
+            assert_eq!(index, rebuilt, "step {step}: the hash index");
             let mut spans: Vec<(u64, u64)> = c
                 .resident
                 .iter()
@@ -771,5 +807,65 @@ mod tests {
             panic!("room after it")
         };
         assert!(other >= at + 256 || other + 256 <= at);
+    }
+}
+
+#[cfg(test)]
+mod restore_cost {
+    use super::*;
+
+    /// Not a gate: the host's cost of restoring a trace's programs, three traces of ~100 KB taking
+    /// turns in a 240 KB cache (`cargo test -p tt-kernels --release restore_cost -- --ignored
+    /// --nocapture`).
+    #[test]
+    #[ignore = "timing probe"]
+    fn three_traces_taking_turns() {
+        let region = Region {
+            name: "test",
+            base: 0x14_1000,
+            end: 0x14_1000 + 240 * 1024,
+        };
+        let mut c = ProgramCache::new(region);
+        let mut s = 7u64;
+        let mut traces = Vec::new();
+        for t in 0..3u32 {
+            // Place the trace's programs as a capture would, evicting what it must, and keep where
+            // they landed.
+            let mut programs = Vec::new();
+            let mut bytes = 0;
+            let mut k = 0;
+            while bytes < 100 * 1024 {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let words = 16 + (s >> 33) as usize % 400;
+                let w: Arc<[u32]> = (0..words as u32).map(|i| t << 24 | k << 12 | i).collect();
+                let h = hash(&w);
+                let Ok(Placed::Upload(at)) = c.place_hashed_evicting(&w, h, true) else {
+                    panic!("placed")
+                };
+                c.unpin_all();
+                programs.push((at, w, h));
+                bytes += words * 4;
+                k += 1;
+            }
+            traces.push(programs);
+        }
+        let start = std::time::Instant::now();
+        let mut n = 0;
+        for round in 0..300 {
+            for (at, w, h) in &traces[round % 3] {
+                c.restore(w, *h, *at, true).unwrap();
+            }
+            c.unpin_all();
+            n += 1;
+        }
+        eprintln!(
+            "{} programs a trace, {} resident, {:?} a trace restored, {} evictions",
+            traces[0].len(),
+            c.resident.len(),
+            start.elapsed() / n,
+            c.stats.evictions
+        );
     }
 }

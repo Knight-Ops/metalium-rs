@@ -926,10 +926,11 @@ pub fn probe_captures(device: TtDevice) -> Result<u64, TtError> {
 }
 
 /// Program bytes `device`'s trace replays have put back in the units' program caches since the
-/// session opened (`Session::restored_bytes`): what paging the traces' programs costs a replay
-/// when they do not fit the cache together. Dev-facing.
+/// session opened: what paging the traces' programs costs a replay when they do not fit the cache
+/// together. The host's writes (`Session::restored_bytes`, the card idle meanwhile), then the B
+/// movers' copies from GDDR (`Session::mover_restored_bytes`). Dev-facing.
 #[doc(hidden)]
-pub fn probe_restored_bytes(device: TtDevice) -> Result<u64, TtError> {
+pub fn probe_restored_bytes(device: TtDevice) -> Result<(u64, u64), TtError> {
     server::run(device, |e, _| e.probe_restored_bytes())
 }
 

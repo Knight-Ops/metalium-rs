@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tt_device::core_control::CYCLES_PER_POLL;
 use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::dataflow::{Channel, Endpoint};
-use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Mover};
+use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Mover, Transform};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::Niu;
@@ -175,6 +175,32 @@ fn containment() -> Containment {
         Ok("off") => Containment::Off,
         _ => Containment::Enforce,
     })
+}
+
+/// A program-restore list's check ([`DataMover::enqueue_program_restore`]): on B, at most
+/// `dm::LIST_MAX` entries, each a plain `READ` (no transform) whose whole L1 range lies in
+/// `tt_isa::l1::PROGRAM_CACHE`, decoded against the chip's `usable` channels as the mover will.
+pub fn check_program_restore(mover: Mover, usable: u32, reads: &[[u32; 8]]) -> Result<()> {
+    if reads.is_empty() || reads.len() > dm::LIST_MAX as usize {
+        return Err(DmError::Invalid(dm::error::LENGTH));
+    }
+    if mover != Mover::B {
+        return Err(DmError::Invalid(dm::error::DIRECTION));
+    }
+    for e in reads {
+        if e[0] != op::READ {
+            return Err(DmError::Invalid(dm::error::OP));
+        }
+        match Entry::decode(usable, *e).map_err(DmError::Invalid)? {
+            Entry::Move {
+                descriptor,
+                transform: Transform::None,
+            } if tt_isa::l1::PROGRAM_CACHE
+                .contains(descriptor.l1 as u64, descriptor.range.len()) => {}
+            _ => return Err(DmError::Invalid(dm::error::RANGE)),
+        }
+    }
+    Ok(())
 }
 
 /// `op`'s access of `len` bytes at L1 address `l1` lies in `arena`: the data arena, or the trace
@@ -869,6 +895,41 @@ impl<N: NocId> DataMover<N> {
         w: &Window,
         entries: &[[u32; 8]],
     ) -> Result<u32> {
+        self.enqueue_form(d, w, entries, true)
+    }
+
+    /// Queue `reads`, each a program's words that the B mover copies from GDDR into this unit's
+    /// program cache (`Session::restore_programs`, `docs/plans/roadmap.md` item 1a). The one list
+    /// that may write the program cache: every other list's moves stay in the arena
+    /// ([`contained`]), and lists never name the cache (`tt_isa::l1::LISTED`). Each entry must be
+    /// a plain `READ` on B whose whole L1 range lies in `tt_isa::l1::PROGRAM_CACHE`; which ranges,
+    /// and that the words are a program the session placed there, is the caller's bookkeeping
+    /// (`ProgramCache::restore` returned `Upload` for exactly that range). The reads go as they
+    /// are, never encoded: an encoded read's guard holds it to the arena. A kernel after them
+    /// waits for them to land (the mover's `KERNEL` and `LAUNCH` wait for B's reads).
+    pub fn enqueue_program_restore<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        reads: &[[u32; 8]],
+    ) -> Result<u32> {
+        self.check_program_restore(reads)?;
+        self.enqueue_form(d, w, reads, false)
+    }
+
+    /// [`DataMover::enqueue_program_restore`]'s check ([`check_program_restore`]).
+    pub fn check_program_restore(&self, reads: &[[u32; 8]]) -> Result<()> {
+        check_program_restore(self.mover, self.usable as u32, reads)
+    }
+
+    /// [`DataMover::enqueue_raw`], its short reads encoded for a fast image only if `encode`.
+    fn enqueue_form<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        entries: &[[u32; 8]],
+        encode: bool,
+    ) -> Result<u32> {
         let n = entries.len() as u32;
         let mut refreshed = false;
         let first = loop {
@@ -896,8 +957,11 @@ impl<N: NocId> DataMover<N> {
                 .0;
             self.wait_for(d, w, oldest)?;
         };
-        let bytes: Vec<u8> = self
-            .upload_form(entries)
+        let form = match encode {
+            true => self.upload_form(entries),
+            false => std::borrow::Cow::Borrowed(entries),
+        };
+        let bytes: Vec<u8> = form
             .iter()
             .flatten()
             .flat_map(|v| v.to_le_bytes())
@@ -1332,5 +1396,99 @@ mod ring {
                 q.pop_front();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod program_restore {
+    use super::{check_program_restore, DmError};
+    use tt_isa::dm::{self, op, Mover};
+    use tt_isa::l1::{DATA, PROGRAM_CACHE};
+
+    const USABLE: u32 = 0xff;
+
+    fn read(l1: u64, len: u32) -> [u32; 8] {
+        // GDDR offset with the L1 address's 64-byte residue, as the session stores it.
+        [
+            op::READ,
+            0,
+            0,
+            0x10_0000 + (l1 % 64) as u32,
+            l1 as u32,
+            len,
+            0,
+            0,
+        ]
+    }
+
+    fn code(r: Result<(), DmError>) -> u32 {
+        match r {
+            Ok(()) => dm::error::NONE,
+            Err(DmError::Invalid(c)) => c,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_into_the_program_cache_passes() {
+        let at = PROGRAM_CACHE.base + 0x40;
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[read(at, 4096)])),
+            0
+        );
+        let last = PROGRAM_CACHE.end - 64;
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[read(last, 64)])),
+            0
+        );
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        let at = PROGRAM_CACHE.base + 0x40;
+        // Out of the cache: the arena, a range that starts in it and runs below, and past L1.
+        for e in [read(DATA.base, 4096), read(PROGRAM_CACHE.base - 64, 128)] {
+            assert_eq!(
+                code(check_program_restore(Mover::B, USABLE, &[e])),
+                dm::error::RANGE,
+                "{e:x?}"
+            );
+        }
+        assert_ne!(
+            code(check_program_restore(
+                Mover::B,
+                USABLE,
+                &[read(PROGRAM_CACHE.end - 64, 128)]
+            )),
+            dm::error::NONE
+        );
+        // Not a plain read.
+        let mut w = read(at, 64);
+        w[0] = op::WRITE;
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[w])),
+            dm::error::OP
+        );
+        // On NC, which only writes.
+        assert_eq!(
+            code(check_program_restore(Mover::NC, USABLE, &[read(at, 64)])),
+            dm::error::DIRECTION
+        );
+        // A misaligned GDDR offset, an empty list and one too long.
+        let mut m = read(at, 64);
+        m[3] += 16;
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[m])),
+            dm::error::ALIGNMENT
+        );
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[])),
+            dm::error::LENGTH
+        );
+        let long = vec![read(at, 64); dm::LIST_MAX as usize + 1];
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &long)),
+            dm::error::LENGTH
+        );
     }
 }

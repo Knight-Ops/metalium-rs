@@ -853,6 +853,38 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     (`1793477637`). The prediction (≥ 1.5x on products, ≥ 1.15x on prefill) was set on the profile's 36.2 ms of
     products; the real 20.3 ms left less to gain. `A` pulled never won at 64 rows.
     ([log](performance-log.md#h14-short-chunks-products-and-the-profile-modes-measured-blocks-2026-10-31-cards-0-and-1))
+- **H15 Program restores on the card** (opened 2026-11-01, roadmap Track 2 follow-ups item 1a).
+  - *Claim:* the 128 / 256-token prefill drift is the host putting paged programs back. F5's
+    subblocked programs are per chunk shape, the generator's traces no longer fit a unit's cache
+    together, and `Session::restore_programs` writes the evicted ones over PCIe, unit by unit, with
+    the card idle. If each trace keeps its programs in GDDR and the unit's B mover copies them back
+    ahead of the replay's `CALL`, the stall goes and F5's gain stays, bit for bit (the same words at
+    the same addresses).
+  - *Prediction:* restore and drain time at least 80% of the 27 ms first-token gap at 256 tokens
+    (93.3 against 66.1 ms subblocks off, `1793503011`, `1793503737`); with mover restores, prefill
+    at or above subblocks-off's 3,061 / 3,875 tokens/s.
+  - *Kills it:* restore and drain under 50% of the gap. The cost would then be elsewhere, and the
+    measured choice would have to count the programs it adds instead.
+  - *Bound (card 1, `1793546264`, the default, host restores timed as `HostStage::Restore`): the
+    kill does not fire.* A generation (prefill and 64 steps) restores 0 / 0.55 / 1.84 MB at 32 / 128 /
+    256 tokens, which takes the host **0 / 12.9 / 49.1 ms** (about 27 ms a MB of host time; the
+    log's 8 ms a MB was the first-token difference). Drains for the restores take 0.03-0.06 ms, so
+    the cost is the PCIe writes, not waiting for queued work. The decode step pays too: 11.36 / 12.12
+    ms at 128 / 256 tokens against 10.93 at 32.
+  - *Found while checking the firmware:* nothing needs to change there. The mover's `KERNEL` and
+    `LAUNCH` wait for B's reads (`TXN`) before posting the generation, and T1 invalidates its
+    instruction cache at every run that calls fused code, after the copy has landed.
+  - *Result (card 1, `1793549551`): held within noise; the mechanism was half wrong.*
+    - With the movers copying, the host still spent 35 ms a 256-token generation restoring, about 410 us
+      a unit restore, of which queueing the copies was 0.2 ms.
+    - The rest was `ProgramCache`'s bookkeeping: a hash index rebuilt at every eviction, and hits found by
+      scanning every resident and comparing its words. Mended in place, it costs 43 us a trace instead of 611
+      in a host model.
+    - With both, the host restores 0 bytes and spends 2.2 / 5.5 ms a generation. Prefill reaches 3,040 /
+      3,827 tokens/s at 128 / 256 tokens, 0.7 / 1.2% below subblocks off, so the prediction is met within
+      run-to-run noise, not shown above it. Decode and the 7,992-token prefill are unchanged, bit for bit.
+    - The lesson for the register: "8 ms a MB, the card idle" named the card's idle time correctly but
+      not its cause. Meter the host stage before choosing where the work moves.
 
 ---
 

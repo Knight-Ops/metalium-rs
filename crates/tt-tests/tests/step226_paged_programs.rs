@@ -8,11 +8,16 @@
 //! trace's programs and a kilobyte:
 //! - **Both traces capture and replay**, alternately, with new inputs each time, and every
 //!   replay's output is the same ops run eagerly, bit for bit.
-//! - **They were paged:** replays put program bytes back (`Session::restored_bytes`).
+//! - **They were paged, by the B movers:** each trace keeps its programs in GDDR, and a replay's
+//!   mover copies back what the other evicted (`Session::mover_restored_bytes`, roadmap item 1a);
+//!   the host writes none (`Session::restored_bytes`).
+//! - **The host's restore still works** with mover restores off (`Session::set_mover_restore`,
+//!   `TT_MOVER_RESTORE=0`): the same outputs, the bytes written by the host.
 //!
 //! Watched failing (the simulator only: on silicon a stale program can hang a core): with
-//! restoring switched off (`probe_skip_restore`), a replay runs the other trace's programs and
-//! its output is not the eager one, or the simulator refuses it.
+//! restoring switched off (`probe_skip_restore`), a replay runs the other trace's programs, and
+//! with the GDDR copies zeroed (`probe_corrupt_program_store`) the movers put back zeros; either
+//! way its output is not the eager one, or the simulator refuses it.
 
 use tt_kernels::kind;
 use tt_kernels::session::{Session, TileChoice};
@@ -120,8 +125,9 @@ fn program_bytes<T: tt_device::Transport>(s: &mut Session<T>, ops: Ops<T>) -> u6
 }
 
 /// The two traces in a cache that holds either but not both, replayed in turn with new inputs:
-/// each replay's output against the eager one's, and the bytes restored.
-fn alternate<T: tt_device::Transport>(s: &mut Session<T>) -> (Vec<bool>, u64) {
+/// each replay's output against the eager one's, and the bytes restored by the host and by the
+/// movers.
+fn alternate<T: tt_device::Transport>(s: &mut Session<T>) -> (Vec<bool>, u64, u64) {
     let (pa, pb) = (program_bytes(s, ops_a), program_bytes(s, ops_b));
     let full = tt_isa::l1::PROGRAM_CACHE.len();
     // Room for the larger trace and a little: programs the two share (an unary op's unpack and
@@ -154,7 +160,7 @@ fn alternate<T: tt_device::Transport>(s: &mut Session<T>) -> (Vec<bool>, u64) {
     s.begin_trace().unwrap();
     let yb = ops_b(s, &xb);
     let b = s.end_trace().unwrap();
-    let before = s.restored_bytes();
+    let before = (s.restored_bytes(), s.mover_restored_bytes());
     let mut same = Vec::new();
     for (i, &seed) in seeds.iter().enumerate() {
         let x = s.upload(&values(seed, N), 1, N).unwrap();
@@ -165,21 +171,75 @@ fn alternate<T: tt_device::Transport>(s: &mut Session<T>) -> (Vec<bool>, u64) {
         s.replay(b).unwrap();
         same.push(bits(&s.download(&yb).unwrap()) == want[i].1);
     }
-    (same, s.restored_bytes() - before)
+    (
+        same,
+        s.restored_bytes() - before.0,
+        s.mover_restored_bytes() - before.1,
+    )
 }
 
 #[test]
 fn traces_that_do_not_fit_together_replay_by_turns() {
     open(|s| {
-        let (same, restored) = alternate(s);
+        assert!(s.mover_restore(), "mover restores are the default");
+        let (same, host, mover) = alternate(s);
         assert!(same.iter().all(|&x| x), "replays against eager: {same:?}");
-        assert!(restored > 0, "nothing was paged");
+        assert!(mover > 0, "nothing was paged");
+        assert_eq!(host, 0, "the host wrote programs back");
         eprintln!(
-            "{restored} program bytes restored over {} replays",
+            "{mover} program bytes restored by the movers over {} replays",
             same.len()
         );
     })
     .unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn the_host_restores_with_mover_restores_off() {
+    open(|s| {
+        s.set_mover_restore(false);
+        let (same, host, mover) = alternate(s);
+        assert!(same.iter().all(|&x| x), "replays against eager: {same:?}");
+        assert!(host > 0, "nothing was paged");
+        assert_eq!(mover, 0, "a mover restored with mover restores off");
+        eprintln!(
+            "{host} program bytes restored by the host over {} replays",
+            same.len()
+        );
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// [`without_restoring_a_replay_runs_the_other_trace_s_programs`]'s shape: the child panics only
+/// if the control passes; a wrong output, a failed replay or the simulator refusing ends it
+/// otherwise.
+#[cfg(not(feature = "silicon"))]
+#[test]
+fn zeroed_gddr_copies_are_not_the_programs() {
+    let r = open(|s| {
+        tt_kernels::session::probe_corrupt_program_store(true);
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| alternate(s)));
+        match run {
+            Ok((same, _, mover)) => {
+                if mover == 0 || same.iter().all(|&x| x) {
+                    panic!("the control passed: {same:?}, {mover} bytes restored");
+                }
+                eprintln!("replays against eager with zeroed copies: {same:?}");
+            }
+            Err(e) => {
+                let why = e
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("?");
+                eprintln!("a replay with zeroed copies failed: {why}");
+            }
+        }
+    });
+    if let Err(e) = r {
+        assert!(!e.contains("the control passed"), "{e}");
+        eprintln!("the simulator refused the zeroed programs: {e}");
+    }
 }
 
 #[cfg(not(feature = "silicon"))]
@@ -191,7 +251,7 @@ fn without_restoring_a_replay_runs_the_other_trace_s_programs() {
     let r = open(|s| {
         tt_kernels::session::probe_skip_restore(true);
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| alternate(s)));
-        if let Ok((same, _)) = run {
+        if let Ok((same, ..)) = run {
             if same.iter().all(|&x| x) {
                 panic!("the control passed: {same:?}");
             }

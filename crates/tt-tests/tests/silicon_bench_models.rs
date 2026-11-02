@@ -1207,9 +1207,24 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
             // (`TracedGenerator::generate_tokens`); the logits path's tokens are the check.
             let want = g.generate(&p, new).unwrap().tokens;
             let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
-            let mut restored = Vec::new();
+            let (mut restored, mut mover_restored, mut restore_ms, mut restore_drain_ms) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            // A host stage's milliseconds, count and PCIe write calls so far (`HostStage::Restore`,
+            // `RestoreDrain`, `RestoreQueue`).
+            let stage = |name: &str| {
+                burn_tt::host_stage_times(d)
+                    .unwrap()
+                    .into_iter()
+                    .find(|(s, ..)| s == name)
+                    .map_or([0.0; 3], |(_, ms, n, w)| [ms, n as f64, w as f64])
+            };
+            let stage_ms = |name: &str| stage(name)[0];
+            let (mut restore_queue_ms, mut restore_calls, mut restore_writes) =
+                (Vec::new(), Vec::new(), Vec::new());
             for i in 0..WARMUPS + SAMPLES {
                 let r0 = burn_tt::probe_restored_bytes(d).unwrap();
+                let (s0, sd0) = (stage("Restore"), stage_ms("RestoreDrain"));
+                let sq0 = stage_ms("RestoreQueue");
                 let t0 = Instant::now();
                 let out = g.generate_tokens(&p, new).unwrap();
                 let all = t0.elapsed();
@@ -1218,17 +1233,64 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
                     first.push(ms(out.times[0]));
                     step.push(median_ms(&out.times[1..]));
                     total.push(ms(all));
-                    restored.push((burn_tt::probe_restored_bytes(d).unwrap() - r0) as f64);
+                    let r1 = burn_tt::probe_restored_bytes(d).unwrap();
+                    restored.push((r1.0 - r0.0) as f64);
+                    mover_restored.push((r1.1 - r0.1) as f64);
+                    let s1 = stage("Restore");
+                    restore_ms.push(s1[0] - s0[0]);
+                    restore_calls.push(s1[1] - s0[1]);
+                    restore_writes.push(s1[2] - s0[2]);
+                    restore_queue_ms.push(stage_ms("RestoreQueue") - sq0);
+                    restore_drain_ms.push(stage_ms("RestoreDrain") - sd0);
                 }
             }
             let key = format!("{name} generation, {len}-token prompt, {new} tokens ({traces})");
             // Program bytes the replays put back a generation: the traces' programs paged through
-            // the units' caches when they do not fit together (`Session::restored_bytes`).
+            // the units' caches when they do not fit together, by the host (`Session::restored_bytes`,
+            // the card idle) and by the B movers from GDDR (`Session::mover_restored_bytes`).
             report(
                 &format!("{key}, restored program bytes a generation, traced"),
                 "bytes",
                 "count",
                 Stats::of(restored),
+            );
+            report(
+                &format!("{key}, mover-restored program bytes a generation, traced"),
+                "bytes",
+                "count",
+                Stats::of(mover_restored),
+            );
+            // The host's time putting them back, the card idle meanwhile, and the part of it spent
+            // draining a unit first (H15, `docs/learnings/dataflow-compiler.md` §13).
+            report(
+                &format!("{key}, program restore a generation, traced"),
+                "ms",
+                "host",
+                Stats::of(restore_ms),
+            );
+            report(
+                &format!("{key}, program restore drains a generation, traced"),
+                "ms",
+                "host",
+                Stats::of(restore_drain_ms),
+            );
+            report(
+                &format!("{key}, program restore queueing a generation, traced"),
+                "ms",
+                "host",
+                Stats::of(restore_queue_ms),
+            );
+            report(
+                &format!("{key}, program restores (unit replays) a generation, traced"),
+                "count",
+                "count",
+                Stats::of(restore_calls),
+            );
+            report(
+                &format!("{key}, program restore PCIe write calls a generation, traced"),
+                "count",
+                "count",
+                Stats::of(restore_writes),
             );
             let step_ms = median(&step);
             report(

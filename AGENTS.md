@@ -239,7 +239,8 @@ role (T1) calls `.ttinsn` code the host wrote to the program cache, its length f
 (`tt_firmware::fused`). The build-time gate cannot see that code, so
 `tt_isa::ttinsn::validate` is its gate: only `code::Code::fused` makes it (emitted,
 validated, and run on the host against the program's own expansion word for word);
-never write code to the program cache any other way, never flag `FUSED` for T0 or T2
+never write code to the program cache any other way (a replay's B mover restoring a trace's
+programs from GDDR copies those same validated words back: `Session::restore_programs`), never flag `FUSED` for T0 or T2
 (they refuse it), and change the skeleton only with `validate`'s mutation tests
 (`docs/plans/ttinsn-push.md`, gate `step231_ttinsn_push`). Ethernet customer code runs on E1; leave E0
 and firmware-owned L1 intact. Read the operating notes before low-level changes.

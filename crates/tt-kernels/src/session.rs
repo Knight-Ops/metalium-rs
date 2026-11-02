@@ -307,6 +307,17 @@ pub fn probe_skip_restore(on: bool) {
     PROBE_SKIP_RESTORE.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+static PROBE_CORRUPT_STORE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A gate's negative control (`step226_paged_programs`, the simulator only): traces captured from
+/// here on keep zeros in GDDR for their programs' words, so a mover restore puts back zeros.
+/// Process-wide; never on silicon, where a wrong program can hang a core.
+#[doc(hidden)]
+pub fn probe_corrupt_program_store(on: bool) {
+    PROBE_CORRUPT_STORE.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 static PROBE_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the space audit): every
@@ -879,6 +890,15 @@ pub struct Session<T: Transport> {
     residency_region: u64,
     /// [`Session::set_capture_reuse`].
     capture_reuse: bool,
+    /// [`Session::set_mover_restore`].
+    mover_restore: bool,
+    /// Per paused capture ([`Session::paused`]), outermost first, each unit's program addresses it
+    /// protects: a capture run while it is paused (a measurement's) ends with
+    /// [`ProgramCache::unprotect_all`], and these are protected again, so nothing the paused capture
+    /// still needs is evicted before it ends.
+    paused_protected: Vec<Vec<Vec<u64>>>,
+    /// [`Session::mover_restored_bytes`].
+    mover_restored_bytes: u64,
     /// [`Session::set_residency_fixed`].
     residency_fixed: bool,
     /// [`Session::probe_planned_region`].
@@ -1195,10 +1215,18 @@ pub enum HostStage {
     /// A product's work built before it queues: its plan and its jobs
     /// (`tensor::matmul_dram_prefetching`).
     Build,
+    /// A replay's programs put back in a unit's cache (`Session::restore_programs`), its drains
+    /// included: what paging the traces' programs costs the host, the card idle meanwhile.
+    Restore,
+    /// The part of [`HostStage::Restore`] spent draining a unit whose queued work held the range a
+    /// program is put back at.
+    RestoreDrain,
+    /// The part of [`HostStage::Restore`] spent queueing the B movers' copies.
+    RestoreQueue,
 }
 
 impl HostStage {
-    pub const ALL: [HostStage; 11] = [
+    pub const ALL: [HostStage; 14] = [
         HostStage::Enqueue,
         HostStage::Segments,
         HostStage::Ensure,
@@ -1210,6 +1238,9 @@ impl HostStage {
         HostStage::Barrier,
         HostStage::Drain,
         HostStage::Build,
+        HostStage::Restore,
+        HostStage::RestoreDrain,
+        HostStage::RestoreQueue,
     ];
 }
 
@@ -2827,6 +2858,9 @@ impl<T: Transport> Session<T> {
             },
             residency_fixed: residency_region_from_env().is_some(),
             capture_reuse: std::env::var("TT_CAPTURE_REUSE").is_ok_and(|v| v == "1"),
+            mover_restore: !std::env::var("TT_MOVER_RESTORE").is_ok_and(|v| v == "0"),
+            paused_protected: Vec::new(),
+            mover_restored_bytes: 0,
             probe_planned_region: None,
             planned_base: None,
             residency_rows: residency_rows_from_env(),
@@ -6029,6 +6063,13 @@ impl<T: Transport> Session<T> {
         for unit in &mut self.units {
             unit.programs.unprotect_all();
         }
+        for frame in &self.paused_protected {
+            for (unit, addresses) in self.units.iter_mut().zip(frame) {
+                for &at in addresses {
+                    unit.programs.protect(at);
+                }
+            }
+        }
         result
     }
 
@@ -6353,6 +6394,13 @@ impl<T: Transport> Session<T> {
                         }
                     }
                     t.restored = Some((cache.generation(), cache.changes()));
+                    if let Err(e) = self.store_programs(u, &mut t) {
+                        if let Ok(d) = self.dram_state() {
+                            d.alloc.free(&t.stream);
+                        }
+                        failure = Some(e);
+                        break;
+                    }
                     stored.push(Some(t))
                 }
                 Err(e) => {
@@ -6365,6 +6413,9 @@ impl<T: Transport> Session<T> {
             for t in stored.into_iter().flatten() {
                 if let Ok(d) = self.dram_state() {
                     d.alloc.free(&t.stream);
+                    if let Some(p) = &t.program_store {
+                        d.alloc.free(p);
+                    }
                 }
             }
             give_back(self, freed);
@@ -6457,6 +6508,8 @@ impl<T: Transport> Session<T> {
             generations,
             held_programs: uc.held_programs.clone(),
             programs: Vec::new(),
+            program_store: None,
+            restore_reads: Vec::new(),
             restored: None,
             sections: uc.sections.clone(),
             composition,
@@ -6662,6 +6715,8 @@ impl<T: Transport> Session<T> {
             generations,
             held_programs: uc.held_programs.clone(),
             programs: Vec::new(),
+            program_store: None,
+            restore_reads: Vec::new(),
             restored: None,
             sections: all_sections.iter().map(|s| s.len() as u32).collect(),
             composition,
@@ -6781,6 +6836,62 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
+    /// Keep trace unit `u`'s programs in GDDR, each once, and build the `READ` that puts each back
+    /// ([`trace::UnitTrace::restore_reads`]), unless mover restores are off. A program's GDDR
+    /// offset has its L1 address's 64-byte residue, as a `READ` needs (`Descriptor::decode`).
+    fn store_programs(&mut self, u: usize, t: &mut trace::UnitTrace) -> Result<(), TensorError> {
+        if t.programs.is_empty() || !self.mover_restore {
+            return Ok(());
+        }
+        let align = tt_isa::dram::ALIGN;
+        let mut offsets = Vec::with_capacity(t.programs.len());
+        let mut end = 0u64;
+        for (at, words, _) in &t.programs {
+            let start = end.next_multiple_of(align) + at % align;
+            offsets.push(start);
+            end = start + 4 * words.len() as u64;
+        }
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))?;
+        let region = d.alloc.alloc_on(u % d.alloc.channel_count(), end)?;
+        let range = region.region().expect("a one-channel placement");
+        let mut bytes = vec![0u8; range.len() as usize];
+        let corrupt = PROBE_CORRUPT_STORE.load(std::sync::atomic::Ordering::Relaxed);
+        for ((_, words, _), &at) in t.programs.iter().zip(&offsets).filter(|_| !corrupt) {
+            for (i, word) in words.iter().enumerate() {
+                let at = at as usize + 4 * i;
+                bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        if let Err(e) = dev.dram_write(&d.w4, range, &bytes) {
+            d.alloc.free(&region);
+            return Err(e.into());
+        }
+        let (channel, base) = (range.channel().index() as u32, range.offset());
+        t.restore_reads = t
+            .programs
+            .iter()
+            .zip(&offsets)
+            .enumerate()
+            .map(|(i, ((at, words, _), &offset))| {
+                [
+                    tt_isa::dm::op::READ,
+                    channel,
+                    ((u + i) % tt_isa::dram::PORTS as usize) as u32,
+                    (base + offset) as u32,
+                    *at as u32,
+                    4 * words.len() as u32,
+                    0,
+                    0,
+                ]
+            })
+            .collect();
+        t.program_store = Some(region);
+        Ok(())
+    }
+
     /// Put trace `id`'s programs back in unit `u`'s cache where its stream names them, unless
     /// nothing has left the cache since they were last there. Programs the trace evicts to make
     /// room may be another replay's still queued, so the unit drains first when it must.
@@ -6799,13 +6910,22 @@ impl<T: Transport> Session<T> {
             return Ok(());
         }
         let programs = ut.programs.clone();
-        for (at, words, hash) in &programs {
+        let reads = ut.restore_reads.clone();
+        // The B mover's copies, queued after the loop: each into a range the cache bookkeeping
+        // just gave the program, free or evicted with the unit idle, so nothing queued uses it.
+        let mut copies: Vec<[u32; 8]> = Vec::new();
+        let start = (std::time::Instant::now(), self.dev.traffic());
+        for (i, (at, words, hash)) in programs.iter().enumerate() {
             for attempt in 0..2 {
                 let Session { dev, units, .. } = self;
                 let unit = &mut units[u];
                 let idle = unit.queued.is_empty();
                 match unit.programs.restore(words, *hash, *at, idle) {
                     Ok(Placed::Hit(_)) => break,
+                    Ok(Placed::Upload(_)) if !reads.is_empty() => {
+                        copies.push(reads[i]);
+                        break;
+                    }
                     Ok(Placed::Upload(_)) => {
                         let w = unit.resident.as_ref().unwrap().window();
                         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -6814,7 +6934,11 @@ impl<T: Transport> Session<T> {
                         break;
                     }
                     Ok(Placed::Bypass) => unreachable!("restore never bypasses"),
-                    Err(CacheError::Full { .. }) if attempt == 0 => self.drain_unit(u)?,
+                    Err(CacheError::Full { .. }) if attempt == 0 => {
+                        let d0 = (std::time::Instant::now(), self.dev.traffic());
+                        self.drain_unit(u)?;
+                        self.stage(HostStage::RestoreDrain, d0);
+                    }
                     Err(CacheError::Full { bytes }) => {
                         return Err(TensorError::Shape(format!(
                             "a trace's {bytes}-byte program cannot be put back at {at:#x}: what \
@@ -6824,6 +6948,26 @@ impl<T: Transport> Session<T> {
                 }
             }
         }
+        let queue = (std::time::Instant::now(), self.dev.traffic());
+        for list in copies.chunks(tt_isa::dm::LIST_MAX as usize) {
+            let Session { dev, units, .. } = self;
+            let unit = &mut units[u];
+            let r = unit.resident.as_ref().unwrap();
+            let m = unit.mover.as_mut().unwrap();
+            let number = m.enqueue_program_restore(dev, r.window(), list)?;
+            unit.queued.push_back(QueuedList {
+                roles: false,
+                number,
+                kernels: false,
+                what: "program restore",
+            });
+            unit.lists += 1;
+            self.mover_restored_bytes += list.iter().map(|e| e[5] as u64).sum::<u64>();
+        }
+        if !copies.is_empty() {
+            self.stage(HostStage::RestoreQueue, queue);
+        }
+        self.stage(HostStage::Restore, start);
         let c = &self.units[u].programs;
         let stamp = Some((c.generation(), c.changes()));
         if let Some(ut) = self.traces.get_mut(&id.0).and_then(|t| t.units[u].as_mut()) {
@@ -6886,6 +7030,9 @@ impl<T: Transport> Session<T> {
             }
             if let Some(d) = self.dram.as_mut() {
                 d.alloc.free(&ut.stream);
+                if let Some(p) = &ut.program_store {
+                    d.alloc.free(p);
+                }
             }
         }
         for p in t.freed {
@@ -6968,6 +7115,11 @@ impl<T: Transport> Session<T> {
                     stream: ut.composition.clone(),
                     top_level_entries: ut.top_level_entries,
                     gddr_bytes: ut.gddr_bytes,
+                    program_store_bytes: ut
+                        .program_store
+                        .as_ref()
+                        .and_then(|p| p.region())
+                        .map_or(0, |r| r.len()),
                     body_entries: ut.body_entries,
                     table_entries: ut.table_entries,
                     called_layers: ut.called_layers,
@@ -9759,8 +9911,23 @@ impl<T: Transport> Session<T> {
             .iter()
             .map(|u| u.resident.as_ref().map(|r| r.generation()))
             .collect();
+        let protected = self
+            .units
+            .iter()
+            .zip(&c.units)
+            .map(|(unit, uc)| {
+                let generation = unit.programs.generation();
+                uc.held_programs
+                    .iter()
+                    .filter(|&&(g, _)| g == generation)
+                    .map(|&(_, at)| at)
+                    .collect()
+            })
+            .collect();
+        self.paused_protected.push(protected);
         let restored = self.set_mover_arena(tt_isa::l1::DATA);
         let out = restored.map(|()| crate::l1::unnoted(|| f(self)));
+        self.paused_protected.pop();
         if let (Some(d), Some(s)) = (self.dram.as_mut(), suspended) {
             d.alloc.resume(s);
         }
@@ -10003,6 +10170,19 @@ impl<T: Transport> Session<T> {
     /// Off by default (`TT_CAPTURE_REUSE=1` turns it on). A capture that reuses is planned for L1
     /// residency as one that does not: the planner finds the tensor an address held at each op
     /// (`crate::residency::Index`, G2).
+    /// Whether traces captured from here on keep their programs in GDDR, so a replay's B movers
+    /// put back what another trace evicted (on by default; `TT_MOVER_RESTORE=0` off, when the
+    /// host writes them back over PCIe with the card idle, about 8 ms a MB on 120 units).
+    /// Roadmap item 1a.
+    pub fn set_mover_restore(&mut self, on: bool) {
+        self.mover_restore = on;
+    }
+
+    /// [`Session::set_mover_restore`].
+    pub fn mover_restore(&self) -> bool {
+        self.mover_restore
+    }
+
     pub fn set_capture_reuse(&mut self, on: bool) {
         self.capture_reuse = on;
     }
@@ -10516,6 +10696,12 @@ impl<T: Transport> Session<T> {
     /// costs, in uploads.
     pub fn restored_bytes(&self) -> u64 {
         self.restored_bytes
+    }
+
+    /// Program bytes replays' B movers have copied back into the units' caches from GDDR
+    /// ([`Session::set_mover_restore`]); [`Session::restored_bytes`] counts the host's.
+    pub fn mover_restored_bytes(&self) -> u64 {
+        self.mover_restored_bytes
     }
 
     /// Whether a profile records the roles' events as well as the mover's
