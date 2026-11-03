@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [One copy of a relaid weight, bounded: the kill fires](#one-copy-of-a-relaid-weight-bounded-the-kill-fires-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase C0 (`tensor::probe_relaid_blocks`, bit for bit): every other product over a relaid weight read from its regions; eager products 1.34-3.38x slower, prefill over one-column runs 4-13% slower, decode unchanged; the decode deal's 1-2-column runs make ~4x the list entries; 8.3% of column-run tiles held twice; one copy closed in this form |
 | [X9's weight layout, bit for bit: a 1.7B decode step 11.08 -> 9.90 ms](#x9s-weight-layout-bit-for-bit-a-17b-decode-step-1108---990-ms-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase B (on by default since 2026-11-03, ~3.4 GB more GDDR, `TT_WEIGHT_LAYOUT=0` opts out): each unit's share of a streamed weight copied into one channel in its read order, read in 16 KiB pieces (`record::BSpan`), reads ahead too at a cap of 1; bit for bit (`step267`, `step188`); decode 11.08 / 12.27 -> 9.90 / 10.94 ms at 32 / 256 tokens, prefill unchanged; large reads ahead at cap 2 slow the small ops (T8); host scans of ~11,500 regions cost ~0.6 ms a step until indexed by source |
 | [H11's then step: contiguous weights in 16 KiB reads](#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1) | 2026-11-02 | roadmap 2b, Phase A (a timing probe, `tensor::probe_contiguous_b`): more requests at tile-sized entries buy nothing (stream cap 3-8); each unit's weight share contiguous in one channel, read in 16 KiB entries: `down` 1.34-1.43x on its slowest unit, `qkv` 1.4x, `gate\|up`'s mean unit 12-14% but not its slowest (evenness), `o` unchanged; layout alone nothing; the step 10.94 / 12.14 -> 10.55 / 11.95 ms measured, ~1 ms against its own cap; kill not fired, Phase B (bit-exact) next |
 | [A decode product's pipeline metered from inside: read-bound by its reads in flight](#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1) | 2026-11-02 | `Detail::Pipeline` times each streamed batch on every unit (B's credits, T0's and T2's tables through an L1 log); the 1.7B's decode products are read-bound, not ring-bound: T0 starves 52-86% of the slowest unit's work, the ring waits 1-2%, perfect overlap saves 0-11%, `fast-reads` changes nothing; a unit reads ~4-5 GB/s, ~1.3 us a 2 KiB read under load: bytes in flight (H11) is the lever; found: the timestamper repeats and drops events in a burst |
@@ -405,6 +406,55 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## One copy of a relaid weight, bounded: the kill fires (2026-11-03, cards 0 and 1)
+
+Roadmap Track 2 follow-ups, item 2b, Phase C0 ([plan](../plans/decode-bytes-in-flight.md#c0-the-bound-a-bit-exact-probe-timing-decides)).
+The question was whether X9's layout can be a weight's only storage, giving back the ~3.4 GB the second copy takes on
+the 1.7B. The bound: what every other reader of a relaid weight pays to read the regions instead of the weight as it
+lies.
+
+**The probe** (`tensor::probe_relaid_blocks`, `TT_PROBE_RELAID_BLOCKS=1`).
+- **How it reads.** Each `B` gather of a product over a relaid weight (prefill, eager, a measurement) is split.
+  The record keeps `A` (`GATHER_B_RESIDENT`), and each `K` row's runs become plain `READ`s from the regions, of at
+  most 16 KiB.
+- **Bit for bit**, while both copies exist: `step267` on ttsim in both read modes and on card 0, and `step188`'s
+  traced generation on card 0 (`1793682326`).
+- **Why plain reads and not a record a run.** A block's packet holds at most 512 entries, and a record a one-column
+  run overflowed it (`LENGTH`, `step188`).
+
+**Measured** (card 1, release, safe image, every tile, the 1.7B with BF16 weights). Full tables are in the plan.
+
+| | read as it lies | from the regions |
+|---|--:|--:|
+| eager `down` `[m, 8192] @ [8192, 2048]`, m = 64 / 256 / 512, us (`1793682506`) | 13,325 / 13,097 / 6,620 | 18,265 / 22,036 / 22,383 |
+| eager `qkv` `[m, 2048] @ [2048, 6144]`, us | 5,306 / 2,230 / 5,512 | 7,093 / 5,124 / 8,694 |
+| prefill at 32 / 128 / 256 tokens, chunks of 64, tokens/s (ABBA `1793682568`, `1793682781`, `1793683019`, `1793683256`) | 1,093 / 2,148 / 2,089; 1,090 / 2,141 / 2,081 | 948 / 1,872 / 1,826; 1,046 / 2,062 / 2,008 |
+| decode step at 32 / 256 tokens, ms | 9.73-9.80 / 10.90-10.94 | 9.80 / 10.94 |
+
+- **Every eager product is slower**: 1.34x to 3.38x over the four weights and three row counts.
+- **Prefill** is 4-13% slower, beyond both brackets.
+- **The entries are the cost, not the bytes.** 2.3 M gathers became 48.7 M entries (~4x the list): a decode deal's
+  runs are one or two columns wide (10,752 and 8,447 runs), so a prefill block becomes an entry for each row and run.
+  The host builds and sends each one for an eager product, and B walks them in a replay.
+- **The audit.**
+  - One-column weights: every tile held once.
+  - Column-run weights (`qkv`, `gate|up`, the head): 8.3% of their tiles held twice, since prefetch units' shares and
+    different captures' thin runs overlap. So today's regions are not a partition, and ~0.2 GB of the second copy is
+    a third.
+
+**Verdict** (rules fixed beforehand, in the plan).
+- Both classes are killed by the eager rule (> 5%), and the one-column class by the prefill rule too.
+- The column-run class's prefill is void (rule 1: 91.7% held once).
+- **One copy closes in this form.** Reopen only with a record that cuts a region's rows into a block (an L1 pitch, a
+  new encoding) and one deal a weight. Next: regions that yield.
+
+**Found and fixed on the way** (`66aef11`).
+- **The bug.** `meet`'s padding fill in place called only `note_written`, so a relaid weight's regions (and a packed
+  twin) kept the old padding.
+- **Why it mattered.** It was unreachable through today's products, whose packed `A` leaves their padding undefined,
+  but not through this probe.
+- **The gate:** `step267`'s `a_padding_fill_in_place_reaches_the_regions`, watched failing first.
 
 ## X9's weight layout, bit for bit: a 1.7B decode step 11.08 -> 9.90 ms (2026-11-03, cards 0 and 1)
 

@@ -390,6 +390,62 @@ weight as it lies.
 
 **Prediction.** Column runs within ±1%. One-column runs 3-10% slower at 7,992 tokens, an entry a tile.
 
+### C0 results (2026-11-03, card 1): the kill fires for both classes; one copy closes in this form
+
+**Eager products** (`silicon_bench_relaid`, `1793682506`). Medians of 14 host-timed products, ABBA in one process
+over the same regions, each product bit for bit. Every tile was read from a region, and each weight's regions held
+every tile exactly once.
+
+| weight (its runs) | `m` = 64, us | `m` = 256, us | `m` = 512, us |
+|---|--:|--:|--:|
+| `qkv` (2 columns) | 5,306 → 7,093 (1.34x) | 2,230 → 5,124 (2.30x) | 5,512 → 8,694 (1.58x) |
+| `o` (1 column) | 3,466 → 4,672 (1.35x) | 3,598 → 5,724 (1.59x) | 2,129 → 6,066 (2.85x) |
+| `gate\|up` (1-2 columns) | 5,760 → 11,032 (1.92x) | 6,557 → 11,809 (1.80x) | 18,953 → 29,116 (1.54x) |
+| `down` (1 column) | 13,325 → 18,265 (1.37x) | 13,097 → 22,036 (1.68x) | 6,620 → 22,383 (3.38x) |
+
+**Prefill** (`traced_generation_stream_ceiling`, `TT_TILES=all`, chunks of 64; tokens/s at 32 / 128 / 256 tokens).
+
+| run | probe | prefill | decode step, ms |
+|---|---|--:|--:|
+| `1793682568` | off | 1,093 / 2,148 / 2,089 | 9.73 / 10.24 / 10.90 |
+| `1793682781` | on | 948 / 1,872 / 1,826 | 9.80 / 10.29 / 10.94 |
+| `1793683019` | on | 1,046 / 2,062 / 2,008 | 9.80 / 10.31 / 10.94 |
+| `1793683256` | off | 1,090 / 2,141 / 2,081 | 9.80 / 10.30 / 10.94 |
+
+- **What the probe moved.** 2.30 M / 2.04 M gathers became 48.7 M / 48.3 M entries, reading 107 / 109 GB of `B` from
+  regions and none as it lies.
+- **The audit.**
+  - One-column runs: 48 weights and 491,520 tiles, all held once.
+  - Column runs: 49 weights and 1,179,648 tiles, all held, but **98,176 (8.3%) held twice**.
+  - Run widths: 10,752 runs of one column and 8,447 of two.
+- The 7,992-token prefill was not run: the eager rule had already decided both classes.
+
+**Verdict, by the rules fixed beforehand.**
+- **Rule 2, eager.** Every eager product over the regions is 1.34-3.38x slower, against a 5% kill. Both classes are
+  killed.
+- **Rule 2, prefill.**
+  - The one-column class (audit valid) is 3.7-13% below both brackets at 128 and 256 tokens: killed again.
+  - The column-run class's prefill is **void by rule 1**, since only 91.7% of its tiles are held exactly once. Its
+    eager kill stands, from a run whose audit was exact.
+- **Rule 3:** both classes are killed. **One copy closes in this form.** Next is "regions that yield".
+- **Decode** did not move: 9.73-9.80 / 10.90-10.94 ms.
+- **The prediction:**
+  - column runs, within ±1%: missed (eager up to 2.3x);
+  - one-column runs, 3-10% slower: low (prefill 4-13%, eager up to 3.4x).
+
+**What it found.**
+- **The cost is the entries, not the bytes.**
+  - A decode deal's runs are one or two columns wide, so a prefill block (several columns, a `K` chunk) becomes an
+    entry for every row and run: ~21 entries for each 5-entry gather, ~4x the list.
+  - Each one is built and sent by the host for an eager product, and stored and walked by B for a replay.
+  - The bytes read are the same, in reads of one or two tiles: no larger than today's.
+- **A layout chosen for the decode reader is the wrong layout for a block reader.** For both to read one copy in
+  large pieces, either the deal's runs must be as wide as a prefill block, which Phase A's evenness argues against,
+  or a record must cut a region's rows into a block with an L1 pitch, which is a new encoding.
+- **Today's decode deals do not partition a weight.** 8.3% of the column-run weights' tiles sit in two regions:
+  prefetch units' shares and the thin runs of different captures overlap. That is ~0.2 GB of the 1.7B's ~3.4 GB
+  second copy. A one-copy design would first need one deal a weight.
+
 ## Work
 
 - [x] A0 on card 1 (2026-11-02, `1793645082`-`1793647203`): more requests at tile-sized entries buy nothing (Results).
@@ -448,7 +504,11 @@ weight as it lies.
     - **The 135M gains 0.04 ms (0.5%).** Its products are too small to be read-bound.
     - **ResNet-18 and ViT-Tiny are unchanged within run-to-run noise** (±0.3 ms). They have no one-row product but
       their classifier heads.
-- [ ] **One copy instead of two** (the owner's next ask, 2026-11-03): X9 as the weight's only storage. Prefill and
+- [x] **One copy instead of two: bounded and closed in this form** (2026-11-03, Phase C0 above; card 1
+  `1793682506`, `1793682568`-`1793683256`). The probe was bit for bit, but eager products over the regions are
+  1.34-3.38x slower and prefill over one-column runs is 4-13% slower, from ~4x the list entries. Reopen only with a
+  record that cuts a region's rows into a block (an L1 pitch: a new encoding) and one deal a weight.
+  The entry as first written: X9 as the weight's only storage. Prefill and
   eager products read the same layout a column run at a time (a decode unit's share is whole runs, so one `GATHER` a
   run, no new encoding); the tied head's token lookups, in-place writes and downloads need their own paths; the split
   is fixed at load from the decode deal. **Bound first:** prefill and an eager `m > 1` product over the relaid layout,

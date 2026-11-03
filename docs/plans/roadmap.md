@@ -1000,7 +1000,19 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     - **Found and fixed:** the relayout's pause left redundant setup runs in the capture that made the regions (now a
       movers-only pause).
   - *Next steps, in order* (owner 2026-11-03: the default stands, the second copy should go):
-    - [ ] **One copy instead of two (gets the ~3.4 GB back).** X9 as the weight's only storage. A decode unit's
+    - [x] **One copy instead of two: bounded 2026-11-03, the kill fired; closed in this form**
+      ([plan](decode-bytes-in-flight.md#c0-results-2026-11-03-card-1-the-kill-fires-for-both-classes-one-copy-closes-in-this-form),
+      [log](../learnings/performance-log.md#one-copy-of-a-relaid-weight-bounded-the-kill-fires-2026-11-03-cards-0-and-1)).
+      - **The probe** (`tensor::probe_relaid_blocks`) had every other product read the regions, bit for bit
+        (`step267`, and `step188` on card 0).
+      - **Eager products** over the regions are 1.34-3.38x slower.
+      - **Prefill over one-column runs** is 4-13% slower; prefill over column runs is void, since 8.3% of those tiles
+        sit in two regions.
+      - **Decode** is unchanged.
+      - **Why:** the decode deal's runs are one or two columns wide, so a prefill block becomes ~4x the list entries.
+      - **Reopen** only with a record that cuts a region's rows into a block (an L1 pitch, a new encoding) and one deal
+        a weight. Found and fixed on the way: `meet`'s padding fill in place did not mark a relaid weight dirty.
+      - The entry as first written: X9 as the weight's only storage. A decode unit's
       share is whole column runs, so prefill and eager products can read the same layout by splitting each block's
       read per run (one `GATHER` a run, no new encoding). Every other reader needs a path too: the tied head's token
       lookups (embedding), in-place writes and downloads. The split must be fixed when the weights load, from the
@@ -1011,7 +1023,7 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     - [ ] **The cheaper middle, if one copy stalls: relay only the products that gain.** Phase A put the gain in
       `down` and `qkv` (`o` did not move, `gate|up`'s slowest unit gained least). Measure the step with only those
       relaid; it holds roughly half the extra GDDR.
-    - [ ] **Regions that yield.** Free relaid regions no live trace reads when an allocation is refused, before
+    - [ ] **Regions that yield** (next, since one copy closed). Free relaid regions no live trace reads when an allocation is refused, before
       failing it (and drop them on `set_weight_layout(false)`), so the default never costs a model its fit.
     - [ ] **Regions made at load time,** not at a capture's first sight: no pause inside the first capture (Qwen3.5's
       build is ~30 s longer with the layout) and the GDDR taken where the model's own allocations are.
