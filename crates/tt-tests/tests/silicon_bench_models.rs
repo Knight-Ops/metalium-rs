@@ -37,9 +37,10 @@ const SAMPLES: usize = 9;
 
 fn conditions(card: usize) {
     println!(
-        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\"}}",
+        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\",\"weight_layout\":{}}}",
         git_sha(),
-        !cfg!(debug_assertions)
+        !cfg!(debug_assertions),
+        std::env::var("TT_WEIGHT_LAYOUT").map_or(true, |v| v != "0"),
     );
 }
 
@@ -1443,6 +1444,17 @@ fn traced_generation_stream_ceiling() {
     tt_kernels::tensor::probe_skip_batched_a_reads(batched_a == "1");
     tt_kernels::tensor::probe_skip_batched_a_rereads(batched_a == "rereads");
     probe_background_stream(background);
+    // `TT_PROBE_CONTIGUOUS_B=<entry bytes>`: each one-row product's weight stream read from a
+    // contiguous scratch in entries of that size, under B's own cap (`TT_IN_FLIGHT_CAP`), its
+    // products wrong (`tt_kernels::tensor::probe_contiguous_b`, `docs/plans/decode-bytes-in-flight.md`).
+    let contiguous: Option<u32> = std::env::var("TT_PROBE_CONTIGUOUS_B")
+        .ok()
+        .filter(|v| v != "off")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("TT_PROBE_CONTIGUOUS_B={v}: off or an entry's bytes"))
+        });
+    tt_kernels::tensor::probe_contiguous_b(contiguous);
     probe_space_report(true);
     let split = std::env::var("TT_PROBE_ATTENTION_SPLIT").is_ok_and(|v| v == "1");
     tt_kernels::attention::probe_split(split);
@@ -1478,14 +1490,21 @@ fn traced_generation_stream_ceiling() {
         "rereads" => format!("{tag}, batched A re-reads skipped"),
         _ => tag,
     };
+    let tag = match contiguous {
+        Some(entry) => format!("{tag}, contiguous B in {entry}-byte reads"),
+        None => tag,
+    };
     let residency = std::env::var("TT_PROBE_RESIDENCY").is_ok_and(|v| v == "1");
     let nc_waits = std::env::var("TT_PROBE_NC_WAITS").is_ok_and(|v| v == "1");
     tt_kernels::residency::probe_residency_plan(residency);
     with_device(Config::default(), |d| {
         conditions(card());
         println!(
-            "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split},\"batched_a_skipped\":\"{batched_a}\",\"free\":\"{}\"}}",
-            dropped.join(",")
+            "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split},\"batched_a_skipped\":\"{batched_a}\",\"free\":\"{}\",\"contiguous_b\":{},\"in_flight_cap\":\"{}\",\"stream_cap_bf16\":\"{}\"}}",
+            dropped.join(","),
+            contiguous.unwrap_or(0),
+            std::env::var("TT_IN_FLIGHT_CAP").unwrap_or_default(),
+            std::env::var("TT_STREAM_CAP_BF16").unwrap_or_default(),
         );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = m.fused();
@@ -1589,7 +1608,18 @@ fn traced_generation_stream_ceiling() {
                 Stats::of(step),
             );
         }
+        // In the device's process (a fork), where the probe counted.
+        if contiguous.is_some() {
+            let [moved, ahead] = tt_kernels::tensor::probe_contiguous_b_bytes();
+            println!(
+                "CONTIGUOUS B: {:.1} GB moved to contiguous reads, {:.1} GB left read ahead ({:.1}%)",
+                moved as f64 / 1e9,
+                ahead as f64 / 1e9,
+                100.0 * ahead as f64 / (moved + ahead).max(1) as f64
+            );
+        }
     });
+    tt_kernels::tensor::probe_contiguous_b(None);
     probe_skip_weight_reads(false);
     tt_kernels::tensor::probe_skip_batched_a_reads(false);
     tt_kernels::tensor::probe_skip_batched_a_rereads(false);

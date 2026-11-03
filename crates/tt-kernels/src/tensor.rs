@@ -559,6 +559,11 @@ impl DramAlloc {
         self.free.iter().flat_map(|f| f.values()).sum()
     }
 
+    /// Free bytes on `channel` (0 past the last).
+    pub(crate) fn free_bytes_on(&self, channel: usize) -> u64 {
+        self.free.get(channel).map_or(0, |f| f.values().sum())
+    }
+
     /// Free bytes on the fullest channel.
     pub fn free_bytes(&self) -> u64 {
         self.free
@@ -1674,6 +1679,235 @@ pub(crate) fn probe_gather(
         gather.extend(record);
     }
     gather
+}
+
+/// A development probe (`docs/plans/decode-bytes-in-flight.md`, roadmap Track 2 follow-ups item
+/// 2b, H11's "then" step): each one-row product's weight stream (a `GATHER` with
+/// [`record::GATHER_STREAM`] and `A` resident, so it reads only `B`) reads its bytes from a scratch
+/// region of their size, contiguous in one channel (unit `u`'s in channel `u % 8`, X9's layout),
+/// in plain `READ`s of this many bytes, landing in the same slots. A read ahead
+/// ([`record::GATHER_PREFETCH`]) is left as it is. The scratch holds whatever GDDR held: **the
+/// products are wrong**; only their time means anything. The reads run under B's own cap
+/// (`TT_IN_FLIGHT_CAP`), not the stream's. 0 is off.
+static PROBE_CONTIGUOUS_B: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// [`PROBE_CONTIGUOUS_B`]'s bytes moved to plain reads, and left read ahead, since it was set.
+static PROBE_CONTIGUOUS_BYTES: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Turn [`PROBE_CONTIGUOUS_B`] on with entries of `entry_bytes` (a positive multiple of 64), or
+/// off, process-wide; zeroes its byte counts. Dev-facing: a timing bound, never a result.
+#[doc(hidden)]
+pub fn probe_contiguous_b(entry_bytes: Option<u32>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let entry = entry_bytes.unwrap_or(0);
+    assert!(
+        entry % tt_isa::dram::ALIGN as u32 == 0,
+        "a contiguous read's entry is whole 64-byte units: {entry}"
+    );
+    PROBE_CONTIGUOUS_B.store(entry, SeqCst);
+    for c in &PROBE_CONTIGUOUS_BYTES {
+        c.store(0, SeqCst);
+    }
+}
+
+/// [`PROBE_CONTIGUOUS_B`]'s bytes since it was set: `[moved to contiguous reads, left read ahead]`,
+/// counted as ops are queued (an op queued twice, as a capture's run and its trace's, counts once
+/// each time).
+#[doc(hidden)]
+pub fn probe_contiguous_b_bytes() -> [u64; 2] {
+    PROBE_CONTIGUOUS_BYTES
+        .each_ref()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub(crate) fn probing_contiguous_b() -> Option<u32> {
+    match PROBE_CONTIGUOUS_B.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// What [`PROBE_CONTIGUOUS_B`] does with a `GATHER` record's header: `Some((B's bytes, its first
+/// slot in L1))` for a weight stream it moves, `None` for any other gather (it counts a read
+/// ahead's bytes as left).
+pub(crate) fn contiguous_b_bytes(header: &[u32; 8]) -> Result<Option<(u64, u32)>> {
+    let flags = header[1];
+    let refuse = |code| TensorError::Shape(format!("a gather's flags ({flags:#x}): {code}"));
+    let bytes = || -> Result<u64> {
+        let slot = record::gather_b_tile_format(flags)
+            .map_err(refuse)?
+            .slot_bytes();
+        Ok(record::gather_kt(flags) as u64 * header[7] as u64 * slot)
+    };
+    if flags & record::GATHER_PREFETCH != 0 {
+        PROBE_CONTIGUOUS_BYTES[1].fetch_add(bytes()?, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+    if flags & record::GATHER_STREAM == 0 {
+        return Ok(None);
+    }
+    if flags & record::GATHER_A_RESIDENT == 0 || flags & 2 != 0 {
+        return Err(TensorError::Shape(format!(
+            "a weight stream that reads more than an untransposed `B` ({flags:#x})"
+        )));
+    }
+    Ok(Some((bytes()?, header[3])))
+}
+
+/// A weight stream's `B`, `bytes` from L1 `b_at` on, as plain `READ`s of `entry` bytes from
+/// `(channel, off)` on: contiguous in GDDR and in L1 (the record lands tile `(kk, j)` at
+/// `b_at + (kk * cols + j) * slot`, one span), the last read shorter, the port rotating as
+/// `GATHER`'s does. Each read stays inside [`tt_isa::l1::LISTED`] and keeps the NoC's 64-byte
+/// congruence.
+pub(crate) fn contiguous_b_reads(
+    b_at: u32,
+    bytes: u64,
+    (channel, off): (u32, u64),
+    entry: u32,
+) -> Result<Vec<[u32; 8]>> {
+    let align = tt_isa::dram::ALIGN;
+    let listed = tt_isa::l1::LISTED;
+    let end = b_at as u64 + bytes;
+    if entry == 0 || entry as u64 % align != 0 {
+        return Err(TensorError::Shape(format!(
+            "a contiguous read of {entry} bytes"
+        )));
+    }
+    if (b_at as u64) < listed.base || end > listed.end {
+        return Err(TensorError::Shape(format!(
+            "a weight stream's slots {b_at:#x}..{end:#x} leave the listed L1"
+        )));
+    }
+    if off % align != b_at as u64 % align {
+        return Err(TensorError::Shape(format!(
+            "GDDR {off:#x} and L1 {b_at:#x} differ mod {align}"
+        )));
+    }
+    if off + bytes > u32::MAX as u64 + 1 {
+        return Err(TensorError::Shape(format!(
+            "a scratch region past a 32-bit offset ({off:#x} + {bytes})"
+        )));
+    }
+    let mut reads = Vec::new();
+    let mut at = 0u64;
+    while at < bytes {
+        let len = (bytes - at).min(entry as u64);
+        reads.push([
+            tt_isa::dm::op::READ,
+            channel,
+            (reads.len() % 3) as u32,
+            (off + at) as u32,
+            (b_at as u64 + at) as u32,
+            len as u32,
+            0,
+            0,
+        ]);
+        at += len;
+    }
+    PROBE_CONTIGUOUS_BYTES[0].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    Ok(reads)
+}
+
+/// One weight stream's region in X9's layout (`docs/plans/decode-bytes-in-flight.md` Phase B): a
+/// `B`-only `GATHER` record of a one-row product (`A` resident, `B` untransposed), as the product
+/// was built to read it, and the region `(channel, offset)` that holds the same tiles in the order
+/// it reads them, contiguous in one channel. [`relayout_jobs`] fills the region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Relayout {
+    pub record: [[u32; 8]; 5],
+    pub region: (u32, u64),
+}
+
+/// The bytes a [`Relayout`]'s region holds: the record's `B`, `kt x cols` slots.
+pub(crate) fn relayout_bytes(record: &[[u32; 8]; 5]) -> Result<u64> {
+    let flags = record[0][1];
+    let slot = record::gather_b_tile_format(flags)
+        .map_err(|code| {
+            TensorError::Shape(format!("a weight stream's flags ({flags:#x}): {code}"))
+        })?
+        .slot_bytes();
+    Ok(record::gather_kt(flags) as u64 * record[0][7] as u64 * slot)
+}
+
+/// The jobs that fill each [`Relayout`]'s region, bit for bit: the record itself, its `B` only
+/// and neither streamed nor read ahead, gathers a batch of its terms into a staging area -- the
+/// slots in the order the product reads them -- and NC writes them out to the region in pieces of
+/// one request. Data movement only. A job a region.
+pub(crate) fn relayout_jobs(copies: &[Relayout]) -> Result<Vec<Job>> {
+    const KT_BITS: u32 = 0x3FFF << 8;
+    const PIECE: u64 = tt_isa::noc::niu::MAX_REQUEST_BYTES as u64;
+    let slots = arena_group(64);
+    let stage = staging("weight relayout", slots)?;
+    let room = slots as u64 * TILE_SLOT;
+    copies
+        .iter()
+        .map(|c| {
+            let h = c.record[0];
+            let flags = h[1];
+            let (kt, cols) = (record::gather_kt(flags) as u64, h[7] as u64);
+            let row = relayout_bytes(&c.record)? / kt.max(1);
+            if row == 0 || row > room || flags & 2 != 0 || flags & record::GATHER_A_RESIDENT == 0 {
+                return Err(TensorError::Shape(format!(
+                    "a weight relayout of {cols} columns ({row} bytes a term, {room} staged, flags {flags:#x})"
+                )));
+            }
+            let b = TensorRef::decode([c.record[3], c.record[4]])
+                .map_err(|code| TensorError::Shape(format!("a weight stream's `B` ({code})")))?;
+            let per = (room / row).max(1);
+            let mut batches = Vec::new();
+            let mut k0 = 0;
+            while k0 < kt {
+                let n = per.min(kt - k0);
+                let mut chunk = b;
+                chunk.first += (k0 * b.ct as u64) as u32;
+                let chunk = chunk.encode();
+                let read_flags = flags & !(KT_BITS | record::GATHER_STREAM | record::GATHER_PREFETCH)
+                    | (n as u32) << 8;
+                let read = vec![
+                    [
+                        record::GATHER,
+                        read_flags,
+                        stage as u32,
+                        stage as u32,
+                        h[4],
+                        h[5],
+                        h[6],
+                        h[7],
+                    ],
+                    c.record[1],
+                    c.record[2],
+                    chunk[0],
+                    chunk[1],
+                ];
+                let (ch, base) = c.region;
+                let bytes = n * row;
+                let write = (0..bytes.div_ceil(PIECE))
+                    .map(|p| {
+                        let at = p * PIECE;
+                        [
+                            tt_isa::dm::op::WRITE,
+                            ch,
+                            (p % 3) as u32,
+                            (base + k0 * row + at) as u32,
+                            (stage + at) as u32,
+                            (bytes - at).min(PIECE) as u32,
+                            0,
+                            0,
+                        ]
+                    })
+                    .collect();
+                batches.push(TransferBatch { read, write });
+                k0 += n;
+            }
+            Ok(vec![Step::Transfer {
+                what: "weight relayout",
+                depth: 1,
+                batches,
+            }])
+        })
+        .collect()
 }
 
 /// How a GDDR matmul reads `A` ([`matmul_dram_limited`]).
@@ -8194,5 +8428,118 @@ mod batched_questions {
                 );
             }
         }
+    }
+}
+
+/// The contiguous-weight probe's rewrite (`docs/plans/decode-bytes-in-flight.md`).
+#[cfg(test)]
+mod contiguous_b {
+    /// [`super::contiguous_b_reads`]: a weight stream's span moved to plain reads covers its slots
+    /// exactly, front to back, in one channel, each read congruent mod 64, the last shorter; and
+    /// what would leave the listed L1, break the congruence or misname an entry is refused.
+    #[test]
+    fn a_contiguous_weight_stream_tiles_its_slots_exactly() {
+        use super::contiguous_b_reads;
+        use tt_isa::dm::op;
+        let (b_at, slot) = (0x2_0000u32, 2112u64);
+        for (kt, cols, entry) in [
+            (64u64, 2u64, 16_384u32),
+            (64, 1, 2112),
+            (13, 3, 65_536),
+            (1, 1, 64),
+        ] {
+            let bytes = kt * cols * slot;
+            let (ch, off) = (5u32, 0x40_0000u64);
+            let reads = contiguous_b_reads(b_at, bytes, (ch, off), entry).unwrap();
+            let what = format!("{kt} x {cols} slots in {entry}-byte reads");
+            assert_eq!(reads.len() as u64, bytes.div_ceil(entry as u64), "{what}");
+            let mut at = 0u64;
+            for (i, r) in reads.iter().enumerate() {
+                assert_eq!(
+                    [r[0], r[1], r[2]],
+                    [op::READ, ch, (i % 3) as u32],
+                    "{what}: read {i}"
+                );
+                assert_eq!(r[3] as u64, off + at, "{what}: read {i}'s GDDR offset");
+                assert_eq!(r[4] as u64, b_at as u64 + at, "{what}: read {i}'s slot");
+                assert_eq!(
+                    r[3] as u64 % 64,
+                    r[4] as u64 % 64,
+                    "{what}: read {i} congruent"
+                );
+                assert!(r[5] > 0 && r[5] <= entry, "{what}: read {i}'s length");
+                assert_eq!([r[6], r[7]], [0, 0]);
+                at += r[5] as u64;
+            }
+            assert_eq!(at, bytes, "{what}: the span covered exactly");
+        }
+        let ok = |b_at, bytes, off, entry| contiguous_b_reads(b_at, bytes, (0, off), entry).is_ok();
+        assert!(ok(b_at, 4224, 0, 2112), "the control");
+        assert!(!ok(b_at, 4224, 32, 2112), "GDDR and L1 differ mod 64");
+        assert!(
+            !ok(b_at, 4224, 0, 100),
+            "an entry not of whole 64-byte units"
+        );
+        assert!(!ok(b_at, 4224, 0, 0), "an empty entry");
+        let listed = tt_isa::l1::LISTED;
+        assert!(
+            !ok(listed.base as u32 - 64, 4224, 0, 2112),
+            "below the listed L1"
+        );
+        assert!(
+            !ok((listed.end - 4160) as u32, 4224, 0, 2112),
+            "past the listed L1"
+        );
+    }
+
+    /// [`super::contiguous_b_bytes`] moves a weight stream (`B` only) and nothing else: a read
+    /// ahead and a plain gather stay, and a stream that would also read `A` is refused.
+    #[test]
+    fn only_a_weight_stream_is_moved_to_contiguous_reads() {
+        use super::contiguous_b_bytes;
+        use tt_isa::dm::record;
+        let bf16 = record::gather_b_format(tt_isa::tile::L1Format::Bf16).unwrap();
+        let header = |flags: u32| {
+            [
+                record::GATHER,
+                flags | 64 << 8,
+                0x3_0000,
+                0x2_0000,
+                0,
+                1,
+                4,
+                3,
+            ]
+        };
+        let stream = record::GATHER_STREAM | record::GATHER_A_RESIDENT;
+        assert_eq!(
+            contiguous_b_bytes(&header(stream | bf16)).unwrap(),
+            Some((64 * 3 * 2112, 0x2_0000)),
+            "BF16: 64 terms of 3 columns"
+        );
+        assert_eq!(
+            contiguous_b_bytes(&header(stream)).unwrap(),
+            Some((64 * 3 * super::TILE_SLOT, 0x2_0000)),
+            "FP32"
+        );
+        let ahead = record::GATHER_PREFETCH | record::GATHER_A_RESIDENT | bf16;
+        assert_eq!(
+            contiguous_b_bytes(&header(ahead)).unwrap(),
+            None,
+            "a read ahead"
+        );
+        assert_eq!(
+            contiguous_b_bytes(&header(bf16)).unwrap(),
+            None,
+            "a plain gather"
+        );
+        assert!(
+            contiguous_b_bytes(&header(record::GATHER_STREAM | bf16)).is_err(),
+            "a stream that reads `A` too"
+        );
+        assert!(
+            contiguous_b_bytes(&header(stream | 2)).is_err(),
+            "a transposed `B`"
+        );
     }
 }

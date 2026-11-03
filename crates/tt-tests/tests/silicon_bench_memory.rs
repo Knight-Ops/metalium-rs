@@ -1817,22 +1817,27 @@ fn gddr_readers_by_channel() {
                 shape,
                 &format!("decode {units} units {nc} columns {len} B"),
             );
-            // H11's bound: the same units and bytes a unit, each unit's share contiguous in one
-            // channel, read in `DECODE_LENS`-byte entries.
-            let bytes = shape.bytes() as u32;
-            for len in list("DECODE_LENS", "2112,16384,65536") {
-                let shape = Shape {
-                    entries: (bytes / len).clamp(1, dm::LIST_MAX - 2),
-                    len,
-                };
-                run(
-                    d,
-                    &mut f,
-                    units,
-                    Mix::DecodeContiguous,
-                    shape,
-                    &format!("decode contiguous {units} units {len} B"),
-                );
+            // H11's bound: the same units and bytes a unit (or `DECODE_BYTES`, comma-separated:
+            // a product's bytes a unit, item 2b's stream time), each unit's share contiguous in
+            // one channel, read in `DECODE_LENS`-byte entries.
+            for bytes in list("DECODE_BYTES", &shape.bytes().to_string()) {
+                for len in list("DECODE_LENS", "2112,16384,65536") {
+                    let shape = Shape {
+                        entries: bytes.div_ceil(len).clamp(1, dm::LIST_MAX - 2),
+                        len,
+                    };
+                    run(
+                        d,
+                        &mut f,
+                        units,
+                        Mix::DecodeContiguous,
+                        shape,
+                        &format!(
+                            "decode contiguous {units} units {len} B, {} B a unit",
+                            shape.bytes()
+                        ),
+                    );
+                }
             }
         }
         if std::env::var("BANK_READERS").is_ok_and(|v| v == "none") {

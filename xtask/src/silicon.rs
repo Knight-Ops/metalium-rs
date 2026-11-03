@@ -375,6 +375,10 @@ pub const SMOKE: &[&str] = &[
     // F4a.1: kept barriers lowered to per-edge credits (opt-in); sparse ops and a SmolLM2-135M
     // decode replay bit for bit, a dropped edge and an unbalanced credit refused.
     "step265_edge_credits::",
+    // Roadmap 2b, Phase B: X9's weight layout (on by default); a relaid one-row product is the
+    // product bit for bit, a write reaches its replays, a stale region shows, a capture that
+    // writes its relaid weight is refused.
+    "step267_weight_layout::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     "step165_resnet18::",

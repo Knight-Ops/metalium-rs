@@ -201,6 +201,8 @@ pub struct PrefetchCursor {
     unpacked: bool,
     /// `B`'s slot in GDDR and L1, and each read's length ([`gather_b_format`]).
     slot: u32,
+    /// A one-channel `B`, read in large pieces ([`BSpan`]), as [`expand_reads`] reads it.
+    span: Option<BSpan>,
     next: u32,
 }
 
@@ -240,6 +242,13 @@ impl PrefetchCursor {
         if thin > 16 || (thin != 0 && a_t) {
             return Err(super::error::RANGE);
         }
+        let span = match b_t {
+            false if laid_for_reader(rec, 3) => {
+                BSpan::of(&b, b_at, kt, j0, cols, slot, BSpan::piece(flags, slot))?
+            }
+            false => None,
+            true => None,
+        };
         Ok(Some(PrefetchCursor {
             b,
             b_at,
@@ -248,13 +257,22 @@ impl PrefetchCursor {
             j0,
             unpacked,
             slot,
+            span,
             next: 0,
         }))
     }
 
+    /// Reads in all.
+    fn reads(&self) -> u32 {
+        match &self.span {
+            Some(s) => s.count(),
+            None => self.kt * self.cols,
+        }
+    }
+
     /// Reads not yet given.
     pub fn left(&self) -> u32 {
-        self.kt * self.cols - self.next
+        self.reads() - self.next
     }
 }
 
@@ -263,8 +281,13 @@ impl Iterator for PrefetchCursor {
     type Item = Result<[u32; 8], u32>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next >= self.kt * self.cols {
+        if self.next >= self.reads() {
             return None;
+        }
+        if let Some(span) = &self.span {
+            let read = span.read(self.next);
+            self.next += 1;
+            return Some(Ok(read));
         }
         let (kk, j) = (self.next / self.cols, self.next % self.cols);
         self.next += 1;
@@ -628,6 +651,112 @@ impl Cursor<'_> {
 
 const PORTS: u32 = crate::dram::PORTS as u32;
 
+/// Word 4 of a tensor reference's first entry ([`TensorRef::encode`] leaves it 0, and
+/// [`TensorRef::decode`] does not read it): a one-channel `B` laid out for the record that reads it,
+/// its tiles in the order the record reads them (X9, `tt_kernels`' weight layout). Only such a `B`
+/// is read in large pieces ([`BSpan`]); any other, a one-channel chip's tensors included, is read a
+/// tile at a time.
+pub const REF_LAID_FOR_READER: u32 = 1;
+
+/// Whether the reference at `rec[at]` carries [`REF_LAID_FOR_READER`].
+fn laid_for_reader(rec: &[[u32; 8]], at: usize) -> bool {
+    rec[at][4] & REF_LAID_FOR_READER != 0
+}
+
+/// A [`GATHER`]'s `B` in one channel (`n == 1`) and marked [`REF_LAID_FOR_READER`]
+/// (`docs/plans/decode-bytes-in-flight.md`, X9's layout: a weight stored for its reader), read as
+/// it lies: row `kk`'s `cols` tiles from `j0`
+/// are consecutive slots in GDDR, as their slots `b_at + (kk * cols + j) * slot` are in L1, so
+/// each row is one run, and with `ct == cols` the rows meet and the block is one run. Each run is
+/// read in pieces of [`crate::noc::niu::MAX_REQUEST_BYTES`] ([`BSpan::piece`]; one request each,
+/// so the in-flight caps count what they did), the port rotating as a tile's would: the same bytes
+/// into the same slots as a read a tile, in a few large reads (X10). A read ahead
+/// ([`GATHER_PREFETCH`]) too, under its own cap, which then holds more bytes in flight: the ops it
+/// runs under read GDDR behind it (`docs/plans/decode-bytes-in-flight.md` Phase B). Any other `B`
+/// is read a tile at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BSpan {
+    ch: u32,
+    /// GDDR offset and L1 address of the first run's first byte.
+    off: u64,
+    l1: u32,
+    /// Runs, each `bytes` long; GDDR advances `stride` from one run to the next, L1 `bytes`.
+    runs: u32,
+    bytes: u32,
+    stride: u64,
+    /// Pieces a run, and each piece's bytes (the last of a run may be shorter).
+    pieces: u32,
+    piece: u32,
+}
+
+impl BSpan {
+    /// The piece of a record with `flags`: one request, for a stream and a read ahead alike.
+    /// (A read ahead a slot a piece was measured too: its small ops were faster, its products
+    /// slower by more, `docs/plans/decode-bytes-in-flight.md` Phase B.)
+    fn piece(_flags: u32, _slot: u32) -> u32 {
+        crate::noc::niu::MAX_REQUEST_BYTES
+    }
+
+    /// The span of a one-channel, untransposed `b`; `None` for any other.
+    fn of(
+        b: &TensorRef,
+        b_at: u32,
+        kt: u32,
+        j0: u32,
+        cols: u32,
+        slot: u32,
+        piece: u32,
+    ) -> Result<Option<Self>, u32> {
+        if b.n != 1 || piece == 0 {
+            return Ok(None);
+        }
+        let (ch, off) = b.tile_in(0, j0, slot as u64)?;
+        let row = cols.checked_mul(slot).ok_or(super::error::RANGE)?;
+        let whole = b.ct == cols;
+        let (runs, bytes) = if whole {
+            (1, kt.checked_mul(row).ok_or(super::error::RANGE)?)
+        } else {
+            (kt, row)
+        };
+        // The last byte read must be a slot the tile-by-tile reads would name.
+        let end = off as u64 + ((runs - 1) as u64) * (b.ct as u64 * slot as u64) + bytes as u64;
+        if end > u32::MAX as u64 + 1 {
+            return Err(super::error::RANGE);
+        }
+        Ok(Some(BSpan {
+            ch,
+            off: off as u64,
+            l1: b_at,
+            runs,
+            bytes,
+            stride: b.ct as u64 * slot as u64,
+            pieces: bytes.div_ceil(piece),
+            piece,
+        }))
+    }
+
+    /// Reads in all.
+    fn count(&self) -> u32 {
+        self.runs * self.pieces
+    }
+
+    /// Read `n` of [`BSpan::count`].
+    fn read(&self, n: u32) -> [u32; 8] {
+        let (run, piece) = (n / self.pieces, n % self.pieces);
+        let at = piece * self.piece;
+        [
+            op::READ,
+            self.ch,
+            n % PORTS,
+            (self.off + run as u64 * self.stride + at as u64) as u32,
+            self.l1 + run * self.bytes + at,
+            (self.bytes - at).min(self.piece),
+            0,
+            0,
+        ]
+    }
+}
+
 fn tensor(rec: &[[u32; 8]], at: usize) -> Result<TensorRef, u32> {
     TensorRef::decode([rec[at], rec[at + 1]])
 }
@@ -789,6 +918,19 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                         None => emit(fetch(&a, a_t, i0 + i, kk, to)?)?,
                     }
                 }
+            }
+            let span = match (b_t || b_resident || !laid_for_reader(rec, 3), b_slot) {
+                (false, slot) => {
+                    let slot = slot as u32;
+                    BSpan::of(&b, b_at, kt, j0, cols, slot, BSpan::piece(flags, slot))?
+                }
+                _ => None,
+            };
+            if let Some(span) = span {
+                for n in 0..span.count() {
+                    emit(span.read(n))?;
+                }
+                return Ok(());
             }
             for kk in (0..kt).filter(|_| !b_resident) {
                 let mut row = if b_t { None } else { Some(b.cursor(kk, j0)?) };
@@ -2280,5 +2422,204 @@ mod tests {
         );
         // `emit`'s error stops the expansion.
         assert_eq!(expand(&rec, |_| Err(42)), Err(42));
+    }
+    /// A gather of `B` only (`A` resident), `kt` terms of `cols` columns from `j0`, `B` in `b`,
+    /// marked [`REF_LAID_FOR_READER`] where `laid`.
+    fn b_gather(
+        flags: u32,
+        kt: u32,
+        j0: u32,
+        cols: u32,
+        b: &TensorRef,
+        laid: bool,
+    ) -> Vec<[u32; 8]> {
+        let a = TensorRef {
+            n: 1,
+            ct: 1,
+            ..TensorRef::default()
+        };
+        let (a, mut b) = (a.encode(), b.encode());
+        if laid {
+            b[0][4] = REF_LAID_FOR_READER;
+        }
+        let b_at = 0x2_0000;
+        Vec::from([
+            [
+                GATHER,
+                flags | GATHER_A_RESIDENT | kt << 8,
+                0x8_0000,
+                b_at,
+                0,
+                1,
+                j0,
+                cols,
+            ],
+            a[0],
+            a[1],
+            b[0],
+            b[1],
+        ])
+    }
+
+    /// Each 64-byte unit a list of reads moves: `(channel, GDDR offset, L1 address)`, sorted.
+    fn units_moved(reads: &[[u32; 8]]) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        for r in reads {
+            assert_eq!(r[0], op::READ, "{r:?}");
+            assert_eq!(r[5] % 64, 0, "whole 64-byte units: {r:?}");
+            for k in (0..r[5]).step_by(64) {
+                out.push((r[1], r[3] + k, r[4] + k));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// X9's layout (`docs/plans/decode-bytes-in-flight.md`): a one-channel `B` laid out for its
+    /// reader ([`REF_LAID_FOR_READER`]), read as it lies, is read in pieces of at most one request,
+    /// and moves exactly the bytes, to exactly the slots, that a read a tile would (the oracle
+    /// below, from the record's own definition: tile `(kk, j0 + j)` of a tensor `ct` wide at
+    /// `base + (first + kk * ct + j0 + j) * slot`, into `b_at + (kk * cols + j) * slot`). Whole when
+    /// the rows meet (`ct == cols`), a run a row when they do not; a read ahead reads the same
+    /// pieces and the pump's cursor gives them; unmarked, or interleaved, a `B` keeps a read a tile.
+    #[test]
+    fn a_one_channel_b_laid_for_its_reader_is_read_in_large_pieces() {
+        let bf16 = gather_b_format(crate::tile::L1Format::Bf16).unwrap();
+        for (flags, slot) in [
+            (GATHER_STREAM | bf16, 2112u32),
+            (GATHER_STREAM, TILE_SLOT as u32),
+        ] {
+            for (kt, j0, cols, ct, first) in [
+                (64u32, 0u32, 3u32, 3u32, 0u32),
+                (13, 0, 1, 1, 0),
+                (7, 2, 3, 9, 5),
+                (64, 0, 5, 5, 128),
+            ] {
+                let what = std::format!(
+                    "slot {slot}, kt {kt}, j0 {j0}, cols {cols}, ct {ct}, first {first}"
+                );
+                let mut b = TensorRef {
+                    n: 1,
+                    first,
+                    ct,
+                    ..TensorRef::default()
+                };
+                (b.channels[0], b.base[0]) = (6, 0x40_0000);
+                let rec = b_gather(flags, kt, j0, cols, &b, true);
+                let mut reads = Vec::new();
+                expand_reads(
+                    &rec,
+                    |_| 0,
+                    |e| {
+                        reads.push(e);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                let mut oracle = Vec::new();
+                for kk in 0..kt {
+                    for j in 0..cols {
+                        let t = first + kk * ct + j0 + j;
+                        oracle.push([
+                            op::READ,
+                            6,
+                            0,
+                            0x40_0000 + t * slot,
+                            0x2_0000 + (kk * cols + j) * slot,
+                            slot,
+                            0,
+                            0,
+                        ]);
+                    }
+                }
+                assert_eq!(
+                    units_moved(&reads),
+                    units_moved(&oracle),
+                    "{what}: the bytes moved"
+                );
+                let runs = if ct == cols { 1 } else { kt };
+                let per_run = (kt * cols * slot / runs).div_ceil(16384);
+                assert_eq!(reads.len() as u32, runs * per_run, "{what}: reads");
+                assert!(
+                    reads.iter().all(|r| r[5] <= 16384 && r[2] < PORTS),
+                    "{what}"
+                );
+                assert!(
+                    reads.iter().all(|r| r[3] % 64 == r[4] % 64),
+                    "{what}: congruent"
+                );
+                // A read ahead: the same bytes to the same slots, in the same pieces, and the
+                // pump's cursor gives the record's own expansion.
+                let mut ahead = rec.clone();
+                ahead[0][1] = ahead[0][1] & !GATHER_STREAM | GATHER_PREFETCH;
+                let mut expanded = Vec::new();
+                expand_reads(
+                    &ahead,
+                    |_| 0,
+                    |e| {
+                        expanded.push(e);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    units_moved(&expanded),
+                    units_moved(&oracle),
+                    "{what}: ahead's bytes"
+                );
+                assert_eq!(expanded, reads, "{what}: ahead's reads are the stream's");
+                let cursor = PrefetchCursor::new(&ahead).unwrap().unwrap();
+                assert_eq!(
+                    cursor.left(),
+                    expanded.len() as u32,
+                    "{what}: the cursor's count"
+                );
+                let pumped: Vec<_> = cursor.map(Result::unwrap).collect();
+                assert_eq!(pumped, expanded, "{what}: the cursor's reads");
+                // Unmarked (a one-channel chip's tensor): a read a tile, as before.
+                let mut plain = Vec::new();
+                expand_reads(
+                    &b_gather(flags, kt, j0, cols, &b, false),
+                    |_| 0,
+                    |e| {
+                        plain.push(e);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    plain.len() as u32,
+                    kt * cols,
+                    "{what}: unmarked, a read a tile"
+                );
+                assert_eq!(
+                    units_moved(&plain),
+                    units_moved(&oracle),
+                    "{what}: unmarked bytes"
+                );
+            }
+        }
+        // Interleaved over eight channels: a read a tile, as before.
+        let mut b = TensorRef {
+            n: 8,
+            ct: 4,
+            ..TensorRef::default()
+        };
+        for c in 0..8 {
+            (b.channels[c], b.base[c]) = (c as u8, 0x40_0000);
+        }
+        let rec = b_gather(GATHER_STREAM | bf16, 16, 0, 4, &b, true);
+        let mut reads = Vec::new();
+        expand_reads(
+            &rec,
+            |_| 0,
+            |e| {
+                reads.push(e);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(reads.len(), 64, "a read a tile");
+        assert!(reads.iter().all(|r| r[5] == 2112));
     }
 }
