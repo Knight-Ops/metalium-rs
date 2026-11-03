@@ -13,6 +13,8 @@
 //!   product over the new weight (its regions filled again first).
 //! - **The replay reads the regions** (the negative control): with the refill suppressed
 //!   (`probe_stale_relaid`), a replay after a write still gives the old product.
+//! - **A padding fill in place reaches the regions.** After an op zeroes the weight's padding in
+//!   place (`meet`), a replay's padding columns are the eager product's.
 //! - **A capture that writes its relaid weight is refused**, where the same capture without the
 //!   layout is not.
 //! - **A full GDDR leaves the weight where it lies.** Where a region would leave its channel less
@@ -305,6 +307,66 @@ fn a_full_gddr_leaves_the_weight_where_it_lies() {
         assert_eq!(replayed(s, id, &out), want, "relaid replay");
         s.release_trace(id).unwrap();
         for t in [a, b, out] {
+            s.free(t).unwrap();
+        }
+        s.set_streamed_k(true);
+    });
+}
+
+/// A relaid weight whose padding a later op zeroes in place (`meet`, for a product that needs
+/// it zero along its `K`): its regions must hold the weight's bytes, padding included, so a later
+/// replay's padding columns are the eager product's. (A relaid product's output claims undefined
+/// padding today, since its `A` is packed, so no claim depends on this yet; a product of more rows
+/// reading the regions would.)
+#[test]
+fn a_padding_fill_in_place_reaches_the_regions() {
+    use tt_kernels::tensor::{Eltwise, Pad};
+    with_session(|s| {
+        let (k, n) = (2048usize, 250usize);
+        let width = n.div_ceil(32) * 32;
+        s.set_streamed_k(false);
+        let a = s.upload(&floats(13, k), 1, k).unwrap();
+        // `exp` of a zero-padded weight: its padding columns hold `e^0`, not zero.
+        let raw = weight(s, 17, k, n, false);
+        let exp = Eltwise {
+            kind: tt_kernels::sfpu::ops::kind_sfpu::EXP,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let b = s.eltwise(exp, &raw, None).unwrap();
+        s.free(raw).unwrap();
+        assert_eq!(b.pad(), Pad::Undefined, "the weight's padding is not zero");
+        // `B`'s `K` is whole tiles, so the product reads it as it is and relays it, padding and all.
+        let before = s.relaid_bytes();
+        let (id, out) = traced(s, &a, &b, false, true);
+        assert!(s.relaid_bytes() > before, "relaid");
+        let row0 = |s: &mut Session<_>, t: &DramTensor| -> Vec<u32> {
+            bits(&s.download_padded(t).unwrap()[..width])
+        };
+        s.replay(id).unwrap();
+        let eager_out = product(s, &a, &b, false);
+        assert_eq!(row0(s, &out), row0(s, &eager_out), "before the fill");
+        assert!(
+            row0(s, &out)[n..].iter().any(|&x| x != 0),
+            "the padding columns hold the weight's padding's image"
+        );
+        s.free(eager_out).unwrap();
+        // A product over `B`'s ragged columns needs them zero: filled in place.
+        let c = weight(s, 19, n, 32, false);
+        let fill = product(s, &b, &c, false);
+        assert_eq!(b.pad(), Pad::Zero, "filled in place");
+        s.replay(id).unwrap();
+        let eager_out = product(s, &a, &b, false);
+        let (got, want) = (row0(s, &out), row0(s, &eager_out));
+        assert!(want[n..].iter().all(|&x| x == 0), "eager: zero padding");
+        assert_eq!(
+            got[n..],
+            want[n..],
+            "after the fill: the regions hold the weight's padding"
+        );
+        assert_eq!(got, want, "after the fill: the product");
+        s.release_trace(id).unwrap();
+        for t in [a, b, c, fill, out, eager_out] {
             s.free(t).unwrap();
         }
         s.set_streamed_k(true);

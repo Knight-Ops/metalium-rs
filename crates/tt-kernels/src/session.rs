@@ -8748,7 +8748,9 @@ impl<T: Transport> Session<T> {
         }
         let units = self.spread_for(tiles_of(t));
         if t.placement.owned() {
-            self.note_written(t);
+            // A write in place like any other: a packed twin is dropped, and a relaid weight's
+            // regions are filled again before they are read next, padding included.
+            self.drop_twin(t)?;
             let jobs = tensor::fill_pad(t, 0.0, units)?;
             self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
             t.set_pad(Pad::Zero);
