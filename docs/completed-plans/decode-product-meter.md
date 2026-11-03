@@ -143,7 +143,7 @@ A meter whose verdict two runs disagree on is reported as not reproducible and i
 
 | `Step(64)` product | slowest unit, us | ring | gather | T0 starves | kernel | tail | what-if saves |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| `qkv` | 51.5 | 1% | 75% | 76% | 13% | 8% | 3% |
+| `qkv` | 34.6 (corrected 2026-11-02: first given as 51.5, see [the log](../learnings/performance-log.md#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1)) | 1% | 68% | 69% | 15% | | |
 | `o` | 16.4 | 2% | 49% | 52% | 18% | 21% | 0% |
 | `gate\|up` | 123.0 | 1% | 83% | 86% | 11% | 1% | 11% |
 | `down` | 117.1 | 1% | 88% | 82% | 11% | 3% | 1% |

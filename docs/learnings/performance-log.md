@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [X9's weight layout, bit for bit: a 1.7B decode step 11.08 -> 9.90 ms](#x9s-weight-layout-bit-for-bit-a-17b-decode-step-1108---990-ms-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase B (on by default since 2026-11-03, ~3.4 GB more GDDR, `TT_WEIGHT_LAYOUT=0` opts out): each unit's share of a streamed weight copied into one channel in its read order, read in 16 KiB pieces (`record::BSpan`), reads ahead too at a cap of 1; bit for bit (`step267`, `step188`); decode 11.08 / 12.27 -> 9.90 / 10.94 ms at 32 / 256 tokens, prefill unchanged; large reads ahead at cap 2 slow the small ops (T8); host scans of ~11,500 regions cost ~0.6 ms a step until indexed by source |
+| [H11's then step: contiguous weights in 16 KiB reads](#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1) | 2026-11-02 | roadmap 2b, Phase A (a timing probe, `tensor::probe_contiguous_b`): more requests at tile-sized entries buy nothing (stream cap 3-8); each unit's weight share contiguous in one channel, read in 16 KiB entries: `down` 1.34-1.43x on its slowest unit, `qkv` 1.4x, `gate\|up`'s mean unit 12-14% but not its slowest (evenness), `o` unchanged; layout alone nothing; the step 10.94 / 12.14 -> 10.55 / 11.95 ms measured, ~1 ms against its own cap; kill not fired, Phase B (bit-exact) next |
 | [A decode product's pipeline metered from inside: read-bound by its reads in flight](#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1) | 2026-11-02 | `Detail::Pipeline` times each streamed batch on every unit (B's credits, T0's and T2's tables through an L1 log); the 1.7B's decode products are read-bound, not ring-bound: T0 starves 52-86% of the slowest unit's work, the ring waits 1-2%, perfect overlap saves 0-11%, `fast-reads` changes nothing; a unit reads ~4-5 GB/s, ~1.3 us a 2 KiB read under load: bytes in flight (H11) is the lever; found: the timestamper repeats and drops events in a burst |
 | [Program restores on the card: paged programs copied back by the B movers](#program-restores-on-the-card-paged-programs-copied-back-by-the-b-movers-2026-11-01-cards-0-and-1) | 2026-11-01 | traces keep their programs in GDDR and a replay's B mover copies back what another trace evicted (H15); the host's restore was its cache bookkeeping more than its PCIe writes (410 us a unit, now ~55). 1.7B prefill 2,546 / 2,744 -> **3,040 / 3,827 tokens/s** at 128 / 256 tokens, within 1.2% of subblocks off; decode and the 7,992-token prefill unchanged, bit for bit; found and fixed: a measurement's capture unprotected the paused capture's programs |
 | [The 128 / 256-token prefill drift located: F5's programs paged through the cache](#the-128--256-token-prefill-drift-located-f5s-programs-paged-through-the-cache-2026-11-01-card-1) | 2026-11-01 | F5's subblocked kernel is faster alone (a 256-token chunk 77.9 against 79.8 ms) but its programs do not fit the units' caches beside the generator's other traces: 0.6 / 2.0 MB restored a 128 / 256-token generation, ~8 ms a MB; with `TT_DST_SUBBLOCKS=0` prefill 3,061 / 3,875 tokens/s (F4b.2 2,778 / 3,335); fix open |
@@ -404,6 +406,151 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## X9's weight layout, bit for bit: a 1.7B decode step 11.08 -> 9.90 ms (2026-11-03, cards 0 and 1)
+
+Roadmap Track 2 follow-ups, item 2b, Phase B ([plan](../plans/decode-bytes-in-flight.md)), after [Phase
+A](#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1)'s kill did not fire.
+`Session::set_weight_layout`; **on by default since 2026-11-03** (`TT_WEIGHT_LAYOUT=0` turns it off and gives the
+GDDR back).
+
+**What it is.**
+- **The format.** A `B` in one channel, marked `REF_LAID_FOR_READER` in an unused word of its reference, is X9's
+  layout. The card reads it in pieces of one 16 KiB request (`tt_isa::dm::record::BSpan`, in `expand_reads` and the
+  read-ahead pump alike); any other `B` is read a tile at a time, a one-channel chip's tensors included.
+- **The relayout.** A capture copies each unit's share of a weight it neither made nor writes into a region in the
+  order the unit reads it, and points the product's records at it. A paused copy job fills it, using the record
+  itself into staging.
+- **Lifetime.** The regions are shared by every trace, freed with the weight and refilled after an in-place write;
+  a capture that writes a relaid weight is refused.
+- **Bit for bit.** The same bytes land in the same slots: `step267` (ttsim, card 0 `1793657310`/`1793665424`) and
+  `step188`'s traced test with it on (`1793665445`).
+
+**Measured** (card 1, release, safe image, SmolLM2-1.7B-Instruct, BF16 weights, `TT_TILES=all`, 512-position cache).
+- **Profiled** (`Step(64)`, slowest unit, us; the step's ops summed):
+  - default `1793658870`: `o` 16.9, `gate|up` 124.9, `down` 119.0, `qkv` 35.2; 10,759 us.
+  - Layout at the default read-ahead cap of 2 (`1793659575`): 12.3 / 110.6 / 89.4 / 18.1; 10,042 us. The products
+    gain more than Phase A's probe, because their reads ahead are large too. But the ops those reads run under slow
+    down: `rope` with the cache's scatter 586 -> 1,102 us, `rms_norm` 821 -> 969 (T8, GDDR is one queue).
+  - Read-ahead cap 1 (`1793660329`): 12.1 / 106.8 / 88.2 / 18.1; **9,504 us**.
+  - Reads ahead a slot a piece (`1793661072`): the small ops recover, but the products lose half their gain;
+    10,054 us.
+- **Unprofiled, the default against the layout** (ms, 32 / 256 tokens):
+  - the default, read-ahead cap 1 alone: 11.52 / 12.79 (`1793662104`), worse;
+  - layout, read-ahead cap 2: 11.14 / 12.17 (`1793662331`);
+  - layout, read-ahead cap 1: 10.62 / 11.63 (`1793662552`), with prefill 4-5% slower.
+- **The host scanned every region** (~11,500) at each free and in-place write. Prefill's chunks took the same
+  device time (15,672 against 15,630 us), so the loss was host-side. With the relaid weights indexed by source:
+
+| run | decode step, ms | prefill, tokens/s |
+|---|--:|--:|
+| default (`1793663597`) | 11.072 / 12.264 | 1,085 / 2,076 |
+| **layout** (`1793663823`) | **9.886 / 10.932** | 1,072 / 2,048 |
+| **layout again** (`1793664027`) | **9.913 / 10.940** | 1,087 / 2,078 |
+| default again (`1793664232`) | 11.087 / 12.268 | 1,069 / 2,045 |
+| default, the marker's build (`1793665594`) | 11.008 / 12.175 | 1,071 / 2,053 |
+| **layout, the marker's build** (`1793665823`) | **9.894 / 10.897** | 1,094 / 2,094 |
+| default again (`1793666028`) | 11.006 / 12.156 | 1,091 / 2,089 |
+
+- **Decode is 10.7-10.8% faster, 101 tokens/s at a 32-token prompt.**
+- **Prefill is unchanged within one-sample noise.**
+- **Cost:** 0.49 GB more of the fullest channel (3.34 -> 2.85 GB free).
+- **The other models with it on** (card 1):
+  - **Qwen3.5-4B decode** 64.11 / 64.45 -> 62.85 / 63.26 ms (`1793670805`, `1793671626`); prefill unchanged.
+  - **The 135M** 7.03 / 8.26 -> 6.99 / 8.22 ms.
+  - **ResNet-18 and ViT-Tiny** traced forward unchanged within ±0.3 ms.
+  - **Bit for bit on card 0** (`1793666474`, `1793668937`), Qwen3.5's traced generation included.
+  - **Found on the way:** the relayout's pause left redundant setup runs in the capture that made the regions, which
+    `step216`'s structural tests caught. It is now a movers-only pause.
+- **Made the default (2026-11-03, the owner's call).**
+  - **The price:** each streamed weight is held twice, ~3.4 GB more GDDR on the 1.7B's BF16 weights (an F32 model
+    pays its streamed bytes again). `TT_WEIGHT_LAYOUT=0` at open, or `set_weight_layout(false)` before the first
+    capture, keeps it. The benches' conditions line now records `weight_layout`.
+  - **A region leaves its channel 64 MiB free** (`RELAID_HEADROOM`), else the record reads its weight as it lies,
+    with the same bits. Found by `step267`'s new full-GDDR test on card 0 (`1793679359`): with every tile, the small
+    regions fit the last room on channel 0, and the capture's own stored streams (`store_stream`, a unit's trace
+    kept in its channel) were then refused. With the headroom it passes on ttsim and card 0 (`1793679476` and after).
+- **Left** ([roadmap](../plans/roadmap.md) item 2b's next steps): one copy instead of two (bound prefill on the relaid
+  layout first); relaying only `down` and `qkv` if that stalls; regions that yield to a refused allocation; regions
+  made at load time; `gate|up`'s evenness.
+
+## H11's then step: contiguous weights in 16 KiB reads (2026-11-02, card 1)
+
+Roadmap Track 2 follow-ups, item 2b, Phase A ([plan](../plans/decode-bytes-in-flight.md), rules fixed before any
+measurement). The [entry below](#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1)
+found the decode products bound by each unit's bytes in flight.
+
+**The probe** (`tt_kernels::tensor::probe_contiguous_b`, `TT_PROBE_CONTIGUOUS_B=<bytes>` in
+`traced_generation_stream_ceiling`). Timing only.
+- **What it changes.** Each one-row product's weight stream (a `GATHER_STREAM` record) becomes plain `READ`s of a
+  scratch region the size of the record's `B`. The region is contiguous in channel `u % 8` for unit `u`, and the reads
+  land in the same slots.
+- **What it leaves.** Reads ahead keep today's records.
+- **The cap.** The reads run under B's own cap (`TT_IN_FLIGHT_CAP`), so each probe run is paired with a baseline at
+  that cap.
+- **Gates.** Host tests of the rewrite, and the ttsim spike `probe_contiguous_b`.
+
+**Conditions.** Release, safe image, SmolLM2-1.7B-Instruct with BF16 weights, `TT_TILES=all`, a 512-position cache,
+card 1. The spans use `--profile` with the pipeline detail and are each product's slowest unit in `Step(64)`, median
+over layers. The steps are unprofiled: 9 samples, 32 / 256-token prompts.
+
+**A0: more requests at tile-sized entries** (`TT_STREAM_CAP_BF16`, `1793645082` / `1793645792` / `1793646497` /
+`1793647203` for caps 3 / 4 / 6 / 8):
+- `down` 116.7 -> 110.7 us at cap 8;
+- `gate|up` 123.8 -> 138.7, and the head 446 -> 547 (past the ~32-requests-a-channel knee);
+- `qkv` and `o` flat.
+
+So the request count is not the lever.
+
+**Phase A: matched pairs** (baseline -> contiguous 16 KiB entries, slowest unit, us):
+
+| product | units | cap 1 | cap 2 | cap 3 |
+|---|--:|---|---|---|
+| `down` | 64 | 116.2 -> 81.5 | 115.6 -> 83.5 | 116.3 -> 86.8 |
+| `qkv` | 120 | 46.0 -> 39.6 | 46.8 -> 32.7 | 39.6 -> 28.4 |
+| `gate\|up` | 120 | 129.5 -> 124.1 | 131.7 -> 133.6 | 127.2 -> 135.4 |
+| `o` | 64 | 17.8 -> 17.9 | 17.2 -> 17.7 | 16.8 -> 17.0 |
+
+Runs: cap 1 `1793650022` / `1793649323`; cap 2 `1793647913` / `1793648628`, repeated `1793652866`; cap 3 `1793650741`
+/ `1793651451`.
+- **`gate|up`'s mean unit is 12-14% faster**, but large entries serve its 120 units unevenly, so its slowest unit is
+  not.
+- **The control:** contiguous at 2,112-byte entries, cap 3 (`1793652146`), gives `down` 122.7, `qkv` 39.2,
+  `gate|up` 130.3 and `o` 17.1 us. The layout alone buys nothing; the entry size does.
+- **B's own cap moves the baseline.** `qkv` is 34.3 us at the default cap of 8.
+
+**The stream's own time `S`** (`gddr_readers_by_channel`, `DECODE_BYTES` added, `1793653566`):
+- 64 units at 16 KiB entries read `down`'s 541 KB a unit at 496 / 483 / 476 GB/s at caps 1 / 2 / 3.
+- 120 units at 16 KiB entries read 454-470 GB/s.
+- Today's deal at tile-sized entries reads 319-399 GB/s on 64 units.
+- **`down`'s gap ratio** (span less `S`, today over probe) is 3.1-4.0 with `S` from its full 34.6 MB, and 2.1-2.4 from
+  the 28.1 MB not queued ahead. The kill was < 1.2.
+- **For the other three products `S` is not computable as the rule fixed it.** Part of their `B` is read ahead of the
+  span, so a full-weight `S` exceeds the span (`qkv`: ~56 us against 28-47).
+
+**The step** (host-timed medians, ms, 32 / 256 tokens):
+
+| configuration | run | step |
+|---|---|--:|
+| default | `1793653745` | 10.937 / 12.140 |
+| contiguous 16 KiB, cap 1 | `1793653969` | **10.545 / 11.954** |
+| baseline, cap 1 | `1793654187` | 11.577 / 12.915 |
+| contiguous 16 KiB, cap 3 | `1793654412` | 10.743 / 12.000 |
+| baseline, cap 3 | `1793654630` | 11.177 / 12.415 |
+| default again | `1793654854` | 10.957 / 12.125 |
+
+- **0.40 / 0.18 ms faster than today, measured,** with every other B read held to cap 1, which alone costs 0.64 /
+  0.78 ms.
+- **~1 ms against its own cap.**
+- 28.4% of the weight bytes stay in today's tile-sized reads ahead.
+
+**Verdict.** The kill does not fire. Phase B, the bit-exact layout (X9's first piece) with a stream cap of its own, is
+next. `gate|up`'s evenness is a deal question for X10.
+
+**Correction to the entry below.** Its `qkv` row (51.5 us, 119 units, 1.3 batches, issue 75%) does not come out of
+its own `pipeline.tsv` when the products are classed by their order in a layer. Read that way, `qkv` is 34.2 / 34.6 us
+on 120 units, 1 batch, issue 68%, starve 69% (`1793637811` / `1793638678`). Rule 2 still holds for it. The other
+three rows reproduce exactly.
+
 ## A decode product's pipeline metered from inside: read-bound by its reads in flight (2026-11-02, cards 0 and 1)
 
 Roadmap Track 2 follow-ups, item 2; plan and decision rules in [decode-product-meter.md](../completed-plans/decode-product-meter.md),
@@ -435,7 +582,7 @@ and kernel over time.
 
 | product | units | batches | slowest unit, us | ring | issue | land | T0 starves | kernel | tail | what-if saves |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| `qkv` | 119 | 1.3 | 51.5 | 1% | 75% | 1% | 76% | 13% | 8% | 3% |
+| `qkv` | 120 | 1.0 | 34.6 (was given as 51.5 on 119 units, 1.3 batches, 75% / 76%; corrected 2026-11-02, [above](#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1)) | 1% | 68% | 1% | 69% | 15% | | |
 | `o` | 64 | 1.0 | 16.4 | 2% | 49% | 2% | 52% | 18% | 21% | 0% |
 | `gate\|up` | 120 | 3.0 | 123.0 | 1% | 83% | 1% | 86% | 11% | 1% | 11% |
 | `down` | 64 | 4.0 | 117.1 | 1% | 88% | 1% | 82% | 11% | 3% | 1% |

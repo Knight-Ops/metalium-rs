@@ -1362,6 +1362,20 @@ From decode-to-bandwidth.md Phase 10 (F27), `silicon_bench_memory::gddr_readers_
 
   So long entries buy rate only where few readers would otherwise under-fill the channels (64 units: 395 -> 499),
   and pay for it in fairness ([log](performance-log.md#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1)).
+- **Inside a decode product, the same holds** (2026-11-02, card 1, roadmap 2b, the in-model probe
+  `tensor::probe_contiguous_b`):
+  - **Large entries pay where few units read.** Each unit's weight share contiguous in one channel, in 16 KiB entries,
+    makes the 64-unit `down` 1.34-1.43x faster on its slowest unit.
+  - **They serve many units unevenly.** The 120-unit `gate|up`'s mean unit is 12-14% faster, but its slowest unit is
+    not.
+  - **More tile-sized requests do not pay.** Raising a stream's cap from 3 to 8 slows the 120-unit products up to 23%.
+  ([log](performance-log.md#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1))
+- **Large reads ahead crowd the ops they run under** (2026-11-03, card 1, the weight layout,
+  [log](performance-log.md#x9s-weight-layout-bit-for-bit-a-17b-decode-step-1108---990-ms-2026-11-03-cards-0-and-1)).
+  - **At the default read-ahead cap of 2,** 16 KiB reads ahead made the small ops after `qkv` 0.5 ms a step slower
+    (`rope` and the cache's scatter 586 -> 1,102 us) and `rms_norm` 0.15 ms.
+  - **At a cap of 1** most of that goes, and the products keep their gain.
+  - **Bytes in flight, not request count, is what a GDDR reader takes from the others.**
 - **The NoC #0 endpoint nearest above a tile** (shortest Y leg) is how the bench picks its port; on card 0 the
   nearest tiles to channels 0-3 sit at raw X 1-6 and to 4-7 at raw X 11-16 (`banked_tiles`).
 - **The B mover's list loop is that tight:** one more check per entry there (a barrier test, nothing stamped) cost

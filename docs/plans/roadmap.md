@@ -14,8 +14,8 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
-  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 91 tokens/s traced against
-  burn-flex's 3.4 (10.95 ms a step with BF16 weights, card 1, 2026-10-29, [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1); 88 tokens/s on 2026-10-27, 13.6 on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 101 tokens/s traced against
+  burn-flex's 3.4 (9.89 ms a step with BF16 weights and X9's weight layout, on by default for ~3.4 GB more GDDR, card 1, 2026-11-03, item 2b below; 10.95 ms on 2026-10-29, [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1); 88 tokens/s on 2026-10-27, 13.6 on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
   5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
@@ -953,14 +953,70 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       2 KiB read under load.
   - *Next:* item 2b.
 - [ ] **2b. More bytes in flight for a decode product** (named by item 2, 2026-11-02; H11's "then" step in the
-  [design reference](../learnings/dataflow-compiler.md) §13).
-  - *The bound first:* the `m = 1` product over a relaid weight on card 1, each unit's share contiguous in one channel
-    in 16-64 KiB entries (X9's layout, built only as a probe), against today's deal. Measure with the pipeline
-    detail, reads and kernel together.
-  - *Kill:* a product's span not ≥ 1.2x closer to its stream's time.
-  - *H11's evenness caveat holds:* large entries served 64 units unevenly (80-141 us a unit at 16 KiB, cap 3), so the
-    bound must time the slowest unit, not the aggregate.
-  - *Only then:* X9's load-time layout pass, and X10's entry size and reads in flight in the cost model.
+  [design reference](../learnings/dataflow-compiler.md) §13; [plan](decode-bytes-in-flight.md),
+  [log](../learnings/performance-log.md#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1)).
+  - *Phase A, the bound: done 2026-11-02 on card 1, and the kill does not fire.*
+    - **The probe.** `tensor::probe_contiguous_b`, timing only: each one-row product's weight stream read from a
+      contiguous scratch in one channel a unit, in large plain reads.
+    - **More requests at tile-sized entries buy nothing** (A0, the BF16 stream cap 3-8). The 120-unit products lose
+      up to 23% past the knee.
+    - **16 KiB entries make `down` 1.34-1.43x faster on its slowest unit, and `qkv` 1.4x at caps 2-3.** The gap
+      ratio is 2.1-4.0 against a kill of 1.2.
+    - **`gate|up`**'s mean unit is 12-14% faster, but its slowest unit is not (H11's evenness).
+    - **`o`** does not move.
+    - **The layout alone, at tile-sized entries, buys nothing.**
+    - **The step: 10.94 / 12.14 -> 10.55 / 11.95 ms** at 32 / 256 tokens, measured, although the probe caps every
+      other B read at 1. Against its own cap it saves ~1 ms.
+  - *Phase B, built 2026-11-03, **on by default** since 2026-11-03* (`Session::set_weight_layout`; X9's first piece):
+    **decode 11.01 / 12.17 -> 9.89 / 10.90 ms** at 32 / 256 tokens (card 1; first measured 11.08 / 12.27 -> 9.90 /
+    10.94, `1793663823` / `1793664027` against `1793663597` / `1793664232`), bit for bit, prefill unchanged.
+    - **The format.** A one-channel `B` is the layout, so there is no new encoding: the card reads such a `B` in
+      16 KiB pieces (`record::BSpan`).
+    - **The relayout.** A capture copies each unit's share of a weight it neither made nor writes into a region in
+      the order the unit reads it.
+    - **Lifetime.** The regions are freed with the weight and refilled after a write, and a capture that writes a
+      relaid weight is refused.
+    - **The read-ahead cap.** Large reads ahead need a cap of 1, or the small ops behind them pay.
+    - **A full GDDR.** A region leaves its channel 64 MiB free (`RELAID_HEADROOM`, room for every capture's stored
+      streams and programs); with less, that record reads its weight as it lies (said once on stderr) and the capture
+      still succeeds, with the same bits.
+    - **Gates:** `step267` (ttsim and card 0, with a stale-region negative control and a full-GDDR test, in
+      `--smoke`), `step188`'s traced test with it on, `step12_mnist`, and the mover gates in every read mode.
+  - **The cost of the default: GDDR, and how to get it back.**
+    - Each streamed weight is held twice: as it lies (prefill, eager ops and the tied head's token lookups read it)
+      and relaid. The SmolLM2-1.7B's BF16 weights take **~3.4 GB more** (0.49 GB more on the fullest channel, 3.34 ->
+      2.85 GB free); an F32 model pays its streamed weights' bytes again (6.8 GB for the 1.7B in F32).
+    - **Opt out:** `TT_WEIGHT_LAYOUT=0` when the session opens, or `Session::set_weight_layout(false)` before the
+      first capture. Regions already made stay until their weight is freed. Decode is then ~10% slower on the 1.7B
+      and ~2% on Qwen3.5-4B; other models do not change.
+    - The regions are made at a capture's first sight of a weight, after the model loaded, so a model that fits
+      only just can find a later allocation (a longer KV cache, another model) refused where it would not be
+      without the layout. Opt out in that case until the regions can yield (below).
+  - *The other models with it on* (2026-11-03):
+    - **Bit for bit on card 0:** `step187`, `step185`, `step233`, `step234`, `step240`, `step205`, `step216`, `step219`,
+      `step212`, `step224` and `step263` (Qwen3.5-4B).
+    - **Qwen3.5-4B decode** 64.11 / 64.45 -> 62.85 / 63.26 ms.
+    - **The 135M, ResNet-18 and ViT-Tiny** are unchanged within noise.
+    - **Found and fixed:** the relayout's pause left redundant setup runs in the capture that made the regions (now a
+      movers-only pause).
+  - *Next steps, in order* (owner 2026-11-03: the default stands, the second copy should go):
+    - [ ] **One copy instead of two (gets the ~3.4 GB back).** X9 as the weight's only storage. A decode unit's
+      share is whole column runs, so prefill and eager products can read the same layout by splitting each block's
+      read per run (one `GATHER` a run, no new encoding). Every other reader needs a path too: the tied head's token
+      lookups (embedding), in-place writes and downloads. The split must be fixed when the weights load, from the
+      decode deal.
+      - **First the bound:** prefill (and an eager `m > 1` product) reading the relaid layout per run, on card 1,
+        against today's. Narrow runs could slow prefill; if they do, keep two copies where prefill pays and one
+        elsewhere.
+    - [ ] **The cheaper middle, if one copy stalls: relay only the products that gain.** Phase A put the gain in
+      `down` and `qkv` (`o` did not move, `gate|up`'s slowest unit gained least). Measure the step with only those
+      relaid; it holds roughly half the extra GDDR.
+    - [ ] **Regions that yield.** Free relaid regions no live trace reads when an allocation is refused, before
+      failing it (and drop them on `set_weight_layout(false)`), so the default never costs a model its fit.
+    - [ ] **Regions made at load time,** not at a capture's first sight: no pause inside the first capture (Qwen3.5's
+      build is ~30 s longer with the layout) and the GDDR taken where the model's own allocations are.
+    - [ ] **`gate|up`'s evenness** (its slowest unit gains least; X10: a deal that sizes each unit's share to the
+      rate it gets).
 - [ ] **3. Qwen3.5: a replay's own wall time on the card.** Profiled again 2026-10-31
   ([log](../learnings/performance-log.md#qwen35-4bs-decode-step-profiled-whole-but-for-nine-ops-2026-10-31-card-1)).
   - *The gap:* 1,071 of 1,080 ops make 43.97 ms on the card against 64.28 host-timed. ~20 ms is in no op's span.

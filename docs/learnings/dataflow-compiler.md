@@ -288,8 +288,8 @@ Each transform states its legality under S2/S3, its expected effect, and the evi
 | X6 | **Barriers become channel edges**: a unit starts when its own inputs are ready | Yes (S1) | [HYP] H4. The evidence cuts both ways (T10): a barrier's time after a product is the slowest unit's work, so removing the barrier alone buys little. The gain has to come from overlap, below. Built in F4a.1 (`barriers::credit`, opt-in, 2026-10-30): a 1.7B decode step admits it only after products into their residual adds, and is not faster |
 | X7 | **Spatial pipelining**: ops on disjoint core sets at once, linked by channels | Yes (S1) | [HYP] H5. Only on exact resource accounting. tt-mlir brought it back as `d2m.spatial` [PUB] |
 | X8 | **Prefetch** of data-independent operands (weights) | Yes | [MEAS] exists. It competes with small ops for the one GDDR queue (T8) |
-| X9 | **Static-operand storage layout chosen for its consumer**: a weight stored at load time with each unit's share contiguous in one channel, in slot format and consumption order | Yes. Moves bytes only; `K` order unchanged | [MEAS] H11's bound (`1793463838`): large entries lift 64 readers from 395 to ~499 GB/s, unevenly; the 96-unit deal already reads ~499. Parked until a product meter shows a 64-unit product read-bound. tt-metal: DRAM-sharded, receiver-contiguous weights [PUB] |
-| X10 | **A unit's read pipeline**: entry size, reads in flight, ring depth, all owned by the cost model | Yes. Changes timing only | [MEAS] The product meter (`Detail::Pipeline`, 2026-11-02, card 1, `1793638678`): the ring is not what binds a decode product (its wait 1-2% of the slowest unit's work; perfect overlap saves 0-11%), its reads in flight are (T0 starves 52-86%; ~1.3 us a 2 KiB read under load, unchanged by `fast-reads`). Entry size and bytes in flight are the lever, with X9. tt-metal: 16 KB pages, 3 rotating transaction IDs, triple buffering [PUB] |
+| X9 | **Static-operand storage layout chosen for its consumer**: a weight stored at load time with each unit's share contiguous in one channel, in slot format and consumption order | Yes. Moves bytes only; `K` order unchanged | [MEAS] H11's bound (`1793463838`): large entries lift 64 readers from 395 to ~499 GB/s, unevenly; the 96-unit deal already reads ~499. Released by the meter (2026-11-02). The in-model probe (roadmap 2b Phase A) makes `down` 1.34-1.43x faster on its slowest unit; the layout at tile-sized entries buys nothing, so X9 pays only with X10's large entries. **Built, on by default since 2026-11-03 (`Session::set_weight_layout`; ~3.4 GB more GDDR on the 1.7B, `TT_WEIGHT_LAYOUT=0` opts out):** a one-channel `B` is the layout (no new encoding), relaid by a capture at first sight, bit for bit; a 1.7B decode step 11.08 / 12.27 -> 9.90 / 10.94 ms. Left: one copy instead of two (X9 as the only storage, prefill reading it per column run), load-time regions. tt-metal: DRAM-sharded, receiver-contiguous weights [PUB] |
+| X10 | **A unit's read pipeline**: entry size, reads in flight, ring depth, all owned by the cost model | Yes. Changes timing only | [MEAS] The product meter (`Detail::Pipeline`, 2026-11-02, card 1, `1793638678`): the ring is not what binds a decode product (its wait 1-2% of the slowest unit's work; perfect overlap saves 0-11%), its reads in flight are (T0 starves 52-86%; ~1.3 us a 2 KiB read under load, unchanged by `fast-reads`). Entry size and bytes in flight are the lever, with X9. Confirmed 2026-11-02 (roadmap 2b): more requests at tile-sized entries buy nothing (the BF16 stream cap 3-8; 120-unit products slow past the knee), while 16 KiB entries over X9's layout do, best at cap 1 for `down`; a 120-unit product's slowest unit needs a deal that sizes each unit's share to the rate it gets (`gate\|up`'s mean unit 12-14% faster, its slowest not). With X9 built (2026-11-03): reads ahead in 16 KiB pieces need a read-ahead cap of 1 (`WEIGHT_LAYOUT_PREFETCH_CAP`); at 2 the small ops behind them lost more than the products gained. tt-metal: 16 KB pages, 3 rotating transaction IDs, triple buffering [PUB] |
 | — | Split-K, flash-attention rescaling, packer L1 accumulation, 16-bit `Dst`, fidelity below exact | **No**: different contracts | Opt-in only, by name. Packer L1 accumulation was rejected as a default because it reorders the sum (G3); split-K and flash-decode are parked ([proposal](../proposals/split-k-and-flash-decode.md)) |
 
 **X5's rounding rule makes fusion format-generic.** A fused body equals the unfused graph exactly when every pack of the unfused graph that narrows is replayed as an explicit rounding to that edge's `TileFormat`. Fusion then never depends on which format the intermediate had.
@@ -810,6 +810,31 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     - **X10's ring depth is ruled out. The reads-in-flight half is named**: larger entries, which need X9's layout.
     - The "then" step above is unblocked: the `m = 1` product over a relaid weight, with the same kill
       (a span not ≥ 1.2x closer to its stream's time).
+  - *The "then" step, as a timing probe (2026-11-02, card 1; roadmap item 2b,
+    [plan](../plans/decode-bytes-in-flight.md),
+    [log](performance-log.md#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1)): large entries
+    pay inside the product, and the claim holds for the 64-unit `down` and for `qkv`.*
+    - **More requests at tile-sized entries buy nothing** (the BF16 stream cap 3-8): the 120-unit products slow past
+      the knee.
+    - **Each unit's share contiguous in one channel, read in 16 KiB entries** (`tensor::probe_contiguous_b`):
+      - `down` is 1.34-1.43x faster on its slowest unit, a gap ratio of 2.1-4.0 against the kill's 1.2;
+      - `qkv` is 1.4x faster at caps 2-3;
+      - `gate|up`'s mean unit is 12-14% faster, but not its slowest (the evenness caveat);
+      - `o` does not move.
+    - **The layout at tile-sized entries buys nothing.**
+    - **The step is 10.94 / 12.14 -> 10.55 / 11.95 ms, measured,** with the probe's cap on B's other reads costing it
+      0.6-0.8 ms. Against its own cap it saves ~1 ms.
+    - **Kill not fired.** X9's first piece (bit-exact) is next, and `gate|up`'s evenness is X10's.
+  - *X9's first piece, built (2026-11-03; [log](performance-log.md#x9s-weight-layout-bit-for-bit-a-17b-decode-step-1108---990-ms-2026-11-03-cards-0-and-1)):
+    H11 holds, bit for bit.*
+    - **What it is.** `Session::set_weight_layout` (on by default since 2026-11-03, for a second copy of the
+      streamed weights; `TT_WEIGHT_LAYOUT=0` opts out) relays each unit's share of a streamed weight into one
+      channel. The card reads a one-channel `B` in 16 KiB pieces, reads ahead included.
+    - **The step:** 11.08 / 12.27 -> 9.90 / 10.94 ms.
+    - **Two findings.**
+      - Large reads ahead need a lower read-ahead cap (1), or the small ops they run under pay more than the
+        products gain (T8).
+      - Host bookkeeping over ~11,500 regions cost ~0.6 ms a step until indexed by weight.
 - **H12 Bit-exact speculative decode** (recorded 2026-10-31, a later track; owner: after the bandwidth items).
   - *Mechanism:* a draft (SmolLM2-135M for the 1.7B, same tokenizer; Qwen3.5's MTP head) proposes `k` tokens, and the
     target verifies them in one `m = k` step.
