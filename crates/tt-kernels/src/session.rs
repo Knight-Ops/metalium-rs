@@ -1361,6 +1361,16 @@ struct DramState {
     relaid_sources: Vec<tensor::Placement>,
     /// Whether a weight was left unrelaid for want of GDDR (said once).
     relaid_full: bool,
+    /// Bumped whenever [`DramState::relaid`] gains or loses a region: what keeps
+    /// [`DramState::relaid_index`] honest.
+    relaid_epoch: u64,
+    /// [`tensor::probe_relaid_blocks`]'s index of each relaid weight's regions, by source, as of
+    /// the epoch it was built at.
+    relaid_index: Vec<(
+        tensor::Placement,
+        (u64, bool),
+        std::sync::Arc<tensor::RelaidIndex>,
+    )>,
 }
 
 /// One mover list for one unit: list entries, the `KERNEL` entries among
@@ -3492,6 +3502,8 @@ impl<T: Transport> Session<T> {
             relaid: std::collections::HashMap::new(),
             relaid_sources: Vec::new(),
             relaid_full: false,
+            relaid_epoch: 0,
+            relaid_index: Vec::new(),
         });
         Ok(())
     }
@@ -9131,6 +9143,14 @@ impl<T: Transport> Session<T> {
                         return Err(e);
                     }
                 }
+                // A development probe (`docs/plans/decode-bytes-in-flight.md`, Phase C0): every
+                // other read of a relaid `B` from its regions, bit for bit.
+                if tensor::probing_relaid_blocks() {
+                    if let Err(e) = self.probe_relaid_blocks(&mut work.jobs, b_read) {
+                        let _ = self.free(work.out);
+                        return Err(e);
+                    }
+                }
                 if let Some(twin) = &out_twin {
                     twinned = tensor::twin_one_row_scatters(&mut work.jobs, &work.out, twin);
                 }
@@ -10474,6 +10494,7 @@ impl<T: Transport> Session<T> {
                             {
                                 d.relaid_sources.push(b.placement.clone());
                             }
+                            d.relaid_epoch += 1;
                             d.relaid.insert(
                                 key,
                                 Relaid {
@@ -10561,6 +10582,8 @@ impl<T: Transport> Session<T> {
             return Vec::new();
         };
         d.relaid_sources.swap_remove(at);
+        d.relaid_epoch += 1;
+        d.relaid_index.retain(|(q, _, _)| !q.same_allocation(p));
         let keys: Vec<ContiguousKey> = d
             .relaid
             .iter()
@@ -10572,6 +10595,125 @@ impl<T: Transport> Session<T> {
             .filter_map(|k| d.relaid.remove(k))
             .map(|r| r.region)
             .collect()
+    }
+
+    /// [`tensor::probe_relaid_blocks`] for one product's jobs over `b`: where `b` is relaid, each
+    /// gather that reads it as it lies ([`tensor::split_relaid_gather`]) reads its regions instead,
+    /// the regions filled again first if `b` was written since. Bit for bit; nothing else changes.
+    fn probe_relaid_blocks(
+        &mut self,
+        jobs: &mut [tensor::Job],
+        b: &DramTensor,
+    ) -> Result<(), TensorError> {
+        use tt_isa::dm::record;
+        let relaid = self.dram.as_ref().is_some_and(|d| {
+            d.relaid_sources
+                .iter()
+                .any(|p| p.same_allocation(&b.placement))
+        });
+        if !relaid {
+            return Ok(());
+        }
+        self.refresh_relaid()?;
+        let want = b.tensor_ref().encode();
+        let same_b = |r: &[[u32; 8]]| {
+            [r[0][0], r[0][1], r[0][3]] == [want[0][0], want[0][1], want[0][3]] && r[1] == want[1]
+        };
+        let d = self
+            .dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("the relaid-blocks probe needs GDDR".into()))?;
+        let epoch = (d.relaid_epoch, tensor::probing_relaid_shift());
+        let cached = d
+            .relaid_index
+            .iter()
+            .find(|(p, e, _)| *e == epoch && p.same_allocation(&b.placement))
+            .map(|(_, _, i)| i.clone());
+        let index = match cached {
+            Some(i) => i,
+            None => {
+                let copies: Vec<&tensor::Relayout> = d
+                    .relaid
+                    .values()
+                    .filter(|r| r.source.same_allocation(&b.placement))
+                    .map(|r| &r.copy)
+                    .collect();
+                let slot = match copies.first() {
+                    Some(c) => {
+                        tensor::relayout_bytes(&c.record)?
+                            / (record::gather_kt(c.record[0][1]) as u64 * c.record[0][7] as u64)
+                                .max(1)
+                    }
+                    None => return Ok(()),
+                };
+                let mut runs = copies
+                    .iter()
+                    .map(|c| tensor::RelaidRun::of(c))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if tensor::probing_relaid_shift() {
+                    runs[0].off += slot;
+                }
+                let index =
+                    std::sync::Arc::new(tensor::RelaidIndex::new(b.tensor_ref().ct, slot, runs));
+                tensor::note_relaid_audit(&b.placement, &index);
+                d.relaid_index
+                    .retain(|(p, _, _)| !p.same_allocation(&b.placement));
+                d.relaid_index
+                    .push((b.placement.clone(), epoch, index.clone()));
+                index
+            }
+        };
+        for job in jobs.iter_mut() {
+            for step in job.iter_mut() {
+                let Step::List { entries, .. } = step else {
+                    continue;
+                };
+                if !entries.iter().any(|e| e[0] == record::GATHER) {
+                    continue;
+                }
+                // A list that grows past half a mover's list keeps its gathers (a block's list, its
+                // kernel and its scatter share one packet): its bytes count as read where they lie.
+                const BUDGET: usize = tt_isa::dm::LIST_MAX as usize / 2;
+                let mut out = Vec::with_capacity(entries.len());
+                let (mut records, mut from_regions, mut as_lies, mut whole) = (0, 0, 0, 0);
+                let mut i = 0;
+                while i < entries.len() {
+                    let len = record::len(entries[i][0]).max(1);
+                    let rec = &entries[i..i + len];
+                    let split = match rec[0][0] == record::GATHER && same_b(&rec[3..5]) {
+                        true => tensor::split_relaid_gather(rec, &index)?,
+                        false => None,
+                    };
+                    match split {
+                        Some(sp) => {
+                            records += 1;
+                            (from_regions, as_lies) =
+                                (from_regions + sp.from_regions, as_lies + sp.as_lies);
+                            whole += sp.from_regions + sp.as_lies;
+                            out.extend(sp.entries);
+                        }
+                        None => out.extend_from_slice(rec),
+                    }
+                    i += len;
+                }
+                if records == 0 {
+                    continue;
+                }
+                if out.len() > BUDGET.max(entries.len()) {
+                    tensor::count_relaid_split(0, 0, 0, whole);
+                    continue;
+                }
+                tensor::count_relaid_split(records, out.len() as u64, from_regions, as_lies);
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    eprintln!(
+                        "session: TT_PROBE_RELAID_BLOCKS: products read relaid weights from their regions"
+                    )
+                });
+                *entries = out;
+            }
+        }
+        Ok(())
     }
 
     /// Whether, in a capture, a unit's `BUSY_PREFETCH` list that lands right after its arrival at

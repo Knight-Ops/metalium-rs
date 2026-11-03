@@ -337,6 +337,59 @@ Started 2026-11-02, after Phase A's kill did not fire.
   already made stay until their weight is freed). A region leaves its channel 64 MiB free (`RELAID_HEADROOM`); with
   less, that record reads its weight as it lies, with the same bits (`step267`'s full-GDDR test).
 
+## Phase C: one copy instead of two (opened 2026-11-03)
+
+The owner's next ask: X9's layout as a weight's only storage, giving back the ~3.4 GB the second copy takes on the
+1.7B. Its bound comes first: what every *other* reader of a relaid weight pays to read the layout instead of the
+weight as it lies.
+
+### C0: the bound (a bit-exact probe; timing decides)
+
+**The probe.** `tensor::probe_relaid_blocks` (or `TT_PROBE_RELAID_BLOCKS=1`) is test-only.
+- **Which products.** Every product over a relaid weight that reads it as it lies: prefill chunks, eager products,
+  a measurement's timing captures, a head's `m = 1` product in a planned capture.
+- **How each `B` gather is split** (`tensor::split_relaid_gather`):
+  - the record keeps `A`, now `GATHER_B_RESIDENT`;
+  - each `K` row of the block is cut into runs of columns that sit in one region and follow each other there;
+  - each run is plain `READ`s of at most 16 KiB from the region;
+  - consecutive rows of one region whose rows are as wide as the block are one span;
+  - tiles in no region stay a `B`-only `GATHER` as they lie.
+- **Plain reads, not a record a run.** A packet carries a block's gather, kernel and scatter in at most
+  `dm::LIST_MAX` (512) entries, and a record a one-column run overflowed it (`step188` refused it, `LENGTH`). A list
+  that would still pass 256 entries keeps its gathers, and its bytes are counted as read where they lie.
+- **Values.** While both copies exist the probe reads the same bytes into the same slots, so it is **bit for bit**,
+  and timing is the only question.
+
+**Gates.**
+- **Host.** `tensor::relaid_split_tests`: what each L1 byte holds, against the record's own expansion, for column
+  runs, one-column runs, a partly relaid weight, a block that is one run and a block narrower than its run. Three
+  mutations were run: two are caught, and a third was caught once the narrow block was added.
+- **`step267`** (ttsim in both read modes, and card 0 `1793682326`). After a decode capture relays the weight,
+  `[64, k]` products, eager and replayed, equal the products read as they lie. Every tile comes from a region, and
+  the control (`probe_relaid_shift`, each weight's first region read one slot off) gives other bits.
+- **`step188`'s** traced generation with the probe on is bit for bit (card 0, `1793682326`; its output says the probe split its gathers).
+- **Found on the way and fixed:** `meet`'s padding fill in place did not mark a relaid weight dirty (`66aef11`, gate
+  `a_padding_fill_in_place_reaches_the_regions`). It is unreachable through today's products, whose packed `A`
+  leaves their padding undefined, but not through this probe.
+
+**Conditions.** Card 1, release, safe image, every tile; the 1.7B with BF16 weights and a 512-position cache.
+- **Prefill** (`traced_generation_stream_ceiling`): 32 / 128 / 256 tokens at chunks of 64; and 7,992 tokens at chunks
+  of 512 with an 8,192-position cache, one sample.
+- **Eager products** (`silicon_bench_relaid`): the four weights at `m` = 64 / 256 / 512, ABBA in one process over the
+  same regions.
+- Decode at 32 / 256 tokens is the sanity check.
+
+**Decision rules (fixed 2026-11-03, before any measurement).** Each rule applies per weight class: *column runs*
+(`qkv`, `o`, `gate|up`, the head) and *one-column runs* (`down`, `K` streamed).
+1. **Void** if the audit shows less than 99% of a class's tiles held by exactly one region. Fix it and rerun.
+2. **The class is killed** if prefill at 128, 256 or 7,992 tokens is more than 2% slower than both brackets
+   (off / on / on / off), or an eager product's median is more than 5% slower at any `m`. A killed class keeps two
+   copies: the "cheaper middle".
+3. **Both classes killed:** close one copy, and go to "regions that yield".
+4. **Brackets that disagree:** report the result as not reproducible, and do not tune it.
+
+**Prediction.** Column runs within ±1%. One-column runs 3-10% slower at 7,992 tokens, an entry a tile.
+
 ## Work
 
 - [x] A0 on card 1 (2026-11-02, `1793645082`-`1793647203`): more requests at tile-sized entries buy nothing (Results).

@@ -372,3 +372,71 @@ fn a_padding_fill_in_place_reaches_the_regions() {
         s.set_streamed_k(true);
     });
 }
+
+/// Phase C0's probe (`tensor::probe_relaid_blocks`, the bound on one copy instead of two): once a
+/// decode capture has relaid a weight, products of more rows -- eager and captured -- read it from
+/// its regions, a gather of a block cut into reads of its runs, and give the products' bits. Every
+/// tile they read comes from a region (coverage), and the control (each weight's first region read
+/// one slot off, `probe_relaid_shift`) gives other bits.
+#[test]
+fn products_of_more_rows_read_a_relaid_weight_from_its_regions() {
+    use tt_kernels::tensor::{
+        probe_relaid_audit, probe_relaid_blocks, probe_relaid_blocks_counts, probe_relaid_shift,
+    };
+    with_session(|s| {
+        for (k, n, streamed) in [(8192, 64, true), (2048, 256, false)] {
+            for bf16 in [false, true] {
+                let what =
+                    format!("[64, {k}] @ [{k}, {n}], decode K streamed {streamed}, BF16 {bf16}");
+                s.set_streamed_k(streamed);
+                let row = s.upload(&floats(k as u64 + 1, k), 1, k).unwrap();
+                let a = s.upload(&floats(k as u64 + 3, 64 * k), 64, k).unwrap();
+                let b = weight(s, n as u64 + 5, k, n, bf16);
+                let want = eager(s, &a, &b, bf16);
+                // The decode capture that relays `B`.
+                tt_kernels::tensor::probe_relaid_audit_reset();
+                let (decode, decode_out) = traced(s, &row, &b, bf16, true);
+                assert!(s.relaid_bytes() > 0, "{what}: relaid");
+                probe_relaid_blocks(true);
+                assert_eq!(
+                    eager(s, &a, &b, bf16),
+                    want,
+                    "{what}: eager, from the regions"
+                );
+                let (id, out) = traced(s, &a, &b, bf16, false);
+                for r in 0..2 {
+                    assert_eq!(replayed(s, id, &out), want, "{what}: replay {r}");
+                }
+                let [split, records, regions, lies] = probe_relaid_blocks_counts();
+                let ([blocks, stream], widths) = probe_relaid_audit();
+                println!(
+                    "{what}: {split} gathers became {records}; {regions} bytes from regions, {lies} as they lie; \
+                     coverage {blocks:?} / {stream:?}, widths {widths:?}"
+                );
+                assert!(
+                    split > 0 && regions > 0,
+                    "{what}: the products read the regions"
+                );
+                assert_eq!(lies, 0, "{what}: every tile from a region");
+                let c = if streamed { stream } else { blocks };
+                assert_eq!((c[2], c[3]), (c[1], 0), "{what}: every tile in one region");
+                // The control: each weight's first region read one slot off.
+                probe_relaid_blocks(true);
+                probe_relaid_shift(true);
+                let shifted = eager(s, &a, &b, bf16);
+                probe_relaid_shift(false);
+                probe_relaid_blocks(false);
+                assert_ne!(
+                    shifted, want,
+                    "{what}: a region read one slot off is caught"
+                );
+                s.release_trace(id).unwrap();
+                s.release_trace(decode).unwrap();
+                for t in [row, a, b, out, decode_out] {
+                    s.free(t).unwrap();
+                }
+            }
+        }
+        s.set_streamed_k(true);
+    });
+}
