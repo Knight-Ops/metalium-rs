@@ -114,6 +114,40 @@ impl std::error::Error for TensorError {}
 
 pub type Result<T> = std::result::Result<T, TensorError>;
 
+/// How a tensor's tiles are dealt to its channels' regions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Layout {
+    /// Tile `t` (row-major) on channel `t % n` at slot `t / n`: every tensor's, by default.
+    #[default]
+    Interleaved,
+    /// A weight laid by column (`docs/plans/decode-bytes-in-flight.md` Phase C1,
+    /// [`tt_isa::dm::record::REF_BY_COLUMN`]): column `c`'s tiles consecutive on channel `c % n`,
+    /// from slot `(c / n) * rows` there. A decode product reads each of its columns in large
+    /// pieces; a block reads it a tile at a time, as it reads an interleaved one. Only a
+    /// [`tt_isa::dm::record::GATHER`] reads it on the card; host paths address it by
+    /// [`Placement::slot`].
+    ByColumn,
+}
+
+impl Layout {
+    /// How a weight of `[rows, cols]` tiles over `n` channels is laid when `wanted`: by column
+    /// only where that takes no more slots a channel than interleaved. Every channel's region is
+    /// `cols.div_ceil(n)` columns, so a column count that is not a multiple of `n` leaves up to a
+    /// column a channel empty (a weight's bytes held once, plus that, which grows with the
+    /// model: the 135M's 18-column weights took 38 MB more); such a weight stays interleaved.
+    pub fn for_weight(wanted: Layout, [rows, cols]: [usize; 2], n: usize) -> Layout {
+        let fits = || {
+            let by_column = cols.div_ceil(n).checked_mul(rows)?;
+            let tiles = rows.checked_mul(cols)?;
+            Some(tiles > 0 && by_column <= tiles.div_ceil(n))
+        };
+        match wanted {
+            Layout::ByColumn if n > 0 && fits() == Some(true) => Layout::ByColumn,
+            _ => Layout::Interleaved,
+        }
+    }
+}
+
 /// Where one tensor's tiles are: a region of `slots` slots at `base[i]` on
 /// each of `channels[i]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +159,9 @@ pub struct Placement {
     tiles: usize,
     /// A view's first tile within the allocation it borrows from.
     first: usize,
+    /// Laid by column ([`Layout::ByColumn`]): the grid's `[rows, columns]` in tiles; `None`
+    /// interleaved.
+    by_column: Option<[usize; 2]>,
     /// Did this placement allocate its slots? A view ([`DramTensor::rows_view`])
     /// did not, and freeing it gives nothing back.
     owned: bool,
@@ -139,16 +176,41 @@ impl Placement {
         self.slots * self.slot_bytes
     }
 
+    /// How its tiles are dealt ([`Layout`]).
+    pub fn layout(&self) -> Layout {
+        match self.by_column {
+            Some(_) => Layout::ByColumn,
+            None => Layout::Interleaved,
+        }
+    }
+
     pub(crate) fn tensor_ref(&self, ct: usize) -> TensorRef {
+        let col_tiles = match self.by_column {
+            Some([rows, cols]) => {
+                assert_eq!(
+                    ct, cols,
+                    "a tensor laid by column is named with its own grid"
+                );
+                rows as u32
+            }
+            None => 0,
+        };
         let mut r = TensorRef {
             n: self.channels.len() as u8,
             first: self.first as u32,
             ct: ct as u32,
+            col_tiles,
             ..TensorRef::default()
         };
         for (i, (c, b)) in self.channels.iter().zip(&self.base).enumerate() {
             r.channels[i] = c.index();
             r.base[i] = *b as u32;
+        }
+        // The control: the card reads by the reference's layout, so a rotated one misreads.
+        if col_tiles != 0 && PROBE_COLUMN_SHIFT.load(std::sync::atomic::Ordering::Relaxed) {
+            let n = self.channels.len();
+            r.channels[..n].rotate_left(1);
+            r.base[..n].rotate_left(1);
         }
         r
     }
@@ -170,7 +232,13 @@ impl Placement {
         assert!(t < self.tiles, "tile {t} of {}", self.tiles);
         let t = t + self.first;
         let n = self.channels.len();
-        let (c, i) = (t % n, (t / n) as u64);
+        let (c, i) = match self.by_column {
+            Some([rows, cols]) => {
+                let (r, col) = (t / cols, t % cols);
+                (col % n, ((col / n) * rows + r) as u64)
+            }
+            None => (t % n, (t / n) as u64),
+        };
         self.channels[c]
             .range(self.base[c] + i * self.slot_bytes, self.slot_bytes)
             .expect("the allocator placed every slot inside its channel")
@@ -443,9 +511,42 @@ impl DramAlloc {
             slot_bytes: TILE_SLOT,
             tiles: 1,
             first: 0,
+            by_column: None,
             owned: true,
             serial: self.serial - 1,
         })
+    }
+
+    /// Room for a `[rows, cols]`-tile grid in slots of `slot_bytes`, laid as `layout` says. By
+    /// column, each channel holds whole columns (`cols.div_ceil(n) * rows` slots): the same
+    /// regions as interleaved but for at most one column a channel's rounding.
+    pub(crate) fn alloc_laid(
+        &mut self,
+        [rows, cols]: [usize; 2],
+        slot_bytes: u64,
+        layout: Layout,
+    ) -> Result<Placement> {
+        let tiles = rows
+            .checked_mul(cols)
+            .ok_or_else(|| TensorError::Shape("tile count overflow".into()))?;
+        match layout {
+            Layout::Interleaved => self.alloc_slots(tiles, slot_bytes),
+            Layout::ByColumn => {
+                if tiles == 0 {
+                    return Err(TensorError::Shape("an empty grid laid by column".into()));
+                }
+                let n = self.channels.len();
+                let mut p = self.alloc_slots(cols.div_ceil(n) * n * rows, slot_bytes)?;
+                debug_assert_eq!(p.slots, (cols.div_ceil(n) * rows) as u64);
+                (p.tiles, p.by_column) = (tiles, Some([rows, cols]));
+                if let Some(log) = &mut self.log {
+                    if let Some(last) = log.last_mut().filter(|l| l.serial == p.serial) {
+                        *last = p.clone();
+                    }
+                }
+                Ok(p)
+            }
+        }
     }
 
     /// Room for `tiles` tile slots, interleaved.
@@ -515,6 +616,7 @@ impl DramAlloc {
             slot_bytes,
             tiles,
             first: 0,
+            by_column: None,
             owned: true,
             serial: self.serial - 1,
         };
@@ -909,6 +1011,19 @@ impl DramTensor {
     ) -> Result<()> {
         let t = self;
         let img = matmul::TILE_IMAGE_BYTES;
+        // Laid by column: each tile to its own slot (a weight's, written once).
+        if t.placement.by_column.is_some() {
+            for (tile, image) in images.chunks_exact(img).enumerate() {
+                let s = t.placement.slot(tile);
+                let r = s
+                    .channel()
+                    .range(s.offset(), img as u64)
+                    .expect("inside its slot");
+                dev.dram_write(w, r, image)?;
+            }
+            t.set_pad(Pad::Zero);
+            return Ok(());
+        }
         let per = t.placement.channels.len();
         let mut regions = vec![vec![0u8; (t.placement.slots * TILE_SLOT) as usize]; per];
         for (tile, image) in images.chunks_exact(img).enumerate() {
@@ -1001,7 +1116,10 @@ impl DramTensor {
         // A small tensor, or a view: tile by tile, and of each tile only the
         // faces and face rows its data reaches -- a `[1, n]` row is 64 bytes
         // from each of two faces, not 4 KiB per tile.
-        if self.placement.first != 0 || self.placement.tiles < 2 * self.placement.channels.len() {
+        if self.placement.first != 0
+            || self.placement.tiles < 2 * self.placement.channels.len()
+            || self.placement.by_column.is_some()
+        {
             let [rt, ct] = self.grid();
             let mut packed = vec![0u8; self.placement.tiles * 4096];
             for i in 0..rt {
@@ -1960,6 +2078,18 @@ pub(crate) fn probing_relaid_blocks() -> bool {
         || *FROM_ENV.get_or_init(|| std::env::var("TT_PROBE_RELAID_BLOCKS").is_ok_and(|v| v == "1"))
 }
 
+/// Phase C1's negative control (`step268_column_weights`): a weight laid by column named with its
+/// channels rotated by one, so each column is read from the next column's channel. Host paths
+/// (writes, downloads) still address it by [`Placement::slot`].
+static PROBE_COLUMN_SHIFT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_COLUMN_SHIFT`] on or off (a gate's control, never a result).
+#[doc(hidden)]
+pub fn probe_column_shift(on: bool) {
+    PROBE_COLUMN_SHIFT.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// [`PROBE_RELAID_BLOCKS`]'s negative control: each weight's first region read one slot off.
 static PROBE_RELAID_SHIFT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2301,6 +2431,7 @@ mod relaid_split_tests {
             base: [base; 8],
             first,
             ct,
+            col_tiles: 0,
         }
     }
 
@@ -9108,5 +9239,103 @@ mod contiguous_b {
             contiguous_b_bytes(&header(stream | 2)).is_err(),
             "a transposed `B`"
         );
+    }
+}
+
+#[cfg(test)]
+mod by_column_tests {
+    use super::*;
+    use tt_isa::dram::Dram;
+
+    /// Phase C1's placement (`docs/plans/decode-bytes-in-flight.md`): a grid laid by column puts
+    /// tile `(r, c)` on channel `c % n` at slot `(c / n) * rows + r` of the region there (the
+    /// layout's definition, the oracle here), every tile in a slot of its own inside the regions,
+    /// which are each `cols.div_ceil(n) * rows` slots: the bytes of the interleaved grid but for
+    /// at most one column a channel. A row view names the same slots; its reference carries the
+    /// layout; a grid laid by column is refused a reference under another width.
+    /// A weight is laid by column only where that takes no more slots a channel than
+    /// interleaved: the 1.7B's and Qwen3.5-4B's weights (columns a multiple of 8), not the 135M's
+    /// 18 columns, nor any column count on a 7-channel chip that leaves a channel's region short.
+    #[test]
+    fn a_weight_is_laid_by_column_only_where_it_takes_no_more_gddr() {
+        let (by, flat) = (Layout::ByColumn, Layout::Interleaved);
+        for (grid, n, want) in [
+            ([64, 192], 8, by),  // the 1.7B's `qkv`
+            ([256, 64], 8, by),  // its `down`
+            ([80, 288], 8, by),  // Qwen3.5-4B's
+            ([18, 18], 8, flat), // the 135M's `q`: 3 columns a channel, 2 on six of them
+            ([18, 48], 8, by),   // its `gate`
+            ([64, 64], 7, flat), // 10 columns a channel against 586 slots
+            ([64, 70], 7, by),   // whole columns on every channel
+            ([1, 5], 8, by),     // one row: as many slots as interleaved
+            ([0, 8], 8, flat),   // nothing to hold (`alloc_laid` refuses it by column)
+            ([4, 8], 0, flat),   // no channels
+            ([usize::MAX, 9], 8, flat),
+        ] {
+            assert_eq!(Layout::for_weight(by, grid, n), want, "{grid:?} over {n}");
+            assert_eq!(
+                Layout::for_weight(flat, grid, n),
+                flat,
+                "{grid:?} over {n}, not asked"
+            );
+            if want == by && n > 0 {
+                let [rows, cols] = grid;
+                assert!(cols.div_ceil(n) * rows <= (rows * cols).div_ceil(n));
+            }
+        }
+    }
+
+    #[test]
+    fn a_grid_laid_by_column_holds_each_tile_once_where_the_layout_puts_it() {
+        for mask in [0xFFu8, 0b1011_0110] {
+            let dram = Dram::from_usable_mask(mask);
+            let mut a = DramAlloc::new(&dram);
+            let n = a.channel_count();
+            for (rows, cols, slot) in [
+                (64usize, 64usize, 2112u64),
+                (7, 13, TILE_SLOT),
+                (3, 1, 1088),
+            ] {
+                let what = format!("mask {mask:#x}, [{rows}, {cols}] tiles, slot {slot}");
+                let p = a.alloc_laid([rows, cols], slot, Layout::ByColumn).unwrap();
+                let flat = a
+                    .alloc_laid([rows, cols], slot, Layout::Interleaved)
+                    .unwrap();
+                assert_eq!(p.layout(), Layout::ByColumn);
+                assert_eq!(p.tiles(), rows * cols, "{what}");
+                assert_eq!(p.slots, (cols.div_ceil(n) * rows) as u64, "{what}");
+                assert!(
+                    p.slots - flat.slots <= rows as u64,
+                    "{what}: at most a column a channel more than interleaved"
+                );
+                let mut seen = std::collections::HashSet::new();
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let s = p.slot(r * cols + c);
+                        let k = c % n;
+                        let want = p.base[k] + ((c / n) * rows + r) as u64 * slot;
+                        assert_eq!(s.channel(), p.channels[k], "{what}: ({r}, {c}) channel");
+                        assert_eq!(s.offset(), want, "{what}: ({r}, {c}) offset");
+                        assert!(want + slot <= p.base[k] + p.slots * slot, "{what}: inside");
+                        assert!(seen.insert((k, want)), "{what}: ({r}, {c}) shares a slot");
+                    }
+                }
+                let x = p.tensor_ref(cols);
+                assert_eq!(x.col_tiles, rows as u32, "{what}");
+                assert_eq!(TensorRef::decode(x.encode()), Ok(x), "{what}");
+                // A view of rows from the second on: the same slots, its reference offset.
+                if rows > 1 {
+                    let v = p.borrowed_tiles(cols, (rows - 1) * cols);
+                    for t in 0..(rows - 1) * cols {
+                        assert_eq!(v.slot(t), p.slot(t + cols), "{what}: view tile {t}");
+                    }
+                    assert_eq!(v.tensor_ref(cols).first, cols as u32);
+                }
+                let wrong = std::panic::catch_unwind(|| p.tensor_ref(cols + 1));
+                assert!(wrong.is_err(), "{what}: another width misnames it");
+                a.free(&p);
+                a.free(&flat);
+            }
+        }
     }
 }

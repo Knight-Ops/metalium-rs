@@ -1499,6 +1499,10 @@ pub mod error {
     /// (or, with `encoded-guard`, its guard, [`super::encoded::guard`]): not what the
     /// host's encoder makes, or damaged on the way.
     pub const ENCODED: u32 = 12;
+    /// A tensor reference in a layout its record does not read: a weight laid by column
+    /// ([`super::record::REF_BY_COLUMN`]) anywhere but a [`super::record::GATHER`], or a reader's
+    /// L1 order by column ([`super::record::REF_L1_BY_COLUMN`]) on what cannot take it.
+    pub const LAYOUT: u32 = 13;
 }
 
 /// A descriptor, as both sides see it.

@@ -958,6 +958,24 @@ matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-
 
 ## RISCV B's image budget (2026-10-13, ttsim and card 0)
 
+**Update 2026-11-04: B's slot is 44,928 bytes; the role slots are 9,600 (`0x2580`).** Weights laid by column
+(`docs/plans/decode-bytes-in-flight.md` Phase C1) add 3.6 KB to every B image, and with them the `profile` image
+built with `fast-reads` (and `encoded-guard`) no longer fit 43,008 bytes. The role images are at most 8,884 bytes (a
+`profile` one; 7,704 otherwise), so each slot gave up 640 bytes: T0 `0xAF80`, T1 `0xD500`, T2 `0xFA80`, still ending at
+NC's reset PC. Room left: B 4,584 (safe), 2,420 (`encoded-guard`), 220 (`profile` + `fast-reads` + `encoded-guard`);
+the role images 716 (`profile`). The opt-in `ttinsn-experiment` image (`ttinsn_t1`) did not fit its slot before this
+either (about 4 KB over at `1ff07dc`).
+
+**Where B's code sits matters, not only its size** (C1, 2026-11-04). B's and NC's instruction caches are ~4 KiB; the
+per-tile loops are in `run_record`, which `sections.x` places after `.text.hot`. The first C1 build put a by-column
+test in `TensorRef::tile` / `Cursor`, and a later one by-column code inside the `GATHER` arm, between its loops: both
+made every model 1.5-3% slower with no tensor laid by column (ViT-Tiny 7.50-7.72 -> 7.80-7.89 ms), with the compute
+cores' push cycles a word up 8-12% while their own images were unchanged (`TT_PROFILE`, `1793799184` against
+`1793799228`). The form that held: the arm is the baseline's code byte for byte, and a by-column record leaves it once,
+at its top, for one cold function (`record::gather_by_column`); `run_record` then starts at the baseline's address
+(`0x2794`) and is 112 bytes larger. A `bool` in `BSpan` (its `Option`'s niche) also made every copy of a span byte by
+byte (81 more `lbu` in `run_record`); a `u32` does not.
+
 **Update 2026-10-13: B's slot is 42 KiB, not 24 KiB.** The role images moved (below); the measurements and
 lessons that follow were taken against the old 24,576-byte slot and still describe how code size moves.
 

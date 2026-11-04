@@ -2810,6 +2810,7 @@ mod tests {
             base: [0x10_0000; 8],
             first: 0,
             ct,
+            col_tiles: 0,
         };
         let [a0, a1] = record::TensorRef::default().encode();
         let [b0, b1] = b.encode();

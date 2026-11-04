@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Weights laid by column, one copy: a 1.7B decode step 11.00 -> 10.06 ms, the default](#weights-laid-by-column-one-copy-a-17b-decode-step-1100---1006-ms-the-default-2026-11-04-cards-0-and-1) | 2026-11-04 | roadmap 2b Phase C1: each stored weight's column contiguous in one channel, the same bytes; decode reads 16 KiB pieces, blocks a tile at a time; 1.7B decode 10.06 / 11.21 ms (`1ff07dc` 11.00 / 12.18), Qwen3.5-4B -2.1%, prefill and eager blocks unchanged, GDDR unchanged; the off path's per-tile code kept byte for byte (code placement cost 1.5-3%) |
 | [X9's weight layout back to opt-in: a default must hold the weights once](#x9s-weight-layout-back-to-opt-in-a-default-must-hold-the-weights-once-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b, owner's call: `TT_WEIGHT_LAYOUT=1` opts in, the default reads each weight as it lies (one copy, read-ahead cap 2); the second copy grows with the model and does not scale (the roadmap's new constraint); 1.7B decode 10.96 / 12.14 ms by default, 9.75 / 10.88 opted in (card 1), prefill unchanged; card 0 `step267`, `step12_mnist`, `step188` pass |
 | [One copy of a relaid weight, bounded: the kill fires](#one-copy-of-a-relaid-weight-bounded-the-kill-fires-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase C0 (`tensor::probe_relaid_blocks`, bit for bit): every other product over a relaid weight read from its regions; eager products 1.34-3.38x slower, prefill over one-column runs 4-13% slower, decode unchanged; the decode deal's 1-2-column runs make ~4x the list entries; 8.3% of column-run tiles held twice; one copy closed in this form |
 | [X9's weight layout, bit for bit: a 1.7B decode step 11.08 -> 9.90 ms](#x9s-weight-layout-bit-for-bit-a-17b-decode-step-1108---990-ms-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase B (opt-in, `TT_WEIGHT_LAYOUT=1`; briefly the default on 2026-11-03, ~3.4 GB more GDDR): each unit's share of a streamed weight copied into one channel in its read order, read in 16 KiB pieces (`record::BSpan`), reads ahead too at a cap of 1; bit for bit (`step267`, `step188`); decode 11.08 / 12.27 -> 9.90 / 10.94 ms at 32 / 256 tokens, prefill unchanged; large reads ahead at cap 2 slow the small ops (T8); host scans of ~11,500 regions cost ~0.6 ms a step until indexed by source |
@@ -407,6 +408,49 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Weights laid by column, one copy: a 1.7B decode step 11.00 -> 10.06 ms, the default (2026-11-04, cards 0 and 1)
+
+Roadmap 2b, Phase C1, "the scalable form"
+([plan](../plans/decode-bytes-in-flight.md#c1-final-the-rules-on-the-code-as-built-2026-11-04-card-1)).
+
+**The layout.** A stored weight's column `j` is contiguous in channel `j % 8` (`tensor::Layout::ByColumn`,
+`record::REF_BY_COLUMN`). It is the same bytes as interleaved and the default for stored weights (`TT_WEIGHT_COLUMNS=0`
+opts out).
+- **A one-row product** takes `B` into L1 by column (`REF_L1_BY_COLUMN`) and reads each column in 16 KiB pieces, the
+  columns' pieces in turn.
+- **Blocks** read it a tile at a time, one `GATHER` a block.
+- **Weights whose columns do not fill the channels stay interleaved** (`Layout::for_weight`): the 135M's 18-column
+  weights.
+
+**Conditions.** Card 1, release, safe image, every tile. Each run is a process of its own. The baseline is the
+committed `1ff07dc`, built in its own worktree.
+
+| | `1ff07dc` | layout off | **layout on (the default)** |
+|---|--:|--:|--:|
+| 1.7B decode, 32 / 128 / 256 tokens, ms (`1793807556`-`1793808695`) | 11.004 / 11.527 / 12.179; 10.947 / 11.476 / 12.151 | 11.054 / 11.605 / 12.247; 11.090 / 11.571 / 12.244 | **10.069 / 10.568 / 11.213; 10.056 / 10.549 / 11.207** |
+| 1.7B prefill, 32 / 128 / 256 tokens, tokens/s | 1,094 / 2,152 / 2,092; 1,075 / 2,118 / 2,056 | 1,071 / 2,109 / 2,052; 1,087 / 2,139 / 2,082 | 1,096 / 2,155 / 2,095; 1,100 / 2,161 / 2,098 |
+| 1.7B, 7,992-token prompt: prefill ms / decode step ms (`1793808930`-`1793811764`) | | 5,909.1 / 46.99; 5,908.8 / 47.08 | 5,897.3 / **45.85**; 5,898.2 / **45.94** |
+| Qwen3.5-4B decode, 32 / 256 tokens, ms (`1793812735`-`1793815192`) | | 64.22 / 64.58; 64.20 / 64.59 | **62.88 / 63.24; 62.89 / 63.24** |
+| SmolLM2-135M decode, 32 / 256 tokens, ms (`1793816020`-`1793816179`) | | 7.066 / 8.294; 7.060 / 8.254 | 7.032 / 8.250; 7.029 / 8.257 |
+| ResNet-18 forward, traced, ms (`1793807243`-`1793807427`) | 12.516; 12.553 | | 12.577; 12.576 |
+| ViT-Tiny forward, traced, ms (`1793807486`-`1793807528`) | 7.691; 7.663 | | 7.507; 7.704 |
+
+- **Eager products** (`silicon_bench_columns`, `1793807545`, bit for bit):
+  - one-row products are 2.9-6.1% faster;
+  - blocks at `m` = 64 / 256 / 512 are within -2.5% to +1.4%.
+- **GDDR:** each weight takes the interleaved bytes. The 1.7B's free GDDR is 26.760 GB with the layout on and
+  26.75 GB off.
+- **Builds** are 13-18% shorter, from shorter decode lists.
+- **Two findings.**
+  - **Lockstep units.** A span read column after column put lockstep units on the same channel. Reading the columns'
+    pieces in turn fixed it.
+  - **Code placement.** Any test in the movers' per-tile loops cost every model 1.5-3%, by placement against a ~4 KiB
+    instruction cache. So the `GATHER` arm is the baseline's code with one cold dispatch, and the role slots gave the
+    B image 1,920 bytes ([operating notes](silicon-operating-notes.md)).
+- **The opt-out is ~0.5% slower than the baseline**, from that dispatch.
+- **Correctness:** card 0 with the layout on passed the gate list, 71 of 71 (`1793801167`), and `--smoke`, 1,283 of
+  1,283 (`1793805483`).
 
 ## X9's weight layout back to opt-in: a default must hold the weights once (2026-11-03, cards 0 and 1)
 

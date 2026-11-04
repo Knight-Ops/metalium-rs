@@ -55,6 +55,9 @@ fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
         .unwrap();
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // X9 relays interleaved weights: these are stored before its captures turn it on, so
+        // not by column (the default for stored weights since Phase C1).
+        s.set_column_weights(false).unwrap();
         f(&mut s);
     }) {
         panic!("{e}");
@@ -73,6 +76,9 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
         .unwrap_or_else(|e| panic!("{e}"));
         s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // X9 relays interleaved weights: these are stored before its captures turn it on, so
+        // not by column (the default for stored weights since Phase C1).
+        s.set_column_weights(false).unwrap();
         f(&mut s);
     }) {
         panic!("{e}");

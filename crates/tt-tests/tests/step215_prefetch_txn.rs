@@ -65,6 +65,7 @@ fn b_ref() -> record::TensorRef {
         base: [DRAM_AT as u32; 8],
         first: 0,
         ct: COLS,
+        col_tiles: 0,
     }
 }
 

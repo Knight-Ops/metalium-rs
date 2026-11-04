@@ -1645,6 +1645,7 @@ mod tests {
             base: [0x10_0000, 0x20_0000, 0x30_0000, 0, 0, 0, 0, 0],
             first: 0,
             ct: 5,
+            col_tiles: 0,
         }
         .encode();
         for head in [record::SELECT_ROWS, record::SCATTER_ROWS] {

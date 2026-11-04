@@ -248,15 +248,18 @@ fn jobs(input: &Placement, output: &Placement, compress: bool) -> Result<Vec<Job
         .collect())
 }
 
+/// `input` narrowed to BF16 into a new tensor laid as `layout` says (each tile to its slot, so
+/// either layout is written alike).
 pub(crate) fn compress(
     alloc: &mut DramAlloc,
     input: &DramTensor,
+    layout: crate::tensor::Layout,
 ) -> Result<(Bf16Tensor, Vec<Job>)> {
     input.expect("BF16 conversion", Elem::F32)?;
     let output = Bf16Tensor {
         rows: input.rows,
         cols: input.cols,
-        placement: alloc.alloc_slots(input.placement.tiles(), TILE_SLOT)?,
+        placement: alloc.alloc_laid(input.grid(), TILE_SLOT, layout)?,
     };
     let jobs = jobs(&input.placement, &output.placement, true)?;
     Ok((output, jobs))

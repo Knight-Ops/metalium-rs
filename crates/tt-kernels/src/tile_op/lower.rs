@@ -615,7 +615,11 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
                     0
                 }
                 | formats;
-            let (are, bre) = (ar.encode(), br.encode());
+            let (are, mut bre) = (ar.encode(), br.encode());
+            // A one-row product takes a `B` laid by column into L1 by column (`Mma`'s pairs).
+            if row.is_some() && !tb && br.col_tiles != 0 {
+                bre[0][4] |= record::REF_L1_BY_COLUMN;
+            }
             let mut gather = tensor::probe_gather(
                 gather,
                 [

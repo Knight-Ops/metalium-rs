@@ -220,6 +220,7 @@ pub(crate) fn compress(
     alloc: &mut DramAlloc,
     input: &DramTensor,
     format: BfpFormat,
+    laid: crate::tensor::Layout,
 ) -> Result<(BfpTensor, Vec<Job>)> {
     input.expect("BFP conversion", Elem::F32)?;
     if input.pad() != Pad::Zero {
@@ -234,7 +235,7 @@ pub(crate) fn compress(
         rows: input.rows,
         cols: input.cols,
         format,
-        placement: alloc.alloc_slots(input.placement.tiles(), format.slot_bytes())?,
+        placement: alloc.alloc_laid(input.grid(), format.slot_bytes(), laid)?,
     };
     let jobs = (0..input.placement.tiles())
         .map(|t| {

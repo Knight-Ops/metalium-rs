@@ -66,13 +66,54 @@ pub fn take_reads_pumped(job: &mut Job, n: usize) -> Vec<[u32; 8]> {
 
 /// One gather list's contraction record and what follows it, split out of `entries`, which keeps
 /// what came before; `None` where it has none. With `prefetch`, the record reads ahead
-/// ([`take_reads`]).
+/// ([`take_reads`]), and `None` where it may not: a `B` laid by column but read a tile at a time
+/// (no `record::REF_L1_BY_COLUMN`), which the mover reads ahead only by column, stays in place.
 pub fn split(entries: &mut Vec<[u32; 8]>, prefetch: bool) -> Option<Vec<[u32; 8]>> {
     let at = entries.iter().position(|e| e[0] == record::GATHER)?;
+    let b = entries.get(at + 3).map_or(0, |e| e[4]);
+    if prefetch && b & record::REF_BY_COLUMN != 0 && b & record::REF_L1_BY_COLUMN == 0 {
+        return None;
+    }
     let mut reads = entries.split_off(at);
     debug_assert!(reads.len() >= GATHER_ENTRIES);
     if prefetch {
         reads[0][1] = reads[0][1] & !record::GATHER_STREAM | record::GATHER_PREFETCH;
     }
     Some(reads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A list: a packed operand's read, then a `GATHER` whose `B` reference's word 4 is `b_marks`.
+    fn list(b_marks: u32) -> Vec<[u32; 8]> {
+        let mut e = vec![[0u32; 8]; 1 + GATHER_ENTRIES];
+        e[0][0] = tt_isa::dm::op::READ;
+        e[1][0] = record::GATHER;
+        e[1][1] = record::GATHER_STREAM;
+        e[4][4] = b_marks;
+        e
+    }
+
+    /// A `B` laid by column is read ahead only by column; read a tile at a time, its gather stays
+    /// in its list (the mover refuses that read ahead, `record::gather_span`).
+    #[test]
+    fn a_weight_laid_by_column_is_read_ahead_only_by_column() {
+        let by_column = record::REF_BY_COLUMN;
+        let in_l1_by_column = by_column | record::REF_L1_BY_COLUMN;
+        for (marks, ahead) in [(0, true), (in_l1_by_column, true), (by_column, false)] {
+            let mut entries = list(marks);
+            let early = split(&mut entries, true);
+            assert_eq!(early.is_some(), ahead, "marks {marks:#x}");
+            if let Some(early) = early {
+                assert_eq!(entries.len(), 1, "the operand's read stays");
+                assert_eq!(early[0][1], record::GATHER_PREFETCH, "marks {marks:#x}");
+            } else {
+                assert_eq!(entries, list(marks), "left as it was");
+            }
+            // Split to run elsewhere in its turn (no read ahead), any layout moves.
+            assert!(split(&mut list(marks), false).is_some(), "marks {marks:#x}");
+        }
+    }
 }

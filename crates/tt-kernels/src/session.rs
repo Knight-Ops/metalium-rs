@@ -291,14 +291,16 @@ fn probing_stale_b() -> bool {
 /// layout's copies never cost a capture its own storage. 64 MiB a channel, 0.5 GB of a card's 32.
 pub const RELAID_HEADROOM: u64 = 64 << 20;
 
-/// A read ahead's cap under [`Session::set_weight_layout`]: one 16 KiB request in flight. A 1.7B
+/// A read ahead's cap under [`Session::set_weight_layout`] or [`Session::set_column_weights`]: one
+/// 16 KiB request in flight. A 1.7B
 /// decode step (card 1, `docs/plans/decode-bytes-in-flight.md` Phase B): 11.14 / 12.17 ms at the
 /// default cap of 2, 10.62 / 11.63 at 1, against 11.07 / 12.23 without the layout (`1793662331`,
 /// `1793662552`, `1793661878`).
 pub const WEIGHT_LAYOUT_PREFETCH_CAP: u32 = 1;
 
 /// The read-ahead cap a B mover is given at start: `TT_PREFETCH_CAP` where set (`dm::DataMover`
-/// reads it), else [`WEIGHT_LAYOUT_PREFETCH_CAP`] under the weight layout, else the mover's own.
+/// reads it), else [`WEIGHT_LAYOUT_PREFETCH_CAP`] where weights are read ahead in large pieces
+/// (the weight layout, or weights laid by column), else the mover's own.
 fn prefetch_cap(weight_layout: bool) -> Option<u32> {
     match std::env::var("TT_PREFETCH_CAP")
         .ok()
@@ -905,6 +907,9 @@ pub struct Session<T: Transport> {
     /// Whether a capture stores the weights its one-row products stream in X9's layout
     /// ([`Session::set_weight_layout`], `docs/plans/decode-bytes-in-flight.md` Phase B).
     weight_layout: bool,
+    /// Stored weights laid by column (`tensor::Layout::ByColumn`;
+    /// [`Session::set_column_weights`]).
+    column_weights: bool,
     /// Sources of relaid weights written in place since their regions were filled
     /// ([`DramState::relaid`]): filled again before they are read ([`Session::refresh_relaid`]).
     relaid_dirty: Vec<tensor::Placement>,
@@ -2932,6 +2937,10 @@ impl<T: Transport> Session<T> {
             // 1, bit for bit, but for a second copy of every streamed weight (~3.4 GB on the 1.7B), which
             // grows with the model and does not scale. `TT_WEIGHT_LAYOUT=1` turns it on.
             weight_layout: std::env::var("TT_WEIGHT_LAYOUT").is_ok_and(|v| v == "1"),
+            // On by default since 2026-11-04 (`docs/plans/decode-bytes-in-flight.md` Phase C1): a
+            // 1.7B decode step ~10% faster on card 1, bit for bit, with prefill, eager blocks and
+            // GDDR unchanged (the weight held once). `TT_WEIGHT_COLUMNS=0` turns it off.
+            column_weights: std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0"),
             relaid_dirty: Vec::new(),
             // On by default since 2026-10-29 (`docs/completed-plans/dataflow-compiler.md` F4a.2): a 1.7B step
             // 11.32 / 12.69 -> 10.95 / 12.16 ms at 32 / 256 tokens on card 1, bit for bit;
@@ -3572,7 +3581,16 @@ impl<T: Transport> Session<T> {
         &mut self,
         input: &DramTensor,
     ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
-        let (out, jobs) = crate::bf16::compress(&mut self.dram_state()?.alloc, input)?;
+        self.bf16_from_f32_laid(input, tensor::Layout::Interleaved)
+    }
+
+    /// [`Session::bf16_from_f32`] into a tensor laid as `layout` says.
+    fn bf16_from_f32_laid(
+        &mut self,
+        input: &DramTensor,
+        layout: tensor::Layout,
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        let (out, jobs) = crate::bf16::compress(&mut self.dram_state()?.alloc, input, layout)?;
         if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
             self.dram_state()?.alloc.free(&out.placement);
             return Err(error);
@@ -3597,7 +3615,8 @@ impl<T: Transport> Session<T> {
     pub fn store_bf16(&mut self, input: &DramTensor) -> Result<DramTensor, TensorError> {
         input.expect("BF16 storage", tensor::Elem::F32)?;
         let repaired = self.meet(input, tensor::PadNeed::Zero)?;
-        let stored = self.bf16_from_f32(repaired.as_ref().unwrap_or(input));
+        let layout = self.stored_layout(input.grid())?;
+        let stored = self.bf16_from_f32_laid(repaired.as_ref().unwrap_or(input), layout);
         if let Some(r) = repaired {
             self.free(r)?;
         }
@@ -3614,8 +3633,50 @@ impl<T: Transport> Session<T> {
         rows: usize,
         cols: usize,
     ) -> Result<DramTensor, TensorError> {
-        let t = self.upload_bf16(bits, rows, cols)?;
+        let layout = self.stored_layout([rows.div_ceil(32), cols.div_ceil(32)])?;
+        let t = self.upload_bf16_laid(bits, rows, cols, layout)?;
         Ok(DramTensor::from_bf16(t, tensor::Pad::Zero))
+    }
+
+    /// `input` stored as a BFP weight ([`tensor::Elem::Packed`]), laid as stored weights are
+    /// ([`Session::set_column_weights`]): [`Session::bfp_from_f32`]'s conversion.
+    pub fn store_bfp(
+        &mut self,
+        input: &DramTensor,
+        format: crate::bfp::BfpFormat,
+    ) -> Result<DramTensor, TensorError> {
+        let layout = self.stored_layout(input.grid())?;
+        let t = self.bfp_from_f32_laid(input, format, layout)?;
+        Ok(DramTensor::from_bfp(t))
+    }
+
+    /// Lay stored weights by column from now on (`tensor::Layout::ByColumn`;
+    /// `docs/plans/decode-bytes-in-flight.md` Phase C1): [`Session::store_bf16`],
+    /// [`Session::store_bfp`] and [`Session::upload_bf16_weight`] put each column's tiles
+    /// consecutive in one channel, the weight's only copy, so a one-row product reads each column
+    /// in large pieces and a block reads it a tile at a time as before. Weights stored before
+    /// keep their layout. On by default (`TT_WEIGHT_COLUMNS=0` at open turns it off); X9's
+    /// two-copy layout ([`Session::set_weight_layout`]), an explicit opt-in that relays only
+    /// interleaved weights, takes precedence while it is on.
+    ///
+    /// Its reads ahead come in 16 KiB pieces too, so the layout lowers a read ahead's cap to
+    /// [`WEIGHT_LAYOUT_PREFETCH_CAP`] as X9's does (`TT_PREFETCH_CAP` still rules).
+    pub fn set_column_weights(&mut self, on: bool) -> Result<(), TensorError> {
+        self.column_weights = on;
+        self.push_prefetch_cap()
+    }
+
+    /// How a weight of `grid` tiles stored now is laid ([`Session::set_column_weights`];
+    /// interleaved while X9's layout is on, [`Session::set_weight_layout`], whose relayout reads
+    /// interleaved weights, and wherever by column would take more GDDR,
+    /// [`tensor::Layout::for_weight`]).
+    pub fn stored_layout(&mut self, grid: [usize; 2]) -> Result<tensor::Layout, TensorError> {
+        let wanted = match self.column_weights && !self.weight_layout {
+            true => tensor::Layout::ByColumn,
+            false => tensor::Layout::Interleaved,
+        };
+        let n = self.dram_state()?.alloc.channel_count();
+        Ok(tensor::Layout::for_weight(wanted, grid, n))
     }
 
     /// A stored BF16 weight ([`Session::store_bf16`]) widened to a new FP32 tensor, for any op
@@ -3639,6 +3700,16 @@ impl<T: Transport> Session<T> {
         input: &DramTensor,
         format: crate::bfp::BfpFormat,
     ) -> Result<crate::bfp::BfpTensor, TensorError> {
+        self.bfp_from_f32_laid(input, format, tensor::Layout::Interleaved)
+    }
+
+    /// [`Session::bfp_from_f32`] into a tensor laid as `layout` says.
+    pub fn bfp_from_f32_laid(
+        &mut self,
+        input: &DramTensor,
+        format: crate::bfp::BfpFormat,
+        layout: tensor::Layout,
+    ) -> Result<crate::bfp::BfpTensor, TensorError> {
         input.expect("BFP conversion", tensor::Elem::F32)?;
         let repaired = self.meet(input, tensor::PadNeed::Zero)?;
         let result = (|| {
@@ -3646,6 +3717,7 @@ impl<T: Transport> Session<T> {
                 &mut self.dram_state()?.alloc,
                 repaired.as_ref().unwrap_or(input),
                 format,
+                layout,
             )?;
             if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
                 self.dram_state()?.alloc.free(&out.placement);
@@ -3770,6 +3842,17 @@ impl<T: Transport> Session<T> {
         rows: usize,
         cols: usize,
     ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        self.upload_bf16_laid(values, rows, cols, tensor::Layout::Interleaved)
+    }
+
+    /// [`Session::upload_bf16`] into a tensor laid as `layout` says.
+    fn upload_bf16_laid(
+        &mut self,
+        values: &[u16],
+        rows: usize,
+        cols: usize,
+        layout: tensor::Layout,
+    ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
         if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(values.len()) {
             return Err(TensorError::Shape("invalid BF16 upload shape".into()));
         }
@@ -3781,10 +3864,11 @@ impl<T: Transport> Session<T> {
         let output = crate::bf16::Bf16Tensor {
             rows,
             cols,
-            placement: self
-                .dram_state()?
-                .alloc
-                .alloc_slots(tiles, crate::bf16::TILE_SLOT)?,
+            placement: self.dram_state()?.alloc.alloc_laid(
+                [rows.div_ceil(32), cols.div_ceil(32)],
+                crate::bf16::TILE_SLOT,
+                layout,
+            )?,
         };
         let result = (|| {
             let d = self.dram.as_ref().expect("enabled above");
@@ -4061,7 +4145,9 @@ impl<T: Transport> Session<T> {
         values: Src<'_>,
         tiles: usize,
     ) -> Result<Option<()>, TensorError> {
-        if self.staging().is_none() {
+        // The DMA's records read interleaved tensors only; a weight laid by column goes tile by
+        // tile through its slots.
+        if self.staging().is_none() || t.placement.layout() == tensor::Layout::ByColumn {
             return Ok(None);
         }
         let stride = tensor::row_major_stride(t.cols);
@@ -4500,7 +4586,10 @@ impl<T: Transport> Session<T> {
     /// to host memory. `None` if there is no host memory (or a capture is on).
     /// The caller has synced.
     fn dma_download(&mut self, t: &DramTensor) -> Result<Option<Vec<f32>>, TensorError> {
-        if self.capture.is_some() || self.staging().is_none() {
+        if self.capture.is_some()
+            || self.staging().is_none()
+            || t.placement.layout() == tensor::Layout::ByColumn
+        {
             return Ok(None);
         }
         let [rt, ct] = t.grid();
@@ -4974,6 +5063,7 @@ impl<T: Transport> Session<T> {
             l1_writes,
             mover_arena,
             weight_layout,
+            column_weights,
             ..
         } = self;
         let idle = units.iter().all(|u| u.queued.is_empty());
@@ -5020,7 +5110,7 @@ impl<T: Transport> Session<T> {
             if let Some(b) = unit.mover.as_mut() {
                 b.set_l1_writes(l1_writes.clone())?;
                 b.set_arena(*mover_arena)?;
-                if let Some(cap) = prefetch_cap(*weight_layout) {
+                if let Some(cap) = prefetch_cap(*weight_layout || *column_weights) {
                     b.set_prefetch_cap(dev, r.window(), cap)?;
                 }
             }
@@ -10379,7 +10469,13 @@ impl<T: Transport> Session<T> {
     /// 16 KiB, not a tile, and at two in flight the ops it runs under read GDDR behind it.
     pub fn set_weight_layout(&mut self, on: bool) -> Result<(), TensorError> {
         self.weight_layout = on;
-        let cap = prefetch_cap(on).unwrap_or(tt_isa::dm::PREFETCH_CAP_DEFAULT);
+        self.push_prefetch_cap()
+    }
+
+    /// Give every B mover the read-ahead cap [`prefetch_cap`] says for the layouts in use.
+    fn push_prefetch_cap(&mut self) -> Result<(), TensorError> {
+        let large = self.weight_layout || self.column_weights;
+        let cap = prefetch_cap(large).unwrap_or(tt_isa::dm::PREFETCH_CAP_DEFAULT);
         let Session { dev, units, .. } = self;
         for unit in units.iter() {
             if let (Some(b), Some(r)) = (unit.mover.as_ref(), unit.resident.as_ref()) {
@@ -10416,6 +10512,11 @@ impl<T: Transport> Session<T> {
     ) -> Result<(), TensorError> {
         use tt_isa::dm::record;
         self.refresh_relaid()?;
+        // A weight laid by column is already read in large pieces, by column; a region would
+        // hold its tiles by row, against the column order its records' pairs name.
+        if b.placement.layout() == tensor::Layout::ByColumn {
+            return Ok(());
+        }
         let planned = self.capture.as_ref().is_some_and(|c| c.planned);
         let want = b.tensor_ref().encode();
         // The same tensor, at any first tile (a record's `first` names its chunk).
@@ -10477,7 +10578,7 @@ impl<T: Transport> Session<T> {
                                     eprintln!(
                                         "session: GDDR is too full for the weight layout's \
                                          copies; the weights left over are read as they lie \
-                                         (TT_WEIGHT_LAYOUT=0 turns the layout off)"
+                                         (TT_WEIGHT_LAYOUT unset leaves the layout off)"
                                     );
                                 }
                                 i += len;

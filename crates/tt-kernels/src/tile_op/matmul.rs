@@ -137,6 +137,7 @@ pub fn matmul(
             fidelity,
             unpack_b: unpack_b && b.transposed,
             packed: packed.is_some(),
+            b_by_column: packed.is_some() && !b.transposed && b.at.col_tiles != 0,
             kt: k.div_ceil(32),
             schedule,
         }),
@@ -154,6 +155,11 @@ struct Mma {
     unpack_b: bool,
     /// `A` read from its packed row (`matmul::packed_a_pairs`).
     packed: bool,
+    /// A one-row product's `B` laid by column (`tensor::Layout::ByColumn`), taken into L1 by
+    /// column: tile `(kk, j)` at `b_at + (j * kt + kk) * slot`, each column one run read in large
+    /// pieces (`tt_isa::dm::record::REF_L1_BY_COLUMN`, which the gathers carry where this does).
+    /// The pairs name the same tiles in the same order, so the sum is the same.
+    b_by_column: bool,
     kt: usize,
     schedule: Schedule,
 }
@@ -318,18 +324,28 @@ impl Microkernel for Mma {
                 let matmul::Layout {
                     a_at,
                     b_at,
-                    outputs,
+                    mut outputs,
                     sems,
                     init,
                 } = matmul::slots_layout(tiles, slots, l1);
+                if self.b_by_column {
+                    let [_, kt, nt] = tiles;
+                    for (o, out) in outputs.iter_mut().enumerate() {
+                        let j = o % nt;
+                        for (kk, pair) in out.pairs.iter_mut().enumerate() {
+                            pair.1 = b_at + (j * kt + kk) as u64 * slots.b;
+                        }
+                    }
+                }
                 let outputs = match self.packed {
                     true => matmul::packed_a_pairs(&outputs, a_at, 0),
                     false => outputs,
                 };
                 // The cache tells the stagings and halves apart: their programs name different
                 // addresses.
-                let variant =
-                    half.map_or(0, |h| 1 + u32::from(h)) | if self.packed { 0x40 } else { 0 };
+                let variant = half.map_or(0, |h| 1 + u32::from(h))
+                    | if self.packed { 0x40 } else { 0 }
+                    | if self.b_by_column { 0x100 } else { 0 };
                 let (roles, mop) = matmul::kernel_programs(
                     tiles,
                     variant,

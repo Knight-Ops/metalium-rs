@@ -459,6 +459,372 @@ every tile exactly once.
   prefetch units' shares and the thin runs of different captures overlap. That is ~0.2 GB of the 1.7B's ~3.4 GB
   second copy. A one-copy design would first need one deal a weight.
 
+## Phase C1: by-column weights, the scalable form (opened 2026-11-04)
+
+**The form.** A stored weight `[K, N]` (`Kt x Nt` tiles) is laid **by column**: column `j`'s `Kt` tiles are contiguous
+in channel `channels[j % n]`, at `base[c] + ((j / n) * Kt + kk) * slot`. The tile contents and the bytes are those of
+today's interleaved weight. It is held once and made at load time.
+- **Why not C0's prescription.**
+  - *One deal a weight:* the decode deal depends on the capture. The prefetch units, the spread and `thin_runs`'
+    remainders differ between captures, which is what put 8.3% of the column-run tiles in two regions. Fixing a deal
+    would change decode's schedule and its evenness.
+  - *A pitched read a region:* each 1-2-column run would still be its own `GATHER`, so a block would cost several.
+- **What the form gives.**
+  - **Decode.** Any deal's column run is a union of whole columns, and each column is one run in one channel (128 KiB
+    at `K` = 2048 in BF16). Decode reads it in 16 KiB pieces, reads ahead included. A K-whole decode job places `B` in
+    L1 by column, `(j * kt + kk)`: the kernel takes per-pair addresses (`matmul::slots_layout`), so this needs no new
+    microkernel. Streamed `down` jobs are one column already.
+  - **Blocks** (prefill, eager, measured-block captures) keep one `GATHER` a block and read a tile at a time, as today:
+    the same entries and the same channel spread along a block row. Only the order within a channel differs.
+  - **Nothing else to maintain.** No relayout, regions, headroom, staleness or partition.
+- **Encoding.** Two bits in word 4 of the `B` reference's first entry, which `TensorRef::encode` leaves 0:
+  - `REF_BY_COLUMN`, the placement;
+  - `REF_L1_BY_COLUMN`, this reader's L1 order.
+
+  Every record but `GATHER` refuses a by-column reference by name. Records expand alike on the host and the card and
+  are never encoded, so the read modes are untouched.
+- **Results.** Bit for bit, since each output's `kk` pairs stay in ascending order.
+- **The two-copy form stays opt-in** (`TT_WEIGHT_LAYOUT=1`, `step267`).
+
+**Decision rules (fixed 2026-11-04, before any measurement).**
+
+*Conditions:* card 1, release, safe image, every tile (`TT_TILES=all`), and the 1.7B with BF16 weights and a
+512-position cache. Each comparison is bracketed off / on / on / off.
+
+0. **Void** if the audit fails. Every tile of a by-column weight must be held exactly once, and the GDDR it takes must
+   be within one column a channel of the interleaved bytes.
+1. **Blocks are killed** if either of these holds:
+   - an eager product over a by-column weight is more than 5% slower (median) at any `m` = 64 / 256 / 512;
+   - prefill at 128, 256 or 7,992 tokens is more than 2% below both brackets.
+2. **Decode is killed** if the step at 32 / 256 tokens does not gain at least half of Phase B's 1.1 / 1.3 ms, that is,
+   if it is slower than ~10.45 / 11.55 ms against ~11.0 / 12.2.
+3. **The outcome.**
+   - Neither killed: the default for stored weights.
+   - Blocks killed only: opt-in, its prefill cost named.
+   - Decode killed: close the form, and go to item 5's copy-free levers.
+4. **Brackets that disagree:** the result is reported as not reproducible, and nothing is tuned.
+
+**Prediction.** Eager products and prefill within ±2%, and decode at or below Phase B's 9.9 / 10.9 ms.
+
+**Order.**
+1. The encoding, with host tests against a read-a-tile oracle.
+2. The firmware.
+3. A ttsim gate (`step268_column_weights`) with a negative control (the column-to-channel map rotated), then that gate
+   alone on card 0.
+4. The eager bound (`silicon_bench_columns`, card 1; rule 1's cheap half, and the decode-shaped `m = 1` product).
+5. The load-time path (`TT_WEIGHT_COLUMNS=1`).
+6. The model bound.
+
+### C1 as built (2026-11-04)
+
+- **The encoding** (`tt_isa::dm::record`).
+  - `TensorRef::col_tiles`, written as `REF_BY_COLUMN` in word 4 with the length in word 5.
+    - A `GATHER`'s by-column `A` or `B` read a tile at a time is dispatched once a record to one out-of-line walk,
+      `record::walk_by_column` (untransposed or transposed; a walk past a row's last column goes on at the next row, as
+      the tile numbers do, and a row past the column's length is refused). `TensorRef::tile`, `Cursor` and the
+      read-ahead cursor stay the interleaved code, byte for byte (first built with a by-column branch in them; that
+      cost every model 2-3%, below).
+  - `REF_L1_BY_COLUMN` on a `GATHER`'s `B`: `BSpan::of_columns`, one run a column on its own channel, in 16 KiB pieces
+    taken from the columns in turn. `PrefetchCursor` gives the same reads.
+  - Refusals, with a new code, `error::LAYOUT`:
+    - a by-column reference in any record but a `GATHER`;
+    - the L1 order by column over an interleaved, transposed or resident `B`, or on `A`;
+    - `REF_LAID_FOR_READER` beside a by-column layout;
+    - a read ahead of a by-column `B` read a tile at a time (the host never asks for one: `tile_op::ahead::split`).
+  - All of these are checked before anything is read.
+- **The firmware** needs no change of its own: the B mover runs the shared `expand_reads` and `PrefetchCursor`. Clippy
+  is clean in every feature set; the B image's room is below.
+- **The host** (`tt_kernels::tensor`).
+  - `Layout::{Interleaved, ByColumn}` and `DramAlloc::alloc_laid`. A by-column grid takes the interleaved grid's
+    regions, `cols.div_ceil(n) * rows` slots a channel.
+  - `Placement::slot` and `tensor_ref` follow the layout. Every host path that addresses through `slot()` follows too:
+    BF16 and BFP compression, widening and downloads, BF16 uploads, and `write_images` / `download_any`, tile by tile.
+  - The DMA's records take interleaved tensors only, so a by-column tensor goes through its slots.
+  - A one-row product over a by-column `B` sets `REF_L1_BY_COLUMN` (`tile_op::lower`). Its `Blocks` pairs name `B` at
+    `(j * kt + kk)`, with a program variant of their own (`0x100`), so the sum is in the same order.
+  - The two-copy relayout skips a by-column weight.
+- **Load time.** `Session::set_column_weights` (`TT_WEIGHT_COLUMNS`, on by default since the verdict; `=0` off) lays
+  what `store_bf16`, `store_bfp` (now burn-tt's BFP storage cast) and `upload_bf16_weight` store. X9's two-copy form
+  (`TT_WEIGHT_LAYOUT=1`) takes precedence: with it on, weights are stored interleaved for it to relay. F32 weights
+  (no storage cast) stay interleaved, a follow-up.
+- **Gates.**
+  - **Host.** Four `tt-isa` tests against the layout's definition:
+    - the reference and its walk;
+    - a block a tile at a time;
+    - the decode read in pieces, for FP32, BF16 and BFP8, a stream's chunk and a view's columns;
+    - the refusals, each other record against its interleaved twin.
+
+    Four mutations were each caught: the channel, the column step, the span's channel, and the span's row offset.
+    A `tt-kernels` placement test checks every tile in a slot of its own, on a full and a harvested grid.
+  - **`step268_column_weights`** (ttsim in the safe, `fast-reads` and `fast-reads` + `encoded-guard` images; card 0
+    `1793760854`, every tile):
+    - one-row products (`down`'s and `gate|up`'s schedules), eager and three replays, and blocks at `m` = 64 / 40,
+      each bit for bit against the interleaved weight, for BF16 and BFP8;
+    - the stored bits and the widened tensor equal;
+    - the control: names rotated a channel give other bits.
+
+    A mutation that keeps the gather's order but drops the pairs' fails the one-row test.
+  - `step172` and `step173` pass in every read mode. `step267` (the two-copy form) is unchanged.
+  - **Card 0 with `TT_WEIGHT_COLUMNS=1`** (`1793760979`): `step188`'s traced generation against the eager one,
+    `step234`, `step240` and `step187`, 18 of 18, bit for bit.
+
+### C1 results (2026-11-04, card 1)
+
+**Eager products** (`silicon_bench_columns`, `1793760911` and `1793760944`; medians of 7 host-timed products, ABBA in
+one process, each product bit for bit against the first interleaved one).
+
+| weight | `m` = 1 | `m` = 64 | `m` = 256 | `m` = 512 |
+|---|--:|--:|--:|--:|
+| `qkv` `[2048, 6144]` | 1,320 → 1,208 (-8.5%); 1,309 → 1,217 (-7.1%) | -0.0% / +0.1% | +0.5% / +0.5% | -0.3% / -0.6% |
+| `o` `[2048, 2048]` | 829 → 777 (-6.3%); 811 → 775 (-4.4%) | -0.8% / -0.1% | +0.3% / +0.6% | +0.5% / +0.4% |
+| `gate\|up` `[2048, 16384]` | 2,400 → 2,197 (-8.5%); 2,338 → 2,191 (-6.3%) | -0.3% / -0.3% | +0.3% / +0.6% | +1.9% / -0.3% |
+| `down` `[8192, 2048]` | 2,946 → 2,700 (-8.3%); 2,893 → 2,705 (-6.5%) | +0.1% / -0.0% | +0.1% / -0.0% | -0.3% / -0.3% |
+
+- **Rule 1, eager: not killed.** The block products are within -0.8% to +1.9% of interleaved, against 5%.
+- **GDDR:** each weight takes exactly the interleaved bytes (3,244,032 / 1,081,344 / 8,650,752 / 4,325,376). Every
+  `Nt` is a multiple of 8, so there is no rounding.
+- **The one-row products**, eager, are 4-8.5% faster, from their columns read in pieces.
+
+**The model, first build: decode killed, and the meter found why.**
+
+Conditions: `traced_generation_stream_ceiling` with `TT_TILES=all`, prompts of 32 / 128 / 256 tokens, and the 1.7B with
+BF16 weights.
+
+| run | decode step at 32 / 128 / 256 tokens, ms | prefill, tokens/s |
+|---|--:|--:|
+| off (`1793761260`) | 11.261 / 11.747 / 12.420 | 1,065 / 2,092 / 2,033 |
+| by column, read-ahead cap 2 (`1793761504`) | 11.784 / 12.341 / 12.967 | 1,054 / 2,072 / 2,018 |
+| by column, read-ahead cap 2 (`1793761723`) | 11.768 / 12.345 / 12.977 | 1,060 / 2,081 / 2,026 |
+| off (`1793761943`) | 11.213 / 11.743 / 12.420 | 1,067 / 2,091 / 2,035 |
+| off (`1793762211`) | 11.257 / 11.778 / 12.450 | 1,066 / 2,090 / 2,034 |
+| by column, `TT_PREFETCH_CAP=1` (`1793762453`) | 11.114 / 11.583 / 12.174 | 1,059 / 2,080 / 2,025 |
+| by column, `TT_PREFETCH_CAP=1` (`1793762670`) | 11.156 / 11.573 / 12.174 | 1,053 / 2,073 / 2,017 |
+| off (`1793762886`) | 11.216 / 11.714 / 12.372 | 1,072 / 2,110 / 2,052 |
+
+- **The first build left out Phase B's read-ahead cap of 1.** Its 16 KiB reads ahead at the mover's cap of 2 slowed
+  the small ops behind them, as in Phase B: decode was 4.7% slower.
+- **At cap 1 the gain was 1-2%,** where rule 2 wants about 7%. As built, rule 2's kill fired.
+- **The profiled pair** (`--profile`, `TT_PROFILE_DETAIL=pipeline`, 32 tokens; `Step(64)`, each product's slowest
+  unit, us, the median over layers):
+
+  | product | off (`1793763203`) | by column, column after column (`1793763811`) | by column, pieces in turn (`1793765738`) |
+  |---|--:|--:|--:|
+  | `qkv` | 36.3 | 18.7 | 18.5 |
+  | `o` | 17.7 | 12.6 | 12.6 |
+  | `gate\|up` | 380.6 | **418.2** | 350.8 |
+  | `down` | 495.9 | 365.4 | 359.1 |
+  | head | 3,559.5 | **3,972.3** | 3,542.0 |
+
+  (The work figures sum each unit's batches, so they are not comparable with Phase B's table; the ratios are.)
+- **What was wrong: a channel hotspot.** `qkv`, `o` and `down` gained what Phase B measured, but the wide-run 120-unit
+  products lost.
+  - A unit's run of `c` columns starts at column `u * c` and sits on consecutive channels.
+  - The span read a whole column before the next, so every unit in step read channel `(u * c) % 8`. At four columns a
+    run that is channels 0 and 4 only.
+  - Phase B's regions put each unit on its own channel, `u % 8`.
+- **The fix is the read order only:** the span now reads its columns' pieces in turn (piece 0 of each column, then
+  piece 1, ...). It reads the same bytes into the same slots, so the bits are unchanged.
+  - Re-gated on ttsim in every read mode and on card 0 (`1793764546`), with the per-read channel check pinning the
+    order.
+  - The cap of 1 is now built in: `set_column_weights` lowers a read ahead's cap as `set_weight_layout` does.
+- **This is a defect found by the meter, not a parameter tuned to the rule.** The rule is applied to the built form
+  below, with both reported.
+
+**The model, the built form** (by column, pieces in turn, read-ahead cap 1 by the layout).
+
+| run | decode step at 32 / 128 / 256 tokens, ms | prefill, tokens/s | first build, s |
+|---|--:|--:|--:|
+| off (`1793764793`) | 11.256 / 11.747 / 12.423 | 1,064 / 2,091 / 2,035 | 90.5 |
+| **by column** (`1793765041`) | **10.101 / 10.628 / 11.266** | 1,064 / 2,085 / 2,030 | 75.1 |
+| **by column** (`1793765257`) | **10.066 / 10.590 / 11.232** | 1,065 / 2,088 / 2,032 | 75.1 |
+| off (`1793765473`) | 11.235 / 11.768 / 12.442 | 1,071 / 2,105 / 2,048 | 89.6 |
+
+- **Decode is 10.4% / 9.7% faster** at 32 / 256 tokens: 11.25 → 10.08 and 12.43 → 11.25 ms, 99 tokens/s. Phase B's
+  two copies gave 10.7%.
+- **Rule 2, decode: not killed.** 10.08 / 11.25 ms is within the ≤ 10.45 / 11.55 bar.
+- **Rule 1, prefill:** 128 and 256 tokens are at most 0.3% below the brackets, against 2%. The 7,992-token prefill is
+  below.
+
+- **GDDR:** 26.754 / 26.75 GB free, against 26.75 with the default. The fullest channel is 3.344 GB free either way.
+  The weights are held once.
+- **Builds are 17% faster** (90 → 75 s first, 39.5 → 31.3 s second): the decode lists are shorter.
+
+**The long prompt** (7,992 tokens at chunks of 512, an 8,192-position cache, one sample, 4 new tokens; the runner's
+limit raised to 2,400 s, since the first build alone takes ~12 minutes and the default 900 s cut off the first attempt,
+`1793766347`-`1793769051`).
+
+| run | prefill, ms | decode step after 7,992, ms | first / second build, s |
+|---|--:|--:|--:|
+| off (`1793769996`) | 5,956.0 | 47.94 | 720.5 / 191.6 |
+| **by column** (`1793771014`) | 5,958.4 | **46.54** | 680.9 / 174.4 |
+| **by column** (`1793771974`) | 5,959.1 | **46.60** | 679.3 / 174.1 |
+| off (`1793772933`) | 5,953.7 | 47.99 | 717.8 / 192.2 |
+
+- **Rule 1, prefill at 7,992: not killed.** 0.05% slower, against 2%. The prefill's blocks (`m` = 512) read the
+  layout a tile at a time, as the eager bound showed.
+- **Decode after 7,992 tokens is 2.9% faster**: the products are a smaller share of a step whose attention reads
+  8,192 positions.
+- **GDDR:** 16.18 GB free either way; the fullest channel 2.02 GB.
+
+**The other models** (card 1, release, every tile; off / by column / by column / off, each a process of its own).
+
+| model | off | by column | off again |
+|---|--:|--:|--:|
+| Qwen3.5-4B decode, 32 / 256 tokens, ms (`1793773961`-`1793776432`) | 65.48 / 65.84 | **63.41 / 63.84**, **63.45 / 63.84** | 65.46 / 65.87 |
+| Qwen3.5-4B prefill, 32 / 256 tokens, ms | 466.0 / 3,730.5 | 466.1 / 3,729.7, 466.2 / 3,729.1 | 466.1 / 3,730.3 |
+| Qwen3.5-4B build, s | 614.7 | 584.2, 581.9 | 611.0 |
+| SmolLM2-135M decode, 32 / 256 tokens, ms (`1793777272`-`1793777433`) | 7.190 / 8.484 | 7.239 / 8.451, 7.143 / 8.386 | 7.228 / 8.472 |
+| ResNet-18 forward, traced, ms (`1793777487`-`1793777688`) | 12.97 | 12.97, 12.98 | 13.01 |
+| ViT-Tiny forward, traced, ms (`1793777755`-`1793777800`) | 7.97 | 7.94, 8.00 | 7.93 |
+
+- **Qwen3.5-4B decodes 3.1% faster** (2.0 ms a step; X9's two copies gave 1.2-1.3 ms), with prefill unchanged and
+  its build 30 s shorter.
+- **The 135M, ResNet-18 and ViT-Tiny are unchanged.** The 135M's products are too small to be read-bound; the image
+  models store no weight (F32, interleaved).
+
+**The verdict (rules 0-3): both halves pass, so the layout becomes the default for stored weights.**
+- Rule 0: every tile held once (`a_grid_laid_by_column_holds_each_tile_once_where_the_layout_puts_it`,
+  `a_weight_laid_by_column_holds_what_was_stored`), and GDDR taken equals the interleaved bytes.
+- Rule 1: eager blocks within -0.8% to +1.9% (bar 5%); prefill at 128 / 256 / 7,992 within 0.3% (bar 2%).
+- Rule 2: decode 10.08 / 11.25 ms at 32 / 256 tokens (bar 10.45 / 11.55).
+- Rule 4: every bracket agrees with its twin within 0.4%.
+
+**The off path paid for the layout: found and fixed (2026-11-04).** Every "off" run above was 2-3% slower than the
+day before on the same card (the 1.7B's decode 11.25 ms against 10.96, `1793723839`), and so were ResNet-18 and ViT-Tiny,
+which store no weight. A bracket of the committed `1ff07dc` against this tree with the layout off, on card 1, put it
+in the code, not the card:
+
+| | `1ff07dc` (`1793778018`, `1793778978`) | this tree, off (`1793778338`, `1793778662`) |
+|---|--:|--:|
+| 1.7B decode, 32 / 128 / 256 tokens, ms | 11.00 / 11.50 / 12.18 | 11.22 / 11.77 / 12.44 |
+| 1.7B prefill, 32 / 128 / 256 tokens, tokens/s | 1,086 / 2,136 / 2,076 | 1,065 / 2,089 / 2,035 |
+| ResNet-18 forward, traced, ms (`1793777945`, `1793778904` against `1793778256`, `1793778581`) | 12.54 / 12.56 | 12.93 / 12.99 |
+| ViT-Tiny forward, traced, ms | 7.66 / 7.49 | 7.74 / 7.74 |
+
+- **Where:** the movers' per-tile loops. A hybrid (the baseline with only the new record code) was as slow; the
+  baseline with only the new reference fields and their per-record decoding was not (12.53 / 12.55 and 7.65 / 7.70
+  ms). The profile (`1793780198` against `1793780286`) showed every op slower, gathers 2-4% and fused eltwise groups
+  5-8%, with the compute cores' push cycles a word up 8-12% while their images were unchanged: the movers' larger,
+  branchier per-tile code, which shares L1 with the compute cores' instruction fetches.
+- **Moving the by-column branches out of line was not enough** (ResNet-18 12.69 / 12.90 ms, ViT-Tiny 7.92 / 7.91):
+  any test in the per-tile path cost.
+- **The fix:** `TensorRef::tile`, `Cursor` and the read-ahead cursor are the baseline's code again, and a by-column
+  operand is dispatched once a record to one out-of-line walk (`record::walk_by_column`): a `GATHER`'s `A` or `B`,
+  untransposed (a row a walk, a step a tile, no division) or transposed. A read ahead of a by-column `B` read a tile at
+  a time is refused by the card and never asked for by the host (`tile_op::ahead::split`); a by-column `B` read by
+  column keeps its span. Off, ResNet-18 12.56 / 12.58 ms and ViT-Tiny 7.50 / 7.56 against the baseline's 12.56 /
+  12.56 and 7.68 / 7.67 (`1793781126`-`1793781431`).
+- **Found on the way:** a stored weight can be a product's `A` (`step241`'s every pair of edge formats), which the
+  first build read by column through the generic cursor and the fix first refused; the walk reads it.
+- **It came back, and the fix had to go further** (the first full run on card 1, `1793788972`-`1793797887`). With `A`
+  walked too, the dispatch sat inside the `GATHER` arm, between its loops, and the tree was again slower than the
+  baseline whatever the flag: ViT-Tiny 7.80-7.89 ms against 7.48-7.72 in eight runs each, ResNet-18 up to 1.5%, the
+  1.7B's off runs 1.0-1.4%. The profile (`1793799184` against `1793799228`) showed the same mark, the fused eltwise
+  groups' push cycles a word up 10-12%. The read-ahead cap was not it (`TT_PREFETCH_CAP=2` changed nothing,
+  `1793797995`-`1793798606`).
+  - **The form that held:** the `GATHER` arm is the baseline's code byte for byte; at its top, a record with either
+    operand laid by column, or a mark of the L1 order, leaves once for `record::gather_by_column` (cold, out of line),
+    which checks `B`'s marks before any read and walks each operand in its own layout (`walk_by_column` steps an
+    interleaved operand as well, a channel at a time). `run_record` now starts at the baseline's address with 112
+    bytes more. ViT-Tiny 7.680 / 7.681 ms against the baseline's 7.612 / 7.719, ResNet-18 12.545 / 12.547 against
+    12.358 / 12.545 (`1793799852`-`1793800085`).
+  - A host test pins the interleaved operand's reads in the cold path to the arm's (each of three mutations caught).
+- **The B image's room.** The cold path is 3.6 KB, and the `profile` image built with `fast-reads` no longer fit
+  `IMAGE_MAX` (1,580 bytes over; `encoded-guard` more). Two changes:
+  - **Smaller code:** one decode body for both reference kinds, the span's flag a `u32` (a `bool` was its `Option`'s
+    niche and made every copy of a span byte by byte), the slots passed in, one loop body in the walk.
+  - **The role slots gave B 1,920 bytes** (`tt_isa::l1::roles::SLOT` 10,240 -> 9,600; the largest role image is
+    8,884). B's room left: 4,584 bytes (safe), 2,420 (`encoded-guard`), 220 (`profile` + `fast-reads` +
+    `encoded-guard`). The next firmware growth must find its room.
+- **Weights whose columns do not fill the channels stay interleaved** (`tensor::Layout::for_weight`). By column, every
+  channel's region holds `cols.div_ceil(n)` columns, and the 135M's 18-column weights took 38 MB more (33.235 -> 33.197
+  GB free, `1793797728` against `1793797781`): GDDR that grows with the model. A weight is now laid by column only
+  where that takes no more slots a channel than interleaved, which every weight of the 1.7B and Qwen3.5-4B does.
+- **The rules are applied again to the final code** (below).
+
+### C1 final: the rules on the code as built (2026-11-04, card 1)
+
+The tree as it will be committed, against the committed baseline `1ff07dc` built in its own worktree, card 1, release,
+safe image, every tile (`TT_TILES=all`), each run a process of its own. Card 0 had passed the gate list with the
+layout on by default (71 of 71, `1793801167`) and `--smoke` (1,283 of 1,283, `1793805483`) first.
+
+**The off path** (models that store no weight; baseline / tree / tree / baseline).
+
+| model | `1ff07dc` | tree (default, on) | `1ff07dc` again |
+|---|--:|--:|--:|
+| ResNet-18 forward, traced, ms (`1793807243`-`1793807427`) | 12.516 | 12.577, 12.576 | 12.553 |
+| ViT-Tiny forward, traced, ms (`1793807486`-`1793807528`) | 7.691 | 7.507, 7.704 | 7.663 |
+
+The slowdown of the first full run is gone: ResNet-18 is within 0.3% of its baseline, and ViT-Tiny sits inside its
+brackets.
+
+**Eager products** (`silicon_bench_columns`, `1793807545`; interleaved → by column, medians, ABBA in one process, bit
+for bit).
+
+| weight | `m` = 1 | `m` = 64 | `m` = 256 | `m` = 512 |
+|---|--:|--:|--:|--:|
+| `qkv` `[2048, 6144]` | 1,239 → 1,164 us (-6.1%) | +0.1% | -1.1% | -0.8% |
+| `o` `[2048, 2048]` | 808 → 784 us (-2.9%) | +1.4% | +0.9% | -0.6% |
+| `gate\|up` `[2048, 16384]` | 2,294 → 2,205 us (-3.9%) | -0.1% | -0.0% | -2.5% |
+| `down` `[8192, 2048]` | 2,777 → 2,697 us (-2.9%) | +0.3% | +0.1% | -0.3% |
+
+GDDR: each weight takes the interleaved bytes exactly (3,244,032 / 1,081,344 / 8,650,752 / 4,325,376).
+
+**The 1.7B** (`traced_generation_stream_ceiling`, BF16 weights, a 512-position cache; baseline / off / on / on / off /
+baseline).
+
+| run | decode step at 32 / 128 / 256 tokens, ms | prefill, tokens/s | first / second build, s | GDDR free, GB |
+|---|--:|--:|--:|--:|
+| `1ff07dc` (`1793807556`) | 11.004 / 11.527 / 12.179 | 1,094 / 2,152 / 2,092 | 86.7 / 37.6 | 26.760 |
+| off (`1793807793`) | 11.054 / 11.605 / 12.247 | 1,071 / 2,109 / 2,052 | 85.1 / 37.5 | 26.752 |
+| **on** (`1793808030`) | **10.069 / 10.568 / 11.213** | 1,096 / 2,155 / 2,095 | 74.8 / 31.1 | 26.760 |
+| **on** (`1793808246`) | **10.056 / 10.549 / 11.207** | 1,100 / 2,161 / 2,098 | 74.0 / 30.9 | 26.760 |
+| off (`1793808461`) | 11.090 / 11.571 / 12.244 | 1,087 / 2,139 / 2,082 | 85.0 / 37.4 | 26.750 |
+| `1ff07dc` (`1793808695`) | 10.947 / 11.476 / 12.151 | 1,075 / 2,118 / 2,056 | 86.2 / 37.6 | 26.752 |
+
+- **Decode: 10.06 / 11.21 ms** at 32 / 256 tokens, 99.4 tokens/s. That is 9.1% / 8.5% faster than the layout off
+  and 8.4% / 7.9% faster than the baseline.
+- **Prefill** with the layout on is at or above every bracket at every length.
+- **Builds are 13-18% shorter.**
+- **GDDR:** the fullest channel is 3.344 GB free with the layout on and 3.343 GB off.
+- **The opt-out pays about 0.5%:** off, decode is 11.05-11.09 / 12.24-12.25 ms against the baseline's 10.95-11.00 /
+  12.15-12.18. It is the cold dispatch's test at the top of every `GATHER`. With the layout on, every run beats the
+  baseline.
+
+**The long prompt** (7,992 tokens at chunks of 512, an 8,192-position cache, 4 new tokens; off / on / on / off).
+
+| run | prefill, ms | decode step after 7,992, ms | first / second build, s |
+|---|--:|--:|--:|
+| off (`1793808930`) | 5,909.1 | 46.99 | 681.7 / 183.7 |
+| **on** (`1793809900`) | 5,897.3 | **45.85** | 663.5 / 171.0 |
+| **on** (`1793810840`) | 5,898.2 | **45.94** | 646.3 / 171.3 |
+| off (`1793811764`) | 5,908.8 | 47.08 | 682.0 / 183.5 |
+
+GDDR is 16.18 GB free either way, and the fullest channel 2.02 GB.
+
+**The other models** (off / on / on / off).
+
+| model | off | on | off again |
+|---|--:|--:|--:|
+| Qwen3.5-4B decode, 32 / 256 tokens, ms (`1793812735`-`1793815192`) | 64.22 / 64.58 | **62.88 / 63.24**, **62.89 / 63.24** | 64.20 / 64.59 |
+| Qwen3.5-4B prefill, 32 / 256 tokens, ms | 464.0 / 3,712.9 | 464.0 / 3,712.3, 464.4 / 3,712.9 | 464.3 / 3,713.4 |
+| Qwen3.5-4B build, s | 607.6 | 582.6, 582.4 | 598.6 |
+| SmolLM2-135M decode, 32 / 256 tokens, ms (`1793816020`-`1793816179`) | 7.066 / 8.294 | 7.032 / 8.250, 7.029 / 8.257 | 7.060 / 8.254 |
+
+- **Qwen3.5-4B decodes 2.1% faster** (1.3 ms a step), with prefill unchanged.
+- **The 135M is unchanged within 0.5%.** Its 18-column weights stay interleaved (`Layout::for_weight`), its GDDR is
+  33.235 GB free either way, and its products are too small to be read-bound.
+
+**The verdict (rules 0-4, final code): both halves pass. The layout is the default for stored weights**
+(`TT_WEIGHT_COLUMNS=0` opts out).
+- **Rule 0:** every tile is held once. GDDR taken equals the interleaved bytes for every weight laid by column, and the
+  models' free GDDR is unchanged.
+- **Rule 1:** eager blocks are within -2.5% to +1.4% (bar 5%). Prefill at 128 / 256 / 7,992 tokens is at or above
+  both brackets (bar 2% below).
+- **Rule 2:** decode is 10.06 / 11.21 ms (bar 10.45 / 11.55), within 2% of Phase B's two copies (9.90 / 10.94), from
+  one.
+- **Rule 4:** each run agrees with its twin within 0.2% (ViT-Tiny's within its run-to-run noise).
+
 ## Work
 
 - [x] A0 on card 1 (2026-11-02, `1793645082`-`1793647203`): more requests at tile-sized entries buy nothing (Results).
@@ -528,11 +894,23 @@ every tile exactly once.
   card 1, against today's.
 - [x] **The default reverted** (2026-11-03, owner): opt-in again (`TT_WEIGHT_LAYOUT=1`), because the second copy
   grows with the weights (above).
-- [ ] **The scalable form** (next): one stored layout, made at load time from one deal per weight. Decode reads it in
-  large pieces, and prefill and eager blocks read it through a record with an L1 pitch (a new encoding), at about
-  today's entries. Bound it first against the one-copy default, on prefill and eager as well as decode.
+- [x] **The scalable form** (Phase C1, by-column weights, 2026-11-04; the default for stored weights): one stored layout, made at load time,
+  each column contiguous in one channel. Decode reads it in large pieces; prefill and eager blocks read it at today's
+  entries. No deal is fixed. Bound against the one-copy default on prefill and eager as well as decode (C1's rules).
+  - [x] Encoding (`REF_BY_COLUMN`, `REF_L1_BY_COLUMN`), host tests, mutations watched failing
+  - [x] Firmware (no change of its own: the shared expansion), clippy in every feature set
+  - [x] `step268_column_weights` on ttsim (every read mode), then card 0 alone (`1793760854`)
+  - [x] Eager bound on card 1 (`silicon_bench_columns`, `1793760911`, `1793760944`): not killed
+  - [x] Load time (`TT_WEIGHT_COLUMNS=1`), other readers supported or refused by name (`error::LAYOUT`)
+  - [x] Model bound on card 1; the verdict by the rules (C1 final, `1793807243`-`1793816179`): both halves pass,
+    the default; card 0's gate list and `--smoke` with it on (`1793801167`, `1793805483`)
+  - [ ] F32 weights (no `with_storage` today) stay interleaved: a follow-up if an F32-stored model is read-bound
 - [ ] Item 5's copy-free levers (bank-affine placement, atomic column claims, a dedicated prefetcher), ranked against
-  the scalable form after its bound.
+  the scalable form after its bound. **Ranked after C1 (2026-11-04):** C1 took nearly all of 2b's gain (10.06 against
+  two copies' 9.90 ms), so these levers now compete for what is left beyond it, not for 2b's ~10%.
+  - **First: bank-affine placement.** It composes with C1, since column `j`'s channel is a free choice of the layout.
+  - **Second: `gate|up`'s evenness (below).** Its slowest unit sets the product.
+  - **Third: atomic claims and a dedicated prefetcher.** They need new firmware, and B has 4.6 KB of room (safe).
 - [ ] `gate|up`'s evenness: its mean unit is faster but not its slowest. A deal that sizes each unit's share to the rate
   it gets, measured with the pipeline detail (X10). Layout-independent.
 - Parked, opt-in only (two-copy refinements that cannot become a default):

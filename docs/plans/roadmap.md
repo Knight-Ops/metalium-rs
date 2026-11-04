@@ -14,9 +14,10 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
-  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at ~91 tokens/s traced against
-  burn-flex's 3.4 (10.96 ms a step with BF16 weights, card 1, 2026-11-03, `1793723839`; 9.75 ms with X9's weight layout, which is
-  opt-in because it holds the streamed weights twice and does not scale, item 2b below and the scaling constraint; 10.95 ms on 2026-10-29, [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1); 88 tokens/s on 2026-10-27, 13.6 on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at ~99 tokens/s traced against
+  burn-flex's 3.4 (10.06 ms a step with BF16 weights laid by column, the default since 2026-11-04, card 1,
+  `1793808030`, holding each weight once, item 2b below; 10.96 ms interleaved on 2026-11-03, `1793723839`; 9.75 ms with X9's
+  two-copy layout, opt-in because it does not scale; 10.95 ms on 2026-10-29, [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1); 88 tokens/s on 2026-10-27, 13.6 on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
   5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
@@ -1040,8 +1041,23 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       - **First the bound:** prefill (and an eager `m > 1` product) reading the relaid layout per run, on card 1,
         against today's. Narrow runs could slow prefill; if they do, keep two copies where prefill pays and one
         elsewhere.
-    - [ ] **The scalable form: one stored layout that every reader takes in large pieces** (next). C0 names what
-      it needs:
+    - [x] **The scalable form: one stored layout that every reader takes in large pieces.** Done 2026-11-04 as
+      Phase C1, by-column weights, now the default for stored weights (`TT_WEIGHT_COLUMNS=0` opts out)
+      ([plan](decode-bytes-in-flight.md#c1-final-the-rules-on-the-code-as-built-2026-11-04-card-1)).
+      - **The layout:** column `j`'s tiles are contiguous in channel `j % 8`.
+      - **Decode** reads each column in 16 KiB pieces.
+      - **Blocks** read it a tile at a time, at today's entries, one `GATHER` a block.
+      - **No relayout and no deal coupling:** any run of whole columns is any capture's deal.
+      - **The 1.7B decodes at 10.06 / 11.21 ms** at 32 / 256 tokens, against 11.07 / 12.25 off and 11.00 / 12.18 at
+        `1ff07dc`.
+      - **Prefill** is at or above every bracket, eager blocks are within -2.5% to +1.4%, and GDDR is the interleaved
+        bytes.
+      - **Qwen3.5-4B decodes 2.1% faster.** The 135M is unchanged; its 18-column weights stay interleaved, by
+        `Layout::for_weight`.
+      - **Found on the way:** any test in the movers' per-tile loops cost every model 1.5-3%, by code placement against
+        a ~4 KiB instruction cache. The `GATHER` arm is now the baseline's code with one cold dispatch. The role slots
+        gave the B image 1,920 bytes.
+      - The entry as first written (C0 named what it needed):
       - a record that cuts a region's rows into a block with an L1 pitch, so a prefill or eager block over the
         layout costs about today's entries and not ~4x (a new encoding: ttsim and an isolated gate before silicon);
       - one deal a weight, so the regions partition it (today 8.3% of column-run tiles sit in two regions);
@@ -1050,8 +1066,9 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       - **Bound it first,** on card 1 against today's default: prefill at 128 / 256 / 7,992 tokens and eager
         products, not only decode. C0's rules apply.
     - [ ] **The copy-free levers of item 5.** Bank-affine placement, columns claimed from an atomic counter and a
-      dedicated prefetcher need no second copy. They are the other route to 2b's ~10%; rank them against the
-      scalable form after its bound.
+      dedicated prefetcher need no second copy. **Ranked after C1:** C1 took nearly all of 2b's gain (10.06 ms
+      against two copies' 9.90), so these compete for what is left. Bank-affine placement comes first: it composes
+      with C1, since column `j`'s channel is the layout's choice.
     - [ ] **`gate|up`'s evenness** (its slowest unit gains least; X10: a deal that sizes each unit's share to the
       rate it gets). It applies to any layout, so it does not depend on the second copy.
     - **Parked, opt-in only.** These refine the two-copy form, so none of them can become a default:

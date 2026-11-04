@@ -37,10 +37,12 @@ const SAMPLES: usize = 9;
 
 fn conditions(card: usize) {
     println!(
-        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\",\"weight_layout\":{}}}",
+        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\",\"weight_layout\":{},\"column_weights\":{}}}",
         git_sha(),
         !cfg!(debug_assertions),
         std::env::var("TT_WEIGHT_LAYOUT").is_ok_and(|v| v == "1"),
+        std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0")
+            && !std::env::var("TT_WEIGHT_LAYOUT").is_ok_and(|v| v == "1"),
     );
 }
 

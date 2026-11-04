@@ -46,12 +46,15 @@ pub const IMAGES: Region = Region {
 /// for every core but B). The slots are what T0..T2's default reset PCs would
 /// leave -- 16 KiB each, of which the images used about half -- and the space
 /// they free goes to B's mover ([`dm::IMAGE_MAX`]), which cannot be moved: its
-/// entry point is L1 offset 0.
+/// entry point is L1 offset 0. 9,600 bytes each since 2026-11-04 (10 KiB before):
+/// the largest role image is 8,884 bytes (a `profile` one), and B's took the
+/// 1,920 bytes freed for weights laid by column
+/// (`docs/plans/decode-bytes-in-flight.md` Phase C1).
 pub mod roles {
     use crate::tensix::Core;
 
     /// One role image's slot.
-    pub const SLOT: u64 = 0x2800;
+    pub const SLOT: u64 = 0x2580;
     /// The end of the last slot: NC's default reset PC, where its stub lives.
     pub const END: u64 = Core::NC.default_reset_pc() as u64;
     /// The load address (and link address) of the T0, T1 and T2 role images.

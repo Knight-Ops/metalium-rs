@@ -939,8 +939,8 @@ impl DramBuffers {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let error = |e: tt_kernels::tensor::TensorError| TtError::from(e);
         if let Some(format) = format {
-            let t = s.bfp_from_f32(self.get(id)?, format).map_err(error)?;
-            Ok(self.insert(tt_kernels::tensor::DramTensor::from_bfp(t)))
+            let t = s.store_bfp(self.get(id)?, format).map_err(error)?;
+            Ok(self.insert(t))
         } else {
             let t = self.bfp(id)?;
             let t = s.bfp_to_f32(&t).map_err(error)?;

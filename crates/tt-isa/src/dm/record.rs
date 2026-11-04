@@ -237,18 +237,12 @@ impl PrefetchCursor {
             return Err(super::error::RANGE);
         }
         let (_, cols) = (extent(rows)?, extent(cols)?);
-        let (_, b) = (tensor(rec, 1)?, tensor(rec, 3)?);
+        let (_, b) = (tensor_any(rec, 1)?, tensor_any(rec, 3)?);
+        let span = gather_span(rec, &b, flags, b_at, kt, j0, cols, slot)?;
         let thin = (flags >> GATHER_ROWS_SHIFT) & 0x1f;
         if thin > 16 || (thin != 0 && a_t) {
             return Err(super::error::RANGE);
         }
-        let span = match b_t {
-            false if laid_for_reader(rec, 3) => {
-                BSpan::of(&b, b_at, kt, j0, cols, slot, BSpan::piece(flags, slot))?
-            }
-            false => None,
-            true => None,
-        };
         Ok(Some(PrefetchCursor {
             b,
             b_at,
@@ -285,7 +279,7 @@ impl Iterator for PrefetchCursor {
             return None;
         }
         if let Some(span) = &self.span {
-            let read = span.read(self.next);
+            let read = span.read_any(self.next, &self.b);
             self.next += 1;
             return Some(Ok(read));
         }
@@ -388,8 +382,8 @@ pub const PAD_WRITE: u32 = 0x17;
 /// only on an even row, so a read must take the pair a row is half of and the
 /// wanted half be moved; that code, in this record, measured 400 bytes more
 /// in RISCV B's image, which then had 172 of its 24 KiB left (a mover image
-/// may not pass `IMAGE_MAX`; the slot is 42 KiB since the role images were
-/// repacked). `docs/plans/roadmap.md`, "Gather without staging", has the
+/// may not pass `IMAGE_MAX`; the slot is 44,928 bytes since the role images
+/// were repacked). `docs/plans/roadmap.md`, "Gather without staging", has the
 /// options.
 ///
 /// The slots are not checked against the data arena here (the mover's image has
@@ -543,6 +537,13 @@ pub const fn is_record(op: u32) -> bool {
 /// tile `t` (counted from `first`, for a view) on `channels[t % n]` at slot
 /// `t / n` of the region starting at `base` there. The same placement
 /// `tt_kernels::tensor::Placement` keeps.
+///
+/// **By column** (`col_tiles != 0`, [`REF_BY_COLUMN`]; `docs/plans/decode-bytes-in-flight.md`
+/// Phase C1): a weight stored for its decode readers and still read by any [`GATHER`]. Tile `t`
+/// is row `r = t / ct` and column `c = t % ct` of the grid; column `c`'s `col_tiles` tiles are
+/// consecutive slots on `channels[c % n]`, from slot `(c / n) * col_tiles` of the region there,
+/// row `r` at slot `(c / n) * col_tiles + r`. The tiles are the same as interleaved ones; only
+/// where they sit differs. Every other record refuses such a reference ([`super::error::LAYOUT`]).
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct TensorRef {
     pub n: u8,
@@ -550,29 +551,67 @@ pub struct TensorRef {
     pub base: [u32; 8],
     pub first: u32,
     pub ct: u32,
+    /// `0`: interleaved. Otherwise laid by column, each column this many tiles long.
+    pub col_tiles: u32,
 }
 
+/// Word 4 of a tensor reference's first entry: the tensor is laid by column
+/// ([`TensorRef::col_tiles`], in word 5).
+pub const REF_BY_COLUMN: u32 = 2;
+
+/// Word 4 of a [`GATHER`]'s `B` reference: this reader takes `B` into L1 by column, tile
+/// `(kk, j)` at `b_at + (j * kt + kk) * slot`, rather than by row (`(kk * cols + j)`). Only for a
+/// `B` laid by column ([`REF_BY_COLUMN`]), untransposed and not resident: each of its columns is
+/// then one run in GDDR and in L1, read in large pieces ([`BSpan`]). A matmul whose pairs name
+/// `B` by column reads it so (`tt_kernels::matmul::slots_layout`); the sum's order is unchanged.
+pub const REF_L1_BY_COLUMN: u32 = 4;
+
 impl TensorRef {
-    /// `[n, channels (four bits each), first, ct, 0, 0, 0, 0]` and the bases.
+    /// `[n, channels (four bits each), first, ct, flags, col_tiles, 0, 0]` and the bases: `flags`
+    /// is [`REF_BY_COLUMN`] for a tensor laid by column, else 0, as is `col_tiles`.
     pub fn encode(&self) -> [[u32; 8]; 2] {
         let mut packed = 0u32;
         for (i, c) in self.channels.iter().enumerate() {
             packed |= ((*c as u32) & 0xF) << (4 * i);
         }
+        let flags = if self.col_tiles != 0 {
+            REF_BY_COLUMN
+        } else {
+            0
+        };
         [
-            [self.n as u32, packed, self.first, self.ct, 0, 0, 0, 0],
+            [
+                self.n as u32,
+                packed,
+                self.first,
+                self.ct,
+                flags,
+                self.col_tiles,
+                0,
+                0,
+            ],
             self.base,
         ]
     }
 
     /// The inverse of [`TensorRef::encode`]. `n` may be 0 only for a tensor
     /// that is never read (a record's absent operand); whether each channel is one
-    /// the chip has is checked on every entry the tensor produces.
+    /// the chip has is checked on every entry the tensor produces. Of word 4 only
+    /// [`REF_BY_COLUMN`] is the tensor's; the other bits are its reader's.
     pub fn decode(w: [[u32; 8]; 2]) -> Result<Self, u32> {
         let [m, base] = w;
         if m[0] > 8 || m[3] > MAX_EXTENT {
             return Err(super::error::RANGE);
         }
+        let col_tiles = if m[4] & REF_BY_COLUMN != 0 {
+            // A column of no tiles, or a grid of no columns, names nothing.
+            if m[5] == 0 || m[5] > MAX_EXTENT || m[3] == 0 {
+                return Err(super::error::RANGE);
+            }
+            m[5]
+        } else {
+            0
+        };
         let mut channels = [0u8; 8];
         for (i, c) in channels.iter_mut().enumerate() {
             *c = ((m[1] >> (4 * i)) & 0xF) as u8;
@@ -583,6 +622,7 @@ impl TensorRef {
             base,
             first: m[2],
             ct: m[3],
+            col_tiles,
         })
     }
 
@@ -651,7 +691,7 @@ impl Cursor<'_> {
 
 const PORTS: u32 = crate::dram::PORTS as u32;
 
-/// Word 4 of a tensor reference's first entry ([`TensorRef::encode`] leaves it 0, and
+/// Word 4 of a tensor reference's first entry ([`TensorRef::encode`] leaves this bit 0, and
 /// [`TensorRef::decode`] does not read it): a one-channel `B` laid out for the record that reads it,
 /// its tiles in the order the record reads them (X9, `tt_kernels`' weight layout). Only such a `B`
 /// is read in large pieces ([`BSpan`]); any other, a one-channel chip's tensors included, is read a
@@ -661,6 +701,11 @@ pub const REF_LAID_FOR_READER: u32 = 1;
 /// Whether the reference at `rec[at]` carries [`REF_LAID_FOR_READER`].
 fn laid_for_reader(rec: &[[u32; 8]], at: usize) -> bool {
     rec[at][4] & REF_LAID_FOR_READER != 0
+}
+
+/// Whether the reference at `rec[at]` carries [`REF_L1_BY_COLUMN`].
+fn l1_by_column(rec: &[[u32; 8]], at: usize) -> bool {
+    rec[at][4] & REF_L1_BY_COLUMN != 0
 }
 
 /// A [`GATHER`]'s `B` in one channel (`n == 1`) and marked [`REF_LAID_FOR_READER`]
@@ -687,6 +732,14 @@ struct BSpan {
     /// Pieces a run, and each piece's bytes (the last of a run may be shorter).
     pieces: u32,
     piece: u32,
+    /// A `B` laid by column read by column ([`REF_L1_BY_COLUMN`]): run `r` is column `ch + r`
+    /// (`ch` is the first column), on that column's channel of `B`'s reference, from its base
+    /// there plus `(column / n) * stride` (`stride` a column's bytes) and `off` (the record's
+    /// first row). The fields are reused so that a span is no larger than an interleaved one's:
+    /// it rides in every read ahead ([`PrefetchCursor`]).
+    /// 1 by column, else 0: a word, not a `bool`, whose niche made every copy of an
+    /// `Option<BSpan>` byte by byte (the B image's room).
+    by_column: u32,
 }
 
 impl BSpan {
@@ -732,7 +785,58 @@ impl BSpan {
             stride: b.ct as u64 * slot as u64,
             pieces: bytes.div_ceil(piece),
             piece,
+            by_column: 0,
         }))
+    }
+
+    /// The span of a `B` laid by column ([`TensorRef::col_tiles`]) that its reader takes into L1
+    /// by column ([`REF_L1_BY_COLUMN`]): column `j0 + j`'s rows `kt` long, one run each, at
+    /// `b_at + j * kt * slot`. Refuses a block that leaves its grid's row or its columns' length,
+    /// or whose last byte on any channel is past what an offset names.
+    #[cold]
+    #[inline(never)]
+    fn of_columns(
+        b: &TensorRef,
+        b_at: u32,
+        kt: u32,
+        j0: u32,
+        cols: u32,
+        slot: u32,
+        piece: u32,
+    ) -> Result<Self, u32> {
+        if b.n == 0 || b.col_tiles == 0 || piece == 0 {
+            return Err(super::error::LAYOUT);
+        }
+        let (r0, c0) = (b.first / b.ct, b.first % b.ct + j0);
+        let ends = |a: u32, n: u32| a.checked_add(n).ok_or(super::error::RANGE);
+        if ends(c0, cols)? > b.ct || ends(r0, kt)? > b.col_tiles {
+            return Err(super::error::RANGE);
+        }
+        let bytes = kt.checked_mul(slot).ok_or(super::error::RANGE)?;
+        let (n, slot64) = (b.n as u32, slot as u64);
+        let col_bytes = b.col_tiles as u64 * slot64;
+        // Each channel's furthest byte is in its last column of the block.
+        for k in 0..cols.min(n) {
+            let c = c0 + cols - 1 - k;
+            let end = b.base[(c % n) as usize] as u64
+                + (c / n) as u64 * col_bytes
+                + r0 as u64 * slot64
+                + bytes as u64;
+            if end > u32::MAX as u64 + 1 {
+                return Err(super::error::RANGE);
+            }
+        }
+        Ok(BSpan {
+            ch: c0,
+            off: r0 as u64 * slot64,
+            l1: b_at,
+            runs: cols,
+            bytes,
+            stride: col_bytes,
+            pieces: bytes.div_ceil(piece),
+            piece,
+            by_column: 1,
+        })
     }
 
     /// Reads in all.
@@ -740,7 +844,9 @@ impl BSpan {
         self.runs * self.pieces
     }
 
-    /// Read `n` of [`BSpan::count`].
+    /// Read `n` of [`BSpan::count`] of a span laid for its reader ([`BSpan::read_any`] for either
+    /// kind). Out of line, as the baseline's code had it.
+    #[inline(never)]
     fn read(&self, n: u32) -> [u32; 8] {
         let (run, piece) = (n / self.pieces, n % self.pieces);
         let at = piece * self.piece;
@@ -755,10 +861,266 @@ impl BSpan {
             0,
         ]
     }
+
+    /// Read `n` of [`BSpan::count`], of `B` (`b`, its reference; read only by column).
+    fn read_any(&self, n: u32, b: &TensorRef) -> [u32; 8] {
+        match self.by_column != 0 {
+            true => self.read_by_column(b, n),
+            false => self.read(n),
+        }
+    }
+
+    /// [`BSpan::read`] by column: the runs' pieces in turn (piece 0 of each column, then piece 1,
+    /// ...). A unit's columns sit on consecutive channels, and units whose runs start on the same
+    /// channel would otherwise all read it at once (a two-channel hotspot at four columns a run,
+    /// `docs/plans/decode-bytes-in-flight.md` C1 results). The same bytes to the same slots, in
+    /// another order. Out of line, as [`walk_by_column`] is.
+    #[cold]
+    #[inline(never)]
+    fn read_by_column(&self, b: &TensorRef, n: u32) -> [u32; 8] {
+        let (run, piece) = (n % self.runs, n / self.runs);
+        let at = piece * self.piece;
+        let (c, nb) = (self.ch + run, b.n as u32);
+        let k = (c % nb) as usize;
+        let column = b.base[k] as u64 + (c / nb) as u64 * self.stride;
+        [
+            op::READ,
+            b.channels[k] as u32,
+            n % PORTS,
+            (column + self.off + at as u64) as u32,
+            self.l1 + run * self.bytes + at,
+            (self.bytes - at).min(self.piece),
+            0,
+            0,
+        ]
+    }
 }
 
+/// The reference at `rec[at]`, interleaved: every record but a [`GATHER`]'s `B` reads only
+/// those, and refuses one laid by column ([`super::error::LAYOUT`]) rather than misaddress it.
 fn tensor(rec: &[[u32; 8]], at: usize) -> Result<TensorRef, u32> {
-    TensorRef::decode([rec[at], rec[at + 1]])
+    tensor_of(rec, at, false)
+}
+
+/// The reference at `rec[at]` in either layout: a [`GATHER`]'s operands.
+fn tensor_any(rec: &[[u32; 8]], at: usize) -> Result<TensorRef, u32> {
+    tensor_of(rec, at, true)
+}
+
+/// [`tensor`] (`any` false) or [`tensor_any`]: one body (the B image's room).
+#[inline(never)]
+fn tensor_of(rec: &[[u32; 8]], at: usize, any: bool) -> Result<TensorRef, u32> {
+    let x = TensorRef::decode([rec[at], rec[at + 1]])?;
+    if !any && (x.col_tiles != 0 || l1_by_column(rec, at)) {
+        return Err(super::error::LAYOUT);
+    }
+    Ok(x)
+}
+
+/// A [`GATHER`]'s `B` span, by its reference's marks: by column ([`BSpan::of_columns`]) where its
+/// reader asks for that order, in pieces where it is laid for its reader ([`BSpan::of`]), else
+/// none (a tile at a time). Refuses an order its `B` cannot take, a mark beside a layout it does
+/// not describe, and a read ahead ([`GATHER_PREFETCH`]) of a `B` laid by column but read a tile
+/// at a time: [`PrefetchCursor`] walks only interleaved tiles, so that its per-read code is the
+/// interleaved code alone (the host reads such a record in place, `tile_op::ahead::split`).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn gather_span(
+    rec: &[[u32; 8]],
+    b: &TensorRef,
+    flags: u32,
+    b_at: u32,
+    kt: u32,
+    j0: u32,
+    cols: u32,
+    slot: u32,
+) -> Result<Option<BSpan>, u32> {
+    let (b_t, b_resident) = (flags & 2 != 0, flags & GATHER_B_RESIDENT != 0);
+    if l1_by_column(rec, 1) || (b.col_tiles != 0 && laid_for_reader(rec, 3)) {
+        return Err(super::error::LAYOUT);
+    }
+    if l1_by_column(rec, 3) {
+        if b.col_tiles == 0 || b_t || b_resident {
+            return Err(super::error::LAYOUT);
+        }
+        let piece = BSpan::piece(flags, slot);
+        return BSpan::of_columns(b, b_at, kt, j0, cols, slot, piece).map(Some);
+    }
+    if b.col_tiles != 0 && flags & GATHER_PREFETCH != 0 {
+        return Err(super::error::LAYOUT);
+    }
+    if b_t || b_resident || !laid_for_reader(rec, 3) {
+        return Ok(None);
+    }
+    BSpan::of(b, b_at, kt, j0, cols, slot, BSpan::piece(flags, slot))
+}
+
+/// One operand of a [`GATHER`] with an operand laid by column, read a tile at a time as the
+/// interleaved walk reads it. Laid by column ([`TensorRef::col_tiles`]), tile `(r, col)`, by tile
+/// number as [`TensorRef::tile`] counts, is on channel `col % n` at slot `(col / n) * col_tiles +
+/// r`; interleaved, where [`TensorRef::tile`] puts it (the other operand's walk): `outer`
+/// rows of `inner` tiles, tile `(o, k)` op(X)'s `(r0 + o, c0 + k)` (`A`: `r0` is `i0`; `B`: `c0`
+/// is `j0`), into `at + (o * inner + k) * slot` on port `(r0 + c0 + o + k) % PORTS`. Transposed,
+/// it is `(c0 + k, r0 + o)` as it lies, moved by `transposed`'s op, whole; untransposed, the last
+/// row's first `thin` rows alone where asked (an `A` of whole tiles). A walk stays in its row
+/// (or, transposed, its column).
+struct ColumnWalk {
+    r0: u32,
+    c0: u32,
+    outer: u32,
+    inner: u32,
+    at: u32,
+    slot: u32,
+    transposed: Option<u32>,
+    thin: u32,
+}
+
+/// [`ColumnWalk`]'s reads of `x`, in a record [`gather_by_column`] took out of line, as every
+/// by-column path is: [`TensorRef::tile`], [`Cursor`] and the [`GATHER`] arm stay the interleaved
+/// code alone. The mover's per-tile loops are hot for every op, and a by-column branch in them, or
+/// by-column code between their blocks, made every model 2-3% slower with no tensor laid by
+/// column (`docs/plans/decode-bytes-in-flight.md`, C1 results). `emit` is a trait object, so the
+/// mover's issue code is not copied in (the B image's room is `dm::IMAGE_MAX`). Each walk's first
+/// tile takes one division; each next one a step (an interleaved operand down a column, which no
+/// layout's product reads, [`TensorRef::tile_in`] each).
+#[cold]
+#[inline(never)]
+fn walk_by_column(
+    x: &TensorRef,
+    w: &ColumnWalk,
+    emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    let (size, n, by_column) = (TILE_SLOT as u32, x.n as u32, x.col_tiles != 0);
+    if n == 0 {
+        return Err(super::error::RANGE);
+    }
+    let down = w.transposed.is_some();
+    let slot = if down { size } else { w.slot };
+    // A tile's slot is `(g * per + r) * slot` on channel `c`: by column, `g` its column group,
+    // `per` a column's tiles and `r` its row; interleaved, `g` its slot (`per` 1, `r` 0). Each
+    // next tile is a step, the channel carrying into `g`: down a column by column, a row; along
+    // a row, a channel; interleaved down a column, `ct` tiles. One loop body for every walk (the
+    // B image's room).
+    let (dr, dc, dg) = match (by_column, down) {
+        (true, true) => (1, 0, 0),
+        (false, true) => (0, x.ct % n, x.ct / n),
+        (_, false) => (0, 1, 0),
+    };
+    let per = if by_column { x.col_tiles } else { 1 };
+    for o in 0..w.outer {
+        let (i, j) = if down {
+            (w.c0, w.r0 + o)
+        } else {
+            (w.r0 + o, w.c0)
+        };
+        let t = x.first + i * x.ct + j;
+        let (mut r, mut c, mut g) = if by_column {
+            let (r, col) = (t / x.ct, t % x.ct);
+            let (rows, cols) = if down { (w.inner, 1) } else { (1, w.inner) };
+            let past = |a: u32, k: u32, end: u32| a.checked_add(k).is_none_or(|e| e > end);
+            if past(r, rows, x.col_tiles) || past(col, cols, x.ct) {
+                return Err(super::error::RANGE);
+            }
+            (r, col % n, col / n)
+        } else {
+            (0, t % n, t / n)
+        };
+        // Each read: whole tiles, or (the last row of an `A` of whole tiles, where asked) face
+        // 0 whole and face 1's first `thin` rows, as the interleaved walk reads.
+        let thin = if o + 1 == w.outer && !down && w.slot == size {
+            w.thin
+        } else {
+            0
+        };
+        let (op, data, bytes) = match (w.transposed, thin) {
+            (Some(op), _) => (op, 0, size),
+            (None, 0) => (op::READ, 0, w.slot),
+            (None, thin) => (op::READ, TILE_DATA as u32, 1024 + 64 * thin),
+        };
+        for k in 0..w.inner {
+            // `c < n <= 8` (`TensorRef::decode`), so the mask only spares a bounds check.
+            let at = c as usize & 7;
+            let off = (g.checked_mul(per))
+                .and_then(|s| s.checked_add(r)?.checked_mul(slot))
+                .and_then(|o| o.checked_add(x.base[at]))
+                .ok_or(super::error::RANGE)?;
+            let port = (w.r0 + w.c0 + o + k) % PORTS;
+            let to = w.at + (o * w.inner + k) * w.slot;
+            emit([
+                op,
+                x.channels[at] as u32,
+                port,
+                off + data,
+                to + data,
+                bytes,
+                0,
+                0,
+            ])?;
+            (r, c, g) = (r + dr, c + dc, g + dg);
+            if c >= n {
+                (c, g) = (c - n, g + 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A [`GATHER`] with an operand laid by column, or a mark of the L1 order (refused unless `B` is
+/// laid by column and read by column), out of line: `B`'s marks checked before anything is read
+/// ([`gather_span`]), then `A`'s reads and `B`'s, each operand in its own layout
+/// ([`walk_by_column`]), or `B`'s span. The same reads the arm gives an interleaved record, at
+/// each tile's place.
+#[cold]
+#[inline(never)]
+fn gather_by_column(
+    rec: &[[u32; 8]],
+    a: &TensorRef,
+    b: &TensorRef,
+    [a_slot, b_slot]: [u32; 2],
+    emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    // The header and the slots as its arm checked them.
+    let [_, f, a_at, b_at, i0, rows, j0, cols] = rec[0];
+    let (a_t, b_t, kt) = (f & 1 != 0, f & 2 != 0, gather_kt(f));
+    let span = gather_span(rec, b, f, b_at, kt, j0, cols, b_slot)?;
+    if f & GATHER_A_RESIDENT == 0 {
+        let walk = ColumnWalk {
+            r0: i0,
+            c0: 0,
+            outer: rows,
+            inner: kt,
+            at: a_at,
+            slot: a_slot,
+            transposed: a_t.then_some(op::READ_TRANSPOSED),
+            thin: (f >> GATHER_ROWS_SHIFT) & 0x1f,
+        };
+        walk_by_column(a, &walk, emit)?;
+    }
+    if let Some(span) = span {
+        for n in 0..span.count() {
+            emit(span.read_any(n, b))?;
+        }
+        return Ok(());
+    }
+    if f & GATHER_B_RESIDENT != 0 {
+        return Ok(());
+    }
+    // Unpacked, the kernel transposes the tile as it lies.
+    let op = match f & GATHER_B_UNPACK_TRANSPOSE != 0 {
+        true => op::READ,
+        false => op::READ_TRANSPOSED,
+    };
+    let walk = ColumnWalk {
+        r0: 0,
+        c0: j0,
+        outer: kt,
+        inner: cols,
+        at: b_at,
+        slot: b_slot,
+        transposed: b_t.then_some(op),
+        thin: 0,
+    };
+    walk_by_column(b, &walk, emit)
 }
 
 fn extent(v: u32) -> Result<u32, u32> {
@@ -848,7 +1210,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 return Err(super::error::RANGE);
             }
             let (rows, cols) = (extent(rows)?, extent(cols)?);
-            let (a, b) = (tensor(rec, 1)?, tensor(rec, 3)?);
+            let (a, b) = (tensor_any(rec, 1)?, tensor_any(rec, 3)?);
             // Tile (i, j) of op(X), into L1 at `to`.
             let fetch =
                 |x: &TensorRef, t: bool, i: u32, j: u32, to: u32| -> Result<[u32; 8], u32> {
@@ -876,6 +1238,15 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             let thin = (flags >> GATHER_ROWS_SHIFT) & 0x1f;
             if thin > 16 || (thin != 0 && a_t) {
                 return Err(super::error::RANGE);
+            }
+            // A by-column operand, or a mark of the L1 order, goes out of line once a record: what
+            // follows is the interleaved code as it was before the layout, byte for byte (tests in
+            // its per-tile loops, or its blocks spread apart, cost every model 2-3%: the movers'
+            // code shares L1 with the compute cores' instruction fetches).
+            if a.col_tiles != 0 || b.col_tiles != 0 || l1_by_column(rec, 1) || l1_by_column(rec, 3)
+            {
+                let slots = [a_slot as u32, b_slot as u32];
+                return gather_by_column(rec, &a, &b, slots, &mut emit);
             }
             for i in (0..rows).filter(|_| !resident) {
                 let mut row = if a_t {
@@ -2621,5 +2992,493 @@ mod tests {
         .unwrap();
         assert_eq!(reads.len(), 64, "a read a tile");
         assert!(reads.iter().all(|r| r[5] == 2112));
+    }
+
+    /// A tensor laid by column over `n` channels, `ct` columns of `col_tiles` tiles: channel `c`
+    /// at `0x40_0000 + 0x1_0000 * c`.
+    fn by_column(n: u8, ct: u32, col_tiles: u32, first: u32) -> TensorRef {
+        let mut x = TensorRef {
+            n,
+            first,
+            ct,
+            col_tiles,
+            ..TensorRef::default()
+        };
+        for c in 0..n as usize {
+            (x.channels[c], x.base[c]) = (7 - c as u8, 0x40_0000 + 0x1_0000 * c as u32);
+        }
+        x
+    }
+
+    /// Where tile `(r, c)` of [`by_column`]'s tensor sits, from the layout's definition
+    /// (`docs/plans/decode-bytes-in-flight.md` Phase C1): column `c` on channel `c % n`, its
+    /// row `r` at slot `(c / n) * col_tiles + r` there.
+    fn by_column_oracle(x: &TensorRef, r: u32, c: u32, slot: u32) -> (u32, u32) {
+        let n = x.n as u32;
+        let k = (c % n) as usize;
+        (
+            x.channels[k] as u32,
+            x.base[k] + ((c / n) * x.col_tiles + r) * slot,
+        )
+    }
+
+    fn expanded_reads(rec: &[[u32; 8]]) -> Result<Vec<[u32; 8]>, u32> {
+        let mut reads = Vec::new();
+        expand_reads(
+            rec,
+            |_| 0,
+            |e| {
+                reads.push(e);
+                Ok(())
+            },
+        )?;
+        Ok(reads)
+    }
+
+    /// [`walk_by_column`]'s reads of `x`, untransposed: rows `r0..r0 + outer` from column `c0`.
+    fn walked(
+        x: &TensorRef,
+        r0: u32,
+        c0: u32,
+        outer: u32,
+        inner: u32,
+        slot: u32,
+    ) -> Result<Vec<[u32; 8]>, u32> {
+        let w = ColumnWalk {
+            r0,
+            c0,
+            outer,
+            inner,
+            at: 0,
+            slot,
+            transposed: None,
+            thin: 0,
+        };
+        let mut reads = Vec::new();
+        walk_by_column(x, &w, &mut |e| {
+            reads.push(e);
+            Ok(())
+        })?;
+        Ok(reads)
+    }
+
+    /// A reference laid by column survives its encoding; each tile along any row, from any
+    /// column, is where the layout puts it; a walk past its row's end or the columns' length is
+    /// refused, not read from the next; the reference is refused where it names nothing.
+    #[test]
+    fn a_tensor_laid_by_column_puts_each_column_in_one_channel() {
+        for (n, ct, col_tiles, first) in [(8u8, 20u32, 6u32, 0u32), (3, 7, 4, 9), (1, 3, 5, 0)] {
+            let x = by_column(n, ct, col_tiles, first);
+            let w = x.encode();
+            assert_eq!(w[0][4], REF_BY_COLUMN);
+            assert_eq!(w[0][5], col_tiles);
+            assert_eq!(TensorRef::decode(w), Ok(x));
+            let (r_first, c_first) = (first / ct, first % ct);
+            let rows = col_tiles - r_first;
+            let range = Err(super::super::error::RANGE);
+            for slot in [TILE_SLOT as u32, 2112] {
+                for r0 in 0..rows {
+                    for c0 in 0..ct - c_first {
+                        let inner = ct - c_first - c0;
+                        let got = walked(&x, r0, c0, 1, inner, slot).unwrap();
+                        let want: Vec<_> = (0..inner)
+                            .map(|k| by_column_oracle(&x, r_first + r0, c_first + c0 + k, slot))
+                            .collect();
+                        let at: Vec<_> = got.iter().map(|e| (e[1], e[3])).collect();
+                        assert_eq!(at, want, "row {r0}, from {c0}, slot {slot}");
+                        assert_eq!(
+                            walked(&x, r0, c0, 1, inner + 1, slot),
+                            range,
+                            "past the row"
+                        );
+                    }
+                }
+                assert_eq!(
+                    walked(&x, rows, 0, 1, 1, slot),
+                    range,
+                    "past the columns' length"
+                );
+            }
+        }
+        // Interleaved stays as it was: no flag, no length.
+        let plain = TensorRef {
+            n: 8,
+            ct: 4,
+            ..TensorRef::default()
+        };
+        assert_eq!(plain.encode()[0][4..6], [0, 0]);
+        // A mark with no length, or over no columns, names nothing.
+        let mut w = by_column(8, 4, 2, 0).encode();
+        w[0][5] = 0;
+        assert_eq!(TensorRef::decode(w), Err(super::super::error::RANGE));
+        let mut w = by_column(8, 4, 2, 0).encode();
+        w[0][3] = 0;
+        assert_eq!(TensorRef::decode(w), Err(super::super::error::RANGE));
+    }
+
+    /// A block over a `B` laid by column, read by row as today's kernels read it: a read a
+    /// tile, each tile from where the layout puts it into `b_at + (kk * cols + j) * slot`, in
+    /// the interleaved walk's order. Transposed, each tile `(j0 + j, kk)` as it lies, moved
+    /// transposed or (unpacked) as it lies. A row's walk past its last column is refused, and so
+    /// is a read ahead of the record: [`PrefetchCursor`] walks interleaved tiles only.
+    #[test]
+    fn a_block_reads_a_b_laid_by_column_a_tile_at_a_time() {
+        let bf16 = gather_b_format(crate::tile::L1Format::Bf16).unwrap();
+        for flags in [0, bf16] {
+            let slot = gather_b_slot(flags).unwrap() as u32;
+            for (n, ct, col_tiles, first, kt, j0, cols) in [
+                (8u8, 64u32, 64u32, 0u32, 16u32, 8u32, 12u32),
+                (8, 20, 10, 40, 4, 3, 17),
+                (3, 7, 5, 1, 3, 2, 4),
+            ] {
+                let what = std::format!("slot {slot}, n {n}, ct {ct}, first {first}, j0 {j0}");
+                let b = by_column(n, ct, col_tiles, first);
+                let rec = b_gather(flags, kt, j0, cols, &b, false);
+                let reads = expanded_reads(&rec).unwrap();
+                let mut oracle = Vec::new();
+                for kk in 0..kt {
+                    for j in 0..cols {
+                        let t = first + kk * ct + j0 + j;
+                        let (ch, off) = by_column_oracle(&b, t / ct, t % ct, slot);
+                        let to = 0x2_0000 + (kk * cols + j) * slot;
+                        oracle.push([op::READ, ch, (kk + j0 + j) % PORTS, off, to, slot, 0, 0]);
+                    }
+                }
+                assert_eq!(reads, oracle, "{what}");
+                let mut ahead = rec.clone();
+                ahead[0][1] |= GATHER_PREFETCH;
+                let layout = super::super::error::LAYOUT;
+                assert_eq!(expanded_reads(&ahead), Err(layout), "{what}: ahead");
+                let pump = PrefetchCursor::new(&ahead).map(|_| ());
+                assert_eq!(pump, Err(layout), "{what}: pump");
+                // One column past the row's end.
+                let wide = b_gather(flags, kt, ct - cols, cols + 1, &b, false);
+                let past = Err(super::super::error::RANGE);
+                assert_eq!(expanded_reads(&wide), past, "{what}: past the row");
+            }
+        }
+        // Transposed (whole tiles): tile `(kk, j0 + j)` of op(B) is `(j0 + j, kk)` as it lies.
+        let b = by_column(8, 12, 40, 0);
+        for (extra, op) in [
+            (2, op::READ_TRANSPOSED),
+            (2 | GATHER_B_UNPACK_TRANSPOSE, op::READ),
+        ] {
+            let (kt, j0, cols) = (12u32, 5u32, 9u32);
+            let rec = b_gather(extra, kt, j0, cols, &b, false);
+            let mut oracle = Vec::new();
+            for kk in 0..kt {
+                for j in 0..cols {
+                    let (ch, off) = by_column_oracle(&b, j0 + j, kk, TILE_SLOT as u32);
+                    let to = 0x2_0000 + (kk * cols + j) * TILE_SLOT as u32;
+                    let slot = TILE_SLOT as u32;
+                    oracle.push([op, ch, (kk + j0 + j) % PORTS, off, to, slot, 0, 0]);
+                }
+            }
+            assert_eq!(
+                expanded_reads(&rec).unwrap(),
+                oracle,
+                "transposed {extra:#x}"
+            );
+            // Down a column past its length (rows 5..14 of 13): refused, not read from the next.
+            let short = by_column(8, 12, 13, 0);
+            let rec = b_gather(extra, kt, j0, cols, &short, false);
+            let past = Err(super::super::error::RANGE);
+            assert_eq!(expanded_reads(&rec), past, "transposed {extra:#x}, past");
+        }
+    }
+
+    /// A stored weight on a product's left: an `A` laid by column is read as an interleaved `A`
+    /// is, a read a tile into `a_at + (i * kt + kk) * slot`, each from where the layout puts it:
+    /// whole, packed (its own slot), its last row's first rows alone (`thin`), and transposed
+    /// (tile `(kk, i0 + i)` as it lies, moved transposed).
+    #[test]
+    fn a_block_reads_an_a_laid_by_column_a_tile_at_a_time() {
+        let bf16 = gather_a_format(crate::tile::L1Format::Bf16).unwrap();
+        let a = by_column(8, 24, 30, 24 * 2);
+        let b = TensorRef {
+            n: 1,
+            ct: 1,
+            ..TensorRef::default()
+        };
+        let (i0, rows, kt, a_at) = (3u32, 5u32, 11u32, 0x8_0000u32);
+        for (flags, t, thin) in [
+            (0, false, 0),
+            (bf16, false, 0),
+            (gather_rows(5), false, 5),
+            (1, true, 0),
+        ] {
+            let slot = gather_a_slot(flags).unwrap() as u32;
+            let (ar, br) = (a.encode(), b.encode());
+            let h = [
+                GATHER,
+                flags | GATHER_B_RESIDENT | kt << 8,
+                a_at,
+                0x2_0000,
+                i0,
+                rows,
+                0,
+                1,
+            ];
+            let rec = [h, ar[0], ar[1], br[0], br[1]];
+            let mut oracle = Vec::new();
+            for i in 0..rows {
+                for kk in 0..kt {
+                    let to = a_at + (i * kt + kk) * slot;
+                    let port = (i0 + i + kk) % PORTS;
+                    let (tr, tc) = if t {
+                        let n = a.first + kk * a.ct + i0 + i;
+                        (n / a.ct, n % a.ct)
+                    } else {
+                        let n = a.first + (i0 + i) * a.ct + kk;
+                        (n / a.ct, n % a.ct)
+                    };
+                    let (ch, off) =
+                        by_column_oracle(&a, tr, tc, if t { TILE_SLOT as u32 } else { slot });
+                    oracle.push(if t {
+                        [
+                            op::READ_TRANSPOSED,
+                            ch,
+                            port,
+                            off,
+                            to,
+                            TILE_SLOT as u32,
+                            0,
+                            0,
+                        ]
+                    } else if thin != 0 && i + 1 == rows {
+                        let d = TILE_DATA as u32;
+                        [op::READ, ch, port, off + d, to + d, 1024 + 64 * thin, 0, 0]
+                    } else {
+                        [op::READ, ch, port, off, to, slot, 0, 0]
+                    });
+                }
+            }
+            assert_eq!(expanded_reads(&rec).unwrap(), oracle, "flags {flags:#x}");
+        }
+    }
+
+    /// A record with an operand laid by column goes out of line ([`gather_by_column`]), and its
+    /// other, interleaved operand is read there exactly as the arm reads it: `A` whole, packed,
+    /// thin and transposed beside a `B` laid by column, and `B` untransposed, packed, transposed
+    /// and unpacked beside an `A` laid by column, each equal to the same record's reads with both
+    /// interleaved (over 5 channels, so the walk wraps, from a `first` past 0).
+    #[test]
+    fn an_interleaved_operand_beside_one_laid_by_column_is_read_as_the_arm_reads_it() {
+        let flat = |x: TensorRef| TensorRef {
+            n: 5,
+            col_tiles: 0,
+            ..x
+        };
+        let (i0, rows, kt, j0, cols) = (3u32, 5u32, 11u32, 2u32, 6u32);
+        let (a_at, b_at) = (0x8_0000u32, 0x2_0000u32);
+        let record = |flags: u32, a: &TensorRef, b: &TensorRef| {
+            let (ar, br) = (a.encode(), b.encode());
+            let h = [GATHER, flags | kt << 8, a_at, b_at, i0, rows, j0, cols];
+            [h, ar[0], ar[1], br[0], br[1]]
+        };
+        let a_reads = (rows * kt) as usize;
+        // `A` interleaved (`ct` 30, `first` 7) beside `B` laid by column, and its twin.
+        let (a, b) = (flat(by_column(8, 30, 40, 7)), by_column(8, 40, 12, 0));
+        let bf16 = gather_a_format(crate::tile::L1Format::Bf16).unwrap();
+        for flags in [0, bf16, gather_rows(5), 1] {
+            let cold = expanded_reads(&record(flags, &a, &b)).unwrap();
+            let arm = expanded_reads(&record(flags, &a, &flat(b))).unwrap();
+            assert_eq!(cold[..a_reads], arm[..a_reads], "A, flags {flags:#x}");
+            assert_ne!(
+                cold[a_reads..],
+                arm[a_reads..],
+                "B read by column, flags {flags:#x}"
+            );
+        }
+        // `B` interleaved (`ct` 40, `first` 3) beside `A` laid by column, and its twin.
+        let (a, b) = (by_column(8, 16, 10, 0), flat(by_column(8, 40, 40, 3)));
+        let packed = gather_b_format(crate::tile::L1Format::Bf16).unwrap();
+        let unpacked = 2 | GATHER_B_UNPACK_TRANSPOSE;
+        for flags in [0, packed, 2, unpacked] {
+            let cold = expanded_reads(&record(flags, &a, &b)).unwrap();
+            let arm = expanded_reads(&record(flags, &flat(a), &b)).unwrap();
+            assert_eq!(cold[a_reads..], arm[a_reads..], "B, flags {flags:#x}");
+            assert_eq!(cold.len(), arm.len(), "flags {flags:#x}");
+            assert_ne!(
+                cold[..a_reads],
+                arm[..a_reads],
+                "A read by column, flags {flags:#x}"
+            );
+        }
+    }
+
+    /// Phase C1's decode read: a `B` laid by column, taken into L1 by column
+    /// ([`REF_L1_BY_COLUMN`], tile `(kk, j)` at `b_at + (j * kt + kk) * slot`), is read a run a
+    /// column in pieces of at most one request, each run on its column's channel, and moves
+    /// exactly the bytes, to exactly the slots, that a read a tile would (the oracle, from the
+    /// layout's definition). A stream's chunk (`first` past row 0) and a view's columns (`j0`)
+    /// alike; a read ahead reads the same pieces and the pump's cursor gives them.
+    #[test]
+    fn a_b_laid_by_column_read_by_column_comes_in_large_pieces() {
+        let bf16 = gather_b_format(crate::tile::L1Format::Bf16).unwrap();
+        let bfp8 = gather_b_format(crate::tile::L1Format::Bfp8).unwrap();
+        for flags in [0, bf16, bfp8] {
+            let slot = gather_b_slot(flags).unwrap() as u32;
+            for (n, ct, col_tiles, first, kt, j0, cols) in [
+                (8u8, 64u32, 64u32, 0u32, 64u32, 9u32, 2u32),
+                (8, 64, 256, 64 * 32, 32, 13, 1),
+                (8, 512, 64, 0, 64, 500, 5),
+                (3, 7, 9, 7 * 2 + 1, 5, 1, 4),
+                (1, 3, 600, 0, 600, 0, 3),
+            ] {
+                let what = std::format!(
+                    "slot {slot}, n {n}, ct {ct}, col_tiles {col_tiles}, first {first}, kt {kt}, \
+                     j0 {j0}, cols {cols}"
+                );
+                let b = by_column(n, ct, col_tiles, first);
+                let mut rec = b_gather(flags | GATHER_STREAM, kt, j0, cols, &b, false);
+                rec[3][4] |= REF_L1_BY_COLUMN;
+                let reads = expanded_reads(&rec).unwrap();
+                let mut oracle = Vec::new();
+                for kk in 0..kt {
+                    for j in 0..cols {
+                        let t = first + kk * ct + j0 + j;
+                        let (ch, off) = by_column_oracle(&b, t / ct, t % ct, slot);
+                        oracle.push([
+                            op::READ,
+                            ch,
+                            0,
+                            off,
+                            0x2_0000 + (j * kt + kk) * slot,
+                            slot,
+                            0,
+                            0,
+                        ]);
+                    }
+                }
+                assert_eq!(
+                    units_moved(&reads),
+                    units_moved(&oracle),
+                    "{what}: the bytes moved"
+                );
+                let per_column = (kt * slot).div_ceil(16384);
+                assert_eq!(reads.len() as u32, cols * per_column, "{what}: reads");
+                assert!(
+                    reads.iter().all(|r| r[5] <= 16384 && r[2] < PORTS),
+                    "{what}"
+                );
+                assert!(
+                    reads.iter().all(|r| r[3] % 64 == r[4] % 64),
+                    "{what}: congruent"
+                );
+                // Each column's pieces come from its own channel, the columns' pieces in turn.
+                for (k, r) in reads.iter().enumerate() {
+                    let c = (first % ct) + j0 + k as u32 % cols;
+                    assert_eq!(
+                        r[1],
+                        b.channels[(c % n as u32) as usize] as u32,
+                        "{what}: channel"
+                    );
+                }
+                let mut ahead = rec.clone();
+                ahead[0][1] = ahead[0][1] & !GATHER_STREAM | GATHER_PREFETCH;
+                let expanded = expanded_reads(&ahead).unwrap();
+                assert_eq!(expanded, reads, "{what}: ahead's reads are the stream's");
+                let cursor = PrefetchCursor::new(&ahead).unwrap().unwrap();
+                assert_eq!(
+                    cursor.left(),
+                    expanded.len() as u32,
+                    "{what}: the cursor's count"
+                );
+                let pumped: Vec<_> = cursor.map(Result::unwrap).collect();
+                assert_eq!(pumped, expanded, "{what}: the cursor's reads");
+            }
+        }
+    }
+
+    /// What a layout mark cannot describe is refused ([`super::super::error::LAYOUT`]) before
+    /// anything is read: an L1 order by column over an interleaved, transposed or resident `B`
+    /// or on `A`, a reader's piece mark beside a layout by column; and every record but a
+    /// [`GATHER`] refuses a tensor laid by column, where the same record interleaved expands.
+    /// A block past its columns or their length is out of range.
+    #[test]
+    fn what_a_layout_by_column_cannot_take_is_refused() {
+        use super::super::error::{LAYOUT, RANGE};
+        let by_col = by_column(8, 16, 8, 0);
+        let interleaved = TensorRef {
+            n: 8,
+            ct: 16,
+            channels: [0, 1, 2, 3, 4, 5, 6, 7],
+            ..TensorRef::default()
+        };
+        let read = |rec: &[[u32; 8]]| expanded_reads(rec).map(|_| ());
+        // The order by column over an interleaved `B`.
+        let mut rec = b_gather(GATHER_STREAM, 4, 0, 2, &interleaved, false);
+        rec[3][4] |= REF_L1_BY_COLUMN;
+        assert_eq!(read(&rec), Err(LAYOUT));
+        assert_eq!(
+            PrefetchCursor::new(&{
+                let mut r = rec.clone();
+                r[0][1] = r[0][1] & !GATHER_STREAM | GATHER_PREFETCH;
+                r
+            }),
+            Err(LAYOUT)
+        );
+        // Transposed, resident, on `A`, or marked laid for its reader too.
+        let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
+        rec[0][1] |= 2;
+        rec[3][4] |= REF_L1_BY_COLUMN;
+        assert_eq!(read(&rec), Err(LAYOUT));
+        let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
+        rec[0][1] |= GATHER_B_RESIDENT;
+        rec[3][4] |= REF_L1_BY_COLUMN;
+        assert_eq!(read(&rec), Err(LAYOUT));
+        let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
+        rec[1][4] |= REF_L1_BY_COLUMN;
+        assert_eq!(read(&rec), Err(LAYOUT));
+        let mut rec = b_gather(GATHER_STREAM, 4, 0, 2, &by_col, false);
+        rec[3][4] |= REF_LAID_FOR_READER;
+        assert_eq!(read(&rec), Err(LAYOUT));
+        // Past the grid's columns, or the columns' length.
+        let mut rec = b_gather(GATHER_STREAM, 4, 15, 2, &by_col, false);
+        rec[3][4] |= REF_L1_BY_COLUMN;
+        assert_eq!(read(&rec), Err(RANGE));
+        let mut rec = b_gather(GATHER_STREAM, 9, 0, 2, &by_col, false);
+        rec[3][4] |= REF_L1_BY_COLUMN;
+        assert_eq!(read(&rec), Err(RANGE));
+        let mut rec = b_gather(0, 9, 0, 2, &by_col, false);
+        assert_eq!(read(&rec), Err(RANGE), "a tile at a time, past the length");
+        rec[0][1] |= GATHER_B_RESIDENT;
+        assert_eq!(read(&rec), Ok(()), "resident: nothing of `B` read");
+        // Every other record.
+        for head in [
+            [SCATTER, 0x2_0000, TILE_SLOT as u32, 0, 1, 0, 1, 0],
+            [FILL_PAD, 0, 0, 1, 1, 0, 0x2_0000, 1],
+            [PAD_WRITE, 0, 0, 1, 1, 0, 0x2_0000, 1],
+            [READ_RUN, 0, 2, 0x2_0000, 0, 16, 0, 0],
+            [WRITE_RUN, 0, 2, 0x2_0000, 0, 0, 0, 0],
+            [SELECT_ROWS, 0x3_0000, 1, 32, 0, 2, 0x2_0000, 0],
+            [SCATTER_ROWS, 0x3_0000, 1, 32, 0, 2, 0x2_0000, 0],
+        ] {
+            let rec_of = |x: &TensorRef| {
+                let [x0, x1] = x.encode();
+                [head, x0, x1]
+            };
+            assert_eq!(
+                expand(&rec_of(&interleaved), |_| Ok(())),
+                Ok(()),
+                "op {:#x} interleaved",
+                head[0]
+            );
+            assert_eq!(
+                expand(&rec_of(&by_col), |_| Ok(())),
+                Err(LAYOUT),
+                "op {:#x} by column",
+                head[0]
+            );
+            let mut marked = rec_of(&interleaved);
+            marked[1][4] |= REF_L1_BY_COLUMN;
+            assert_eq!(
+                expand(&marked, |_| Ok(())),
+                Err(LAYOUT),
+                "op {:#x} marked",
+                head[0]
+            );
+        }
     }
 }

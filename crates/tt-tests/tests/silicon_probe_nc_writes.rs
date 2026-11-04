@@ -57,6 +57,7 @@ fn nc_writes_against_records() {
             base: [base; 8],
             first: 0,
             ct: 32,
+            col_tiles: 0,
         };
         // A tile's datums (past the 16-byte header, before the slot's padding) are what both forms write.
         let datums = |k: u32| {
