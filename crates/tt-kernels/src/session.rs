@@ -2927,10 +2927,11 @@ impl<T: Transport> Session<T> {
             // (`docs/plans/planned-l1-residency.md` 3b): a 1.7B step 19.51 -> 18.40 ms at the
             // prefetch cap of 2 (`dm::PREFETCH_CAP_DEFAULT`), nothing measured slower.
             busy_prefetch: std::env::var("TT_BUSY_PREFETCH").map_or(true, |v| v != "0"),
-            // On by default since 2026-11-03 (`docs/plans/decode-bytes-in-flight.md` Phase B): a 1.7B
-            // decode step 11.01 / 12.17 -> 9.89 / 10.90 ms at 32 / 256 tokens on card 1, bit for bit,
-            // for ~3.4 GB more GDDR; `TT_WEIGHT_LAYOUT=0` turns it off and keeps the GDDR.
-            weight_layout: std::env::var("TT_WEIGHT_LAYOUT").map_or(true, |v| v != "0"),
+            // Off by default (`docs/plans/decode-bytes-in-flight.md` Phase B; on 2026-11-03, reverted the
+            // same day): a 1.7B decode step 11.01 / 12.17 -> 9.89 / 10.90 ms at 32 / 256 tokens on card
+            // 1, bit for bit, but for a second copy of every streamed weight (~3.4 GB on the 1.7B), which
+            // grows with the model and does not scale. `TT_WEIGHT_LAYOUT=1` turns it on.
+            weight_layout: std::env::var("TT_WEIGHT_LAYOUT").is_ok_and(|v| v == "1"),
             relaid_dirty: Vec::new(),
             // On by default since 2026-10-29 (`docs/completed-plans/dataflow-compiler.md` F4a.2): a 1.7B step
             // 11.32 / 12.69 -> 10.95 / 12.16 ms at 32 / 256 tokens on card 1, bit for bit;
@@ -10365,10 +10366,11 @@ impl<T: Transport> Session<T> {
     /// after their weight is written in place, and freed with it. Eager products read the weight as
     /// it lies.
     ///
-    /// **On by default; it costs GDDR.** Each relaid weight is held twice, as it lies (for prefill,
-    /// eager ops and token lookups) and as relaid: a SmolLM2-1.7B holds ~3.4 GB more, a weight's
-    /// streamed bytes once more. `TT_WEIGHT_LAYOUT=0` at open, or `set_weight_layout(false)` before
-    /// the first capture, keeps that GDDR (regions already made stay until their weight is freed).
+    /// **Off by default: it costs GDDR in proportion to the weights.** Each relaid weight is held
+    /// twice, as it lies (for prefill, eager ops and token lookups) and as relaid: a SmolLM2-1.7B
+    /// holds ~3.4 GB more, a weight's streamed bytes once more, so a model that fills the card
+    /// cannot afford it. `TT_WEIGHT_LAYOUT=1` at open, or `set_weight_layout(true)` before the
+    /// first capture, turns it on (regions already made stay until their weight is freed).
     /// Where a region would leave its channel less than [`RELAID_HEADROOM`] free, that record reads
     /// its weight as it lies.
     ///

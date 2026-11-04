@@ -205,7 +205,8 @@ Started 2026-11-02, after Phase A's kill did not fire.
   - card 0: the 1.7B's four shapes, `step188`, and `step12_mnist`.
 - **Then, as roadmap items:** X9's load-time layout pass, and X10's entry size and reads in flight in the cost model.
 
-**As built** (`Session::set_weight_layout`; on by default since 2026-11-03, `TT_WEIGHT_LAYOUT=0` turns it off).
+**As built** (`Session::set_weight_layout`; opt-in, `TT_WEIGHT_LAYOUT=1`. It was on by default for part of 2026-11-03,
+then reverted because the second copy does not scale; see "The default reverted" below).
 
 - **No new encoding: a one-channel `B` is X9's layout.** A `TensorRef` with `n == 1` already puts tile `t` at
   `base + t * slot`. So a region holding a record's tiles in the order it reads them (`kk * cols + j`) is a plain
@@ -336,6 +337,18 @@ Started 2026-11-02, after Phase A's kill did not fire.
   session with `TT_WEIGHT_LAYOUT=0`, or call `Session::set_weight_layout(false)` before the first capture (regions
   already made stay until their weight is freed). A region leaves its channel 64 MiB free (`RELAID_HEADROOM`); with
   less, that record reads its weight as it lies, with the same bits (`step267`'s full-GDDR test).
+
+**The default reverted (owner, 2026-11-03): opt-in again, because a second copy does not scale.**
+- **What changed.** `TT_WEIGHT_LAYOUT=1` (or `Session::set_weight_layout(true)`) turns the layout on. By default
+  each weight is held once, as it lies, and a read ahead's cap is the mover's 2 again.
+- **Why.** The second copy's GDDR grows with the weights: ~3.4 GB on the 1.7B in BF16 and 6.8 GB in F32. A model
+  that fills a card, or is split across both, cannot afford it, and the 1.7B is a test model. C0 (below) showed that
+  one copy in this form slows every other reader.
+- **The rule** now on the roadmap
+  ([constraint](roadmap.md#constraint-every-default-must-scale-to-larger-models)): a default holds a weight's bytes
+  once. A gain that needs spare GDDR stays opt-in, with its cost named.
+- **Kept.** The code, `step267` (in `--smoke`, so the opt-in path is still exercised), `silicon_bench_relaid` and
+  the C0 probes. They may serve prefill and decode on different cards, where each card holds one layout.
 
 ## Phase C: one copy instead of two (opened 2026-11-03)
 
@@ -473,7 +486,7 @@ every tile exactly once.
   (`Session::set_weight_layout`, opt-in), regions freed with their source and refilled after a write, the read-ahead
   cap the layout needs, the host's lookups by source. Gates on ttsim and card 0; decode 11.08 / 12.27 -> 9.90 /
   10.94 ms on card 1 (above).
-- [x] The default: **on since 2026-11-03**, by the owner's call, for ~3.4 GB more GDDR on the 1.7B (`TT_WEIGHT_LAYOUT=0`
+- [x] The default: **on 2026-11-03** by the owner's call (reverted the same day, below), for ~3.4 GB more GDDR on the 1.7B (`TT_WEIGHT_LAYOUT=0`
   opts out). A region leaves its channel 64 MiB free (`RELAID_HEADROOM`), else its weight is read as it lies
   (`step267::a_full_gddr_leaves_the_weight_where_it_lies`: watched failing on ttsim with no fallback, and on card 0,
   `1793679359`, with no headroom, where the regions took channel 0's last room and the capture's own stored streams
@@ -513,10 +526,19 @@ every tile exactly once.
   run, no new encoding); the tied head's token lookups, in-place writes and downloads need their own paths; the split
   is fixed at load from the decode deal. **Bound first:** prefill and an eager `m > 1` product over the relaid layout,
   card 1, against today's.
-- [ ] If one copy stalls: relay only `down` and `qkv` (Phase A's gains), roughly half the extra GDDR, measured.
-- [ ] Regions that yield: on a refused allocation, free relaid regions no live trace reads before failing it; drop
-  them on `set_weight_layout(false)`.
+- [x] **The default reverted** (2026-11-03, owner): opt-in again (`TT_WEIGHT_LAYOUT=1`), because the second copy
+  grows with the weights (above).
+- [ ] **The scalable form** (next): one stored layout, made at load time from one deal per weight. Decode reads it in
+  large pieces, and prefill and eager blocks read it through a record with an L1 pitch (a new encoding), at about
+  today's entries. Bound it first against the one-copy default, on prefill and eager as well as decode.
+- [ ] Item 5's copy-free levers (bank-affine placement, atomic column claims, a dedicated prefetcher), ranked against
+  the scalable form after its bound.
 - [ ] `gate|up`'s evenness: its mean unit is faster but not its slowest. A deal that sizes each unit's share to the rate
-  it gets, measured with the pipeline detail (X10).
-- [ ] X9 at load time: the regions are made at a capture's first sight of a weight; a model loader could make them
-  when the weights are stored, with the deal the decode traces will use.
+  it gets, measured with the pipeline detail (X10). Layout-independent.
+- Parked, opt-in only (two-copy refinements that cannot become a default):
+  - relay only `down` and `qkv` (Phase A's gains), roughly half the extra GDDR;
+  - regions that yield: on a refused allocation, free relaid regions no live trace reads before failing it, and drop
+    them on `set_weight_layout(false)`;
+  - two-copy regions made at load time, not at a capture's first sight.
+- Parked use: prefill and decode on different cards, each holding one layout (needs the decode card's other readers
+  to read the regions, C0's gap).

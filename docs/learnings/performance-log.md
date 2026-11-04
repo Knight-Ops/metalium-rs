@@ -12,8 +12,9 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [X9's weight layout back to opt-in: a default must hold the weights once](#x9s-weight-layout-back-to-opt-in-a-default-must-hold-the-weights-once-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b, owner's call: `TT_WEIGHT_LAYOUT=1` opts in, the default reads each weight as it lies (one copy, read-ahead cap 2); the second copy grows with the model and does not scale (the roadmap's new constraint); 1.7B decode 10.96 / 12.14 ms by default, 9.75 / 10.88 opted in (card 1), prefill unchanged; card 0 `step267`, `step12_mnist`, `step188` pass |
 | [One copy of a relaid weight, bounded: the kill fires](#one-copy-of-a-relaid-weight-bounded-the-kill-fires-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase C0 (`tensor::probe_relaid_blocks`, bit for bit): every other product over a relaid weight read from its regions; eager products 1.34-3.38x slower, prefill over one-column runs 4-13% slower, decode unchanged; the decode deal's 1-2-column runs make ~4x the list entries; 8.3% of column-run tiles held twice; one copy closed in this form |
-| [X9's weight layout, bit for bit: a 1.7B decode step 11.08 -> 9.90 ms](#x9s-weight-layout-bit-for-bit-a-17b-decode-step-1108---990-ms-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase B (on by default since 2026-11-03, ~3.4 GB more GDDR, `TT_WEIGHT_LAYOUT=0` opts out): each unit's share of a streamed weight copied into one channel in its read order, read in 16 KiB pieces (`record::BSpan`), reads ahead too at a cap of 1; bit for bit (`step267`, `step188`); decode 11.08 / 12.27 -> 9.90 / 10.94 ms at 32 / 256 tokens, prefill unchanged; large reads ahead at cap 2 slow the small ops (T8); host scans of ~11,500 regions cost ~0.6 ms a step until indexed by source |
+| [X9's weight layout, bit for bit: a 1.7B decode step 11.08 -> 9.90 ms](#x9s-weight-layout-bit-for-bit-a-17b-decode-step-1108---990-ms-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase B (opt-in, `TT_WEIGHT_LAYOUT=1`; briefly the default on 2026-11-03, ~3.4 GB more GDDR): each unit's share of a streamed weight copied into one channel in its read order, read in 16 KiB pieces (`record::BSpan`), reads ahead too at a cap of 1; bit for bit (`step267`, `step188`); decode 11.08 / 12.27 -> 9.90 / 10.94 ms at 32 / 256 tokens, prefill unchanged; large reads ahead at cap 2 slow the small ops (T8); host scans of ~11,500 regions cost ~0.6 ms a step until indexed by source |
 | [H11's then step: contiguous weights in 16 KiB reads](#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1) | 2026-11-02 | roadmap 2b, Phase A (a timing probe, `tensor::probe_contiguous_b`): more requests at tile-sized entries buy nothing (stream cap 3-8); each unit's weight share contiguous in one channel, read in 16 KiB entries: `down` 1.34-1.43x on its slowest unit, `qkv` 1.4x, `gate\|up`'s mean unit 12-14% but not its slowest (evenness), `o` unchanged; layout alone nothing; the step 10.94 / 12.14 -> 10.55 / 11.95 ms measured, ~1 ms against its own cap; kill not fired, Phase B (bit-exact) next |
 | [A decode product's pipeline metered from inside: read-bound by its reads in flight](#a-decode-products-pipeline-metered-from-inside-read-bound-by-its-reads-in-flight-2026-11-02-cards-0-and-1) | 2026-11-02 | `Detail::Pipeline` times each streamed batch on every unit (B's credits, T0's and T2's tables through an L1 log); the 1.7B's decode products are read-bound, not ring-bound: T0 starves 52-86% of the slowest unit's work, the ring waits 1-2%, perfect overlap saves 0-11%, `fast-reads` changes nothing; a unit reads ~4-5 GB/s, ~1.3 us a 2 KiB read under load: bytes in flight (H11) is the lever; found: the timestamper repeats and drops events in a burst |
 | [Program restores on the card: paged programs copied back by the B movers](#program-restores-on-the-card-paged-programs-copied-back-by-the-b-movers-2026-11-01-cards-0-and-1) | 2026-11-01 | traces keep their programs in GDDR and a replay's B mover copies back what another trace evicted (H15); the host's restore was its cache bookkeeping more than its PCIe writes (410 us a unit, now ~55). 1.7B prefill 2,546 / 2,744 -> **3,040 / 3,827 tokens/s** at 128 / 256 tokens, within 1.2% of subblocks off; decode and the 7,992-token prefill unchanged, bit for bit; found and fixed: a measurement's capture unprotected the paused capture's programs |
@@ -407,6 +408,36 @@ All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
 
+## X9's weight layout back to opt-in: a default must hold the weights once (2026-11-03, cards 0 and 1)
+
+Roadmap Track 2 follow-ups, item 2b ([plan](../plans/decode-bytes-in-flight.md)), after Phase C0 closed one copy in
+its first form (below).
+
+**The decision (owner).** X9's two-copy layout is a speed-up only for the test model. The 1.7B leaves most of a card
+free, but a model that fills a card, or is split across both, has no room for a second copy of its streamed weights.
+`Session::set_weight_layout` is **off by default again**: `TT_WEIGHT_LAYOUT=1` at open, or `set_weight_layout(true)`
+before the first capture, turns it on. Off, a read ahead's cap is the mover's 2 again. No code was removed: the
+layout, its gates (`step267`, still in `--smoke`) and the C0 probes stay, for later uses such as prefill and decode on
+different cards. The rule is now on the roadmap
+([constraint](../plans/roadmap.md#constraint-every-default-must-scale-to-larger-models)) and in the design
+reference's §6: a default holds a weight's bytes once.
+
+**Conditions.** Card 1, release, safe image, every tile (`TT_TILES=all`), `traced_generation_stream_ceiling`, the
+1.7B with BF16 weights and a 512-position cache. 2 warmups, 9 samples, host-timed; the tree `244d705` with the default
+flipped. Runs were default / on / default.
+
+| run | `weight_layout` | decode step, ms (32 / 256 tokens) | prefill, tokens/s (32 / 256) |
+|---|---|--:|--:|
+| `1793723839` | off (default) | **10.961 / 12.142** | 1,090 / 2,087 |
+| `1793724067` | on (`TT_WEIGHT_LAYOUT=1`) | 9.754 / 10.885 | 1,093 / 2,090 |
+| `1793724273` | off (default) | **10.966 / 12.191** | 1,094 / 2,091 |
+
+- **The default is back where it was before Phase B** (11.01 / 12.16, `1793665594` / `1793666028`). Opting in still
+  gives -11% / -10%, matching Phase B's 9.89 / 10.90. Prefill does not move.
+- **Gates at the new default, card 0:** `step267_weight_layout` 6 of 6 (`1793721589`, the opt-in path),
+  `step12_mnist` 8 of 8 (`1793721606`), `step188_smollm2_1_7b` 3 of 3 (`1793721621`; its traced generation equals the
+  eager one, bit for bit). On ttsim, `step267` passes 6 of 6. The host's `tt-kernels` suite passes 343 of 343.
+
 ## One copy of a relaid weight, bounded: the kill fires (2026-11-03, cards 0 and 1)
 
 Roadmap Track 2 follow-ups, item 2b, Phase C0 ([plan](../plans/decode-bytes-in-flight.md#c0-the-bound-a-bit-exact-probe-timing-decides)).
@@ -460,8 +491,8 @@ lies.
 
 Roadmap Track 2 follow-ups, item 2b, Phase B ([plan](../plans/decode-bytes-in-flight.md)), after [Phase
 A](#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1)'s kill did not fire.
-`Session::set_weight_layout`; **on by default since 2026-11-03** (`TT_WEIGHT_LAYOUT=0` turns it off and gives the
-GDDR back).
+`Session::set_weight_layout`; on by default for part of 2026-11-03, **opt-in since** (`TT_WEIGHT_LAYOUT=1`; [the
+revert](#x9s-weight-layout-back-to-opt-in-a-default-must-hold-the-weights-once-2026-11-03-cards-0-and-1): a second copy does not scale).
 
 **What it is.**
 - **The format.** A `B` in one channel, marked `REF_LAID_FOR_READER` in an unused word of its reference, is X9's
@@ -511,7 +542,7 @@ GDDR back).
   - **Bit for bit on card 0** (`1793666474`, `1793668937`), Qwen3.5's traced generation included.
   - **Found on the way:** the relayout's pause left redundant setup runs in the capture that made the regions, which
     `step216`'s structural tests caught. It is now a movers-only pause.
-- **Made the default (2026-11-03, the owner's call).**
+- **Made the default (2026-11-03, the owner's call; [reverted](#x9s-weight-layout-back-to-opt-in-a-default-must-hold-the-weights-once-2026-11-03-cards-0-and-1) the same day).**
   - **The price:** each streamed weight is held twice, ~3.4 GB more GDDR on the 1.7B's BF16 weights (an F32 model
     pays its streamed bytes again). `TT_WEIGHT_LAYOUT=0` at open, or `set_weight_layout(false)` before the first
     capture, keeps it. The benches' conditions line now records `weight_layout`.

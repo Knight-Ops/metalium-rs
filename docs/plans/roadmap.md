@@ -14,8 +14,9 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
-  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at 101 tokens/s traced against
-  burn-flex's 3.4 (9.89 ms a step with BF16 weights and X9's weight layout, on by default for ~3.4 GB more GDDR, card 1, 2026-11-03, item 2b below; 10.95 ms on 2026-10-29, [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1); 88 tokens/s on 2026-10-27, 13.6 on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at ~91 tokens/s traced against
+  burn-flex's 3.4 (10.96 ms a step with BF16 weights, card 1, 2026-11-03, `1793723839`; 9.75 ms with X9's weight layout, which is
+  opt-in because it holds the streamed weights twice and does not scale, item 2b below and the scaling constraint; 10.95 ms on 2026-10-29, [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1); 88 tokens/s on 2026-10-27, 13.6 on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
   5.0x on one tile and faster than burn-flex on every tile (131 ms against 151, Track 2 item 2).
@@ -43,6 +44,19 @@ linking to its evidence and to the detailed plan. Closed work lives in
 
 The goals, in order: **real models run**, then **performance parity**, then **multi-chip**.
 A publishable crate is a long-term goal (last section), not scheduled.
+
+## Constraint: every default must scale to larger models
+
+Owner, 2026-11-03, after X9's weight layout was briefly the default (item 2b). The test models are small. An
+optimization that pays on them only because the card has room to spare is not a default.
+- **A default must hold a weight's bytes once.** It must not take GDDR that grows with the weights: no second copy,
+  relaid twin or per-consumer layout beside the stored one.
+- **Extra GDDR a default takes is bounded.** Either by a constant (as `RELAID_HEADROOM` is) or by what already
+  scales with the workload (activations, the KV cache, stored traces).
+- **Judge a decode optimization against the largest model in scope,** not the one it was measured on. That means
+  Qwen3.5-4B (in F32 too), a model whose weights fill one card, and a model split across both cards.
+- **A gain that needs spare GDDR stays opt-in.** It is documented with its GDDR cost beside its speed-up. Its code
+  may stay for later uses, such as prefill and decode on different cards.
 
 ## Track 1: first real models
 
@@ -967,7 +981,8 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     - **The layout alone, at tile-sized entries, buys nothing.**
     - **The step: 10.94 / 12.14 -> 10.55 / 11.95 ms** at 32 / 256 tokens, measured, although the probe caps every
       other B read at 1. Against its own cap it saves ~1 ms.
-  - *Phase B, built 2026-11-03, **on by default** since 2026-11-03* (`Session::set_weight_layout`; X9's first piece):
+  - *Phase B, built 2026-11-03; on by default that day, **opt-in again since 2026-11-03*** (`Session::set_weight_layout`,
+    `TT_WEIGHT_LAYOUT=1`; X9's first piece). The measured gain:
     **decode 11.01 / 12.17 -> 9.89 / 10.90 ms** at 32 / 256 tokens (card 1; first measured 11.08 / 12.27 -> 9.90 /
     10.94, `1793663823` / `1793664027` against `1793663597` / `1793664232`), bit for bit, prefill unchanged.
     - **The format.** A one-channel `B` is the layout, so there is no new encoding: the card reads such a `B` in
@@ -982,16 +997,21 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       still succeeds, with the same bits.
     - **Gates:** `step267` (ttsim and card 0, with a stale-region negative control and a full-GDDR test, in
       `--smoke`), `step188`'s traced test with it on, `step12_mnist`, and the mover gates in every read mode.
-  - **The cost of the default: GDDR, and how to get it back.**
-    - Each streamed weight is held twice: as it lies (prefill, eager ops and the tied head's token lookups read it)
-      and relaid. The SmolLM2-1.7B's BF16 weights take **~3.4 GB more** (0.49 GB more on the fullest channel, 3.34 ->
-      2.85 GB free); an F32 model pays its streamed weights' bytes again (6.8 GB for the 1.7B in F32).
-    - **Opt out:** `TT_WEIGHT_LAYOUT=0` when the session opens, or `Session::set_weight_layout(false)` before the
-      first capture. Regions already made stay until their weight is freed. Decode is then ~10% slower on the 1.7B
-      and ~2% on Qwen3.5-4B; other models do not change.
-    - The regions are made at a capture's first sight of a weight, after the model loaded, so a model that fits
-      only just can find a later allocation (a longer KV cache, another model) refused where it would not be
-      without the layout. Opt out in that case until the regions can yield (below).
+  - **Why it is opt-in: it does not scale** (owner, 2026-11-03; the
+    [scaling constraint](#constraint-every-default-must-scale-to-larger-models)).
+    - **Each streamed weight is held twice:** as it lies (prefill, eager ops and the tied head's token lookups read
+      it) and relaid. On the SmolLM2-1.7B that is **~3.4 GB more** in BF16 (0.49 GB more on the fullest channel,
+      3.34 -> 2.85 GB free) and 6.8 GB in F32. The cost grows with the weights.
+    - **Only the toy pays off.** The 1.7B leaves most of a card free. A model whose weights fill the card, or one
+      split across both cards, has no room for a second copy. The regions are also made at a capture's first sight
+      of a weight, after the model loaded, so a later allocation (a longer KV cache, another model) can be refused
+      that would fit without them.
+    - **One copy does not work in this form** (C0, below): every other reader is slower over the decode layout.
+    - **Opt in:** `TT_WEIGHT_LAYOUT=1` when the session opens, or `Session::set_weight_layout(true)` before the
+      first capture. Decode is then ~10% faster on the 1.7B and ~2% on Qwen3.5-4B, bit for bit, with its read-ahead
+      cap of 1. Off, the read-ahead cap is the mover's 2 again.
+    - **The code stays,** with its gates (`step267` in `--smoke`) and probes. It may be useful when prefill and decode
+      run on different cards (below).
   - *The other models with it on* (2026-11-03):
     - **Bit for bit on card 0:** `step187`, `step185`, `step233`, `step234`, `step240`, `step205`, `step216`, `step219`,
       `step212`, `step224` and `step263` (Qwen3.5-4B).
@@ -999,7 +1019,7 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     - **The 135M, ResNet-18 and ViT-Tiny** are unchanged within noise.
     - **Found and fixed:** the relayout's pause left redundant setup runs in the capture that made the regions (now a
       movers-only pause).
-  - *Next steps, in order* (owner 2026-11-03: the default stands, the second copy should go):
+  - *Next steps, in order* (owner 2026-11-03: the default is one copy; 2b's gain must come in a form that scales):
     - [x] **One copy instead of two: bounded 2026-11-03, the kill fired; closed in this form**
       ([plan](decode-bytes-in-flight.md#c0-results-2026-11-03-card-1-the-kill-fires-for-both-classes-one-copy-closes-in-this-form),
       [log](../learnings/performance-log.md#one-copy-of-a-relaid-weight-bounded-the-kill-fires-2026-11-03-cards-0-and-1)).
@@ -1020,15 +1040,31 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       - **First the bound:** prefill (and an eager `m > 1` product) reading the relaid layout per run, on card 1,
         against today's. Narrow runs could slow prefill; if they do, keep two copies where prefill pays and one
         elsewhere.
-    - [ ] **The cheaper middle, if one copy stalls: relay only the products that gain.** Phase A put the gain in
-      `down` and `qkv` (`o` did not move, `gate|up`'s slowest unit gained least). Measure the step with only those
-      relaid; it holds roughly half the extra GDDR.
-    - [ ] **Regions that yield** (next, since one copy closed). Free relaid regions no live trace reads when an allocation is refused, before
-      failing it (and drop them on `set_weight_layout(false)`), so the default never costs a model its fit.
-    - [ ] **Regions made at load time,** not at a capture's first sight: no pause inside the first capture (Qwen3.5's
-      build is ~30 s longer with the layout) and the GDDR taken where the model's own allocations are.
+    - [ ] **The scalable form: one stored layout that every reader takes in large pieces** (next). C0 names what
+      it needs:
+      - a record that cuts a region's rows into a block with an L1 pitch, so a prefill or eager block over the
+        layout costs about today's entries and not ~4x (a new encoding: ttsim and an isolated gate before silicon);
+      - one deal a weight, so the regions partition it (today 8.3% of column-run tiles sit in two regions);
+      - the layout made at load time as the weight's only storage, chosen from that one deal, with paths for the
+        tied head's token lookups, in-place writes and downloads.
+      - **Bound it first,** on card 1 against today's default: prefill at 128 / 256 / 7,992 tokens and eager
+        products, not only decode. C0's rules apply.
+    - [ ] **The copy-free levers of item 5.** Bank-affine placement, columns claimed from an atomic counter and a
+      dedicated prefetcher need no second copy. They are the other route to 2b's ~10%; rank them against the
+      scalable form after its bound.
     - [ ] **`gate|up`'s evenness** (its slowest unit gains least; X10: a deal that sizes each unit's share to the
-      rate it gets).
+      rate it gets). It applies to any layout, so it does not depend on the second copy.
+    - **Parked, opt-in only.** These refine the two-copy form, so none of them can become a default:
+      - *Relay only the products that gain* (`down` and `qkv`, Phase A): still about half the extra GDDR, and still
+        growing with the weights.
+      - *Regions that yield:* free relaid regions no live trace reads when an allocation is refused, and drop them on
+        `set_weight_layout(false)`.
+      - *Regions made at load time* for the two-copy form: no pause inside the first capture (Qwen3.5's build is ~30 s
+        longer with the layout).
+    - **Parked use of the code: prefill and decode on different cards** (not scheduled; multi-chip track). A decode
+      card could hold only the relaid layout and a prefill card only the weight as it lies: one copy on each card.
+      This needs the decode card's other readers (the tied head's token lookups, `m > 1` products such as a
+      speculative verify, writes) to read the regions, the gap C0 measured.
 - [ ] **3. Qwen3.5: a replay's own wall time on the card.** Profiled again 2026-10-31
   ([log](../learnings/performance-log.md#qwen35-4bs-decode-step-profiled-whole-but-for-nine-ops-2026-10-31-card-1)).
   - *The gap:* 1,071 of 1,080 ops make 43.97 ms on the card against 64.28 host-timed. ~20 ms is in no op's span.
@@ -1045,7 +1081,8 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     FlashInfer in one call.
   - H10's kill does not transfer (ADR 0001): bound B13c's epilogues on this model separately.
 - [ ] **5. Released by item 2** (2026-11-02: every decode product read-bound by its bytes in flight). Work these after
-  item 2b's bound, which tells whether larger entries alone suffice:
+  item 2b's bound, which tells whether larger entries alone suffice. Since 2b's second copy went back to opt-in
+  (2026-11-03), these are the copy-free route to its decode gain and must hold one copy of the weights:
   - bank-affine placement at 2-3 units a bank (tt-metal's 88-90%, `f2c0b2623fe`);
   - columns claimed from an atomic counter (legal under S1);
   - a dedicated prefetcher, worker or DRISC (F10 below).
