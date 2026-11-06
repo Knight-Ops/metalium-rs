@@ -37,12 +37,10 @@ const SAMPLES: usize = 9;
 
 fn conditions(card: usize) {
     println!(
-        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\",\"weight_layout\":{},\"column_weights\":{}}}",
+        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\",\"column_weights\":{}}}",
         git_sha(),
         !cfg!(debug_assertions),
-        std::env::var("TT_WEIGHT_LAYOUT").is_ok_and(|v| v == "1"),
-        std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0")
-            && !std::env::var("TT_WEIGHT_LAYOUT").is_ok_and(|v| v == "1"),
+        std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0"),
     );
 }
 
@@ -1609,31 +1607,6 @@ fn traced_generation_stream_ceiling() {
                 "host",
                 Stats::of(step),
             );
-        }
-        // `TT_PROBE_RELAID_BLOCKS=1` (`tt_kernels::tensor::probe_relaid_blocks`, Phase C0 of
-        // `docs/plans/decode-bytes-in-flight.md`): every other product over a relaid weight read
-        // from its regions, bit for bit; what it moved, and how much of each class the regions hold.
-        if std::env::var("TT_PROBE_RELAID_BLOCKS").is_ok_and(|v| v == "1") {
-            let [split, entries, regions, lies] = tt_kernels::tensor::probe_relaid_blocks_counts();
-            let ([blocks, stream], widths) = tt_kernels::tensor::probe_relaid_audit();
-            println!(
-                "RELAID BLOCKS: {split} gathers became {entries} entries; {:.2} GB of B from regions, \
-                 {:.2} GB as it lies ({:.2}%)",
-                regions as f64 / 1e9,
-                lies as f64 / 1e9,
-                100.0 * lies as f64 / (regions + lies).max(1) as f64
-            );
-            for (class, c) in [("column runs", blocks), ("one-column runs", stream)] {
-                println!(
-                    "RELAID AUDIT {class}: {} weights, {} tiles, {} held ({:.2}%), {} held twice",
-                    c[0],
-                    c[1],
-                    c[2],
-                    100.0 * c[2] as f64 / c[1].max(1) as f64,
-                    c[3]
-                );
-            }
-            println!("RELAID AUDIT run widths: {widths:?}");
         }
         // In the device's process (a fork), where the probe counted.
         if contiguous.is_some() {

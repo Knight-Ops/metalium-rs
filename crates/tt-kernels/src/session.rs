@@ -286,40 +286,23 @@ fn probing_stale_b() -> bool {
     PROBE_STALE_B.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// GDDR a relaid weight's region leaves free on its channel ([`Session::set_weight_layout`]): room
-/// for what every capture stores per unit at its end (`store_stream`, `store_programs`), so the
-/// layout's copies never cost a capture its own storage. 64 MiB a channel, 0.5 GB of a card's 32.
-pub const RELAID_HEADROOM: u64 = 64 << 20;
-
-/// A read ahead's cap under [`Session::set_weight_layout`] or [`Session::set_column_weights`]: one
-/// 16 KiB request in flight. A 1.7B
-/// decode step (card 1, `docs/plans/decode-bytes-in-flight.md` Phase B): 11.14 / 12.17 ms at the
-/// default cap of 2, 10.62 / 11.63 at 1, against 11.07 / 12.23 without the layout (`1793662331`,
-/// `1793662552`, `1793661878`).
+/// A read ahead's cap under [`Session::set_column_weights`]: one 16 KiB request in flight. A
+/// 1.7B decode step (card 1, `docs/plans/decode-bytes-in-flight.md` Phase B, measured with X9's
+/// since-retired two-copy layout, whose reads ahead came in the same pieces): 11.14 / 12.17 ms at
+/// the default cap of 2, 10.62 / 11.63 at 1 (`1793662331`, `1793662552`).
 pub const WEIGHT_LAYOUT_PREFETCH_CAP: u32 = 1;
 
 /// The read-ahead cap a B mover is given at start: `TT_PREFETCH_CAP` where set (`dm::DataMover`
 /// reads it), else [`WEIGHT_LAYOUT_PREFETCH_CAP`] where weights are read ahead in large pieces
-/// (the weight layout, or weights laid by column), else the mover's own.
-fn prefetch_cap(weight_layout: bool) -> Option<u32> {
+/// (weights laid by column), else the mover's own.
+fn prefetch_cap(large_pieces: bool) -> Option<u32> {
     match std::env::var("TT_PREFETCH_CAP")
         .ok()
         .and_then(|v| v.parse().ok())
     {
         Some(cap) => Some(cap),
-        None => weight_layout.then_some(WEIGHT_LAYOUT_PREFETCH_CAP),
+        None => large_pieces.then_some(WEIGHT_LAYOUT_PREFETCH_CAP),
     }
-}
-
-static PROBE_STALE_RELAID: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// A negative control (`docs/plans/decode-bytes-in-flight.md` Phase B): with it on, a relaid
-/// weight written in place is not copied to its regions again ([`Session::set_weight_layout`]),
-/// so a replay reads what they held: the proof that it reads them. Process-wide; dev-facing.
-#[doc(hidden)]
-pub fn probe_stale_relaid(on: bool) {
-    PROBE_STALE_RELAID.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
 static PROBE_BUSY_TOPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -551,6 +534,13 @@ pub enum SessionError {
 /// replaces them rather than ignored, so a script that still sets one learns why it no longer
 /// does anything. `get` reads a variable, as `std::env::var` does.
 pub fn refuse_retired_settings(get: impl Fn(&str) -> Option<String>) -> Result<(), SessionError> {
+    if let Some(value) = get("TT_WEIGHT_LAYOUT") {
+        return Err(SessionError::Retired(format!(
+            "TT_WEIGHT_LAYOUT={value}: X9's two-copy weight layout was retired on 2026-11-06 (it \
+             held every streamed weight twice, GDDR that grows with the model); stored weights are \
+             laid by column by default (TT_WEIGHT_COLUMNS), one copy; unset it"
+        )));
+    }
     if let Some(value) = get("TT_SUB_TRACES") {
         return Err(SessionError::Retired(format!(
             "TT_SUB_TRACES={value}: layer sub-traces were retired on 2026-11-06 (opt-in and \
@@ -899,15 +889,9 @@ pub struct Session<T: Transport> {
     prefetch_anchor: Vec<Option<u32>>,
     /// [`Session::set_busy_prefetch`].
     busy_prefetch: bool,
-    /// Whether a capture stores the weights its one-row products stream in X9's layout
-    /// ([`Session::set_weight_layout`], `docs/plans/decode-bytes-in-flight.md` Phase B).
-    weight_layout: bool,
     /// Stored weights laid by column (`tensor::Layout::ByColumn`;
     /// [`Session::set_column_weights`]).
     column_weights: bool,
-    /// Sources of relaid weights written in place since their regions were filled
-    /// ([`DramState::relaid`]): filled again before they are read ([`Session::refresh_relaid`]).
-    relaid_dirty: Vec<tensor::Placement>,
     /// [`Session::set_read_ahead_early`].
     read_ahead_early: bool,
     /// [`Session::set_idle_ahead_early`].
@@ -1326,15 +1310,6 @@ fn diff(a: tt_device::Traffic, b: tt_device::Traffic) -> tt_device::Traffic {
 /// slots zeroed, and its `B` reference.
 type ContiguousKey = (usize, [u32; 8], [[u32; 8]; 2]);
 
-/// A weight stream's region in X9's layout ([`DramState::relaid`]).
-struct Relaid {
-    /// Its slots, and the weight whose tiles it holds.
-    region: tensor::Placement,
-    source: tensor::Placement,
-    /// The copy that fills it: the stream's record as built, and `(channel, offset)`.
-    copy: tensor::Relayout,
-}
-
 /// What a session needs to keep tensors in GDDR: the chip's channels, an
 /// allocator, the data mover image, and a window for each size of access.
 struct DramState {
@@ -1350,25 +1325,6 @@ struct DramState {
     /// it and the record's header (its slots zeroed) and `B` reference, as `(channel, offset)`.
     /// Kept, never freed, for as long as GDDR is: an op lowered again reads the same bytes.
     contiguous_b: std::collections::HashMap<ContiguousKey, (u32, u64)>,
-    /// X9's layout ([`Session::set_weight_layout`]): each weight stream's region, by the same key,
-    /// with the weight it copies. Freed with its source ([`Session::free`]), filled again after
-    /// its source is written in place.
-    relaid: std::collections::HashMap<ContiguousKey, Relaid>,
-    /// The weights [`DramState::relaid`] copies, each once: what a free or an in-place write
-    /// looks up first (a model's ~170 weights, not its ~10,000 regions).
-    relaid_sources: Vec<tensor::Placement>,
-    /// Whether a weight was left unrelaid for want of GDDR (said once).
-    relaid_full: bool,
-    /// Bumped whenever [`DramState::relaid`] gains or loses a region: what keeps
-    /// [`DramState::relaid_index`] honest.
-    relaid_epoch: u64,
-    /// [`tensor::probe_relaid_blocks`]'s index of each relaid weight's regions, by source, as of
-    /// the epoch it was built at.
-    relaid_index: Vec<(
-        tensor::Placement,
-        (u64, bool),
-        std::sync::Arc<tensor::RelaidIndex>,
-    )>,
 }
 
 /// One mover list for one unit: list entries, the `KERNEL` entries among
@@ -2926,16 +2882,10 @@ impl<T: Transport> Session<T> {
             // (`docs/plans/planned-l1-residency.md` 3b): a 1.7B step 19.51 -> 18.40 ms at the
             // prefetch cap of 2 (`dm::PREFETCH_CAP_DEFAULT`), nothing measured slower.
             busy_prefetch: std::env::var("TT_BUSY_PREFETCH").map_or(true, |v| v != "0"),
-            // Off by default (`docs/plans/decode-bytes-in-flight.md` Phase B; on 2026-11-03, reverted the
-            // same day): a 1.7B decode step 11.01 / 12.17 -> 9.89 / 10.90 ms at 32 / 256 tokens on card
-            // 1, bit for bit, but for a second copy of every streamed weight (~3.4 GB on the 1.7B), which
-            // grows with the model and does not scale. `TT_WEIGHT_LAYOUT=1` turns it on.
-            weight_layout: std::env::var("TT_WEIGHT_LAYOUT").is_ok_and(|v| v == "1"),
             // On by default since 2026-11-04 (`docs/plans/decode-bytes-in-flight.md` Phase C1): a
             // 1.7B decode step ~10% faster on card 1, bit for bit, with prefill, eager blocks and
             // GDDR unchanged (the weight held once). `TT_WEIGHT_COLUMNS=0` turns it off.
             column_weights: std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0"),
-            relaid_dirty: Vec::new(),
             // On by default since 2026-10-29 (`docs/completed-plans/dataflow-compiler.md` F4a.2): a 1.7B step
             // 11.32 / 12.69 -> 10.95 / 12.16 ms at 32 / 256 tokens on card 1, bit for bit;
             // `TT_READ_AHEAD_EARLY=0` turns it off.
@@ -3502,11 +3452,6 @@ impl<T: Transport> Session<T> {
             w4,
             zero_rows: Vec::new(),
             contiguous_b: std::collections::HashMap::new(),
-            relaid: std::collections::HashMap::new(),
-            relaid_sources: Vec::new(),
-            relaid_full: false,
-            relaid_epoch: 0,
-            relaid_index: Vec::new(),
         });
         Ok(())
     }
@@ -3648,23 +3593,19 @@ impl<T: Transport> Session<T> {
     /// [`Session::store_bfp`] and [`Session::upload_bf16_weight`] put each column's tiles
     /// consecutive in one channel, the weight's only copy, so a one-row product reads each column
     /// in large pieces and a block reads it a tile at a time as before. Weights stored before
-    /// keep their layout. On by default (`TT_WEIGHT_COLUMNS=0` at open turns it off); X9's
-    /// two-copy layout ([`Session::set_weight_layout`]), an explicit opt-in that relays only
-    /// interleaved weights, takes precedence while it is on.
+    /// keep their layout. On by default (`TT_WEIGHT_COLUMNS=0` at open turns it off).
     ///
     /// Its reads ahead come in 16 KiB pieces too, so the layout lowers a read ahead's cap to
-    /// [`WEIGHT_LAYOUT_PREFETCH_CAP`] as X9's does (`TT_PREFETCH_CAP` still rules).
+    /// [`WEIGHT_LAYOUT_PREFETCH_CAP`] (`TT_PREFETCH_CAP` still rules).
     pub fn set_column_weights(&mut self, on: bool) -> Result<(), TensorError> {
         self.column_weights = on;
         self.push_prefetch_cap()
     }
 
     /// How a weight of `grid` tiles stored now is laid ([`Session::set_column_weights`];
-    /// interleaved while X9's layout is on, [`Session::set_weight_layout`], whose relayout reads
-    /// interleaved weights, and wherever by column would take more GDDR,
-    /// [`tensor::Layout::for_weight`]).
+    /// interleaved wherever by column would take more GDDR, [`tensor::Layout::for_weight`]).
     pub fn stored_layout(&mut self, grid: [usize; 2]) -> Result<tensor::Layout, TensorError> {
-        let wanted = match self.column_weights && !self.weight_layout {
+        let wanted = match self.column_weights {
             true => tensor::Layout::ByColumn,
             false => tensor::Layout::Interleaved,
         };
@@ -4663,9 +4604,6 @@ impl<T: Transport> Session<T> {
             let (_, twin) = self.twins.swap_remove(i);
             self.free_placement(twin.placement)?;
         }
-        // Its relaid regions ([`Session::set_weight_layout`]) go where it goes: a trace that
-        // holds it reads them too.
-        let relaid = self.take_relaid(&p);
         // A trace's: its replays read or write it (`crate::trace`). One the capture made itself
         // (not an upload) it may take again, where the capture reuses: every op after its last
         // reader runs after that reader's barrier (`Session::set_capture_reuse`).
@@ -4675,12 +4613,10 @@ impl<T: Transport> Session<T> {
             } else {
                 c.freed.push(p);
             }
-            c.freed.extend(relaid);
             return Ok(());
         }
         if let Some(t) = self.traces.values_mut().find(|t| t.holds(&p)) {
             t.freed.push(p);
-            t.freed.extend(relaid);
             return Ok(());
         }
         // A queued list may still read it, and the next allocation must not
@@ -4688,7 +4624,6 @@ impl<T: Transport> Session<T> {
         if self.units.iter().any(|u| !u.queued.is_empty()) {
             self.pending_bytes += p.channel_bytes();
             self.pending_frees.push(p);
-            self.pending_frees.extend(relaid);
             // More waiting to be freed than is free: wait for the queue and take it back, rather
             // than let a long chain of queued ops run GDDR out (an eager 32K prefill's 255
             // chunks, each a new copy of the cache, filled 31 GB; `docs/plans/long-context.md`).
@@ -4697,11 +4632,7 @@ impl<T: Transport> Session<T> {
             }
             return Ok(());
         }
-        let alloc = &mut self.dram_state()?.alloc;
-        alloc.free(&p);
-        for r in &relaid {
-            alloc.free(r);
-        }
+        self.dram_state()?.alloc.free(&p);
         Ok(())
     }
 
@@ -5055,7 +4986,6 @@ impl<T: Transport> Session<T> {
             release_rects,
             l1_writes,
             mover_arena,
-            weight_layout,
             column_weights,
             ..
         } = self;
@@ -5103,7 +5033,7 @@ impl<T: Transport> Session<T> {
             if let Some(b) = unit.mover.as_mut() {
                 b.set_l1_writes(l1_writes.clone())?;
                 b.set_arena(*mover_arena)?;
-                if let Some(cap) = prefetch_cap(*weight_layout || *column_weights) {
+                if let Some(cap) = prefetch_cap(*column_weights) {
                     b.set_prefetch_cap(dev, r.window(), cap)?;
                 }
             }
@@ -6373,26 +6303,7 @@ impl<T: Transport> Session<T> {
     /// given back. Either way its programs are held as any trace's are from here
     /// on, no longer protected ([`ProgramCache::protect`]).
     pub fn end_trace(&mut self) -> Result<TraceId, TensorError> {
-        let written = self.capture.as_ref().map(|c| c.written.clone());
         let result = self.end_trace_inner();
-        // A capture that writes a relaid weight ([`Session::set_weight_layout`]) would leave its
-        // regions behind what its replays write: refused, never stale.
-        let relaid_written = self.dram.as_ref().is_some_and(|d| {
-            d.relaid_sources
-                .iter()
-                .any(|r| written.iter().flatten().any(|p| p.same_allocation(r)))
-        });
-        let result = match result {
-            Ok(id) if relaid_written => {
-                self.release_trace(id)?;
-                Err(TensorError::Shape(
-                    "the capture writes in place a weight that a weight layout relaid \
-                     (`Session::set_weight_layout`): its replays would leave the regions stale"
-                        .into(),
-                ))
-            }
-            r => r,
-        };
         for unit in &mut self.units {
             unit.programs.unprotect_all();
         }
@@ -6860,8 +6771,6 @@ impl<T: Transport> Session<T> {
         for u in 0..self.units.len() {
             self.ensure_unit(u)?;
         }
-        // Relaid weights written since are filled again first ([`Session::set_weight_layout`]).
-        self.refresh_relaid()?;
         let t = &self.traces[&id.0];
         if t.epoch != self.epoch {
             return Err(TraceError::Stale.into());
@@ -8616,8 +8525,7 @@ impl<T: Transport> Session<T> {
         }
         let units = self.spread_for(tiles_of(t));
         if t.placement.owned() {
-            // A write in place like any other: a packed twin is dropped, and a relaid weight's
-            // regions are filled again before they are read next, padding included.
+            // A write in place like any other: a packed twin is dropped.
             self.drop_twin(t)?;
             let jobs = tensor::fill_pad(t, 0.0, units)?;
             self.submit_jobs_on(jobs, units, RESET_BUDGET)?;
@@ -8838,16 +8746,6 @@ impl<T: Transport> Session<T> {
                 .chain(self.dram.as_ref().map_or(&[][..], |d| d.alloc.logged()))
                 .any(|p| p.same_allocation(&b_read.placement))
         }) || probing_stale_b();
-        // X9's layout ([`Session::set_weight_layout`]): only a `B` the capture found, never one it
-        // made or wrote.
-        let relay = self.weight_layout
-            && packed_a.is_some()
-            && self.capture.as_ref().is_some_and(|c| {
-                !c.written
-                    .iter()
-                    .chain(self.dram.as_ref().map_or(&[][..], |d| d.alloc.logged()))
-                    .any(|p| p.same_allocation(&b_read.placement))
-            });
         // In a capture, the units past the product's own that ran nothing since their anchor --
         // the last weight-streaming product, or the last they took part in ([`PrefetchAnchor`])
         // -- each with the barrier it waits for: each can read a job's `B` while the ops between
@@ -8991,22 +8889,6 @@ impl<T: Transport> Session<T> {
             })
             .and_then(|(mut work, dealt)| {
                 self.stage(HostStage::Build, built);
-                if relay {
-                    if let Err(e) =
-                        self.relay_weights(&mut work.jobs, dealt.unwrap_or(units), b_read)
-                    {
-                        let _ = self.free(work.out);
-                        return Err(e);
-                    }
-                }
-                // A development probe (`docs/plans/decode-bytes-in-flight.md`, Phase C0): every
-                // other read of a relaid `B` from its regions, bit for bit.
-                if tensor::probing_relaid_blocks() {
-                    if let Err(e) = self.probe_relaid_blocks(&mut work.jobs, b_read) {
-                        let _ = self.free(work.out);
-                        return Err(e);
-                    }
-                }
                 if let Some(twin) = &out_twin {
                     twinned = tensor::twin_one_row_scatters(&mut work.jobs, &work.out, twin);
                 }
@@ -9665,21 +9547,6 @@ impl<T: Transport> Session<T> {
     /// reads it ahead of no product ([`trace::Capture::written`]).
     fn drop_twin(&mut self, t: &DramTensor) -> Result<(), TensorError> {
         self.note_written(t);
-        // A relaid weight's regions are filled again before they are read next
-        // ([`Session::refresh_relaid`]): after this write, which is queued first.
-        let relaid = self.dram.as_ref().is_some_and(|d| {
-            d.relaid_sources
-                .iter()
-                .any(|p| p.same_allocation(&t.placement))
-        });
-        if relaid
-            && !self
-                .relaid_dirty
-                .iter()
-                .any(|p| p.same_allocation(&t.placement))
-        {
-            self.relaid_dirty.push(t.placement.clone());
-        }
         if let Some(i) = self.twins.iter().position(|(p, _)| *p == t.placement) {
             let (_, twin) = self.twins.swap_remove(i);
             self.free(twin)?;
@@ -10047,13 +9914,6 @@ impl<T: Transport> Session<T> {
         self.paused_as(false, f)
     }
 
-    /// [`Session::paused`] for `f` that runs only movers' lists (transfers, no kernel): the
-    /// compute roles' tile state is as `f` found it, so the capture keeps what it knew of it and
-    /// records no setup run for it (a weight layout's copies, [`Session::set_weight_layout`]).
-    fn paused_movers<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Result<R, TensorError> {
-        self.paused_as(true, f)
-    }
-
     fn paused_as<R>(
         &mut self,
         movers_only: bool,
@@ -10203,374 +10063,13 @@ impl<T: Transport> Session<T> {
         self.busy_prefetch = on;
     }
 
-    /// Whether a capture stores the weights its one-row products stream in X9's layout
-    /// (`docs/learnings/dataflow-compiler.md` §6; `docs/plans/decode-bytes-in-flight.md` Phase B):
-    /// each unit's share of a `B` the capture neither allocated nor writes is copied, the first
-    /// time a capture reads it, into a region contiguous in one channel in the order the unit
-    /// reads it, and the product's record reads the region instead, a few large reads a run
-    /// (`record::GATHER` over a one-channel `B`). The same bytes land in the same slots, so the
-    /// product is bit for bit the same. The regions are kept for the next captures, filled again
-    /// after their weight is written in place, and freed with it. Eager products read the weight as
-    /// it lies.
-    ///
-    /// **Off by default: it costs GDDR in proportion to the weights.** Each relaid weight is held
-    /// twice, as it lies (for prefill, eager ops and token lookups) and as relaid: a SmolLM2-1.7B
-    /// holds ~3.4 GB more, a weight's streamed bytes once more, so a model that fills the card
-    /// cannot afford it. `TT_WEIGHT_LAYOUT=1` at open, or `set_weight_layout(true)` before the
-    /// first capture, turns it on (regions already made stay until their weight is freed).
-    /// Where a region would leave its channel less than [`RELAID_HEADROOM`] free, that record reads
-    /// its weight as it lies.
-    ///
-    /// With it on, a read ahead holds one request in flight, not [`tt_isa::dm::PREFETCH_CAP_DEFAULT`]
-    /// ([`WEIGHT_LAYOUT_PREFETCH_CAP`]; `TT_PREFETCH_CAP` still rules where set): its requests are
-    /// 16 KiB, not a tile, and at two in flight the ops it runs under read GDDR behind it.
-    pub fn set_weight_layout(&mut self, on: bool) -> Result<(), TensorError> {
-        self.weight_layout = on;
-        self.push_prefetch_cap()
-    }
-
     /// Give every B mover the read-ahead cap [`prefetch_cap`] says for the layouts in use.
     fn push_prefetch_cap(&mut self) -> Result<(), TensorError> {
-        let large = self.weight_layout || self.column_weights;
-        let cap = prefetch_cap(large).unwrap_or(tt_isa::dm::PREFETCH_CAP_DEFAULT);
+        let cap = prefetch_cap(self.column_weights).unwrap_or(tt_isa::dm::PREFETCH_CAP_DEFAULT);
         let Session { dev, units, .. } = self;
         for unit in units.iter() {
             if let (Some(b), Some(r)) = (unit.mover.as_ref(), unit.resident.as_ref()) {
                 b.set_prefetch_cap(dev, r.window(), cap)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether [`Session::set_weight_layout`] is on.
-    pub fn weight_layout(&self) -> bool {
-        self.weight_layout
-    }
-
-    /// Bytes of GDDR the relaid weights hold ([`Session::set_weight_layout`]).
-    pub fn relaid_bytes(&self) -> u64 {
-        self.dram.as_ref().map_or(0, |d| {
-            d.relaid
-                .values()
-                .map(|r| tensor::relayout_bytes(&r.copy.record).unwrap_or(0))
-                .sum()
-        })
-    }
-
-    /// [`Session::set_weight_layout`] for one product's jobs, dealt job `j` to unit `j % units`:
-    /// each streamed or read-ahead `GATHER` of `b` reads its region, which is made and filled
-    /// (outside the capture) the first time it is seen. A planned capture makes none (it cannot
-    /// pause): where a region is missing the record reads `b` as it lies.
-    fn relay_weights(
-        &mut self,
-        jobs: &mut [tensor::Job],
-        units: usize,
-        b: &DramTensor,
-    ) -> Result<(), TensorError> {
-        use tt_isa::dm::record;
-        self.refresh_relaid()?;
-        // A weight laid by column is already read in large pieces, by column; a region would
-        // hold its tiles by row, against the column order its records' pairs name.
-        if b.placement.layout() == tensor::Layout::ByColumn {
-            return Ok(());
-        }
-        let planned = self.capture.as_ref().is_some_and(|c| c.planned);
-        let want = b.tensor_ref().encode();
-        // The same tensor, at any first tile (a record's `first` names its chunk).
-        let same_b = |r: &[[u32; 8]]| {
-            [r[0][0], r[0][1], r[0][3]] == [want[0][0], want[0][1], want[0][3]] && r[1] == want[1]
-        };
-        let d = self
-            .dram
-            .as_mut()
-            .ok_or_else(|| TensorError::Shape("a weight layout needs GDDR".into()))?;
-        let channels = d.alloc.channel_count();
-        let mut copies = Vec::new();
-        for (j, job) in jobs.iter_mut().enumerate() {
-            let u = j % units.max(1);
-            for step in job.iter_mut() {
-                let Step::List { entries, .. } = step else {
-                    continue;
-                };
-                let mut i = 0;
-                while i < entries.len() {
-                    let head = entries[i];
-                    let len = record::len(head[0]).max(1);
-                    let flags = head[1];
-                    let stream = record::GATHER_STREAM | record::GATHER_PREFETCH;
-                    if head[0] != record::GATHER
-                        || flags & stream == 0
-                        || flags & record::GATHER_A_RESIDENT == 0
-                        || flags & 2 != 0
-                        || !same_b(&entries[i + 3..i + 5])
-                    {
-                        i += len;
-                        continue;
-                    }
-                    let rec: [[u32; 8]; 5] = entries[i..i + 5].try_into().expect("a record");
-                    let mut key_head = head;
-                    key_head[1] &= !stream;
-                    (key_head[2], key_head[3]) = (0, 0);
-                    let key = (u, key_head, [entries[i + 3], entries[i + 4]]);
-                    let at = match d.relaid.get(&key) {
-                        Some(r) => Some(r.copy.region),
-                        None if planned => None,
-                        None => {
-                            let bytes = tensor::relayout_bytes(&rec)?;
-                            // A region leaves its channel `RELAID_HEADROOM` free, for what
-                            // every capture stores there (its streams and programs); with less
-                            // room the record reads `b` as it lies. The layout is a copy: the
-                            // product is the same bits either way.
-                            let c = u % channels;
-                            let placed = if d.alloc.free_bytes_on(c) >= bytes + RELAID_HEADROOM {
-                                let held = d.alloc.suspend();
-                                let placed = d.alloc.alloc_on(c, bytes).ok();
-                                d.alloc.resume(held);
-                                placed
-                            } else {
-                                None
-                            };
-                            let Some(region) = placed else {
-                                if !std::mem::replace(&mut d.relaid_full, true) {
-                                    eprintln!(
-                                        "session: GDDR is too full for the weight layout's \
-                                         copies; the weights left over are read as they lie \
-                                         (TT_WEIGHT_LAYOUT unset leaves the layout off)"
-                                    );
-                                }
-                                i += len;
-                                continue;
-                            };
-                            let (ch, off, _) = region.extents().next().expect("one channel");
-                            let copy = tensor::Relayout {
-                                record: rec,
-                                region: (ch as u32, off),
-                            };
-                            copies.push(copy.clone());
-                            if !d
-                                .relaid_sources
-                                .iter()
-                                .any(|p| p.same_allocation(&b.placement))
-                            {
-                                d.relaid_sources.push(b.placement.clone());
-                            }
-                            d.relaid_epoch += 1;
-                            d.relaid.insert(
-                                key,
-                                Relaid {
-                                    region,
-                                    source: b.placement.clone(),
-                                    copy,
-                                },
-                            );
-                            Some((ch as u32, off))
-                        }
-                    };
-                    if let Some((ch, off)) = at {
-                        // The region as a one-channel tensor as wide as the record's block: tile
-                        // `(kk, j)` at slot `kk * cols + j`, the order the record reads.
-                        let mut region = record::TensorRef {
-                            n: 1,
-                            first: 0,
-                            ct: head[7],
-                            ..Default::default()
-                        };
-                        region.channels[0] = ch as u8;
-                        region.base[0] = u32::try_from(off).map_err(|_| {
-                            TensorError::Shape(format!("a weight region at {off:#x}"))
-                        })?;
-                        let mut region = region.encode();
-                        region[0][4] = record::REF_LAID_FOR_READER;
-                        entries[i][6] = 0;
-                        (entries[i + 3], entries[i + 4]) = (region[0], region[1]);
-                    }
-                    i += len;
-                }
-            }
-        }
-        self.fill_relaid(copies)
-    }
-
-    /// Fill `copies`' regions, outside any capture, and wait for them.
-    fn fill_relaid(&mut self, copies: Vec<tensor::Relayout>) -> Result<(), TensorError> {
-        if copies.is_empty() {
-            return Ok(());
-        }
-        let n = self.units.len();
-        self.paused_movers(|s| {
-            let jobs = tensor::relayout_jobs(&copies)?;
-            s.submit_jobs_on(jobs, n, RESET_BUDGET)?;
-            s.sync()
-        })?
-    }
-
-    /// Fill again the regions of every relaid weight written in place since
-    /// ([`Session::set_weight_layout`]), after what wrote it.
-    fn refresh_relaid(&mut self) -> Result<(), TensorError> {
-        if self.relaid_dirty.is_empty() {
-            return Ok(());
-        }
-        if self.capture.as_ref().is_some_and(|c| c.planned) {
-            return Err(TensorError::Shape(
-                "a relaid weight was written in place: a planned capture cannot fill its regions \
-                 again (replay or capture once unplanned first)"
-                    .into(),
-            ));
-        }
-        let dirty = std::mem::take(&mut self.relaid_dirty);
-        if PROBE_STALE_RELAID.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(());
-        }
-        let copies: Vec<tensor::Relayout> = self.dram.as_ref().map_or(Vec::new(), |d| {
-            d.relaid
-                .values()
-                .filter(|r| dirty.iter().any(|p| p.same_allocation(&r.source)))
-                .map(|r| r.copy.clone())
-                .collect()
-        });
-        self.sync()?;
-        self.fill_relaid(copies)
-    }
-
-    /// The regions relaid from `p` ([`Session::set_weight_layout`]), taken from the cache: what
-    /// is freed with it.
-    fn take_relaid(&mut self, p: &tensor::Placement) -> Vec<tensor::Placement> {
-        let Some(d) = self.dram.as_mut() else {
-            return Vec::new();
-        };
-        let Some(at) = d.relaid_sources.iter().position(|q| q.same_allocation(p)) else {
-            return Vec::new();
-        };
-        d.relaid_sources.swap_remove(at);
-        d.relaid_epoch += 1;
-        d.relaid_index.retain(|(q, _, _)| !q.same_allocation(p));
-        let keys: Vec<ContiguousKey> = d
-            .relaid
-            .iter()
-            .filter(|(_, r)| r.source.same_allocation(p))
-            .map(|(k, _)| *k)
-            .collect();
-        self.relaid_dirty.retain(|q| !q.same_allocation(p));
-        keys.iter()
-            .filter_map(|k| d.relaid.remove(k))
-            .map(|r| r.region)
-            .collect()
-    }
-
-    /// [`tensor::probe_relaid_blocks`] for one product's jobs over `b`: where `b` is relaid, each
-    /// gather that reads it as it lies ([`tensor::split_relaid_gather`]) reads its regions instead,
-    /// the regions filled again first if `b` was written since. Bit for bit; nothing else changes.
-    fn probe_relaid_blocks(
-        &mut self,
-        jobs: &mut [tensor::Job],
-        b: &DramTensor,
-    ) -> Result<(), TensorError> {
-        use tt_isa::dm::record;
-        let relaid = self.dram.as_ref().is_some_and(|d| {
-            d.relaid_sources
-                .iter()
-                .any(|p| p.same_allocation(&b.placement))
-        });
-        if !relaid {
-            return Ok(());
-        }
-        self.refresh_relaid()?;
-        let want = b.tensor_ref().encode();
-        let same_b = |r: &[[u32; 8]]| {
-            [r[0][0], r[0][1], r[0][3]] == [want[0][0], want[0][1], want[0][3]] && r[1] == want[1]
-        };
-        let d = self
-            .dram
-            .as_mut()
-            .ok_or_else(|| TensorError::Shape("the relaid-blocks probe needs GDDR".into()))?;
-        let epoch = (d.relaid_epoch, tensor::probing_relaid_shift());
-        let cached = d
-            .relaid_index
-            .iter()
-            .find(|(p, e, _)| *e == epoch && p.same_allocation(&b.placement))
-            .map(|(_, _, i)| i.clone());
-        let index = match cached {
-            Some(i) => i,
-            None => {
-                let copies: Vec<&tensor::Relayout> = d
-                    .relaid
-                    .values()
-                    .filter(|r| r.source.same_allocation(&b.placement))
-                    .map(|r| &r.copy)
-                    .collect();
-                let slot = match copies.first() {
-                    Some(c) => {
-                        tensor::relayout_bytes(&c.record)?
-                            / (record::gather_kt(c.record[0][1]) as u64 * c.record[0][7] as u64)
-                                .max(1)
-                    }
-                    None => return Ok(()),
-                };
-                let mut runs = copies
-                    .iter()
-                    .map(|c| tensor::RelaidRun::of(c))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if tensor::probing_relaid_shift() {
-                    runs[0].off += slot;
-                }
-                let index =
-                    std::sync::Arc::new(tensor::RelaidIndex::new(b.tensor_ref().ct, slot, runs));
-                tensor::note_relaid_audit(&b.placement, &index);
-                d.relaid_index
-                    .retain(|(p, _, _)| !p.same_allocation(&b.placement));
-                d.relaid_index
-                    .push((b.placement.clone(), epoch, index.clone()));
-                index
-            }
-        };
-        for job in jobs.iter_mut() {
-            for step in job.iter_mut() {
-                let Step::List { entries, .. } = step else {
-                    continue;
-                };
-                if !entries.iter().any(|e| e[0] == record::GATHER) {
-                    continue;
-                }
-                // A list that grows past half a mover's list keeps its gathers (a block's list, its
-                // kernel and its scatter share one packet): its bytes count as read where they lie.
-                const BUDGET: usize = tt_isa::dm::LIST_MAX as usize / 2;
-                let mut out = Vec::with_capacity(entries.len());
-                let (mut records, mut from_regions, mut as_lies, mut whole) = (0, 0, 0, 0);
-                let mut i = 0;
-                while i < entries.len() {
-                    let len = record::len(entries[i][0]).max(1);
-                    let rec = &entries[i..i + len];
-                    let split = match rec[0][0] == record::GATHER && same_b(&rec[3..5]) {
-                        true => tensor::split_relaid_gather(rec, &index)?,
-                        false => None,
-                    };
-                    match split {
-                        Some(sp) => {
-                            records += 1;
-                            (from_regions, as_lies) =
-                                (from_regions + sp.from_regions, as_lies + sp.as_lies);
-                            whole += sp.from_regions + sp.as_lies;
-                            out.extend(sp.entries);
-                        }
-                        None => out.extend_from_slice(rec),
-                    }
-                    i += len;
-                }
-                if records == 0 {
-                    continue;
-                }
-                if out.len() > BUDGET.max(entries.len()) {
-                    tensor::count_relaid_split(0, 0, 0, whole);
-                    continue;
-                }
-                tensor::count_relaid_split(records, out.len() as u64, from_regions, as_lies);
-                static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| {
-                    eprintln!(
-                        "session: TT_PROBE_RELAID_BLOCKS: products read relaid weights from their regions"
-                    )
-                });
-                *entries = out;
             }
         }
         Ok(())

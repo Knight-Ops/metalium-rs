@@ -982,8 +982,10 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     - **The layout alone, at tile-sized entries, buys nothing.**
     - **The step: 10.94 / 12.14 -> 10.55 / 11.95 ms** at 32 / 256 tokens, measured, although the probe caps every
       other B read at 1. Against its own cap it saves ~1 ms.
-  - *Phase B, built 2026-11-03; on by default that day, **opt-in again since 2026-11-03*** (`Session::set_weight_layout`,
-    `TT_WEIGHT_LAYOUT=1`; X9's first piece). The measured gain:
+  - *Phase B, built 2026-11-03; on by default that day, opt-in again since 2026-11-03, **retired 2026-11-06*** (the
+    firmware diet: its one-channel span cost the B mover ~1.1 KB in the `GATHER` arm, and C1 took its gain in one copy;
+    the code is in git at `61604b9`, `TT_WEIGHT_LAYOUT` is refused by name). The record as it stood (X9's first
+    piece). The measured gain:
     **decode 11.01 / 12.17 -> 9.89 / 10.90 ms** at 32 / 256 tokens (card 1; first measured 11.08 / 12.27 -> 9.90 /
     10.94, `1793663823` / `1793664027` against `1793663597` / `1793664232`), bit for bit, prefill unchanged.
     - **The format.** A one-channel `B` is the layout, so there is no new encoding: the card reads such a `B` in
@@ -1008,11 +1010,11 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       of a weight, after the model loaded, so a later allocation (a longer KV cache, another model) can be refused
       that would fit without them.
     - **One copy does not work in this form** (C0, below): every other reader is slower over the decode layout.
-    - **Opt in:** `TT_WEIGHT_LAYOUT=1` when the session opens, or `Session::set_weight_layout(true)` before the
-      first capture. Decode is then ~10% faster on the 1.7B and ~2% on Qwen3.5-4B, bit for bit, with its read-ahead
-      cap of 1. Off, the read-ahead cap is the mover's 2 again.
-    - **The code stays,** with its gates (`step267` in `--smoke`) and probes. It may be useful when prefill and decode
-      run on different cards (below).
+    - **Opt in (until 2026-11-06):** `TT_WEIGHT_LAYOUT=1` when the session opened. Decode was then ~10% faster on the
+      1.7B and ~2% on Qwen3.5-4B, bit for bit, with its read-ahead cap of 1.
+    - **Retired 2026-11-06** (owner, firmware diet), with `step267`, `silicon_bench_relaid` and the C0 probe. The
+      "code stays for prefill and decode on different cards" note is withdrawn: recover it from `61604b9` if that
+      track needs it.
   - *The other models with it on* (2026-11-03):
     - **Bit for bit on card 0:** `step187`, `step185`, `step233`, `step234`, `step240`, `step205`, `step216`, `step219`,
       `step212`, `step224` and `step263` (Qwen3.5-4B).
@@ -1071,14 +1073,15 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       with C1, since column `j`'s channel is the layout's choice.
     - [ ] **`gate|up`'s evenness** (its slowest unit gains least; X10: a deal that sizes each unit's share to the
       rate it gets). It applies to any layout, so it does not depend on the second copy.
-    - **Parked, opt-in only.** These refine the two-copy form, so none of them can become a default:
+    - **Retired with the two-copy form (2026-11-06).** These refined it, so none of them could become a default:
       - *Relay only the products that gain* (`down` and `qkv`, Phase A): still about half the extra GDDR, and still
         growing with the weights.
       - *Regions that yield:* free relaid regions no live trace reads when an allocation is refused, and drop them on
         `set_weight_layout(false)`.
       - *Regions made at load time* for the two-copy form: no pause inside the first capture (Qwen3.5's build is ~30 s
         longer with the layout).
-    - **Parked use of the code: prefill and decode on different cards** (not scheduled; multi-chip track). A decode
+    - **Was a parked use of the code (withdrawn 2026-11-06): prefill and decode on different cards** (not scheduled;
+      multi-chip track; the code is at `61604b9`). A decode
       card could hold only the relaid layout and a prefill card only the weight as it lies: one copy on each card.
       This needs the decode card's other readers (the tied head's token lookups, `m > 1` products such as a
       speculative verify, writes) to read the regions, the gap C0 measured.

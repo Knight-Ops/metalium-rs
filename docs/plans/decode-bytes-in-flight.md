@@ -910,13 +910,15 @@ GDDR is 16.18 GB free either way, and the fullest channel 2.02 GB.
   two copies' 9.90 ms), so these levers now compete for what is left beyond it, not for 2b's ~10%.
   - **First: bank-affine placement.** It composes with C1, since column `j`'s channel is a free choice of the layout.
   - **Second: `gate|up`'s evenness (below).** Its slowest unit sets the product.
-  - **Third: atomic claims and a dedicated prefetcher.** They need new firmware, and B has 4.6 KB of room (safe).
+  - **Third: atomic claims and a dedicated prefetcher.** They need new firmware: B had 4.6 KB of room (safe) and 220
+    bytes in the tightest build, so the firmware diet (2026-11-06) made room first (`cargo xtask fw-size`).
 - [ ] `gate|up`'s evenness: its mean unit is faster but not its slowest. A deal that sizes each unit's share to the rate
   it gets, measured with the pipeline detail (X10). Layout-independent.
-- Parked, opt-in only (two-copy refinements that cannot become a default):
+- Retired 2026-11-06 with the two-copy form itself (firmware diet; code at `61604b9`; `TT_WEIGHT_LAYOUT` refused by
+  name). These refined it:
   - relay only `down` and `qkv` (Phase A's gains), roughly half the extra GDDR;
   - regions that yield: on a refused allocation, free relaid regions no live trace reads before failing it, and drop
     them on `set_weight_layout(false)`;
   - two-copy regions made at load time, not at a capture's first sight.
-- Parked use: prefill and decode on different cards, each holding one layout (needs the decode card's other readers
+- Withdrawn 2026-11-06, the parked use: prefill and decode on different cards, each holding one layout (needs the decode card's other readers
   to read the regions, C0's gap).

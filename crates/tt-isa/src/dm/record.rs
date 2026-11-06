@@ -279,7 +279,7 @@ impl Iterator for PrefetchCursor {
             return None;
         }
         if let Some(span) = &self.span {
-            let read = span.read_any(self.next, &self.b);
+            let read = span.read_by_column(&self.b, self.next);
             self.next += 1;
             return Some(Ok(read));
         }
@@ -682,10 +682,12 @@ impl Cursor<'_> {
 const PORTS: u32 = crate::dram::PORTS as u32;
 
 /// Word 4 of a tensor reference's first entry ([`TensorRef::encode`] leaves this bit 0, and
-/// [`TensorRef::decode`] does not read it): a one-channel `B` laid out for the record that reads it,
-/// its tiles in the order the record reads them (X9, `tt_kernels`' weight layout). Only such a `B`
-/// is read in large pieces ([`BSpan`]); any other, a one-channel chip's tensors included, is read a
-/// tile at a time.
+/// [`TensorRef::decode`] does not read it). **Retired 2026-11-06** with X9's two-copy weight
+/// layout (`docs/plans/decode-bytes-in-flight.md` Phase B): it marked a one-channel `B` laid out
+/// for its reader, which the mover read in large pieces. Nothing sets it now. An interleaved `B`
+/// carrying it is read a tile at a time, the same bytes into the same slots the pieces moved, so
+/// the hot arm spends nothing on it; beside a `B` laid by column it is refused
+/// ([`super::error::LAYOUT`]), as it always was.
 pub const REF_LAID_FOR_READER: u32 = 1;
 
 /// Whether the reference at `rec[at]` carries [`REF_LAID_FOR_READER`].
@@ -698,17 +700,15 @@ fn l1_by_column(rec: &[[u32; 8]], at: usize) -> bool {
     rec[at][4] & REF_L1_BY_COLUMN != 0
 }
 
-/// A [`GATHER`]'s `B` in one channel (`n == 1`) and marked [`REF_LAID_FOR_READER`]
-/// (`docs/plans/decode-bytes-in-flight.md`, X9's layout: a weight stored for its reader), read as
-/// it lies: row `kk`'s `cols` tiles from `j0`
-/// are consecutive slots in GDDR, as their slots `b_at + (kk * cols + j) * slot` are in L1, so
-/// each row is one run, and with `ct == cols` the rows meet and the block is one run. Each run is
-/// read in pieces of [`crate::noc::niu::MAX_REQUEST_BYTES`] ([`BSpan::piece`]; one request each,
-/// so the in-flight caps count what they did), the port rotating as a tile's would: the same bytes
-/// into the same slots as a read a tile, in a few large reads (X10). A read ahead
-/// ([`GATHER_PREFETCH`]) too, under its own cap, which then holds more bytes in flight: the ops it
-/// runs under read GDDR behind it (`docs/plans/decode-bytes-in-flight.md` Phase B). Any other `B`
-/// is read a tile at a time.
+/// A [`GATHER`]'s `B` laid by column ([`TensorRef::col_tiles`]) and taken into L1 by column
+/// ([`REF_L1_BY_COLUMN`]; `docs/plans/decode-bytes-in-flight.md` Phase C1): run `r` is column
+/// `ch + r` (`ch` the first column), on that column's channel of `B`'s reference, from its base
+/// there plus `(column / n) * stride` (`stride` a column's bytes) and `off` (the record's first
+/// row), into `l1 + r * bytes`. Each run is read in pieces of
+/// [`crate::noc::niu::MAX_REQUEST_BYTES`] ([`BSpan::piece`]; one request each, so the in-flight caps
+/// count what they did), the port rotating as a tile's would: the same bytes into the same slots
+/// as a read a tile, in a few large reads (X10). A read ahead ([`GATHER_PREFETCH`]) too, under its
+/// own cap. It rides in every read ahead ([`PrefetchCursor`]), so it is kept small.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BSpan {
     ch: u32,
@@ -722,14 +722,6 @@ struct BSpan {
     /// Pieces a run, and each piece's bytes (the last of a run may be shorter).
     pieces: u32,
     piece: u32,
-    /// A `B` laid by column read by column ([`REF_L1_BY_COLUMN`]): run `r` is column `ch + r`
-    /// (`ch` is the first column), on that column's channel of `B`'s reference, from its base
-    /// there plus `(column / n) * stride` (`stride` a column's bytes) and `off` (the record's
-    /// first row). The fields are reused so that a span is no larger than an interleaved one's:
-    /// it rides in every read ahead ([`PrefetchCursor`]).
-    /// 1 by column, else 0: a word, not a `bool`, whose niche made every copy of an
-    /// `Option<BSpan>` byte by byte (the B image's room).
-    by_column: u32,
 }
 
 impl BSpan {
@@ -738,45 +730,6 @@ impl BSpan {
     /// slower by more, `docs/plans/decode-bytes-in-flight.md` Phase B.)
     fn piece(_flags: u32, _slot: u32) -> u32 {
         crate::noc::niu::MAX_REQUEST_BYTES
-    }
-
-    /// The span of a one-channel, untransposed `b`; `None` for any other.
-    fn of(
-        b: &TensorRef,
-        b_at: u32,
-        kt: u32,
-        j0: u32,
-        cols: u32,
-        slot: u32,
-        piece: u32,
-    ) -> Result<Option<Self>, u32> {
-        if b.n != 1 || piece == 0 {
-            return Ok(None);
-        }
-        let (ch, off) = b.tile_in(0, j0, slot as u64)?;
-        let row = cols.checked_mul(slot).ok_or(super::error::RANGE)?;
-        let whole = b.ct == cols;
-        let (runs, bytes) = if whole {
-            (1, kt.checked_mul(row).ok_or(super::error::RANGE)?)
-        } else {
-            (kt, row)
-        };
-        // The last byte read must be a slot the tile-by-tile reads would name.
-        let end = off as u64 + ((runs - 1) as u64) * (b.ct as u64 * slot as u64) + bytes as u64;
-        if end > u32::MAX as u64 + 1 {
-            return Err(super::error::RANGE);
-        }
-        Ok(Some(BSpan {
-            ch,
-            off: off as u64,
-            l1: b_at,
-            runs,
-            bytes,
-            stride: b.ct as u64 * slot as u64,
-            pieces: bytes.div_ceil(piece),
-            piece,
-            by_column: 0,
-        }))
     }
 
     /// The span of a `B` laid by column ([`TensorRef::col_tiles`]) that its reader takes into L1
@@ -825,7 +778,6 @@ impl BSpan {
             stride: col_bytes,
             pieces: bytes.div_ceil(piece),
             piece,
-            by_column: 1,
         })
     }
 
@@ -834,33 +786,7 @@ impl BSpan {
         self.runs * self.pieces
     }
 
-    /// Read `n` of [`BSpan::count`] of a span laid for its reader ([`BSpan::read_any`] for either
-    /// kind). Out of line, as the baseline's code had it.
-    #[inline(never)]
-    fn read(&self, n: u32) -> [u32; 8] {
-        let (run, piece) = (n / self.pieces, n % self.pieces);
-        let at = piece * self.piece;
-        [
-            op::READ,
-            self.ch,
-            n % PORTS,
-            (self.off + run as u64 * self.stride + at as u64) as u32,
-            self.l1 + run * self.bytes + at,
-            (self.bytes - at).min(self.piece),
-            0,
-            0,
-        ]
-    }
-
-    /// Read `n` of [`BSpan::count`], of `B` (`b`, its reference; read only by column).
-    fn read_any(&self, n: u32, b: &TensorRef) -> [u32; 8] {
-        match self.by_column != 0 {
-            true => self.read_by_column(b, n),
-            false => self.read(n),
-        }
-    }
-
-    /// [`BSpan::read`] by column: the runs' pieces in turn (piece 0 of each column, then piece 1,
+    /// Read `n` of [`BSpan::count`], of `B` (`b`, its reference), by column: the runs' pieces in turn (piece 0 of each column, then piece 1,
     /// ...). A unit's columns sit on consecutive channels, and units whose runs start on the same
     /// channel would otherwise all read it at once (a two-channel hotspot at four columns a run,
     /// `docs/plans/decode-bytes-in-flight.md` C1 results). The same bytes to the same slots, in
@@ -908,8 +834,7 @@ fn tensor_of(rec: &[[u32; 8]], at: usize, any: bool) -> Result<TensorRef, u32> {
 }
 
 /// A [`GATHER`]'s `B` span, by its reference's marks: by column ([`BSpan::of_columns`]) where its
-/// reader asks for that order, in pieces where it is laid for its reader ([`BSpan::of`]), else
-/// none (a tile at a time). Refuses an order its `B` cannot take, a mark beside a layout it does
+/// reader asks for that order, else none (a tile at a time). Refuses an order its `B` cannot take, a mark beside a layout it does
 /// not describe, and a read ahead ([`GATHER_PREFETCH`]) of a `B` laid by column but read a tile
 /// at a time: [`PrefetchCursor`] walks only interleaved tiles, so that its per-read code is the
 /// interleaved code alone (the host reads such a record in place, `tile_op::ahead::split`).
@@ -939,10 +864,7 @@ fn gather_span(
     if b.col_tiles != 0 && flags & GATHER_PREFETCH != 0 {
         return Err(super::error::LAYOUT);
     }
-    if b_t || b_resident || !laid_for_reader(rec, 3) {
-        return Ok(None);
-    }
-    BSpan::of(b, b_at, kt, j0, cols, slot, BSpan::piece(flags, slot))
+    Ok(None)
 }
 
 /// One operand of a [`GATHER`] with an operand laid by column, read a tile at a time as the
@@ -1088,7 +1010,7 @@ fn gather_by_column(
     }
     if let Some(span) = span {
         for n in 0..span.count() {
-            emit(span.read_any(n, b))?;
+            emit(span.read_by_column(b, n))?;
         }
         return Ok(());
     }
@@ -1279,19 +1201,6 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                         None => emit(fetch(&a, a_t, i0 + i, kk, to)?)?,
                     }
                 }
-            }
-            let span = match (b_t || b_resident || !laid_for_reader(rec, 3), b_slot) {
-                (false, slot) => {
-                    let slot = slot as u32;
-                    BSpan::of(&b, b_at, kt, j0, cols, slot, BSpan::piece(flags, slot))?
-                }
-                _ => None,
-            };
-            if let Some(span) = span {
-                for n in 0..span.count() {
-                    emit(span.read(n))?;
-                }
-                return Ok(());
             }
             for kk in (0..kt).filter(|_| !b_resident) {
                 let mut row = if b_t { None } else { Some(b.cursor(kk, j0)?) };
@@ -2836,26 +2745,20 @@ mod tests {
         out
     }
 
-    /// X9's layout (`docs/plans/decode-bytes-in-flight.md`): a one-channel `B` laid out for its
-    /// reader ([`REF_LAID_FOR_READER`]), read as it lies, is read in pieces of at most one request,
-    /// and moves exactly the bytes, to exactly the slots, that a read a tile would (the oracle
-    /// below, from the record's own definition: tile `(kk, j0 + j)` of a tensor `ct` wide at
-    /// `base + (first + kk * ct + j0 + j) * slot`, into `b_at + (kk * cols + j) * slot`). Whole when
-    /// the rows meet (`ct == cols`), a run a row when they do not; a read ahead reads the same
-    /// pieces and the pump's cursor gives them; unmarked, or interleaved, a `B` keeps a read a tile.
+    /// The retired mark of X9's two-copy layout ([`REF_LAID_FOR_READER`]) costs the hot arm
+    /// nothing and changes nothing: a one-channel `B` carrying it, interleaved, is read a tile at a
+    /// time, exactly the bytes to exactly the slots the record defines (the oracle: tile
+    /// `(kk, j0 + j)` of a tensor `ct` wide at `base + (first + kk * ct + j0 + j) * slot`, into
+    /// `b_at + (kk * cols + j) * slot`), as an unmarked one is; a read ahead and the pump's cursor
+    /// give the same reads.
     #[test]
-    fn a_one_channel_b_laid_for_its_reader_is_read_in_large_pieces() {
+    fn the_retired_laid_for_reader_mark_reads_a_tile_at_a_time() {
         let bf16 = gather_b_format(crate::tile::L1Format::Bf16).unwrap();
         for (flags, slot) in [
             (GATHER_STREAM | bf16, 2112u32),
             (GATHER_STREAM, TILE_SLOT as u32),
         ] {
-            for (kt, j0, cols, ct, first) in [
-                (64u32, 0u32, 3u32, 3u32, 0u32),
-                (13, 0, 1, 1, 0),
-                (7, 2, 3, 9, 5),
-                (64, 0, 5, 5, 128),
-            ] {
+            for (kt, j0, cols, ct, first) in [(13u32, 0u32, 1u32, 1u32, 0u32), (7, 2, 3, 9, 5)] {
                 let what = std::format!(
                     "slot {slot}, kt {kt}, j0 {j0}, cols {cols}, ct {ct}, first {first}"
                 );
@@ -2866,17 +2769,6 @@ mod tests {
                     ..TensorRef::default()
                 };
                 (b.channels[0], b.base[0]) = (6, 0x40_0000);
-                let rec = b_gather(flags, kt, j0, cols, &b, true);
-                let mut reads = Vec::new();
-                expand_reads(
-                    &rec,
-                    |_| 0,
-                    |e| {
-                        reads.push(e);
-                        Ok(())
-                    },
-                )
-                .unwrap();
                 let mut oracle = Vec::new();
                 for kk in 0..kt {
                     for j in 0..cols {
@@ -2893,95 +2785,33 @@ mod tests {
                         ]);
                     }
                 }
-                assert_eq!(
-                    units_moved(&reads),
-                    units_moved(&oracle),
-                    "{what}: the bytes moved"
-                );
-                let runs = if ct == cols { 1 } else { kt };
-                let per_run = (kt * cols * slot / runs).div_ceil(16384);
-                assert_eq!(reads.len() as u32, runs * per_run, "{what}: reads");
-                assert!(
-                    reads.iter().all(|r| r[5] <= 16384 && r[2] < PORTS),
-                    "{what}"
-                );
-                assert!(
-                    reads.iter().all(|r| r[3] % 64 == r[4] % 64),
-                    "{what}: congruent"
-                );
-                // A read ahead: the same bytes to the same slots, in the same pieces, and the
-                // pump's cursor gives the record's own expansion.
-                let mut ahead = rec.clone();
+                let expanded = |rec: &[[u32; 8]]| {
+                    let mut reads = Vec::new();
+                    expand_reads(
+                        rec,
+                        |_| 0,
+                        |e| {
+                            reads.push(e);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    reads
+                };
+                let marked = expanded(&b_gather(flags, kt, j0, cols, &b, true));
+                let plain = expanded(&b_gather(flags, kt, j0, cols, &b, false));
+                assert_eq!(marked, plain, "{what}: the mark changes nothing");
+                assert_eq!(marked.len() as u32, kt * cols, "{what}: a read a tile");
+                assert_eq!(units_moved(&marked), units_moved(&oracle), "{what}: bytes");
+                let mut ahead = b_gather(flags, kt, j0, cols, &b, true);
                 ahead[0][1] = ahead[0][1] & !GATHER_STREAM | GATHER_PREFETCH;
-                let mut expanded = Vec::new();
-                expand_reads(
-                    &ahead,
-                    |_| 0,
-                    |e| {
-                        expanded.push(e);
-                        Ok(())
-                    },
-                )
-                .unwrap();
-                assert_eq!(
-                    units_moved(&expanded),
-                    units_moved(&oracle),
-                    "{what}: ahead's bytes"
-                );
-                assert_eq!(expanded, reads, "{what}: ahead's reads are the stream's");
+                let reads = expanded(&ahead);
+                assert_eq!(reads, marked, "{what}: ahead's reads are the stream's");
                 let cursor = PrefetchCursor::new(&ahead).unwrap().unwrap();
-                assert_eq!(
-                    cursor.left(),
-                    expanded.len() as u32,
-                    "{what}: the cursor's count"
-                );
                 let pumped: Vec<_> = cursor.map(Result::unwrap).collect();
-                assert_eq!(pumped, expanded, "{what}: the cursor's reads");
-                // Unmarked (a one-channel chip's tensor): a read a tile, as before.
-                let mut plain = Vec::new();
-                expand_reads(
-                    &b_gather(flags, kt, j0, cols, &b, false),
-                    |_| 0,
-                    |e| {
-                        plain.push(e);
-                        Ok(())
-                    },
-                )
-                .unwrap();
-                assert_eq!(
-                    plain.len() as u32,
-                    kt * cols,
-                    "{what}: unmarked, a read a tile"
-                );
-                assert_eq!(
-                    units_moved(&plain),
-                    units_moved(&oracle),
-                    "{what}: unmarked bytes"
-                );
+                assert_eq!(pumped, reads, "{what}: the cursor's reads");
             }
         }
-        // Interleaved over eight channels: a read a tile, as before.
-        let mut b = TensorRef {
-            n: 8,
-            ct: 4,
-            ..TensorRef::default()
-        };
-        for c in 0..8 {
-            (b.channels[c], b.base[c]) = (c as u8, 0x40_0000);
-        }
-        let rec = b_gather(GATHER_STREAM | bf16, 16, 0, 4, &b, true);
-        let mut reads = Vec::new();
-        expand_reads(
-            &rec,
-            |_| 0,
-            |e| {
-                reads.push(e);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(reads.len(), 64, "a read a tile");
-        assert!(reads.iter().all(|r| r[5] == 2112));
     }
 
     /// A tensor laid by column over `n` channels, `ct` columns of `col_tiles` tiles: channel `c`
