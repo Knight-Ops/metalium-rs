@@ -419,6 +419,26 @@ pub fn start<T: Transport, N: NocId>(
             )));
         }
     }
+    // The production role images (`tt_firmware_images::ROLES`, in the role slots
+    // of `tt_isa::l1::roles`) leave guarded runs out to keep their slots small: a
+    // guarded program on one would run unguarded, with nothing to bound a parked
+    // thread. Only the guarded images (`GUARDED_ROLES`, at the cores' default
+    // reset PCs) run them.
+    let guarded = spec
+        .roles
+        .iter()
+        .any(|r| matches!(r, RoleProgram::Guarded(_)));
+    if guarded
+        && images
+            .iter()
+            .any(|(_, _, at)| tt_isa::l1::roles::BASE.contains(at))
+    {
+        return Err(AtomicsError::Refused(
+            "a guarded program needs the guarded role images (tt_firmware_images::GUARDED_ROLES); \
+             the production role images leave guarded runs out"
+                .to_string(),
+        ));
+    }
     let simulated = dev.transport().is_simulated();
     let push_window = if simulated {
         mailbox::SIM_PUSH_WINDOW

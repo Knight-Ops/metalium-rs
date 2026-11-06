@@ -62,17 +62,34 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    run_in::<Riscv, Thread>(Mailbox::single_core())
+    // The single-core probe images (`corpus`, `corpus_t0`) have no slot to
+    // fit, so they keep guarded runs (`step105_mutex`'s refusals arm one).
+    run_in::<Riscv, Thread, true>(Mailbox::single_core())
 }
 
 /// The same runner, reporting through a role mailbox: one of three cores each
-/// running its own part of a kernel (`tt_isa::mailbox::role`).
+/// running its own part of a kernel (`tt_isa::mailbox::role`). The production
+/// role images: no guarded runs, whose machinery (`guard_wait` and its helpers,
+/// about 1.9 KB an image) is compiled out, so the role slots stay small and their
+/// room goes to B's mover (`tt_isa::l1::roles`).
 pub fn run_role<Riscv, Thread>() -> !
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    run_in::<Riscv, Thread>(Mailbox::of(Thread::INDEX))
+    run_in::<Riscv, Thread, false>(Mailbox::of(Thread::INDEX))
+}
+
+/// The role runner with **guarded runs** (`tt_isa::mailbox::guard`): the probe
+/// images `guarded_t0..2`, at their cores' default reset PCs, which
+/// `tt_kernels::atomics` loads for the Sync Unit and L1 atomics gates. Never
+/// loaded beside the mover.
+pub fn run_guarded_role<Riscv, Thread>() -> !
+where
+    Thread: TensixThread,
+    Riscv: PushesTo<Thread>,
+{
+    run_in::<Riscv, Thread, true>(Mailbox::of(Thread::INDEX))
 }
 
 /// Stop, having said why in `mb` as well as in the single-core mailbox the
@@ -409,7 +426,7 @@ fn guard_wait(mb: Mailbox, run: &GuardRun) {
     crumb(g, stage::DRAINED);
 }
 
-fn run_in<Riscv, Thread>(mb: Mailbox) -> !
+fn run_in<Riscv, Thread, const GUARDED: bool>(mb: Mailbox) -> !
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
@@ -430,7 +447,7 @@ where
     // SAFETY: as above; written by the host before this core left reset.
     let mut generation = unsafe { l1_read32(mb.generation()) };
     loop {
-        let program_len = run_once::<Riscv, Thread>(mb);
+        let program_len = run_once::<Riscv, Thread, GUARDED>(mb);
         if generation == 0 {
             // The dump is what carries the result; this only says it is complete.
             if mb == Mailbox::single_core() {
@@ -476,7 +493,7 @@ where
 
 /// One run of the staged program: read the descriptor, push the program, wait
 /// for it to retire, dump `Dst`. Returns the program's length.
-fn run_once<Riscv, Thread>(mb: Mailbox) -> u32
+fn run_once<Riscv, Thread, const GUARDED: bool>(mb: Mailbox) -> u32
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
@@ -514,7 +531,9 @@ where
     // cannot fill a blocked thread's FIFO, is neither streamed, looped nor
     // dumping, and carries its own bounds. Checked before anything is pushed;
     // the window drain is off because it is a coprocessor-drain load too.
-    let guarded = guard_armed(mb);
+    // Only an image built with them (`run_guarded_role`) looks at the guard
+    // block at all; a production role never arms, and never reads it.
+    let guarded = GUARDED && guard_armed(mb);
     let guard_run = if guarded {
         push_window = 0;
         Some(guard_begin(mb, streamed, looped, dump_rows, program_len))

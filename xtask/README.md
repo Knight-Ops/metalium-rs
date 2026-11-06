@@ -24,6 +24,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `silicon [options]` | The silicon suite, one test per process. |
 | `conformance [options]` | Burn's own backend tests against `burn-tt` on ttsim, one test per process, compared with `crates/burn-tt-conformance/expected-failures.toml`; `--exact` runs the second profile, with exact matmul accumulation (`expected-failures-exact.toml`). See that crate's README. |
 | `bench [options]` | The firmware benchmarks on silicon, collected into `target/silicon/bench/`. |
+| `fw-size [--set <name>]... [--symbols] [--top <n>]` | Builds `crates/tt-firmware` in every shipped feature set (safe, `fast-reads`, `encoded-guard`, each with `profile`) into `target/fw-size/` and prints each loaded image's bytes, slot and room (`dm_b`, `dm_nc`, `role_t0..2`), then the B mover's hot-path functions by address. The span comes from `sections.x`'s `__image_base`/`__image_limit` and `__bss_end`. Quote it for any firmware change: sizes move by tens of bytes with unrelated changes. |
 
 `--check` fails if the committed file is stale instead of rewriting it. CI runs all
 three generators with `--check`. All pins are in `PINS.toml`.

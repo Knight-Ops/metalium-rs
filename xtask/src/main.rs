@@ -12,6 +12,7 @@ mod burn_coverage;
 mod burn_tests;
 mod conformance;
 mod fetch;
+mod fw_size;
 mod gen_burn;
 mod gen_cfg;
 mod gen_isa;
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
         Some("conformance") => conformance::run(args),
         Some("bench") => silicon::bench(args),
         Some("bench-diff") => bench_diff::run(args),
+        Some("fw-size") => fw_size::run(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
     };
@@ -119,4 +121,7 @@ tasks:
                           `cargo xtask bench --help`
   bench-diff <before.jsonl> <after.jsonl>
                           two bench collections side by side, each result's
-                          ratio and whether it moved past its own spread";
+                          ratio and whether it moved past its own spread
+  fw-size [options]       each firmware image's bytes against its slot in every
+                          shipped feature set, and the B mover's hot path;
+                          `cargo xtask fw-size --help`";

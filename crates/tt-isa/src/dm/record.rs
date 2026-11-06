@@ -382,8 +382,8 @@ pub const PAD_WRITE: u32 = 0x17;
 /// only on an even row, so a read must take the pair a row is half of and the
 /// wanted half be moved; that code, in this record, measured 400 bytes more
 /// in RISCV B's image, which then had 172 of its 24 KiB left (a mover image
-/// may not pass `IMAGE_MAX`; the slot is 44,928 bytes since the role images
-/// were repacked). `docs/plans/roadmap.md`, "Gather without staging", has the
+/// may not pass `IMAGE_MAX`, now 52,224 bytes since the role images were
+/// repacked; `cargo xtask fw-size` prints the room left). `docs/plans/roadmap.md`, "Gather without staging", has the
 /// options.
 ///
 /// The slots are not checked against the data arena here (the mover's image has

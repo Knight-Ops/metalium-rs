@@ -577,7 +577,7 @@ mod silicon_gates {
             let mut launch = atomics::start(
                 dev,
                 harness::tensix_tile(),
-                &tt_tests::firmware::ROLES,
+                &tt_tests::firmware::GUARDED_ROLES,
                 &Spec {
                     roles: [
                         RoleProgram::Plain(&programs[0]),
@@ -897,7 +897,7 @@ mod silicon_gates {
         let mut launch = atomics::start(
             dev,
             harness::tensix_tile(),
-            &tt_tests::firmware::ROLES,
+            &tt_tests::firmware::GUARDED_ROLES,
             &Spec {
                 roles: [
                     RoleProgram::Guarded(consumer),

@@ -958,6 +958,27 @@ matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-
 
 ## RISCV B's image budget (2026-10-13, ttsim and card 0)
 
+**Update 2026-11-06: the firmware diet; B's slot is 52,224 bytes, the role slots 7,168 (`0x1C00`).** Measured with
+`cargo xtask fw-size` (new: every shipped feature set, each image's bytes to the end of its last L1 section, its slot
+from the link script, the room left; and B's hot path by address). The role images carried the guarded-run machinery
+(`guard_wait` and its helpers, ~2.4 KB a `profile` image) that only `tt_kernels::atomics` arms, for `step105` and
+`step106`. It is now compiled into the probe images `guarded_t0..2` (at the cores' default reset PCs) and the
+single-core `corpus` images only; `atomics::start` refuses a guarded program on the production role images by name
+(gate `step105`'s `a_guarded_program_on_the_production_role_images_is_refused`). B's and the role images' link
+scripts are generated from `tt_isa::dm::IMAGE_MAX` and `tt_isa::l1::roles` (`crates/tt-firmware/build.rs`), so a slot
+is one constant. B's code is unchanged byte for byte (`run_record` still at `0x2794`); only its limit moved. Card 0:
+`step105`, `step106` and `step12_mnist`, 56 of 57 (`1793983256`; the one failure is
+`guard_poll_rate_calibration_full`, expected to fail on silicon as its comment says).
+
+| image, feature set | bytes before | room before | bytes after | room after |
+|---|--:|--:|--:|--:|
+| `dm_b`, safe | 40,360 | 4,568 | 40,360 | 11,864 |
+| `dm_b`, `encoded-guard` | 42,532 | 2,396 | 42,532 | 9,692 |
+| `dm_b`, `profile` + `encoded-guard` | 44,748 | 180 | 44,748 | 7,476 |
+| `role_t1`, safe | 7,704 | 1,896 | 5,168 | 2,000 |
+| `role_t1`, `profile` (the largest role) | 8,884 | 716 | 6,496 | 672 |
+| `dm_nc`, `profile` | 21,544 | 3,032 | 21,544 | 3,032 |
+
 **Update 2026-11-04: B's slot is 44,928 bytes; the role slots are 9,600 (`0x2580`).** Weights laid by column
 (`docs/plans/decode-bytes-in-flight.md` Phase C1) add 3.6 KB to every B image, and with them the `profile` image
 built with `fast-reads` (and `encoded-guard`) no longer fit 43,008 bytes. The role images are at most 8,884 bytes (a
