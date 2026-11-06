@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The firmware diet: B's room 180 -> 10,356 bytes at the same speed; H16 and H17 killed](#the-firmware-diet-bs-room-180---10356-bytes-at-the-same-speed-h16-and-h17-killed-2026-11-06-cards-0-and-1) | 2026-11-06 | roadmap 2b's next levers need firmware room: guarded runs out of the role images (slots 9,600 -> 7,168, B +7,296 bytes), layer sub-traces and X9's two-copy layout retired; `cargo xtask fw-size`; every model within noise of `41575d1`; H16 (cold record arms, `opt-level = 2`) no gain, `opt-level = 2` 1.9% slower on ResNet-18; H17 (bank-affine at 16 KiB) bounded at 1.04-1.06x, killed |
 | [Weights laid by column, one copy: a 1.7B decode step 11.00 -> 10.06 ms, the default](#weights-laid-by-column-one-copy-a-17b-decode-step-1100---1006-ms-the-default-2026-11-04-cards-0-and-1) | 2026-11-04 | roadmap 2b Phase C1: each stored weight's column contiguous in one channel, the same bytes; decode reads 16 KiB pieces, blocks a tile at a time; 1.7B decode 10.06 / 11.21 ms (`1ff07dc` 11.00 / 12.18), Qwen3.5-4B -2.1%, prefill and eager blocks unchanged, GDDR unchanged; the off path's per-tile code kept byte for byte (code placement cost 1.5-3%) |
 | [X9's weight layout back to opt-in: a default must hold the weights once](#x9s-weight-layout-back-to-opt-in-a-default-must-hold-the-weights-once-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b, owner's call: `TT_WEIGHT_LAYOUT=1` opts in, the default reads each weight as it lies (one copy, read-ahead cap 2); the second copy grows with the model and does not scale (the roadmap's new constraint); 1.7B decode 10.96 / 12.14 ms by default, 9.75 / 10.88 opted in (card 1), prefill unchanged; card 0 `step267`, `step12_mnist`, `step188` pass |
 | [One copy of a relaid weight, bounded: the kill fires](#one-copy-of-a-relaid-weight-bounded-the-kill-fires-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b Phase C0 (`tensor::probe_relaid_blocks`, bit for bit): every other product over a relaid weight read from its regions; eager products 1.34-3.38x slower, prefill over one-column runs 4-13% slower, decode unchanged; the decode deal's 1-2-column runs make ~4x the list entries; 8.3% of column-run tiles held twice; one copy closed in this form |
@@ -408,6 +409,58 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The firmware diet: B's room 180 -> 10,356 bytes at the same speed; H16 and H17 killed (2026-11-06, cards 0 and 1)
+
+Roadmap Track 2 item 2b's next steps. Its third lever (atomic column claims or a dedicated prefetcher) needs new
+firmware, and B's mover had 220 bytes left in its tightest build. So: make the budget visible, delete what the
+defaults never run, then try the two remaining ideas with numbers fixed beforehand
+(`docs/learnings/dataflow-compiler.md` §13, H16 and H17).
+
+**Room** (`cargo xtask fw-size`, new; bytes to the end of the last L1 section, room to the slot's end):
+
+| build | `dm_b` before | `dm_b` after | room before | room after |
+|---|--:|--:|--:|--:|
+| safe | 40,360 | 37,596 | 4,568 | 14,628 |
+| `encoded-guard` | 42,532 | 39,792 | 2,396 | 12,432 |
+| `profile` + `encoded-guard` | 44,748 | 41,868 | 180 | 10,356 |
+
+- `fb2ec4b`: the production role images leave guarded runs out (only `tt_kernels::atomics` arms them; the probe
+  images `guarded_t0..2` keep them): the largest role image 8,884 -> 6,496 bytes, the slots 9,600 -> 7,168, B's slot
+  44,928 -> 52,224. B's code unchanged.
+- `61604b9`: layer sub-traces retired (opt-in and slower since 2026-10-23): B -1,624, NC -704.
+- `61a71b2`: X9's two-copy weight layout retired (opt-in since 2026-11-03; C1 holds its gain in one copy): B -1,140,
+  the span block out of the `GATHER` arm.
+- Card 0: `--smoke` 1,273 of 1,273 (`1793984685`, its eight two-card tests rerun once card 1 was free,
+  `1793987899`); `step105`/`step106` from the guarded images (`1793983256`).
+
+**Speed** (card 1, release, every tile, each run its own process; medians, ms):
+
+| run | ResNet-18 traced | ViT-Tiny traced | 1.7B decode, 32 / 256 tokens | 1.7B prefill, 32 / 256, tokens/s |
+|---|--:|--:|--:|--:|
+| `41575d1` (`1793984806`) | 12.488 | 7.681 | 10.071 / 11.195 | 1,097 / 2,097 |
+| diet `61a71b2` (`1793985175`) | 12.496 | 7.610 | 10.062 / 11.184 | 1,099 / 2,104 |
+| diet (`1793985451`) | 12.468 | 7.628 | 10.038 / 11.167 | 1,104 / 2,105 |
+| `41575d1` (`1793985728`) | 12.377 | 7.640 | 10.015 / 11.146 | 1,098 / 2,101 |
+| diet (`1793986026`) | 12.317 | 7.624 | 9.990 / 11.158 | 1,106 / 2,107 |
+| H16a (`1793986388`) | 12.177 | 7.628 | 10.052 / 11.162 | 1,095 / 2,096 |
+| H16b, `opt-level = 2` (`1793986747`) | 12.611 | 7.544 | 10.043 / 11.217 | 1,089 / 2,079 |
+| H16b (`1793987024`) | 12.592 | 7.771 | 10.040 / 11.215 | 1,083 / 2,072 |
+| H16a (`1793987301`) | 12.431 | 7.593 | 10.047 / 11.205 | 1,100 / 2,100 |
+| diet (`1793987580`) | 12.453 | 7.660 | 10.050 / 11.205 | 1,100 / 2,101 |
+
+- **The diet costs nothing:** every model within the baseline's brackets.
+- **H16a** (`SELECT_ROWS` and the padding fill out of `run_record`, which stays at `0x2794`, 1,276 bytes shorter):
+  within noise, and 632 bytes larger whole. Reverted: past C1's form, B's per-tile code size no longer shows in model
+  time.
+- **H16b** (`opt-level = 2`, 4,260 bytes smaller): ResNet-18 1.9% slower, prefill 1.2%. October's "as fast as 3"
+  (the image budget section below) no longer holds. Not adopted.
+
+**H17, bank-affine placement at 16 KiB** (`silicon_bench_memory::gddr_readers_by_channel` with `BANK_BYTES`, new,
+`--feature profile`, card 1, `1793988029`): each product's own bytes, "together" (first start to last end), best of
+caps 2-3. `down`: C1's 64 units 485.2 GB/s, 2 a channel 504.0, 3 a channel 502.5 (1.04x). `o`: 457.0, 481.5, 485.6
+(1.06x). Under 0.1 ms a 1.7B step before the larger kernel share fewer units carry, against a kill of 1.15x and
+0.2 ms: not built.
 
 ## Weights laid by column, one copy: a 1.7B decode step 11.00 -> 10.06 ms, the default (2026-11-04, cards 0 and 1)
 

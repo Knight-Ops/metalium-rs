@@ -908,7 +908,8 @@ GDDR is 16.18 GB free either way, and the fullest channel 2.02 GB.
 - [ ] Item 5's copy-free levers (bank-affine placement, atomic column claims, a dedicated prefetcher), ranked against
   the scalable form after its bound. **Ranked after C1 (2026-11-04):** C1 took nearly all of 2b's gain (10.06 against
   two copies' 9.90 ms), so these levers now compete for what is left beyond it, not for 2b's ~10%.
-  - **First: bank-affine placement.** It composes with C1, since column `j`'s channel is a free choice of the layout.
+  - **First: bank-affine placement. Bounded and killed 2026-11-06** (H17, card 1, `1793988029`): 2-3 readers a
+    channel at 16 KiB read `down`'s bytes 1.04x and `o`'s 1.06x faster than C1's deal, under 0.1 ms a step.
   - **Second: `gate|up`'s evenness (below).** Its slowest unit sets the product.
   - **Third: atomic claims and a dedicated prefetcher.** They need new firmware: B had 4.6 KB of room (safe) and 220
     bytes in the tightest build, so the firmware diet (2026-11-06) made room first (`cargo xtask fw-size`).

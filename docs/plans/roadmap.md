@@ -1071,6 +1071,15 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       dedicated prefetcher need no second copy. **Ranked after C1:** C1 took nearly all of 2b's gain (10.06 ms
       against two copies' 9.90), so these compete for what is left. Bank-affine placement comes first: it composes
       with C1, since column `j`'s channel is the layout's choice.
+      - [x] **The firmware diet first** (2026-11-06, [log](../learnings/performance-log.md#the-firmware-diet-bs-room-180---10356-bytes-at-the-same-speed-h16-and-h17-killed-2026-11-06-cards-0-and-1)):
+        the third lever needs firmware and B had 220 bytes in its tightest build. `cargo xtask fw-size`; guarded runs
+        out of the role images (slots 9,600 -> 7,168 bytes); layer sub-traces and X9's two-copy layout retired. B's
+        room 180 -> 10,356 bytes (tightest), 4,568 -> 14,628 (safe), every model within noise of `41575d1`. H16 (the
+        hot window: cold record arms out, `opt-level = 2`) killed: no gain, `opt-level = 2` 1.9% slower.
+      - [x] **Bank-affine placement: bounded, killed** (H17, 2026-11-06, card 1, `1793988029`): at 16 KiB entries, 2-3
+        readers a channel read `down`'s and `o`'s bytes only 1.04x / 1.06x faster than C1's deal (kill 1.15x, under
+        0.1 ms a step). Not built.
+      - Next: `gate|up`'s evenness (below), then atomic claims or a dedicated prefetcher in the room the diet made.
     - [ ] **`gate|up`'s evenness** (its slowest unit gains least; X10: a deal that sizes each unit's share to the
       rate it gets). It applies to any layout, so it does not depend on the second copy.
     - **Retired with the two-copy form (2026-11-06).** These refined it, so none of them could become a default:

@@ -946,6 +946,66 @@ Each entry: the claim, the prediction, how it is measured, and what kills it. Re
     - The lesson for the register: "8 ms a MB, the card idle" named the card's idle time correctly but
       not its cause. Meter the host stage before choosing where the work moves.
 
+- **H16 The B mover's hot window** (opened 2026-11-06, the firmware diet; roadmap Track 2 item 2b).
+  - *Claim:* the B mover's per-tile path is spread over more than its ~4 KiB instruction cache. A
+    tile's read runs the `GATHER` arm's loop inside `run_record` (7,892 bytes from `0x2794`), then
+    `record_entry` (`0x220`), `issue` (`0x1f14`) and the NoC issue (`0x21c4`-`0x23ec`), with `exec`'s
+    7,140 bytes between them (`cargo xtask fw-size`). B's misses are L1 fetches that the compute
+    cores' pushes wait behind: C1 showed this as push cycles a word up 8-12% on every model when
+    B's per-tile code grew, with the compute images unchanged (`silicon-operating-notes.md`, "Where
+    B's code sits"). If the rarely run record arms leave `run_record` for cold code, and the
+    `GATHER` loop with the issue path it calls is laid out in one window of ≤ 4 KiB, B misses
+    less, and so does every model.
+  - *Prediction:* ViT-Tiny and ResNet-18 traced 1-3% faster, the 1.7B decode step ≥ 0.5% faster,
+    and the profile's push cycles a word lower. Card 1, release, ABBA against the diet's Phase 1
+    tree, each run its own process, `TT_TILES=all`.
+  - *Kills it:* under 0.5% on all three, or any model slower beyond its run-to-run noise. Then the
+    layout is reverted and only the bytes saved are kept.
+  - *Measured in the same pass:* `opt-level = 2` for the firmware (1,744 bytes smaller on `dm_b`
+    and as fast as 3 on two benches in October, performance log "Firmware image budget"), adopted
+    only if every model above stays within its noise.
+  - *Before either:* the diet's Phase 1 tree is checked against the pre-diet baseline `41575d1`.
+    X9's removal changed the arm's bytes (the span block went), so that tree must be no slower.
+  - *Result (card 1, 2026-11-06): the kill fires; nothing is kept.* The Phase 1 tree (`61a71b2`)
+    is within noise of `41575d1` on every model (ABBA `1793984806`-`1793985728`: ResNet-18
+    12.47-12.50 against 12.38-12.49 ms, ViT-Tiny 7.61-7.63 against 7.64-7.68, the 1.7B decode
+    10.04-10.06 / 11.17-11.18 against 10.02-10.07 / 11.15-11.20). Then ABCCBA
+    (`1793986026`-`1793987580`):
+    - *H16a*, `SELECT_ROWS` and the padding fill out of line, `run_record` pinned after the NoC
+      issue (6,616 bytes, 1,276 fewer, still at `0x2794`): within noise everywhere (ResNet-18
+      12.18 / 12.43 against 12.32 / 12.45 ms, ViT-Tiny 7.63 / 7.59 against 7.62 / 7.66, decode
+      10.05 / 11.16-11.21 against 9.99-10.05 / 11.16-11.21), and 632 bytes larger whole (the
+      out-of-line calls). Reverted.
+    - *H16b*, H16a at `opt-level = 2`: 4,260 bytes smaller still (`dm_b` 33,968 safe;
+      `run_record` 4,936), but ResNet-18 1.9% slower (12.61 / 12.59 ms) and prefill 1.2%
+      (2,079 / 2,072 against 2,101-2,107 tokens/s). October's "as fast as 3" no longer holds
+      on today's models. Not adopted.
+    - What it says: past C1's form (one cold dispatch, the arm byte for byte), B's remaining
+      per-tile code size does not show in model time; size is a budget, not a speed lever, now.
+
+- **H17 Bank-affine placement at large entries** (opened 2026-11-06; roadmap Track 2 item 2b's
+  first copy-free lever; D3 and F27 decided it at 2 KiB entries only).
+  - *Claim:* with C1's by-column weights read in 16 KiB pieces, a one-row product whose units each
+    read only the columns in the channel beside them, at 2-3 units a channel, reads faster on its
+    slowest unit than C1's deal. F27 measured 509 GB/s at 2 readers a channel with 16 KiB entries.
+    H11 says the 96-120-unit products (`gate|up`, `qkv`) already read ~499 GB/s, so the claim is
+    for the 64-unit ones, `o` and `down`.
+  - *Prediction:* `down`'s and `o`'s slowest unit ≥ 1.15x faster, and the 1.7B decode step ≥ 0.2 ms
+    faster, bit for bit.
+  - *Bound first, no build:* `silicon_bench_memory::gddr_readers_by_channel` gains a mix with
+    `down`'s and `o`'s per-unit bytes at 16 KiB, banked at 2 and 3 units a channel, against C1's
+    deal of the same bytes (card 1). The units' kernel share grows as 64 units become 16-24; the
+    bound charges it from the pipeline meter's kernel time a batch.
+  - *Kills it:* the bound under 1.15x for both products, or a projected step saving under 0.2 ms.
+  - *Bound (card 1, 2026-11-06, `1793988029`, a `profile` image for the movers' stamps): the
+    kill fires; not built.* Each product's bytes at 16 KiB entries, "together" (first start to
+    last end, so the slowest reader is charged), best of caps 2-3:
+    `down` 485.2 GB/s on C1's 64 units against 504.0 at 2 a channel and 502.5 at 3 (1.04x);
+    `o` 457.0 against 481.5 and 485.6 (1.06x). Projected on the 1.7B, 24 layers: ~0.06 ms
+    (`down`) and ~0.03 ms (`o`) a step, under 0.2 ms before charging the larger kernel share 16-24
+    units would carry. At large entries the channels are near their peak whoever reads them;
+    D3 stands at 16 KiB too. Next of item 2b's levers: `gate|up`'s evenness (X10).
+
 ---
 
 ## 14. Bibliography

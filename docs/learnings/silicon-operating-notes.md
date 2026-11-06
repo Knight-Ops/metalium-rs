@@ -979,6 +979,22 @@ is one constant. B's code is unchanged byte for byte (`run_record` still at `0x2
 | `role_t1`, `profile` (the largest role) | 8,884 | 716 | 6,496 | 672 |
 | `dm_nc`, `profile` | 21,544 | 3,032 | 21,544 | 3,032 |
 
+Then two retirements, each its own commit, measured the same way:
+- **Layer sub-traces** (`61604b9`): `CALL_BODY`, `ARG_REF`, `ARG_WORD` and the argument table out of both movers.
+  `dm_b` 40,360 -> 38,736 (safe), `dm_nc` 20,428 -> 19,724. Nothing before `run_record` moved (`0x2794`).
+- **X9's two-copy weight layout** (`61a71b2`): the one-channel span (`BSpan::of`) and its block in the `GATHER` arm.
+  `dm_b` 38,736 -> 37,596 (safe); `run_record` 8,180 -> 7,892 bytes, still at `0x2794`. This one changes the arm's
+  bytes, so its speed was checked on card 1 (the performance log, "the firmware diet").
+- Not taken: the two compatibility forms the survey named (`READ_RUN`'s word 5 of 0, `STREAM_CAP`'s plain word) are
+  a few bytes each and both still mean "the default"; `expand_reads`' `POKE_RUN` arm is the host's oracle that
+  `step175` holds the firmware's `poke_run` to, and B's `run_record` returns before reaching it.
+
+| image, tightest build (`profile` + `encoded-guard`) | 2026-11-04 | 2026-11-06 |
+|---|--:|--:|
+| `dm_b` bytes / room | 44,748 / 180 | 41,868 / 10,356 |
+| `dm_nc` bytes / room | 21,544 / 3,032 | 20,868 / 3,708 |
+| largest role image / room | 8,884 / 716 | 6,496 / 672 |
+
 **Update 2026-11-04: B's slot is 44,928 bytes; the role slots are 9,600 (`0x2580`).** Weights laid by column
 (`docs/plans/decode-bytes-in-flight.md` Phase C1) add 3.6 KB to every B image, and with them the `profile` image
 built with `fast-reads` (and `encoded-guard`) no longer fit 43,008 bytes. The role images are at most 8,884 bytes (a
@@ -1007,7 +1023,8 @@ every core but B. The role images are now linked at `tt_isa::l1::roles::BASE` (T
 `0xF800`, 10 KiB slots ending at NC's reset PC), so `tt_isa::dm::IMAGE_MAX` is 43,008 bytes (`dm_b`: 24,404, so 18,604
 left). Only the production role images moved; probe images (`corpus`, `icache_t*`, ...) keep the default PCs and are
 never loaded beside the mover. Silicon is unchanged in speed ([performance-log.md](performance-log.md#firmware-image-budget-and-core-assignment-2026-10-13-card-0)).
-Also measured there: `opt-level` 2 is as fast as 3 and 1.7 KB smaller; `s` and `z` are not usable (mover 1.6x
+Also measured there: `opt-level` 2 is as fast as 3 and 1.7 KB smaller (**no longer, 2026-11-06:** 4.3 KB smaller on
+today's B image but ResNet-18 1.9% and prefill 1.2% slower on card 1, H16 in `dataflow-compiler.md`); `s` and `z` are not usable (mover 1.6x
 slower, role push loop 7x).
 
 Before the role images moved, RISCV B's mover image (`dm_b`) could not pass 0x6000 = 24,576 bytes: T0's default

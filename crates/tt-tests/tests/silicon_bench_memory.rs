@@ -1858,20 +1858,34 @@ fn gddr_readers_by_channel() {
                     at.join(", ")
                 );
             }
+            // `BANK_BYTES` (comma-separated, bytes a reader): a product's own bytes over `8 r`
+            // readers, against `DECODE_BYTES` over the deal's units (H17 in
+            // `docs/learnings/dataflow-compiler.md`); unset, `entries_for` a list.
+            let bytes = std::env::var("BANK_BYTES")
+                .ok()
+                .map(|_| list("BANK_BYTES", "0"))
+                .unwrap_or_default();
             for len in list("BANK_LENS", "2112,16384,131072") {
-                let shape = Shape {
-                    entries: entries_for(len),
-                    len,
+                let sizes: Vec<u32> = match bytes.is_empty() {
+                    true => vec![entries_for(len)],
+                    false => bytes
+                        .iter()
+                        .map(|&b| b.div_ceil(len).clamp(1, dm::LIST_MAX - 2))
+                        .collect(),
                 };
-                let what = format!("banked {r} a channel {len} B");
-                run(
-                    d,
-                    &mut f,
-                    8 * r as usize,
-                    Mix::Banked(r as u8),
-                    shape,
-                    &what,
-                );
+                for entries in sizes {
+                    let shape = Shape { entries, len };
+                    let what =
+                        format!("banked {r} a channel {len} B, {} B a reader", shape.bytes());
+                    run(
+                        d,
+                        &mut f,
+                        8 * r as usize,
+                        Mix::Banked(r as u8),
+                        shape,
+                        &what,
+                    );
+                }
             }
         }
     });
