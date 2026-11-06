@@ -1634,7 +1634,7 @@ mailboxes, the probes' scratch, NC's list ring), `TRACE` (the timestamper's buff
   second session on the first's L1 and requires the same bits (ttsim starts every process from zeroed L1, so this is
   how a gate there sees state an earlier process left).
 - **The free L1 below `OUTER_CHUNK` holds a layer body's argument table** (2026-10-23,
-  `docs/plans/layer-sub-traces.md`): `dataflow::ARG_TABLE` at `0x12040`, 126 entries, between NC's 8-byte stub at
+  `docs/completed-plans/layer-sub-traces.md`): `dataflow::ARG_TABLE` at `0x12040`, 126 entries, between NC's 8-byte stub at
   `0x12000` and `OUTER_CHUNK` (`0x13000`). B reads a table there for each `CALL_BODY`, and NC reads it in place
   during the body's pairs. Both fence after the read lands (`publish`), so neither core's L0 data cache serves a
   previous layer's table. B's safe image is 35,284 of 43,008 bytes since (it was 33,668), NC's 19,020 of 24,576.

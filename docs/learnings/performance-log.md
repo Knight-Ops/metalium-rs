@@ -3187,7 +3187,7 @@ time each head's attention as two halves of its positions on two units, with not
 
 ## Layer sub-traces: stored bodies and calls (2026-10-23, card 0)
 
-[layer-sub-traces.md](../plans/layer-sub-traces.md). Every tile (`TT_TILES=all`), release, the defaults otherwise, 2
+[layer-sub-traces.md](../completed-plans/layer-sub-traces.md). Every tile (`TT_TILES=all`), release, the defaults otherwise, 2
 warmups and 9 samples, validated; off and on (`TT_SUB_TRACES=1`) in the same build.
 
 | Workload | Off | On | Runs |

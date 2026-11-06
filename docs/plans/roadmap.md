@@ -488,7 +488,7 @@ Detail: [burn-backend-parity.md](burn-backend-parity.md) (B-numbers).
         is its busy units' column count, which 40 more columns on idle units do not lower. **Room for `B` is not what
         binds the window now**; the firmware half (R3-R4) is not built on that evidence. Next: what the profile points at,
         a product's longest unit (the column deal) and the aggregate rate inside its span. `gamma`'s product is
-        deferred. **Layer sub-traces built, opt-in** (2026-10-23, [layer-sub-traces.md](layer-sub-traces.md), gate
+        deferred. **Layer sub-traces built, opt-in** (retired 2026-11-06 with the firmware diet; 2026-10-23, [layer-sub-traces.md](../completed-plans/layer-sub-traces.md), gate
         `step223`; `TT_SUB_TRACES=1`): one stored layer body a unit and a `CALL_BODY` a layer (`dm::op::CALL_BODY`,
         arguments `dm::ARG_REF`/`ARG_WORD` from a table in L1), every stored layout emulated on the host against the
         capture first; bit for bit on card 0 (`step185`-`step223`, `step188` included, `1792732559`). The decode trace's
@@ -1388,7 +1388,7 @@ the 1.7B's long prefill ("Fused `.ttinsn` push" below).
 - [ ] **Trace segmentation.** Training traces overflow the 240 KB program cache
   ("a list's programs do not fit"). Split into segments so training runs traced
   ([traced-execution.md](traced-execution.md) §8). Related, built and opt-in (2026-10-23):
-  [layer-sub-traces.md](layer-sub-traces.md), one stored layer called once a layer (a 1.7B decode trace's layers
+  [layer-sub-traces.md](../completed-plans/layer-sub-traces.md) (retired 2026-11-06), one stored layer called once a layer (a 1.7B decode trace's layers
   5.6x fewer entries, prefill's 8.4x). It shrinks the streams in GDDR, not the programs, which are already shared by
   hash: the program cache that segmentation must page is unchanged.
 - [x] **Trace size in GDDR** (2026-10-15, [decode-length-cost.md](../completed-plans/decode-length-cost.md) A0-A1).

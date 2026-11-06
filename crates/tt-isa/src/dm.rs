@@ -585,16 +585,9 @@ pub mod op {
     /// spans a chunk (the capture pads with `WAIT`s), and a `CALL` inside a
     /// call is refused. Only in a list entry.
     pub const CALL: u32 = 10;
-    /// Run a layer body inside a [`CALL`]'s own stream (`docs/plans/layer-sub-traces.md`):
-    /// `[CALL_BODY, channel, offset, count, generation_offset, barrier_offset, table_offset,
-    /// table_entries]`. The mover reads the `table_entries` entries of the call's arguments
-    /// from `table_offset` of `channel` into [`crate::dataflow::ARG_TABLE`], then runs the
-    /// body's `count` entries from `offset` as the call's own, a chunk at a time, with the
-    /// call's generation and barrier bases plus these offsets, every [`super::ARG_REF`] and
-    /// [`super::ARG_WORD`] in it, and in its sections, taken from the table. Only in a
-    /// [`CALL`]'s top-level stream, the last entry of its chunk: never in a body, a section or a
-    /// list.
-    pub const CALL_BODY: u32 = 0x4B;
+    // 0x4B was `CALL_BODY` (a layer body called from a trace's stream, layer
+    // sub-traces, opt-in and slower; retired 2026-11-06 for B's image room).
+    // Nothing emits it, and the decode refuses it as an unknown op.
     /// Write one word of a role's mailbox: `[POKE, address, value, 0, ...]`,
     /// the address a word of `crate::mailbox::role`'s three mailboxes. A
     /// trace's role descriptors, which the host writes for an ordinary list
@@ -707,14 +700,6 @@ pub const SCRATCH: u64 = LIST + LIST_MAX as u64 * ENTRY_BYTES;
 pub const TRACE_CHUNK: u64 = 0x1_9100;
 /// Entries one chunk holds.
 pub const TRACE_CHUNK_ENTRIES: u32 = 64;
-/// In a layer body ([`op::CALL_BODY`]), a record's tensor reference `[ARG_REF, k, 0, ...]`,
-/// its second entry all zero: entries `k` and `k + 1` of the call's argument table. Above 8, so a
-/// reference left unsubstituted is refused (`record::TensorRef::decode`, `error::RANGE`).
-pub const ARG_REF: u32 = 0x4C;
-/// In a layer body, word 6 of an [`op::READ`] or [`op::WRITE`]: `ARG_WORD | k` takes the
-/// entry's channel, port and offset (words 1 to 3) from words 1 to 3 of argument entry `k`. The
-/// body names channel `u32::MAX` there, so a move left unsubstituted is refused (`error::RANGE`).
-pub const ARG_WORD: u32 = 1 << 31;
 const _: () = assert!(SCRATCH + TILE_SLOT <= 0x2_0000);
 
 /// One tile's data mover, by core: where its image, mailbox, list ring,
@@ -2152,8 +2137,9 @@ mod tests {
 
     #[test]
     fn retired_peer_ops_are_refused() {
-        // `SIGNAL` and `WAIT_PEER` (12 and 13) had their own entries once.
-        for retired in [12, 13] {
+        // `SIGNAL` and `WAIT_PEER` (12 and 13) had their own entries once, and
+        // `CALL_BODY` (0x4B) called a layer body until layer sub-traces retired.
+        for retired in [12, 13, 0x4B] {
             assert!(Entry::decode(ALL, [retired, 0, 1, 0, 0, 0, 0, 0]).is_err());
         }
     }

@@ -1057,7 +1057,7 @@ impl<N: NocId> DataMover<N> {
 
     /// A stalled tile's state, on stderr (`TT_STALL_DUMP=1`, a development switch read when a
     /// list times out): both movers' descriptor, queue and trace-progress words, the pair counters
-    /// and NC's wait reasons (`tt_isa::dataflow`), the head of the layer-body argument table, the
+    /// and NC's wait reasons (`tt_isa::dataflow`), the
     /// three roles' generation, acknowledgement, status and panic words, and the barrier words.
     /// What it shows: whether the tile waits in a pair, for its roles or at a barrier.
     fn dump_stall<T: Transport>(&self, d: &mut Device<T>, w: &Window) {
@@ -1102,12 +1102,6 @@ impl<N: NocId> DataMover<N> {
                 .map(|i| tt_isa::dataflow::INPUT + 4 * i)
                 .collect::<Vec<_>>(),
         );
-        let table = words(
-            d,
-            &(0..16)
-                .map(|i| tt_isa::dataflow::ARG_TABLE + 4 * i)
-                .collect::<Vec<_>>(),
-        );
         use tt_isa::mailbox::role::Mailbox;
         let roles = words(
             d,
@@ -1129,7 +1123,7 @@ impl<N: NocId> DataMover<N> {
         );
         eprintln!(
                 "STALL tile {:?}: B [seq done error op qhead qdone progress] {b:?}; NC [seq done error op l1_addr len progress] {n:?}; \
-                 dataflow [input2 output2 abort role_progress3 wait_reason5 transfer2] {flow:?}; table {table:?}; \
+                 dataflow [input2 output2 abort role_progress3 wait_reason5 transfer2] {flow:?}; \
                  roles [gen ack status panic]x3 {roles:?}; barrier [counter poll ret release] {barrier:?}",
                 self.tile
             );

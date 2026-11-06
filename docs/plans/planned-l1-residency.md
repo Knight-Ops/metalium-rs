@@ -13,7 +13,7 @@ rate the weights stream at, not the small ops (Phase 5b, the stored layer, defer
 [decode-to-bandwidth.md](decode-to-bandwidth.md): the space audit, busy-unit prefetch and the prefetch pump.
 It is the "sharded, L1-resident tensors" gap of [tt-metal-concepts-review.md](../learnings/tt-metal-concepts-review.md)
 (G12). That gap was deferred "until a measured op chain is GDDR-bound", and that measurement now exists. It is designed
-together with [layer-sub-traces.md](layer-sub-traces.md): a planned layer has the same L1 addresses in every repeat.
+together with [layer-sub-traces.md](../completed-plans/layer-sub-traces.md): a planned layer has the same L1 addresses in every repeat.
 Roadmap: Track 1, "Decode at GDDR's bandwidth".
 
 ## Why
@@ -713,7 +713,7 @@ from GDDR in a 1.7B step (`Step(64)`, profile `1792609145`): the KV cache (state
 
 ### Phase 5a. A replay's next reader section read ahead (done 2026-10-21)
 
-The layer sub-traces' cheaper first step ([layer-sub-traces.md](layer-sub-traces.md)): every chunk a replay
+The layer sub-traces' cheaper first step ([layer-sub-traces.md](../completed-plans/layer-sub-traces.md)): every chunk a replay
 runs was read, then waited for, in turn (`call_chunks`). B now reads the first chunk of the next `PAIR_CALL`'s reader
 section ahead, into `dataflow::AHEAD_CHUNK` (the free 2 KiB after `OUTER_CHUNK`), on a transaction ID of its own
 (`dm::TXN_FETCH` = 8), and the pair waits only for that ID. It is issued when an outer chunk lands (its first pair) and

@@ -1745,8 +1745,6 @@ fn pair_call(
     wr(peer.at(dm::CHANNEL), writer[0]);
     wr(peer.at(dm::DRAM_OFFSET), writer[1]);
     wr(peer.at(dm::LEN), writer[2]);
-    // The body's arguments, if a body is running: the writer section takes them too.
-    wr(peer.at(dm::L1_ADDR), unsafe { ARGS }.map_or(0, |n| n | dm::ARG_WORD));
     publish();
     wr(peer.at(dm::SEQ), sequence);
     publish();
@@ -2051,15 +2049,9 @@ fn call_chunks(
     } else {
         M.trace_chunk
     };
-    // A call's own stream may call layer bodies (`op::CALL_BODY`); a body, a section and NC's
-    // streams may not.
-    let calls_bodies = !IS_NC && !unsafe { PAIR_ACTIVE } && unsafe { ARGS }.is_none();
     while done < count {
         use tt_isa::mailbox::trace as ev;
-        // To the end of the stream's chunk: after a body, the rest of the chunk it was called
-        // from, whose records were laid out not to cross it.
-        let chunk_entries = dm::TRACE_CHUNK_ENTRIES;
-        let n = (count - done).min(chunk_entries - done % chunk_entries);
+        let n = (count - done).min(dm::TRACE_CHUNK_ENTRIES);
         let stamped = stamps_waits();
         trace(stamped, ev::ENTRY_BEGIN, dm::trace_mode::FETCH);
         let since = nc_clock();
@@ -2103,10 +2095,7 @@ fn call_chunks(
         trace(stamped, ev::ENTRY_END, dm::trace_mode::FETCH);
         // The chunk is in L1, written by the NoC past the L0 cache.
         publish();
-        let args = unsafe { ARGS };
         let mut i = 0u32;
-        // The entries run from this chunk: up to a layer body's call, if it calls one.
-        let mut body = None;
         while i < n {
             let a = chunk + i as u64 * dm::ENTRY_BYTES;
             let head = rd(a);
@@ -2114,29 +2103,21 @@ fn call_chunks(
                 op::KERNEL | op::LAUNCH | op::KERNEL_WAIT => generation_base,
                 op::BARRIER => barrier_base,
                 op::CALL => return Err(dm::error::OP),
-                op::CALL_BODY if calls_bodies => {
-                    body = Some((i, entry_at(a)));
-                    break;
-                }
-                op::CALL_BODY => return Err(dm::error::OP),
                 _ => 0,
             };
             if base != 0 {
                 wr(a + 4, rd(a + 4).wrapping_add(base));
             }
-            if let Some(args) = args {
-                take_arguments(a, head, args)?;
-            }
             i += record::len(head) as u32;
         }
-        if body.is_none() && i != n {
+        if i != n {
             return Err(dm::error::LENGTH);
         }
         publish();
         // An outer chunk: its first pair's first reader chunk read ahead now.
         let outer = !IS_NC && !unsafe { PAIR_ACTIVE };
         if outer {
-            unsafe { OUTER = Some((chunk, i)) };
+            unsafe { OUTER = Some((chunk, n)) };
             fetch_ahead(me, usable, None);
         }
         let previous = unsafe { CALL_BASE };
@@ -2144,7 +2125,7 @@ fn call_chunks(
             CALL_BASE = generation_base;
         }
         let saved = enter_trace_domain();
-        let result = run_entries(me, usable, chunk, i);
+        let result = run_entries(me, usable, chunk, n);
         if outer {
             unsafe { OUTER = None };
         }
@@ -2153,105 +2134,8 @@ fn call_chunks(
             CALL_BASE = previous;
         }
         result?;
+        done += n;
         wr(M.at(dm::TRACE_PROGRESS), rd(M.at(dm::TRACE_PROGRESS)).wrapping_add(1));
-        match body {
-            Some((at, e)) => {
-                call_body(me, usable, e, generation_base, barrier_base)?;
-                done += at + 1;
-            }
-            None => done += n,
-        }
-    }
-    Ok(())
-}
-
-/// The table of the layer body running ([`call_body`]): its entries at
-/// `tt_isa::dataflow::ARG_TABLE`. On NC, the table of the body whose pair's writer section it
-/// runs ([`pair_call`] passes it in `dm::L1_ADDR`).
-static mut ARGS: Option<u32> = None;
-
-/// Run the layer body `e` names (`op::CALL_BODY`) from a call with these bases: its argument
-/// table read into `dataflow::ARG_TABLE`, then its entries as a call's, its counters offset by its
-/// own, every argument in it taken from the table ([`take_arguments`]).
-#[cold]
-#[inline(never)]
-fn call_body(
-    me: (u8, u8),
-    usable: u32,
-    e: [u32; 8],
-    generation_base: u32,
-    barrier_base: u32,
-) -> Result<(), u32> {
-    let [_, channel, offset, count, generation_offset, barrier_offset, table, entries] = e;
-    if count == 0 || entries > tt_isa::dataflow::ARG_TABLE_ENTRIES {
-        return Err(dm::error::LENGTH);
-    }
-    if entries != 0 {
-        exec(
-            me,
-            usable,
-            [
-                op::READ,
-                channel,
-                0,
-                table,
-                tt_isa::dataflow::ARG_TABLE as u32,
-                entries * dm::ENTRY_BYTES as u32,
-                0,
-                0,
-            ],
-        )?;
-        noc::wait(TXN);
-        publish();
-    }
-    unsafe { ARGS = Some(entries) };
-    let result = call_chunks(
-        me,
-        usable,
-        channel,
-        offset,
-        count,
-        generation_base.wrapping_add(generation_offset),
-        barrier_base.wrapping_add(barrier_offset),
-    );
-    unsafe { ARGS = None };
-    result
-}
-
-/// Take the arguments of the entry or record at `a` (head `head`) in a body's chunk from the
-/// table of `args` entries: a plain move's channel, port and offset (`dm::ARG_WORD`), or a
-/// record's tensor reference, both its entries (`dm::ARG_REF`). One past the table is refused.
-#[cold]
-#[inline(never)]
-fn take_arguments(a: u64, head: u32, args: u32) -> Result<(), u32> {
-    let table = tt_isa::dataflow::ARG_TABLE;
-    if head == op::READ || head == op::WRITE {
-        let marked = rd(a + 24);
-        if marked & dm::ARG_WORD != 0 {
-            let k = marked & !dm::ARG_WORD;
-            if k >= args {
-                return Err(dm::error::RANGE);
-            }
-            let t = table + k as u64 * dm::ENTRY_BYTES;
-            for w in 1..4 {
-                wr(a + 4 * w, rd(t + 4 * w));
-            }
-            wr(a + 24, 0);
-        }
-        return Ok(());
-    }
-    for &r in record::references(head) {
-        let at = a + r as u64 * dm::ENTRY_BYTES;
-        if rd(at) == dm::ARG_REF {
-            let k = rd(at + 4);
-            if k >= args || args - k < 2 {
-                return Err(dm::error::RANGE);
-            }
-            let t = table + k as u64 * dm::ENTRY_BYTES;
-            for w in 0..16 {
-                wr(at + 4 * w, rd(t + 4 * w));
-            }
-        }
     }
     Ok(())
 }
@@ -2351,27 +2235,15 @@ pub extern "Rust" fn firmware_main() -> ! {
             }
         } else if rd(M.at(dm::OP)) == op::CALL && M == dm::Mover::NC {
             let since = nc_clock();
-            // A layer body's arguments, in its table (`pair_call`): `ARG_WORD | entries`, or 0.
-            let args = rd(M.at(dm::L1_ADDR));
-            unsafe {
-                ARGS = (args & dm::ARG_WORD != 0).then_some(args & !dm::ARG_WORD);
-            }
-            let r = if args & !dm::ARG_WORD > tt_isa::dataflow::ARG_TABLE_ENTRIES {
-                Err(dm::error::RANGE)
-            } else {
-                call(
+            let r = call(
                 me,
                 usable,
                 rd(M.at(dm::CHANNEL)),
                 rd(M.at(dm::DRAM_OFFSET)),
-                    rd(M.at(dm::LEN)),
-                    0,
-                    0,
-                )
-            };
-            unsafe {
-                ARGS = None;
-            }
+                rd(M.at(dm::LEN)),
+                0,
+                0,
+            );
             nc_waited(tt_isa::dataflow::NcWait::Call, since);
             r
         } else if rd(M.at(dm::OP)) == op::LIST {

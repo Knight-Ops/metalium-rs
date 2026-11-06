@@ -1,5 +1,11 @@
 # Layer sub-traces: one stored layer, called once a layer
 
+**Retired 2026-11-06** (firmware diet, roadmap Track 2 item 2b). Opt-in and slower since it was built, its firmware
+(`CALL_BODY`, `ARG_REF`, `ARG_WORD`, the argument table) cost the B mover 1,624 bytes and NC 704, room the next decode
+levers need. The code is in git at the commit before the retirement (`subtrace.rs`, `Session::store_sub_stream`,
+`step223_sub_traces`); `TT_SUB_TRACES` is refused by name at `Session::open`; opcode `0x4B` is refused as unknown.
+What follows is the record as it stood.
+
 Status (2026-10-23): **Phases 0-4 done; opt-in (`TT_SUB_TRACES=1`, `Session::set_sub_traces`), not the default.**
 A trace whose ops repeat stores one layer body per unit and a `CALL_BODY` a layer. Replays are bit for bit on ttsim
 and on card 0, and every stored layout is emulated on the host and compared with the capture before it is written.

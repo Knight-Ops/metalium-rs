@@ -47,7 +47,6 @@ pub mod sfpu;
 pub mod shard;
 pub mod softmax;
 pub mod source_banks;
-pub(crate) mod subtrace;
 pub mod tensor;
 pub mod tile_op;
 pub mod trace;

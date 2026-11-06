@@ -336,9 +336,6 @@ pub const SMOKE: &[&str] = &[
     // A capture leaves the program slots alone, and the eager runtime writes them again after
     // one (decode-to-bandwidth.md Phase 8, P2).
     "step222_programs_for_traces::",
-    // Layer sub-traces: a body called once a layer replays as the ops run fresh, another layer's
-    // table diverges, a short one is refused (layer-sub-traces.md).
-    "step223_sub_traces::",
     // A grouped-query mask read as a block of whole tile rows, not a row gather
     // (long-context.md D3).
     "step227_block_broadcast::",
