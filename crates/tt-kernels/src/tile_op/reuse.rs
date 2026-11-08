@@ -645,6 +645,7 @@ mod tests {
             units,
             &[],
             &tiles,
+            None,
         )
         .unwrap();
         (work.jobs, tiles)

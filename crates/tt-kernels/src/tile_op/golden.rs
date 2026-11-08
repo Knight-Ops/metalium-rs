@@ -666,6 +666,7 @@ impl Product {
             self.spread,
             &busy,
             &[],
+            None,
         );
         match built {
             Ok((work, dealt)) => {

@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [The even deal, the default: a 1.7B decode step 10.14 -> 9.90 ms](#the-even-deal-the-default-a-17b-decode-step-1014---990-ms-2026-11-07-cards-0-and-1) | 2026-11-07 | roadmap 2b, the owner's call over X10's narrow kill: in-span columns over the prefetching units too, `TT_EVEN_DEAL=0` off; bit for bit; Qwen3.5-4B 0.4% slower, the rest within noise; claims not built (C.0) |
+| [X10, a deal sized to each unit's rate: bounded, killed (H18)](#x10-a-deal-sized-to-each-units-rate-bounded-killed-h18-2026-11-07-cards-0-and-1) | 2026-11-07 | roadmap 2b: `cargo xtask pipeline-report`; `gate\|up`'s spread is the deal's shape, then position; dealing in-span columns over the prefetching units too: the 1.7B 10.04 / 11.20 -> 9.82 / 10.98 ms bit for bit, but the slowest unit 1.094x (bar 1.10x); position weights 1.02x, slower |
 | [The firmware diet: B's room 180 -> 10,356 bytes at the same speed; H16 and H17 killed](#the-firmware-diet-bs-room-180---10356-bytes-at-the-same-speed-h16-and-h17-killed-2026-11-06-cards-0-and-1) | 2026-11-06 | roadmap 2b's next levers need firmware room: guarded runs out of the role images (slots 9,600 -> 7,168, B +7,296 bytes), layer sub-traces and X9's two-copy layout retired; `cargo xtask fw-size`; every model within noise of `41575d1`; H16 (cold record arms, `opt-level = 2`) no gain, `opt-level = 2` 1.9% slower on ResNet-18; H17 (bank-affine at 16 KiB) bounded at 1.04-1.06x, killed |
 | [Weights laid by column, one copy: a 1.7B decode step 11.00 -> 10.06 ms, the default](#weights-laid-by-column-one-copy-a-17b-decode-step-1100---1006-ms-the-default-2026-11-04-cards-0-and-1) | 2026-11-04 | roadmap 2b Phase C1: each stored weight's column contiguous in one channel, the same bytes; decode reads 16 KiB pieces, blocks a tile at a time; 1.7B decode 10.06 / 11.21 ms (`1ff07dc` 11.00 / 12.18), Qwen3.5-4B -2.1%, prefill and eager blocks unchanged, GDDR unchanged; the off path's per-tile code kept byte for byte (code placement cost 1.5-3%) |
 | [X9's weight layout back to opt-in: a default must hold the weights once](#x9s-weight-layout-back-to-opt-in-a-default-must-hold-the-weights-once-2026-11-03-cards-0-and-1) | 2026-11-03 | roadmap 2b, owner's call: `TT_WEIGHT_LAYOUT=1` opts in, the default reads each weight as it lies (one copy, read-ahead cap 2); the second copy grows with the model and does not scale (the roadmap's new constraint); 1.7B decode 10.96 / 12.14 ms by default, 9.75 / 10.88 opted in (card 1), prefill unchanged; card 0 `step267`, `step12_mnist`, `step188` pass |
@@ -409,6 +411,56 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## The even deal, the default: a 1.7B decode step 10.14 -> 9.90 ms (2026-11-07, cards 0 and 1)
+
+Roadmap Track 2 item 2b ([plan](../plans/decode-bytes-in-flight.md#the-even-deal-the-default-2026-11-07-cards-0-and-1)).
+X10's even form (below) was killed narrowly by its rule (`gate|up`'s slowest unit 1.094x against 1.10x). Run-time
+column claims' ceiling with whole columns (105.4 us) matched the even deal's measured `gate|up` (106.5 us), so claims
+are not built. The owner's call: the even deal becomes the default instead (`Session::set_even_deal`,
+`TT_EVEN_DEAL=0` off). Each one-row product's in-span columns are dealt over its prefetching units too, and each
+column's sum stays on one unit, so the result is bit for bit.
+
+- **Card 0** (release, safe image): `step188` 3 of 3, `step187`, `step205`, `step216`, `step268` and `step12_mnist`'s
+  goldens (`1794024322`); `--smoke` 1,274 of 1,274 (`1794026773`; its 11 two-card tests rerun once card 1 was free,
+  `1794029886`).
+- **Card 1** (release, every tile, each run its own process; medians; off is `TT_EVEN_DEAL=0`):
+
+| run | deal | 1.7B decode 32 / 256, ms | 1.7B prefill 32 / 256, tokens/s | 135M decode 32 / 128 / 256, ms |
+|---|---|--:|--:|--:|
+| `1794024329` | off | 10.180 / 11.166 | 1,096 / 2,094 | |
+| `1794024534` | on | 9.963 / 10.948 | 1,100 / 2,101 | |
+| `1794024746` | off | 10.176 / 11.178 | 1,098 / 2,102 | 7.049 / 7.505 / 8.174 |
+| `1794025139` | on | 9.957 / 10.952 | 1,099 / 2,102 | 7.031 / 7.506 / 8.170 |
+| `1794025528` | on | 9.775 / 10.945 | 1,100 / 2,103 | 7.036 / 7.524 / 8.174 |
+| `1794025917` | off | 10.049 / 11.193 | 1,099 / 2,102 | 6.978 / 7.518 / 8.203 |
+
+| run | deal | Qwen3.5-4B decode 32 / 256, ms | prefill 32 / 256, ms | run | ResNet-18 / ViT-Tiny traced, ms |
+|---|---|--:|--:|---|--:|
+| `1794026313` | off | 62.231 / 62.584 | 460.9 / 3,685.5 | `1794029589` | 12.504 / 7.626 |
+| `1794027144` | on | 62.467 / 62.813 | 461.2 / 3,687.2 | `1794029662` | 12.313 / 7.593 |
+| `1794027958` | on | 62.496 / 62.858 | 461.0 / 3,688.6 | `1794029732` | 12.488 / 7.609 |
+| `1794028778` | off | 62.224 / 62.592 | 460.6 / 3,684.9 | `1794029804` | 12.326 / 7.608 |
+
+- **The 1.7B** (the mean of the runs' medians): 10.135 / 11.179 -> 9.898 / 10.948 ms (-0.24 / -0.23 ms, -2.3 / -2.1%), the same tokens in every run.
+- **Qwen3.5-4B: 0.4% slower** (0.25 ms of 62.5), reproducibly, under the 0.5% rule fixed beforehand. Not located yet.
+- The 135M, the 1.7B's prefill, ResNet-18 and ViT-Tiny within noise.
+
+## X10, a deal sized to each unit's rate: bounded, killed (H18) (2026-11-07, cards 0 and 1)
+
+Roadmap Track 2 item 2b, `gate|up`'s evenness ([plan](../plans/decode-bytes-in-flight.md#x10-evenness-opened-2026-11-07)).
+Card 1, release, every tile, the 1.7B with BF16 weights; card 0 for `step205` (`1794016170`, 9 of 9).
+
+- **The meter** (`cargo xtask pipeline-report`, `1794015328`): `gate|up`'s slowest unit 116.2 us, its mean 71.7. The
+  24 prefetching units read nothing in span and wait ~100 us; units 0-79 read 3 columns in span, 80-95 read 2. Position
+  second (unit 30 slowest in 24 of 24 layers), not chance.
+- **Even** (`TT_PROBE_DEAL=even`, the in-span columns over the prefetching units too), decode step at 32 / 256 tokens:
+  off 10.017 / 11.201 (`1794017941`), even 9.820 / 10.997 and 9.814 / 10.953 (`1794018143`, `1794018346`), off
+  10.061 / 11.192 (`1794018549`); `gate|up`'s slowest unit 116.5 -> 106.5 us (`1794016196` against `1794016777`,
+  `1794017355`). Same tokens in every run. Killed by its rule (1.094x against 1.10x), kept as a probe.
+- **Position weights** (the even runs' measured rates as a table): `gate|up` 104.6 us (1.02x against even), the head
+  2-3% slower, the step 9.890 / 11.018 and 9.876 / 11.044 against even's 9.826 / 10.989 and 9.762 / 10.968
+  (`1794020364`-`1794022130`). Killed: a unit's rate follows the load the deal gives it.
 
 ## The firmware diet: B's room 180 -> 10,356 bytes at the same speed; H16 and H17 killed (2026-11-06, cards 0 and 1)
 

@@ -2210,6 +2210,7 @@ pub(crate) fn matmul_dram_limited(
         units,
         &[],
         &[],
+        None,
     )
     .map(|(work, ..)| work)
 }
@@ -2251,6 +2252,7 @@ pub(crate) fn matmul_dram_prefetching(
     spread: usize,
     busy: &[Option<u64>],
     tiles: &[(u8, u8)],
+    deal: Option<&[u32]>,
 ) -> Result<(Work, Option<usize>)> {
     let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
     a.expect("a matmul", edge(route.packed_a()))?;
@@ -2389,6 +2391,7 @@ pub(crate) fn matmul_dram_prefetching(
             && staging == Staging::Slots
             && kc < kt,
         busy: busy.to_vec(),
+        deal: deal.map(<[u32]>::to_vec),
     };
     let prefetch = &prefetch[..prefetch
         .len()
@@ -2446,6 +2449,99 @@ pub fn thin_runs(
             .into_iter()
             .map(|r| full + r.start..full + r.end),
     );
+    Some(out)
+}
+
+/// X10's probe (`docs/plans/decode-bytes-in-flight.md`, "X10: evenness"): a one-row product with
+/// prefetching units and `K` whole deals its in-span columns over its own units **and** its
+/// prefetching ones ([`dealt_runs`]), each unit's share by its weight (indexed by unit, a missing
+/// weight 1; none: even). Set, it takes precedence over the session's even deal
+/// (`Session::set_even_deal`, on by default); off (`None`), the session's choice stands. Bit for
+/// bit either way: only which unit holds a column moves. Dev-facing: position weights were bounded
+/// and killed (a unit's rate follows the load its deal gives it).
+static PROBE_DEAL: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(None);
+
+/// Turn [`PROBE_DEAL`] on with these per-unit weights (empty: even), or off, process-wide.
+#[doc(hidden)]
+pub fn probe_deal(weights: Option<Vec<u32>>) {
+    *PROBE_DEAL.lock().unwrap_or_else(|e| e.into_inner()) = weights;
+}
+
+pub(crate) fn probing_deal() -> Option<Vec<u32>> {
+    PROBE_DEAL.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// `total` cut in proportion to `weights` (all zero counts as all one), in whole parts summing
+/// to `total`: each its floor, then one more to the largest remainders, ties to the later.
+pub fn weighted_counts(total: usize, weights: &[u32]) -> Vec<usize> {
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    let ones = weights.iter().all(|&w| w == 0);
+    let w = |i: usize| if ones { 1 } else { u128::from(weights[i]) };
+    let sum: u128 = (0..weights.len()).map(w).sum();
+    let mut out: Vec<usize> = (0..weights.len())
+        .map(|i| (total as u128 * w(i) / sum) as usize)
+        .collect();
+    let mut left = total - out.iter().sum::<usize>();
+    // The remainders, as numerators over `sum`, largest first, the later first among equals.
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by_key(|&i| {
+        (
+            std::cmp::Reverse(total as u128 * w(i) % sum),
+            std::cmp::Reverse(i),
+        )
+    });
+    for i in order {
+        if left == 0 {
+            break;
+        }
+        out[i] += 1;
+        left -= 1;
+    }
+    out
+}
+
+/// [`PROBE_DEAL`]'s deal of columns `cols` at most `nc` a run: per unit of `deal` (a product's own
+/// units `0..units` first, then its prefetching units), its runs in order. Round 0 gives each own
+/// unit `nc` columns (its first job, which it reads ahead where it is busy); every unit of `deal`
+/// then takes its weighted share ([`weighted_counts`], `weights` by unit, a missing weight 1) of
+/// the rest, in rounds of at most `nc` each, the columns of a round in `deal`'s order -- so
+/// neighbours start on neighbouring channels, as [`thin_runs`]' rounds do. `None` where the own
+/// units' first round would not fit.
+pub fn dealt_runs(
+    cols: std::ops::Range<usize>,
+    nc: usize,
+    units: usize,
+    deal: &[usize],
+    weights: &[u32],
+) -> Option<Vec<Vec<std::ops::Range<usize>>>> {
+    if nc == 0 || units == 0 || deal.len() < units || cols.len() < units * nc {
+        return None;
+    }
+    let rest = cols.len() - units * nc;
+    let w: Vec<u32> = deal
+        .iter()
+        .map(|&u| weights.get(u).copied().unwrap_or(1))
+        .collect();
+    let share = weighted_counts(rest, &w);
+    let mut out: Vec<Vec<std::ops::Range<usize>>> = vec![Vec::new(); deal.len()];
+    let mut j = cols.start;
+    for runs in out.iter_mut().take(units) {
+        runs.push(j..j + nc);
+        j += nc;
+    }
+    let mut taken = vec![0usize; deal.len()];
+    while j < cols.end {
+        for (d, runs) in out.iter_mut().enumerate() {
+            let t = nc.min(share[d] - taken[d]);
+            if t > 0 {
+                runs.push(j..j + t);
+                taken[d] += t;
+                j += t;
+            }
+        }
+    }
     Some(out)
 }
 
@@ -3420,6 +3516,7 @@ pub(crate) fn matmul_dram_batched_limited(
         packed_a: None,
         stream_k: false,
         busy: Vec::new(),
+        deal: None,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -7380,6 +7477,182 @@ mod tests {
     /// than the plan's block, covering every column once and in order -- and
     /// never more than [`blocks`]' deal gave it. Not for `K` blocked, a
     /// pipelined staging, more than one tile row, or no more columns than units.
+    /// [`weighted_counts`] sums to its total, in proportion, the remainder to the larger remainders
+    /// and then the later parts.
+    #[test]
+    fn weighted_counts_cut_a_total_in_proportion() {
+        use super::weighted_counts;
+        assert_eq!(weighted_counts(10, &[1, 1, 1]), [3, 3, 4]);
+        assert_eq!(
+            weighted_counts(10, &[0, 0, 0]),
+            [3, 3, 4],
+            "all zero is even"
+        );
+        assert_eq!(weighted_counts(6, &[1, 2, 3]), [1, 2, 3]);
+        assert_eq!(weighted_counts(7, &[1, 2, 3]), [1, 2, 4]);
+        assert_eq!(weighted_counts(5, &[3, 1]), [4, 1]);
+        assert_eq!(weighted_counts(0, &[5, 1]), [0, 0]);
+        assert_eq!(weighted_counts(4, &[]), Vec::<usize>::new());
+        for total in [0, 1, 17, 272, 1000] {
+            for w in [&[1u32, 7, 3, 0, 2][..], &[9; 120][..]] {
+                assert_eq!(weighted_counts(total, w).iter().sum::<usize>(), total);
+            }
+        }
+    }
+
+    /// [`dealt_runs`] covers every column once, in order of rounds, at most `nc` a run: each own
+    /// unit's first run `nc` wide, then each unit's share by weight; a deal whose first round would
+    /// not fit is `None`.
+    #[test]
+    fn dealt_runs_cover_every_column_once_by_weight() {
+        use super::dealt_runs;
+        // The 1.7B's `gate|up`: 512 columns, 48 read ahead by 24 prefetching units (96..120), the
+        // rest over 96 own units at `nc` 2.
+        let deal: Vec<usize> = (0..120).collect();
+        let runs = dealt_runs(48..512, 2, 96, &deal, &[]).unwrap();
+        let mut cover: Vec<usize> = runs.iter().flatten().flat_map(|r| r.clone()).collect();
+        cover.sort_unstable();
+        assert_eq!(cover, (48..512).collect::<Vec<_>>());
+        assert!(runs.iter().flatten().all(|r| !r.is_empty() && r.len() <= 2));
+        // Own units: their first job of 2, then 272 in-span columns over 120: 2 each, 32 left to
+        // the last 32 (units 88..120), so 88 own units read 2 in span and 8 own units 3.
+        let held = |d: usize| runs[d].iter().map(|r| r.len()).sum::<usize>();
+        assert!(runs[..96].iter().all(|r| r[0].len() == 2));
+        assert_eq!((held(0), held(87), held(88), held(95)), (4, 4, 5, 5));
+        assert_eq!((held(96), held(119)), (3, 3));
+        // Round 0 in order, then rounds over every unit: the first in-span run is unit 0's.
+        assert_eq!(runs[0][0], 48..50);
+        assert_eq!(runs[95][0], 238..240);
+        assert_eq!(runs[0][1], 240..242);
+        assert_eq!(runs[96][0], 242 + 2 * 95..242 + 2 * 95 + 2);
+        // Weights by unit: a unit of weight 0 takes nothing past its first job.
+        let mut w = vec![1u32; 120];
+        w[30] = 0;
+        let weighted = dealt_runs(48..512, 2, 96, &deal, &w).unwrap();
+        assert_eq!((weighted[30].len(), weighted[30][0].clone()), (1, 108..110));
+        // A deal over other units' indices reads their weights.
+        let other: Vec<usize> = (0..96).chain(100..124).collect();
+        let mut w = vec![1u32; 124];
+        w[123] = 0;
+        let r = dealt_runs(48..512, 2, 96, &other, &w).unwrap();
+        assert!(r[119].is_empty());
+        // No room for the first round.
+        assert_eq!(dealt_runs(0..191, 2, 96, &deal, &[]), None);
+        assert_eq!(dealt_runs(0..512, 0, 96, &deal, &[]), None);
+        assert_eq!(dealt_runs(0..512, 2, 96, &deal[..90], &[]), None);
+    }
+
+    /// X10's probe on the 1.7B's `gate|up` (`[1, 2048] @ [2048, 16384]`, 96 own units, 24
+    /// prefetching): the in-span columns go over all 120, every output column is written once, as
+    /// off, each prefetching unit's job read ahead stays its first, and each busy own unit's first
+    /// job still reads ahead.
+    #[test]
+    fn the_probe_deals_the_in_span_columns_over_the_prefetching_units_too() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let (units, spread, k, n) = (96, 120, 2048, 16384);
+        let prefetch: Vec<usize> = (units..spread).collect();
+        let busy = vec![Some(tt_isa::l1::DATA.base); units];
+        let built = |deal: Option<&[u32]>| {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+            let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+            let (work, dealt) = super::matmul_dram_prefetching(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                None,
+                super::Reads {
+                    thin: true,
+                    resident_a: true,
+                    unpack_b: false,
+                    packed_a: Some(p.tensor_ref()),
+                    stream_k: false,
+                    stream_prefetch: false,
+                    prefetch_units: [usize::MAX; 2],
+                    block_stream: super::BlockStream::Off,
+                    reuse: super::Reuse::Off,
+                },
+                &prefetch,
+                spread,
+                &busy,
+                &[],
+                deal,
+            )
+            .unwrap();
+            assert_eq!(dealt, Some(spread));
+            work.jobs
+        };
+        let first = |job: &Job| match job.first() {
+            Some(Step::List { what, .. }) => Some(*what),
+            _ => None,
+        };
+        // Per unit: its output columns, its jobs, and what its first job starts with.
+        let per_unit = |jobs: &[Job]| {
+            let mut cols = vec![Vec::new(); spread];
+            let mut count = vec![0usize; spread];
+            let mut starts = vec![None; spread];
+            for (j, job) in jobs.iter().enumerate().filter(|(_, j)| !j.is_empty()) {
+                let u = j % spread;
+                if count[u] == 0 {
+                    starts[u] = first(job);
+                }
+                count[u] += 1;
+                for step in job {
+                    let Step::List { entries, .. } = step else {
+                        continue;
+                    };
+                    for e in entries.iter().filter(|e| e[0] == record::SCATTER) {
+                        cols[u].extend(e[5] as usize..(e[5] + e[6]) as usize);
+                    }
+                }
+            }
+            (cols, count, starts)
+        };
+        let (off_cols, off_count, off_starts) = per_unit(&built(None));
+        let (on_cols, on_count, on_starts) = per_unit(&built(Some(&[])));
+        let all = |cols: &[Vec<usize>]| {
+            let mut v: Vec<usize> = cols.iter().flatten().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(all(&off_cols), (0..n / 32).collect::<Vec<_>>());
+        assert_eq!(all(&on_cols), all(&off_cols), "every column once, as off");
+        // Off: the prefetching units run their one job; on, past it, the in-span columns.
+        assert!(off_count[units..].iter().all(|&c| c == 1));
+        assert!(on_count[units..].iter().all(|&c| c > 1));
+        let in_span = |c: &[Vec<usize>], u: usize| c[u].len() - 2;
+        let most = (0..spread).map(|u| in_span(&on_cols, u)).max().unwrap();
+        let least = (0..spread).map(|u| in_span(&on_cols, u)).min().unwrap();
+        assert_eq!((least, most), (2, 3), "272 in-span columns over 120");
+        assert_eq!(
+            (0..spread).map(|u| in_span(&off_cols, u)).max().unwrap(),
+            3,
+            "off, 80 own units read 3 in span"
+        );
+        for u in 0..spread {
+            let want = match u < units {
+                true => Some(super::BUSY_PREFETCH),
+                false => Some(super::PREFETCH),
+            };
+            assert_eq!(on_starts[u], want, "unit {u}");
+            assert_eq!(off_starts[u], want, "unit {u}, off");
+        }
+        // Weights move columns: unit 30 at weight 0 keeps only its first job.
+        let mut w = vec![1u32; spread];
+        w[30] = 0;
+        let (w_cols, ..) = per_unit(&built(Some(&w)));
+        assert_eq!(w_cols[30].len(), 2);
+        assert_eq!(all(&w_cols), all(&off_cols));
+    }
+
     #[test]
     fn thin_runs_give_no_unit_more_than_its_share() {
         use super::thin_runs;
@@ -7623,6 +7896,7 @@ mod tests {
                 units,
                 busy,
                 &[],
+                None,
             )
             .unwrap()
             .0
@@ -7793,6 +8067,7 @@ mod tests {
                     spread,
                     &[],
                     &[],
+                    None,
                 )
                 .unwrap();
                 let (kt, nt) = ((k / 32) as u64, n.div_ceil(32));

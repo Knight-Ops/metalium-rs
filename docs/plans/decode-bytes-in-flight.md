@@ -825,6 +825,249 @@ GDDR is 16.18 GB free either way, and the fullest channel 2.02 GB.
   one.
 - **Rule 4:** each run agrees with its twin within 0.2% (ViT-Tiny's within its run-to-run noise).
 
+## X10: evenness (opened 2026-11-07)
+
+Phase A's open half: at 16 KiB entries `gate|up`'s mean unit is 12-14% faster but its slowest is not, and the product
+waits for its slowest unit. X10 in the [design reference](../learnings/dataflow-compiler.md) §6: a deal that sizes each
+unit's share to the rate it gets. Host-only: no firmware, no encoding.
+
+**The meter's method as code.** `cargo xtask pipeline-report <profile dir> --names o,gate|up,down,qkv`
+(`xtask/src/pipeline_report.rs`) reads `skew.tsv` and `pipeline.tsv`.
+- **Classes.** The products are classed by the layers' period.
+- **What it reports per class** (median over the class's ops):
+  - the slowest and mean unit;
+  - an even and a rate-weighted re-deal of the same in-span bytes: fluid, and in whole columns, floored at the card's
+    512 GB/s;
+  - what explains the spread: the line `work = a + b * MB` and its R² (*share*), the rank correlation of each unit's
+    residual between consecutive layers (*position*), and a unit's own p10..p90 over replays against the residuals'
+    p10..p90 between units (*chance*).
+- **`skew.tsv` gains each unit's p10 / p90 work over replays** (`UnitMedian::work_p10` / `work_p90`) for that last
+  test.
+- **`--column down=0.541`.** `down`'s column must be named: 24 of its units read half a column in span (the other half
+  read ahead), which the inferred granule takes for a column that no deal can move.
+
+**The bound, from the meter** (card 1, release, `profile` image, every tile, 1.7B BF16, 32 tokens, `Step(64)`,
+`1794015328`; C1's own profile `1793765738` agrees within 1 us).
+
+| class | units | in-span MB | slowest us | mean us | ideal, whole columns, us | saving, ms a step | R² share | rank corr. | replay p10..p90 / residual p10..p90, us | slowest |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| `gate\|up` | 120 | 36.80 | 116.2 | 71.7 | 77.6 | **0.942** | 0.86 | 0.98 | 6.7 / 25.7 | unit 30 in 24 of 24 |
+| `down` | 64 | 28.12 | 89.0 | 69.7 | 79.0 | 0.245 | 0.54 | 0.95 | 4.8 / 16.6 | 20 x15, 29 x8 |
+| `qkv` | 120 | 0.00 | 17.9 | 13.6 | - | 0.129 | - | 0.85 | 1.6 / 5.2 | 37 x16 |
+| `o` | 64 | 0.00 | 12.4 | 10.1 | - | 0.062 | - | 0.89 | 0.9 / 3.7 | 30 x10, 29 x8 |
+| head | 120 | 182.66 | 435.5 | 292.4 | (fluid 356.8) | 0.079 | 0.87 | - | 13.5 / 91.8 | 28 |
+
+- **`gate|up`'s spread is the deal's shape first.** Of its 512 columns, each own unit's first job (2) and each
+  prefetching unit's one job (2) are read ahead, which leaves 272 in span:
+  - units 0-79 read 3 columns in span (0.41 MB), and take 61-117 us;
+  - units 80-95 read 2 (0.27 MB), and take 38-49 us;
+  - the 24 prefetching units (96-119) read none in span. Their job read ahead takes 12-18 us, and they then wait
+    ~100 us for the product's barrier.
+- **Position comes second.** Among units of the same share the spread is stable from layer to layer (rank correlation
+  0.98; unit 30 is the slowest in every layer), and a unit's own replay-to-replay spread (6.7 us) is a quarter of the
+  spread between units (25.7 us). It is not chance.
+- **Over the span,** the card reads at ~490 GB/s while all 120 units work, then less as they finish: 345 GB/s with 50
+  units left, 208 with 11 (`tails.tsv`, `1793765738`).
+- **`down` is out of a column deal's reach.** Its 64 columns are one a unit; its saving would need the read-ahead
+  halves moved to its slow-position units.
+- **`qkv` and `o` read everything ahead,** so nothing is left in their spans to deal.
+
+**The probe.** `tensor::probe_deal` (`TT_PROBE_DEAL=even|<weights file>` in `traced_generation_stream_ceiling`).
+- **What it changes.** A one-row product with prefetching units and `K` whole deals its in-span columns over its own
+  units **and** its prefetching ones (`tensor::dealt_runs`).
+  - Round 0 gives each own unit its first job (read ahead where it is busy).
+  - Every unit then takes its weighted share of the rest, in rounds of at most `nc` columns, so neighbours start on
+    neighbouring channels.
+  - A prefetching unit's job read ahead stays its first.
+- **Bit for bit,** since only which unit holds a column moves:
+  - host test `the_probe_deals_the_in_span_columns_over_the_prefetching_units_too`;
+  - `step205`'s `the_probe_deal_puts_in_span_columns_on_the_prefetching_units_bit_for_bit` on ttsim, off / even /
+    weighted against the ops run fresh. Watched failing with the jobs read ahead dropped.
+- **Even** gives `gate|up` 2 in-span columns on 88 units and 3 on the last 32 (units 88-119).
+- **The bench now checks its tokens.** Every generation must equal the first, and it prints a digest (`TOKENS`) to
+  compare runs.
+- **The prior.** The retired balanced deal (`8a354a0`, completed-plans/dataflow-compiler.md F4a.3) also used the
+  prefetching units. It was 0.16-0.19 ms slower, but on tile-sized entries, before C1. It is re-measured here, not
+  assumed.
+
+**Decision rules (fixed 2026-11-07, before the probe ran).**
+
+*Conditions:* card 1, release, safe image, every tile, the 1.7B with BF16 weights and a 512-position cache. Profiled
+pairs at 32 tokens (`TT_PROFILE_DETAIL=pipeline`); unprofiled off / even / even / off at 32 / 256 tokens.
+
+1. **The bound:**
+   - **Kill X10** if the whole-column ideal saves under 0.15 ms a step, or `gate|up`'s slowest unit gains under 1.10x.
+   - *Applied:* not killed (0.94 ms; 116.2 -> 77.6 us, 1.50x).
+2. **Attribution:**
+   - **Chance** if a unit's replay p10..p90 is at least the residuals' p10..p90 between units. Then X10 closes as "not
+     static", and claims (Part 2 of the work) are next.
+   - *Applied:* share first (R² 0.86), then position (0.98); not chance.
+3. **The even probe is killed** if any of these holds:
+   - `gate|up`'s slowest unit (profiled) gains under 1.10x;
+   - the unprofiled step at 32 / 256 tokens gains under 0.15 ms against both brackets;
+   - another product class's slowest unit is more than 5% slower;
+   - prefill is more than 2% below both brackets;
+   - the tokens differ from the off runs'.
+4. **If the even probe is not killed:**
+   - build the deal as a rule of the shape (no table), with a session knob;
+   - then try position weights on top (from the meter, as a function of the unit's place, never a card's table),
+     judged by the same rule 3 against the even form.
+5. **Brackets that disagree:** report "not reproducible" and tune nothing.
+
+**Prediction.**
+- `gate|up`'s slowest unit 116 -> 85-90 us: the slow-position units drop to 2 columns, and the 3-column units are the
+  fastest positions.
+- The step 0.4-0.7 ms faster.
+- `down` unchanged: the prefetching units now also hold `gate|up` columns before reading `down`'s ahead.
+
+### X10 results: the even probe (2026-11-07, card 1)
+
+Card 0 first: `step205` 9 of 9 (`1794016170`), the probe's bit-exact test included.
+
+**Profiled** (`Step(64)`, us, the median over 24 layers of each class's slowest unit).
+
+| run | `gate\|up` slowest | `gate\|up` mean | `down` | `qkv` | `o` | head |
+|---|--:|--:|--:|--:|--:|--:|
+| off (`1794015328`) | 116.2 | 71.7 | 89.0 | 17.9 | 12.4 | 435.5 |
+| off (`1794016196`) | 116.5 | 71.5 | 89.1 | 17.9 | 12.4 | 436.0 |
+| even (`1794016777`) | **106.5** | 85.3 | 89.1 | 17.9 | 12.4 | 440.5 |
+| even (`1794017355`) | **106.4** | 85.4 | 89.2 | 17.9 | 12.4 | 439.8 |
+
+**Unprofiled** (32 / 256 tokens; 9 samples, host-timed medians).
+
+| run | decode step, ms | prefill, tokens/s |
+|---|--:|--:|
+| off (`1794017941`) | 10.017 / 11.201 | 1,103 / 2,103 |
+| even (`1794018143`) | **9.820 / 10.997** | 1,095 / 2,095 |
+| even (`1794018346`) | **9.814 / 10.953** | 1,100 / 2,105 |
+| off (`1794018549`) | 10.061 / 11.192 | 1,100 / 2,102 |
+
+- **Tokens:** every run, profiled or not and on or off, gives the same digests (`56c30b1f5b9c7ffc` at 32 tokens,
+  `e35596f2741d0fac` at 256).
+- **What moved.**
+  - The step is 0.20-0.25 ms faster at both lengths (2.0%), against both brackets.
+  - `gate|up`'s slowest unit is 1.094x faster.
+  - The head's slowest unit is 1% slower; nothing else moved.
+- **Where the tail went.**
+  - Units 0-60 now read 2 in-span columns and still take 85-106 us; with 3 they took 88-117. A third less work bought
+    them ~10%.
+  - Units 88-119 read 3 columns in 55-96 us.
+  - So what is left is position: those units get a lower rate wherever their columns sit. Unit 42 is the slowest in
+    20 of 24 layers.
+- **The report's ideal does not hold once shares are near-equal.** With R² 0.22 the line's per-unit costs are noise,
+  and the whole-column ideal (119 us) exceeds the slowest unit. Read the bound only where shares differ.
+
+**The verdict by rule 3 is split.**
+- The step (0.20 ms against a 0.15 ms bar), the other classes, prefill and the tokens all pass.
+- `gate|up`'s slowest unit gains 1.094x against a 1.10x bar, so **the kill fires** as written.
+- Not tuned. The owner's call (2026-11-07): keep the kill on record, and bound rule 4's position weights once as a
+  bound only, under the same rules, judged against the even form; build a deal only if they pass.
+
+### X10 results: position weights (2026-11-07, card 1), and the close
+
+**The weights** (a bound only, a measured table no rule would ship): each unit's in-span MB over its work, median over
+the even runs' 24 `gate|up` layers (`1794016777`, `1794017355`), scaled to 1,000 at the median. They run from 805 (unit
+42) to 2,347 (unit 116); the prefetching units weigh 1,800-2,300.
+
+| run | `gate\|up` slowest, us | head slowest, us | decode step, 32 / 256 tokens, ms |
+|---|--:|--:|--:|
+| weighted, profiled (`1794020364`, `1794020942`) | 104.7 / 104.5 | 447.6 / 455.1 | |
+| even (`1794021520`) | | | 9.826 / 10.989 |
+| weighted (`1794021723`) | | | 9.890 / 11.018 |
+| weighted (`1794021927`) | | | 9.876 / 11.044 |
+| even (`1794022130`) | | | 9.762 / 10.968 |
+
+- **Tokens:** the same digests as every other run.
+- **Rule 3 against the even form: killed.**
+  - `gate|up`'s slowest unit gains 1.02x (bar 1.10x).
+  - The step is 0.05-0.11 ms slower: the head's slowest unit is 2-3% slower, under weights taken from `gate|up`'s
+    units.
+- **Why the table failed.** A unit's rate is not its own: it follows the load the deal gives it.
+  - Units 84-119 read 3-4 columns at 55-96 us under the even deal.
+  - With 3-4 columns each under the weights, the same units take 86-105 us, and unit 90 becomes the slowest.
+  - So the rates measured under one deal do not hold under the next. A static deal can take the shape's gain (the
+    even form's 0.20 ms), but not position's.
+
+**X10 closes.**
+- The even form's kill is on record: 1.094x against 1.10x, although the step was 0.20 ms faster bit for bit.
+- Position weights are killed outright.
+- The probe stays in the tree as a development probe (`tensor::probe_deal`, `TT_PROBE_DEAL`, `step205`'s test,
+  `cargo xtask pipeline-report`), so the even form can be reopened.
+- **What it hands Part 2.** The tail left after the even deal is load-coupled position, which only a deal that reacts
+  as it runs can follow. That is run-time column claims; their bound (C.0, host-only) comes next.
+
+## Run-time column claims: the ceiling (C.0, 2026-11-07)
+
+Item 5's second lever, legal under S1: a unit claims its next column from a counter
+(`noc::Command::AtomicIncrement`, a fetch-and-add that runs on ttsim and passed on silicon in `step116`) instead of a
+static deal. It needs firmware: a claimed `GATHER` in B, and a `SCATTER` in NC that reads the claimed column. Bound
+first, with no build.
+
+**Why a ceiling and not a replay.** X10 showed that a unit's rate follows the load its deal gives it, so replaying the
+measured per-batch times under another deal would not be a bound. Instead:
+- **The ceiling.** No run-time deal does better than every unit reading until the bytes run out, at the card's rate
+  with all units at work, then the last column's kernel and claim.
+- **Whole columns add a tail.** The unit that claims the last column starts it as the bytes run out. A 0.135 MB
+  column (K = 2048, BF16) takes ~22 us even at the best rate a lone unit reaches.
+
+**Inputs** (`gate|up`, 24 layers, the even runs `1794016777`, `1794017355`):
+- the rate with ≥ 110 of 120 units at work: 484 GB/s, the median of `tails.tsv`'s eighths. The off run's 544 includes
+  the first eighth's issue burst, above the card's peak;
+- a unit's best rate: 6.09 GB/s (p95 of units with ≥ 0.2 MB in span);
+- the kernel: 5.2 us a column job (`pipeline.tsv`);
+- a claim: 2 us (the silicon notes' 1.81 us handoff).
+
+| | `gate\|up`'s slowest unit, us |
+|---|--:|
+| today's deal (off), measured | 116.4 |
+| the even static deal (X10's probe), measured | 106.5 |
+| **claims, ceiling with no tail** (36.75 MB at 484 GB/s, + 5.2 + 2.0) | **83.2** |
+| **claims, ceiling with one column's tail** (+ 22.2) | **105.4** |
+
+- **By the rule fixed in the plan** (kill if claims beat the static deal by < 0.1 ms a step or < 1.10x; against
+  today's deal, since X10 closed): **not killed**. The ceiling is 1.10-1.40x and 0.26-0.80 ms a step against today's
+  116.4 us.
+- **Against the even static deal, which needs no firmware,** claims' realistic ceiling (105.4 us) is the even deal's
+  measured 106.5. Only the no-tail end, which whole columns forbid, would add anything. Column granularity limits
+  both alike.
+- **The owner's call (2026-11-07): claims are not built.** The even deal is revived as the default instead,
+  overriding its narrow kill (1.094x against 1.10x) on its 0.20 ms step gain, bit for bit.
+
+## The even deal, the default (2026-11-07, cards 0 and 1)
+
+By the owner's call above, X10's even form is the session's default: each one-row product's in-span columns are dealt
+over its prefetching units too (`Session::set_even_deal`, `TT_EVEN_DEAL=0` turns it off; `tensor::dealt_runs` with
+equal weights). `TT_PROBE_DEAL` stays as the development probe and takes precedence. Streamed (`stream_k`) and batched
+products keep today's deal.
+
+**Gates, card 0** (release, safe image): `step188` (3 of 3, traced equals eager on the 1.7B), `step187`, `step205`
+(with `the_even_deal_puts_in_span_columns_on_the_prefetching_units_bit_for_bit`), `step216`, `step268` and
+`step12_mnist`'s goldens (`1794024322`); `--smoke` 1,274 of 1,274 (`1794026773`, its 11 two-card tests rerun once the
+benches freed card 1, `1794029886`).
+
+**The rule** (X10.3, fixed before measuring): the default if nothing else is more than 0.5% slower. Card 1, release,
+every tile, each run its own process, off (`TT_EVEN_DEAL=0`) / on brackets; medians:
+
+| | off | on | on against off |
+|---|--:|--:|--:|
+| 1.7B decode, 32 tokens, ms | 10.180, 10.176, 10.049 | 9.963, 9.957, 9.775 | **-0.24 ms (-2.3%)** |
+| 1.7B decode, 256 tokens, ms | 11.166, 11.178, 11.193 | 10.948, 10.952, 10.945 | **-0.23 ms (-2.1%)** |
+| 1.7B prefill, 32 / 256, tokens/s | 1,096-1,099 / 2,094-2,102 | 1,099-1,101 / 2,101-2,103 | within noise |
+| 135M decode, 32 / 128 / 256, ms | 7.049 / 7.505 / 8.174, 6.978 / 7.518 / 8.203 | 7.031 / 7.506 / 8.170, 7.036 / 7.524 / 8.174 | within noise |
+| Qwen3.5-4B decode, 32 / 256, ms | 62.231 / 62.584, 62.224 / 62.592 | 62.467 / 62.813, 62.496 / 62.858 | **+0.41% / +0.40%** |
+| Qwen3.5-4B prefill, 32 / 256, ms | 460.9 / 3,685.5, 460.6 / 3,684.9 | 461.2 / 3,687.2, 461.0 / 3,688.6 | +0.06% |
+| ResNet-18 traced, ms | 12.504, 12.326 | 12.313, 12.488 | within noise |
+| ViT-Tiny traced, ms | 7.626, 7.608 | 7.593, 7.609 | within noise |
+
+Runs: the 1.7B off `1794024329`, `1794024746`, `1794025917`, on `1794024534`, `1794025139`, `1794025528` (the 135M in
+the last four); Qwen3.5-4B off `1794026313`, `1794028778`, on `1794027144`, `1794027958`; ResNet-18 / ViT-Tiny off
+`1794029589`, `1794029804`, on `1794029662`, `1794029732`. The 1.7B's tokens equal in every run.
+
+- **The default holds by the rule:** nothing is 0.5% slower.
+- **Qwen3.5-4B pays 0.25 ms a step (0.4%), reproducibly** (its bands are 0.02-0.06 ms wide). Its decode reads at
+  ~155 GB/s, so the products are a smaller share of its step and the deal's shape matters less. The cost is
+  not located yet; a `--profile` pair with `TT_PROFILE_DETAIL=pipeline` and `cargo xtask pipeline-report` would place it.
+
 ## Work
 
 - [x] A0 on card 1 (2026-11-02, `1793645082`-`1793647203`): more requests at tile-sized entries buy nothing (Results).
@@ -905,16 +1148,30 @@ GDDR is 16.18 GB free either way, and the fullest channel 2.02 GB.
   - [x] Model bound on card 1; the verdict by the rules (C1 final, `1793807243`-`1793816179`): both halves pass,
     the default; card 0's gate list and `--smoke` with it on (`1793801167`, `1793805483`)
   - [ ] F32 weights (no `with_storage` today) stay interleaved: a follow-up if an F32-stored model is read-bound
-- [ ] Item 5's copy-free levers (bank-affine placement, atomic column claims, a dedicated prefetcher), ranked against
+- [x] Item 5's copy-free levers (bank-affine placement, atomic column claims, a dedicated prefetcher), ranked against
   the scalable form after its bound. **Ranked after C1 (2026-11-04):** C1 took nearly all of 2b's gain (10.06 against
   two copies' 9.90 ms), so these levers now compete for what is left beyond it, not for 2b's ~10%.
   - **First: bank-affine placement. Bounded and killed 2026-11-06** (H17, card 1, `1793988029`): 2-3 readers a
     channel at 16 KiB read `down`'s bytes 1.04x and `o`'s 1.06x faster than C1's deal, under 0.1 ms a step.
-  - **Second: `gate|up`'s evenness (below).** Its slowest unit sets the product.
+  - **Second: `gate|up`'s evenness (below).** Its slowest unit sets the product. Its even form is the default since
+    2026-11-07 (the owner's call over a narrow kill).
   - **Third: atomic claims and a dedicated prefetcher.** They need new firmware: B had 4.6 KB of room (safe) and 220
-    bytes in the tightest build, so the firmware diet (2026-11-06) made room first (`cargo xtask fw-size`).
-- [ ] `gate|up`'s evenness: its mean unit is faster but not its slowest. A deal that sizes each unit's share to the rate
-  it gets, measured with the pipeline detail (X10). Layout-independent.
+    bytes in the tightest build, so the firmware diet (2026-11-06) made room first (`cargo xtask fw-size`). **Not
+    built (2026-11-07):** claims' ceiling with whole columns is the even deal's measured time (C.0); a worker-core
+    prefetcher's read side is bounded by H17 (1.04-1.06x), and DRISC has no loader in this stack (roadmap F10).
+- [x] `gate|up`'s evenness (X10, 2026-11-07): bounded and killed ("X10: evenness" above), then its even form made the
+  default by the owner's call (below). The even deal made the step 0.20 ms faster, but `gate|up`'s slowest unit only
+  1.094x (bar 1.10x); position weights 1.02x, the step slower.
+  - [x] `cargo xtask pipeline-report`, the meter's method as code; `skew.tsv`'s per-unit p10 / p90
+  - [x] The probe (`tensor::probe_deal`, `dealt_runs`), host tests, `step205` on ttsim and card 0 (`1794016170`)
+  - [x] The bench checks its tokens and prints their digest
+  - [x] Even and weighted on card 1, by the rules fixed beforehand
+- [x] Claims' ceiling (C.0, 2026-11-07): within the even deal's measured time; not built (owner).
+- [x] The even deal, the default (2026-11-07, owner's call; "The even deal, the default" above): the 1.7B 0.23-0.24 ms
+  faster, bit for bit; Qwen3.5-4B 0.4% slower, under the 0.5% rule; the rest within noise. `TT_EVEN_DEAL=0` opts out.
+  - [x] `Session::set_even_deal`, `step205`'s test of the default, the bench's conditions
+  - [x] card 0: the gates and `--smoke`; card 1: off / on brackets
+- [ ] Locate Qwen3.5-4B's 0.4% under the even deal (a profiled pair, `pipeline-report`)
 - Retired 2026-11-06 with the two-copy form itself (firmware diet; code at `61604b9`; `TT_WEIGHT_LAYOUT` refused by
   name). These refined it:
   - relay only `down` and `qkv` (Phase A's gains), roughly half the extra GDDR;

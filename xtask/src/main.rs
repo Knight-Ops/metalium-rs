@@ -17,6 +17,7 @@ mod gen_burn;
 mod gen_cfg;
 mod gen_isa;
 mod pin;
+mod pipeline_report;
 mod ship;
 mod silicon;
 mod spec;
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
         Some("bench") => silicon::bench(args),
         Some("bench-diff") => bench_diff::run(args),
         Some("fw-size") => fw_size::run(args),
+        Some("pipeline-report") => pipeline_report::run(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
     };
@@ -124,4 +126,9 @@ tasks:
                           ratio and whether it moved past its own spread
   fw-size [options]       each firmware image's bytes against its slot in every
                           shipped feature set, and the B mover's hot path;
-                          `cargo xtask fw-size --help`";
+                          `cargo xtask fw-size --help`
+  pipeline-report <profile dir> [options]
+                          a decode step's products unit against unit from a
+                          TT_PROFILE_DETAIL=pipeline profile: slowest and mean
+                          unit, an even and a rate-weighted re-deal, and what
+                          explains the spread; `cargo xtask pipeline-report --help`";

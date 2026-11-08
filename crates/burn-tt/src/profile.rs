@@ -22,7 +22,8 @@
 //! * `ops.tsv`: every attributed op, one per line (a trace op's `card_read_bytes` and `card_read_gbps`:
 //!   every unit's GDDR reads issued in its span).
 //! * `skew.tsv`: every trace op's units, one per line: each unit's work and its wait at the op's
-//!   barrier, from its own stamps.
+//!   barrier, from its own stamps (medians over replays, with the work's 10th and 90th
+//!   percentiles). `cargo xtask pipeline-report` reads it with `pipeline.tsv`.
 //! * `channels.tsv`: every trace op's GDDR reads by channel and NoC #0 endpoint, in its span
 //!   and read ahead (`summary.md` has each product label's busiest channel and endpoint).
 //! * `tails.tsv`: every trace op's reads in eighths of its span, its own units' against units

@@ -558,6 +558,10 @@ pub(crate) struct Plan {
     /// weight-streaming product planned, where all are known: the unit's first job reads its `B`
     /// ahead ([`BUSY_PREFETCH`]) if `B`'s ring lies above it. Empty: none does.
     pub(crate) busy: Vec<Option<u64>>,
+    /// With prefetching units and `K` whole, the in-span columns dealt over the own units and the
+    /// prefetching ones alike, each unit's share by its weight (indexed by unit; empty: even)
+    /// ([`crate::tensor::dealt_runs`], X10's probe). `None`: [`thin_runs`] over the own units.
+    pub(crate) deal: Option<Vec<u32>>,
 }
 
 impl Plan {
@@ -652,8 +656,36 @@ impl Plan {
         // The gathers each prefetched job reads ahead: a streamed column's first two chunks.
         let ahead = if self.stream_k { 2 } else { 1 };
         let firsts = (prefetch.len() * nc).min(nt);
+        // X10's probe: the rest over the own units and the prefetching ones alike.
+        let deal: Vec<usize> = (0..self.units).chain(prefetch.iter().copied()).collect();
+        let dealt = match self.stream_k {
+            false => self.deal.as_ref().and_then(|weights| {
+                crate::tensor::dealt_runs(firsts..nt, nc, self.units, &deal, weights)
+            }),
+            true => None,
+        };
+        // Each unit's runs as a product of its own, so its jobs continue from each other (its first
+        // reading ahead where it is busy, `A` resident after it, as when dealt among many).
+        let mut per_unit: Vec<Vec<Job>> = Vec::new();
+        for (d, runs) in dealt.iter().flatten().enumerate() {
+            let mut one = Vec::new();
+            if !runs.is_empty() {
+                let u = deal[d];
+                Plan {
+                    units: 1,
+                    col_runs: Some(runs.clone()),
+                    busy: match u < self.units {
+                        true => vec![self.busy.get(u).copied().flatten()],
+                        false => Vec::new(),
+                    },
+                    ..self.clone()
+                }
+                .push_jobs(&mut one, refs, transposed)?;
+            }
+            per_unit.push(one);
+        }
         let mut regular = Vec::new();
-        if firsts < nt {
+        if dealt.is_none() && firsts < nt {
             let rest = nt - firsts;
             let runs = thin_runs([1, kt, rest], [kt, nc], Staging::Slots, self.units)
                 .unwrap_or_else(|| {
@@ -698,6 +730,29 @@ impl Plan {
                 },
             );
             early.push(job);
+        }
+        if dealt.is_some() {
+            // Unit `deal[d]`'s `k`th job at `k spread + deal[d]`; a prefetching unit's job read
+            // ahead first (`early` is in `prefetch`'s order, as `deal` is past the own units).
+            let mut early = early.into_iter();
+            let mut laid: Vec<Job> = Vec::new();
+            for (d, mut js) in per_unit.into_iter().enumerate() {
+                if d >= self.units {
+                    if let Some(job) = early.next() {
+                        js.insert(0, job);
+                    }
+                }
+                for (k, job) in js.into_iter().enumerate() {
+                    let at = k * spread + deal[d];
+                    if laid.len() <= at {
+                        laid.resize(at + 1, Vec::new());
+                    }
+                    laid[at] = job;
+                }
+            }
+            laid.resize(laid.len().div_ceil(spread).max(1) * spread, Vec::new());
+            jobs.extend(laid);
+            return Ok(());
         }
         let units = self.units.max(1);
         let rounds = regular.len().div_ceil(units).max(1);

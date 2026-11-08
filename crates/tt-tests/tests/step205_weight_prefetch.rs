@@ -245,6 +245,78 @@ fn prefetched_products_replay_as_the_ops_run_fresh() {
     });
 }
 
+/// X10's even deal (`Session::set_even_deal`, on by default; `docs/plans/decode-bytes-in-flight.md`,
+/// "X10: evenness"): the in-span columns dealt over the prefetching units too (units 4-7, past
+/// their job read ahead), evenly, and by a probe's weights (`tensor::probe_deal`). The capture's
+/// run and its replays are the ops run fresh, bit for bit, and the prefetching units hold more of
+/// the products than with the deal off. Watched failing with the jobs read ahead dropped.
+#[test]
+fn the_even_deal_puts_in_span_columns_on_the_prefetching_units_bit_for_bit() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        let chain = Chain::upload(s);
+        let x = s.upload(&values(10, K), 1, K).unwrap();
+        let warm = chain.forward(s, &x, Spread::Fixed(4));
+        s.free(warm).unwrap();
+        let mut runs = Vec::new();
+        // Off, even, and weighted (unit 1 nothing past its first job, unit 6 three times).
+        for (even, deal) in [
+            (false, None),
+            (true, None),
+            (true, Some(vec![1, 0, 1, 1, 1, 1, 3, 1])),
+        ] {
+            s.set_even_deal(even);
+            tt_kernels::tensor::probe_deal(deal);
+            s.write(&x, &values(10, K)).unwrap();
+            s.begin_trace().unwrap();
+            let y = chain.forward(s, &x, Spread::Fixed(4));
+            let id = s.end_trace().unwrap();
+            // The entries the products put on units 4-7.
+            let idle: usize = s
+                .trace_ops(id)
+                .unwrap()
+                .iter()
+                .filter(|op| op.what.contains("matmul"))
+                .map(|op| op.entries[4..8].iter().map(|r| r.len()).sum::<usize>())
+                .sum();
+            let mut replays = vec![s.download(&y).unwrap()];
+            for round in 0..2u64 {
+                s.write(&x, &values(20 + round, K)).unwrap();
+                s.replay(id).unwrap();
+                s.sync().unwrap();
+                replays.push(s.download(&y).unwrap());
+            }
+            s.release_trace(id).unwrap();
+            s.free(y).unwrap();
+            runs.push((idle, replays));
+        }
+        tt_kernels::tensor::probe_deal(None);
+        s.set_even_deal(true);
+        let mut fresh = Vec::new();
+        for seed in [10, 20, 21] {
+            s.write(&x, &values(seed, K)).unwrap();
+            let y = chain.forward(s, &x, Spread::Fixed(4));
+            fresh.push(s.download(&y).unwrap());
+            s.free(y).unwrap();
+        }
+        assert!(
+            runs[1].0 > runs[0].0 && runs[2].0 > runs[0].0,
+            "the probe puts more on units 4-7: {} / {} / {} entries",
+            runs[0].0,
+            runs[1].0,
+            runs[2].0
+        );
+        for (name, (_, replays)) in ["off", "even", "weighted"].iter().zip(&runs) {
+            for (i, want) in fresh.iter().enumerate() {
+                assert_bits(&format!("{name}, run {i}"), &replays[i], want);
+            }
+        }
+        for t in chain.w.into_iter().chain([x]) {
+            s.free(t).unwrap();
+        }
+    });
+}
+
 /// Claim three.
 #[test]
 fn a_unit_that_ran_an_op_since_the_last_product_does_not_prefetch() {

@@ -37,10 +37,12 @@ const SAMPLES: usize = 9;
 
 fn conditions(card: usize) {
     println!(
-        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\",\"column_weights\":{}}}",
+        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\",\"column_weights\":{},\"even_deal\":{},\"deal_probe\":\"{}\"}}",
         git_sha(),
         !cfg!(debug_assertions),
         std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0"),
+        std::env::var("TT_EVEN_DEAL").map_or(true, |v| v != "0"),
+        std::env::var("TT_PROBE_DEAL").unwrap_or_else(|_| "off".into()),
     );
 }
 
@@ -1455,6 +1457,25 @@ fn traced_generation_stream_ceiling() {
                 .unwrap_or_else(|_| panic!("TT_PROBE_CONTIGUOUS_B={v}: off or an entry's bytes"))
         });
     tt_kernels::tensor::probe_contiguous_b(contiguous);
+    // `TT_PROBE_DEAL=even|<file>`: X10's probe, each one-row product's in-span columns dealt over
+    // its prefetching units too, evenly or by the file's per-unit weights (whitespace-separated,
+    // by unit index), over the session's own choice (`TT_EVEN_DEAL`, even by default); bit for bit
+    // (`tt_kernels::tensor::probe_deal`, `docs/plans/decode-bytes-in-flight.md`, "X10: evenness").
+    let deal: Option<Vec<u32>> = std::env::var("TT_PROBE_DEAL")
+        .ok()
+        .filter(|v| v != "off")
+        .map(|v| match v.as_str() {
+            "even" => Vec::new(),
+            path => std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("TT_PROBE_DEAL={path}: {e}"))
+                .split_whitespace()
+                .map(|w| {
+                    w.parse()
+                        .unwrap_or_else(|_| panic!("TT_PROBE_DEAL={path}: `{w}` is no weight"))
+                })
+                .collect(),
+        });
+    tt_kernels::tensor::probe_deal(deal);
     probe_space_report(true);
     let split = std::env::var("TT_PROBE_ATTENTION_SPLIT").is_ok_and(|v| v == "1");
     tt_kernels::attention::probe_split(split);
@@ -1572,6 +1593,9 @@ fn traced_generation_stream_ceiling() {
         for len in prompts {
             let p = gen_prompt(len, config.vocab);
             let (mut prefill, mut step) = (Vec::new(), Vec::new());
+            // Every generation's tokens, against the first's: a schedule that changes them fails
+            // here, and the digest compares runs (a probe against its baseline) bit for bit.
+            let mut first: Option<Vec<i32>> = None;
             for i in 0..WARMUPS + samples {
                 // With `TT_PROBE_NC_WAITS=1`, NC's waits over one measured generation (firmware
                 // built with the profile feature): what B's waits for its writer are made of.
@@ -1583,11 +1607,28 @@ fn traced_generation_stream_ceiling() {
                 if nc_waits {
                     report_nc_waits(&burn_tt::probe_nc_waits(d).unwrap(), len, new);
                 }
+                match &first {
+                    None => first = Some(out.tokens.clone()),
+                    Some(t) => assert_eq!(&out.tokens, t, "{len}-token prompt, generation {i}"),
+                }
                 if i >= WARMUPS {
                     prefill.push(ms(out.times[0]));
                     step.push(median_ms(&out.times[1..]));
                 }
             }
+            let tokens = first.unwrap_or_default();
+            // FNV-1a over the tokens' bytes.
+            let digest = tokens
+                .iter()
+                .flat_map(|t| t.to_le_bytes())
+                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+                });
+            println!(
+                "TOKENS {name} ({tag}), {len}-token prompt: {} tokens, digest {digest:016x}, first {:?}",
+                tokens.len(),
+                &tokens[..tokens.len().min(8)]
+            );
             // The prompt's chunks and the first token read back (`generate_tokens`' first time).
             report(
                 &format!("{name} stream ceiling ({tag}), {len}-token prompt, prefill"),
@@ -1620,6 +1661,7 @@ fn traced_generation_stream_ceiling() {
         }
     });
     tt_kernels::tensor::probe_contiguous_b(None);
+    tt_kernels::tensor::probe_deal(None);
     probe_skip_weight_reads(false);
     tt_kernels::tensor::probe_skip_batched_a_reads(false);
     tt_kernels::tensor::probe_skip_batched_a_rereads(false);

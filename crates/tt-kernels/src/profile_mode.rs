@@ -1237,6 +1237,10 @@ pub struct UnitTime {
 pub struct UnitMedian {
     pub unit: u16,
     pub work: u64,
+    /// The 10th and 90th percentiles of `work` over the replays ([`quantile`]): how much a unit's
+    /// own time moves from replay to replay, beside how far units sit from each other.
+    pub work_p10: u64,
+    pub work_p90: u64,
     pub wait: u64,
     pub push: u64,
     pub drain: u64,
@@ -1558,6 +1562,16 @@ fn median(mut v: Vec<u64>) -> u64 {
     v[v.len() / 2]
 }
 
+/// The `q` quantile of `v` (the sample nearest `q` of the way from the least to the greatest, as
+/// the benches' `Stats` take it), 0 for none.
+fn quantile(mut v: Vec<u64>, q: f64) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    v.sort_unstable();
+    v[((v.len() - 1) as f64 * q).round() as usize]
+}
+
 impl TraceSamples {
     /// [`Detail::Pipeline`]: one replay's streamed batches on every unit, by op ([`unit_pipes`]).
     fn pipelines(&mut self, units: &[Vec<TraceEvent>], lo: u32, hi: u32) {
@@ -1641,9 +1655,12 @@ impl TraceSamples {
                 by.into_iter()
                     .map(|(unit, ts)| {
                         let m = |f: fn(&UnitTime) -> u64| median(ts.iter().map(|t| f(t)).collect());
+                        let work: Vec<u64> = ts.iter().map(|t| t.work).collect();
                         UnitMedian {
                             unit,
                             work: m(|t| t.work),
+                            work_p10: quantile(work.clone(), 0.1),
+                            work_p90: quantile(work, 0.9),
                             wait: m(|t| t.wait),
                             push: m(|t| t.push),
                             drain: m(|t| t.drain),
@@ -2420,10 +2437,11 @@ impl ProfileReport {
     }
 
     /// Every trace op's units, one line each, tab-separated: each unit's median work (from its last
-    /// barrier's release to its arrival at the op's) and wait there, in microseconds.
+    /// barrier's release to its arrival at the op's) and wait there, in microseconds, and its work's
+    /// 10th and 90th percentiles over the replays (last, so readers by position are unchanged).
     pub fn skew_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
         let mut out = String::from(
-            "source\tindex\tlabel\twhat\tunit\tsamples\twork_us\twait_us\tspan_mb\tahead_mb\tspan_gbps\tpush_us\tdrain_us\tpush_words\n",
+            "source\tindex\tlabel\twhat\tunit\tsamples\twork_us\twait_us\tspan_mb\tahead_mb\tspan_gbps\tpush_us\tdrain_us\tpush_words\twork_p10_us\twork_p90_us\n",
         );
         for (&id, t) in &self.traces {
             let source = name(id);
@@ -2434,7 +2452,7 @@ impl ProfileReport {
                     let ahead = o.unit_bytes(u).map_or(0, |b| b.ahead);
                     let _ = writeln!(
                         out,
-                        "{source}\t{i}\t{}\t{}\t{u}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{:.3}\t{:.3}\t{}",
+                        "{source}\t{i}\t{}\t{}\t{u}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{:.3}\t{:.3}\t{}\t{:.3}\t{:.3}",
                         o.label,
                         o.what,
                         m.samples,
@@ -2446,6 +2464,8 @@ impl ProfileReport {
                         self.us(m.push),
                         self.us(m.drain),
                         m.words,
+                        self.us(m.work_p10),
+                        self.us(m.work_p90),
                     );
                 }
             }
@@ -3209,6 +3229,32 @@ mod tests {
         // Stamps that do not line up with the stream are refused, not misattributed.
         assert_eq!(unit_times(&w, &sat_out(), 5, 1, 5), None, "one stamp short");
         assert_eq!(unit_times(&x, &sat_out(), 5, 2, 5), None, "one stamp over");
+    }
+
+    #[test]
+    fn a_units_work_over_replays_gives_its_median_and_its_10th_and_90th_percentiles() {
+        // Eleven replays of one unit, in no order: 10..=110 us of work.
+        let replays = [70, 10, 110, 40, 20, 100, 30, 60, 90, 50, 80].map(|work| UnitTime {
+            unit: 3,
+            work,
+            wait: 0,
+            push: 0,
+            drain: 0,
+            words: 0,
+        });
+        let mut t = TraceSamples {
+            units: vec![replays.to_vec()],
+            ..TraceSamples::default()
+        };
+        let m = t.unit_medians()[0][0];
+        assert_eq!(
+            (m.unit, m.samples, m.work_p10, m.work, m.work_p90),
+            (3, 11, 20, 60, 100)
+        );
+        // One replay: every quantile is that replay.
+        t.units[0].truncate(1);
+        let m = t.unit_medians()[0][0];
+        assert_eq!((m.work_p10, m.work, m.work_p90), (70, 70, 70));
     }
 
     #[test]

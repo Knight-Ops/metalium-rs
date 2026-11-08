@@ -892,6 +892,8 @@ pub struct Session<T: Transport> {
     /// Stored weights laid by column (`tensor::Layout::ByColumn`;
     /// [`Session::set_column_weights`]).
     column_weights: bool,
+    /// [`Session::set_even_deal`].
+    even_deal: bool,
     /// [`Session::set_read_ahead_early`].
     read_ahead_early: bool,
     /// [`Session::set_idle_ahead_early`].
@@ -2886,6 +2888,10 @@ impl<T: Transport> Session<T> {
             // 1.7B decode step ~10% faster on card 1, bit for bit, with prefill, eager blocks and
             // GDDR unchanged (the weight held once). `TT_WEIGHT_COLUMNS=0` turns it off.
             column_weights: std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0"),
+            // On by default since 2026-11-07 (`docs/plans/decode-bytes-in-flight.md`, "X10:
+            // evenness"; the owner's call over its narrow kill): a 1.7B decode step 10.04 / 11.20 ->
+            // 9.82 / 10.98 ms on card 1, bit for bit. `TT_EVEN_DEAL=0` turns it off.
+            even_deal: std::env::var("TT_EVEN_DEAL").map_or(true, |v| v != "0"),
             // On by default since 2026-10-29 (`docs/completed-plans/dataflow-compiler.md` F4a.2): a 1.7B step
             // 11.32 / 12.69 -> 10.95 / 12.16 ms at 32 / 256 tokens on card 1, bit for bit;
             // `TT_READ_AHEAD_EARLY=0` turns it off.
@@ -3600,6 +3606,18 @@ impl<T: Transport> Session<T> {
     pub fn set_column_weights(&mut self, on: bool) -> Result<(), TensorError> {
         self.column_weights = on;
         self.push_prefetch_cap()
+    }
+
+    /// Deal a one-row product's in-span columns over its prefetching units too (X10;
+    /// `docs/plans/decode-bytes-in-flight.md`, "X10: evenness"). Where a one-row product with `K`
+    /// whole has units reading their first columns ahead (`Session::set_weight_prefetch`), each of
+    /// them then also takes an even share of the columns its own units would read in the
+    /// product's span ([`tensor::dealt_runs`]), instead of waiting for the product's barrier. Only
+    /// which unit holds a column moves: bit for bit either way. On by default (`TT_EVEN_DEAL=0`
+    /// at open turns it off); a development probe's weights ([`tensor::probe_deal`]) take
+    /// precedence.
+    pub fn set_even_deal(&mut self, on: bool) {
+        self.even_deal = on;
     }
 
     /// How a weight of `grid` tiles stored now is laid ([`Session::set_column_weights`];
@@ -8854,6 +8872,9 @@ impl<T: Transport> Session<T> {
             None
         };
         let mut twinned = false;
+        // X10: the in-span columns over the prefetching units too, evenly ([`Session::set_even_deal`])
+        // or by a development probe's weights.
+        let deal = tensor::probing_deal().or_else(|| self.even_deal.then(Vec::new));
         let built = self.mark();
         let out = self
             .dram_state()
@@ -8885,6 +8906,7 @@ impl<T: Transport> Session<T> {
                     spread,
                     &busy,
                     &tiles,
+                    deal.as_deref(),
                 )
             })
             .and_then(|(mut work, dealt)| {

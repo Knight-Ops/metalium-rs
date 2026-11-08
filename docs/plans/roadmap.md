@@ -14,9 +14,10 @@ linking to its evidence and to the detailed plan. Closed work lives in
 - **Models: four pretrained networks run on a card.** ResNet-18, ViT-Tiny and SmolLM2-135M (a
   30-layer Llama with a KV cache) run inference through `burn-tt` and agree with burn-flex on silicon
   (`crates/tt-models`, 2026-10-12), in F32, with SmolLM2 also in every mix of F32, BF16, F16 and BFP8/4/2. The
-  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at ~99 tokens/s traced against
-  burn-flex's 3.4 (10.06 ms a step with BF16 weights laid by column, the default since 2026-11-04, card 1,
-  `1793808030`, holding each weight once, item 2b below; 10.96 ms interleaved on 2026-11-03, `1793723839`; 9.75 ms with X9's
+  first past 1B parameters, SmolLM2-1.7B-Instruct (2026-10-15), decodes at ~101 tokens/s traced against
+  burn-flex's 3.4 (9.90 ms a step with BF16 weights laid by column and each one-row product's columns dealt over its
+  prefetching units too, the default since 2026-11-07, card 1, `1794024534`-`1794025528`, item 2b below; 10.06 ms laid
+  by column alone, the default since 2026-11-04, `1793808030`, holding each weight once; 10.96 ms interleaved on 2026-11-03, `1793723839`; 9.75 ms with X9's
   two-copy layout, opt-in because it does not scale; 10.95 ms on 2026-10-29, [log](../learnings/performance-log.md#f4a2-a-products-units-read-the-next-weights-before-their-arrival-2026-10-29-cards-0-and-1); 88 tokens/s on 2026-10-27, 13.6 on 2026-10-15), and prefills 7,992 tokens in 5.98 s.
   They were 105x, 7.8x and 24x behind burn-flex per forward pass
   ([profile](../learnings/performance-log.md#model-ladder-real-models-on-the-card-2026-10-12-cards-0-and-1)); ResNet-18 is now
@@ -1067,7 +1068,8 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
         tied head's token lookups, in-place writes and downloads.
       - **Bound it first,** on card 1 against today's default: prefill at 128 / 256 / 7,992 tokens and eager
         products, not only decode. C0's rules apply.
-    - [ ] **The copy-free levers of item 5.** Bank-affine placement, columns claimed from an atomic counter and a
+    - [x] **The copy-free levers of item 5** (decided 2026-11-07: bank-affine placement killed, the even deal the
+      default, claims and a prefetcher not built). Bank-affine placement, columns claimed from an atomic counter and a
       dedicated prefetcher need no second copy. **Ranked after C1:** C1 took nearly all of 2b's gain (10.06 ms
       against two copies' 9.90), so these compete for what is left. Bank-affine placement comes first: it composes
       with C1, since column `j`'s channel is the layout's choice.
@@ -1079,9 +1081,24 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       - [x] **Bank-affine placement: bounded, killed** (H17, 2026-11-06, card 1, `1793988029`): at 16 KiB entries, 2-3
         readers a channel read `down`'s and `o`'s bytes only 1.04x / 1.06x faster than C1's deal (kill 1.15x, under
         0.1 ms a step). Not built.
-      - Next: `gate|up`'s evenness (below), then atomic claims or a dedicated prefetcher in the room the diet made.
-    - [ ] **`gate|up`'s evenness** (its slowest unit gains least; X10: a deal that sizes each unit's share to the
-      rate it gets). It applies to any layout, so it does not depend on the second copy.
+      - Next: `gate|up`'s evenness (below, killed 2026-11-07, then its even form the default), then atomic claims or
+        a dedicated prefetcher in the room the diet made (not built, below).
+    - [x] **`gate|up`'s evenness: bounded, killed, then the even form the default** (X10, H18, 2026-11-07, card 1,
+      [plan](decode-bytes-in-flight.md#x10-evenness-opened-2026-11-07)). `cargo xtask pipeline-report` put the
+      spread in the deal's shape (the 24 prefetching units idle ~100 us) and then in position, not chance.
+      - **Even** (the in-span columns over the prefetching units too): the step 10.04 / 11.20 -> 9.82 / 10.98 ms,
+        bit for bit, but the slowest unit only 1.094x against the 1.10x bar. Killed narrowly, kept on record as a
+        probe (`TT_PROBE_DEAL`).
+      - **Position weights:** killed (1.02x, the step slower). A unit's rate follows the load the deal gives it.
+      - **Run-time column claims: not built** (C.0, host-only): with whole columns their ceiling (105.4 us) is the
+        even deal's measured `gate|up` (106.5 us). A worker-core prefetcher is bounded by H17; DRISC has no loader
+        here (F10).
+      - **The even deal, the default** (2026-11-07, the owner's call over the narrow kill;
+        [plan](decode-bytes-in-flight.md#the-even-deal-the-default-2026-11-07-cards-0-and-1)): `TT_EVEN_DEAL=0`
+        opts out. The 1.7B **10.14 / 11.18 -> 9.90 / 10.95 ms** at 32 / 256 tokens, bit for bit (card 1,
+        `1794024329`-`1794025917`); Qwen3.5-4B 0.4% slower (under the 0.5% rule, `1794026313`-`1794028778`); the
+        135M, prefill, ResNet-18 and ViT-Tiny within noise. Card 0: the gates and `--smoke` 1,274 of 1,274.
+      - [ ] Locate Qwen3.5-4B's 0.4% under the even deal (a profiled pair and `pipeline-report`).
     - **Retired with the two-copy form (2026-11-06).** These refined it, so none of them could become a default:
       - *Relay only the products that gain* (`down` and `qkv`, Phase A): still about half the extra GDDR, and still
         growing with the weights.
