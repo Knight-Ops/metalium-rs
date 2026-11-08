@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Qwen3.5-4B's step on the card: a third of it is the greedy pick; the even deal's 0.4% is the head](#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1) | 2026-11-08 | roadmap item 3 and 2b's last box: a replay's wall on the card 64.34 ms against 62.52 host-timed, so the time is on the card; the 21.5 ms in no span is `greedy`'s eight single-unit argmax parts (~2.7 ms each); the even deal's +0.19 ms is the head on 88 units, not 64 |
 | [The even deal, the default: a 1.7B decode step 10.14 -> 9.90 ms](#the-even-deal-the-default-a-17b-decode-step-1014---990-ms-2026-11-07-cards-0-and-1) | 2026-11-07 | roadmap 2b, the owner's call over X10's narrow kill: in-span columns over the prefetching units too, `TT_EVEN_DEAL=0` off; bit for bit; Qwen3.5-4B 0.4% slower, the rest within noise; claims not built (C.0) |
 | [X10, a deal sized to each unit's rate: bounded, killed (H18)](#x10-a-deal-sized-to-each-units-rate-bounded-killed-h18-2026-11-07-cards-0-and-1) | 2026-11-07 | roadmap 2b: `cargo xtask pipeline-report`; `gate\|up`'s spread is the deal's shape, then position; dealing in-span columns over the prefetching units too: the 1.7B 10.04 / 11.20 -> 9.82 / 10.98 ms bit for bit, but the slowest unit 1.094x (bar 1.10x); position weights 1.02x, slower |
 | [The firmware diet: B's room 180 -> 10,356 bytes at the same speed; H16 and H17 killed](#the-firmware-diet-bs-room-180---10356-bytes-at-the-same-speed-h16-and-h17-killed-2026-11-06-cards-0-and-1) | 2026-11-06 | roadmap 2b's next levers need firmware room: guarded runs out of the role images (slots 9,600 -> 7,168, B +7,296 bytes), layer sub-traces and X9's two-copy layout retired; `cargo xtask fw-size`; every model within noise of `41575d1`; H16 (cold record arms, `opt-level = 2`) no gain, `opt-level = 2` 1.9% slower on ResNet-18; H17 (bank-affine at 16 KiB) bounded at 1.04-1.06x, killed |
@@ -411,6 +412,89 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Qwen3.5-4B's step on the card: a third of it is the greedy pick; the even deal's 0.4% is the head (2026-11-08, cards 0 and 1)
+
+Roadmap Track 2 item 3 ("a replay's own wall time on the card") and item 2b's last box (the even deal's 0.4%), in one
+profiling pass. The rules were fixed before the runs.
+
+**What the profile mode now reports (host only, no firmware change).** The mover stamps `LIST_BEGIN` / `LIST_END`
+around every replay whatever the window (`mover.rs`'s `call`), so each replay's wall time on the card is unit 0's last
+`LIST_BEGIN` to the `LIST_END` after it (`profile_mode::replay_wall`). `Profiler::drained` now keeps a
+`ReplayRecord` for every replay, overflowed ones too, with:
+- its window, and the units that overflowed;
+- its wall on unit 0 and on the longest unit;
+- the lists queued before it;
+- its ops' summed spans;
+- the program bytes put back for it, by the B movers and by the host;
+- its host time, and the part of that spent reading the stamps back.
+
+The trace's summary gains a line, "On the card, a replay … is in no covered span", and names the ops no replay
+stamped. `replays.tsv` holds one row per replay. burn-tt's Replays table gains "on the card ms" and "stamps read back
+ms". Gate `silicon_profile_mode` (card 0, `--feature profile`, 6 of 6, `1794101761`) checks that each whole replay
+has spans ≤ wall ≤ its host time. Its overflow test is the negative control: the uncovered time must show and the
+lost ops must be named. `cargo xtask pipeline-report <a> --against <b>` diffs two profiles by label (ops.tsv) and by
+product class (the slowest unit).
+
+**Runs** (card 1, release, safe image, every tile, `51817f5` plus this change, each run its own process):
+- profiled, `TT_GEN_PROMPTS=32 TT_GEN_NEW=96 TT_GEN_SAMPLES=1 TT_PROFILE_DETAIL=pipeline --profile`, in the order
+  on `1794101823`, off `1794103109`, off `1794104384`, on `1794105660`;
+- unprofiled at the default prompts, on `1794106945`, off `1794107760` (off is `TT_EVEN_DEAL=0`).
+
+Every run passed its in-run checks: tokens and logits equal the eager schedule bit for bit, and every generation's
+tokens equal the logits path's. (This bench prints no `TOKENS` digest.)
+
+| run | deal | `Step(64)` on the card (unit 0), us | covered spans (1,071 ops), us | in no span, us | host, unprofiled, 32 / 256, ms |
+|---|---|--:|--:|--:|--:|
+| `1794101823` | on | 64,340.5 | 42,820.6 | 21,519.9 | |
+| `1794103109` | off | 64,150.6 | 42,671.8 | 21,478.8 | |
+| `1794104384` | off | 64,147.3 | 42,657.7 | 21,489.6 | |
+| `1794105660` | on | 64,337.7 | 42,823.1 | 21,514.6 | |
+| `1794106945` | on | | | | 62.522 / 62.863 |
+| `1794107760` | off | | | | 62.260 / 62.593 |
+
+**Item 3: the time is on the card.**
+- The card wall, 64.34 ms, is 2.9% above the unprofiled host step (62.52), inside the 5% rule. The excess is the
+  stamping's own cost on the card.
+- The host adds nothing measurable around a replay. No program is put back on any replay (0 bytes by the movers, 0 by
+  the host).
+- Profiled, the host's 161-166 ms a replay is 92-97 ms of reading the stamps back, plus the step itself. Profiled
+  host times are not comparable with unprofiled ones.
+- Step(128) gives the same picture: 64.44 / 64.24 ms on the card.
+- **The 21.5 ms in no span is the greedy pick.** Spans tile the list (barrier end to barrier end, the first from
+  `LIST_BEGIN`), so the only time outside them is the ops never stamped: 1048-1056.
+  - Ops 1048-1055 are `generate::greedy`'s eight parts (248,320 = 8 x 31,040 columns). Each holds its part's row on
+    one unit, and its `argmax gather` is an estimated 6,084 stamps on unit 0, against a 928-stamp window: no window
+    can hold one, so every replay that tries overflows.
+  - Op 1056 is a state write-back, about 34 us like its 22 siblings.
+  - The parts therefore take ~21.4 ms a step, ~2.7 ms each: a third of the step.
+  - Eager, the same kernel measures 4.7 ms a part on average (90 ops in this run's eager validation), 98% of it
+    waiting on data.
+- Without them the step's ops are 42.8 ms: the head 5.4-5.6, the weight products ~19.5, the rest as on 2026-10-31.
+
+**The even deal's 0.4% is the tied head.** Unprofiled, it costs +0.26 / +0.27 ms at 32 / 256 tokens, again. On the
+card, +190 us of the wall in both pairs, +149 / +165 us of it in covered spans.
+
+`pipeline-report --against`, on less off:
+
+| pair | `float_matmul` spans (272 ops) | class `last` (the head, op 1046), slowest unit | next largest class |
+|---|--:|--:|--:|
+| `1794101823` - `1794103109` | +0.153 ms | **+0.182 ms** (5.440 -> 5.622) | -0.056 |
+| `1794105660` - `1794104384` | +0.160 ms | **+0.215 ms** (5.404 -> 5.619) | -0.053 |
+
+- One class carries it: ≥ 0.15 ms in both pairs, the same sign. Every other class is under 0.06 ms and changes sign
+  between pairs. By the rule, it is located.
+- **Why.** Without the even deal, the head's 2.58 GB are dealt over 64 units (40.4 MB each, the slowest 1.03x the
+  mean). With it, they are dealt over 88 (29.3 MB each). The mean unit is faster (5.13 against 5.26 ms), but the
+  spread is wider (1.09x) and the slowest unit slower.
+- The head already reads at ~475 GB/s against the card's 512, so the 24 more readers add no bytes in flight that GDDR
+  can serve. They only add channels' unfair service ("What holds card reads at ~430 GB/s" below).
+- **The rule this suggests** (not built, roadmap item 2b):
+  - deal a product evenly only where its uneven deal is not already at the card's read rate;
+  - statically, for example: not where its bytes per unit exceed a bound that its rate makes GDDR-bound;
+  - host only, bit for bit, the same for every model;
+  - worth at most ~0.2 ms of Qwen3.5's step (0.3%);
+  - before it changes the default, bracket it on the 1.7B and on Qwen3.5 under the 0.5% rule.
 
 ## The even deal, the default: a 1.7B decode step 10.14 -> 9.90 ms (2026-11-07, cards 0 and 1)
 
@@ -1192,6 +1276,8 @@ host-timed unprofiled on the same tree (`1793409872`).
     the coverage, and was reverted. The overflow is not where those ops are lost.
 - **Next:** a replay's own wall time on the card (unit 0's first stamp to its last) beside the summed spans, in the
   profile mode. That tells card from host before anything is built for Qwen3.5.
+  *Answered 2026-11-08* ([above](#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1)):
+  on the card. The nine ops are the greedy pick's eight single-unit argmax parts (~21.4 ms) and a write-back.
 
 ## H11's bound: a decode product's reads at large entries (2026-10-31, card 1)
 

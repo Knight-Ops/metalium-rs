@@ -94,13 +94,23 @@ impl Profile {
         if !self.replays.is_empty() {
             let _ = writeln!(
                 out,
-                "## Replays\n\nMedians, host-timed.\n\n| trace | replays | input write ms | replay ms | output read ms |\n|---|--:|--:|--:|--:|"
+                "## Replays\n\nMedians, host-timed, beside the replay's wall time on the card (unit 0's replay list) and the host's time reading the stamps back, which a profiled replay pays and an unprofiled one does not.\n\n| trace | replays | input write ms | replay ms | output read ms | on the card ms | stamps read back ms |\n|---|--:|--:|--:|--:|--:|--:|"
             );
             for (&id, runs) in &self.replays {
                 let col = |k: usize| median_ms(runs.iter().map(|r| r[k]).collect());
+                let card = self
+                    .device
+                    .replay_wall_us(id)
+                    .map_or("-".to_string(), |us| format!("{:.3}", us / 1e3));
+                let drain = self.device.traces.get(&id).map_or("-".to_string(), |t| {
+                    let mut v: Vec<f64> = t.replay_records.iter().map(|r| r.drain_us).collect();
+                    v.sort_by(f64::total_cmp);
+                    v.get(v.len() / 2)
+                        .map_or("-".to_string(), |us| format!("{:.3}", us / 1e3))
+                });
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {:.3} | {:.3} | {:.3} |",
+                    "| {} | {} | {:.3} | {:.3} | {:.3} | {card} | {drain} |",
                     self.name(id),
                     runs.len(),
                     col(0),
@@ -141,7 +151,7 @@ impl Profile {
         out
     }
 
-    /// Write `summary.md`, `ops.tsv`, `skew.tsv`, `channels.tsv`, `tails.tsv` and `trace.json` into
+    /// Write `summary.md`, `ops.tsv`, `skew.tsv`, `channels.tsv`, `tails.tsv`, `replays.tsv` and `trace.json` into
     /// `dir`, creating it, and `entries.tsv` and `pipeline.tsv` when their detail recorded them.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         let name = |id: u64| self.name(id);
@@ -151,6 +161,7 @@ impl Profile {
         std::fs::write(dir.join("skew.tsv"), self.device.skew_tsv(&name))?;
         std::fs::write(dir.join("channels.tsv"), self.device.channels_tsv(&name))?;
         std::fs::write(dir.join("tails.tsv"), self.device.tails_tsv(&name))?;
+        std::fs::write(dir.join("replays.tsv"), self.device.replays_tsv(&name))?;
         if self
             .device
             .traces

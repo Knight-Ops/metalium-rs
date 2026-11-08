@@ -59,7 +59,11 @@ options:
   --peak-gbps <rate>    the card's read rate the ideal may not beat (default 512)
   --column <class>=<MB> that class's column, in place of the one inferred from its
                         shares (repeatable): a share read partly ahead looks like
-                        a smaller column than any deal can move";
+                        a smaller column than any deal can move
+  --against <dir>       compare with a second profile of the same trace (one
+                        skew.tsv in or below each): every op's span by label
+                        (ops.tsv), and each product class's slowest unit, as
+                        <dir> less the first, summed a step, ms";
 
 /// What the re-deals assume beyond the profile.
 #[derive(Clone, Debug)]
@@ -82,6 +86,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut source = "Step(64)".to_string();
     let mut names = Vec::new();
     let mut units = None;
+    let mut against = None;
     let mut model = Model {
         peak_gbps: PEAK_GBPS,
         columns: BTreeMap::new(),
@@ -98,6 +103,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
                     .collect()
             }
             "--units" => units = Some(value("--units")?),
+            "--against" => against = Some(PathBuf::from(value("--against")?)),
             "--column" => {
                 let v = value("--column")?;
                 let (class, mb) = v
@@ -117,6 +123,34 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         }
     }
     let dir = dir.ok_or(USAGE)?;
+    if let Some(other) = against {
+        let one = |d: &Path| -> Result<PathBuf, String> {
+            let mut found = Vec::new();
+            find_skews(d, 4, &mut found);
+            match found.len() {
+                1 => Ok(found.remove(0)),
+                n => Err(format!(
+                    "{}: {n} skew.tsv, --against needs one",
+                    d.display()
+                )),
+            }
+        };
+        let (a, b) = (one(&dir)?, one(&other)?);
+        let read = |d: &Path, f: &str| {
+            std::fs::read_to_string(d.join(f)).map_err(|e| format!("{}: {e}", d.join(f).display()))
+        };
+        println!("## {} against {}\n", b.display(), a.display());
+        print!(
+            "{}",
+            compare(
+                [&read(&a, "ops.tsv")?, &read(&b, "ops.tsv")?],
+                [&read(&a, "skew.tsv")?, &read(&b, "skew.tsv")?],
+                &source,
+                &names,
+            )?
+        );
+        return Ok(());
+    }
     let mut found = Vec::new();
     find_skews(&dir, 4, &mut found);
     if found.is_empty() {
@@ -685,6 +719,152 @@ fn report(ops: &[Op], names: &[String], units: Option<&str>, model: &Model) -> S
     out
 }
 
+/// `ops.tsv`'s ops of `source`: `(index, label, span_us)`.
+fn op_spans(ops: &str, source: &str) -> Result<Vec<(u32, String, f64)>, String> {
+    let mut lines = ops.lines();
+    let header: Vec<&str> = lines
+        .next()
+        .ok_or("ops.tsv is empty")?
+        .split('\t')
+        .collect();
+    let col = |name: &str| {
+        header
+            .iter()
+            .position(|h| *h == name)
+            .ok_or_else(|| format!("ops.tsv has no `{name}` column"))
+    };
+    let (c_source, c_index, c_label, c_span) = (
+        col("source")?,
+        col("index")?,
+        col("label")?,
+        col("span_us")?,
+    );
+    let mut out = Vec::new();
+    for (n, line) in lines.enumerate() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < header.len() || f[c_source] != source {
+            continue;
+        }
+        let at = |e: String| format!("ops.tsv line {}: {e}", n + 2);
+        out.push((
+            f[c_index].parse().map_err(|e| at(format!("index: {e}")))?,
+            f[c_label].to_string(),
+            f[c_span].parse().map_err(|e| at(format!("span_us: {e}")))?,
+        ));
+    }
+    Ok(out)
+}
+
+/// Profile `b` against profile `a` of the same trace: each label's spans summed over the ops both
+/// stamped, and each product class's slowest unit summed over its ops, `b - a` in ms a step,
+/// largest first. Ops only one profile stamped are counted and left out, so a difference is never
+/// a coverage's.
+fn compare(
+    ops: [&str; 2],
+    skews: [&str; 2],
+    source: &str,
+    names: &[String],
+) -> Result<String, String> {
+    let mut out = String::new();
+    let [a, b] = [op_spans(ops[0], source)?, op_spans(ops[1], source)?];
+    let b_at: BTreeMap<u32, (&str, f64)> =
+        b.iter().map(|(i, l, s)| (*i, (l.as_str(), *s))).collect();
+    let mut labels: BTreeMap<&str, (u32, f64, f64)> = BTreeMap::new();
+    let (mut only, mut differ) = (a.len() + b.len(), 0);
+    for (i, label, span) in &a {
+        let Some(&(bl, bs)) = b_at.get(i) else {
+            continue;
+        };
+        only -= 2;
+        if bl != label {
+            differ += 1;
+            continue;
+        }
+        let e = labels.entry(label).or_default();
+        e.0 += 1;
+        e.1 += span;
+        e.2 += bs;
+    }
+    if differ > 0 {
+        return Err(format!(
+            "{differ} ops of {source} differ in label: not the same trace"
+        ));
+    }
+    let (ta, tb): (f64, f64) = labels
+        .values()
+        .fold((0.0, 0.0), |s, v| (s.0 + v.1, s.1 + v.2));
+    let _ = writeln!(
+        out,
+        "{source}: the ops both stamped, {:.3} -> {:.3} ms a step ({:+.3}); {only} stamped by one \
+         only, left out.\n\n| label | ops | first ms | second ms | difference ms |\n|---|--:|--:|--:|--:|",
+        ta / 1e3,
+        tb / 1e3,
+        (tb - ta) / 1e3
+    );
+    let mut rows: Vec<(&str, (u32, f64, f64))> = labels.into_iter().collect();
+    rows.sort_by(|x, y| (y.1 .2 - y.1 .1).abs().total_cmp(&(x.1 .2 - x.1 .1).abs()));
+    for (label, (n, sa, sb)) in rows.iter().take(15) {
+        let _ = writeln!(
+            out,
+            "| {label} | {n} | {:.3} | {:.3} | {:+.3} |",
+            sa / 1e3,
+            sb / 1e3,
+            (sb - sa) / 1e3
+        );
+    }
+    let [pa, pb] = [
+        parse(skews[0], None, source)?,
+        parse(skews[1], None, source)?,
+    ];
+    let slowest = |ops: &[Op]| -> BTreeMap<String, (u32, f64)> {
+        let mut by: BTreeMap<String, (u32, f64)> = BTreeMap::new();
+        for (op, c) in ops.iter().zip(classes(ops, names)) {
+            let e = by.entry(c).or_default();
+            e.0 += 1;
+            e.1 += op.units.iter().map(|u| u.work).fold(0.0, f64::max);
+        }
+        by
+    };
+    let (ca, cb) = (slowest(&pa), slowest(&pb));
+    let _ = writeln!(
+        out,
+        "\nProducts by class, the slowest unit summed over the class's ops, ms a step.\n\n| class | \
+         ops | first ms | second ms | difference ms |\n|---|--:|--:|--:|--:|"
+    );
+    // (class, (ops, ms) first, the same second where it has the class)
+    type Row<'a> = (&'a String, (u32, f64), Option<(u32, f64)>);
+    let mut rows: Vec<Row> = ca
+        .iter()
+        .map(|(c, &v)| (c, v, cb.get(c).copied()))
+        .collect();
+    rows.sort_by(|x, y| {
+        let d = |r: &Row| r.2.map_or(0.0, |b| (b.1 - r.1 .1).abs());
+        d(y).total_cmp(&d(x))
+    });
+    for (c, (n, sa), b) in rows {
+        match b {
+            Some((nb, sb)) if nb == n => {
+                let _ = writeln!(
+                    out,
+                    "| {c} | {n} | {:.3} | {:.3} | {:+.3} |",
+                    sa / 1e3,
+                    sb / 1e3,
+                    (sb - sa) / 1e3
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "| {c} | {n} | {:.3} | - | not in both alike |",
+                    sa / 1e3
+                );
+            }
+        }
+    }
+    out.push('\n');
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +902,51 @@ mod tests {
         s.push(line(9, "float_matmul", "head", 0, 50.0, 3.0));
         s.push(line(0, "float_matmul", "first", 0, 1.0, 1.0).replace("Step(64)", "Step(128)"));
         s.join("\n")
+    }
+
+    /// `ops.tsv` with `(index, label, span_us)` rows of `Step(64)`, and one of another source.
+    fn ops_tsv(rows: &[(u32, &str, f64)]) -> String {
+        let mut s = vec!["source\tindex\tlabel\twhat\tunits\tsamples\tspan_us".to_string()];
+        for (i, l, us) in rows {
+            s.push(format!("Step(64)\t{i}\t{l}\tw\t1\t3\t{us}"));
+        }
+        s.push("Step(128)\t0\tx\tw\t1\t3\t1000".into());
+        s.join("\n")
+    }
+
+    #[test]
+    fn a_comparison_takes_the_ops_both_stamped_and_puts_the_largest_difference_first() {
+        let a = ops_tsv(&[
+            (0, "rms_norm", 10.0),
+            (1, "float_add", 5.0),
+            (2, "rms_norm", 10.0),
+            (3, "x", 7.0),
+        ]);
+        // Op 3 only in the first: left out, not a difference. rms_norm 200 us slower.
+        let b = ops_tsv(&[
+            (0, "rms_norm", 110.0),
+            (1, "float_add", 6.0),
+            (2, "rms_norm", 110.0),
+        ]);
+        let slower = skew().replace("\t45\t", "\t245\t");
+        let r = compare([&a, &b], [&skew(), &slower], "Step(64)", &[]).unwrap();
+        assert!(
+            r.contains("0.025 -> 0.226 ms a step (+0.201); 1 stamped by one only"),
+            "{r}"
+        );
+        let rows: Vec<&str> = r.lines().filter(|l| l.starts_with("| ")).collect();
+        assert!(
+            rows[1].starts_with("| rms_norm | 2 | 0.020 | 0.220 | +0.200 |"),
+            "{r}"
+        );
+        // The slow gate|up unit (45 -> 245 us in both layers) is its class's 0.4 ms.
+        assert!(
+            r.contains("| slot 1 (gu, 4 units) | 2 | 0.090 | 0.490 | +0.400 |"),
+            "{r}"
+        );
+        // Not the same trace: refused.
+        let c = ops_tsv(&[(0, "float_add", 1.0)]);
+        assert!(compare([&a, &c], [&skew(), &skew()], "Step(64)", &[]).is_err());
     }
 
     #[test]

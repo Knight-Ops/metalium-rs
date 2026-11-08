@@ -1012,6 +1012,8 @@ pub struct Session<T: Transport> {
     /// ([`Session::set_count_trace_bytes`]); the profile mode counts whether or not it is set.
     count_trace_bytes: bool,
     profile_drained: Vec<Vec<tt_device::trace::TraceEvent>>,
+    /// The host's time reading stamps back ([`Session::drain`]) since the profile mode last asked.
+    profile_drain_time: std::time::Duration,
     /// Where each unit's timestamper stream goes, and its bytes
     /// ([`Session::set_profile_buffer`]): the fixed trace buffer unless moved.
     profile_buffer: (u64, u64),
@@ -2967,6 +2969,7 @@ impl<T: Transport> Session<T> {
             profiler: None,
             count_trace_bytes: false,
             profile_drained: Vec::new(),
+            profile_drain_time: std::time::Duration::ZERO,
             profile_buffer: (
                 tt_isa::mailbox::TRACE_BUFFER,
                 tt_isa::mailbox::TRACE_BUFFER_BYTES,
@@ -3327,12 +3330,14 @@ impl<T: Transport> Session<T> {
             profiling,
             profiler,
             profile_drained,
+            profile_drain_time,
             profile_buffer: (buffer, bytes),
             ..
         } = self;
         let (Some(p), Some(r)) = (profiling.as_mut(), units[u].resident.as_ref()) else {
             return Ok(());
         };
+        let drain_start = std::time::Instant::now();
         let tile = units[u].tile;
         let events = match (dev.read_trace(r.window(), tile, *buffer), profiler.as_mut()) {
             // The profile mode never fails a run: an op whose stamps outran the buffer is reported as
@@ -3344,7 +3349,7 @@ impl<T: Transport> Session<T> {
                 }),
                 Some(pr),
             ) => {
-                pr.overflowed();
+                pr.overflowed(u);
                 Vec::new()
             }
             (events, _) => events?,
@@ -3381,7 +3386,9 @@ impl<T: Transport> Session<T> {
         } else {
             p[u].events.extend(events);
         }
-        dev.configure_trace(r.window(), tile, *buffer, *bytes)
+        let configured = dev.configure_trace(r.window(), tile, *buffer, *bytes);
+        *profile_drain_time += drain_start.elapsed();
+        configured
     }
 
     /// Enable GDDR with fixed resident B-reader / NC-writer compute ownership.
@@ -6802,6 +6809,7 @@ impl<T: Transport> Session<T> {
             })
             .collect();
         let barriers = t.barriers;
+        let restored = (self.mover_restored_bytes, self.restored_bytes);
         // Its programs where it names them: another trace's may have taken the room since
         // (`ProgramCache::restore`).
         for (u, call) in calls.iter().enumerate() {
@@ -6871,8 +6879,18 @@ impl<T: Transport> Session<T> {
         }
         if window.is_some() {
             // Profiled, a replay is timed alone, as an eager op is.
+            let start = std::time::Instant::now();
+            self.profile_drain_time = std::time::Duration::ZERO;
             self.sync()?;
             self.profile_collect();
+            let restored = (
+                self.mover_restored_bytes - restored.0,
+                self.restored_bytes - restored.1,
+            );
+            let drain = std::mem::take(&mut self.profile_drain_time);
+            if let Some(p) = self.profiler.as_mut() {
+                p.note_replay_host(start.elapsed(), drain, restored.0, restored.1);
+            }
         }
         Ok(())
     }

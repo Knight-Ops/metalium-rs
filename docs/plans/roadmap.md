@@ -1098,7 +1098,15 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
         opts out. The 1.7B **10.14 / 11.18 -> 9.90 / 10.95 ms** at 32 / 256 tokens, bit for bit (card 1,
         `1794024329`-`1794025917`); Qwen3.5-4B 0.4% slower (under the 0.5% rule, `1794026313`-`1794028778`); the
         135M, prefill, ResNet-18 and ViT-Tiny within noise. Card 0: the gates and `--smoke` 1,274 of 1,274.
-      - [ ] Locate Qwen3.5-4B's 0.4% under the even deal (a profiled pair and `pipeline-report`).
+      - [x] **Qwen3.5-4B's 0.4% located: the tied head** (2026-11-08, card 1, profiled pairs `1794101823` /
+        `1794103109` and `1794105660` / `1794104384`;
+        [log](../learnings/performance-log.md#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1)).
+        `pipeline-report --against` puts +0.18 / +0.22 ms in class `last` (op 1046) and under 0.06 ms in every other
+        class. The even deal spreads the head's 2.58 GB over 88 units instead of 64. It already reads at ~475 GB/s, so
+        the extra readers only widen the spread (1.03x -> 1.09x the mean).
+      - [ ] *Proposed, not built:* deal a product evenly only where its uneven deal is not already at the card's
+        read rate (host only, bit for bit, the same for every model; at most ~0.2 ms of Qwen3.5's step). Bracket it
+        on the 1.7B and Qwen3.5 under the 0.5% rule before it changes the default.
     - **Retired with the two-copy form (2026-11-06).** These refined it, so none of them could become a default:
       - *Relay only the products that gain* (`down` and `qkv`, Phase A): still about half the extra GDDR, and still
         growing with the weights.
@@ -1111,7 +1119,21 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
       card could hold only the relaid layout and a prefill card only the weight as it lies: one copy on each card.
       This needs the decode card's other readers (the tied head's token lookups, `m > 1` products such as a
       speculative verify, writes) to read the regions, the gap C0 measured.
-- [ ] **3. Qwen3.5: a replay's own wall time on the card.** Profiled again 2026-10-31
+- [x] **3. Qwen3.5: a replay's own wall time on the card** (closed 2026-11-08, card 1;
+  [log](../learnings/performance-log.md#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1)).
+  - **Verdict: on the card.**
+    - A replay takes 64.34 ms on the card (profiled), against 62.52 ms host-timed unprofiled. That is within the 5%
+      rule; the difference is the stamping's own cost. No programs are put back.
+    - The 21.5 ms in no span is ops 1048-1055: `generate::greedy`'s eight argmax parts, each holding 31,040 columns
+      on one unit (~2.7 ms each). No 928-stamp window can hold one. The spans tile the list, so nothing else is
+      uncovered.
+  - **How it is measured** (in the profile mode, no firmware):
+    - each replay's wall comes from unit 0's `LIST_BEGIN` / `LIST_END`;
+    - `replays.tsv` holds one row per replay;
+    - the ops never stamped are named in the summary;
+    - gate `silicon_profile_mode` (run with `--feature profile`, which turns the mode on itself, not with
+      `--profile`).
+  - Profiled again 2026-10-31
   ([log](../learnings/performance-log.md#qwen35-4bs-decode-step-profiled-whole-but-for-nine-ops-2026-10-31-card-1)).
   - *The gap:* 1,071 of 1,080 ops make 43.97 ms on the card against 64.28 host-timed. ~20 ms is in no op's span.
     Ops 1048-1056 (after the greedy pick) are never stamped.
@@ -1119,14 +1141,23 @@ Ranked, in the order to work them (review's suggestion, 2026-10-31):
     time. Splitting overflowed windows changed nothing (tried, reverted).
   - *The work:* in the profile mode, report each replay's wall time on the card (unit 0's first stamp to its last)
     beside its summed spans. That tells card from host before anything is built for Qwen3.5.
-- [ ] **4. Qwen3.5's step, shortened.**
+- [ ] **4. Qwen3.5's step, shortened.** Ordered by item 3's attribution (2026-11-08).
+  - [ ] **The greedy pick over the grid** (~21.4 ms, a third of the step). A row past 65,536 columns is taken in
+    eight 31,040-column parts, each an `argmax` on one unit (`generate::greedy`). Eager, each part is 4.7 ms, 98% of
+    it waiting on data. Instead, spread each part's columns over many units the way a product's are, and take the
+    winner from their partial results. This is for every model whose vocabulary exceeds one unit's arena, not only
+    Qwen3.5.
+    - *Bound it first:* one 31,040-column part's argmax on 1 unit and on N units, traced, on card 1.
+    - The pick must stay bit for bit: the first largest value wins, NaN ranked as `argmax` ranks it.
   - [ ] A BF16 copy of the tied head. The head reads the F32 table, 2.58 GB in 5.37 ms at 481 GB/s, so the copy
     saves ~2.7 ms.
   - [ ] The delta-rule step in fewer ops: ~25 non-product ops a DeltaNet layer, 776 non-product ops at 16.8 ms a
     step. tt-metal does it in about ten (`models/experimental/gated_attention_gated_deltanet/tt/ttnn_delta_rule_ops.py`),
     FlashInfer in one call.
   - H10's kill does not transfer (ADR 0001): bound B13c's epilogues on this model separately.
-- [ ] **5. Released by item 2** (2026-11-02: every decode product read-bound by its bytes in flight). Work these after
+- [x] **5. Released by item 2** (2026-11-02: every decode product read-bound by its bytes in flight). *Decided
+  2026-11-07, under item 2b's "copy-free levers" above:* bank-affine placement killed (H17); the even deal is the
+  default; column claims and a prefetcher were not built. Work these after
   item 2b's bound, which tells whether larger entries alone suffice. Since 2b's second copy went back to opt-in
   (2026-11-03), these are the copy-free route to its decode gain and must hold one copy of the weights:
   - bank-affine placement at 2-3 units a bank (tt-metal's 88-90%, `f2c0b2623fe`);

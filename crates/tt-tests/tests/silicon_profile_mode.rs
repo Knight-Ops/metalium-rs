@@ -136,6 +136,7 @@ fn eager_ops_are_attributed_to_their_burn_ops() {
             "ops.tsv",
             "skew.tsv",
             "tails.tsv",
+            "replays.tsv",
             "trace.json",
         ] {
             assert!(dir.join(f).metadata().unwrap().len() > 0, "{f}");
@@ -234,6 +235,20 @@ fn windows_stitch_to_the_whole_trace() {
             }
             let p = profile_mode(d, None).unwrap().unwrap();
             let (_, t) = p.device.traces.iter().next().unwrap();
+            // Each replay's wall on the card holds its covered spans, and the host's time around
+            // it holds the wall.
+            assert_eq!(t.replay_records.len(), replays);
+            for r in &t.replay_records {
+                let wall = r.wall.expect("unit 0's replay list is stamped");
+                assert!(r.overflowed.is_empty(), "{r:?}");
+                assert!(r.spans <= wall, "spans {} beyond the wall {wall}", r.spans);
+                assert!(
+                    wall as f64 / p.device.ticks_per_us <= r.host_us,
+                    "the wall {wall} cycles beyond the host's {} us",
+                    r.host_us
+                );
+                assert!(r.wall_max.is_some_and(|(_, w)| w >= wall), "{r:?}");
+            }
             for r in 0..replays {
                 sums.push(
                     t.samples
@@ -295,6 +310,20 @@ fn without_the_window_a_long_trace_overflows() {
         assert_eq!((t.replays, t.overflowed), (3, 3), "every replay overflowed");
         assert_eq!(t.covered(), 0, "and none was attributed");
         assert!(p.summary().contains("(3 overflowed)"));
+        // Each is still recorded, with the units that overflowed, and its ops are named as never
+        // stamped (a trace stored unwindowed is still segmented).
+        assert_eq!(t.replay_records.len(), 3);
+        assert!(
+            t.replay_records.iter().all(|r| !r.overflowed.is_empty()),
+            "{:?}",
+            t.replay_records
+        );
+        assert!(
+            p.summary()
+                .contains(&format!("Ops no replay stamped ({})", t.ops.len())),
+            "{}",
+            p.summary()
+        );
     });
 }
 

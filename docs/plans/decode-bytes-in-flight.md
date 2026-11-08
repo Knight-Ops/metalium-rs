@@ -1067,6 +1067,8 @@ the last four); Qwen3.5-4B off `1794026313`, `1794028778`, on `1794027144`, `179
 - **Qwen3.5-4B pays 0.25 ms a step (0.4%), reproducibly** (its bands are 0.02-0.06 ms wide). Its decode reads at
   ~155 GB/s, so the products are a smaller share of its step and the deal's shape matters less. The cost is
   not located yet; a `--profile` pair with `TT_PROFILE_DETAIL=pipeline` and `cargo xtask pipeline-report` would place it.
+  *Located 2026-11-08:* the tied head, dealt over 88 units instead of 64 while already near the card's read rate
+  (Work, below).
 
 ## Work
 
@@ -1171,7 +1173,12 @@ the last four); Qwen3.5-4B off `1794026313`, `1794028778`, on `1794027144`, `179
   faster, bit for bit; Qwen3.5-4B 0.4% slower, under the 0.5% rule; the rest within noise. `TT_EVEN_DEAL=0` opts out.
   - [x] `Session::set_even_deal`, `step205`'s test of the default, the bench's conditions
   - [x] card 0: the gates and `--smoke`; card 1: off / on brackets
-- [ ] Locate Qwen3.5-4B's 0.4% under the even deal (a profiled pair, `pipeline-report`)
+- [x] Locate Qwen3.5-4B's 0.4% under the even deal (2026-11-08, card 1, profiled pairs `1794101823` / `1794103109`
+  and `1794105660` / `1794104384`;
+  [log](../learnings/performance-log.md#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1)):
+  the tied head, +0.18 / +0.22 ms. The even deal spreads it over 88 units instead of 64, and it already reads at
+  ~475 GB/s. `pipeline-report --against` diffs two profiles.
+  - [ ] Proposed, not built: deal evenly only where the uneven deal is not already at the card's read rate (roadmap 2b)
 - Retired 2026-11-06 with the two-copy form itself (firmware diet; code at `61604b9`; `TT_WEIGHT_LAYOUT` refused by
   name). These refined it:
   - relay only `down` and `qkv` (Phase A's gains), roughly half the extra GDDR;

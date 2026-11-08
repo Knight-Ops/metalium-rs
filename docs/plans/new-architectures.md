@@ -238,3 +238,9 @@ Left:
   - Measured since (2026-10-31, card 1, merged F4a/F5 tree): 64.28 / 64.65 ms (`1793409872`); F4a.1's edge credits
     (`TT_EDGE_CREDITS=4`, opt-in) leave the decode unchanged and make the prefill 1.4% faster (3,709 -> 3,656 ms for 256
     tokens; [log](../learnings/performance-log.md#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1)).
+  - Where the step goes (2026-11-08, card 1, roadmap item 3;
+    [log](../learnings/performance-log.md#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1)):
+    - 62.52 / 62.86 ms host-timed; all of it on the card.
+    - **The greedy pick is ~21.4 ms**: (6)'s eight single-row argmax parts, each 31,040 columns on one unit.
+    - The head is 5.4-5.6 ms, the weight products ~19.5 ms, the rest ~18 ms.
+    - The pick over the grid now leads roadmap item 4.

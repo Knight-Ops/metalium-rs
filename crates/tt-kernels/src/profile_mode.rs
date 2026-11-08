@@ -1289,6 +1289,59 @@ pub struct TraceSamples {
     cursor: usize,
     /// Its ops end in barriers on unit 0, so a replay can be split into ops.
     segmented: bool,
+    /// Every replay, overflowed or not, in order ([`ReplayRecord`]).
+    pub replay_records: Vec<ReplayRecord>,
+}
+
+/// One replay of a trace as a whole: its wall time on the card beside the spans it attributed, and
+/// the host's time around it. What tells the card's time from the host's when a trace's covered
+/// spans fall short of its host-timed replay.
+#[derive(Clone, Debug, Default)]
+pub struct ReplayRecord {
+    /// The window it stamped (`lo..hi`, `hi == 0` for all).
+    pub lo: u32,
+    pub hi: u32,
+    /// The window's estimated stamps on its busiest unit ([`ProfileOptions::stamps`]).
+    pub estimated: u32,
+    /// Units whose stamps outran their buffer: nothing of this replay was attributed.
+    pub overflowed: Vec<u16>,
+    /// Unit 0's replay list, its begin to its end (cycles): the trace on the card. `None` when
+    /// unit 0's stamps were lost.
+    pub wall: Option<u64>,
+    /// The longest replay list over every unit whose stamps were kept, `(unit, cycles)`.
+    pub wall_max: Option<(u16, u64)>,
+    /// Unit 0's lists queued before the replay's (its catch-up and its programs put back), from
+    /// the first one's begin to the replay's begin (cycles).
+    pub lead: Option<u64>,
+    /// The ops this replay attributed, and their spans summed (cycles).
+    pub ops: u32,
+    pub spans: u64,
+    /// Bytes of programs put back before it: by the B movers from GDDR, and by the host.
+    pub restore_mover_bytes: u64,
+    pub restore_host_bytes: u64,
+    /// The host's time from queueing the replay to its stamps attributed, and the part of it
+    /// spent reading the stamps back (microseconds).
+    pub host_us: f64,
+    pub drain_us: f64,
+}
+
+/// A unit's replay list in its drained stamps: `(lead, wall)` in cycles, the replay's list (the
+/// last outermost one) from its begin to its end, and the lists before it from the first's begin
+/// to the replay's. `None` without a whole replay list.
+pub fn replay_wall(events: &[TraceEvent]) -> Option<(u64, u64)> {
+    let stamps: Vec<(Event, u64)> = events.iter().filter_map(mover).collect();
+    let begin = stamps
+        .iter()
+        .rposition(|(e, _)| matches!(e, Event::List { begin: true, .. }))?;
+    let end = stamps[begin..]
+        .iter()
+        .rposition(|(e, _)| matches!(e, Event::List { begin: false, .. }))?;
+    let first = stamps
+        .iter()
+        .find(|(e, _)| matches!(e, Event::List { begin: true, .. }))?
+        .1;
+    let (t0, t1) = (stamps[begin].1, stamps[begin + end].1);
+    Some((t0.saturating_sub(first), t1.saturating_sub(t0)))
 }
 
 /// What the profile is waiting to attribute when the next drain comes.
@@ -1318,10 +1371,12 @@ pub struct Profiler {
     eager: Vec<EagerSample>,
     /// Eager ops whose stamps outran a unit's buffer, by label: not attributed.
     eager_overflowed: BTreeMap<&'static str, u32>,
-    /// The stamps since the last attribution outran a buffer.
-    overflow: bool,
+    /// The units whose stamps since the last attribution outran their buffer.
+    overflow: Vec<u16>,
     traces: BTreeMap<u64, TraceSamples>,
     pending: Option<Pending>,
+    /// The trace whose replay was last attributed, for the host's side of its record.
+    last_replay: Option<u64>,
     counter_at_start: u64,
     host_at_start: std::time::Instant,
 }
@@ -1332,9 +1387,10 @@ impl Profiler {
             options,
             eager: Vec::new(),
             eager_overflowed: BTreeMap::new(),
-            overflow: false,
+            overflow: Vec::new(),
             traces: BTreeMap::new(),
             pending: None,
+            last_replay: None,
             counter_at_start,
             host_at_start: std::time::Instant::now(),
         }
@@ -1409,8 +1465,32 @@ impl Profiler {
 
     /// A unit's stamps since the last attribution outran its buffer: what was pending is counted as
     /// overflowed, not attributed.
-    pub(crate) fn overflowed(&mut self) {
-        self.overflow = true;
+    pub(crate) fn overflowed(&mut self, unit: usize) {
+        self.overflow.push(unit as u16);
+    }
+
+    /// The host's side of the replay just attributed ([`ReplayRecord`]): its time from queueing to
+    /// attribution, the stamps' read-back within it, and the programs put back before it.
+    pub(crate) fn note_replay_host(
+        &mut self,
+        host: std::time::Duration,
+        drain: std::time::Duration,
+        restore_mover_bytes: u64,
+        restore_host_bytes: u64,
+    ) {
+        let Some(trace) = self.last_replay.take() else {
+            return;
+        };
+        if let Some(r) = self
+            .traces
+            .get_mut(&trace)
+            .and_then(|t| t.replay_records.last_mut())
+        {
+            r.host_us = host.as_secs_f64() * 1e6;
+            r.drain_us = drain.as_secs_f64() * 1e6;
+            r.restore_mover_bytes = restore_mover_bytes;
+            r.restore_host_bytes = restore_host_bytes;
+        }
     }
 
     pub(crate) fn expecting_replay(&self) -> bool {
@@ -1421,7 +1501,42 @@ impl Profiler {
     /// attributed to what was pending.
     pub(crate) fn drained(&mut self, units: &[Vec<TraceEvent>]) {
         let detail = self.options.detail;
-        if std::mem::take(&mut self.overflow) {
+        let mut overflow = std::mem::take(&mut self.overflow);
+        // Every replay is recorded whole, overflowed or not: an overflowed unit's stream is empty,
+        // so the others still give their walls.
+        if let Some(Pending::Replay { trace, lo, hi, .. }) = self.pending {
+            if let Some(t) = self.traces.get_mut(&trace) {
+                overflow.sort_unstable();
+                overflow.dedup();
+                let estimated = match (lo, hi) {
+                    (0, 0) => t.stamps.iter().sum(),
+                    _ => t.stamps[lo as usize..(hi as usize).min(t.stamps.len())]
+                        .iter()
+                        .sum(),
+                };
+                let walls: Vec<(u16, (u64, u64))> = units
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(u, e)| Some((u as u16, replay_wall(e)?)))
+                    .collect();
+                let unit0 = walls.iter().find(|(u, _)| *u == 0).map(|&(_, w)| w);
+                t.replay_records.push(ReplayRecord {
+                    lo,
+                    hi,
+                    estimated,
+                    overflowed: overflow.clone(),
+                    wall: unit0.map(|(_, w)| w),
+                    wall_max: walls
+                        .iter()
+                        .map(|&(u, (_, w))| (u, w))
+                        .max_by_key(|&(_, w)| w),
+                    lead: unit0.map(|(l, _)| l),
+                    ..Default::default()
+                });
+                self.last_replay = Some(trace);
+            }
+        }
+        if !overflow.is_empty() {
             match self.pending.take() {
                 Some(Pending::Eager { label, .. }) => {
                     *self.eager_overflowed.entry(label).or_default() += 1;
@@ -1458,10 +1573,17 @@ impl Profiler {
                 t.replays += 1;
                 let unit0 = units.first().map(Vec::as_slice).unwrap_or(&[]);
                 if t.segmented {
+                    let (mut ops, mut spans) = (0u32, 0u64);
                     for (k, time) in attribute_replay(unit0, lo, detail).into_iter().enumerate() {
                         if let Some(s) = t.samples.get_mut(first + k) {
+                            ops += 1;
+                            spans += time.span;
                             s.push(time);
                         }
+                    }
+                    if let Some(r) = t.replay_records.last_mut() {
+                        r.ops = ops;
+                        r.spans = spans;
                     }
                     if detail == Detail::Full {
                         for (k, costs) in attribute_entries(unit0, lo).into_iter().enumerate() {
@@ -1512,6 +1634,10 @@ impl Profiler {
                     (attribute_eager(unit0, detail), t.samples.first_mut())
                 {
                     // One unit and no barriers: the replay as a whole, charged to its first op.
+                    if let Some(r) = t.replay_records.last_mut() {
+                        r.ops = 1;
+                        r.spans = time.span;
+                    }
                     s.push(time);
                 }
             }
@@ -2564,6 +2690,130 @@ impl ProfileReport {
         out
     }
 
+    /// A trace's wall time on the card against its covered spans (`covered`, cycles), and the ops
+    /// no replay stamped: what tells the card's time from the host's ([`ReplayRecord`]).
+    fn wall_lines(&self, out: &mut String, t: &TraceSamples, covered: u64) {
+        let r = &t.replay_records;
+        let med = |f: &dyn Fn(&ReplayRecord) -> Option<u64>| {
+            let v: Vec<u64> = r.iter().filter_map(f).collect();
+            (!v.is_empty()).then(|| median(v))
+        };
+        if let Some(wall) = med(&|r| r.wall) {
+            let max = med(&|r| r.wall_max.map(|(_, w)| w)).unwrap_or(0);
+            let lead = med(&|r| r.lead).unwrap_or(0);
+            let host: Vec<u64> = r.iter().map(|r| (r.host_us * 1e3) as u64).collect();
+            let drain: Vec<u64> = r.iter().map(|r| (r.drain_us * 1e3) as u64).collect();
+            let _ = writeln!(
+                out,
+                "On the card, a replay (median of {} with unit 0's stamps): **{:.1} us** on unit 0, \
+                 {:.1} us on its longest unit, after {:.1} us of lists queued before it (catch-up, \
+                 programs put back); the covered ops' spans {:.1} us, so **{:.1} us** is in no \
+                 covered span (ops never stamped, and between spans). Host, profiled: {:.1} us from \
+                 queueing to attribution, {:.1} us of it reading the stamps back. Programs put back \
+                 a replay (mean): {:.0} bytes by the B movers, {:.0} by the host.\n",
+                r.iter().filter(|r| r.wall.is_some()).count(),
+                self.us(wall),
+                self.us(max),
+                self.us(lead),
+                self.us(covered),
+                self.us(wall.saturating_sub(covered)),
+                median(host) as f64 / 1e3,
+                median(drain) as f64 / 1e3,
+                r.iter().map(|r| r.restore_mover_bytes).sum::<u64>() as f64
+                    / r.len().max(1) as f64,
+                r.iter().map(|r| r.restore_host_bytes).sum::<u64>() as f64 / r.len().max(1) as f64,
+            );
+        }
+        let never: Vec<usize> = (0..t.ops.len())
+            .filter(|&i| t.samples[i].is_empty())
+            .collect();
+        if !never.is_empty() && t.segmented {
+            let _ = writeln!(
+                out,
+                "Ops no replay stamped ({}): {}.\n",
+                never.len(),
+                never
+                    .iter()
+                    .take(40)
+                    .map(|&i| {
+                        let o = &t.ops[i];
+                        let units: Vec<String> = r
+                            .iter()
+                            .filter(|r| {
+                                !r.overflowed.is_empty()
+                                    && (r.lo as usize..r.hi as usize).contains(&i)
+                            })
+                            .flat_map(|r| r.overflowed.iter().map(|u| u.to_string()))
+                            .collect();
+                        format!(
+                            "{i} `{}` ({}, {} stamps est.{})",
+                            o.label,
+                            o.what,
+                            t.stamps.get(i).copied().unwrap_or(0),
+                            if units.is_empty() {
+                                String::new()
+                            } else {
+                                format!(", overflowed on unit {}", units.join("/"))
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+    }
+
+    /// Every replay of every trace, one line each, tab-separated ([`ReplayRecord`]): its window,
+    /// the units that overflowed, its wall time on the card and the spans it attributed, the
+    /// programs put back before it, and the host's time around it (microseconds).
+    pub fn replays_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
+        let mut out = String::from(
+            "source\treplay\tlo\thi\testimated\toverflowed\twall_us\twall_max_us\twall_max_unit\tlead_us\tops\tspans_us\trestore_mover_bytes\trestore_host_bytes\thost_us\tdrain_us\n",
+        );
+        let opt = |c: Option<u64>| c.map_or(String::new(), |c| format!("{:.3}", self.us(c)));
+        for (&id, t) in &self.traces {
+            let source = name(id);
+            for (n, r) in t.replay_records.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "{source}\t{n}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{:.1}\t{:.1}",
+                    r.lo,
+                    r.hi,
+                    r.estimated,
+                    r.overflowed
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    opt(r.wall),
+                    opt(r.wall_max.map(|(_, w)| w)),
+                    r.wall_max.map_or(String::new(), |(u, _)| u.to_string()),
+                    opt(r.lead),
+                    r.ops,
+                    self.us(r.spans),
+                    r.restore_mover_bytes,
+                    r.restore_host_bytes,
+                    r.host_us,
+                    r.drain_us,
+                );
+            }
+        }
+        out
+    }
+
+    /// A trace's median wall time on the card a replay, unit 0's (microseconds), if any replay kept
+    /// unit 0's stamps.
+    pub fn replay_wall_us(&self, trace: u64) -> Option<f64> {
+        let v: Vec<u64> = self
+            .traces
+            .get(&trace)?
+            .replay_records
+            .iter()
+            .filter_map(|r| r.wall)
+            .collect();
+        (!v.is_empty()).then(|| self.us(median(v)))
+    }
+
     /// The report as markdown: eager ops by label, then each trace by label and its costliest ops.
     /// `name` names a trace by its session id.
     pub fn summary(&self, name: &dyn Fn(u64) -> String) -> String {
@@ -2620,6 +2870,7 @@ impl ProfileReport {
                 t.stamps.iter().max().copied().unwrap_or(0),
                 t.unit_mismatches,
             );
+            self.wall_lines(&mut out, t, sum);
             let rows = by_label(
                 t.ops
                     .iter()
@@ -3449,5 +3700,124 @@ mod tests {
         }
         assert!(seen.iter().all(|&s| s), "every op covered");
         assert!(replays >= n * 9 / WINDOW_EVENTS as usize);
+    }
+
+    /// A profiler that knows trace 7: three ops of nine stamps, ending in barriers on unit 0.
+    fn three_ops() -> Profiler {
+        let mut p = Profiler::new(ProfileOptions::default(), 0);
+        p.know_trace(7, || {
+            (
+                (0..3)
+                    .map(|_| OpInfo {
+                        label: "x",
+                        what: "y",
+                        units: 2,
+                        bytes: OpBytes::default(),
+                        unit_bytes: Vec::new(),
+                    })
+                    .collect(),
+                vec![9; 3],
+                true,
+                Vec::new(),
+            )
+        });
+        p
+    }
+
+    /// `replay()` on another unit, its replay list `extra` cycles longer.
+    fn longer(extra: u64) -> Vec<TraceEvent> {
+        let mut v = replay();
+        v.last_mut().unwrap().cycles += extra;
+        v
+    }
+
+    #[test]
+    fn a_replays_wall_is_its_list_after_the_lists_before_it() {
+        assert_eq!(replay_wall(&replay()), Some((100, 151)));
+        assert_eq!(replay_wall(&[]), None);
+        // A replay list that never ended (its unit stopped) has no wall.
+        let mut open = replay();
+        open.pop();
+        assert_eq!(replay_wall(&open), None);
+    }
+
+    #[test]
+    fn every_replay_is_recorded_with_its_wall_beside_its_spans() {
+        let mut p = three_ops();
+        assert_eq!(p.next_window(7), 3 << 16, "one window holds the trace");
+        p.drained(&[replay(), longer(30)]);
+        p.note_replay_host(
+            std::time::Duration::from_micros(500),
+            std::time::Duration::from_micros(200),
+            64,
+            0,
+        );
+        let t = &p.traces[&7];
+        assert_eq!(t.covered(), 3);
+        let r = &t.replay_records[0];
+        assert_eq!((r.lo, r.hi, r.estimated), (0, 3, 27));
+        assert!(r.overflowed.is_empty());
+        assert_eq!(
+            (r.wall, r.lead, r.wall_max),
+            (Some(151), Some(100), Some((1, 181)))
+        );
+        assert_eq!((r.ops, r.spans), (3, 150));
+        assert!(r.spans <= r.wall.unwrap(), "spans lie within the wall");
+        assert_eq!(
+            (r.host_us, r.drain_us, r.restore_mover_bytes),
+            (500.0, 200.0, 64)
+        );
+        let report = ProfileReport {
+            ticks_per_us: 1.0,
+            traces: p.traces.clone(),
+            ..Default::default()
+        };
+        assert_eq!(report.replay_wall_us(7), Some(151.0));
+        let s = report.summary(&|_| "T".into());
+        assert!(s.contains("**151.0 us** on unit 0"), "{s}");
+        assert!(s.contains("**1.0 us** is in no covered span"), "{s}");
+        assert!(!s.contains("Ops no replay stamped"), "{s}");
+        let tsv = report.replays_tsv(&|_| "T".into());
+        assert_eq!(tsv.lines().count(), 2, "{tsv}");
+        assert!(
+            tsv.lines().nth(1).unwrap().starts_with(
+                "T\t0\t0\t3\t27\t\t151.000\t181.000\t1\t100.000\t3\t150.000\t64\t0\t500.0\t200.0"
+            ),
+            "{tsv}"
+        );
+    }
+
+    /// The negative control: a replay whose stamps outran unit 1's buffer attributes nothing, but
+    /// its wall is kept from unit 0, so its time shows as in no covered span instead of vanishing,
+    /// and its ops are named with the unit that overflowed.
+    #[test]
+    fn an_overflowed_replays_time_shows_as_uncovered_and_its_ops_are_named() {
+        let mut p = three_ops();
+        p.next_window(7);
+        p.overflowed(1);
+        p.drained(&[replay(), Vec::new()]);
+        let t = &p.traces[&7];
+        assert_eq!((t.replays, t.overflowed, t.covered()), (1, 1, 0));
+        let r = &t.replay_records[0];
+        assert_eq!(r.overflowed, vec![1]);
+        assert_eq!((r.wall, r.wall_max, r.ops), (Some(151), Some((0, 151)), 0));
+        let report = ProfileReport {
+            ticks_per_us: 1.0,
+            traces: p.traces.clone(),
+            ..Default::default()
+        };
+        let s = report.summary(&|_| "T".into());
+        assert!(s.contains("**151.0 us** is in no covered span"), "{s}");
+        assert!(s.contains("Ops no replay stamped (3)"), "{s}");
+        assert!(
+            s.contains("0 `x` (y, 9 stamps est., overflowed on unit 1)"),
+            "{s}"
+        );
+        // The next replay starts clean: no overflow carried over.
+        p.next_window(7);
+        p.drained(&[replay(), replay()]);
+        let t = &p.traces[&7];
+        assert!(t.replay_records[1].overflowed.is_empty());
+        assert_eq!(t.covered(), 3);
     }
 }
