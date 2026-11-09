@@ -1,4 +1,4 @@
-//! Which of a capture's barriers its data needs (`docs/plans/decode-small-ops.md` S5): a host-only
+//! Which of a capture's barriers its data needs (`docs/completed-plans/decode-small-ops.md` S5): a host-only
 //! analysis of the captured streams, made as a capture ends.
 //!
 //! Every captured op ends in a barrier its units arrive at, and every unit that runs the next op
@@ -725,7 +725,7 @@ pub struct Pruned {
     pub entries: usize,
 }
 
-/// Drop the barriers `keep` does not keep from capture `c`'s streams (`docs/plans/decode-small-ops.md`
+/// Drop the barriers `keep` does not keep from capture `c`'s streams (`docs/completed-plans/decode-small-ops.md`
 /// S5, A1). The ops between two kept barriers become one op (a run): every unit that ran any of
 /// them arrives once, after its last, at the run's barrier; its earlier arrivals in the run go. A
 /// wait-only entry waits for the last kept barrier at or before the one it waited for (none: it

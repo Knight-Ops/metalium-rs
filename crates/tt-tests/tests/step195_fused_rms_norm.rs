@@ -1,4 +1,4 @@
-//! RMSNorm as one op on `Tt` (`docs/plans/decode-small-ops.md` S3, `docs/plans/kernel-fusion.md`
+//! RMSNorm as one op on `Tt` (`docs/completed-plans/decode-small-ops.md` S3, `docs/plans/kernel-fusion.md`
 //! Phase 4): burn-fusion's chain fuser recognises Burn's `RmsNorm` up to its scale -- `x * x`,
 //! the mean over the last dimension, `+ eps`, `sqrt`, `x / rms` -- and runs it as one kernel
 //! (`tt_kernels::sfpu::norm`) in place of five device ops and their intermediate tensors.

@@ -143,7 +143,7 @@ pub const TXN_NC: u8 = 4;
 /// The NoC transaction ID of RISCV B's prefetch reads ([`record::GATHER_PREFETCH`]): apart from
 /// [`TXN_B`], so the entries that drain B's moves -- a kernel's launch, a barrier, a chunk's end
 /// -- leave them in flight. Only an [`op::WAIT`] with [`WAIT_PREFETCH`] drains them, which the
-/// op that reads what they bring puts before its kernel (`docs/plans/decode-to-bandwidth.md`
+/// op that reads what they bring puts before its kernel (`docs/completed-plans/decode-to-bandwidth.md`
 /// Phase 8). Its cap is [`TILE_IN_FLIGHT_CAP`], set once when the mover starts.
 pub const TXN_PREFETCH: u8 = 6;
 /// The NoC transaction ID of RISCV NC's multicasts ([`op::WRITE_L1_MCAST`]): apart from
@@ -317,11 +317,11 @@ const _: () = assert!(ENCODE_KEY + 4 <= TRACE_WINDOW);
 /// Host -> RISCV B: [`TXN_PREFETCH`]'s in-flight cap, applied as each list starts (nothing is then
 /// in flight on it: the last list's end drained it); 0 is [`TILE_IN_FLIGHT_CAP`]. Prefetch reads
 /// share GDDR with the ops they run under, whose latency-bound reads queue behind them
-/// (`docs/plans/decode-to-bandwidth.md` Phase 8).
+/// (`docs/completed-plans/decode-to-bandwidth.md` Phase 8).
 pub const PREFETCH_CAP: u64 = MAILBOX_BASE + 0xF8;
 /// The [`PREFETCH_CAP`] a host sets unless told otherwise (`tt_kernels::dm::DataMover::start`,
 /// `TT_PREFETCH_CAP`): two reads in flight, where busy-unit prefetch measured best on a 1.7B decode
-/// step (18.40 ms against 18.73 at 4 and 19.08 at 8, `docs/plans/planned-l1-residency.md` 3b).
+/// step (18.40 ms against 18.73 at 4 and 19.08 at 8, `docs/completed-plans/planned-l1-residency.md` 3b).
 pub const PREFETCH_CAP_DEFAULT: u32 = 2;
 /// Host -> RISCV B: the in-flight cap of a weight stream's reads (`record::GATHER_STREAM`),
 /// read as each such record starts; 0 is [`TILE_IN_FLIGHT_CAP`]. The low 16 bits are an FP32
@@ -351,7 +351,7 @@ const _: () = assert!(STREAM_CAP + 4 <= MAILBOX_BASE + 0x100);
 /// The [`STREAM_CAP`] a host sets unless told otherwise (`tt_kernels::dm::DataMover::start`,
 /// `TT_STREAM_CAP`): two reads in flight. With every B read at 2, a 1.7B decode step measured
 /// 17.27 / 18.91 ms against 18.28 / 19.84 at the tile cap of 8 (4: 17.80 / 19.32, 1: 18.13 /
-/// 19.99), its products' units served evenly (`docs/plans/decode-to-bandwidth.md` Phase 8).
+/// 19.99), its products' units served evenly (`docs/completed-plans/decode-to-bandwidth.md` Phase 8).
 pub const STREAM_CAP_DEFAULT: u32 = 2;
 /// [`STREAM_CAP_DEFAULT`] for a stream of BF16 weights (`TT_STREAM_CAP_BF16`): three in flight, half
 /// the bytes each. SmolLM2-1.7B with its weights stored BF16, 96 stream units (card 0, 2026-10-26):
@@ -454,7 +454,7 @@ pub mod op {
     /// `crate::l1::LISTED`, congruent mod 16; `len` at most `crate::noc::niu::MAX_REQUEST_BYTES`;
     /// `(x, y)` a coordinate a Tensix tile could have (`crate::noc::grid::is_tensix_geometry`),
     /// which is all the card can check: the host narrows it to the tiles of its session that read
-    /// what is written, and every one of them exists (`docs/plans/planned-l1-residency.md`).
+    /// what is written, and every one of them exists (`docs/completed-plans/planned-l1-residency.md`).
     /// Response-marked, so the drain at a list's end waits for it: a unit's writes have landed
     /// before it reports done and arrives at its barrier. NC's only. Only in a list entry.
     pub const WRITE_L1: u32 = 0x24;
@@ -477,7 +477,7 @@ pub mod op {
     /// Word 6 may be [`super::MCAST_RUN_ACKS`]: a multicast so marked that follows another so
     /// marked neither waits for earlier writes nor counts its own acknowledgements before the
     /// next entry; the run's acknowledgements are counted together before the first entry that is
-    /// not one of it, and at the list's end (`docs/plans/planned-l1-residency.md` 2f (c)). The
+    /// not one of it, and at the list's end (`docs/completed-plans/planned-l1-residency.md` 2f (c)). The
     /// run's first still waits for NC's earlier writes, so nothing else is in flight to add to the
     /// count.
     pub const WRITE_L1_MCAST: u32 = 0x25;
@@ -486,7 +486,7 @@ pub mod op {
     /// the tile at `(x, y)` -- this tile's own, a loopback -- into its own L1 at `to`, one request
     /// through NoC #0 under its read ID, so what drains its reads (a kernel's launch, a list's
     /// end) drains it. The checks are [`WRITE_L1`]'s; the host narrows `(x, y)` to its session's
-    /// tiles and `from` to the window it keeps (`docs/plans/planned-l1-residency.md`). B's only.
+    /// tiles and `from` to the window it keeps (`docs/completed-plans/planned-l1-residency.md`). B's only.
     /// Only in a list entry.
     pub const READ_L1: u32 = 0x26;
     /// A channel's credit to a peer (`tt_kernels::channel`): `[CREDIT, x, y, addr, value, 0, 0,
@@ -1796,7 +1796,7 @@ mod tests {
     /// Every entry that names L1 may name the trace arena -- `DATA`, the capture-only arena and
     /// the program slots, where a trace's capture plans -- and nothing past it: placed at the
     /// capture-only arena's start, the program slots' start and their last slot, each decodes; at
-    /// the mailboxes' base, none does (`docs/plans/decode-to-bandwidth.md` Phase 8, P1).
+    /// the mailboxes' base, none does (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, P1).
     #[test]
     fn entries_name_the_trace_arena_and_not_the_mailboxes() {
         use super::*;

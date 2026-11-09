@@ -15,16 +15,14 @@ flowchart TD
 
     subgraph Tier2["Tier 2: docs/plans/ (Active Specs)"]
         PL0["roadmap.md (START HERE: open work only)"]
+        PL1["tt-metal-parity.md (2026-11-09 review, W0-W10)"]
         PL3["new-op-definition-of-done.md (standing contract for new ops)<br>conformance-to-feature.md (standing process: failing Burn test to documented feature)"]
         PL4["burn-op-coverage.md (generated) + burn-op-notes.md"]
         PL5["burn-backend-parity.md (B0-B16 Roadmap)"]
         PL6["burn-native-cutover.md (Native Cutover Record)"]
         PL7["traced-execution.md (Unified Inference & Training)"]
         PL8["kernel-fusion.md (B12 & B13a-c Burn Fusion)"]
-        PL9["mixed-bfp-storage.md (BFP8/4/2 Contract & PRNG Diagnostics)"]
-        PL10["ttinsn-push-experiment.md (done: result go)"]
-        PL11["decode-to-bandwidth.md, decode-attention.md, decode-matmul-bandwidth.md, decode-small-ops.md, in-place-cache-write.md (LLM decode performance)"]
-        PL12["ttinsn-push.md (fused push from the host, the default)"]
+        PL11["decode-bytes-in-flight.md, prefill-operand-reuse.md, long-context.md, new-architectures.md (LLM performance and models)"]
     end
 
     subgraph Tier1["Tier 1: docs/learnings/ (Ground Truth & Learnings)"]
@@ -36,12 +34,14 @@ flowchart TD
         L6["streaming-dataflow-architecture.md (Reader/Writer Contract)"]
         L7["kernel-fusion-architecture.md (Two-Stage Fusion & Dst/L1)"]
         L8["tt-metal-comparison.md (+ method): where we stand against tt-metal, fixes to investigate"]
-        L9["dataflow-compiler.md (design reference below Burn, ADRs 0003-0005)"]
+        L9["dataflow-compiler.md (design reference below Burn, ADRs 0003-0006)"]
+        L11["failed-approaches.md (killed and retired approaches, with retry conditions)"]
         L10["test-tiers.md (ttsim vs burn-flex vs silicon; where suite time goes)"]
     end
 
     subgraph Done["docs/completed-plans/ (archive)"]
-        D1["phases-0-10-roadmap.md<br>phases-0-10-checklist.md<br>hardware-coverage.md<br>tensix-next-features.md<br>hardware-coverage-closeout.md, ...<br><i>(closed trackers, kept as a record)</i>"]
+        D0["achievements.md (the record moved out of the roadmap)"]
+        D1["phases-0-10-roadmap.md<br>decode plans, ttinsn-push, BF16/BFP storage<br>phases-0-10-checklist.md<br>hardware-coverage.md<br>tensix-next-features.md<br>hardware-coverage-closeout.md, ...<br><i>(closed trackers, kept as a record)</i>"]
     end
 
     Tier3 --"Approval & Scheduling"--> Tier2
@@ -53,12 +53,10 @@ flowchart TD
 ---
 
 **Decisions that bind future work** are recorded beside the tiers as Architectural Decision Records in
-[`docs/adr/`](adr/), one numbered file each, with the code paths they govern. Record one with
-`scryer record-adr` (which also indexes it, so `query_adrs` and `inspect_symbol` surface it on those paths), and
-search them with `scryer query-adrs`. So far:
+[`docs/adr/`](adr/), one numbered file each, with the code paths they govern. Write one by hand in the same front-matter format; Scryer indexes `docs/adr/`, so `query_adrs` and `inspect_symbol` surface it on its paths. So far:
 [0001](adr/0001-llm-support-is-generic-across-architectures-not-model-specific.md), LLM support is generic across
 architectures; [0002](adr/0002-profiling-is-one-switchable-mode-and-costs-nothing-unless-built-in.md), profiling is
-one switchable mode and costs nothing unless built in; [0003](adr/0003-a-tile-level-dataflow-compiler-below-burn.md), a tile-level dataflow compiler below Burn; [0004](adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md), formats are edge data converted only at unpack and pack; [0005](adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md), every op has a numeric contract and schedules choose only among bit-equivalent options.
+one switchable mode and costs nothing unless built in; [0003](adr/0003-a-tile-level-dataflow-compiler-below-burn.md), a tile-level dataflow compiler below Burn; [0004](adr/0004-formats-are-edge-data-converted-only-at-unpack-and-pack.md), formats are edge data converted only at unpack and pack; [0005](adr/0005-every-op-has-a-numeric-contract-schedules-choose-only-among-bit-equivalent-options.md), every op has a numeric contract and schedules choose only among bit-equivalent options; [0006](adr/0006-two-numeric-contracts-reference-and-performance.md), two numeric contracts: bit-exact reference for conformance and training, a deterministic performance contract as the inference default (amends 0005's default).
 
 ## The Three Tiers
 
@@ -75,6 +73,7 @@ Permanent, cumulative empirical realities discovered through silicon execution, 
   - [`tt-metal-comparison.md`](learnings/tt-metal-comparison.md): Dated snapshot (2026-10-26) of the project's state and of every performance result and limit against tt-metal's own LLM stack (traces, dispatch cost, attention, SFPU, multi-chip, DRAM), with fixes to investigate (F1-F27). Re-run it with [`tt-metal-comparison-method.md`](learnings/tt-metal-comparison-method.md): the procedure, claims sheet and agent prompts.
   - [`streaming-dataflow-architecture.md`](learnings/streaming-dataflow-architecture.md): The core architectural contract of the GDDR streaming scheduler (B reader on NoC0, T0–T2 compute, NC writer on NoC1, streaming credits, transfer channels).
   - [`dataflow-compiler.md`](learnings/dataflow-compiler.md): **The design reference, the source of truth every optimization below Burn builds on, with its external research** (ADRs 0003-0005): the machine's fundamental truths, Kahn semantics and per-op numeric contracts, formats as edge data, the tile-generic op and dataflow-graph IR, transforms written once with their legality, credits and deadlock checks, the cost model, decisions between Tenstorrent's designs and alternatives, and a hypotheses register. Every principle carries its evidence.
+  - [`failed-approaches.md`](learnings/failed-approaches.md): every killed, reverted or retired approach, its measured result, why it failed and the condition under which it is worth retrying. Add a row in the same change that kills a hypothesis or retires a knob.
   - [`kernel-fusion-architecture.md`](learnings/kernel-fusion-architecture.md): Architectural ground truth on two-stage kernel fusion (Burn IR vs. Tensix hardware), Dst register allocation, and L1 Circular Buffer streaming. Its §4 (no second graph compiler) and §6.2 are superseded by `dataflow-compiler.md`.
 
 ### 2. `docs/plans/` — Active Implementation Plans
@@ -83,21 +82,18 @@ Actionable technical specifications, interface contracts, and execution checklis
 - **Start with [`roadmap.md`](plans/roadmap.md)**: the single list of open work (first real models, performance, multi-chip, long-term publishing). The other plans are the evidence and detail behind it.
 - **Contents**:
   - [`roadmap.md`](plans/roadmap.md): Open work only, grouped into tracks, each item linking to its detailed plan and evidence.
+  - [`tt-metal-parity.md`](plans/tt-metal-parity.md): the 2026-11-09 review against tt-metal and the improvement program (W0-W10) the roadmap's tracks follow: the performance contract, operand multicast and sharded activations, batched decode, sampling on the grid, an 8B-class model, defaults, consolidation, LLM fine-tuning, firmware, multi-card.
   - [`burn-op-coverage.md`](plans/burn-op-coverage.md): Generated (`cargo xtask burn-coverage`) status of every Burn operation-trait method: native, composed or explicitly unsupported with its `[-]` reason.
   - [`new-op-definition-of-done.md`](plans/new-op-definition-of-done.md): The standing contract every new kernel/op must meet (oracle, simulator gate with negative control, silicon on one card, Burn routing, padding, findings logged).
   - [`burn-op-notes.md`](plans/burn-op-notes.md): Hand-written per-method Device and Item notes behind the generated Burn op table.
-  - [`ttinsn-push-experiment.md`](plans/ttinsn-push-experiment.md): Done (2026-10-10): `.ttinsn` push fusion measured 2.77x on a push-bound SFPU kernel on card 0; its follow-on is `ttinsn-push.md`.
-  - [`ttinsn-push.md`](plans/ttinsn-push.md): fused `.ttinsn` push from the host (2026-10-25): the math role's long programs as host-made, host-validated code in the program cache, on by default; the profile mode's push totals; one item left (the experiment image no longer fits T1's slot).
   - [`burn-backend-parity.md`](plans/burn-backend-parity.md): B0–B16 roadmap for `burn-tt` to achieve full backend parity with CubeCL/CUDA.
   - [`burn-native-cutover.md`](plans/burn-native-cutover.md): Native cutover record, retired Flex fallback, delivered tensor storage and deferred formats.
-  - [`mixed-bfp-storage.md`](plans/mixed-bfp-storage.md): Delivered BFP8/4/2 storage and training contract, acceptance checklist, PRNG diagnostics and remaining application RNG work.
   - [`traced-execution.md`](plans/traced-execution.md): Comprehensive implementation plan for generalized multi-input inference and whole training step hardware traces (`TracedInference`, `TracedTrainingStep`).
   - [`kernel-fusion.md`](plans/kernel-fusion.md): Actionable specification and execution checklist for Burn backend kernel fusion milestones B12 and B13a–B13c.
-  - [`decode-matmul-bandwidth.md`](plans/decode-matmul-bandwidth.md): an LLM decode step's `m = 1` products against GDDR's bandwidth (P0-P3 done: thin activation reads, an even last round, fused projections; P5 open: one channel a column).
-  - [`decode-to-bandwidth.md`](plans/decode-to-bandwidth.md): the umbrella plan for single-user decode at 90-95% of GDDR's bandwidth, ordering the decode plans below; with [`decode-attention.md`](plans/decode-attention.md) (attention reading the cache in place).
-  - [`decode-small-ops.md`](plans/decode-small-ops.md): the decode step's non-matmul half (RMSNorm, RoPE, attention, SiLU): repack fixes first, then where fusion lives.
+  - [`decode-bytes-in-flight.md`](plans/decode-bytes-in-flight.md): the batch-1 decode plan still open (a decode product is bound by its reads in flight; weights laid by column; the even deal). The earlier decode plans are archived in `completed-plans/`.
+  - [`prefill-operand-reuse.md`](plans/prefill-operand-reuse.md): prefill products' operand reuse (P5, each operand out of GDDR once; now [`tt-metal-parity.md`](plans/tt-metal-parity.md) W2).
+  - [`new-architectures.md`](plans/new-architectures.md): Qwen3.5-4B, Nemotron-3.5-Bolt (Gemma 4 E4B) and MOSS-Image.
   - [`long-context.md`](plans/long-context.md): real model context lengths (8K on the 1.7B, 32K synthetic): traces whose programs do not grow with length, prefill that costs the prompt not the cache, and flash-decode past the fused attention op's L1 limit.
-  - [`in-place-cache-write.md`](plans/in-place-cache-write.md): writing a traced key/value cache in place (no whole-cache copy a write), and the donation and buffer-generation rules that make a read of the overwritten cache an error by name (was a proposal).
 
 ### 3. `docs/proposals/` — Feature Proposals & RFCs
 Unscheduled design proposals and exploratory RFCs evaluating trade-offs before implementation.
@@ -118,6 +114,10 @@ Plans whose checklists are closed move here as a record, with their evidence. Th
 - [`hardware-coverage-closeout.md`](completed-plans/hardware-coverage-closeout.md): the Phase 10 close-out.
 - [`tensix-next-features.md`](completed-plans/tensix-next-features.md): the 2026-10-05 sprint record.
 - [`remaining-firmware-instructions.md`](completed-plans/remaining-firmware-instructions.md) and the ADC copy, source-bank and scalar-movement plans.
+- [`achievements.md`](completed-plans/achievements.md): what the project has achieved, by theme, with run IDs: the record moved out of the roadmap on 2026-11-09.
+- The LLM decode plans, archived 2026-11-09: [`decode-to-bandwidth.md`](completed-plans/decode-to-bandwidth.md) (the umbrella), [`decode-step-bandwidth.md`](completed-plans/decode-step-bandwidth.md), [`decode-matmul-bandwidth.md`](completed-plans/decode-matmul-bandwidth.md), [`decode-small-ops.md`](completed-plans/decode-small-ops.md), [`decode-attention.md`](completed-plans/decode-attention.md), [`in-place-cache-write.md`](completed-plans/in-place-cache-write.md), [`bf16-weight-storage.md`](completed-plans/bf16-weight-storage.md), [`planned-l1-residency.md`](completed-plans/planned-l1-residency.md), [`replay-fixed-cost.md`](completed-plans/replay-fixed-cost.md).
+- [`mixed-bfp-storage.md`](completed-plans/mixed-bfp-storage.md): the delivered BFP8/4/2 storage and training contract.
+- [`ttinsn-push-experiment.md`](completed-plans/ttinsn-push-experiment.md) and [`ttinsn-push.md`](completed-plans/ttinsn-push.md): the `.ttinsn` experiment (2.77x, result go) and the fused push from the host, the default since 2026-10-25.
 - [`decode-host-cost.md`](completed-plans/decode-host-cost.md): roadmap Track 2 items 3 and 4 (2026-10-14): jobs counted per Burn op, a native `cat`, cache writes as a tile copy, slices and swaps as views.
 
 ---
@@ -132,7 +132,7 @@ Because core accelerator runtime features are cross-cutting (spanning firmware, 
 | **`tt-device` / `tt-kmd`** | Transport abstraction, ARC discovery, PCIe, reset/power | [`silicon-operating-notes.md`](learnings/silicon-operating-notes.md)<br>[`ttsim-divergence.md`](learnings/ttsim-divergence.md) | [`roadmap.md`](plans/roadmap.md) |
 | **`tt-layout`** | Tilize, detilize, format conversions | [`performance-scoreboard.md`](learnings/performance-scoreboard.md) | [`roadmap.md`](plans/roadmap.md)<br>[`new-op-definition-of-done.md`](plans/new-op-definition-of-done.md) |
 | **`tt-firmware`** | Baby RISC-V firmware (B, NC, T0–T2, E1) | [`performance-scoreboard.md`](learnings/performance-scoreboard.md)<br>[`streaming-dataflow-architecture.md`](learnings/streaming-dataflow-architecture.md)<br>[`silicon-operating-notes.md`](learnings/silicon-operating-notes.md)<br>[`riscv-guide-review.md`](learnings/riscv-guide-review.md) | [`roadmap.md`](plans/roadmap.md)<br>[`traced-execution.md`](plans/traced-execution.md)<br>[`kernel-fusion.md`](plans/kernel-fusion.md) |
-| **`tt-kernels`** | Program builders, `Session`, GDDR, L1, traces, mesh | [`streaming-dataflow-architecture.md`](learnings/streaming-dataflow-architecture.md)<br>[`tt-metal-concepts-review.md`](learnings/tt-metal-concepts-review.md) | [`roadmap.md`](plans/roadmap.md)<br>[`traced-execution.md`](plans/traced-execution.md)<br>[`kernel-fusion.md`](plans/kernel-fusion.md)<br>[`new-op-definition-of-done.md`](plans/new-op-definition-of-done.md) |
+| **`tt-kernels`** | Program builders, `Session`, GDDR, L1, traces, mesh | [`streaming-dataflow-architecture.md`](learnings/streaming-dataflow-architecture.md)<br>[`dataflow-compiler.md`](learnings/dataflow-compiler.md)<br>[`failed-approaches.md`](learnings/failed-approaches.md)<br>[`tt-metal-concepts-review.md`](learnings/tt-metal-concepts-review.md) | [`roadmap.md`](plans/roadmap.md)<br>[`traced-execution.md`](plans/traced-execution.md)<br>[`kernel-fusion.md`](plans/kernel-fusion.md)<br>[`new-op-definition-of-done.md`](plans/new-op-definition-of-done.md) |
 | **`burn-tt`** | Burn backend, tensor storage, server thread | [`tt-metal-concepts-review.md`](learnings/tt-metal-concepts-review.md) | [`roadmap.md`](plans/roadmap.md)<br>[`burn-backend-parity.md`](plans/burn-backend-parity.md)<br>[`burn-native-cutover.md`](plans/burn-native-cutover.md)<br>[`traced-execution.md`](plans/traced-execution.md)<br>[`burn-op-notes.md`](plans/burn-op-notes.md) |
 | **`tt-tests` / `tt-mnist`** | E2E gates, simulator, models, golden regressions | [`ttsim-divergence.md`](learnings/ttsim-divergence.md)<br>[`performance-scoreboard.md`](learnings/performance-scoreboard.md) | [`roadmap.md`](plans/roadmap.md)<br>[`new-op-definition-of-done.md`](plans/new-op-definition-of-done.md) |
 | **`xtask`** | Silicon test runner, code generators | [`silicon-operating-notes.md`](learnings/silicon-operating-notes.md) | [`roadmap.md`](plans/roadmap.md)<br>[`burn-backend-parity.md`](plans/burn-backend-parity.md) |

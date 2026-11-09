@@ -127,7 +127,7 @@ pub const THIN_STREAM_K_TILES: usize = 32;
 pub const PREFETCH_UNITS: usize = 40;
 
 /// Where, in a capture, a unit starts reading a product's weights ahead of it
-/// ([`Session::set_prefetch_anchor`]; `docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle
+/// ([`Session::set_prefetch_anchor`]; `docs/completed-plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle
 /// before `o`"). [`PrefetchAnchor::Own`] by default: a SmolLM2-1.7B step 16.87 / 18.29 -> 16.79 /
 /// 18.20 ms; the 135M's 0.01-0.03 ms slower, ResNet-18 and ViT-Tiny unchanged; `OwnOldest`
 /// 17.13 / 18.67 (`docs/learnings/performance-log.md`, "Each unit's own prefetch anchor").
@@ -164,7 +164,7 @@ pub const PACKED_A_K_TILES: usize = 32;
 /// persistent region costs the step").
 pub const RESIDENCY_REGION: u64 = 96 << 10;
 
-/// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the small ops' cost under a
+/// A development probe (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, the small ops' cost under a
 /// stream): every capture's stream on units `first..first + units` begins with `tiles_per_unit`
 /// tiles of a scratch tensor read into a window at the top of `DATA` ([`Session::probe_stream`]'s
 /// `READ_RUN`s), queued without a barrier and before anything else, so a replay reads GDDR on those
@@ -274,7 +274,7 @@ pub fn probe_profiled_measurement(on: bool) {
 
 static PROBE_STALE_B: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// A negative control (`docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`"):
+/// A negative control (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`"):
 /// with it on, a captured product reads its `B` ahead even where the capture allocated or wrote
 /// that `B` in place, so a prefetch can read it before it is written. Process-wide; dev-facing.
 #[doc(hidden)]
@@ -339,7 +339,7 @@ pub fn probe_corrupt_program_store(on: bool) {
 
 static PROBE_SPACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the space audit): every
+/// A development probe (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, the space audit): every
 /// capture prints, as it ends, what its ops take of the three things that bound a trace -- a
 /// unit's `DATA` arena, its program cache and the stream in GDDR -- by op, and how many of its ops
 /// are alike ([`Session::space_report`]). Process-wide; dev-facing.
@@ -829,6 +829,8 @@ pub struct Session<T: Transport> {
     pipeline: bool,
     /// How many units an op runs on ([`Session::set_spread`]).
     spread: Spread,
+    /// [`Session::set_capture_spread`].
+    capture_spread: Option<Spread>,
     matmul_k_block_limit: Option<std::num::NonZeroUsize>,
     /// [`Session::set_thin_matmul_reads`].
     thin_matmul_reads: bool,
@@ -2839,6 +2841,7 @@ impl<T: Transport> Session<T> {
             profile: runtime::Profile::default(),
             pipeline: true,
             spread: Spread::All,
+            capture_spread: None,
             matmul_k_block_limit: None,
             thin_matmul_reads: true,
             packed_thin_a: true,
@@ -2865,7 +2868,7 @@ impl<T: Transport> Session<T> {
             streamed_k: true,
             weight_prefetch: true,
             // `TT_PREFETCH_UNITS=<n>`: a development knob for the sweep of
-            // `docs/plans/decode-to-bandwidth.md` Phase 8, "The stream's rate".
+            // `docs/completed-plans/decode-to-bandwidth.md` Phase 8, "The stream's rate".
             prefetch_units: units_from_env("TT_PREFETCH_UNITS", PREFETCH_UNITS),
             // `TT_STREAM_PREFETCH=0` turns it off.
             stream_prefetch: std::env::var("TT_STREAM_PREFETCH").map_or(true, |v| v != "0"),
@@ -2878,12 +2881,12 @@ impl<T: Transport> Session<T> {
             // `TT_STREAM_PREFETCH_UNITS=<n>`: as `TT_PREFETCH_UNITS`.
             stream_prefetch_units: units_from_env("TT_STREAM_PREFETCH_UNITS", PREFETCH_UNITS),
             // `TT_PREFETCH_ANCHOR=last|own-oldest`: a development knob for
-            // `docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`".
+            // `docs/completed-plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`".
             anchor_mode: prefetch_anchor_from_env(),
             prefetch_anchor: Vec::new(),
             // The product's own units read their first job's `B` ahead too; `TT_BUSY_PREFETCH=0`
             // turns it off. On by default since NC stopped draining B's prefetch ID at a list's end
-            // (`docs/plans/planned-l1-residency.md` 3b): a 1.7B step 19.51 -> 18.40 ms at the
+            // (`docs/completed-plans/planned-l1-residency.md` 3b): a 1.7B step 19.51 -> 18.40 ms at the
             // prefetch cap of 2 (`dm::PREFETCH_CAP_DEFAULT`), nothing measured slower.
             busy_prefetch: std::env::var("TT_BUSY_PREFETCH").map_or(true, |v| v != "0"),
             // On by default since 2026-11-04 (`docs/plans/decode-bytes-in-flight.md` Phase C1): a
@@ -2906,12 +2909,12 @@ impl<T: Transport> Session<T> {
             prefetch_lists: Vec::new(),
             prefetch_waits: Vec::new(),
             // `TT_L1_REGION=<bytes>`: captures keep that much of each unit's `DATA` arena, at its
-            // top, for a persistent region (`docs/plans/planned-l1-residency.md` Phase 2).
+            // top, for a persistent region (`docs/completed-plans/planned-l1-residency.md` Phase 2).
             l1_region: std::env::var("TT_L1_REGION")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
-            // Captures that can run twice are planned (`docs/plans/planned-l1-residency.md`), each
+            // Captures that can run twice are planned (`docs/completed-plans/planned-l1-residency.md`), each
             // region what its plan uses, at most 96 KiB, unless `TT_RESIDENCY=0`;
             // `TT_RESIDENCY_REGION=<bytes>` keeps that many in both passes instead
             // (`Session::set_residency_fixed`), for measurement.
@@ -4156,7 +4159,7 @@ impl<T: Transport> Session<T> {
         Ok(at)
     }
 
-    /// A development probe (`docs/plans/decode-step-bandwidth.md` B2, the cross-op weight
+    /// A development probe (`docs/completed-plans/decode-step-bandwidth.md` B2, the cross-op weight
     /// prefetch): read `t`'s tiles into L1 on `units`, `per_unit` consecutive tiles a unit (one
     /// `READ_RUN` each, unit `units.start + k` reading tiles `k * per_unit..`) into slots from
     /// `at`, queued without a barrier, so ops queued after it on other units do not wait for it;
@@ -4215,7 +4218,7 @@ impl<T: Transport> Session<T> {
         r
     }
 
-    /// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 0, the read ceiling): every
+    /// A development probe (`docs/completed-plans/decode-to-bandwidth.md` Phase 0, the read ceiling): every
     /// tile of `t` read once into L1 on the first `units` units, as one op with its barrier, so it
     /// can be captured and replayed and its time is the card's. `order` deals the tiles as
     /// [`StreamOrder`] says; each unit reads them as `READ_RUN`s of at most `window` tiles into the
@@ -4306,7 +4309,7 @@ impl<T: Transport> Session<T> {
         Ok(last)
     }
 
-    /// A development probe (`docs/plans/planned-l1-residency.md` 2f): one row delivered to units
+    /// A development probe (`docs/completed-plans/planned-l1-residency.md` 2f): one row delivered to units
     /// that each read it whole, by `scheme` ([`crate::residency::RowScheme`]), as two ops with their
     /// barriers -- three for [`RowScheme::Relay`](crate::residency::RowScheme::Relay) -- so it can be
     /// captured and replayed and its time is the card's.
@@ -4559,7 +4562,7 @@ impl<T: Transport> Session<T> {
         // the card whatever the setting: the tiles would carry four times the data
         // or more across PCIe (a `[1, 49152]` row of logits: 6.3 MB of tiles for its
         // 192 KiB, about 1 ms on card 1), against ~2.6 us of mover time a tile spread
-        // over the units (`docs/plans/replay-fixed-cost.md`).
+        // over the units (`docs/completed-plans/replay-fixed-cost.md`).
         let mostly_padding = 4 * t.rows <= 32 * rt;
         if (self.tilize == Tilize::Card || mostly_padding) && t.rows * stride <= HOST_DMA_STAGING {
             // The card untilizes; the rows come back as they are. A unit for every 96
@@ -4771,7 +4774,7 @@ impl<T: Transport> Session<T> {
     }
 
     /// Drop the barriers a capture's data does not need from its streams as it ends (on by
-    /// default; `TT_BARRIER_PRUNE=0` turns it off; `docs/plans/decode-small-ops.md` S5, A1): a
+    /// default; `TT_BARRIER_PRUNE=0` turns it off; `docs/completed-plans/decode-small-ops.md` S5, A1): a
     /// barrier after which no unit of the next op depends on another unit's op since the last
     /// barrier kept ([`crate::barriers`]). The ops between two kept barriers become one op of the
     /// trace, labelled with all their labels, and every unit that ran any of them arrives once, at
@@ -9302,7 +9305,7 @@ impl<T: Transport> Session<T> {
     /// unlike the XMOV zero fill. Made once per width and datum kind and kept as long as
     /// GDDR is: nothing writes it, and each one made per use was a `metadata` write an op
     /// (34 us of every replayed SmolLM2 layer's attention, twice:
-    /// `docs/plans/replay-fixed-cost.md`). The caller must not free it.
+    /// `docs/completed-plans/replay-fixed-cost.md`). The caller must not free it.
     fn zero_row(&mut self, cols: usize, elem: tensor::Elem) -> Result<DramTensor, TensorError> {
         let kept = &self.dram_state()?.zero_rows;
         if let Some((_, _, z)) = kept.iter().find(|(c, e, _)| (*c, *e) == (cols, elem)) {
@@ -10094,8 +10097,8 @@ impl<T: Transport> Session<T> {
 
     /// Whether, in a capture, the units a one-row product with a packed `A` runs on read their
     /// first job's `B` ahead too, as soon as the last such product is done and under the ops
-    /// between (on by default; `TT_BUSY_PREFETCH=0` turns it off; `docs/plans/decode-to-bandwidth.md`
-    /// Phase 8, `docs/plans/planned-l1-residency.md` 3b). A unit does where every op it ran since planned `DATA` below that `B`'s ring (at
+    /// between (on by default; `TT_BUSY_PREFETCH=0` turns it off; `docs/completed-plans/decode-to-bandwidth.md`
+    /// Phase 8, `docs/completed-plans/planned-l1-residency.md` 3b). A unit does where every op it ran since planned `DATA` below that `B`'s ring (at
     /// the arena's end, `matmul::plan_layout_packed_a`): its reads are a prefetch
     /// (`record::GATHER_PREFETCH`), which those ops' drains leave in flight, and the job waits for
     /// them before its kernel (`tensor::BUSY_PREFETCH`). Off, those units read `B` in the job.
@@ -10142,7 +10145,7 @@ impl<T: Transport> Session<T> {
 
     /// Whether a capture plans into the trace arena (`tt_isa::l1::TRACE_ARENA`: `DATA`, the 88 KiB
     /// the mailboxes left and the program slots, which a trace's kernels never run from;
-    /// `TT_TRACE_ARENA=1` at open; `docs/plans/decode-to-bandwidth.md` Phase 8, P3). On, a capture
+    /// `TT_TRACE_ARENA=1` at open; `docs/completed-plans/decode-to-bandwidth.md` Phase 8, P3). On, a capture
     /// keeps its persistent region at the top of the trace arena, above `DATA`, and its products'
     /// `B` rings reach up to it; every other layout plans in `DATA` as outside a capture, so the
     /// bits are the same. Cached residency plans are dropped: they hold each op's layout.
@@ -10153,7 +10156,7 @@ impl<T: Transport> Session<T> {
     }
 
     /// Whether the math role runs its long programs as fused `.ttinsn` code (on by default,
-    /// `TT_TTINSN=0` at open turns it off; `docs/plans/ttinsn-push.md`): a program of [`FUSE_MIN_WORDS`] pushed words
+    /// `TT_TTINSN=0` at open turns it off; `docs/completed-plans/ttinsn-push.md`): a program of [`FUSE_MIN_WORDS`] pushed words
     /// or more is placed in the program cache as RISC-V code that pushes its words by executing
     /// them (`crate::code::Code::fused`, validated and run on the host against the program's own
     /// expansion first), and the runner calls it instead of reading and storing each word (1.19
@@ -10172,7 +10175,7 @@ impl<T: Transport> Session<T> {
     /// A gate's tool, never for use: wait for everything queued, then forget every unit's program
     /// cache (nothing held: no trace may be alive), so the next programs are placed from the
     /// region's start again, over the words of the ones before. What a gate needs to make a fused
-    /// program run at an address another one's code was run from (`docs/plans/ttinsn-push.md`:
+    /// program run at an address another one's code was run from (`docs/completed-plans/ttinsn-push.md`:
     /// the runner invalidates its instruction cache first).
     #[doc(hidden)]
     pub fn probe_forget_programs(&mut self) -> Result<(), RunError> {
@@ -10189,7 +10192,7 @@ impl<T: Transport> Session<T> {
     /// weight-streaming product ([`PrefetchAnchor::Last`]), or after the last one the unit itself
     /// took part in ([`PrefetchAnchor::Own`], the default), so a unit that sat out the last one
     /// reads under it and the ops before it too (`TT_PREFETCH_ANCHOR=last|own-oldest` at open;
-    /// `docs/plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`"). Placement only:
+    /// `docs/completed-plans/decode-to-bandwidth.md` Phase 8, "The GDDR idle before `o`"). Placement only:
     /// a busy unit's list moves no earlier than every op after it planned `DATA` below its ring,
     /// and no `B` the capture allocated or wrote is read ahead, so the bits are the same. Cached
     /// residency plans are dropped: they hold each op's layout.
@@ -10201,7 +10204,7 @@ impl<T: Transport> Session<T> {
 
     /// Keep `bytes` at the top of each unit's `DATA` arena for a persistent region in every capture
     /// from now on (0, the default, keeps none; `TT_L1_REGION=<bytes>` sets it at open;
-    /// `docs/plans/planned-l1-residency.md` Phase 2). A capture's ops plan below it
+    /// `docs/completed-plans/planned-l1-residency.md` Phase 2). A capture's ops plan below it
     /// ([`crate::l1::arena`]), and one that planned into it, or did not plan its layout while
     /// captured, is refused ([`TraceError::IntoRegion`]). Ops outside a capture use the whole
     /// arena. The region is rounded up to whole 64-byte units.
@@ -10213,7 +10216,7 @@ impl<T: Transport> Session<T> {
 
     /// How a residency plan delivers a row an op reads whole on many units
     /// ([`crate::residency::Rows`]; `TT_RESIDENCY_ROWS=gddr|mcast|held:<h>` at open, default
-    /// `held:2`, `docs/plans/planned-l1-residency.md` 2f). For the plans made from now on.
+    /// `held:2`, `docs/completed-plans/planned-l1-residency.md` 2f). For the plans made from now on.
     pub fn set_residency_rows(&mut self, rows: crate::residency::Rows) {
         self.residency_rows = rows;
         self.plans.clear();
@@ -10222,7 +10225,7 @@ impl<T: Transport> Session<T> {
 
     /// Whether a residency plan drops the writes of the tensors its graph makes and never reads
     /// ([`crate::residency::Plan::dropped`]; on by default, `TT_RESIDENCY_DROP=0` at open turns it
-    /// off, `docs/plans/planned-l1-residency.md` 2g). For the plans made from now on.
+    /// off, `docs/completed-plans/planned-l1-residency.md` 2g). For the plans made from now on.
     pub fn set_residency_drop(&mut self, drop: bool) {
         self.residency_drop = drop;
         self.plans.clear();
@@ -10267,7 +10270,7 @@ impl<T: Transport> Session<T> {
 
     /// Plan captures for L1 residency from now on, in a region of at most `bytes` a unit (0 turns
     /// it off; on at open with [`RESIDENCY_REGION`] unless `TT_RESIDENCY=0`;
-    /// `docs/plans/planned-l1-residency.md` Phase 2). A plan pass
+    /// `docs/completed-plans/planned-l1-residency.md` Phase 2). A plan pass
     /// ([`Session::begin_trace_plan_pass`]) then ends by planning which of its tensors could live
     /// in a region at the top of each unit's arena (`crate::residency`), for
     /// [`Session::begin_trace_planned`] to apply to a capture of the same graph. The planned
@@ -10284,7 +10287,7 @@ impl<T: Transport> Session<T> {
 
     /// Whether both residency passes keep the whole [`Session::set_residency`] region, as before
     /// the region was sized by its plan (`TT_RESIDENCY_REGION=<bytes>` at open;
-    /// `docs/plans/planned-l1-residency.md` 2h). For measurement: a region past
+    /// `docs/completed-plans/planned-l1-residency.md` 2h). For measurement: a region past
     /// `crate::residency::cap` narrows the ops of both passes alike.
     pub fn set_residency_fixed(&mut self, fixed: bool) {
         self.residency_fixed = fixed;
@@ -10324,7 +10327,7 @@ impl<T: Transport> Session<T> {
 
     /// [`Session::begin_trace_planned`], and if the capture is its plan's, the plan kept under
     /// `key` for [`Session::begin_trace_cached`]. `key` names the graph: the caller's, with
-    /// whatever shapes it depends on (`docs/plans/planned-l1-residency.md` 2h).
+    /// whatever shapes it depends on (`docs/completed-plans/planned-l1-residency.md` 2h).
     pub fn begin_trace_planned_as(&mut self, key: u64) -> Result<bool, TensorError> {
         let Some(applied) = self.last_plan.take() else {
             return Ok(false);
@@ -10392,7 +10395,7 @@ impl<T: Transport> Session<T> {
         let kept = c.region_base.unwrap_or(end);
         let g = Graph::from_capture(c, allocs);
         // The region takes at most what leaves every op laid out as here (`cap`), nor more than
-        // `residency_region` (`docs/plans/planned-l1-residency.md` 2h). A pass that kept one (an
+        // `residency_region` (`docs/completed-plans/planned-l1-residency.md` 2h). A pass that kept one (an
         // earlier plan's, a fixed one, `TT_L1_REGION`) plans in what it kept, every op already
         // below it.
         let budget = if c.region_base.is_some() {
@@ -10404,7 +10407,7 @@ impl<T: Transport> Session<T> {
         };
         // A row its readers take whole on many units goes as `residency_rows` says: held by a few
         // of them by default, since every producer multicasting it to all of them serializes
-        // (`docs/plans/planned-l1-residency.md` 2e, 2f).
+        // (`docs/completed-plans/planned-l1-residency.md` 2e, 2f).
         let mut plan = Plan::make_rows(&g, budget, self.residency_rows, |_, u| u.plain);
         if !self.residency_drop {
             plan.dropped.clear();
@@ -10417,7 +10420,7 @@ impl<T: Transport> Session<T> {
         // laid out as here either way, and a model's traces then share one arena end, so their
         // programs, which name addresses planned in it, are one set in the program cache. Kept to
         // what each plan used, each trace's were its own, and a model on 12 tiles filled the
-        // cache (`docs/plans/planned-l1-residency.md` 2h).
+        // cache (`docs/completed-plans/planned-l1-residency.md` 2h).
         let region = self
             .probe_planned_region
             .map_or(budget, |r| r.max(plan.region))
@@ -10694,12 +10697,22 @@ impl<T: Transport> Session<T> {
         self.spread
     }
 
+    /// The spread of the ops queued while a capture is open, instead of
+    /// [`Session::set_spread`]'s; `None` (the default) for the same. A fresh op pays the host
+    /// ~5 us for every unit it runs on, a replayed one nothing, so the two want different
+    /// spreads: on every tile of card 0 (2026-11-09) eager training was fastest at a work
+    /// spread and traced training at every unit (`docs/learnings/performance-log.md`,
+    /// "Training on every tile"). The bits are the same either way.
+    pub fn set_capture_spread(&mut self, spread: Option<Spread>) {
+        self.capture_spread = spread;
+    }
+
     /// The units an op with `work` runs on, by [`Session::set_spread`]. In a capture whose
     /// one-row products prefetch their weights ([`Session::set_weight_prefetch`]), once one has,
     /// at most the units it ran on ([`Session::set_prefetch_keeps_units`]): the units past them are
     /// where the next one's weights stream while the ops between run, and an op on them takes
     /// them from it (a decode step's attention at long context did,
-    /// `docs/plans/decode-to-bandwidth.md` Phase 3). Products take
+    /// `docs/completed-plans/decode-to-bandwidth.md` Phase 3). Products take
     /// [`Session::spread_for_product`].
     fn spread_for(&self, work: usize) -> usize {
         let units = self.spread_for_product(work);
@@ -10717,7 +10730,11 @@ impl<T: Transport> Session<T> {
 
     /// [`Session::spread_for`] for a product, which chooses its own units.
     fn spread_for_product(&self, work: usize) -> usize {
-        self.spread.units_for(work, self.units.len())
+        let spread = match (&self.capture, self.capture_spread) {
+            (Some(_), Some(spread)) => spread,
+            _ => self.spread,
+        };
+        spread.units_for(work, self.units.len())
     }
 
     pub fn set_pipeline(&mut self, on: bool) {
@@ -10809,7 +10826,7 @@ impl<T: Transport> Session<T> {
     /// ([`Session::limit_program_cache`]); `None` puts both back. For profiling a stretch
     /// of ops the fixed buffer cannot hold, one stream to a [`Session::sync`] -- a trace
     /// replay above all, which runs to its end with no sync inside
-    /// (`docs/plans/replay-fixed-cost.md`). Refused while a capture is open, a trace
+    /// (`docs/completed-plans/replay-fixed-cost.md`). Refused while a capture is open, a trace
     /// lives (it holds programs in the cache) or a profile runs.
     #[doc(hidden)]
     /// Count what each op of every trace stored from here on moves through GDDR

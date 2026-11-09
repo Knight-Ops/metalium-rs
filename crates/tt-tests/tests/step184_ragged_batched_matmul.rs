@@ -305,7 +305,7 @@ fn shared_blocks_and_a_transposed_k_side() {
     });
 }
 
-/// Padding off `K` is used as it is (`docs/plans/decode-attention.md` A1): a decode step's `Q`
+/// Padding off `K` is used as it is (`docs/completed-plans/decode-attention.md` A1): a decode step's `Q`
 /// (`[heads m, d]`, `d` whole tiles) whose padding rows hold a bias (`x + b` with `b` a row: the
 /// padding rows are `b`), against `K^T` blocks, queues the same ops as the clean `Q` -- no fill
 /// before the product -- and every product stays bit for bit its block computed alone. With `K`

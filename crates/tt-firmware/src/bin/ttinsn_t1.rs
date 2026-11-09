@@ -1,5 +1,5 @@
 //! The `.ttinsn` push-fusion experiment's T1 image
-//! (`docs/plans/ttinsn-push-experiment.md`): the generic runner on T1, with two
+//! (`docs/completed-plans/ttinsn-push-experiment.md`): the generic runner on T1, with two
 //! hooks and nothing else changed.
 //!
 //! * A staged program that is one of the programs this image was built with

@@ -1,5 +1,5 @@
 //! A one-row element-wise result written packed by the op that makes it
-//! (`docs/plans/decode-to-bandwidth.md` Phase 3, `Session::set_packed_twins`): a `[1, K]` F32 result
+//! (`docs/completed-plans/decode-to-bandwidth.md` Phase 3, `Session::set_packed_twins`): a `[1, K]` F32 result
 //! over a long `K` also writes each output tile's data row into a `[K / 32, 32]` twin from the
 //! slots its scatter writes out (`tensor::packed_twin_writes`), so a product's packed `A` and
 //! RMSNorm's statistic read it with no packing op.

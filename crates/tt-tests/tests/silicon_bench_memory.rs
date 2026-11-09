@@ -594,7 +594,7 @@ enum Mix {
     /// Reads, `r` tiles a channel ([`banked_tiles`]: the tiles moved to the front channel by
     /// channel), tile `t` reading only channel `t / r` (its own share of it) through the NoC #0
     /// endpoint of that channel nearest above it ([`nearest_port`]): F27's bank-local reads at
-    /// more than one reader a channel (`docs/plans/decode-to-bandwidth.md` Phase 10, A1).
+    /// more than one reader a channel (`docs/completed-plans/decode-to-bandwidth.md` Phase 10, A1).
     Banked(u8),
     /// Today's decode product's weight reads (an `m = 1`, `K`-whole job a unit): tile `t` reads
     /// `nc` consecutive columns of a weight `n * nc` tiles wide and `entries / nc` tall,
@@ -1740,7 +1740,7 @@ fn gddr_adjacent_banks() {
     });
 }
 
-/// F27's first question (`docs/plans/decode-to-bandwidth.md` Phase 10, A1): does a channel still
+/// F27's first question (`docs/completed-plans/decode-to-bandwidth.md` Phase 10, A1): does a channel still
 /// give its ~64 GB/s when 2, 4 or 8 tiles beside it share it, and at decode's one-tile entries,
 /// and what does today's decode deal ([`Mix::Decode`]) read at on the same card.
 ///

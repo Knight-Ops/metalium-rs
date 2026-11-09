@@ -26,7 +26,7 @@ traced parameter copies. Named MNIST MLP/CNN precision policies pass both cards;
 masters, gradients and optimizer state remain F32. This does not implement
 portable Burn `QTensorOps`. Random draws run on the device (S7, step140-142), seeded per
 device by `TtBackend::seed`; the RISC-V seed store needs a settling interval, and
-WRCFG and simulator lane initialization differ from silicon. See [the current storage contract](mixed-bfp-storage.md).
+WRCFG and simulator lane initialization differ from silicon. See [the current storage contract](../completed-plans/mixed-bfp-storage.md).
 
 Implementation guide for the Burn-facing half of `burn-tt`: the trait surface, composition
 with Burn's wrappers and tooling, and the developer experience, measured against the
@@ -289,7 +289,7 @@ wrapped `FlexQTensor`; `dtype_usage(QFloat)` was `Storage`, as Flex returned.
 `QTensorOps` impl fails explicitly for quantized construction and compute, and
 `dtype_usage(QFloat)` is empty. Per-tensor BFP8/4/2 storage of logical F32 exists, but it is
 not Burn's portable quantization and is not routed through `QTensorOps`
-([mixed-bfp-storage.md](mixed-bfp-storage.md)). Portable `QTensorOps` remains deferred.
+([mixed-bfp-storage.md](../completed-plans/mixed-bfp-storage.md)). Portable `QTensorOps` remains deferred.
 
 ---
 
@@ -688,7 +688,7 @@ nothing" line in the Definition of done is checked.
    DDP-friendly) or the mesh as one device (today's `Topology::Cards`)? Possibly both, as
    distinct `type_id`s. **Decided 2026-10-14:** each card a `TtDevice`, data parallelism through a
    native `DistributedBackend` (B14); a mesh device stays possible later for tensor parallelism
-   ([roadmap, Track 3](roadmap.md#track-3-multi-chip-after-the-single-chip-path-is-fast)).
+   ([roadmap, Track 3](roadmap.md#w10-multi-chip-after-w1-w3)).
 6. **`burn-backend/distributed` without a cubecl feature** -- `distributed/ops.rs:1`
    imports `cubecl::device::DeviceId`; compile-check before making `distributed` default-on.
 7. **Poisoned tensors vs. Burn's expectations.** Does any Burn wrapper (autodiff,

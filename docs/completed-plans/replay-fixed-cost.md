@@ -1,5 +1,7 @@
 # The fixed cost of a traced replay
 
+> **Archived 2026-11-09.** Complete; its leftover was carried into ../plans/roadmap.md. Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Roadmap Track 2, item 6, next step 1 ("Profile the fixed ~33 ms a replay"). Written 2026-10-15 against `b22a245`.
 Status: **P0 and P2 done (2026-10-15): the traced decode step is at burn-flex's time, 26.46 ms against 26.42 in the same run (was 37.2). P1 done 2026-10-17; the barriers no data needs pruned 2026-10-26 (P2's list).**
 
@@ -121,7 +123,7 @@ stays bit for bit the eager step (`step185_fixed_decode`).
   between become one op of the trace. 194 of the 135M step's 591 barriers go (82 of the 1.7B's 403): 135M 7.35 ->
   6.97 ms, 1.7B 11.76 -> 11.59 (card 0, `1793039044`, `1793039248`). Sparse waits for the rest would save 0.03-0.07
   ms (a what-if over the profile's per-unit times): not built.
-- [ ] Left, by share (tracked as [roadmap](roadmap.md) Track 2 item 6, next step 6): ~~the cache write's `k` and `v` expands and two `mask_where`s~~ (done 2026-10-16: one row
+- [ ] Left, by share (tracked as [roadmap](../plans/roadmap.md) Track 2 item 6, next step 6): ~~the cache write's `k` and `v` expands and two `mask_where`s~~ (done 2026-10-16: one row
   scatter a write, `scatter_nd` with `Assign`; its two whole-cache copies remain), the RMSNorm's broadcast `div` (27 us, twice a layer), the replay's start (~170 us:
   the mover takes a `CALL` only as a list of its own, so each unit's catch-up is a second enqueue), and each op's ~3.5 us
   of control.

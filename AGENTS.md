@@ -46,6 +46,8 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | Task                                    | Reference                                                                                                                                |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | What to work on next (open items)       | [roadmap.md](docs/plans/roadmap.md)                                                                                                      |
+| Strategy against tt-metal; the W0-W10 program | [tt-metal-parity.md](docs/plans/tt-metal-parity.md); what was achieved: [achievements.md](docs/completed-plans/achievements.md) |
+| Before trying an optimization           | [failed-approaches.md](docs/learnings/failed-approaches.md): what was already tried, why it failed, when to retry                        |
 | Setup and task options                  | [README.md](README.md), [xtask/README.md](xtask/README.md)                                                                               |
 | New kernel/op; completion criteria      | [new-op-definition-of-done.md](docs/plans/new-op-definition-of-done.md), [burn-op-notes.md](docs/plans/burn-op-notes.md)                  |
 | Fixing a failing Burn conformance test  | [conformance-to-feature.md](docs/plans/conformance-to-feature.md), then the crate [README](crates/burn-tt-conformance/README.md)           |
@@ -53,7 +55,7 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | Scheduler, credits, traces or recovery  | [streaming architecture](docs/learnings/streaming-dataflow-architecture.md), [traced execution](docs/plans/traced-execution.md)          |
 | Hardware access/bring-up                | [silicon operating notes](docs/learnings/silicon-operating-notes.md), [implementation checklist](docs/completed-plans/phases-0-10-checklist.md) |
 | Simulator refusal or numerical mismatch | [ttsim-divergence.md](docs/learnings/ttsim-divergence.md); read refutations as well as original findings                                 |
-| Optimizations below Burn (formats, fusion, multi-core, credits) | [dataflow-compiler.md](docs/learnings/dataflow-compiler.md) (the design reference: principles, ADRs 0003-0005, hypotheses, external research), [dataflow-compiler plan](docs/completed-plans/dataflow-compiler.md) |
+| Optimizations below Burn (formats, fusion, multi-core, credits) | [dataflow-compiler.md](docs/learnings/dataflow-compiler.md) (the design reference: principles, ADRs 0003-0006, hypotheses, external research), [dataflow-compiler plan](docs/completed-plans/dataflow-compiler.md) |
 | Performance changes                     | [performance-scoreboard.md](docs/learnings/performance-scoreboard.md) (current), [performance-log.md](docs/learnings/performance-log.md) (history) |
 | Architecture/specification rationale    | [phases-0-10-roadmap.md](docs/completed-plans/phases-0-10-roadmap.md), [tt-metal concepts review](docs/learnings/tt-metal-concepts-review.md)                |
 
@@ -65,7 +67,7 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | `tt-device` / `tt-kmd`  | `silicon-operating-notes.md`, `ttsim-divergence.md`                                           | `roadmap.md`                                                                                         |
 | `tt-layout`             | `performance-scoreboard.md`                                                              | `roadmap.md`, `new-op-definition-of-done.md`                                                         |
 | `tt-firmware`           | `performance-scoreboard.md`, `streaming-dataflow-architecture.md`, `silicon-operating-notes.md` | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`                                              |
-| `tt-kernels`            | `dataflow-compiler.md`, `streaming-dataflow-architecture.md`, `tt-metal-concepts-review.md`                           | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`, `new-op-definition-of-done.md`              |
+| `tt-kernels`            | `dataflow-compiler.md`, `streaming-dataflow-architecture.md`, `failed-approaches.md`, `tt-metal-concepts-review.md`   | `roadmap.md`, `tt-metal-parity.md`, `traced-execution.md`, `kernel-fusion.md`, `new-op-definition-of-done.md`              |
 | `burn-tt`               | `tt-metal-concepts-review.md`                                                                 | `roadmap.md`, `burn-backend-parity.md`, `burn-native-cutover.md`, `traced-execution.md`, `burn-op-notes.md` |
 | `tt-tests` / `tt-mnist` | `ttsim-divergence.md`, `performance-scoreboard.md`                                       | `roadmap.md`, `new-op-definition-of-done.md`                                                         |
 | `xtask`                 | `silicon-operating-notes.md`                                                                  | `roadmap.md`, `burn-backend-parity.md`                                                               |
@@ -190,6 +192,12 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
   descriptors: silicon retains state between programs and processes.
 - Declare padding through `Pad`/`OpPadding`; test ragged producers followed by
   reductions/matmul. Repairing a view must not alter its parent's padding claims.
+- Two numeric contracts ([ADR 0006](docs/adr/0006-two-numeric-contracts-reference-and-performance.md)): the bit-exact
+  *reference* contract is the default for conformance and training gates; a deterministic *performance* contract
+  (BF16 activations, BFP8 weights, HiFi2/LoFi, packer L1 accumulation) is the inference default. Inside each contract a
+  schedule chooses only among bit-equivalent options (ADR 0005); state the contract with every performance number.
+- When a hypothesis is killed or an opt-in knob loses, add its row to
+  [failed-approaches.md](docs/learnings/failed-approaches.md) and delete the knob and its code in the same change.
 - Never guess numerical tolerances. Use specification models/SFPU interpreter
   for exact program results and derive approximation bounds beside the gate.
   Cover signed zeros, subnormals, NaNs, infinities and extremes. Preserve stated
@@ -232,7 +240,7 @@ experiment image (cargo feature `ttinsn-experiment`, off by default, never in a
 shippable build), whose `.ttinsn` words the gate validates word by word, and which can also write
 `.ttinsn` code to L1 at run time and invalidate its own instruction cache
 (`tt_firmware::ttinsn`, which checks every word it emits)
-(`docs/plans/ttinsn-push-experiment.md`); the gate refuses data directives in code
+(`docs/completed-plans/ttinsn-push-experiment.md`); the gate refuses data directives in code
 for every image. **Fused code (on by default, `TT_TTINSN=0` off):** the shipped math
 role (T1) calls `.ttinsn` code the host wrote to the program cache, its length flagged
 `tt_isa::ttinsn::FUSED`, after invalidating its own instruction cache once a run
@@ -242,7 +250,7 @@ validated, and run on the host against the program's own expansion word for word
 never write code to the program cache any other way (a replay's B mover restoring a trace's
 programs from GDDR copies those same validated words back: `Session::restore_programs`), never flag `FUSED` for T0 or T2
 (they refuse it), and change the skeleton only with `validate`'s mutation tests
-(`docs/plans/ttinsn-push.md`, gate `step231_ttinsn_push`). Ethernet customer code runs on E1; leave E0
+(`docs/completed-plans/ttinsn-push.md`, gate `step231_ttinsn_push`). Ethernet customer code runs on E1; leave E0
 and firmware-owned L1 intact. Read the operating notes before low-level changes.
 
 ttsim is a non-reentrant process-wide singleton; violations call `_Exit`.

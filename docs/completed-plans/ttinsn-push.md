@@ -1,5 +1,7 @@
 # Fused `.ttinsn` push for the math role (host-side expansion)
 
+> **Archived 2026-11-09.** Complete (fused push from the host, the default since 2026-10-25); one item left: the experiment image no longer fits T1's slot (carried into ../plans/roadmap.md). Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 The follow-on plan the [`.ttinsn` experiment](ttinsn-push-experiment.md) asked for ("Done when"), and the
 roadmap's "Fused `.ttinsn` push for SFPU kernels" (triggered 2026-10-25, raised by the user). Started
 2026-10-25.

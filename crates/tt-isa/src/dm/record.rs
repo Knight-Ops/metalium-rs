@@ -61,7 +61,7 @@ pub const GATHER_PREFETCH: u32 = 1 << 27;
 /// [`GATHER`]'s flag for a weight stream: one of the many units of a product that streams its
 /// weights reads its share. RISCV B issues the record's reads at [`super::STREAM_CAP`] in flight,
 /// not its own cap: a low cap evens out the NoC's service between the units reading together
-/// (`docs/plans/decode-to-bandwidth.md` Phase 8, "The stream's rate"). The reads are the
+/// (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, "The stream's rate"). The reads are the
 /// record's as without it. Not with [`GATHER_PREFETCH`], whose reads have a cap of their own.
 pub const GATHER_STREAM: u32 = 1 << 28;
 /// [`GATHER`]'s bits 29-31: the format of a packed `B` beside an FP32 `A`, by code
@@ -69,7 +69,7 @@ pub const GATHER_STREAM: u32 = 1 << 28;
 /// weight stored in fewer bytes: `B`'s tiles are images of that format in GDDR slots of
 /// [`crate::format::TileFormat::slot_bytes`], each read whole into an L1 slot of the same size
 /// (`b_at + (kk * cols + j) * slot`: more tiles in a ring than an FP32 `B`'s,
-/// `docs/plans/bf16-weight-storage.md` A5b), where the kernel unpacks it in its own format
+/// `docs/completed-plans/bf16-weight-storage.md` A5b), where the kernel unpacks it in its own format
 /// (`tt_kernels::matmul::SrcRoute::Tf32WithB`). A packed `B` is untransposed only (not bit 1,
 /// not [`GATHER_B_UNPACK_TRANSPOSE`]); with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
 /// the writer's (zero for a stored weight): nothing is filled.
@@ -187,7 +187,7 @@ const fn gather_a_slot(flags: u32) -> Result<u64, u32> {
 
 /// A prefetch [`GATHER`]'s reads one at a time: a record with [`GATHER_PREFETCH`] and
 /// [`GATHER_A_RESIDENT`] reads only `B`, tile by tile, and a mover can issue them while it would
-/// otherwise wait (`docs/plans/decode-to-bandwidth.md` Phase 8, the prefetch pump). Its entries,
+/// otherwise wait (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, the prefetch pump). Its entries,
 /// in order, are exactly what [`expand_reads`] gives the record, and it refuses what that
 /// refuses, as soon as [`PrefetchCursor::new`] or the first [`PrefetchCursor::next`] would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

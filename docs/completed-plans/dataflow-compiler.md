@@ -495,7 +495,7 @@ eager product's 3-10% host time after a pulled capture.
 ## Stage F4a (decode): channels instead of barriers, H4
 
 **Opened 2026-10-29 at `9977ad8`.** Sparse waits alone were measured as worth 0.070 ms on the 1.7B
-([decode-small-ops.md](../plans/decode-small-ops.md) A0, A2 not built): a product's consumers need most of its units, so the time
+([decode-small-ops.md](decode-small-ops.md) A0, A2 not built): a product's consumers need most of its units, so the time
 at its barrier is its slowest unit's work (T10). H4's gain has to come from overlap, units that leave a product early
 reading the next product's weights in its tail, so the stage bounds that before building anything (owner, 2026-10-29).
 If the bound fires the kill, H4 is refuted, the three schedules below stay opt-in, and the stage stops.

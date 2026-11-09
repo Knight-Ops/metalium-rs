@@ -1,4 +1,4 @@
-//! Phase 1 of `docs/plans/planned-l1-residency.md`: a captured graph's residency plan, made and
+//! Phase 1 of `docs/completed-plans/planned-l1-residency.md`: a captured graph's residency plan, made and
 //! reported as each capture ends (`tt_kernels::residency`), with nothing made resident.
 //!
 //! The claims, over the traced decode steps and prefill chunk of a synthetic four-layer Llama on

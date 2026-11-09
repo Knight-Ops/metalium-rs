@@ -1,4 +1,4 @@
-//! A matmul's transposed `B` transposed by the kernel's unpacker (`docs/plans/decode-attention.md`
+//! A matmul's transposed `B` transposed by the kernel's unpacker (`docs/completed-plans/decode-attention.md`
 //! A3): `record::GATHER_B_UNPACK_TRANSPOSE` has the mover read each of `B`'s tiles as it lies, and
 //! unpacker 0 transposes it within each face (`Haloize_mode`) while the kernel unpacks `B`'s face
 //! `(k, fj)` from the slot's face `(fj, k)`. The mover's own transpose (`READ_TRANSPOSED`) moves

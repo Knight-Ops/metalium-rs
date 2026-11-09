@@ -1,5 +1,7 @@
 # Decode step bandwidth
 
+> **Archived 2026-11-09.** Superseded: B2 was replaced by busy prefetch and F4a.2; the decode work continued in decode-to-bandwidth.md and decode-bytes-in-flight.md. Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile". Written 2026-10-17 against `c69b9c1`. Status: **B0 and B1 done
 (2026-10-17; a 1.7B step 42.97 / 45.41 / 48.59 -> 41.83 / 44.25 / 47.40 ms, run `1792209913`); B2 designed, with
 B2.0 (replay-fixed-cost P1) recommended next.** Companion plans, which continue under their own names: [decode-matmul-bandwidth.md](decode-matmul-bandwidth.md)

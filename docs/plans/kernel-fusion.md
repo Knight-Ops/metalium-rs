@@ -7,7 +7,7 @@ It tracks milestones **B12** and **B13a–B13c** from [`burn-backend-parity.md`]
 **Decision (2026-10-16): fusion lives in burn-fusion fusers.** The alternative was model-level fused ops in tt-models.
 Fusers are the end state, reliable and benefiting any model that runs on TT through Burn. Individual ops are still
 optimised as far as they go, since every fuser falls back to them. Evidence:
-[decode-small-ops.md](decode-small-ops.md) F0.
+[decode-small-ops.md](../completed-plans/decode-small-ops.md) F0.
 - A decode step on `Fusion<TtBackend>` captures and replays (gate `step193`), and fuses nothing yet.
 - It costs +1.5 / +2.2 ms a step (135M / 1.7B), because burn-fusion 0.21 expands `sigmoid` into Burn's 8-op
   composition.
@@ -18,7 +18,7 @@ Current BFP contract (2026-10-06): `StorageBackend` also supports
 handle, preserving compression boundaries. Compressed add/ReLU executes its
 constituent storage rules rather than collapsing their rounding into the F32
 fused path. Step95 gates storage propagation and residency on both cards.
-See [the delivered storage and training rules](mixed-bfp-storage.md).
+See [the delivered storage and training rules](../completed-plans/mixed-bfp-storage.md).
 
 ---
 
@@ -235,6 +235,10 @@ not reach. The design below stands for a workload whose consumers do not hide un
 - [x] **SiLU** (`x sigmoid(x) y`, decode-small-ops S2b) as one SFPU body (`SILU_MUL`, `SILU`), bit for bit the
   three ops (unit gate `sfpu::ops::silu`; `step194`, a fused projection's halves read in place). BF16 and the
   matrix element-wise mode run the separate ops.
+> **Superseded** by ADR 0003 (the dataflow compiler) and, for the matmul epilogue, by H10's kill on the 1.7B
+> ([failed-approaches.md](../learnings/failed-approaches.md)); the boxes below are kept as a record and will not be done
+> in this form. Fused training kernels are [tt-metal-parity.md](tt-metal-parity.md) W8.
+
 - [ ] Define `SfpuMicroOp` instruction enum and parameterized execution kernel in `tt_kernels::sfpu`.
 - [ ] Implement greedy virtual register allocator (`L0..L7`) with 8-register budget splitting.
 - [ ] Generalize `ElementWiseFuser` to emit arbitrary micro-op bytecode chains.
@@ -262,7 +266,7 @@ not reach. The design below stands for a workload whose consumers do not hide un
     composition above) and `ADD_RMS_NORM_SCALED` (an `Add`, then `burn_tt::rms_norm`'s custom operation, matched by the
     chain's `ScaledNorm` step, `eps` from its id). The first chains with **a second output**: a `Pattern`'s `keep` names
     steps whose results outlive the match (here the sum, the next residual's input), registered beside the result
-    (`ChainMatch::kept`). Bit for bit; slower on silicon, so off ([decode-to-bandwidth.md](decode-to-bandwidth.md)
+    (`ChainMatch::kept`). Bit for bit; slower on silicon, so off ([decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md)
     Phase 7).
   - **Limit:** rows of up to 128 tiles (4096 columns); longer rows run the separate ops.
   - **Row-limited** (2026-10-16): a tile row of fewer than 32 rows runs only the row groups they occupy

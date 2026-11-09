@@ -1,4 +1,4 @@
-//! The program slots are trace data while a trace runs (`docs/plans/decode-to-bandwidth.md` Phase 8,
+//! The program slots are trace data while a trace runs (`docs/completed-plans/decode-to-bandwidth.md` Phase 8,
 //! "Room for a second job's `B`", P2): a trace's capture plans into `tt_isa::l1::TRACE_ARENA`,
 //! which takes in `PROGRAMS`, since a traced kernel runs from the program cache.
 //!

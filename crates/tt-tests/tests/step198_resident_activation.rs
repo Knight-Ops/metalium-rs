@@ -1,4 +1,4 @@
-//! B1 of `docs/plans/decode-step-bandwidth.md`: a GDDR matmul's later blocks on a unit do not
+//! B1 of `docs/completed-plans/decode-step-bandwidth.md`: a GDDR matmul's later blocks on a unit do not
 //! read `A` again (`tt_isa::dm::record::GATHER_A_RESIDENT`). With `K` whole under one staging,
 //! `A` sits at the same slots for every block, so a unit whose previous block of the op read the
 //! same `A` rows reads only `B`. A decode step's `gate|up` (272 blocks on 120 units) and its head

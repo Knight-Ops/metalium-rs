@@ -1,5 +1,5 @@
 //! The L1 map after the mailboxes were packed above the program slots
-//! (`docs/plans/decode-to-bandwidth.md` Phase 8, "Room for a second job's `B`", M2): `DATA`, then
+//! (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, "Room for a second job's `B`", M2): `DATA`, then
 //! the capture-only arena where the mailboxes were, then `PROGRAMS`, then the 40 KiB of
 //! `MAILBOXES`, each block of which is in `tt_isa::l1::FIXED`.
 //!

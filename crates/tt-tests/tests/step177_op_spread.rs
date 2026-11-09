@@ -232,3 +232,47 @@ fn a_spread_by_work_gives_a_small_op_one_unit_and_a_large_one_all() {
         s.free(large).unwrap();
     });
 }
+
+/// `Session::set_capture_spread`: ops queued in a capture take its spread, fresh ops the session's.
+/// At `Fixed(1)` with every unit for captures, a fresh relu runs on unit 0 alone and a captured one
+/// on all four; with no capture spread (the control) the captured relu is unit 0's alone too. The
+/// replay computes the host's bits either way.
+#[test]
+fn a_capture_spread_applies_to_captured_ops_only() {
+    with_tiles(UNITS, |s| {
+        s.set_spread(Spread::Fixed(1));
+        let x = s.upload(&ints(256 * 256, 6), 256, 256).unwrap();
+        s.sync().unwrap();
+        let want: Vec<f32> = s.download(&x).unwrap().iter().map(|v| v.max(0.0)).collect();
+        for (capture_spread, units) in [(Some(Spread::All), UNITS), (None, 1)] {
+            s.set_capture_spread(capture_spread);
+            let before = s.lists_per_tile();
+            let r = ew(s, kind::RELU, &x, None);
+            let lists: Vec<u64> = s
+                .lists_per_tile()
+                .iter()
+                .zip(&before)
+                .map(|(a, b)| a - b)
+                .collect();
+            let used = lists.iter().filter(|&&l| l > 0).count();
+            assert_eq!(used, 1, "{capture_spread:?}, fresh: {lists:?}");
+            assert_eq!(bits(&s.download(&r).unwrap()), bits(&want));
+            s.free(r).unwrap();
+
+            s.begin_trace().unwrap();
+            let r = ew(s, kind::RELU, &x, None);
+            let trace = s.end_trace().unwrap();
+            let ran = s.trace_ops(trace).unwrap()[0]
+                .entries
+                .iter()
+                .filter(|r| !r.is_empty())
+                .count();
+            assert_eq!(ran, units, "{capture_spread:?}, captured");
+            s.replay(trace).unwrap();
+            assert_eq!(bits(&s.download(&r).unwrap()), bits(&want));
+            s.release_trace(trace).unwrap();
+            s.free(r).unwrap();
+        }
+        s.free(x).unwrap();
+    });
+}

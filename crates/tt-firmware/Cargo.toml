@@ -12,7 +12,7 @@ license = "Apache-2.0"
 description = "Bare-metal Rust for the Blackhole baby RISC-V cores."
 
 # Off by default. `ttinsn-experiment` builds the `ttinsn_t1` image and the hooks it
-# needs in `corpus.rs`: see `docs/plans/ttinsn-push-experiment.md`. No image built
+# needs in `corpus.rs`: see `docs/completed-plans/ttinsn-push-experiment.md`. No image built
 # without it contains a `.ttinsn` word.
 [features]
 ttinsn-experiment = []

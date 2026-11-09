@@ -23,10 +23,11 @@ tt-mnist [--model mnist|cnn|transformer] [--card N | --cards 0,1] [--tiles T] [-
 |---|---|
 | `--model M` | `mnist` (default), `cnn`, or `transformer`. |
 | `--model cnn` | Conv2D 1→8 (5×5, stride 4), ReLU, average pool 2×2, Linear 72→10; 938 parameters. Training/inference and single-card traces share the MLP execution paths. |
-| `--model transformer` | A small Burn transformer (embedding, pre-norm encoder layer, Linear head) trained `--steps S` steps (default 50) on one card and on `burn-flex`, printing the time per step of each and burn-tt's per-op report. Takes `--card`, `--tiles` and `--train-trace`; rejects `--bf16`. |
+| `--model transformer` | A small Burn transformer (embedding, pre-norm encoder layer, Linear head) trained `--steps S` steps (default 50) on one card and on `burn-flex`, printing the time per step of each (and, with `--eager`, burn-tt's per-op report). Takes `--card`, `--tiles` and `--eager`; rejects `--bf16`. |
 | `--card N` | Train on `/dev/tenstorrent/N` (default 0). |
 | `--cards 0,1` | Several cabled cards as one Burn device (`burn_tt::MeshEngine`). Buffers stay in chip 0's GDDR; matmuls are split by output columns across the cards and tile slots move between their GDDR over Ethernet, with no host staging. Everything else runs on chip 0, one compute tile per card, and the chips are not yet run concurrently, so it is much slower than one card. Cannot combine with `--tiles`. Training uses fresh dispatch (no `--train-trace`); the two- and four-chip reduced-run gates (`step12_mnist`) match the single-card golden loss curve bit for bit. No data-parallel training. |
-| `--tiles T` | Compute on `T` Tensix tiles of the card, or `all` (default 1). |
+| `--tiles T` | Compute on `T` Tensix tiles of the card, or `all` (the default). |
+| `--eager` | Train op by op. The default on one card without `--fusion` is a hardware trace (`burn_tt::TracedTrainingStep`): step 0 captured, the steps after it replayed. On every tile it is the fastest way in every mode measured (card 0, 2026-11-09: MNIST 1.31 ms a step against 1.55-1.81 eager and 2.3-2.6 on burn-flex; the transformer 3.75 against 9.42 and 3.9-4.4). The first step costs more (MNIST ~3.4 s): it measures each product's block on the card. `--train-trace` asks for the trace explicitly. |
 | `--epochs E` | Passes over the 60 000 training images (default 1). |
 | `--steps S` | Stop after `S` steps. |
 | `--host` | Also train the same model from the same initial weights on the CPU (`burn-flex`) and compare. |
@@ -123,5 +124,5 @@ BFP2/BFP4/BFP8/F32 on actual MNIST data, native gradients, parameter updates,
 no intermediate downloads and changed-input replay on both cards. The small
 four-image/four-step accuracy observations are diagnostics, not held-out
 accuracy or convergence measurements; existing F32 goldens are unchanged.
-See [the storage contract](../../docs/plans/mixed-bfp-storage.md) and
+See [the storage contract](../../docs/completed-plans/mixed-bfp-storage.md) and
 [recorded accuracy and performance](../../docs/learnings/performance-log.md).

@@ -274,7 +274,7 @@ impl TracedInference {
 
     /// [`TracedInference::capture_with_state`] of a step whose state is named before it runs:
     /// `state`, each tensor owning its buffer, is the capture's to write in place
-    /// (`docs/plans/in-place-cache-write.md`). A row scatter into one (`scatter_nd` with
+    /// (`docs/completed-plans/in-place-cache-write.md`). A row scatter into one (`scatter_nd` with
     /// `Assign`, a cache write) then writes the state's own buffer instead of a copy of it,
     /// and a `(new, state)` pair over one buffer needs no write-back. A read of a state tensor
     /// after its write, or of a view of it taken before, is refused by name: the step must
@@ -289,7 +289,7 @@ impl TracedInference {
     }
 
     /// [`TracedInference::capture_donating`], twice where the device plans captures for L1
-    /// residency (`crate::set_residency`, `docs/plans/planned-l1-residency.md`): the plain
+    /// residency (`crate::set_residency`, `docs/completed-plans/planned-l1-residency.md`): the plain
     /// capture plans, and a second run of `f` is captured applying the plan, its trace kept in
     /// the plain one's place. The step runs twice, so it must be one whose second run leaves what
     /// its first did: it writes its state, as a decoder's cache row, and does not accumulate
@@ -297,7 +297,7 @@ impl TracedInference {
     /// printed, and `f` is captured plainly once more: its trace is kept, and the state is what a
     /// plain run leaves.
     ///
-    /// `key` names the graph `f` captures (`docs/plans/planned-l1-residency.md` 2h): a plan kept
+    /// `key` names the graph `f` captures (`docs/completed-plans/planned-l1-residency.md` 2h): a plan kept
     /// under it from an earlier capture is applied in one capture, with no plan pass; if the
     /// session refuses it (the graph is not the plan's), it is forgotten and `f` captured twice as
     /// without one.
@@ -517,7 +517,7 @@ impl TracedInference {
 
     /// The ops the capture recorded, in order: each one's Burn op (or part) as
     /// `label`, and its range of every unit's stream. What a replay runs, op by
-    /// op; for profiling a replay (`docs/plans/replay-fixed-cost.md`).
+    /// op; for profiling a replay (`docs/completed-plans/replay-fixed-cost.md`).
     pub fn ops(&self) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
         let id = self.id;
         server::run(self.device, move |e, _| e.trace_ops(id))
@@ -718,7 +718,7 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
 
     /// Name what the steps belong to (a model), for the residency plans the device keeps for them:
     /// a plan is reused only by a step of the same key, scope and input and state shapes
-    /// (`docs/plans/planned-l1-residency.md` 2h). Two sets of steps that could share a key and
+    /// (`docs/completed-plans/planned-l1-residency.md` 2h). Two sets of steps that could share a key and
     /// shapes, two models on one device, keep apart by scope. A plan reused by another graph is
     /// refused by the device before any op the graph differs at, and planned again; giving the
     /// scope spares that.
@@ -901,7 +901,7 @@ pub fn set_capture_reuse(device: TtDevice, on: bool) -> Result<bool, TtError> {
 /// Keep `bytes` at the top of each unit's L1 arena for a persistent region in every trace captured
 /// on `device` from here on (`Session::set_l1_region`; 0 keeps none): the captured ops plan below
 /// it, and a capture with an op that does not is refused by name.
-/// `docs/plans/planned-l1-residency.md` Phase 2. Dev-facing.
+/// `docs/completed-plans/planned-l1-residency.md` Phase 2. Dev-facing.
 #[doc(hidden)]
 pub fn set_l1_region(device: TtDevice, bytes: u64) -> Result<(), TtError> {
     server::run(device, move |e, _| e.set_l1_region(bytes))
@@ -909,7 +909,7 @@ pub fn set_l1_region(device: TtDevice, bytes: u64) -> Result<(), TtError> {
 
 /// Plan captures on `device` from here on for L1 residency, in a region of at most `bytes` a unit
 /// (0 turns it off; on when the device attaches, unless `TT_RESIDENCY=0`;
-/// `Session::set_residency`, `docs/plans/planned-l1-residency.md`). A capture that can run its
+/// `Session::set_residency`, `docs/completed-plans/planned-l1-residency.md`). A capture that can run its
 /// step twice ([`SharedStateTraces::capture`]) then keeps the planned trace, whose tensors move
 /// between units' L1 where the plan says, and its plan, so a later capture of the same step runs
 /// it once. Dev-facing.

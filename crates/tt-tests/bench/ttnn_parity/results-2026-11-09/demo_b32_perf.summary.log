@@ -1,0 +1,40 @@
+2026-11-09 04:12:41.056 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.056 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.057 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.057 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.057 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.058 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.058 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.059 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.059 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.059 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.060 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.060 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.060 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.061 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.061 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.062 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.062 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.062 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.063 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.063 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.063 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.064 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.064 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.065 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.065 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.066 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.066 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.066 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.067 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:12:41.072 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1501 -
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1502 - === Performance metrics ===
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1504 - 1st token decode time: 22.29ms [44.86 t/s/u, 1435.49 t/s]
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1508 - 128th token decode time: 24.30ms [41.15 t/s/u, 1316.76 t/s]
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1521 - ==
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1522 - Prefill compile time: 11.77s
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1523 - Decode compile time: 8.4s
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1524 -
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1525 - Average Time to First Token (TTFT): 5.25ms
+2026-11-09 04:12:41.073 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1526 - Average speed: 24.82ms @ 40.29 tok/s/user (1289.29 tok/s throughput)
+2026-11-09 04:12:41.138 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1540 - Model SmolLM2-1.7B does not have centralized performance targets set for device P150, batch_size=32, seq_len=1024

@@ -1,4 +1,4 @@
-//! Fused `.ttinsn` push (`Session::set_ttinsn`, on by default, `docs/plans/ttinsn-push.md`): the math role runs
+//! Fused `.ttinsn` push (`Session::set_ttinsn`, on by default, `docs/completed-plans/ttinsn-push.md`): the math role runs
 //! its long programs as RISC-V code in the program cache that pushes each Tensix word by executing
 //! it (`tt_isa::ttinsn`, `tt_firmware::fused`), instead of loading and storing each word.
 //!

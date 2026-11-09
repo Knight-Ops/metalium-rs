@@ -172,7 +172,7 @@ Part 2's unsplit baseline and fallback.
     [log](../learnings/performance-log.md#a-long-prompts-prefill-chunks-attend-to-a-prefix-the-gqa-mask-read-as-a-block-2026-10-24-card-0)):
     a 1.7B chunk of 64 at 8,192 positions 293 -> 187 ms with D3 (the gather was 36%), then each chunk at its prefix:
     prefill of 1,000 / 4,000 / 7,992 tokens **4.69 / 18.46 / 36.63 -> 1.24 / 6.81 / 18.33 s**, decode unchanged.
-- [ ] **1.G GDDR reuse within a capture** (found 2026-10-24). A capture defers every free (`Session::free_placement`), so a
+- [x] **1.G GDDR reuse within a capture** (found 2026-10-24; on by default, see [achievements.md](../completed-plans/achievements.md)). A capture defers every free (`Session::free_placement`), so a
   trace holds every layer's intermediates: a 512-token chunk's scores at 8,192 positions (~48 GB over 24 layers) do not
   fit, so a long prompt runs in chunks of 64; and since D2 a generator holds a chunk trace a length, so the 1.7B's
   eager schedule no longer fits beside them (`step188` releases them first).

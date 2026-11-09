@@ -1,4 +1,4 @@
-//! Element-wise ops over only the rows a tile row has (`docs/plans/decode-to-bandwidth.md`
+//! Element-wise ops over only the rows a tile row has (`docs/completed-plans/decode-to-bandwidth.md`
 //! Phase 3): a tensor of one tile row of fewer than 32 rows -- a decode step's `[1, W]` -- runs a
 //! lanewise kind's programs over only the row groups its rows occupy
 //! (`tt_kernels::sfpu::ops::code_for_rows`: one group of eight for one row), on the card.

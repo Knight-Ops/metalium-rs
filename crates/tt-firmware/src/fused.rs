@@ -1,6 +1,6 @@
 //! Calling fused `.ttinsn` code (`tt_isa::ttinsn`): a role program the host wrote to the program
 //! cache as RISC-V code that pushes its Tensix words by executing them, its length flagged
-//! `tt_isa::ttinsn::FUSED` (`docs/plans/ttinsn-push.md`).
+//! `tt_isa::ttinsn::FUSED` (`docs/completed-plans/ttinsn-push.md`).
 //!
 //! The build-time instruction gate cannot see code written at run time: the host validated it
 //! (`tt_isa::ttinsn::validate`) and ran it against the program's own expansion before writing it,

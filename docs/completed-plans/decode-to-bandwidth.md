@@ -1,5 +1,7 @@
 # Decode at GDDR's bandwidth
 
+> **Archived 2026-11-09.** Closed. Its F32 target (14.5-15.5 ms) was overtaken by BF16 storage (9.90 ms, 2026-11-07). Live items were carried into ../plans/roadmap.md and ../plans/tt-metal-parity.md. Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Roadmap Track 1, SmolLM2 single-user decode. Written 2026-10-17 against `c69b9c1` (plus the uncommitted B0/B1 work of
 [decode-step-bandwidth.md](decode-step-bandwidth.md)). Status (2026-10-19): **a 1.7B step 41.83 / 44.25 / 47.40 -> 24.04 / 24.48 / 25.39 ms (`1792383988`), 135M
 20.03 / 20.55 / 21.19 -> 11.40 / 11.80 / 12.26 (`1792378993`).** The four larger changes are built (below), and the

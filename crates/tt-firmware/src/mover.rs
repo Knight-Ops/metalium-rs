@@ -186,7 +186,7 @@ fn pump_reads(c: &mut record::PrefetchCursor, most: u32, all: bool) -> bool {
 /// waiting on `PREFETCH_TXN` waited for B's reads. B, pumping more of them while it waited for NC
 /// to finish a pair, kept the count above zero, and NC's `DONE` came only when the count
 /// happened to reach it: ~46 us a residual add under busy-unit prefetch
-/// (`docs/plans/planned-l1-residency.md`, Phase 3's finding).
+/// (`docs/completed-plans/planned-l1-residency.md`, Phase 3's finding).
 fn finish_prefetch() -> Result<(), u32> {
     if IS_NC {
         return Ok(());

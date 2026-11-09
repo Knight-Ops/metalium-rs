@@ -11,11 +11,11 @@ new in-op peer wait (none exists: every cross-unit order today is op, barrier, o
 positions, where today's job does not fit L1 and attention runs as the composition; halves fit to 1024.
 
 Original status: **a proposal for a decision, nothing built.** Roadmap Track 1, "Decode at GDDR's bandwidth";
-[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Rules: "split-K and split-position attention change
+[decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Rules: "split-K and split-position attention change
 accumulation order. They come back for a decision with measured numbers and are not built unasked." This is that
 document. It replaces the one-line decision stubs in
-[decode-matmul-bandwidth.md](../plans/decode-matmul-bandwidth.md) P4 (split-K) and
-[decode-attention.md](../plans/decode-attention.md) A5 (flash-decode).
+[decode-matmul-bandwidth.md](../completed-plans/decode-matmul-bandwidth.md) P4 (split-K) and
+[decode-attention.md](../completed-plans/decode-attention.md) A5 (flash-decode).
 
 **Recommendation:** build **flash-decode, variant A** (below), opt-in and used only past an attended length chosen by
 measurement. It is worth ~0.7-1.0 ms of a 1.7B step at a 256-512-position context, and grows with the context.

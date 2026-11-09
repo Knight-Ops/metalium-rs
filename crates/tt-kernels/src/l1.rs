@@ -86,7 +86,7 @@ pub(crate) fn half_arena() -> Region {
 /// end, or, while a capture plans into the trace arena (`tt_isa::l1::TRACE_ARENA`), the base of its
 /// persistent region above `DATA` -- the one layout that reaches past `DATA`, so every other
 /// layout, and every choice sized from the arena, is as it is outside a capture
-/// (`docs/plans/decode-to-bandwidth.md` Phase 8, P3). Whatever caches a ring's layout, or programs
+/// (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, P3). Whatever caches a ring's layout, or programs
 /// that name its addresses, keys them by it.
 pub fn ring_end() -> u64 {
     match RING_END.with(|e| e.get()) {
@@ -115,7 +115,7 @@ pub(crate) fn set_ring_end(end: Option<u64>) -> Option<u64> {
 /// against the arena's end, with a gap below it), and takes in what a choice sized from the arena tested
 /// (`matmul::plan_floor`: the widest block that fits, probed with `A` unpacked), so `need` may pass
 /// `top`. A capture's ops all have their layouts in any arena ending at or above their highest
-/// need, which is what sizes a residency plan's region (`docs/plans/planned-l1-residency.md` 2h).
+/// need, which is what sizes a residency plan's region (`docs/completed-plans/planned-l1-residency.md` 2h).
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Planned {
     pub top: u64,
@@ -366,7 +366,7 @@ impl Requirements {
 
     /// Place `b` against the arena's end rather than at the lowest address it fits: a ring that a
     /// read ahead of the op fills, above what the ops before it plan (a product's `B` ring,
-    /// `docs/plans/decode-to-bandwidth.md` Phase 8). Nothing live with it may be placed above it.
+    /// `docs/completed-plans/decode-to-bandwidth.md` Phase 8). Nothing live with it may be placed above it.
     /// A plan notes what the layout needs as if `b` lay where first fit puts it
     /// ([`Planned::need`]), which is what a smaller arena would still have to hold.
     ///

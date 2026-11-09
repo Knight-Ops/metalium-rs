@@ -3537,7 +3537,7 @@ pub fn matmul_requirements_with(tiles: [usize; 3], a_slots: usize) -> MatmulBuff
 
 /// [`matmul_requirements_with`] with `B`'s ring against the arena's end
 /// ([`crate::l1::Requirements::against_end`]): `A` and the outputs first, `B` above them at the
-/// end (`docs/plans/decode-to-bandwidth.md` Phase 8: the ops between two products plan low, and a
+/// end (`docs/completed-plans/decode-to-bandwidth.md` Phase 8: the ops between two products plan low, and a
 /// prefetch of the next product's `B` lands above them).
 pub fn matmul_requirements_top_b(tiles: [usize; 3], a_slots: usize, slots: Slots) -> MatmulBuffers {
     matmul_requirements_placed(tiles, a_slots, true, slots)
@@ -3852,7 +3852,7 @@ pub enum SrcRoute {
     /// one whose low three mantissa bits are clear, and BFP converts to BF16 losslessly, so the
     /// product is [`SrcRoute::Tf32FromFp32`]'s over the values the operands decode to, bit for bit
     /// (gates `step232` for a BF16 `B`, `step239` for BFP, `step241` for every pair;
-    /// `docs/plans/bf16-weight-storage.md`).
+    /// `docs/completed-plans/bf16-weight-storage.md`).
     Edges { a: TileFormat, b: TileFormat },
 }
 
@@ -3979,7 +3979,7 @@ impl SrcRoute {
 
     /// The bytes a `B` tile takes in a GDDR-staged plan's L1: a packed `B`'s own slot (its format's,
     /// [`tt_isa::dm::record::gather_b_format`] reads it there), so a ring holds more tiles
-    /// (`docs/plans/bf16-weight-storage.md` A5b); [`tt_isa::dm::TILE_SLOT`] otherwise.
+    /// (`docs/completed-plans/bf16-weight-storage.md` A5b); [`tt_isa::dm::TILE_SLOT`] otherwise.
     pub const fn b_slot(self) -> u64 {
         match self.packed_b() {
             Some(format) => format.slot_bytes(),
@@ -4150,7 +4150,7 @@ pub fn chunk_fits(tiles: [usize; 3], route: SrcRoute, fidelity: Fidelity) -> boo
 }
 
 /// How many columns a job of a product with a BF16 `B` (compact rings, [`SrcRoute::b_slot`]) is
-/// planned to take (`docs/plans/bf16-weight-storage.md` A5b). Its rings are compact whichever.
+/// planned to take (`docs/completed-plans/bf16-weight-storage.md` A5b). Its rings are compact whichever.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Bf16Plans {
     /// An FP32 `B`'s columns: the same jobs in about half the bytes.
@@ -4382,7 +4382,7 @@ pub fn plan_in(
 /// [`plan_in`] without noting, and the lowest arena end ([`crate::l1::arena`]) at which its
 /// answer is the same: the chunk it chose is the widest that fits, so it stands while that chunk's
 /// own probe layout fits (`A` unpacked, as [`chunk_fits_in`] lays it out), and a smaller arena
-/// narrows it (`docs/plans/planned-l1-residency.md` 2h: at `K` = 2048, `DATA.end` less 110,464
+/// narrows it (`docs/completed-plans/planned-l1-residency.md` 2h: at `K` = 2048, `DATA.end` less 110,464
 /// bytes). [`Staging::SlotsHalf`] holds it in [`half`] the arena, which keeps it while the arena
 /// is twice the probe on [`half`]'s 4096-byte boundary. 0 for [`Staging::Host`], whose layout is
 /// not planned in the arena.
@@ -4814,7 +4814,7 @@ mod tests {
         ));
     }
 
-    /// `docs/plans/planned-l1-residency.md` 2h: a product's plan stands in any arena ending at or
+    /// `docs/completed-plans/planned-l1-residency.md` 2h: a product's plan stands in any arena ending at or
     /// above its floor, and narrows 64 bytes below it. For a one-row product with `K` whole, the
     /// floor is the widest block's probe with `A` unpacked, `(kt + 1)(nc + 1) - 1` slots: at `K` =
     /// 2048, 110,464 bytes of `DATA` left for a region. `plan_in` notes it, hit or miss.
@@ -4864,7 +4864,7 @@ mod tests {
     }
 
     /// A BF16 `B` ([`SrcRoute::TF32_WITH_BF16_B`]) takes 2,112-byte slots in every slot layout
-    /// (`docs/plans/bf16-weight-storage.md` A5b): its pairs step by them, its rings take that many
+    /// (`docs/completed-plans/bf16-weight-storage.md` A5b): its pairs step by them, its rings take that many
     /// bytes a page, and a decode product's plan holds more columns than an FP32 `B`'s in the
     /// same arena. An FP32 `B`'s plans are unchanged.
     #[test]

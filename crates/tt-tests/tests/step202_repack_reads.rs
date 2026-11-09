@@ -1,4 +1,4 @@
-//! A native repack's reads in flight together (`docs/plans/decode-to-bandwidth.md` Phase 1):
+//! A native repack's reads in flight together (`docs/completed-plans/decode-to-bandwidth.md` Phase 1):
 //! `tensor::repack_many` reads up to `REPACK_SLOTS` source tiles into slots of their own before
 //! it copies any of their words (the mover waits for the preceding reads before a `COPY_WORDS`),
 //! where it read each into one slot and copied it before reading the next; and each read is only

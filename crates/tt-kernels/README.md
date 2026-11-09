@@ -126,7 +126,7 @@ Initial execution is single-card; packed mesh transport remains deferred.
 Step92/94 cover independent encoding/arithmetic oracles, special values,
 ragged padding, physical sizes and changed-input replay on simulator and both
 cards. Pinned ttsim refuses direct BFP2 matmul; that arm is silicon-only. See
-[the delivered contract and validation](../../docs/plans/mixed-bfp-storage.md)
+[the delivered contract and validation](../../docs/completed-plans/mixed-bfp-storage.md)
 and [conversion/matmul release medians](../../docs/learnings/performance-log.md).
 
 `Session::copy_xmov` / `zeros_xmov` and `copy_bf16_xmov` / `zeros_bf16_xmov`

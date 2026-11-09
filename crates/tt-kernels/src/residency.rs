@@ -1,4 +1,4 @@
-//! Planned L1 residency (`docs/plans/planned-l1-residency.md`): which of a captured graph's tensors
+//! Planned L1 residency (`docs/completed-plans/planned-l1-residency.md`): which of a captured graph's tensors
 //! could live in a persistent region at the top of each unit's `DATA` arena, from the op that makes
 //! them to the last op that reads them, instead of going through GDDR in between.
 //!
@@ -39,7 +39,7 @@ pub const ALIGN: u64 = tt_isa::dram::ALIGN;
 static PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PLANS: std::sync::Mutex<Vec<(Graph, Plan)>> = std::sync::Mutex::new(Vec::new());
 
-/// A development probe (`docs/plans/planned-l1-residency.md` Phase 1): every capture plans its
+/// A development probe (`docs/completed-plans/planned-l1-residency.md` Phase 1): every capture plans its
 /// graph as it ends, with an L1 path assumed for every op, prints the plan (`RESIDENCY ...`) and
 /// keeps it for [`take_plans`]. Nothing is made resident. Process-wide; dev-facing.
 #[doc(hidden)]
@@ -418,7 +418,7 @@ fn walk(entries: &[[u32; 8]], f: &mut impl FnMut([u32; 8], bool)) -> u64 {
 /// Whether move `w`, plain or expanded from the record `head`, is one [`Applied::rewrite`]
 /// redirects: a plain `READ` or `WRITE`, or a `READ_RUN` without flags, a `WRITE_RUN` or a
 /// `SCATTER`. A product's `SCATTER` expands to whole-tile writes as a `WRITE_RUN` does, so its
-/// output can go straight into its consumers' L1 (`docs/plans/planned-l1-residency.md` Phase 3).
+/// output can go straight into its consumers' L1 (`docs/completed-plans/planned-l1-residency.md` Phase 3).
 fn plain(head: Option<[u32; 8]>, w: [u32; 8]) -> bool {
     match head {
         None => matches!(w[0], op::READ | op::WRITE),
@@ -567,7 +567,7 @@ enum LeaveOut {
 }
 
 /// How a plan delivers a resident row that an op reads whole on many units ([`Tensor::replicated`]:
-/// a product's packed `A`, RMSNorm's twin), `docs/plans/planned-l1-residency.md` 2f.
+/// a product's packed `A`, RMSNorm's twin), `docs/completed-plans/planned-l1-residency.md` 2f.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Rows {
     /// Not at all: such a row stays in GDDR.
@@ -709,7 +709,7 @@ fn root(parent: &mut [usize], mut t: usize) -> usize {
 /// The most a region at the top of an arena ending at `data_end` can take with every op of `g`
 /// laid out as it was: `data_end` less the highest of the ops' needs
 /// ([`crate::trace::OpRecord::l1_need`], the lowest arena end each op's layouts stand at), in whole
-/// [`ALIGN`]s (`docs/plans/planned-l1-residency.md` 2h). At the 1.7B, the `K` = 2048 products'
+/// [`ALIGN`]s (`docs/completed-plans/planned-l1-residency.md` 2h). At the 1.7B, the `K` = 2048 products'
 /// widest blocks set it: 110,464 bytes.
 pub fn cap(g: &Graph, data_end: u64) -> u64 {
     let (_, need) = neediest(g);
@@ -1257,7 +1257,7 @@ impl Plan {
     }
 }
 
-/// A plan applied to a capture of the same graph (`docs/plans/planned-l1-residency.md` Phase 2):
+/// A plan applied to a capture of the same graph (`docs/completed-plans/planned-l1-residency.md` Phase 2):
 /// what the planned capture's ops' lists become, op by op, so its resident tensors move between
 /// units' L1 and never through GDDR.
 ///
@@ -1716,7 +1716,7 @@ pub fn rectangles(tiles: &[(u8, u8)]) -> Vec<((u8, u8), (u8, u8))> {
     out
 }
 
-/// How a row that many units read whole reaches them (`docs/plans/planned-l1-residency.md` 2f):
+/// How a row that many units read whole reaches them (`docs/completed-plans/planned-l1-residency.md` 2f):
 /// a product's packed `A`, RMSNorm's twin. Its producers each hold a few of its face rows; every
 /// reader needs all of them. [`crate::session::Session::probe_row_delivery`] measures each.
 #[doc(hidden)]

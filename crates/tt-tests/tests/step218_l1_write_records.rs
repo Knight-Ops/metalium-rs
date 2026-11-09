@@ -1,5 +1,5 @@
 //! `op::WRITE_L1`: RISCV NC writes its own L1 into another tile's L1
-//! (`docs/plans/planned-l1-residency.md` Phase 2b, the first record of the hang class: a write to
+//! (`docs/completed-plans/planned-l1-residency.md` Phase 2b, the first record of the hang class: a write to
 //! a tile the chip does not have is a NoC access nothing answers).
 //!
 //! The claims:
@@ -33,7 +33,7 @@
 //!   request, an address below `DATA` or in the mailboxes, addresses not congruent mod 16, and the
 //!   entry on B. It writes nothing for any of them.
 //! - **The tile takes a write into the trace arena** (`l1::TRACE_ARENA`, where a capture plans:
-//!   `DATA`, the capture-only arena and the program slots; `docs/plans/decode-to-bandwidth.md`
+//!   `DATA`, the capture-only arena and the program slots; `docs/completed-plans/decode-to-bandwidth.md`
 //!   Phase 8, P1): sent raw, as the host keeps its own lists to `DATA` until a capture asks, writes
 //!   into a peer's capture-only arena and its last program slot land byte for byte. Only what the card's decode refuses is sent raw: a
 //!   geometry-valid tile the chip may not have is never sent past the host.

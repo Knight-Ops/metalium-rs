@@ -1,4 +1,4 @@
-//! 2f of `docs/plans/planned-l1-residency.md`: a row many units read whole, delivered by each of
+//! 2f of `docs/completed-plans/planned-l1-residency.md`: a row many units read whole, delivered by each of
 //! the candidate schemes (`tt_kernels::residency::RowScheme`, `Session::probe_row_delivery`),
 //! lands whole on every reader. `silicon_probe_row_delivery` times them; this gate holds them to
 //! their bytes.

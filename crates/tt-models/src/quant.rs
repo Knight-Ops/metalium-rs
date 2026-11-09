@@ -4,7 +4,7 @@
 //! that dtype) and BFP8, BFP4 and BFP2 (block floating point, physical storage of a logical F32
 //! tensor that the device decodes as it computes, `burn_tt::storage`). A seventh, [`Format::Bf16Stored`],
 //! is BF16 storage of a logical F32 matrix: computed in F32 on the same values, at half the bytes
-//! ([`Plan::bf16_weights`], `docs/plans/bf16-weight-storage.md`). A [`Plan`] names the format
+//! ([`Plan::bf16_weights`], `docs/completed-plans/bf16-weight-storage.md`). A [`Plan`] names the format
 //! of each matrix by a substring of its parameter path (`layers.3.mlp.down_proj.weight`), and
 //! [`apply`] rewrites a model's matrices accordingly.
 //!

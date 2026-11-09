@@ -788,7 +788,7 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
 
 ## `.ttinsn` push fusion (2026-10-10, card 0)
 
-`docs/plans/ttinsn-push-experiment.md`; gates `probe_ttinsn_push`, run only with
+`docs/completed-plans/ttinsn-push-experiment.md`; gates `probe_ttinsn_push`, run only with
 `cargo xtask silicon --feature ttinsn-experiment` (a feature no shippable build enables).
 
 - **Fused `.ttinsn` words run on silicon.** On RISC-V T1 pushing to Tensix thread 1 (`INSTRN_BUF_BASE`):
@@ -850,7 +850,7 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
 
 ### Fused code from the program cache (2026-10-25, card 0)
 
-`docs/plans/ttinsn-push.md`; gate `step231_ttinsn_push` (ttsim and card 0, run `1792956507`), opt-in
+`docs/completed-plans/ttinsn-push.md`; gate `step231_ttinsn_push` (ttsim and card 0, run `1792956507`), opt-in
 (`TT_TTINSN=1`).
 
 - **The shipped T1 runner calls code the host wrote into the program cache over the NoC** (fused `.ttinsn`
@@ -1086,7 +1086,7 @@ fails the same congruence for one of the two source parities. The candidates:
 
 ## Partial-tile GDDR reads in records: one entry beats fewer bytes (2026-10-16, ttsim and cards 0 and 1)
 
-From [decode-matmul-bandwidth.md](../plans/decode-matmul-bandwidth.md) P1 (log:
+From [decode-matmul-bandwidth.md](../completed-plans/decode-matmul-bandwidth.md) P1 (log:
 [decode matmuls](performance-log.md#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1)).
 
 - **A read shorter than a slot is legal and lands as asked.** `Descriptor::decode` checks only a nonzero length, the
@@ -1110,7 +1110,7 @@ From [decode-matmul-bandwidth.md](../plans/decode-matmul-bandwidth.md) P1 (log:
 
 ## A decode product's weights: what the card reads at (2026-10-17, card 0)
 
-From [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 0 (log:
+From [decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Phase 0 (log:
 [decode products against their weight stream](performance-log.md#decode-products-against-their-weight-stream-2026-10-17-card-0)).
 The probe is `silicon_probe_decode_stream`, traced, so the times are the card's.
 
@@ -1161,7 +1161,7 @@ Gate `step232_mixed_src_formats` (card 0 `1792986764`): `A` FP32 in L1 unpacked 
 through TF32**, at LoFi, HiFi2 and HiFi4, with signed zeros, BF16 subnormals, `bf16::MAX`, infinities and NaN in `B`.
 So the Matrix Unit takes the two `Src` registers in different formats, and a BF16 datum in `SrcA` is the TF32 datum of
 the same value (the phases slice by bit position). What it buys: a weight stored BF16 (half the bytes) multiplies as
-its F32 widening (`SrcRoute::Tf32WithBf16B`, [bf16-weight-storage.md](../plans/bf16-weight-storage.md)). BF16 in with
+its F32 widening (`SrcRoute::Tf32WithBf16B`, [bf16-weight-storage.md](../completed-plans/bf16-weight-storage.md)). BF16 in with
 TF32 out (code 5 in, 4 out) is not a way to write it: the specification calls a mismatched pair undefined and ttsim
 refuses it (`in_data_format=5 mismatches out_data_format=4`); not tried on silicon. Blackhole's `UNPACR_Regular.md` is
 a stub; this is measured, not read off Wormhole's `WriteSrcBF16`.
@@ -1279,7 +1279,7 @@ run that disagrees with itself between the logits path and the token path, fixed
 
 ## A matmul's transposed `B` through unpacker 0 (2026-10-17, card 0)
 
-From [decode-attention.md](../plans/decode-attention.md) A0b; gate `step201_unpacker_transposed_b`.
+From [decode-attention.md](../completed-plans/decode-attention.md) A0b; gate `step201_unpacker_transposed_b`.
 - **The mechanism:** a transposed `B` (its tiles in their slots as they lie in GDDR) is unpacked into `SrcA` with
   `Haloize_mode` set, which transposes within each face. `B`'s face `(k, fj)` is unpacked from the slot's face
   `(fj, k)`. The products are **bit for bit** those of the mover's datum-by-datum transpose (`READ_TRANSPOSED`) and
@@ -1292,7 +1292,7 @@ From [decode-attention.md](../plans/decode-attention.md) A0b; gate `step201_unpa
 
 ## A one-row product's compute, `A` reads and weight stream (2026-10-18, cards 0 and 1)
 
-From [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 4 and 5, SmolLM2-1.7B `Step(64)` profiles on
+From [decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Phase 4 and 5, SmolLM2-1.7B `Step(64)` profiles on
 card 1; gates on card 0.
 
 - **A tile pair is bound by its `MVMUL`s.**
@@ -1448,7 +1448,7 @@ From decode-to-bandwidth.md Phase 10 (F27), `silicon_bench_memory::gddr_readers_
 
 ## GDDR reads are one queue: prefetch traffic is paid by the small ops (2026-10-20, cards 0 and 1)
 
-[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8.
+[decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Phase 8.
 - **A unit's reads are issue-bound.** A whole-tile read lands ~1 us after the mover issues it, and the mover issues
   one in ~0.27 us; with ID 6 at a cap of 8, a 128-tile prefetch stalled 0 times (`step215`, `1792468449`). A read the
   mover issues before an entry has almost always landed by the next entry; only reads it has not issued yet are
@@ -1470,7 +1470,7 @@ From decode-to-bandwidth.md Phase 10 (F27), `silicon_bench_memory::gddr_readers_
 
 ## Units reading GDDR together are served unevenly; two in flight evens them (2026-10-22, cards 0 and 1)
 
-[decode-to-bandwidth.md](../plans/decode-to-bandwidth.md) Phase 8, "The stream's rate"; profiles `1792629809`,
+[decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Phase 8, "The stream's rate"; profiles `1792629809`,
 `1792632189` (`skew.tsv`: each unit's own time at each op).
 - **What:** in a 1.7B decode step's `down` product, 64 units each read one 1.06 MB weight column (256 tiles, all on
   one channel, column `j` on channel `j % 8`), the same bytes a unit. Units 0-15 take 150 us, 16-31 154, 32-47 126,
@@ -1540,7 +1540,7 @@ same ID on the same NoC count into one counter, and either core's wait waits for
 
 ## NC writes another tile's L1 (2026-10-20, ttsim and card 0)
 
-[planned-l1-residency.md](../plans/planned-l1-residency.md) Phase 2b: `op::WRITE_L1`, one unicast `noc::Command::Write`
+[planned-l1-residency.md](../completed-plans/planned-l1-residency.md) Phase 2b: `op::WRITE_L1`, one unicast `noc::Command::Write`
 from NC's L1 into a peer Tensix tile's L1 (gate `step218_l1_write_records`; card 0, safe image `1792524683`,
 `fast-reads` `1792524825`, `fast-reads` + `encoded-guard` `1792524963`).
 - **The peer is named by the coordinate the session uses for it, on either NoC.** With translation on, NoC #1 takes
@@ -1621,7 +1621,7 @@ the arena it plans in (`l1::arena`) only through the choices sized from it, and 
 
 ## The Tensix L1 map, and changing it (2026-10-22, ttsim and card 0)
 
-Since 2026-10-22 (`docs/plans/decode-to-bandwidth.md`, "Room for a second job's `B`", M2) a Tensix tile's L1 is, in
+Since 2026-10-22 (`docs/completed-plans/decode-to-bandwidth.md`, "Room for a second job's `B`", M2) a Tensix tile's L1 is, in
 order: the five baby RISC-V images and B's mover list (`0x0..0x1A000`), NC's mover image (`..0x20000`), **`DATA`**
 (`0x20000..0x100000`, 896 KiB, unchanged), **`CAPTURE_ONLY`** (`0x100000..0x116000`, where the mailboxes were: only a
 trace's capture plans there), **`PROGRAMS`** (the four fixed program slots, `0x116000..0x136000`), **`MAILBOXES`**
@@ -1776,3 +1776,10 @@ hang after "Opening subset of mmio devices" (the first attempt, killed by its 50
   kernel JIT fails), so the working route is a tree with its own SFPI: `tt-metal-v077`'s `build_Release` (SFPI 7.69), which JIT-compiles
   kernels itself.
 - **Fast dispatch reserves cores:** the compute grid is 11x10 = 110 on a card where this repo has 12x10 = 120.
+- **2026-11-09, card 1, v077 (`d53c2a71fb0`), firmware bundle 19.14.0:** without a reset first, `ttnn.open_device` succeeded
+  but the first op hung silently, the process spinning at 95% CPU for over 10 minutes with no Ethernet-timeout message.
+  After `tt-smi -r 0000:02:00.0` every run worked. Reset the card before tt-metal, whatever the symptom.
+- **Afterwards, mesh gates fail until both boards are reset.** `cargo xtask silicon --device 1 --filter step12_mnist`
+  passed 7 of 8 on card 1 (`1794198015`). The eighth, a two-chip test, opens card 0 too whatever `--device` says, and
+  failed with "transfer 1 was not acknowledged", the link state above. A `--device 1` filter is not fenced to card 1
+  when it selects a mesh test.

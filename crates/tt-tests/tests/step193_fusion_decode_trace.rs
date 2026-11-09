@@ -1,4 +1,4 @@
-//! F0 of `docs/plans/decode-small-ops.md`: the decode step captured while the model runs on
+//! F0 of `docs/completed-plans/decode-small-ops.md`: the decode step captured while the model runs on
 //! `burn_tt::Tt` (burn-fusion over `TtBackend`) rather than on `TtBackend` itself.
 //!
 //! The claims:

@@ -1,5 +1,7 @@
 # Decode matmul bandwidth
 
+> **Archived 2026-11-09.** P0-P3 done; P5 (a channel a column) was answered by F27, H11 and H17 (see ../learnings/failed-approaches.md); split-K moved to ../proposals/split-k-and-flash-decode.md. Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile": **the matmuls' bandwidth**. Written 2026-10-16 against
 `5ef99ca` plus the row-scatter work (`step189`). Status (2026-10-16): **P0-P2 done** (a 1.7B decode step
 57.21 / 59.64 / 62.81 -> 49.78 / 52.27 / 55.44 ms; matmuls 33.8 -> 26.3 ms a step); **P3 done** (47.90 / 50.37 /

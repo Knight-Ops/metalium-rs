@@ -1,5 +1,5 @@
 //! A product whose `B` is BF16 in L1 and whose `A` is FP32: is it the FP32 product over the same
-//! values, bit for bit? (`docs/plans/bf16-weight-storage.md` A0.)
+//! values, bit for bit? (`docs/completed-plans/bf16-weight-storage.md` A0.)
 //!
 //! A BF16 value is an FP32 one with its low sixteen bits clear, and the unpacker's TF32 keeps the
 //! top ten mantissa bits, so in `Src` the two should be the same datum. If the Matrix Unit's

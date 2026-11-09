@@ -2,7 +2,7 @@
 //   ttinsn_programs_are_current`; do not edit.
 //
 // Each program the `.ttinsn` experiment image can push fused
-// (`docs/plans/ttinsn-push-experiment.md`): its staged words (to match
+// (`docs/completed-plans/ttinsn-push-experiment.md`): its staged words (to match
 // against), and the same instructions as `.ttinsn` words in section
 // `.ttinsn`, block repeats as loops. A `.ttinsn` word is the Tensix
 // instruction rotated left two bits; the core rotates it back and stores it

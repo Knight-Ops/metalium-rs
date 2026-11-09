@@ -494,7 +494,7 @@ or IEEE special-value behavior is promised.
 
 ## Next tranche delivered: per-tensor BFP8/4/2 and PRNG diagnostics (2026-10-06)
 
-See [mixed BFP storage](../plans/mixed-bfp-storage.md) for the current contract. Session
+See [mixed BFP storage](mixed-bfp-storage.md) for the current contract. Session
 BFP pack/unpack, direct packed products and Burn storage policies retain logical
 F32 and F32 compute/accumulation. Master parameters, gradients and optimizer
 operations remain F32; casts use identity backward. Native policies for actual
@@ -509,7 +509,7 @@ but direct RISC-V seed stores with a fence and conservative settling interval
 restart it on both cards (`1791302214`, 4/4). Lanes have strong initialization
 correlations and seed 0xffffffff is absorbing. *Superseded:* S7 was completed in the
 Phase 10 close-out. Burn random now draws on the device (native `float_random`,
-`crates/burn-tt/src/random.rs`, step140-142; see [mixed-bfp-storage.md](../plans/mixed-bfp-storage.md)).
+`crates/burn-tt/src/random.rs`, step140-142; see [mixed-bfp-storage.md](mixed-bfp-storage.md)).
 Application RNG quality beyond that stays deferred.
 
 ### F1 resident matrix chains continuation (2026-10-06)

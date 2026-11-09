@@ -1,5 +1,7 @@
 # BF16 weight storage: half the bytes a decode step reads, bit for bit
 
+> **Archived 2026-11-09.** Complete (A0-A5, 2026-10-26). Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Status (2026-10-26): **A0-A5 done: built, gated on ttsim and card 0, measured (decode 16.80 -> 11.73 ms), the benches' default.** A5b's compact L1 slots are bit for bit and free L1, but do not shorten the step. Roadmap Track 1, "The roofline";
 [decode-to-bandwidth.md](decode-to-bandwidth.md) Phase 9. Decided by the user on 2026-10-26, once the F32 levers were
 spent (a 1.7B step at 16.8 / 18.2 ms, its weights at ~430 GB/s, 92% of the 469 GB/s read ceiling; F32's floor ~14.3 ms).

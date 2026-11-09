@@ -116,7 +116,7 @@ Native reductions, K-blocked products, resident indexing, BF16 storage/casts,
 convolution/pooling/attention and matrix elementwise arithmetic have landed.
 BFP8/4/2 per-tensor storage, native conversions/products and mixed-storage
 training/traces are delivered; see the
-[storage contract and completed checklist](docs/plans/mixed-bfp-storage.md).
+[storage contract and completed checklist](docs/completed-plans/mixed-bfp-storage.md).
 General payload-preserving Tensix transpose and further format coverage
 (INT8, `a` variants, quantization) remain open. Burn random draws on the device
 (seeded uniform, Bernoulli, normal and integer ranges, step140-142). See

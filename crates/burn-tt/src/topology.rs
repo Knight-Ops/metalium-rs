@@ -31,16 +31,17 @@ pub enum Topology {
 }
 
 impl Topology {
-    /// The tiles every gate in this workspace uses: inside the surviving Tensix
-    /// columns of both p150a cards here (`tt-tests/src/backend.rs`).
+    /// The tiles a mesh ([`Topology::Cards`]) computes and relays on: inside the
+    /// surviving Tensix columns of both p150a cards here (`tt-tests/src/backend.rs`).
     pub const COMPUTE: (u8, u8) = (3, 4);
     pub const RELAY: (u8, u8) = (4, 4);
 
-    /// One card.
+    /// One card, computing on every surviving Tensix tile: the default. Fewer is
+    /// [`Topology::on_tiles`]'s (`TT_TILES`); a gate that needs one known tile names it.
     pub fn single(card: u16) -> Self {
         Topology::Single {
             card,
-            tile: TileChoice::Exactly(Self::COMPUTE.0, Self::COMPUTE.1),
+            tile: TileChoice::All,
         }
     }
 

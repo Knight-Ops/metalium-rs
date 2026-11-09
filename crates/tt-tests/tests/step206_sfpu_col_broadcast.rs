@@ -1,5 +1,5 @@
 //! A `[rows, 1]` operand broadcast across a `[rows, cols]` one by the SFPU, not the mover
-//! (`docs/plans/decode-to-bandwidth.md` Phase 3, the small ops): the mover reads the column's
+//! (`docs/completed-plans/decode-to-bandwidth.md` Phase 3, the small ops): the mover reads the column's
 //! tile as it lies (`record::READ_RUN_COL_AS_IT_LIES`), and the program first copies column 0
 //! into every column in `Dst` (`sfpu::Program::broadcast_col0`). The mover's datum-at-a-time
 //! copy (`READ_BROADCAST_COL`) cost ~10 us a tile: RMSNorm's division and the softmax's

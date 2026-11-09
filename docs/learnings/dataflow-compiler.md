@@ -38,7 +38,7 @@ Every principle also says what would **overturn** it. To change a principle, rec
 **What this repository already does dataflow-style:**
 - Within a core, reads, compute and writes overlap through credits and double-buffered L1 halves (`Session::enable_dram`, [streaming-dataflow-architecture.md](streaming-dataflow-architecture.md)).
 - Traces remove host dispatch.
-- The residency planner keeps graph-internal tensors in L1 and writes producers' outputs into their readers' L1 ([planned-l1-residency.md](../plans/planned-l1-residency.md)).
+- The residency planner keeps graph-internal tensors in L1 and writes producers' outputs into their readers' L1 ([planned-l1-residency.md](../completed-plans/planned-l1-residency.md)).
 - Weight prefetch reads the next product's operand while earlier ops run.
 
 **What it does not do** (survey of 2026-10-27):
@@ -184,6 +184,8 @@ fallback for H11 (§15), not a default. Hazy's measurements put a claim's cost a
 - **Rounding points:** every pack that narrows, with its mode (T3).
 - **Approximation:** an SFPU program's own semantics, fixed by the SFPU interpreter model.
 
+**Two contracts since 2026-11-09** ([ADR 0006](../adr/0006-two-numeric-contracts-reference-and-performance.md)). The defaults above are the *reference* contract, default for conformance and training gates. Inference defaults to the deterministic *performance* contract: BF16 activations with native BF16 arithmetic, BFP8 weights, derived fidelity up to HiFi2 (LoFi for BFP4), packer L1 accumulation with its partial format stated, a fixed per-op K chunking. S1 and S3 hold inside each contract.
+
 The reference for "bit-exact" is the op's **specification model**: the matmul rule of T5, the SFPU interpreter, and the mover's copy semantics. Burn's own results (burn-flex) are checked within bounds derived from the contract, never a guessed tolerance (AGENTS.md).
 
 **S3. A schedule chooses only among bit-equivalent options.** Tiling and distributing *parallel* dimensions is always legal. A reduction dimension may be split or reordered only in the way its contract states. A transform that cannot prove equivalence under S2 is either a **different contract**, opt-in and named (as `MatmulMode::{Fast, Exact, Accurate}` are today), or it is not done. Autotuning searches only within the equivalent set, so tuning never changes results.
@@ -277,7 +279,7 @@ A channel has one producer and N consumers. Broadcast lowers to multicast, and d
 Each transform states its legality under S2/S3, its expected effect, and the evidence for it.
 
 **A transform's GDDR is part of its cost** (owner, 2026-11-03;
-[roadmap constraint](../plans/roadmap.md#constraint-every-default-must-scale-to-larger-models)).
+[roadmap constraint](../plans/roadmap.md#standing-constraints)).
 - A default transform holds a weight's bytes once. Extra GDDR it takes is bounded by a constant or by what already
   scales with the workload (activations, the KV cache, stored traces), never by the weights.
 - A transform that stores a weight twice (X9's two-copy form) can be built and gated, but it stays opt-in.
@@ -469,7 +471,10 @@ Tiling, distribution, fusion, reuse, channels and formats come from the passes.
 
 ## 13. Hypotheses register
 
-Each entry: the claim, the prediction, how it is measured, and what kills it. Results are recorded in place.
+Each entry: the claim, the prediction, how it is measured, and what kills it. Results are recorded in place. Killed
+entries are also listed, with the condition under which they are worth retrying, in
+[failed-approaches.md](failed-approaches.md). Since 2026-11-09 a new hypothesis states its contract (reference or
+performance, ADR 0006) and its predicted gain on the parity workload ([tt-metal-parity.md](../plans/tt-metal-parity.md) §7).
 
 - **H1 Operand reuse.** Products at prefill shapes are bound by operand reads, so reading each operand from GDDR about once (D5's winner) lifts them toward the compute bound, for every format at once.
   - *Prediction as first written:* `[m,2048]@[2048,16384]` at m = 2,048 from 18.2 to ≥ 35 TFLOPS. The BFP8-weight case improves in proportion to its bytes.

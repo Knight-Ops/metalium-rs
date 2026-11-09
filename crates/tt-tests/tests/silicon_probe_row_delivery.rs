@@ -1,4 +1,4 @@
-//! 2f of `docs/plans/planned-l1-residency.md`: what each way of delivering a row that many units
+//! 2f of `docs/completed-plans/planned-l1-residency.md`: what each way of delivering a row that many units
 //! read whole costs on the card (`tt_kernels::residency::RowScheme`,
 //! `Session::probe_row_delivery`).
 //!

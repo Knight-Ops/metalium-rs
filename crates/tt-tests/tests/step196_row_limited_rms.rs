@@ -1,4 +1,4 @@
-//! RMSNorm's statistic over only the rows a tile row has (`docs/plans/decode-small-ops.md` S3):
+//! RMSNorm's statistic over only the rows a tile row has (`docs/completed-plans/decode-small-ops.md` S3):
 //! a tile row of fewer than 32 rows -- a decode step's `[1, d]` -- runs the kernel's programs
 //! over only the row groups its rows occupy (`tt_kernels::sfpu::reduce::row_offsets`: one of
 //! eight for one row), on the card.

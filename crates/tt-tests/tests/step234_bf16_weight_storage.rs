@@ -1,6 +1,6 @@
 //! A model whose weights are stored BF16 (`Llama::with_bf16_weights`: half the bytes a decode step
 //! reads) generates the F32 model's tokens and logits **bit for bit**, traced, wherever its weights
-//! hold BF16 values -- as a BF16 checkpoint widened to F32 does (`docs/plans/bf16-weight-storage.md`
+//! hold BF16 values -- as a BF16 checkpoint widened to F32 does (`docs/completed-plans/bf16-weight-storage.md`
 //! A3). Checked on Llama shapes SmolLM2 lacks (grouped-query attention, an untied head, head width
 //! 128, ragged widths and vocabularies) and on SmolLM2's own checkpoint (`weights` feature).
 //!

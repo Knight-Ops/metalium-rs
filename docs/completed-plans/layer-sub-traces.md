@@ -1,5 +1,7 @@
 # Layer sub-traces: one stored layer, called once a layer
 
+> **Retired 2026-11-06** (`61604b9`): layer sub-traces were slower (+0.15 ms a step) and were removed; the open boxes below will not be done. See [failed-approaches.md](../learnings/failed-approaches.md).
+
 **Retired 2026-11-06** (firmware diet, roadmap Track 2 item 2b). Opt-in and slower since it was built, its firmware
 (`CALL_BODY`, `ARG_REF`, `ARG_WORD`, the argument table) cost the B mover 1,624 bytes and NC 704, room the next decode
 levers need. The code is in git at the commit before the retirement (`subtrace.rs`, `Session::store_sub_stream`,
@@ -156,7 +158,7 @@ The first card run (`step187` SmolLM2, 30 layers, every tile) stalled at a relea
 - [x] **4. Measured** (card 0, every tile, same build): see the status and
   [the performance log](../learnings/performance-log.md#layer-sub-traces-stored-bodies-and-calls-2026-10-23-card-0).
   **Not the default:** the step is slower.
-- [ ] **5. The body resident in L1** (deferred). It would remove a layer's chunk and section fetches (~0.23 ms a step,
+- [-] **5. The body resident in L1** (deferred). It would remove a layer's chunk and section fetches (~0.23 ms a step,
   5a's measure), less the table's read. It needs:
   - ~7 KB a unit reserved from the capture planner (`CAPTURE_ONLY` or `PROGRAMS`);
   - copy-then-patch, since bases and arguments differ per layer.
@@ -164,7 +166,7 @@ The first card run (`step187` SmolLM2, 30 layers, every tile) stalled at a relea
   Worth building only with what else would make it pay: tables in L1 too, or arguments read by the records rather
   than patched (no per-call table read), or once trace storage, not the step, binds (trace segmentation, prefill
   buckets past 256).
-- [ ] **`Chunk(256)`'s bodies:** no unit made one (316 MB stored as captured); report why (most likely tables past
+- [-] **`Chunk(256)`'s bodies:** no unit made one (316 MB stored as captured); report why (most likely tables past
   126 entries) and decide whether the table, or the chunk, should grow.
-- [ ] **Smaller tables** (if storage matters): a reference argument as its bases entry alone where its first entry is
+- [-] **Smaller tables** (if storage matters): a reference argument as its bases entry alone where its first entry is
   the same in every layer (about half the tables).

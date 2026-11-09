@@ -1069,7 +1069,7 @@ impl<B: burn_tt::storage::StorageBackend> Llama<B> {
     /// ([`Llama::untied`], [`crate::quant::Plan::bf16_weights`]): half the bytes a decode step
     /// reads, and for a BF16 checkpoint widened to F32 ([`Precision::F32`]) the same logits **bit
     /// for bit**, since BF16 storage holds those values exactly and burn-tt multiplies them as it
-    /// multiplies F32 (`docs/plans/bf16-weight-storage.md`). Apply after [`Llama::fused`], so the
+    /// multiplies F32 (`docs/completed-plans/bf16-weight-storage.md`). Apply after [`Llama::fused`], so the
     /// fused matrices are the ones stored.
     pub fn with_bf16_weights(self) -> Self {
         self.with_stored_weights(crate::quant::Format::Bf16Stored)

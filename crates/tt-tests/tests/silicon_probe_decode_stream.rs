@@ -1,4 +1,4 @@
-//! Phase 0 of `docs/plans/decode-to-bandwidth.md`: what bounds a decode product's weight read,
+//! Phase 0 of `docs/completed-plans/decode-to-bandwidth.md`: what bounds a decode product's weight read,
 //! against the card's read ceiling (469 GB/s, `silicon_bench_memory`, 120 tiles).
 //!
 //! `cargo xtask silicon --release --device 0 --filter silicon_probe_decode_stream`

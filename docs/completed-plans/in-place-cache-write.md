@@ -1,5 +1,7 @@
 # Writing a traced cache in place
 
+> **Archived 2026-11-09.** Complete (D1-D4, 2026-10-17). Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Status: **D1-D4 done (2026-10-17): a 1.7B decode step 41.83 / 44.25 / 47.40 -> 38.97 / 41.41 / 44.58 ms
 (`1792263398`), 135M 20.03-21.19 -> 18.59-19.79 (`1792263801`); D5 done there as the position-major cache
 (2026-10-18, [decode-attention.md](decode-attention.md) A-layout).** Scheduled 2026-10-16; was `docs/proposals/in-place-cache-write.md`). It follows

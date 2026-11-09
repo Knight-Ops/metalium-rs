@@ -1,4 +1,4 @@
-//! B0 of `docs/plans/decode-step-bandwidth.md`: what each captured op moves through GDDR, counted
+//! B0 of `docs/completed-plans/decode-step-bandwidth.md`: what each captured op moves through GDDR, counted
 //! when its trace is stored (`tt_kernels::profile_mode::OpBytes`; the profile mode counts, and
 //! `burn_tt::set_count_trace_bytes` counts without it).
 //!

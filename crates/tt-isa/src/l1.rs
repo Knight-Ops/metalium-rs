@@ -85,7 +85,7 @@ pub const DATA: Region = Region {
 };
 
 /// What the mailboxes left when they were packed above the program slots
-/// (`docs/plans/decode-to-bandwidth.md` Phase 8, "Room for a second job's `B`",
+/// (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, "Room for a second job's `B`",
 /// M2): L1 between [`DATA`] and [`PROGRAMS`] that only a trace's capture plans
 /// into, with the program slots ([`TRACE_ARENA`]). Ops outside a capture never
 /// see it, so their layouts, block widths and run lengths are sized from

@@ -36,7 +36,7 @@ cargo test -p tt-layout
 
 - This host layout crate converts FP32, BF16 and FP16; it has no BFP encoder.
   Native BFP8/4/2 pack/unpack lives in `tt-kernels::bfp` and runs on Tensix;
-  see [the storage contract](../../docs/plans/mixed-bfp-storage.md).
+  see [the storage contract](../../docs/completed-plans/mixed-bfp-storage.md).
 - The device does not read every FP16 bit pattern the way the host writes it (see
   `HostDtype::F16`'s doc).
 - `PadValue` has only `Zero`: right for accumulation, wrong for a min-reduction.

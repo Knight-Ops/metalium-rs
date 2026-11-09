@@ -11,7 +11,7 @@
 //! others enqueued nothing for it, and the same pair, repeated with fresh operands, is right
 //! every time.
 //!
-//! A capture keeps the rule (`docs/plans/replay-fixed-cost.md` P1): a captured op's barrier
+//! A capture keeps the rule (`docs/completed-plans/replay-fixed-cost.md` P1): a captured op's barrier
 //! counts the units it ran on, a unit that sat ops out waits (a wait-only `BARRIER` in its
 //! stream) before its next op and at the trace's end, and a replay adds the arrivals the
 //! capture counted. Held to the host's products on fresh operands at every replay, with ops

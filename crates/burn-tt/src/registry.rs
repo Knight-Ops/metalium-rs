@@ -22,10 +22,11 @@ use crate::{ElementwiseMode, Fidelity, MatmulMode, SrcRoute, TileChoice, TtDevic
 /// How a device is opened.
 ///
 /// The default is one card -- the device's own, `/dev/tenstorrent/{chip}` --
-/// computing on its first surviving tile, through `Tf32FromFp32` at `HiFi4`,
-/// with SFPU element-wise arithmetic and the fast (FPU) matmul ([`MatmulMode`]). That tile is the one choice that exists
-/// on every card, however it is harvested; a tile *count* is the caller's
-/// ([`TtConfig::tiles`], `TT_TILES`).
+/// computing on every surviving Tensix tile (however the card is harvested), through
+/// `Tf32FromFp32` at `HiFi4`, with SFPU element-wise arithmetic and the fast (FPU) matmul
+/// ([`MatmulMode`]). Fewer tiles are the caller's choice ([`TtConfig::tiles`], `TT_TILES`):
+/// one tile cannot hold a model's traces and is never the fast choice for a model
+/// (`docs/plans/tt-metal-parity.md`, W6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TtConfig {
     topology: Option<Topology>,
@@ -114,10 +115,10 @@ impl TtConfig {
 
     /// The cards and tiles this configuration opens for `device`.
     pub fn resolve(&self, device: TtDevice) -> Result<Topology, TtError> {
-        let base = self.topology.clone().unwrap_or(Topology::Single {
-            card: device.chip,
-            tile: TileChoice::First,
-        });
+        let base = self
+            .topology
+            .clone()
+            .unwrap_or(Topology::single(device.chip));
         match self.tiles {
             Some(tiles) => base.on_tiles(tiles),
             None => Ok(base),
@@ -252,13 +253,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_is_one_card_on_its_first_tile() {
+    fn the_default_is_one_card_on_every_tile() {
         let config = TtConfig::default();
         assert_eq!(
             config.resolve(TtDevice::new(3)).unwrap(),
             Topology::Single {
                 card: 3,
-                tile: TileChoice::First
+                tile: TileChoice::All
             }
         );
     }

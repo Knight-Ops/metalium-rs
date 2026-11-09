@@ -1,4 +1,4 @@
-//! Released barriers (`docs/plans/decode-to-bandwidth.md` Phase 3, `Session::set_barrier_release`,
+//! Released barriers (`docs/completed-plans/decode-to-bandwidth.md` Phase 3, `Session::set_barrier_release`,
 //! `dm::op::BARRIER` word 6): unit 0 waits on the barrier counter in its own L1, then multicasts
 //! each target it arrives at to every other unit's `dm::BARRIER_RELEASE`, and each unit waits on
 //! its own word, with no NoC traffic while it waits -- tt-metal's coordinator-broadcast barrier,

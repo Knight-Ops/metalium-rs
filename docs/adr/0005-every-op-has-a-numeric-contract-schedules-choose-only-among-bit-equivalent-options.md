@@ -1,7 +1,7 @@
 ---
 number: 5
 title: "Every op has a numeric contract; schedules choose only among bit-equivalent options"
-status: "accepted"
+status: "accepted; default amended by ADR 0006"
 affected_paths:
   - "docs/learnings/dataflow-compiler.md"
   - "crates/tt-kernels/src/matmul.rs"
@@ -20,3 +20,6 @@ Every op states a numeric contract: per reduction dimension its chunking and com
 
 ## Consequences
 Results never change with the grid, the session's tile count, the card or the schedule. Split-K, flash-attention, packer L1 accumulation, a 16-bit Dst and fidelity below the contract's rule stay opt-in contracts. Every transform's gate compares bit for bit against the unscheduled composition and the specification model, with a negative control. Fused bodies must round to every narrower intermediate format the unfused graph packed to.
+
+## Amended (2026-11-09)
+[ADR 0006](0006-two-numeric-contracts-reference-and-performance.md) names this default the *reference* contract and makes a deterministic *performance* contract (BF16 activations, BFP8 weights, derived fidelity up to HiFi2, packer L1 accumulation) the inference default. The rule above, that a schedule chooses only among options bit-equivalent under its contract, holds inside each contract.

@@ -492,7 +492,7 @@ fn chain_of(s: &mut Card, n: usize, cols: usize, matmul: bool) -> TraceId {
 }
 
 /// What one more op costs a replay, against how many tiles the session has open and how many of
-/// them the op runs on (`docs/plans/replay-fixed-cost.md`, P0): host-timed replays of captured
+/// them the op runs on (`docs/completed-plans/replay-fixed-cost.md`, P0): host-timed replays of captured
 /// chains of 16 and 64 ops, unstamped, the slope between them the cost an op. Each captured op
 /// ends in a barrier every open unit reaches, so an op on one unit of many shows what the barrier
 /// alone costs. `SWEEP_TILES` (default `1,8,32,all`) picks the session sizes.

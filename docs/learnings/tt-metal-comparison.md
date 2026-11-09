@@ -1,5 +1,10 @@
 # Where we stand against tt-metal: findings and fixes to investigate
 
+> **Followed by the 2026-11-09 review,** [tt-metal-parity.md](../plans/tt-metal-parity.md). It corrects §3.2 (tt-metal's decode
+> matmul computes on its 8-24 DRAM reader cores, not 64-104) and §5's "not found" rows (a Blackhole DRAM-sharded GB/s table,
+> the sampler's ~19.5 ms cost). It also records the same-card baseline that closes F1, and turns the F-items into
+> the W0-W10 program.
+
 **Snapshot of 2026-10-26.** Compared against the local tt-metal checkout `/mnt/nvme/tt-metal` at
 `a11d86c19d3` (`v0.81.0-dev20261013-1`, committed 2026-10-12), with this repository at `22a265f` on branch
 `traced-generation`. It has two halves: how far the stack is from a viable Rust inference engine for

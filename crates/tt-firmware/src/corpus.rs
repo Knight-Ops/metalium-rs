@@ -20,7 +20,7 @@ use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{PushesTo, TensixThread};
 
 /// The hooks the `.ttinsn` experiment image (`bin/ttinsn_t1.rs`) installs
-/// (`docs/plans/ttinsn-push-experiment.md`). Single-threaded: one core runs
+/// (`docs/completed-plans/ttinsn-push-experiment.md`). Single-threaded: one core runs
 /// this, and the image sets them before the runner starts.
 #[cfg(feature = "ttinsn-experiment")]
 pub mod experiment {

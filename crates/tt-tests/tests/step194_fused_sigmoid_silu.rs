@@ -1,6 +1,6 @@
 //! The chain fuser (`burn_tt::fusion::chain`): Burn's default `sigmoid`, `silu` and
 //! `silu(gate) * up` on `Tt` (burn-fusion over `TtBackend`). Plans: `docs/plans/kernel-fusion.md`
-//! Phase 2, `docs/plans/decode-small-ops.md` F0 and S2b.
+//! Phase 2, `docs/completed-plans/decode-small-ops.md` F0 and S2b.
 //!
 //! burn-fusion 0.21 does not forward `ActivationOps` to the backend, so `sigmoid` on `Tt` reaches
 //! the stream as Burn's composition: a cast to F32, `x -1`, `exp`, `+ 1`, `log`, `x -1`, `exp`

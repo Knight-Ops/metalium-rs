@@ -1,5 +1,5 @@
 //! Run-time translation of a staged program into fused `.ttinsn` code
-//! (`docs/plans/ttinsn-push-experiment.md`, "Run-time translator"), and the
+//! (`docs/completed-plans/ttinsn-push-experiment.md`, "Run-time translator"), and the
 //! instruction-cache invalidation executing it needs.
 //!
 //! Only with the `ttinsn-experiment` feature. The build-time gate cannot see

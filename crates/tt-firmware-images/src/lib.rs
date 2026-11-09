@@ -173,7 +173,7 @@ pub const ICACHE_T: [Image; 3] = [
 ];
 
 /// The `.ttinsn` push-fusion experiment's T1 image
-/// (`docs/plans/ttinsn-push-experiment.md`): [`ROLES`]'s math image with two hooks,
+/// (`docs/completed-plans/ttinsn-push-experiment.md`): [`ROLES`]'s math image with two hooks,
 /// built with fused `.ttinsn` words for a few programs. Only with the
 /// `ttinsn-experiment` feature, which no shippable build turns on.
 #[cfg(feature = "ttinsn-experiment")]

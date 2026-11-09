@@ -1,5 +1,5 @@
 //! Fused `.ttinsn` code: a role program as RISC-V code that pushes its Tensix words by
-//! executing them (`docs/plans/ttinsn-push.md`).
+//! executing them (`docs/completed-plans/ttinsn-push.md`).
 //!
 //! A runner pushes a staged program word by word, a load and a store a word (3.31 cycles on
 //! silicon). `.ttinsn` is the same push as one instruction, the Tensix word rotated left two

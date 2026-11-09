@@ -8,7 +8,7 @@ yet. It records:
 - two notes for [batched-decode.md](batched-decode.md): pipelined micro-batches, and KV capacity as the concurrency
   ceiling.
 
-Roadmap: Track 3, multi-chip ([roadmap.md](../plans/roadmap.md#track-3-multi-chip-after-the-single-chip-path-is-fast)).
+Roadmap: Track 3, multi-chip ([roadmap.md](../plans/roadmap.md#w10-multi-chip-after-w1-w3)).
 
 ## What the post describes
 
@@ -46,7 +46,7 @@ A wafer has ~230x a card's raw L1 and ~400x its data area.
 
 ## Rejected: weights resident in L1
 
-- **Whole models.** The 1.7B's F32 weight slots are 6.957 GB ([decode-to-bandwidth.md](../plans/decode-to-bandwidth.md),
+- **Whole models.** The 1.7B's F32 weight slots are 6.957 GB ([decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md),
   "The 2026-10-19 review"). Divided by one card's 110 MB data area:
   - ~63 cards at F32;
   - ~32 cards at BF16;
@@ -58,7 +58,7 @@ A wafer has ~230x a card's raw L1 and ~400x its data area.
     (decode-to-bandwidth, "Room for a second job's `B`"). That ring is being built from `MAILBOXES` and `PROGRAMS`
     instead.
   - The residency region (98,304 B) already sits under the products' cliff of 110,464 B. 64 B past the cliff, the
-    1.7B's products narrow and slow by 8-10% ([planned-l1-residency.md](../plans/planned-l1-residency.md) 2h-i).
+    1.7B's products narrow and slow by 8-10% ([planned-l1-residency.md](../completed-plans/planned-l1-residency.md) 2h-i).
   - Even if 300 KB a tile were free, that is 36 MB: 0.5% of the 1.7B's weights, ~0.07 ms of a 16.8-ms step.
 - **Small models do not need it.** The 135M's F32 weights are ~0.54 GB, ~1.2 ms at 469 GB/s, yet its step is
   8.00-9.38 ms. Small ops and fixed per-op cost bound it, not the weight stream.
@@ -140,5 +140,5 @@ compares two candidates.
 - Cerebras, "How we deploy trillion-parameter frontier models on Cerebras", 2026-10-22,
   https://www.cerebras.ai/blog/how-we-deploy-trillion-parameter-frontier-models-on-cerebras
 - [batched-decode.md](batched-decode.md): KV capacity and the per-user-speed metric, added from this review.
-- [decode-to-bandwidth.md](../plans/decode-to-bandwidth.md), [planned-l1-residency.md](../plans/planned-l1-residency.md):
+- [decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md), [planned-l1-residency.md](../completed-plans/planned-l1-residency.md):
   the single-card floor and the L1 budget used above.

@@ -1,4 +1,4 @@
-//! The `.ttinsn` push-fusion experiment (`docs/plans/ttinsn-push-experiment.md`).
+//! The `.ttinsn` push-fusion experiment (`docs/completed-plans/ttinsn-push-experiment.md`).
 //!
 //! Three things live here:
 //!
@@ -7,7 +7,7 @@
 //!   (`TT_BLESS=1` rewrites it; without, the test fails if it is stale). The
 //!   build-time gate's negative controls (a stray `.word`, a run word with low
 //!   bits `11`, a non-Tensix opcode) were run by hand, not by a test here
-//!   (`docs/plans/ttinsn-push-experiment.md`, Results, Phase 2);
+//!   (`docs/completed-plans/ttinsn-push-experiment.md`, Results, Phase 2);
 //! * the **ttsim** decode-or-refuse probe;
 //! * the **silicon** rungs and measurement, behind the `ttinsn-experiment`
 //!   feature, run only through `cargo xtask silicon` on card 0.
@@ -229,7 +229,7 @@ pub fn generate() -> String {
          //   ttinsn_programs_are_current`; do not edit.\n\
          //\n\
          // Each program the `.ttinsn` experiment image can push fused\n\
-         // (`docs/plans/ttinsn-push-experiment.md`): its staged words (to match\n\
+         // (`docs/completed-plans/ttinsn-push-experiment.md`): its staged words (to match\n\
          // against), and the same instructions as `.ttinsn` words in section\n\
          // `.ttinsn`, block repeats as loops. A `.ttinsn` word is the Tensix\n\
          // instruction rotated left two bits; the core rotates it back and stores it\n\
@@ -505,7 +505,7 @@ mod experiment {
 
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, gathering"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, gathering"]
     fn gathering_is_off_by_default_and_the_flag_keeps_it_on() {
         tt_tests::harness::assert_on_silicon();
         in_device(assert_gathering_follows_the_flag);
@@ -626,7 +626,7 @@ mod experiment {
     /// Rung 1: one fused `.ttinsn` NOP retires, and nothing hangs.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, Phase 4"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, Phase 4"]
     fn rung1_one_fused_nop() {
         tt_tests::harness::assert_on_silicon();
         in_device(|dev| {
@@ -640,7 +640,7 @@ mod experiment {
     /// into one push: all four retire, nothing hangs.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, Phase 4"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, Phase 4"]
     fn rung2_four_fused_nops() {
         tt_tests::harness::assert_on_silicon();
         in_device(|dev| {
@@ -696,7 +696,7 @@ mod experiment {
     /// Rung 4: the full precise `gelu` (11,495 pushed words), bit-exact.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, Phase 4"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, Phase 4"]
     fn rung4_gelu_matches() {
         matches_runner("gelu", BAKED);
     }
@@ -709,7 +709,7 @@ mod experiment {
     /// phase by construction.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, Phase 5"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, Phase 5"]
     fn measure_push_phase() {
         tt_tests::harness::assert_on_silicon();
         const REPS: usize = 9;
@@ -918,7 +918,7 @@ mod experiment {
     /// `REPS` after warm-ups, every run's output compared byte for byte.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, Phase 5"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, Phase 5"]
     fn measure_kernel_level() {
         tt_tests::harness::assert_on_silicon();
         const REPS: usize = 9;
@@ -1020,7 +1020,7 @@ mod experiment {
     /// (must return 2).
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, run-time translator"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, run-time translator"]
     fn rung0_icache_invalidation() {
         tt_tests::harness::assert_on_silicon();
         in_device(|dev| {
@@ -1041,7 +1041,7 @@ mod experiment {
     /// Rung 5: translate four NOPs and run them.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, run-time translator"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, run-time translator"]
     fn rung5_translate_nops() {
         tt_tests::harness::assert_on_silicon();
         in_device(|dev| {
@@ -1057,7 +1057,7 @@ mod experiment {
     /// Rung 6: a short real program, translated, bit-exact.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, run-time translator"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, run-time translator"]
     fn rung6_translated_short_program_matches() {
         matches_runner("short", TRANSLATE | TIME);
     }
@@ -1065,7 +1065,7 @@ mod experiment {
     /// Rung 7: the full precise `gelu`, translated, bit-exact.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, run-time translator"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, run-time translator"]
     fn rung7_translated_gelu_matches() {
         matches_runner("gelu", TRANSLATE | TIME);
     }
@@ -1075,7 +1075,7 @@ mod experiment {
     /// (the runner's `START` is before them), which is what the kernel pays.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, run-time translator"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, run-time translator"]
     fn measure_translator() {
         tt_tests::harness::assert_on_silicon();
         const REPS: usize = 9;
@@ -1217,7 +1217,7 @@ mod experiment {
     /// speed depends on gathering at all.
     #[cfg(feature = "silicon")]
     #[test]
-    #[ignore = "experiment: docs/plans/ttinsn-push-experiment.md, gathering"]
+    #[ignore = "experiment: docs/completed-plans/ttinsn-push-experiment.md, gathering"]
     fn measure_gathering() {
         tt_tests::harness::assert_on_silicon();
         const REPS: usize = 9;

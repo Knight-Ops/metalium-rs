@@ -1,7 +1,7 @@
 # Batched decode, laid out on Blackhole's tiles
 
 Status: **proposal, unscheduled** (2026-10-18). Batch 1 comes first: prefill and decode speed
-([decode-to-bandwidth.md](../plans/decode-to-bandwidth.md)) is the current track. This note fixes the goals and the
+([decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md)) is the current track. This note fixes the goals and the
 shape of a batched decoder, so that batch-1 work does not close doors. It also records which batch-1 pieces already
 serve it. Roadmap: Track 1, "Batched decode".
 

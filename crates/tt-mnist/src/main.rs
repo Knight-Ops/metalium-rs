@@ -241,7 +241,33 @@ struct Run {
     accuracy: f64,
     preload: Duration,
     train: Duration,
+    /// Of `train`, the first step: programs built, and a traced run's capture (its products'
+    /// blocks measured on the card), which the steps after it do not pay.
+    first: Duration,
     steps: usize,
+}
+
+impl Run {
+    /// Milliseconds a step after the first, or over every step if there was only one.
+    fn steady_ms(&self) -> f64 {
+        match self.steps {
+            0 | 1 => self.train.as_secs_f64() * 1e3,
+            n => (self.train - self.first).as_secs_f64() * 1e3 / (n - 1) as f64,
+        }
+    }
+
+    /// `  N training steps   total  (a ms/step; first f, then b ms/step)`: the total over every
+    /// step first, which `bench_training` and older scripts read, then the first step apart.
+    fn print_steps(&self) {
+        println!(
+            "  {} training steps                        {:.2?}  ({:.1} ms/step; first {:.2?}, then {:.2} ms/step)",
+            self.steps,
+            self.train,
+            self.train.as_secs_f64() * 1e3 / self.steps.max(1) as f64,
+            self.first,
+            self.steady_ms()
+        );
+    }
 }
 
 fn labels<B: Backend>(
@@ -281,6 +307,7 @@ fn train<B: AutodiffBackend>(
     let calls = burn_tt::device_time();
 
     let t0 = Instant::now();
+    let mut first = Duration::ZERO;
     let mut losses = Vec::new();
     let mut step = 0;
     'epochs: for _ in 0..epochs {
@@ -299,6 +326,9 @@ fn train<B: AutodiffBackend>(
             }
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             model = optim.step(LR, model, grads);
+            if step == 0 {
+                first = t0.elapsed();
+            }
             step += 1;
         }
     }
@@ -338,6 +368,7 @@ fn train<B: AutodiffBackend>(
         accuracy: right as f64 / test.n as f64,
         preload,
         train: train_time,
+        first,
         steps: step,
     }
 }
@@ -397,6 +428,7 @@ fn train_traced(
     })
     .unwrap_or_else(|e| panic!("capturing training step: {e}"));
 
+    let first = t0_train.elapsed();
     report(0, first_loss);
     losses.push((0, first_loss));
     step += 1;
@@ -463,6 +495,7 @@ fn train_traced(
         accuracy: right as f64 / test_split.n as f64,
         preload,
         train: train_time,
+        first,
         steps: step,
     }
 }
@@ -754,7 +787,9 @@ struct Args {
     transformer: bool,
     cnn: bool,
     bf16: bool,
-    /// `--train-trace`: train with hardware trace (capture step 0 and replay subsequent steps).
+    /// Train with a hardware trace (capture step 0 and replay the steps after it): the default on
+    /// one card without `--fusion`, the fastest way on every tile (2026-11-09: MNIST 1.39 against
+    /// 1.81 ms a step eager, the transformer 3.75 against 9.42); `--eager` turns it off.
     train_trace: bool,
     /// `--fusion`: enable Burn kernel fusion on device.
     fusion: bool,
@@ -765,18 +800,20 @@ struct Args {
 const USAGE: &str = "\
 usage: tt-mnist [--card N | --cards 0,1] [--tiles T] [--epochs E] [--steps S] [--host] [--activation A]
        tt-mnist --infer [--trace] [--batch B] [--passes P] [--card N | --cards 0,1] [--tiles T] [--host]
-       tt-mnist --model transformer [--steps S] [--card N] [--tiles T] [--train-trace]
+       tt-mnist --model transformer [--steps S] [--card N] [--tiles T] [--eager]
 
   --card N      train on /dev/tenstorrent/N (default 0)
   --cards 0,1   several cabled cards, matmuls sharded over Ethernet
-  --tiles T     compute on T Tensix tiles of the card, or `all` (default 1)
+  --tiles T     compute on T Tensix tiles of the card, or `all` (the default)
   --epochs E    passes over the 60 000 training images (default 1)
   --steps S     stop after S steps
   --host        also train on the host CPU (burn-flex), for comparison
   --bf16        store MNIST weights and activations in BF16 (single card);
                 matrix accumulation, loss and trace input/output remain F32
   --hidden H    hidden layer sizes, comma-separated (default 512,256: 784-512-256-10, 535k params)
-  --train-trace train with hardware trace (capture step 0 and replay subsequent steps)
+  --eager       train op by op instead of with a hardware trace (the trace, capturing step 0 and
+                replaying the steps after it, is the default on one card without --fusion)
+  --train-trace train with a hardware trace (the default where it applies)
   --fusion      enable Burn kernel fusion on device
   --infer       benchmark inference alone: no training, the forward pass over
                 the test set (untrained weights), so it profiles on its own
@@ -811,6 +848,7 @@ fn args() -> Result<Args, String> {
         hidden: vec![512, 256],
     };
     let mut tiles = None;
+    let mut train_trace = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().ok_or(format!("{arg} needs a value\n\n{USAGE}"));
@@ -844,7 +882,8 @@ fn args() -> Result<Args, String> {
                     return Err(format!("--hidden needs at least one layer size\n\n{USAGE}"));
                 }
             }
-            "--train-trace" => a.train_trace = true,
+            "--train-trace" => train_trace = Some(true),
+            "--eager" => train_trace = Some(false),
             "--fusion" => a.fusion = true,
             "--infer" => a.infer = true,
             "--trace" => a.trace = true,
@@ -892,6 +931,9 @@ fn args() -> Result<Args, String> {
     if let Some(t) = tiles {
         a.topology = a.topology.on_tiles(t).map_err(|e| e.to_string())?;
     }
+    // Traced unless asked not to, where traced training exists: one card, no fusion.
+    a.train_trace =
+        train_trace.unwrap_or(matches!(a.topology, Topology::Single { .. }) && !a.fusion);
     if a.bf16 && (a.transformer || matches!(a.topology, Topology::Cards { .. })) {
         return Err("--bf16 currently requires MNIST execution on one card".into());
     }
@@ -1056,7 +1098,6 @@ fn main() {
     let moved = burn_tt::tensor_traffic() - before;
     let _ = detach(device);
 
-    let per = |d: Duration| d.as_secs_f64() * 1e3 / card.steps.max(1) as f64;
     println!();
     println!("on the card:");
     if a.fusion {
@@ -1072,12 +1113,7 @@ fn main() {
         train_split.n - train_split.n % BATCH,
         card.preload
     );
-    println!(
-        "  {} training steps                        {:.2?}  ({:.1} ms/step)",
-        card.steps,
-        card.train,
-        per(card.train)
-    );
+    card.print_steps();
     print_calls(&card.calls, card.train, card.steps.max(1), "step");
     println!(
         "  loss                                      {:.4} -> {:.4}",
@@ -1105,12 +1141,7 @@ fn main() {
             &FlexDevice,
             |_, _| {},
         );
-        println!(
-            "  {} training steps                        {:.2?}  ({:.1} ms/step)",
-            host.steps,
-            host.train,
-            host.train.as_secs_f64() * 1e3 / host.steps.max(1) as f64
-        );
+        host.print_steps();
         println!(
             "  test accuracy                             {:.2}%",
             host.accuracy * 100.0

@@ -1,4 +1,4 @@
-//! Phase 2 of `docs/plans/planned-l1-residency.md`: a planned capture keeps its graph's tensors
+//! Phase 2 of `docs/completed-plans/planned-l1-residency.md`: a planned capture keeps its graph's tensors
 //! in the units' L1 between the ops that make and read them (`Session::set_residency`,
 //! `Session::begin_trace_planned`, `tt_kernels::residency::Applied`).
 //!

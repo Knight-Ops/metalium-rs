@@ -2,7 +2,7 @@
 //! as the same weight in FP32, bit for bit, on every path a product takes: whole tiles, a thin
 //! last tile row, `K` blocks, a packed one-row `A`, a streamed `K`, 2-D blocks with `K` streamed,
 //! ragged edges, and a capture whose products read their weights ahead on idle units
-//! (`docs/plans/bf16-weight-storage.md` A2). Its `B` is read from BF16 slots into 2,112-byte L1
+//! (`docs/completed-plans/bf16-weight-storage.md` A2). Its `B` is read from BF16 slots into 2,112-byte L1
 //! slots (`record::GATHER_B_BF16`, A5b: every layout steps `B` by `SrcRoute::b_slot`, the looped
 //! 2-D block kernel by a register of its own, so both block kernels are run) and unpacked as BF16
 //! (`SrcRoute::TF32_WITH_BF16_B`, gate `step232`).

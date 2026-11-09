@@ -654,7 +654,7 @@ fn how_push_bound_are_the_sfpu_math_programs() {
     }
 }
 
-/// The `.ttinsn` experiment's Phase 0 (`docs/plans/ttinsn-push-experiment.md`): the same
+/// The `.ttinsn` experiment's Phase 0 (`docs/completed-plans/ttinsn-push-experiment.md`): the same
 /// model as above, but one row per kind, so the push-bound kinds can be named. A kind is
 /// *scalar-free* when two different scalar pairs give the same words, which is what a
 /// build-time image per kind needs. `stored` is the words the program slot holds (loops

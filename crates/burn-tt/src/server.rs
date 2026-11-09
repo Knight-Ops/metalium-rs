@@ -4552,6 +4552,13 @@ pub fn run_generic_trace(
     })
 }
 
+/// The spread of an eager op on a multi-tile session unless `TT_SPREAD` says otherwise: on
+/// every tile, ResNet-18 146 ms against 232 at `all` and ViT-Tiny 116 against 223
+/// (2026-10-27), and the `tt-mnist` transformer's training 9.4 against 12.4 ms a step
+/// (2026-11-09; `docs/learnings/performance-log.md`, "Training on every tile").
+pub(crate) const EAGER_SPREAD: tt_kernels::session::Spread =
+    tt_kernels::session::Spread::Work { share: 64, min: 4 };
+
 /// `TT_SPREAD`'s value (`Session::set_spread`): `all`, a positive tile count, or
 /// `work:<share>[:<min>]` with positive numbers. `None` for anything else.
 fn parse_spread(v: &str) -> Option<tt_kernels::session::Spread> {
@@ -4623,13 +4630,19 @@ pub(crate) fn kmd_engine_with_elementwise(
             Ok("0") => session.set_pipeline(false),
             Ok(v) => return Err(TtError::Device(format!("TT_PIPELINE={v}: expected 0 or 1"))),
         }
-        // `TT_SPREAD`: how many of the session's tiles each op runs on
-        // (`Session::set_spread`): `all` (the default), a count, or
-        // `work:<share>[:<min>]`, one tile for each `share` of the op's work and at
-        // least `min` (1 if not given). The bits are the same.
+        // How many of the session's tiles each op runs on (`Session::set_spread`). By default
+        // an eager op one tile for each 64 of its work, at least 4 ([`EAGER_SPREAD`]), and a
+        // captured op every tile (`Session::set_capture_spread`): a fresh op pays the host for
+        // each tile it runs on, a replayed one does not. `TT_SPREAD` sets both: `all`, a count,
+        // or `work:<share>[:<min>]` (`min` 1 if not given). The bits are the same.
+        session.set_spread(EAGER_SPREAD);
+        session.set_capture_spread(Some(tt_kernels::session::Spread::All));
         if let Ok(v) = std::env::var("TT_SPREAD") {
             match parse_spread(&v) {
-                Some(spread) => session.set_spread(spread),
+                Some(spread) => {
+                    session.set_spread(spread);
+                    session.set_capture_spread(None);
+                }
                 None => {
                     return Err(TtError::Device(format!(
                         "TT_SPREAD={v}: expected `all`, a tile count, or `work:<share>[:<min>]`"

@@ -133,7 +133,7 @@ impl DramRef {
     }
 
     /// This handle, refused by name if a capture has written its buffer in place since the
-    /// handle was made (`docs/plans/in-place-cache-write.md`): a read of a cache the step
+    /// handle was made (`docs/completed-plans/in-place-cache-write.md`): a read of a cache the step
     /// already overwrote, or of a view of it taken before the write, which would read rows
     /// from the step's future. Only a buffer the open capture owns as its state
     /// ([`server::donated_since`]) is written in place, so for every other buffer this is one

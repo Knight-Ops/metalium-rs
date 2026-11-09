@@ -60,7 +60,7 @@ Checked against the code and `hardware-coverage.md`; open work is listed in
   serves it (other device refusals still panic at the next wait, by design).
 - **G9 formats: mostly implemented.** BF16 and FP16 storage, and per-tensor BFP8/4/2
   with native conversions and products, are delivered
-  ([mixed-bfp-storage.md](../plans/mixed-bfp-storage.md)). INT8, the `a`
+  ([mixed-bfp-storage.md](../completed-plans/mixed-bfp-storage.md)). INT8, the `a`
   variants and portable quantization remain deferred.
 - **G7 multicast:** the NoC multicast primitive is done and silicon-gated
   (`step115_noc_multicast`), but no `tt-kernels` op uses it yet; matmul operands
@@ -576,7 +576,7 @@ fusion (`Requirements::fuse` drops the GDDR legs) plus a `Residency::L1Sharded {
 range: CoreRangeSet, shard: [h, w] }` placement for a `DramTensor`'s successor type, with
 ops declaring which shard specs they accept, as ttnn's `validate` does. Defer until
 G5/G7 exist and a measured op chain is GDDR-bound. **Measured (2026-10-20):** decode's small ops are GDDR-bound under
-a weight stream (the residual add 14 -> ~100 us). Proposal: [planned-l1-residency.md](../plans/planned-l1-residency.md),
+a weight stream (the residual add 14 -> ~100 us). Proposal: [planned-l1-residency.md](../completed-plans/planned-l1-residency.md),
 a static plan over each captured graph rather than a runtime allocator.
 
 ### G13. Debug tooling: watcher, waypoints, device print (P1, developer experience)

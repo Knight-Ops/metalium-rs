@@ -731,7 +731,7 @@ pub trait OpPadding {
 ///   denormal and would flush it).
 ///
 /// `Packed` is the exception: a weight stored in fewer bytes than FP32, tiles of its
-/// [`TileFormat`] in slots of that format's size (BF16, `docs/plans/bf16-weight-storage.md`; or
+/// [`TileFormat`] in slots of that format's size (BF16, `docs/completed-plans/bf16-weight-storage.md`; or
 /// BFP8/4/2), which only a product reads, as its `B` ([`SrcRoute::Tf32WithB`]); every other op
 /// refuses it by its elem. The format is the edge's (`docs/learnings/dataflow-compiler.md` §4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -1632,7 +1632,7 @@ pub fn pipelining_pays(
         return false;
     };
     // Both plans decide; a smaller arena that narrowed either could change the answer
-    // (`docs/plans/planned-l1-residency.md` 2h).
+    // (`docs/completed-plans/planned-l1-residency.md` 2h).
     crate::l1::note_planned(crate::l1::Planned {
         top: 0,
         need: floors.get(),
@@ -1688,7 +1688,7 @@ pub fn matmul_dram(
     )
 }
 
-/// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 4, the bound on reading `A` once a
+/// A development probe (`docs/completed-plans/decode-to-bandwidth.md` Phase 4, the bound on reading `A` once a
 /// product): every GDDR matmul block is gathered [`record::GATHER_A_RESIDENT`], reading only `B`.
 /// **The products are wrong** (`A`'s slots hold whatever they held); only their time means anything.
 static PROBE_SKIP_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1759,7 +1759,7 @@ pub(crate) fn probing_skip_a() -> bool {
             && LOWERING_BATCHED.with(std::cell::Cell::get))
 }
 
-/// A development probe (`docs/plans/decode-to-bandwidth.md` Phase 8, the stream fully ahead of the
+/// A development probe (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, the stream fully ahead of the
 /// products): a product with a packed `A` gathers nothing, so it reads no `B` (its `GATHER` reads
 /// only `B`, [`record::GATHER_A_RESIDENT`]), and the session prefetches nothing. What is left of a
 /// step is its products' compute, control and barriers and the small ops: the step with its weight
@@ -2221,7 +2221,7 @@ pub(crate) fn matmul_dram_limited(
 pub const PREFETCH: &str = "weight prefetch";
 
 /// What a list that reads a product's `B` ahead on a unit that runs the ops before the product
-/// is called (`docs/plans/decode-to-bandwidth.md` Phase 8): its `GATHER` carries
+/// is called (`docs/completed-plans/decode-to-bandwidth.md` Phase 8): its `GATHER` carries
 /// [`record::GATHER_PREFETCH`], so the ops' own drains leave its reads in flight, and the job's
 /// gather list ends with the `WAIT` that drains them. The capture moves it back in the unit's
 /// stream to just after the last weight-streaming product, or towards the last one the unit took
@@ -2344,7 +2344,7 @@ pub(crate) fn matmul_dram_prefetching(
     // The plan's block is what runs, so the arena must keep it (`matmul::plan_floor`) -- except
     // where a packed `A`'s `K` is blocked: its blocks are `packed_k_block`'s, noted where they are
     // placed (`tile_op::allocate`), and its jobs a column each, whatever the plan's width; and a smaller arena keeps `K`
-    // blocked (`docs/plans/planned-l1-residency.md` 2h-i: `down` at 8192, 8960 and 14,336 laid
+    // blocked (`docs/completed-plans/planned-l1-residency.md` 2h-i: `down` at 8192, 8960 and 14,336 laid
     // out and timed alike past the plan's floor).
     if !(reads.packed_a.is_some() && kc < kt) {
         crate::l1::note_planned(crate::l1::Planned {

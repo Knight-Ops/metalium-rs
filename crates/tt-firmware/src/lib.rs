@@ -128,7 +128,7 @@ const CFG0_DIS_TRISC_CACHE: u32 = 1 << 18;
 /// Blackhole boots with gathering on. It buys nothing here: this repo's
 /// firmware pushes Tensix instructions with stores, not `.ttinsn`, and
 /// measuring a `.ttinsn` push with gathering on or off gave identical cycles
-/// (`docs/plans/ttinsn-push-experiment.md`). Off removes the hazard for free.
+/// (`docs/completed-plans/ttinsn-push-experiment.md`). Off removes the hazard for free.
 ///
 /// The sequence is tt-metal's: set `DisBp`, set `DisTriscCache`, clear `DisBp`,
 /// with fences. `cfg0` is then read back, and a core where the bit did not

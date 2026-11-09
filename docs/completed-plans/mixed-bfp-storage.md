@@ -1,5 +1,7 @@
 # Mixed BFP tensor storage and seeded PRNG
 
+> **Archived 2026-11-09.** Complete (2026-10-10). BFP8 becomes the default weight format under the performance contract (../adr/0006-two-numeric-contracts-reference-and-performance.md). Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Current status (2026-10-06): resident BFP8/BFP4/BFP2 conversion and packed
 matmul, Burn propagation and identity backward pass on both cards
 (`1791299490`). Expanded acceptance, fusion and actual MNIST policies pass

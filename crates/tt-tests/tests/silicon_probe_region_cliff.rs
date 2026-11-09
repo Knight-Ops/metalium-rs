@@ -1,4 +1,4 @@
-//! 2h-i of `docs/plans/planned-l1-residency.md`: where a persistent region starts to cost the
+//! 2h-i of `docs/completed-plans/planned-l1-residency.md`: where a persistent region starts to cost the
 //! one-row products, and what predicts it.
 //!
 //! `cargo xtask silicon --release --device 0 --include-ignored --filter silicon_probe_region_cliff`

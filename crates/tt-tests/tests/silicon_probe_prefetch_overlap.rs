@@ -1,4 +1,4 @@
-//! B2 of `docs/plans/decode-step-bandwidth.md`: can weights stream into idle units' L1 while a
+//! B2 of `docs/completed-plans/decode-step-bandwidth.md`: can weights stream into idle units' L1 while a
 //! decode layer's small ops run, and what does that cost the small ops?
 //!
 //! A decode step's small ops (18.3 of 42.3 ms, profile `1792202359`) mostly run on units 0-63 and
@@ -20,7 +20,7 @@
 //! two host costs, so the eager path cannot show whether the card overlaps them. That needs a
 //! replay, and a captured op's barrier involves every unit (`Session::enqueue_work`), so a unit
 //! streaming between two ops holds both ops' barriers: the prefetch first needs barriers on the
-//! units an op ran on (`docs/plans/replay-fixed-cost.md` P1). Kept as the harness for that.
+//! units an op ran on (`docs/completed-plans/replay-fixed-cost.md` P1). Kept as the harness for that.
 #![cfg(feature = "silicon")]
 
 use std::time::{Duration, Instant};

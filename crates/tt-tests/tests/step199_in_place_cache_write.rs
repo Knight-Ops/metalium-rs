@@ -1,4 +1,4 @@
-//! A traced step's state written in place (`docs/plans/in-place-cache-write.md` D1-D3).
+//! A traced step's state written in place (`docs/completed-plans/in-place-cache-write.md` D1-D3).
 //!
 //! A [`SharedStateTraces`] capture names its state before the step runs (a decoder's key/value
 //! cache), so a row scatter into a state tensor (`scatter_nd` with `Assign`, the cache write)

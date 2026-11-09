@@ -1,5 +1,5 @@
 //! A buffer read transposed as a matmul's `B` again and again is transposed once
-//! (`docs/plans/replay-fixed-cost.md`, P2).
+//! (`docs/completed-plans/replay-fixed-cost.md`, P2).
 //!
 //! The mover reads a tile transposed one datum at a time (`READ_TRANSPOSED`: the tile into its
 //! scratch slot, then a software transpose), about 10 us a tile on silicon, so SmolLM2's tied output

@@ -1,4 +1,4 @@
-//! RMSNorm's statistic in one kernel (`docs/plans/decode-small-ops.md` S3): each row's
+//! RMSNorm's statistic in one kernel (`docs/completed-plans/decode-small-ops.md` S3): each row's
 //! `sqrt(mean(x x) + eps)` over its columns, bit for bit the ops Burn composes it from on
 //! `TtBackend` -- `MUL(x, x)`, the sum over columns, `MUL_SCALAR(1/n)`, `ADD_SCALAR(eps)` and
 //! `SQRT` -- as the `[rows, 1]` tensor those leave, with none of their intermediate tensors. The

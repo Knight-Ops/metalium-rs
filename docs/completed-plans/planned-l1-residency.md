@@ -1,5 +1,7 @@
 # Planned L1 residency: activations that survive between ops
 
+> **Archived 2026-11-09.** Complete for captures (Phases 1-3, on by default since 2026-10-21); the one open box (mask read as row 0) and 5b were not built. Sharded L1 activations between ops are now ../plans/tt-metal-parity.md W2. Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Status: **scheduled; Phases 1, 2 and 3 done** (2026-10-21; a proposal until 2026-10-20): rows read whole on many units
 held by two of their readers (2f), never-read writes dropped (2g), the region sized by its plan under the products' cliff,
 plans cached, and residency **on by default** (2h): a 1.7B step 21.00 / 22.25 -> 20.07 / 21.28 ms; slower builds
@@ -196,7 +198,7 @@ DATA.base                                                        DATA.end
 - [x] **The graph off the streams** (`tt_kernels::residency::Graph::from_capture`). A capture logs the tensors it allocates
   (`DramAlloc::start_log`); every op's records and moves, sections included, are expanded as the movers expand them and
   each GDDR access is charged to the tensor and tile it touches. The rest is external (weights, the cache, inputs).
-  A capture that reuses its own tensors' GDDR (`Session::set_capture_reuse`, [long-context.md](long-context.md) 1.G)
+  A capture that reuses its own tensors' GDDR (`Session::set_capture_reuse`, [long-context.md](../plans/long-context.md) 1.G)
   has tensors that share an address at different times: the index (`residency::Index`) grows op by op
   (`OpRecord::allocs`, the tensors allocated when the op was queued), each allocation over the dead extents it
   overlaps, so an access is charged to the tensor its address held at that op; a tensor is the capture's own by its

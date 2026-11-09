@@ -345,7 +345,7 @@ then reverted because the second copy does not scale; see "The default reverted"
   that fills a card, or is split across both, cannot afford it, and the 1.7B is a test model. C0 (below) showed that
   one copy in this form slows every other reader.
 - **The rule** now on the roadmap
-  ([constraint](roadmap.md#constraint-every-default-must-scale-to-larger-models)): a default holds a weight's bytes
+  ([constraint](roadmap.md#standing-constraints)): a default holds a weight's bytes
   once. A gain that needs spare GDDR stays opt-in, with its cost named.
 - **Kept.** The code, `step267` (in `--smoke`, so the opt-in path is still exercised), `silicon_bench_relaid` and
   the C0 probes. They may serve prefill and decode on different cards, where each card holds one layout.

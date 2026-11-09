@@ -1,5 +1,7 @@
 # Experiment: does `.ttinsn` push fusion speed up SFPU kernels?
 
+> **Archived 2026-11-09.** Complete (2026-10-10, result: go); followed by ttinsn-push.md. Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 **Status:** complete 2026-10-10 on card 0. **Result: go.** A fused push is 2.78x faster on the
 push phase and 2.77x on a whole three-role `gelu` kernel; see [Results](#results). The follow-on (a shipped mechanism) was **parked** by owner decision until a real model showed push-bound
 SFPU device time. **That trigger fired on 2026-10-25** (SmolLM2-1.7B's prefill at 8,192 positions:
@@ -11,7 +13,7 @@ work list.
 ([close-out line 157](../completed-plans/hardware-coverage-closeout.md)). P9's own rule was
 "measured first; `[-]` if no measurable push bottleneck or if it weakens the build-time
 instruction gate". Nothing was ever measured, so this experiment does that measurement.
-Linked from [roadmap.md](roadmap.md), Track 2.
+Linked from [roadmap.md](../plans/roadmap.md), Track 2.
 
 ## Question
 
@@ -160,7 +162,7 @@ evidence.
 
 Either way, update: the performance scoreboard and log with conditions and run IDs, a
 `ttsim-divergence.md` row, `silicon-operating-notes.md` if anything hung or misbehaved, and the
-`.ttinsn` line in [roadmap.md](roadmap.md) Track 2. If the answer is yes, the follow-on design
+`.ttinsn` line in [roadmap.md](../plans/roadmap.md) Track 2. If the answer is yes, the follow-on design
 (image-per-kind at build time, scalar kinds, I-cache fit, how `Session` selects an image, a
 gate story that ships) is a new plan, not part of this one.
 

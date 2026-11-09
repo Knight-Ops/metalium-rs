@@ -452,7 +452,7 @@ impl<N: NocId> DataMover<N> {
     }
 
     /// Let this mover's lists name `arena` in L1: `tt_isa::l1::DATA`, or `tt_isa::l1::TRACE_ARENA`
-    /// while a capture plans into it (`docs/plans/decode-to-bandwidth.md` Phase 8, P3). Host state
+    /// while a capture plans into it (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, P3). Host state
     /// only: what a list is checked against before it is queued.
     pub fn set_arena(&mut self, arena: tt_isa::l1::Region) -> Result<()> {
         if arena != tt_isa::l1::DATA && arena != tt_isa::l1::TRACE_ARENA {
@@ -1181,7 +1181,7 @@ impl<N: NocId> DataMover<N> {
 /// of a tile this chip does not have is a NoC access nothing answers, which hangs the NoC and can
 /// take the host down (`docs/learnings/ttsim-divergence.md` row 35). So the host refuses every
 /// `WRITE_L1` but those into the tiles its session runs on (each read off the chip's grid) and the
-/// window it keeps for them (a capture's persistent region, `docs/plans/planned-l1-residency.md`).
+/// window it keeps for them (a capture's persistent region, `docs/completed-plans/planned-l1-residency.md`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct L1Writes {
     /// `(x, y)` as the session names its tiles.

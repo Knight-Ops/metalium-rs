@@ -1,4 +1,4 @@
-//! Element-wise ops on block views, read where they lie (`docs/plans/decode-small-ops.md`, S2a).
+//! Element-wise ops on block views, read where they lie (`docs/completed-plans/decode-small-ops.md`, S2a).
 //!
 //! A view that is a block of its buffer -- a gate's columns of a fused `gate|up` projection, the
 //! heads of `q` along a projection's row -- was copied into a buffer of its own (`copy_blocks`, or

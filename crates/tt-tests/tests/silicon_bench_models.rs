@@ -123,7 +123,7 @@ fn measure(key: &str, mut forward: impl FnMut() -> Vec<f32>) -> Vec<f32> {
     last
 }
 
-/// What a captured trace is made of (`docs/plans/replay-fixed-cost.md`, P0): its ops, the
+/// What a captured trace is made of (`docs/completed-plans/replay-fixed-cost.md`, P0): its ops, the
 /// barriers among them, how many units each op ran on (a unit whose share of the op is only the
 /// barrier entry sat it out), and by the Burn op that queued each (`OpRecord::label`). Reported as
 /// `BENCH` counts under `key`; the table goes to stderr, and the whole list, one op a line, to the
@@ -885,7 +885,7 @@ fn smollm2_decode_with_the_embedding_lookup() {
 ///
 /// The model runs on `burn_tt::Tt` (burn-fusion over `TtBackend`, with its fusers) for the
 /// warm-up, the captures and the validation; `TT_GEN_FUSION=0` runs it on `TtBackend` itself,
-/// its rows named "on TtBackend" (`docs/plans/decode-small-ops.md` F0; gates
+/// its rows named "on TtBackend" (`docs/completed-plans/decode-small-ops.md` F0; gates
 /// `step193_fusion_decode_trace`, `step194_fused_sigmoid_silu`).
 #[test]
 #[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
@@ -1337,7 +1337,7 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
     }
 }
 
-/// The Phase 8 feasibility probe (`docs/plans/decode-to-bandwidth.md`): what a decode step costs
+/// The Phase 8 feasibility probe (`docs/completed-plans/decode-to-bandwidth.md`): what a decode step costs
 /// with its weight stream made free, and what its ops cost under a stream. **Timing only**: under
 /// the probe the products read no weights, so the tokens are not checked.
 ///
@@ -1363,7 +1363,7 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
 /// Every capture also prints its space report (`SPACE` lines, [`tt_kernels::session::probe_space_report`]):
 /// what its ops take of a unit's `DATA`, the program cache and the stream. With `TT_PROBE_RESIDENCY=1`,
 /// its residency plan too (`RESIDENCY` lines, [`tt_kernels::residency::probe_residency_plan`]: what
-/// could stay in L1 between ops; `docs/plans/planned-l1-residency.md` Phase 1).
+/// could stay in L1 between ops; `docs/completed-plans/planned-l1-residency.md` Phase 1).
 ///
 /// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
 /// cache with 64-token chunks (or the comma-separated `TT_GEN_CHUNKS`); prompts of 32 and 256
@@ -1553,7 +1553,7 @@ fn traced_generation_stream_ceiling() {
             Err(_) => Shapes::new(max_len, &chunks),
         };
         // The build, and a second one (with residency on, its plans cached: one capture a trace;
-        // `docs/plans/planned-l1-residency.md` 2h).
+        // `docs/completed-plans/planned-l1-residency.md` 2h).
         let build = |what: &str| {
             let t = std::time::Instant::now();
             let g = TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap();

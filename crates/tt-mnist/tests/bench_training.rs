@@ -47,9 +47,18 @@ fn report(key: &str, samples: Vec<f64>) {
     );
 }
 
-/// Milliseconds a step from a `937 training steps   1.31s  (1.4 ms/step)` line: the total over
-/// the steps, which keeps the digits the binary's rounding drops.
+/// Milliseconds a step from a `937 training steps   1.31s  (1.4 ms/step; first 41ms, then
+/// 1.36 ms/step)` line: the steps after the first, as the transformer's row is (the first builds
+/// programs and, traced, captures and measures its products' blocks). Without a `then`, the total
+/// over the steps, which keeps the digits the binary's rounding drops.
 fn ms_per_step(line: &str) -> f64 {
+    if let Some(then) = line.split("then ").nth(1) {
+        return then
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("milliseconds a step after the first");
+    }
     let words: Vec<&str> = line.split_whitespace().collect();
     let steps: f64 = words[0].parse().expect("a step count");
     let total = words[3];

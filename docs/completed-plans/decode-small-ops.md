@@ -1,5 +1,7 @@
 # Decode small ops
 
+> **Archived 2026-11-09.** Done or superseded: S4 by decode-attention.md; attention became one op. Its two open boxes are stale. Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Roadmap Track 1, SmolLM2-1.7B "Next, by that profile". Written 2026-10-16 against `7e9def9`. Status: **S1, S2a, F0, S2b and S3
 done (2026-10-16; a 1.7B step 42.97 / 45.41 / 48.59 ms on `Tt` with S3's row-limited statistic, run `1792189445`);
 S1d done 2026-10-18 (the position-major cache); S5 measured and A1 (barrier pruning) done 2026-10-26, A2 and A3
@@ -61,7 +63,7 @@ unit reads the whole row), and an element repack ~38 us.
 
 ## The decision to make first: where fusion lives
 
-- **(A) burn-fusion fusers** ([kernel-fusion.md](kernel-fusion.md) B13b's SFPU micro-op chain, B13d's reduce-map for
+- **(A) burn-fusion fusers** ([kernel-fusion.md](../plans/kernel-fusion.md) B13b's SFPU micro-op chain, B13d's reduce-map for
   RMSNorm, LayerNorm and softmax):
   - **For:** general to any Burn model, which suits a general backend; it is the design kernel-fusion.md already
     chose.
@@ -169,7 +171,7 @@ projection), or `FixedWrite` taking the rows before the head split.
     - bit for bit the composition it replaces, or a bound derived beside its gate;
     - gated with a negative control;
     - covered by `cargo xtask conformance --fusion`.
-  - **Order** (each a [kernel-fusion.md](kernel-fusion.md) item):
+  - **Order** (each a [kernel-fusion.md](../plans/kernel-fusion.md) item):
     1. Recognise Burn's generic sigmoid and run the native one. This brings decode on `Tt` to `TtBackend`'s time and
        bits.
     2. SiLU, `silu(gate) up` as one SFPU body (S2b, B13b).

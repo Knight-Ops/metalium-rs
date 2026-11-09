@@ -104,7 +104,7 @@ Step91–96 validate physical layouts, numerical oracles, ragged edges, K reload
 Burn propagation and actual MNIST MLP/CNN precision policies on both cards.
 Full SMOKE passed 364/364 (`1791300502`), final BFP controls 28/28
 (`1791301208`), and PRNG diagnostics 4/4 (`1791302401`). See
-[the contract and completed checklist](mixed-bfp-storage.md) and the
+[the contract and completed checklist](../completed-plans/mixed-bfp-storage.md) and the
 [measured conversion costs and accuracy observations](../learnings/performance-log.md).
 BFP `a` variants, INT8/UINT8, packed mesh transport and portable Burn
 `QTensorOps` remain deferred. Burn random draws on the device (S7, step142): the seeded

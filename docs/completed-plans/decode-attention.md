@@ -1,5 +1,7 @@
 # Decode attention
 
+> **Archived 2026-11-09.** Done; A5 (flash-decode) is parked in ../proposals/split-k-and-flash-decode.md. Kept as a record; current numbers are in [performance-scoreboard.md](../learnings/performance-scoreboard.md).
+
 Phase 2 of [decode-to-bandwidth.md](decode-to-bandwidth.md). Written 2026-10-17 against `c69b9c1`. Status:
 **A0, A0b, A1, A2a, A4a, A4b and the A-layout done (2026-10-18); A2 and A3 superseded for decode by attention as one
 op (2026-10-19, [decode-to-bandwidth.md](decode-to-bandwidth.md) Phase 6, `Session::attention_rows`: a head a unit, no

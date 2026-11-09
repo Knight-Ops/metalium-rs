@@ -1,5 +1,5 @@
 //! A capture drops the barriers its data does not need (`Session::set_barrier_prune`,
-//! `tt_kernels::barriers`, `docs/plans/decode-small-ops.md` S5 A1).
+//! `tt_kernels::barriers`, `docs/completed-plans/decode-small-ops.md` S5 A1).
 //!
 //! The case: three element-wise ops dealt over the same eight units (`x + y`, `(x + y) y`,
 //! `(x + y) y + x`), each unit reading only the tiles it wrote, then a product whose every unit
@@ -277,7 +277,7 @@ const READER: (usize, usize) = (256, 32);
 /// Their bits are reported, not held: a replay's units did not race on either target, so this
 /// pruned trace gave the right bits on ttsim (also with `step208`'s release broken) and on card 0
 /// (also with the slow op at `K` 65536, run `1793038688`), as `step176`'s dropped waits did
-/// (`docs/plans/replay-fixed-cost.md` P1). The stream counts are this control, and the classifier's
+/// (`docs/completed-plans/replay-fixed-cost.md` P1). The stream counts are this control, and the classifier's
 /// are `tt_kernels::barriers`' unit tests (a dependency of each kind dropped is watched failing).
 #[test]
 fn pruning_a_needed_barrier_gives_other_bits() {

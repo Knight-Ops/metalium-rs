@@ -82,7 +82,7 @@ ADC path is slower than native repack.
 |---|---|
 | `TtBackend`, `TtDevice { chip }` | The backend marker and a chip by index. |
 | `TtTensor` | A shared cell with a lazily filled host copy (owned tensor bytes) and device copy (GDDR buffer). |
-| *(nothing)* | A device is attached by the first op that needs it: `TtDevice::new(n)` opens `/dev/tenstorrent/n` on one card's first surviving tile (`TileChoice::First`), configured by `TT_TOPOLOGY`, `TT_TILES`, `TT_MATH` and `TT_EXACT_MATMUL`. A failed open is remembered: the next op fails at once with the same `TtError`. |
+| *(nothing)* | A device is attached by the first op that needs it: `TtDevice::new(n)` opens `/dev/tenstorrent/n` on every surviving Tensix tile of one card (`TileChoice::All`; fewer with `TT_TILES`), configured by `TT_TOPOLOGY`, `TT_TILES`, `TT_MATH` and `TT_EXACT_MATMUL`. A failed open is remembered: the next op fails at once with the same `TtError`. |
 | `init(device, TtConfig)`, `detach(device)` | The explicit, fallible form (a typed error instead of a panic in the first op), and the way back: `detach` closes the card; tensors made before it are `StaleTensor`. `init` is idempotent for an equal `TtConfig` and `AlreadyAttached` for another. |
 | `TtConfig` | Builder for what `init` and `attach_with` open: `topology`, `tiles`, `route`, `fidelity`, `elementwise`; `TtConfig::from_env()` applies the environment. |
 | `attach_with(device, TtConfig)`, `attach(device, factory)` | Scoped, explicit attachment for tests and benchmarks: the guard detaches on drop. `attach` runs any `Engine` factory on the server thread. Attaching a device twice is `TtError::AlreadyAttached`. |
@@ -258,7 +258,7 @@ BFP2/BFP4/BFP8 and their `a` variants are separate physical tile formats with
 shared exponents, rather than aliases for Burn's scalar dtypes. BFP2/BFP4/BFP8
 storage and native conversions/products are implemented through the logical-F32
 storage extension documented below. The `a` variants remain deferred. See
-[the delivered contract](../../docs/plans/mixed-bfp-storage.md).
+[the delivered contract](../../docs/completed-plans/mixed-bfp-storage.md).
 
 ## Environment variables
 
@@ -284,7 +284,7 @@ unparsable value as `0`.
 | `TT_PROFILE` | unset, a directory, a `.json` path | A directory: the **profile mode** (`burn_tt::profile`). Every eager op's device time by Burn op (timed alone), every trace's captured ops by name (a replay stamps a window of its ops, the next replay the next window, so a trace of any length is covered without replaying it twice), each replay's write/replay/read split, and the host's server-thread time, calls and session counters. Written on detach to `<dir>/chip<N>/summary.md`, `ops.tsv` and `trace.json` (Perfetto). `cargo xtask bench --profile` sets it per test. A path ending in `.json`: the raw timestamp trace of every entry, as Chrome trace JSON. `{chip}` becomes the card. Silicon only. |
 | `TT_PROFILE_DETAIL` | unset, `full` | With `TT_PROFILE=<dir>`: `full` also times every data entry (fewer ops a replay window). Unset, only the entries that bound an op's phases are stamped; data time is the remainder. |
 | `TT_PROFILE_PUSH` | unset, `0` | With `TT_PROFILE=<dir>`: the math role totals each kernel's pushing and its wait after pushing for the coprocessor, which the mover stamps (`push_us`, `drain_us`, `push_words` in `ops.tsv`, a push table in the summary: pushing near ~3.3 cycles a word is bound by the pushing). `0` turns it off (three fewer stamps a kernel). |
-| `TT_TTINSN` | unset, `0` | The math role runs its long programs as fused `.ttinsn` code the host made and checked (`Session::set_ttinsn`, `docs/plans/ttinsn-push.md`), bit for bit the pushed programs and faster (1.6-3.9% on the 1.7B's prefill, 7.2% on ViT-Tiny). `0` turns it off. |
+| `TT_TTINSN` | unset, `0` | The math role runs its long programs as fused `.ttinsn` code the host made and checked (`Session::set_ttinsn`, `docs/completed-plans/ttinsn-push.md`), bit for bit the pushed programs and faster (1.6-3.9% on the 1.7B's prefill, 7.2% on ViT-Tiny). `0` turns it off. |
 | `TT_REPORT` | unset, `1` | `1`: print the per-op report at exit (`burn_tt::report`): for every op, calls, results made on the device and on the host, bytes downloaded, uploaded and host-staged, and whether `burn-tt` implements it (`tt`) or the method is unsupported (`unsupported`). The worklist for a new model. |
 | `TT_STRICT` | unset, `1` | `1`: a download a host op causes, or a host-staged matmul, panics with the op's name (`burn_tt::set_strict`; one thread's block: `burn_tt::strictly`). Reading results back (`into_data`) is never one; `burn_tt::host_ok(..)` marks intended host work. |
 | `TT_TRACE_FALLBACK` | unset, any | Prints a backtrace whenever a device tensor is downloaded for a host op: the way to find what still crosses PCIe. |
