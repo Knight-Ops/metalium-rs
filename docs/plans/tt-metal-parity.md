@@ -269,6 +269,12 @@ They run in this order; W1-W4 can overlap.
   - **H13 killed** (0.94x on the 512-row chunk).
   - **Packer L1 accumulation's ceiling** is up to 24% of a product, only under a packed `A`.
   - **The order of the rest follows:** BFP8 weights (no new kernel); then a packed tile whole in `SrcB` and the one-row path for a BF16 row; then BF16 activations; then packer L1 accumulation.
+- **First box landed (2026-11-10;** [log](../learnings/performance-log.md#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1)):
+  - **The switch:** `burn_tt::Numerics`, recorded in traces.
+  - **The default:** tt-models' `for_inference` stores BFP8 weights under the performance contract.
+  - **The gate:** `step269_performance_contract`, teacher-forced against HuggingFace. BFP8 scores top-1 98.28%, top-5 100%, PCC 0.99968, against the reference's 100% / 100% / 0.999998. The margin is the owner's: 2 points and 0.005.
+  - **The 1.7B:** 7.52 ms a step, 0.71x tt-metal's 10.55.
+  - **BFP4 `gate|up`** scores 86.6% / 0.93 on the 1.7B, below tt-metal's floors; it is recorded only.
 - **Gates:**
   - **Each op:** bit for bit against its specification model at the stated fidelity (step158's group adder, applied per phase), with negative controls.
   - **Each model:** teacher-forced top-1/top-5 against HuggingFace on a fixed prompt set, plus logit PCC. Thresholds are derived from a reference-contract run plus a stated margin; tt-metal accepts top-1 >= 90 and PCC >= 0.86-0.95 for 8B. Record ours with the derivation.

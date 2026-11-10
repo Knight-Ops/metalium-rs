@@ -1034,42 +1034,160 @@ fn decode_ms(g: &tt_models::generate::Generation) -> f64 {
     d[d.len() / 2]
 }
 
-/// `TT_WEIGHT_STORAGE`: the format a model's weights but the embedding table are stored in
-/// (`Llama::with_stored_weights`), or `None` to keep them F32 (`f32`). `bf16`, the default: the
-/// SmolLM2 checkpoints are BF16, so the logits are the F32 model's bit for bit (`step234`).
-/// `bfp8`, `bfp4`, `bfp2`: block floating point, which rounds the weights (the logits are those of
-/// the F32 model holding the rounded values, `step240`).
-fn weight_storage() -> Option<tt_models::quant::Format> {
+/// `TT_WEIGHT_STORAGE`: a probe outside the numeric contracts, every weight but the embedding
+/// table stored in one format (`Llama::with_stored_weights`) and the model made for no contract:
+/// `bf16` (the SmolLM2 checkpoints are BF16, so the logits are the F32 model's bit for bit,
+/// `step234`), `bfp8`, `bfp4`, `bfp2` (block floating point, which rounds the weights: the logits
+/// are those of the F32 model holding the rounded values, `step240`), or `f32` (kept F32). Unset:
+/// the contract decides ([`bench_contract`]).
+fn weight_storage_probe() -> Option<Option<tt_models::quant::Format>> {
     use tt_models::quant::Format;
-    match std::env::var("TT_WEIGHT_STORAGE").as_deref() {
-        Ok("bf16") | Err(_) => Some(Format::Bf16Stored),
-        Ok("bfp8") => Some(Format::Bfp8),
-        Ok("bfp4") => Some(Format::Bfp4),
-        Ok("bfp2") => Some(Format::Bfp2),
-        Ok("f32") => None,
-        Ok(other) => panic!("TT_WEIGHT_STORAGE={other}: bf16, bfp8, bfp4, bfp2 or f32"),
+    let v = std::env::var("TT_WEIGHT_STORAGE").ok()?;
+    Some(match v.as_str() {
+        "bf16" => Some(Format::Bf16Stored),
+        "bfp8" => Some(Format::Bfp8),
+        "bfp4" => Some(Format::Bfp4),
+        "bfp2" => Some(Format::Bfp2),
+        "f32" => None,
+        other => panic!("TT_WEIGHT_STORAGE={other}: bf16, bfp8, bfp4, bfp2 or f32"),
+    })
+}
+
+/// The numeric contract a model bench runs under (ADR 0006): `TT_NUMERICS` (`reference` or
+/// `performance`), by default `performance`, the inference contract; `TT_MLP_BFP4=1` its named
+/// option, BFP4 for `gate|up`.
+fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
+    let numerics = burn_tt::Numerics::from_env()
+        .unwrap_or(Ok(burn_tt::Numerics::Performance))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mlp_bfp4 = match std::env::var("TT_MLP_BFP4").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => panic!("TT_MLP_BFP4={other}: expected 0 or 1"),
+    };
+    (numerics, tt_models::quant::WeightOptions { mlp_bfp4 })
+}
+
+/// The plan a bench's model is stored by: [`weight_storage_probe`]'s, else [`bench_contract`]'s.
+fn bench_plan() -> tt_models::quant::Plan {
+    use tt_models::quant::Plan;
+    match weight_storage_probe() {
+        Some(Some(format)) => Plan::stored_weights(format),
+        Some(None) => Plan::new(),
+        None => {
+            let (numerics, options) = bench_contract();
+            Plan::for_numerics(numerics, options)
+        }
     }
 }
 
-/// [`weight_storage`]'s name in a conditions row.
-fn weight_storage_name() -> String {
-    std::env::var("TT_WEIGHT_STORAGE").unwrap_or_else(|_| "bf16".into())
+/// `m` (fused unless `fused` is false) as a bench runs it, its conditions printed: under the
+/// contract ([`bench_contract`], `Llama::for_inference`), or in [`weight_storage_probe`]'s format
+/// for no contract. `for_inference` fuses, so an unfused model is a probe's.
+fn bench_model<B: burn_tt::storage::StorageBackend>(m: Llama<B>, fused: bool) -> Llama<B> {
+    let probe = weight_storage_probe();
+    if let Some(format) = probe.or_else(|| (!fused).then(bench_plan_format)) {
+        println!(
+            "BENCH {{\"kind\":\"conditions\",\"numerics\":\"none\",\"weight_storage\":\"{}\"}}",
+            format.map_or("f32".into(), |f| format!("{f:?}"))
+        );
+        let m = if fused { m.fused() } else { m };
+        return match format {
+            Some(format) => m.with_stored_weights(format),
+            None => m,
+        };
+    }
+    let (numerics, options) = bench_contract();
+    println!(
+        "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{}}}",
+        numerics.name(),
+        options.mlp_bfp4
+    );
+    m.for_inference(numerics, options)
 }
 
-/// Bytes a weight's datum takes in [`weight_storage`]'s format: its tile image without the
-/// header, over the tile's datums (an exponent section included).
-fn weight_datum_bytes() -> f64 {
+/// The one format of an unfused bench under the contract: the reference's BF16, else a probe.
+fn bench_plan_format() -> Option<tt_models::quant::Format> {
+    match bench_contract() {
+        (burn_tt::Numerics::Reference, _) => Some(tt_models::quant::Format::Bf16Stored),
+        _ => panic!("an unfused model (TT_GEN_FUSED=0) is a probe: set TT_WEIGHT_STORAGE"),
+    }
+}
+
+/// The bytes a decode step reads at least: every parameter of `m` (before fusing, whose views
+/// count twice) once, in the format [`bench_plan`] stores it in. The embedding table counts in the
+/// head's format: a step reads one row of it, and a tied head (the table transposed) whole.
+fn weight_bytes<B: burn::tensor::backend::Backend>(m: &Llama<B>) -> f64 {
+    use burn::module::{Module, ModuleVisitor, Param};
     use tt_isa::format::TileFormat;
-    let format = match weight_storage().map(|f| f.storage()) {
-        None => TileFormat::FP32,
-        Some(burn_tt::storage::StorageFormat::Bf16) => TileFormat::BF16,
-        Some(burn_tt::storage::StorageFormat::Bfp8) => TileFormat::BFP8,
-        Some(burn_tt::storage::StorageFormat::Bfp4) => TileFormat::BFP4,
-        Some(burn_tt::storage::StorageFormat::Bfp2) => TileFormat::BFP2,
-        Some(burn_tt::storage::StorageFormat::F32) => TileFormat::FP32,
-    };
-    let image = format.image();
-    (image.total_bytes() - image.header_bytes()) as f64 / TileFormat::TILE_DATUMS as f64
+    use tt_models::quant::Format;
+    struct Count(Vec<String>, tt_models::quant::Plan, f64);
+    impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for Count {
+        fn enter_module(&mut self, name: &str, _: &str) {
+            self.0.push(name.into());
+        }
+        fn exit_module(&mut self, _: &str, _: &str) {
+            self.0.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<B, D>>) {
+            let path = self.0.join(".");
+            let path = if path.contains("embed_tokens") {
+                "lm_head.weight".to_string()
+            } else {
+                path
+            };
+            let format = match self.1.format(&path) {
+                Format::Bf16Stored => TileFormat::BF16,
+                Format::Bfp8 => TileFormat::BFP8,
+                Format::Bfp4 => TileFormat::BFP4,
+                Format::Bfp2 => TileFormat::BFP2,
+                _ => TileFormat::FP32,
+            };
+            let image = format.image();
+            let datum = (image.total_bytes() - image.header_bytes()) as f64
+                / TileFormat::TILE_DATUMS as f64;
+            self.2 += p.val().shape().num_elements() as f64 * datum;
+        }
+    }
+    let mut c = Count(Vec::new(), bench_plan(), 0.0);
+    m.visit(&mut c);
+    c.2
+}
+
+/// The bytes a Qwen3.5 decode step reads at least: every matrix once in the format `plan` stores
+/// it in, the tied head's F32 table once, vectors and taps in F32.
+fn qwen_step_bytes<B: burn::tensor::backend::Backend>(
+    m: &tt_models::qwen35::Qwen35<B>,
+    plan: &tt_models::quant::Plan,
+) -> f64 {
+    use burn::module::{Module, ModuleVisitor, Param};
+    use tt_isa::format::TileFormat;
+    use tt_models::quant::Format;
+    struct Count<'a>(Vec<String>, &'a tt_models::quant::Plan, f64);
+    impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for Count<'_> {
+        fn enter_module(&mut self, name: &str, _: &str) {
+            self.0.push(name.into());
+        }
+        fn exit_module(&mut self, _: &str, _: &str) {
+            self.0.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<B, D>>) {
+            let format = match (D, self.1.format(&self.0.join("."))) {
+                (2, Format::Bf16Stored) => TileFormat::BF16,
+                (2, Format::Bfp8) => TileFormat::BFP8,
+                (2, Format::Bfp4) => TileFormat::BFP4,
+                (2, Format::Bfp2) => TileFormat::BFP2,
+                _ => TileFormat::FP32,
+            };
+            let image = format.image();
+            let datum = (image.total_bytes() - image.header_bytes()) as f64
+                / TileFormat::TILE_DATUMS as f64;
+            self.2 += p.val().shape().num_elements() as f64 * datum;
+        }
+    }
+    let mut c = Count(Vec::new(), plan, 0.0);
+    m.visit(&mut c);
+    c.2
 }
 
 fn ms(t: std::time::Duration) -> f64 {
@@ -1096,24 +1214,16 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
     {
         let d = *d;
         let (m, _) = Llama::<B>::pretrained(config, name, Precision::F32, &d).unwrap();
-        // What a decode step reads at least: every F32 parameter once (counted before fusing, whose
-        // views would count the fused matrices twice).
-        let weight_bytes = burn::module::Module::num_params(&m) as f64 * weight_datum_bytes();
+        // What a decode step reads at least: every parameter once, in its stored format (counted
+        // before fusing).
+        let weight_bytes = weight_bytes(&m);
         // `q|k|v` and `gate|up` one product each (`Llama::fused`, bit for bit the unfused model;
-        // `TT_GEN_FUSED=0` keeps them apart).
+        // `TT_GEN_FUSED=0` keeps them apart, a probe's).
         let fused = std::env::var("TT_GEN_FUSED").map_or(true, |v| v != "0");
         println!("BENCH {{\"kind\":\"conditions\",\"fused_projections\":{fused}}}");
-        let m = if fused { m.fused() } else { m };
-        // The weights stored BF16 (`Llama::with_bf16_weights`, bit for bit for this BF16
-        // checkpoint; the default), BFP, or kept F32 (`TT_WEIGHT_STORAGE`).
-        println!(
-            "BENCH {{\"kind\":\"conditions\",\"weight_storage\":\"{}\"}}",
-            weight_storage_name()
-        );
-        let m = match weight_storage() {
-            Some(format) => m.with_stored_weights(format),
-            None => m,
-        };
+        // The weights in the contract's formats (`TT_NUMERICS`, the performance contract by
+        // default), or a probe's (`TT_WEIGHT_STORAGE`).
+        let m = bench_model(m, fused);
         let t0 = Instant::now();
         // Decode steps attending to 64, 128, ... positions (`TT_GEN_STEPS`, "64,128,256"; empty
         // for the whole cache at every step).
@@ -1541,15 +1651,7 @@ fn traced_generation_stream_ceiling() {
             std::env::var("TT_STREAM_CAP_BF16").unwrap_or_default(),
         );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
-        let m = m.fused();
-        println!(
-            "BENCH {{\"kind\":\"conditions\",\"weight_storage\":\"{}\"}}",
-            weight_storage_name()
-        );
-        let m = match weight_storage() {
-            Some(format) => m.with_stored_weights(format),
-            None => m,
-        };
+        let m = bench_model(m, true);
         // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
         let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
             v.split(',').map(|n| n.trim().parse().unwrap()).collect()
@@ -1734,15 +1836,20 @@ fn qwen35_traced_generation_on<B: tt_models::generate::TracedBackend>(suffix: &s
     };
     with_device(config, |d| {
         conditions(card());
+        // The contract's weights (`TT_NUMERICS`, the performance contract by default); the tied
+        // head stays the F32 table under both (`Qwen35::for_inference`).
+        let (numerics, options) = bench_contract();
         println!(
-            "BENCH {{\"kind\":\"conditions\",\"weight_storage\":\"bf16\",\"head\":\"f32 table\"}}"
+            "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"head\":\"f32 table\"}}",
+            numerics.name(),
+            options.mlp_bfp4
         );
         let (m, _) = Qwen35::<B>::qwen3_5_4b(QWEN3_5_4B.layers, Precision::F32, &d).unwrap();
-        // What a step reads at least: every matrix once in BF16, the tied head's F32 table once.
-        let table = m.embed_table().dims().iter().product::<usize>() as f64;
-        let params = burn::module::Module::num_params(&m) as f64;
-        let step_bytes = (params - table) * 2.0 + table * 4.0;
-        let m = m.with_bf16_weights();
+        // What a step reads at least: every matrix once in its stored format, the tied head's F32
+        // table once.
+        let step_bytes =
+            qwen_step_bytes(&m, &tt_models::quant::Plan::for_numerics(numerics, options));
+        let m = m.for_inference(numerics, options);
         let shapes = Shapes::new(max_len, &chunks).with_prefixes(&[]);
         let traces = format!(
             "chunks {chunks:?}, steps {:?}, {max_len}-position cache{suffix}",

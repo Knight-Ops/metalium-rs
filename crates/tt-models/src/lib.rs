@@ -9,6 +9,7 @@ pub mod kv_cache;
 pub mod llama;
 pub mod load;
 pub mod moss_image;
+pub mod prompt_sets;
 pub mod quant;
 pub mod qwen35;
 pub mod resnet;

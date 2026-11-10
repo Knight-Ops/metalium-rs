@@ -250,6 +250,29 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   packed `A` takes the faces pair order and misses the one-row packing and weight prefetch. H13 killed; packer L1
   accumulation's ceiling, up to 24% of a product, shows only under a packed `A`.
 
+- **W1, first box: BFP8 weights the inference default, behind the contract switch and a model gate** (2026-11-10;
+  gates card 0, benches card 1; [log](../learnings/performance-log.md#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1)).
+  - **The contract switch:** `burn_tt::Numerics`.
+    - `TtConfig::numerics` / `TT_NUMERICS` set it; the default is `Reference`. `with_numerics` scopes it.
+    - A trace records its contract; the residency-plan key includes it; a capture refuses a switch part way (`step40`).
+  - **The models ask for it:**
+    - `Llama::for_inference` / `Qwen35::for_inference` store the weights in the contract's formats
+      (`quant::Plan::for_numerics`).
+    - `TracedGenerator` captures under the model's contract.
+  - **The model gate, `step269_performance_contract`:** the 1.7B traced, teacher-forced over eight prompts (232
+    positions) against HuggingFace (`llama_reference.py --prompt-set`), PCC against burn-flex (held to HuggingFace
+    within 1.07e-4).
+    - **BFP8: top-1 98.28%, top-5 100%, PCC 0.99968**, against the reference contract's 100% / 100% / 0.999998
+      (`1794287910`).
+    - The BFP4 `gate|up` option scores 86.64% / 0.93, below tt-metal's floors on this model; it is recorded, not gated.
+  - **The 1.7B's decode step under the performance contract: 7.52 ms** (133 tokens/s; reference 9.81; `1794291915`,
+    `1794292593`). That is 0.71x tt-metal's 10.55 ms in its performance mode on the same card.
+  - **Qwen3.5-4B under the performance contract: 56.93 ms** (reference 62.49 the same day; `1794293972`,
+    `1794295094`). Its tied head stays the F32 table; its quality gate is still open.
+  - **A fused, stored Llama held each fused matrix's parts a second time.** SmolLM2-135M BF16: 543 MB against 399 MB
+    unfused (`1794286677`). `fuse` now drops the parts: 399.0 MB (`1794286904`, gate
+    `step240::a_fused_stored_model_holds_each_weight_once`).
+
 ## Prefill and long context
 
 Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-context.md](../plans/long-context.md).

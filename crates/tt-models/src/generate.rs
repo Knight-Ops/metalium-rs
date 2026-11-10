@@ -363,6 +363,13 @@ pub(crate) fn eager<B: Backend>(
 pub trait FixedShapeDecoder<B: Backend> {
     type Cache: FixedShapeCache<B>;
 
+    /// The numeric contract the model was made for (ADR 0006), if it was made for one: a
+    /// [`TracedGenerator`] captures its steps under it (`burn_tt::with_numerics`), and each trace
+    /// records it. `None`: whatever the device's attachment is under.
+    fn numerics(&self) -> Option<burn_tt::Numerics> {
+        None
+    }
+
     /// An empty cache of `max_len` positions, in the model's dtype.
     fn new_cache(&self, max_len: usize, device: &B::Device) -> Self::Cache;
 
@@ -767,6 +774,8 @@ pub struct TracedGenerator<'m, M: FixedShapeDecoder<B>, B: TracedBackend = Tt> {
     prefill: usize,
     /// How each trace's second output, its next token, is chosen.
     sampler: Sampler,
+    /// The numeric contract every trace was captured under ([`Self::numerics`]).
+    numerics: burn_tt::Numerics,
 }
 
 impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
@@ -799,6 +808,13 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         Self::build(model, shapes, device, true, Sampler::Greedy)
     }
 
+    /// The numeric contract the traces were captured under (ADR 0006): the model's
+    /// ([`FixedShapeDecoder::numerics`]), else the device attachment's.
+    pub fn numerics(&self) -> burn_tt::Numerics {
+        self.numerics
+    }
+
+    /// [`Self::build_under`] under the model's contract, if it was made for one.
     fn build(
         model: &'m M,
         shapes: &Shapes,
@@ -806,6 +822,21 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         private: bool,
         sampler: Sampler,
     ) -> Result<Self, GenerateError> {
+        let build = || Self::build_under(model, shapes, device, private, sampler);
+        match model.numerics() {
+            Some(numerics) => burn_tt::with_numerics(numerics, build),
+            None => build(),
+        }
+    }
+
+    fn build_under(
+        model: &'m M,
+        shapes: &Shapes,
+        device: &TtDevice,
+        private: bool,
+        sampler: Sampler,
+    ) -> Result<Self, GenerateError> {
+        let numerics = burn_tt::numerics(*device)?;
         let shapes = shapes.checked()?;
         let max_len = shapes.max_len;
         let mut caches = vec![model.new_cache(max_len, device)];
@@ -908,6 +939,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             sets,
             prefill,
             sampler,
+            numerics,
         })
     }
 

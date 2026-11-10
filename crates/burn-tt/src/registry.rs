@@ -17,14 +17,14 @@ use std::sync::{Arc, Mutex};
 use crate::error::TtError;
 use crate::server::{self, AttachGuard, Serve};
 use crate::topology::{tiles_from_env, Topology};
-use crate::{ElementwiseMode, Fidelity, MatmulMode, SrcRoute, TileChoice, TtDevice};
+use crate::{ElementwiseMode, Fidelity, MatmulMode, Numerics, SrcRoute, TileChoice, TtDevice};
 
 /// How a device is opened.
 ///
 /// The default is one card -- the device's own, `/dev/tenstorrent/{chip}` --
 /// computing on every surviving Tensix tile (however the card is harvested), through
 /// `Tf32FromFp32` at `HiFi4`, with SFPU element-wise arithmetic and the fast (FPU) matmul
-/// ([`MatmulMode`]). Fewer tiles are the caller's choice ([`TtConfig::tiles`], `TT_TILES`):
+/// ([`MatmulMode`]), under the reference contract ([`Numerics`]). Fewer tiles are the caller's choice ([`TtConfig::tiles`], `TT_TILES`):
 /// one tile cannot hold a model's traces and is never the fast choice for a model
 /// (`docs/plans/tt-metal-parity.md`, W6).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +35,7 @@ pub struct TtConfig {
     fidelity: Fidelity,
     elementwise: ElementwiseMode,
     matmul: MatmulMode,
+    numerics: Numerics,
 }
 
 impl Default for TtConfig {
@@ -46,12 +47,14 @@ impl Default for TtConfig {
             fidelity: Fidelity::HiFi4,
             elementwise: ElementwiseMode::Sfpu,
             matmul: MatmulMode::Fast,
+            numerics: Numerics::Reference,
         }
     }
 }
 
 impl TtConfig {
-    /// The defaults, with `TT_TOPOLOGY`, `TT_TILES`, `TT_EXACT_MATMUL` and `TT_ACCURATE_MATMUL` applied if set.
+    /// The defaults, with `TT_TOPOLOGY`, `TT_TILES`, `TT_EXACT_MATMUL`, `TT_ACCURATE_MATMUL` and
+    /// `TT_NUMERICS` applied if set.
     pub fn from_env() -> Result<Self, TtError> {
         let mut config = Self::default();
         for (name, mode) in [
@@ -73,6 +76,9 @@ impl TtConfig {
         }
         if let Some(tiles) = tiles_from_env() {
             config.tiles = Some(tiles?);
+        }
+        if let Some(numerics) = Numerics::from_env() {
+            config.numerics = numerics?;
         }
         Ok(config)
     }
@@ -111,6 +117,19 @@ impl TtConfig {
     pub fn matmul(mut self, mode: MatmulMode) -> Self {
         self.matmul = mode;
         self
+    }
+
+    /// The numeric contract the attachment's work runs under ([`Numerics`]; ADR 0006): the
+    /// reference contract unless asked. [`with_numerics`](crate::with_numerics) overrides it for
+    /// the work a closure builds.
+    pub fn numerics(mut self, numerics: Numerics) -> Self {
+        self.numerics = numerics;
+        self
+    }
+
+    /// The contract [`TtConfig::numerics`] chose.
+    pub(crate) fn contract(&self) -> Numerics {
+        self.numerics
     }
 
     /// The cards and tiles this configuration opens for `device`.
@@ -232,7 +251,7 @@ pub fn detach(device: TtDevice) -> Result<(), TtError> {
 /// guard lives: the scoped form tests and benchmarks use. Unlike [`init`] it
 /// does not use [`set_default_engine`].
 pub fn attach_with(device: TtDevice, config: TtConfig) -> Result<AttachGuard, TtError> {
-    server::attach(device, kmd_factory(device, &config)?)
+    server::attach_under(device, kmd_factory(device, &config)?, config.numerics)
 }
 
 impl TtDevice {

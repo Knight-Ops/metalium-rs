@@ -19,15 +19,15 @@
   - Burn's own suites on silicon: F32/F16 3,001 of 3,025, BF16 1,098 of 1,187, none listed for a missing op.
 - **Models run on the card,** traced:
   - ResNet-18 in 12.7 ms and ViT-Tiny in 7.7 ms;
-  - SmolLM2-1.7B decodes at ~101 tokens/s (9.90 ms a step, BF16-stored weights, bit for bit the F32 model); with BFP8 weights 7.51 ms (133 tokens/s; W1, not yet a default);
-  - Qwen3.5-4B decodes in 62.5 ms a step (~21 of it a greedy pick, W4);
+  - SmolLM2-1.7B decodes at ~133 tokens/s (7.52 ms a step) under the performance contract, the inference default since 2026-11-10 (BFP8 weights; top-1 98.28% against HuggingFace, `step269`); 9.81 ms under the reference contract (BF16-stored weights, bit for bit the F32 model);
+  - Qwen3.5-4B decodes in 56.9 ms a step under the performance contract (BFP8 weights; no quality gate yet), 62.5 under the reference (~21 of either a greedy pick, W4);
   - a 7,992-token prompt prefills in 5.98 s.
 
-  All of this is single card and batch 1, under the bit-exact reference contract.
+  All of this is single card and batch 1. The 1.7B's 7.52 ms is under the performance contract; everything else is under the bit-exact reference contract.
 - **Against tt-metal, same card and model (2026-11-09):**
-  - Our batch-1 decode leads: 9.90 against 10.55-12.24 ms.
+  - Our batch-1 decode leads: 7.52 (performance) / 9.81 (reference) against 10.55-12.24 ms.
   - tt-metal batches 32 users at 1,289 tokens/s, prefills 2.2-3.1x faster, and runs prefill-shape products 2.4-22x faster (BF16/BFP8, HiFi2/LoFi, 2-D operand multicast).
-  - Qwen3.5-4B: tt-metal 38.0 ms on the card and 44-46 host-timed, with BFP4/BFP8 weights at LoFi and the argmax on the host; ours 62.5, or ~41 without our 21 ms greedy pick, with BF16 weights.
+  - Qwen3.5-4B: tt-metal 38.0 ms on the card and 44-46 host-timed, with BFP4/BFP8 weights at LoFi and the argmax on the host; ours 56.9 with BFP8 weights (62.5 with BF16), or ~36 without our 21 ms greedy pick.
   - Training, since 2026-11-09 traced on every tile by default (`tt-mnist`), beats burn-flex on the CPU: MNIST 1.31 against 2.3-2.6 ms a step, the small transformer 3.75 against 3.9-4.3.
   - [tt-metal-parity.md](tt-metal-parity.md) §1-§3.
 - **Multi-chip** is a proof of concept: matmul, conv and attention split across two cards; no all-reduce.
@@ -47,7 +47,7 @@ A publishable crate is long-term (last section).
 
 - **Two numeric contracts** ([ADR 0006](../adr/0006-two-numeric-contracts-reference-and-performance.md)).
   - *Reference* (bit-exact: HiFi4, FP32 `Dst`, F32 activations) is the default for conformance and training gates.
-  - *Performance* (deterministic: BF16 activations, BFP8 weights, derived fidelity up to HiFi2, packer L1 accumulation) is the inference default once W1 lands.
+  - *Performance* (deterministic: BF16 activations, BFP8 weights, derived fidelity up to HiFi2, packer L1 accumulation) is the inference default (`burn_tt::Numerics`; tt-models' `for_inference`). So far it is BFP8 weights only; each W1 box below adds a part.
   - Inside each contract a schedule chooses only among bit-equivalent options (ADR 0005).
   - Every performance number states its contract.
 - **Every default must scale** (owner, 2026-11-03):
@@ -77,10 +77,7 @@ In order; W1-W4 can overlap. Each item's prediction, kill criterion and gate are
 - Fidelity moves nothing at `m` = 1.
 - A BF16 `A` is slower until the `SrcB` box and the one-row box below land.
 
-The first four boxes run in this order.
-- [ ] **BFP8 weights by default under the contract.**
-  - Measured end to end: 7.51 ms; BFP4 6.34 as the named option.
-  - Needs the contract switch and the model gate (below), since its tokens are not the reference's.
+BFP8 weights are the inference default since 2026-11-10, behind the contract switch and the model gate `step269` (achievements). The next three boxes run in this order.
 - [ ] **A packed tile whole in `SrcB`.**
   - A BF16 or BFP `A` takes the faces pair order today (`TileFormat::whole_tile_unpack` licenses `SrcA` only). Prefill at HiFi4 runs 1.4-2.0x slower than with an FP32 `A`.
   - Measure it on ttsim, then in an isolated card-0 gate (the `PairOrder::SrcBWhole`/`Tiles` probes), and extend `whole_tile_unpack`.
@@ -104,12 +101,16 @@ The first four boxes run in this order.
   - a BF16 tensor takes an F32 slot in GDDR (`alloc_elem`);
   - casting a just-loaded tensor uploads the original first;
   - the block copier refuses element-interleaving moves past ~400K elements.
-- [ ] **The BF16 embedding lookup without staging** (`gather_indexed_bf16` still stages; `step167` BF16 takes 229 s). B now has the room it lacked (10-14 KiB after the firmware diet).
+- [ ] **The BF16 embedding lookup without staging** (`gather_indexed_bf16` still stages; `step167` BF16 takes 229 s). B now has the room it lacked (10-14 KiB after the firmware diet). It also ends a second copy in today's defaults: a tied Llama (the 1.7B) keeps its table F32 for the lookup and a stored, untied head beside it.
 - [ ] **A BF16 KV cache, and attention reading it without widening** (`attention/widen` widens every call).
 - [ ] **A BFP8 KV cache as a named option** (F8).
-- [ ] **The contract switch** `TtConfig::numerics(Reference | Performance)`, frozen into traces.
+- [ ] **The contract switch's reach.** `burn_tt::Numerics` landed (2026-11-10): attachment, thread scope, frozen into traces. Still open:
+  - ops that branch on it, as BF16 activations, fidelity and packer L1 accumulation land;
+  - `with_numerics` cannot reach `Fusion<TtBackend>`'s ops (another thread), as `with_matmul_mode` cannot. Traces record it, and no op branches yet; fix before the first op does.
 - [ ] **Per-op specification models** at the stated fidelity (step158's group adder per phase).
-- [ ] **A model gate:** teacher-forced top-1/top-5 and logit PCC against HuggingFace, thresholds derived from a reference-contract run.
+- [ ] **The model gate for Qwen3.5-4B** (the 1.7B's is `step269_performance_contract`): a prompt set from `qwen35_reference.py`, the same metrics and margin.
+- [ ] **The model gate's thresholds as each W1 box lands:** BFP8's top-1 clears its floor by one position (228 of 232). A box that trips it is reviewed with the owner, never loosened silently.
+- [ ] **The BFP4 `gate|up` option** misses tt-metal's floors on the 1.7B (top-1 86.6%, PCC 0.93); it is recorded only. Judge it again on the W5 model.
 
 ### W2. Prefill: sharded activations and 2-D operand multicast
 - [ ] **A probe.** `[2048,2048]@[2048,16384]` on a 10x11 sub-grid, BF16-HiFi2:

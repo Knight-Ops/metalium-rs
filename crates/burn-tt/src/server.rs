@@ -2283,6 +2283,8 @@ struct Attached {
     elementwise: ElementwiseMode,
     matmul: MatmulMode,
     exact_matmul_ok: bool,
+    /// The attachment's numeric contract ([`crate::Numerics`]).
+    numerics: crate::Numerics,
     poison: Poison,
     /// Set once the factory has served the first job's worth of state: until
     /// then `elementwise` is a placeholder.
@@ -2425,7 +2427,8 @@ pub(crate) fn ensure_attached(device: TtDevice) -> Result<(), TtError> {
 /// holds [`OPENING`].
 pub(crate) fn attach_auto(device: TtDevice, cfg: crate::TtConfig) -> Result<(), TtError> {
     let factory = crate::registry::default_factory(device, &cfg)?;
-    let guard = attach_inner(device, factory, Some(cfg))?;
+    let numerics = cfg.contract();
+    let guard = attach_inner(device, factory, Some(cfg), numerics)?;
     let old = locked(&AUTO)
         .get_or_insert_with(HashMap::new)
         .insert(device, guard);
@@ -2513,7 +2516,19 @@ pub fn attach<F>(device: TtDevice, factory: F) -> Result<AttachGuard, TtError>
 where
     F: FnOnce(Serve) -> Result<(), TtError> + Send + 'static,
 {
-    attach_inner(device, factory, None)
+    attach_inner(device, factory, None, crate::Numerics::Reference)
+}
+
+/// [`attach`] under the numeric contract `numerics` ([`crate::attach_with`]).
+pub(crate) fn attach_under<F>(
+    device: TtDevice,
+    factory: F,
+    numerics: crate::Numerics,
+) -> Result<AttachGuard, TtError>
+where
+    F: FnOnce(Serve) -> Result<(), TtError> + Send + 'static,
+{
+    attach_inner(device, factory, None, numerics)
 }
 
 /// [`attach`]; `config` is `Some` for the registry's attachments.
@@ -2521,6 +2536,7 @@ fn attach_inner<F>(
     device: TtDevice,
     factory: F,
     config: Option<crate::TtConfig>,
+    numerics: crate::Numerics,
 ) -> Result<AttachGuard, TtError>
 where
     F: FnOnce(Serve) -> Result<(), TtError> + Send + 'static,
@@ -2542,6 +2558,7 @@ where
                     elementwise: ElementwiseMode::Sfpu,
                     matmul: MatmulMode::Fast,
                     exact_matmul_ok: true,
+                    numerics,
                     poison,
                     ready: false,
                     config,
@@ -2832,6 +2849,13 @@ pub(crate) fn matmul_mode(device: TtDevice) -> MatmulMode {
     ensure_attached(device).unwrap_or_else(|e| panic!("{e}"));
     with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.matmul))
         .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }))
+}
+
+/// `device`'s attachment's numeric contract, attaching it if nothing has.
+pub(crate) fn numerics(device: TtDevice) -> Result<crate::Numerics, TtError> {
+    ensure_attached(device)?;
+    with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.numerics))
+        .ok_or(TtError::NotAttached { device })
 }
 
 /// Can `device`'s engine run [`MatmulMode::Exact`]? The attachment's snapshot.

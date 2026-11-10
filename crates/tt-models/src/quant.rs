@@ -66,6 +66,16 @@ impl Format {
     }
 }
 
+/// The named options of a contract's weight formats ([`Plan::for_numerics`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct WeightOptions {
+    /// Under the performance contract, the MLP's `gate` and `up` in BFP4 (ADR 0006's named
+    /// option); `down` and the rest stay BFP8. Recorded, not gated: on SmolLM2-1.7B it misses
+    /// tt-metal's acceptance floors (teacher-forced top-1 86.6%, logit PCC 0.93, against 90% and
+    /// 0.95; `step269_performance_contract`), to be judged again on the 8B-class model (W5).
+    pub mlp_bfp4: bool,
+}
+
 /// The format of each named tensor: the first rule whose pattern is a substring of the name wins,
 /// and a name no rule matches stays F32.
 #[derive(Clone, Debug, Default)]
@@ -103,6 +113,38 @@ impl Plan {
         Self::new()
             .rule("embed_tokens", Format::F32)
             .rule("", format)
+    }
+
+    /// The weight formats of the numeric contract `numerics` (ADR 0006), for a model whose
+    /// weights are BF16 values (every checkpoint `tt-models` loads), fused or not:
+    ///
+    /// - [`Numerics::Reference`]: [`Plan::bf16_weights`], which holds such weights exactly, so the
+    ///   model computes the F32 model's logits bit for bit.
+    /// - [`Numerics::Performance`]: every matrix but the embedding table BFP8, and with
+    ///   [`WeightOptions::mlp_bfp4`] the MLP's `gate` and `up` (`gate_up` fused) BFP4. Its
+    ///   specification model is the F32 model holding the rounded values ([`Emulated`]).
+    ///
+    /// [`Numerics::Reference`]: burn_tt::Numerics::Reference
+    /// [`Numerics::Performance`]: burn_tt::Numerics::Performance
+    pub fn for_numerics(numerics: burn_tt::Numerics, options: WeightOptions) -> Self {
+        match numerics {
+            burn_tt::Numerics::Reference => {
+                assert!(
+                    !options.mlp_bfp4,
+                    "BFP4 weights are a performance-contract option"
+                );
+                Self::bf16_weights()
+            }
+            burn_tt::Numerics::Performance => {
+                let mut plan = Self::new().rule("embed_tokens", Format::F32);
+                if options.mlp_bfp4 {
+                    for part in ["gate_up", "gate_proj", "up_proj"] {
+                        plan = plan.rule(part, Format::Bfp4);
+                    }
+                }
+                plan.rule("", Format::Bfp8)
+            }
+        }
     }
 
     pub fn format(&self, name: &str) -> Format {
@@ -291,6 +333,41 @@ pub fn apply<B: Backend, M: Module<B>>(model: M, plan: &Plan, quantizer: &impl Q
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_contract_names_its_weight_formats() {
+        use burn_tt::Numerics;
+        let names = [
+            "embed_tokens.weight",
+            "layers.0.self_attn.qkv.weight",
+            "layers.0.self_attn.o_proj.weight",
+            "layers.0.mlp.gate_up.weight",
+            "layers.0.mlp.gate_proj.weight",
+            "layers.0.mlp.up_proj.weight",
+            "layers.0.mlp.down_proj.weight",
+            "lm_head.weight",
+        ];
+        let formats = |numerics, mlp_bfp4| {
+            let plan = Plan::for_numerics(numerics, WeightOptions { mlp_bfp4 });
+            names.map(|n| plan.format(n))
+        };
+        use Format::*;
+        assert_eq!(
+            formats(Numerics::Reference, false),
+            [
+                F32, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored,
+                Bf16Stored
+            ]
+        );
+        assert_eq!(
+            formats(Numerics::Performance, false),
+            [F32, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8]
+        );
+        assert_eq!(
+            formats(Numerics::Performance, true),
+            [F32, Bfp8, Bfp8, Bfp4, Bfp4, Bfp4, Bfp8, Bfp8]
+        );
+    }
 
     fn data() -> Vec<f32> {
         // Two rows of 32: a spread of magnitudes inside each block, both signs, zeros.

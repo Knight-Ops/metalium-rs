@@ -127,6 +127,17 @@ const LONG: &[(&str, u64)] = &[
     // 116-135 s on card 0 (`1793030672`, `1793123716`): about the default, so it timed out at
     // 120.16 s in a run that otherwise passed (`1793216912`).
     ("step188_smollm2_1_7b::device_agrees_with_flex", 240),
+    // The performance contract's model gate: 357 s on card 0 for all eight prompts
+    // (`1794287910`), 287 s for the smoke run's two (`1794287596`), burn-flex's F32 run and three
+    // traced 1.7B builds each.
+    (
+        "step269_performance_contract::smollm2_1_7b_agrees_with_huggingface_under_each_contract",
+        660,
+    ),
+    (
+        "step269_performance_contract::smollm2_1_7b_agrees_with_huggingface_smoke",
+        500,
+    ),
     // 383 s on card 0 (`1793550834`), beside a bench on card 1: it timed out at the default 120 s,
     // and its child, still holding the card, failed the next gate's attach (`1793550535`).
     (
@@ -378,6 +389,9 @@ pub const SMOKE: &[&str] = &[
     "step268_column_weights::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
+    // ADR 0006, roadmap W1: the performance contract's model gate on its first two prompts
+    // (the 1.7B traced under each contract, teacher-forced against HuggingFace).
+    "step269_performance_contract::smollm2_1_7b_agrees_with_huggingface_smoke",
     "step165_resnet18::",
     "step166_vit_tiny::",
     "step170_checkpoint_round_trip::",

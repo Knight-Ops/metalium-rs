@@ -318,3 +318,50 @@ fn smollm2_with_bfp_weights_generates_bit_for_bit() {
         }
     });
 }
+
+/// "A default holds a weight's bytes once" (roadmap, standing constraints): SmolLM2-135M fused
+/// (`Llama::fused`: `q|k|v` and `gate|up` one matrix each, the separate ones dropped) and then
+/// stored holds no more GDDR than the same model stored unfused. A fused matrix pads no more than
+/// its parts together, so fusing may only save bytes. Each footprint is the GDDR the stored model
+/// holds: what was free before it was loaded less what is free while it lives (the F32 checkpoint
+/// it was made from is dropped by then). Negative control: before the parts were dropped
+/// (2026-11-10, card 0, `1794286677`) the fused model held 543 MB against 399 MB in BF16, its
+/// `q`, `k`, `v`, `gate` and `up` stored a second time beside the fused matrices.
+#[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "pretrained model, silicon tier: cargo xtask fetch-weights, then cargo xtask silicon --release --filter step240_bfp_weight_storage"
+)]
+fn a_fused_stored_model_holds_each_weight_once() {
+    let config = Config {
+        tiles: Some(burn_tt::TileChoice::All),
+        ..Config::default()
+    };
+    with_device(config, |d| {
+        let free = || burn_tt::gddr_free_bytes(d).unwrap().1;
+        for format in [Format::Bf16Stored, Format::Bfp8] {
+            let held = |fused: bool| {
+                let before = free();
+                let (model, _) =
+                    Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d)
+                        .unwrap();
+                let model = if fused { model.fused() } else { model };
+                let stored = model.with_stored_weights(format);
+                let held = before - free();
+                drop(stored);
+                held
+            };
+            let (unfused, fused) = (held(false), held(true));
+            println!(
+                "BENCH {{\"kind\":\"footprint\",\"model\":\"smollm2-135m\",\"format\":\"{format:?}\",\
+                 \"unfused_bytes\":{unfused},\"fused_bytes\":{fused}}}"
+            );
+            assert!(
+                fused <= unfused,
+                "{format:?}: the fused model holds {fused} bytes, the unfused one {unfused}: \
+                 {} bytes held twice",
+                fused - unfused
+            );
+        }
+    });
+}

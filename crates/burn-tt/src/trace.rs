@@ -229,6 +229,8 @@ impl Drop for Trace {
 pub struct TracedInference {
     device: TtDevice,
     id: u64,
+    /// The numeric contract in force while it was captured ([`Self::numerics`]).
+    numerics: crate::Numerics,
     inputs: Vec<BufferId>,
     outputs: Vec<(BufferId, server::OutputKind, [usize; 2])>,
     _held: Vec<TtTensor>,
@@ -351,6 +353,8 @@ impl TracedInference {
             ));
         };
         let device = first_in.device;
+        // The contract the graph is built under, frozen into the trace: one for the whole graph.
+        let numerics = crate::numerics(device)?;
         let mut in_ids = Vec::with_capacity(inputs.len());
         for &inp in inputs {
             if inp.device != device {
@@ -413,10 +417,14 @@ impl TracedInference {
             Pass::Plain => server::run(device, |e, _| e.begin_trace())?,
         }
         let mut guard = Capturing::new(device, false);
+        // A graph is captured under one contract (ADR 0006): `f` may not switch to another.
+        let contract = crate::numerics::Capture::open(numerics);
         let (outs, updates) = f();
+        drop(contract);
         // From here nothing reads the state as the step's: the write-back below reads it as
         // the buffer the next replay finds.
         drop(donation);
+
         let mut out_info = Vec::with_capacity(outs.len());
         for out in &outs {
             if out.device != device {
@@ -492,12 +500,19 @@ impl TracedInference {
             TracedInference {
                 device,
                 id,
+                numerics,
                 inputs: in_ids,
                 outputs: out_info,
                 _held: held,
             },
             first_outputs,
         )))
+    }
+
+    /// The numeric contract the trace was captured under ([`crate::Numerics`]): every replay
+    /// computes what a run under it computes, whatever is in force when it replays.
+    pub fn numerics(&self) -> crate::Numerics {
+        self.numerics
     }
 
     /// Name the trace in the profile mode's report (`crate::profile`); it is otherwise reported by
@@ -757,7 +772,10 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
         let plan_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (self.plan_scope, format!("{key:?}")).hash(&mut h);
+            // The contract too: a plan made under one is never applied to a graph built under
+            // the other, whose ops may differ.
+            let numerics = crate::numerics(self.device)?;
+            (self.plan_scope, format!("{key:?}"), numerics).hash(&mut h);
             for t in inputs.iter().copied().chain(&self.state) {
                 (t.shape(), format!("{:?}", t.dtype())).hash(&mut h);
             }

@@ -34,6 +34,20 @@ the Hub at the same revision. Prints, as Rust:
 - the checkpoint's shape as a `LlamaConfig` literal, to compare with the preset;
 - for each prompt, its token ids and the ten largest next-token logits (`float32`, CPU);
 - for the last prompt, the greedy continuation's token ids and text.
+
+With `--prompt-set OUT.rs` it writes instead the teacher-forced reference of the performance
+contract's model gate (ADR 0006; `crates/tt-tests/tests/step269_performance_contract.rs`) as a Rust
+module: for each chat message of `PROMPT_SET` below, the chat-templated prompt's ids, the greedy
+continuation (at most `--generate` tokens, ending at the end-of-turn token if it comes first), and
+at every position that predicts a continuation token (the prompt's last, then each continuation
+token but the last) the five largest logits and their ids, from one forward pass over the whole
+sequence:
+
+    uv run crates/tt-models/reference/llama_reference.py \
+        --repo HuggingFaceTB/SmolLM2-1.7B-Instruct \
+        --revision 31b70e2e869a7173562077fd711b654946d38674 \
+        --weights vendor/weights/smollm2-1.7b-instruct/model.safetensors \
+        --generate 32 --prompt-set crates/tt-models/src/prompt_sets/smollm2_1_7b.rs
 """
 
 import argparse
@@ -47,6 +61,83 @@ def rust_list(values, fmt="{}"):
     return "[" + ", ".join(fmt.format(v) for v in values) + "]"
 
 
+# The model gate's prompts: one chat message each, of different kinds (fact, code, arithmetic,
+# summary, explanation, translation, logic, advice). Changing them changes the gate's thresholds,
+# which are derived from a reference-contract run over exactly these.
+PROMPT_SET = [
+    "What is the capital of France?",
+    "Write a Python function that returns the n-th Fibonacci number.",
+    "What is 17 multiplied by 24? Show your steps.",
+    "Summarize the causes of the French Revolution in three sentences.",
+    "Explain what a hash table is to a beginner.",
+    "Translate 'Good morning, how are you?' into Spanish and German.",
+    "If all bloops are razzies and all razzies are lazzies, are all bloops lazzies? Why?",
+    "Give me three tips for writing clear technical documentation.",
+]
+
+
+def rust_f32(value):
+    """`value` to five decimals, without the trailing zeros clippy calls excess precision."""
+    text = f"{value:.5f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
+
+
+def rust_str(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_prompt_set(path, model, tokenizer, a):
+    """The teacher-forced reference over `PROMPT_SET` as a Rust module (see the module doc)."""
+    import transformers
+
+    cases = []
+    for text in PROMPT_SET:
+        ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}], add_generation_prompt=True, tokenize=True)
+        ids = list(ids["input_ids"] if hasattr(ids, "keys") else ids)
+        out = model.generate(torch.tensor([ids]), max_new_tokens=a.generate, do_sample=False)
+        continuation = out[0, len(ids):].tolist()
+        logits = model(torch.tensor([ids + continuation])).logits[0]
+        # Position p predicts token p + 1: the prompt's last position predicts the first token.
+        rows = logits[len(ids) - 1 : len(ids) - 1 + len(continuation)]
+        top = torch.topk(rows, 5, dim=-1)
+        cases.append((text, ids, continuation, top.indices.tolist(), top.values.tolist()))
+        print(f"// {text!r}: {len(ids)} prompt tokens, {len(continuation)} continuation: "
+              f"{tokenizer.decode(continuation)!r}")
+
+    lines = [
+        "//! The performance contract's model gate's reference (ADR 0006): what HuggingFace",
+        "//! `transformers` computes for SmolLM2-1.7B-Instruct, teacher-forced over a fixed prompt set.",
+        "//! **Generated; do not edit.** Written by `crates/tt-models/reference/llama_reference.py",
+        "//! --prompt-set` (see its doc for the command):",
+        f"//! transformers {transformers.__version__}, torch {torch.__version__}, CPU float32,",
+        f"//! {a.repo} at {a.revision}, the pinned `model.safetensors`, greedy continuations of at most",
+        f"//! {a.generate} tokens.",
+        "",
+        "use super::Case;",
+        "",
+        f"pub const CASES: [Case; {len(cases)}] = [",
+    ]
+    for text, ids, continuation, top_ids, top_logits in cases:
+        lines.append("    Case {")
+        lines.append(f"        chat: {rust_str(text)},")
+        lines.append(f"        prompt: &{rust_list(ids)},")
+        lines.append(f"        continuation: &{rust_list(continuation)},")
+        lines.append("        top5: &[")
+        for row in top_ids:
+            lines.append(f"            {rust_list(row)},")
+        lines.append("        ],")
+        lines.append("        logits: &[")
+        for row in top_logits:
+            lines.append("            [" + ", ".join(rust_f32(v) for v in row) + "],")
+        lines.append("        ],")
+        lines.append("    },")
+    lines.append("];")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"// wrote {path}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--repo", required=True)
@@ -55,6 +146,7 @@ def main():
     p.add_argument("--prompt", action="append", default=[], help="raw text")
     p.add_argument("--chat", action="append", default=[], help="a user message, chat-templated")
     p.add_argument("--generate", type=int, default=0, help="greedy tokens after the last prompt")
+    p.add_argument("--prompt-set", help="write the model gate's reference to this Rust file")
     a = p.parse_args()
 
     torch.manual_seed(0)
@@ -88,6 +180,11 @@ def main():
     scaling = getattr(config, "rope_scaling", None)
     bias = getattr(config, "attention_bias", False) or getattr(config, "mlp_bias", False)
     print(f"// rope_scaling: {scaling!r}, attention/mlp bias: {bias}")
+
+    if a.prompt_set:
+        assert a.generate > 0, "--prompt-set needs --generate"
+        write_prompt_set(a.prompt_set, model, tokenizer, a)
+        return
 
     prompts = [("prompt", text, tokenizer(text).input_ids) for text in a.prompt]
     prompts += [

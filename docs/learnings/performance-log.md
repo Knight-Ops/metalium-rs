@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: BFP8 weights the inference default, behind the contract switch and a model gate](#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1) | 2026-11-10 | roadmap W1's first box closed: `burn_tt::Numerics`, `Llama`/`Qwen35::for_inference`, the model gate `step269` (BFP8: top-1 98.28%, top-5 100%, PCC 0.99968 over 232 teacher-forced positions; BFP4 `gate\|up` 86.64% / 0.93, recorded). 1.7B decode under the performance contract **7.52 ms** (reference 9.81). Also: a fused, stored Llama held `q`, `k`, `v`, `gate`, `up` twice (135M BF16 543 -> 399 MB) |
 | [W1 bounded: the performance contract on this stack, before any plumbing](#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1) | 2026-11-09 | roadmap W1's first box (absorbs H13): `silicon_probe_performance_contract` and the 1.7B end to end per weight format. BFP8 weights alone: decode 9.83 -> **7.51 ms** (BFP4 6.34), under W1's 8.0 ms kill; fidelity moves nothing at `m` = 1; a BF16 `A` is **slower** today (decode products 1.4x, prefill at HiFi4 1.4-2.0x): a packed `A` takes the faces pair order and misses the packed thin row and the weight prefetch. H13 killed (0.94x); the packer-L1-accumulation ceiling up to 24% of a product, only under a packed `A`. §6 issue 1 settled: no prefill regression, the ~2,100 tokens/s rows are the stream-ceiling probe's chunks of 64 |
 | [Training on every tile, traced by default](#training-on-every-tile-traced-by-default-2026-11-09-card-0) | 2026-11-09 | roadmap W6/W8: every tile and traced training the defaults; MNIST 1.31 ms a step traced (eager 1 tile 2.17, burn-flex 2.3-2.6), the transformer 3.75 (8.52, 3.9-4.4); eager ops at `work:64:4`, captured on every unit (`set_capture_spread`); the "traced MNIST regression" bisected to `9977ad8` is the first step's block measurement (3.2 s once), not the steady state |
 | [tt-metal on the same card: Qwen3.5-4B](#tt-metal-on-the-same-card-qwen35-4b-2026-11-09-card-1) | 2026-11-09 | tt-metal's `qwen36` path, unchanged, on card 1: 38.0 ms a decode step on the card, 44-46 host-timed (BFP4/BFP8, LoFi, host argmax), against our 62.5 (~41 without our 21 ms greedy pick, BF16 weights); no single-device batch 32 |
@@ -419,6 +420,75 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: BFP8 weights the inference default, behind the contract switch and a model gate (2026-11-10, cards 0 and 1)
+
+Roadmap W1's first box ([tt-metal-parity.md](../plans/tt-metal-parity.md) §5 W1; ADR 0006). The box needed the contract
+switch and a model gate, since BFP8 weights' tokens are not the reference's. Release, safe image, every tile. Gates on
+card 0, benches on card 1 (the W0 parity card).
+
+**What landed.**
+- **The switch:** `burn_tt::Numerics { Reference, Performance }`.
+  - `TtConfig::numerics` / `TT_NUMERICS` set it for an attachment, `Reference` by default; `with_numerics` scopes it on
+    a thread.
+  - A trace records its contract (`TracedInference::numerics`) and the residency-plan key includes it. A capture
+    refuses a switch part way (`step40::a_trace_freezes_the_contract_it_was_captured_under`, ttsim, with its negative
+    control).
+- **The models ask for it:**
+  - `tt_models::quant::Plan::for_numerics`: reference, BF16-stored weights; performance, BFP8, with BFP4 `gate|up` as
+    `WeightOptions::mlp_bfp4`.
+  - `Llama::for_inference` / `Qwen35::for_inference`; `TracedGenerator` captures under the model's contract.
+  - The model benches run the performance contract unless `TT_NUMERICS=reference`. `TT_WEIGHT_STORAGE` is now a probe
+    outside the contracts.
+- **The model gate, `step269_performance_contract`:** SmolLM2-1.7B traced, teacher-forced over eight chat prompts
+  (232 positions).
+  - HuggingFace's continuations and top-5 come from `llama_reference.py --prompt-set`
+    (`tt_models::prompt_sets::smollm2_1_7b`).
+  - PCC is taken against burn-flex's F32 logits. burn-flex is held to HuggingFace over the same set:
+    `llama_1_7b_host::flex_reproduces_the_prompt_set`, largest logit difference 1.07e-4.
+
+**Agreement** (card 0, `1794287910`, then passing in `1794288568`):
+
+| run | top-1 | top-5 | PCC mean (least) |
+|---|--:|--:|--:|
+| burn-flex F32 | 100% | 100% | 1 |
+| reference contract (BF16 weights) | 100% | 100% | 0.999998 (0.999994) |
+| performance contract (BFP8 weights) | **98.28%** | **100%** | **0.999678** (0.999352) |
+| BFP4 `gate\|up` (named option) | 86.64% | 96.55% | 0.932528 (0.773370) |
+
+- **The thresholds:** the reference run less the owner's margin, 2 points of top-1 and top-5 and 0.005 of PCC.
+  BFP8 clears top-1 by one position (228 of 232). It is deterministic, so it moves only with the code.
+- **BFP4 `gate|up` misses tt-metal's acceptance floors** (top-1 90%, PCC 0.95) on this model. It is bit for bit its
+  emulation (`step240`), so this is the format's quality, not an error. The owner kept it as a recorded option, to be
+  judged again on the 8B-class model (W5).
+
+**Decode and prefill** (card 1, `traced_generation`, the 1.7B, chunks 64 / 128 / 256, 512-position cache):
+
+| contract | step at 32 / 128 / 256 tokens, ms | tokens/s at 32 | prefill 32 / 128 / 256, tokens/s | run |
+|---|--:|--:|--:|---|
+| reference (BF16 weights) | 9.81 / 10.31 / 10.93 | 101.9 | 1,098 / 3,091 / 3,881 | `1794292593` |
+| **performance (BFP8 weights)** | **7.52** / 8.02 / 8.68 | 133.0 | 1,190 / 3,259 / 4,012 | `1794291915` |
+| performance, BFP4 `gate\|up` | 6.90 / 7.42 / 8.06 | 144.9 | 1,202 / 3,276 / 4,075 | `1794293267` |
+
+- The bound's 7.51 ms (`1794261034`) holds through `for_inference`.
+- Against tt-metal's 10.55 ms in its performance mode on the same card, the default inference step is 0.71x.
+- **Qwen3.5-4B** (`qwen35_traced_generation`, chunks of 16, 512-position cache):
+  - **56.93 / 57.29 ms** a step at 32 / 256 tokens under the performance contract (`1794293972`), against 62.49 /
+    62.82 under the reference contract the same day (`1794295094`): -8.9%.
+  - Its tied head stays the F32 table under both: an untied, stored head would be a second copy of the table.
+  - The ~21 ms greedy pick is untouched (W4).
+  - Its BFP8 tokens are checked only against its own eager schedule; its model gate is an open roadmap box.
+
+**Found on the way: a fused, stored Llama held five of its matrices twice.**
+- `Llama::fused` left `q`, `k`, `v`, `gate` and `up` as slice views of the fused matrices.
+- A `quant` plan then stored each view as a copy of its own. Slicing a stored weight in burn-tt widens it first.
+- `step240::a_fused_stored_model_holds_each_weight_once` measured SmolLM2-135M fused and stored BF16 at 543 MB of GDDR
+  against 399 MB unfused (`1794286677`).
+- Re-pointing the parts at views of the stored whole made it worse: 1,034 MB, each view an F32 widening.
+- `fuse` now drops the parts (they were never read once fused, as Qwen3.5's `fuse` already did). Fused and stored:
+  399.0 MB BF16, 272.7 MB BFP8, no more than unfused (`1794286904`). This affected the BF16 default since it landed.
+- **Still two copies, by design until the BF16 lookup lands:** the 1.7B's tied head (the table F32 for the lookup, the
+  head stored).
 
 ## W1 bounded: the performance contract on this stack, before any plumbing (2026-11-09, cards 0 and 1)
 

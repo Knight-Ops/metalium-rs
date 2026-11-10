@@ -151,3 +151,61 @@ fn the_host_model_reproduces_the_reference_implementation() {
     let answer = model.generate(&CHAT, CHAT_ANSWER.len(), Precision::F32, &FlexDevice);
     assert_eq!(answer.tokens, CHAT_ANSWER, "the greedy answer");
 }
+
+/// The performance contract's model gate (`step269_performance_contract`) correlates the card's
+/// full logits with burn-flex's in HuggingFace's place, since only HuggingFace's five largest are
+/// stored (`tt_models::prompt_sets::smollm2_1_7b`). This holds burn-flex to HuggingFace there:
+/// teacher-forced over the whole prompt set, at every position HuggingFace's five largest logits
+/// are burn-flex's within the bound `reproduces` uses (a wrong layer or constant moves a logit by
+/// whole units), and their order is burn-flex's wherever HuggingFace's margin between two of them
+/// exceeds twice that bound.
+#[test]
+#[cfg_attr(
+    not(feature = "weights"),
+    ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-models/weights"
+)]
+fn flex_reproduces_the_prompt_set() {
+    use tt_models::generate::EagerDecoder;
+    use tt_models::prompt_sets::smollm2_1_7b::CASES;
+    const BOUND: f32 = 1e-3;
+    let (model, _) = Llama::<Flex>::smollm2_1_7b_instruct(
+        SMOLLM2_1_7B_INSTRUCT.layers,
+        Precision::F32,
+        &FlexDevice,
+    )
+    .unwrap();
+    let mut worst = 0f32;
+    for case in &CASES {
+        let g = EagerDecoder::forced(
+            &model,
+            case.prompt,
+            case.continuation,
+            Precision::F32,
+            &FlexDevice,
+        );
+        for (i, (ids, want)) in case.top5.iter().zip(case.logits).enumerate() {
+            let got = &g.logits[i];
+            for (&id, &w) in ids.iter().zip(want) {
+                let diff = (got[id as usize] - w).abs();
+                worst = worst.max(diff);
+                assert!(
+                    diff < BOUND,
+                    "{:?}, position {i}: token {id}'s logit {} against HuggingFace's {w}",
+                    case.chat,
+                    got[id as usize]
+                );
+            }
+            for k in 1..5 {
+                if want[k - 1] - want[k] > 2.0 * BOUND {
+                    let (a, b) = (ids[k - 1] as usize, ids[k] as usize);
+                    assert!(
+                        got[a] > got[b],
+                        "{:?}, position {i}: HuggingFace's order of {a} and {b}",
+                        case.chat
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("the prompt set: largest logit difference from HuggingFace {worst:e}");
+}

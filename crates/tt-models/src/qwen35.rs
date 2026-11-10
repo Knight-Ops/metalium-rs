@@ -958,6 +958,9 @@ pub struct Qwen35<B: Backend> {
     lm_head: Option<Linear<B>>,
     /// Not a parameter: the module derive skips it.
     config: Qwen35Config,
+    /// The numeric contract the model was made for ([`Qwen35::for_inference`]), or `None`. Not a
+    /// parameter.
+    numerics: Option<burn_tt::Numerics>,
 }
 
 /// Widens every float parameter to F32.
@@ -987,6 +990,7 @@ impl<B: Backend> Qwen35<B> {
             norm: CenteredNorm::new(config.hidden, config.eps, device),
             lm_head: (!config.tied_head).then(|| linear(config.hidden, config.vocab, device)),
             config: *config,
+            numerics: None,
         }
     }
 
@@ -1215,6 +1219,29 @@ impl<B: Backend> Qwen35<B> {
 }
 
 impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
+    /// The model as inference runs it under the numeric contract `numerics` (ADR 0006): every
+    /// matrix but the embedding table in the contract's format ([`crate::quant::Plan::for_numerics`]:
+    /// BF16 under the reference contract, BFP8 under the performance one, BFP4 `gate|up` with
+    /// [`WeightOptions::mlp_bfp4`]). Every matrix here is a product's weight, read where it lies.
+    /// A tied head stays the F32 table: a head of its own would be a second copy of the table
+    /// (roadmap, "a default holds a weight's bytes once"), until the table itself can be stored
+    /// packed and still looked up. For a loaded (prepared) model of BF16 values.
+    ///
+    /// [`WeightOptions::mlp_bfp4`]: crate::quant::WeightOptions::mlp_bfp4
+    pub fn for_inference(
+        self,
+        numerics: burn_tt::Numerics,
+        options: crate::quant::WeightOptions,
+    ) -> Self {
+        let mut model = crate::quant::apply(
+            self,
+            &crate::quant::Plan::for_numerics(numerics, options),
+            &crate::quant::Native,
+        );
+        model.numerics = Some(numerics);
+        model
+    }
+
     /// Every matrix but the embedding table stored BF16 ([`crate::quant::Plan::bf16_weights`]),
     /// for an F32 model ([`Precision::F32`]): half the bytes a decode step reads, the arithmetic
     /// F32 on the checkpoint's own BF16 values. That this gives the F32 model's logits bit for bit
@@ -1517,6 +1544,10 @@ impl<B: Backend> Qwen35<B> {
 
 impl<B: Backend> FixedShapeDecoder<B> for Qwen35<B> {
     type Cache = HybridCache<B>;
+
+    fn numerics(&self) -> Option<burn_tt::Numerics> {
+        self.numerics
+    }
 
     /// A cache whose keys and values are in the embedding table's dtype.
     fn new_cache(&self, max_len: usize, device: &B::Device) -> HybridCache<B> {

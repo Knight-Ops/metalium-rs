@@ -93,6 +93,20 @@ The inference default. Its per-op rule:
 - A contract is chosen per session or per trace (`TtConfig`). A trace freezes the contract it was captured in.
 - Mixing contracts within a graph is allowed only at a named boundary.
 
+### What the switch is, and what Performance means so far (2026-11-10, roadmap W1)
+- **The switch:** `burn_tt::Numerics { Reference, Performance }`.
+  - `TtConfig::numerics` (or `TT_NUMERICS`) sets it for an attachment; the default is `Reference`.
+  - `burn_tt::with_numerics` overrides it for the work a closure builds on its thread.
+  - A trace records the contract it was captured under (`TracedInference::numerics`), and the residency-plan key includes it.
+  - A capture refuses a `with_numerics` to another contract part way: no named boundary exists yet.
+- **Who asks for Performance:** inference does. `tt_models`' `Llama::for_inference` / `Qwen35::for_inference` take the contract, store the weights in its formats (`quant::Plan::for_numerics`) and record it; a `TracedGenerator` captures under the model's contract. Training and conformance keep the attachment's default, the reference contract.
+- **Performance today is its first box only:**
+  - BFP8 weights (BFP4 `gate|up` as `WeightOptions::mlp_bfp4`);
+  - F32 activations and HiFi4, as under the reference contract;
+  - no burn-tt op branches on the contract yet.
+
+  Its specification model is therefore exact: the F32 model holding the weights' rounded values (`step240`). The model gate is `step269_performance_contract`. BF16 activations, derived fidelity and packer L1 accumulation extend both as their boxes land.
+
 ## Consequences
 **Results under the performance contract change** with the contract's version, never with the grid, the card or the schedule.
 

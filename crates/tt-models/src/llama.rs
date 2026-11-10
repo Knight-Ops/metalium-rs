@@ -154,48 +154,53 @@ fn normed<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) -> Ten
 
 #[derive(Module, Debug)]
 pub struct SelfAttn<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
+    /// The three projections as loaded; `None` once fused into [`SelfAttn::qkv`].
+    q_proj: Option<Linear<B>>,
+    k_proj: Option<Linear<B>>,
+    v_proj: Option<Linear<B>>,
     o_proj: Linear<B>,
-    /// `q|k|v` as one `[hidden, q + 2 kv]` matrix ([`Llama::fused`]), whose column blocks the three
-    /// projections above are then views of. `None` as loaded.
+    /// `q|k|v` as one `[hidden, q + 2 kv]` matrix ([`Llama::fused`]), in place of the three
+    /// projections above. `None` as loaded.
     qkv: Option<Linear<B>>,
 }
 
 #[derive(Module, Debug)]
 pub struct Mlp<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
+    /// The two projections as loaded; `None` once fused into [`Mlp::gate_up`].
+    gate_proj: Option<Linear<B>>,
+    up_proj: Option<Linear<B>>,
     down_proj: Linear<B>,
     /// `gate|up` as one `[hidden, 2 ff]` matrix ([`Llama::fused`]), as `qkv` is.
     gate_up: Option<Linear<B>>,
 }
 
-/// The projections `parts` as one matrix, their weights concatenated along the outputs, and each
-/// part's weight replaced by its column block of it (a view where the backend makes slices views,
-/// so the parts and the whole share storage). `None`, and `parts` untouched, unless every part is
-/// the same dtype and without a bias.
-fn fuse<B: Backend>(parts: &mut [&mut Linear<B>]) -> Option<Linear<B>> {
-    let dtype = parts[0].weight.val().dtype();
-    if parts
+/// The projections `parts` as one matrix, their weights concatenated along the outputs, the parts
+/// themselves dropped: the fused matrix is the only copy of their weights. `None`, and `parts`
+/// untouched, unless every part is present, of one dtype and without a bias.
+fn fuse<B: Backend>(parts: &mut [&mut Option<Linear<B>>]) -> Option<Linear<B>> {
+    let weights = parts
         .iter()
-        .any(|p| p.bias.is_some() || p.weight.val().dtype() != dtype)
-    {
+        .map(|p| p.as_ref().map(|l| (l.weight.val(), l.bias.is_some())))
+        .collect::<Option<Vec<_>>>()?;
+    let dtype = weights[0].0.dtype();
+    if weights.iter().any(|(w, bias)| *bias || w.dtype() != dtype) {
         return None;
     }
-    let whole = Tensor::cat(parts.iter().map(|p| p.weight.val()).collect(), 1);
-    let [rows, _] = whole.dims();
-    let mut at = 0;
+    let whole = Tensor::cat(weights.into_iter().map(|(w, _)| w).collect(), 1);
     for p in parts.iter_mut() {
-        let [_, cols] = p.weight.val().dims();
-        p.weight = Param::from_tensor(whole.clone().slice([0..rows, at..at + cols]));
-        at += cols;
+        **p = None;
     }
     Some(Linear {
         weight: Param::from_tensor(whole),
         bias: None,
     })
+}
+
+/// A projection of an unfused layer: present unless [`Llama::fused`] replaced it, and a fused
+/// layer reads its fused matrix instead.
+fn part<B: Backend>(p: &Option<Linear<B>>) -> &Linear<B> {
+    p.as_ref()
+        .expect("a projection fused away is read only through its fused matrix")
 }
 
 /// `x @ W` for the fused `whole`, split back into the parts' outputs, `widths` columns each.
@@ -288,16 +293,16 @@ impl<B: Backend> Layer<B> {
         Self {
             input_layernorm: rms_norm(cfg, device),
             self_attn: SelfAttn {
-                q_proj: linear(h, q, device),
-                k_proj: linear(h, kv, device),
-                v_proj: linear(h, kv, device),
+                q_proj: Some(linear(h, q, device)),
+                k_proj: Some(linear(h, kv, device)),
+                v_proj: Some(linear(h, kv, device)),
                 o_proj: linear(q, h, device),
                 qkv: None,
             },
             post_attention_layernorm: rms_norm(cfg, device),
             mlp: Mlp {
-                gate_proj: linear(h, cfg.ff, device),
-                up_proj: linear(h, cfg.ff, device),
+                gate_proj: Some(linear(h, cfg.ff, device)),
+                up_proj: Some(linear(h, cfg.ff, device)),
                 down_proj: linear(cfg.ff, h, device),
                 gate_up: None,
             },
@@ -345,9 +350,9 @@ impl<B: Backend> Layer<B> {
         let [q, k, v] = match &a.qkv {
             Some(qkv) => project_split(h, qkv, [qw, kvw, kvw]),
             None => [
-                project(h.clone(), &a.q_proj),
-                project(h.clone(), &a.k_proj),
-                project(h, &a.v_proj),
+                project(h.clone(), part(&a.q_proj)),
+                project(h.clone(), part(&a.k_proj)),
+                project(h, part(&a.v_proj)),
             ],
         };
         let q = rope.apply(heads(q, cfg.heads));
@@ -416,7 +421,10 @@ impl<B: Backend> Layer<B> {
         let m = &self.mlp;
         let [gate, up] = match &m.gate_up {
             Some(gate_up) => project_split(h, gate_up, [cfg.ff, cfg.ff]),
-            None => [project(h.clone(), &m.gate_proj), project(h, &m.up_proj)],
+            None => [
+                project(h.clone(), part(&m.gate_proj)),
+                project(h, part(&m.up_proj)),
+            ],
         };
         let hidden = if probing_free(2) {
             drop(gate);
@@ -524,6 +532,9 @@ pub struct Llama<B: Backend> {
     lm_head: Option<Linear<B>>,
     /// Not a parameter: the module derive skips it.
     config: LlamaConfig,
+    /// The numeric contract the model was made for ([`Llama::for_inference`]), or `None` for one
+    /// put together otherwise. Not a parameter.
+    numerics: Option<burn_tt::Numerics>,
 }
 
 /// Widens every float parameter to F32.
@@ -547,6 +558,7 @@ impl<B: Backend> Llama<B> {
             norm: rms_norm(config, device),
             lm_head: (!config.tied_head).then(|| linear(config.hidden, config.vocab, device)),
             config: *config,
+            numerics: None,
         }
     }
 
@@ -558,11 +570,12 @@ impl<B: Backend> Llama<B> {
     /// outputs split back by column views: three products and two become one each, so a decode
     /// step's narrow `m = 1` products spread over more of the card. Every output column keeps its
     /// own accumulation over the hidden dimension, so the logits are the unfused model's **bit for
-    /// bit** (`step191_fused_projections`). The separate weights become views of the fused one,
-    /// which keeps parameter paths (and a later save) as loaded. A group whose matrices differ in
-    /// dtype stays unfused. Not for a model a [`crate::quant`] plan rewrites, before or after: its
-    /// block-float storage is invisible here (the dtype is F32), and its rules name the separate
-    /// matrices.
+    /// bit** (`step191_fused_projections`). The separate matrices are dropped: the fused ones are
+    /// the only copy of their weights (`step240`'s footprint gate), and a save of a fused model
+    /// holds `qkv` and `gate_up` in their place. A group whose matrices differ in dtype stays
+    /// unfused. Fuse **before** a [`crate::quant`] plan is applied, whose rules then name the fused
+    /// matrices (`qkv`, `gate_up`); not after, since block-float storage is invisible here (the
+    /// dtype is F32) and the parts would be concatenated by widening.
     pub fn fused(mut self) -> Self {
         for layer in &mut self.layers {
             layer.fuse();
@@ -926,6 +939,10 @@ impl<B: Backend> Llama<B> {
 impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
     type Cache = LlamaCache<B>;
 
+    fn numerics(&self) -> Option<burn_tt::Numerics> {
+        self.numerics
+    }
+
     /// A cache in the model's own dtype.
     fn new_cache(&self, max_len: usize, device: &B::Device) -> LlamaCache<B> {
         self.fixed_cache(max_len, self.embed_tokens.weight.val().dtype(), device)
@@ -1065,6 +1082,28 @@ impl<B: Backend> crate::generate::EagerDecoder<B> for Llama<B> {
 }
 
 impl<B: burn_tt::storage::StorageBackend> Llama<B> {
+    /// The model as inference runs it under the numeric contract `numerics` (ADR 0006): fused
+    /// ([`Llama::fused`]), its head untied, and every weight but the embedding table stored in the
+    /// contract's format ([`crate::quant::Plan::for_numerics`]: BF16 under the reference contract,
+    /// BFP8 under the performance one, and BFP4 for `gate|up` with [`WeightOptions::mlp_bfp4`]).
+    /// For a checkpoint of BF16 values, as every one `tt-models` loads. A traced generator captures
+    /// the model's steps under its contract ([`FixedShapeDecoder::numerics`]).
+    ///
+    /// [`WeightOptions::mlp_bfp4`]: crate::quant::WeightOptions::mlp_bfp4
+    pub fn for_inference(
+        self,
+        numerics: burn_tt::Numerics,
+        options: crate::quant::WeightOptions,
+    ) -> Self {
+        let mut model = crate::quant::apply(
+            self.fused().untied(),
+            &crate::quant::Plan::for_numerics(numerics, options),
+            &crate::quant::Native,
+        );
+        model.numerics = Some(numerics);
+        model
+    }
+
     /// Every weight but the embedding table stored BF16, the output head untied first
     /// ([`Llama::untied`], [`crate::quant::Plan::bf16_weights`]): half the bytes a decode step
     /// reads, and for a BF16 checkpoint widened to F32 ([`Precision::F32`]) the same logits **bit
