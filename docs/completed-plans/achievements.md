@@ -242,6 +242,14 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
 - **135M** over the same period: 24.40 ms (2026-10-16) -> 6.92 / 7.47 / 8.14 ms at 32 / 128 / 256 tokens
   (2026-10-27), against burn-flex's 26.5 / 29.1 / 30.5.
 
+- **W1 bounded: the performance contract's products measured before any plumbing** (2026-11-09, card 1,
+  `silicon_probe_performance_contract` `1794257871`/`1794258133`, the 1.7B per weight format `1794260351`,
+  `1794261034`, `1794261722`; [log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1)). BFP8 weights alone take the 1.7B's decode step 9.83 -> **7.51 ms** (BFP4 6.34),
+  F32 activations at HiFi4, against tt-metal's 10.55 on the same card: W1's 8.0 ms kill does not fire. Fidelity
+  moves no product at `m` = 1. A BF16 `A` is slower today (decode products 1.4x, prefill at HiFi4 1.4-2.0x): a
+  packed `A` takes the faces pair order and misses the one-row packing and weight prefetch. H13 killed; packer L1
+  accumulation's ceiling, up to 24% of a product, shows only under a packed `A`.
+
 ## Prefill and long context
 
 Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-context.md](../plans/long-context.md).
@@ -275,6 +283,12 @@ Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-con
   below): 1.11x at 64 / 256 tokens. **Program restores on the card** (1a, below): 128 / 256 tokens 2,546 / 2,744 ->
   3,040 / 3,827 tokens/s.
 - As of 2026-11-07 the 1.7B prefills 7,992 tokens in 5.98 s.
+
+- **No 1.7B prefill regression** (2026-11-09, `1794260351`, [log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1)): `traced_generation` reads 1,098 / 3,084 /
+  3,890 tokens/s at 32 / 128 / 256 tokens, against H15's 3,827 at 256. The ~2,090 quoted since 2026-11-03 were
+  `traced_generation_stream_ceiling`'s rows (prefill in chunks of 64), which run under the same filter. Model
+  benchmarks now attach every tile unless `TT_TILES` says otherwise (the gate tile alone overflowed the 1.7B's
+  program cache).
 
 ## Traced execution and replay
 

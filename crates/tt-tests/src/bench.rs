@@ -320,6 +320,57 @@ pub fn report(key: &str, unit: &str, timed: &str, stats: Stats) {
     .emit();
 }
 
+/// The median of `samples` host-timed `replay` + `sync` of `trace`, after `warmups`, in
+/// microseconds.
+pub fn replay_us<T: tt_device::Transport>(
+    s: &mut tt_kernels::session::Session<T>,
+    trace: tt_kernels::trace::TraceId,
+    warmups: usize,
+    samples: usize,
+) -> f64 {
+    let mut v: Vec<f64> = (0..warmups + samples)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            s.replay(trace).unwrap();
+            s.sync().unwrap();
+            t.elapsed().as_secs_f64() * 1e6
+        })
+        .skip(warmups)
+        .collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+/// One op's time on the card, in microseconds: a trace of `reps` copies of `op` against a trace of
+/// one, each replayed `warmups` + `samples` times (medians), the difference over `reps - 1`. A
+/// replay's start and the host's sync drop out, so an op of a few microseconds is timed as the
+/// card runs it inside a longer trace (tt-metal's `ttnn_parity` scripts time the same slope).
+pub fn trace_slope_us<T: tt_device::Transport>(
+    s: &mut tt_kernels::session::Session<T>,
+    reps: usize,
+    warmups: usize,
+    samples: usize,
+    mut op: impl FnMut(&mut tt_kernels::session::Session<T>),
+) -> f64 {
+    assert!(reps > 1, "a slope needs at least two copies");
+    let mut trace = |s: &mut tt_kernels::session::Session<T>, n: usize| {
+        s.begin_trace().unwrap();
+        for _ in 0..n {
+            op(s);
+        }
+        s.end_trace().unwrap()
+    };
+    let one = trace(s, 1);
+    let many = trace(s, reps);
+    let (t1, tn) = (
+        replay_us(s, one, warmups, samples),
+        replay_us(s, many, warmups, samples),
+    );
+    s.release_trace(one).unwrap();
+    s.release_trace(many).unwrap();
+    (tn - t1) / (reps - 1) as f64
+}
+
 /// A throughput from `bytes` moved per sample of `us` microseconds, against
 /// `peak`. The stats printed are the microseconds; the rate is the median's.
 pub fn report_rate(key: &str, timed: &str, bytes: f64, us: Stats, peak: Option<&Peak>) {

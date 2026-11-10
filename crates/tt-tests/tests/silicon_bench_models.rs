@@ -16,7 +16,8 @@
 //! whole step from a token id, which the row select (`step171_select_rows`) made affordable.
 //!
 //! Silicon only, `#[ignore]`d (run with `cargo xtask bench --filter silicon_bench_models`), and
-//! independent of each other, so two can run at once on two cards.
+//! independent of each other, so two can run at once on two cards. Each runs on every tile of its
+//! card ([`bench_config`]), as burn-tt opens a card by default; `TT_TILES` chooses fewer.
 
 #![cfg(feature = "silicon")]
 
@@ -44,6 +45,18 @@ fn conditions(card: usize) {
         std::env::var("TT_EVEN_DEAL").map_or(true, |v| v != "0"),
         std::env::var("TT_PROBE_DEAL").unwrap_or_else(|_| "off".into()),
     );
+}
+
+/// The device a model benchmark attaches: every tile of the card, as burn-tt opens one by default
+/// (`docs/plans/tt-metal-parity.md` W6), unless `TT_TILES` says otherwise. The gate tile alone
+/// cannot hold a 1.7B step's programs: a capture overflows its program cache.
+fn bench_config() -> Config {
+    Config {
+        tiles: std::env::var("TT_TILES")
+            .is_err()
+            .then_some(burn_tt::TileChoice::All),
+        ..Config::default()
+    }
 }
 
 fn card() -> usize {
@@ -263,7 +276,7 @@ fn resnet18_forward() {
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         })
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) = ResNet18::<TtBackend>::pretrained(&d).unwrap();
         let got = measure("resnet18 224x224 batch 1 forward", || {
@@ -367,7 +380,7 @@ fn resnet18_forward_traced() {
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         })
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) = ResNet18::<TtBackend>::pretrained(&d).unwrap();
         traced_image_forward(
@@ -395,7 +408,7 @@ fn vit_tiny_forward_traced() {
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         })
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) = VitTiny::<TtBackend>::pretrained(FULL_DEPTH, &d).unwrap();
         traced_image_forward(
@@ -422,7 +435,7 @@ fn vit_tiny_forward() {
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         })
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) = VitTiny::<TtBackend>::pretrained(FULL_DEPTH, &d).unwrap();
         let got = measure("vit-tiny 224x224 batch 1 forward", || {
@@ -472,7 +485,7 @@ fn smollm2_decode_without_the_embedding_lookup() {
             },
         );
     }
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) =
             Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
@@ -538,7 +551,7 @@ fn smollm2_decode_traced() {
                 .unwrap()
         });
     }
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let dtype = DType::F32;
         let (m, _) =
@@ -688,7 +701,7 @@ fn smollm2_prefill_chunk_sweep() {
             });
         }
     }
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let dtype = DType::F32;
         let (m, _) =
@@ -837,7 +850,7 @@ fn smollm2_decode_with_the_embedding_lookup() {
                 .unwrap()
         });
     }
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) =
             Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
@@ -970,7 +983,7 @@ fn traced_generation() {
         buckets,
         new,
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         if std::env::var("TT_GEN_FUSION").is_ok_and(|v| v == "0") {
             traced_generation_on::<TtBackend>(&d, &run, " on TtBackend");
@@ -1518,7 +1531,7 @@ fn traced_generation_stream_ceiling() {
     let residency = std::env::var("TT_PROBE_RESIDENCY").is_ok_and(|v| v == "1");
     let nc_waits = std::env::var("TT_PROBE_NC_WAITS").is_ok_and(|v| v == "1");
     tt_kernels::residency::probe_residency_plan(residency);
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         println!(
             "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split},\"batched_a_skipped\":\"{batched_a}\",\"free\":\"{}\",\"contiguous_b\":{},\"in_flight_cap\":\"{}\",\"stream_cap_bf16\":\"{}\"}}",

@@ -30,7 +30,7 @@ Every other choice is a separately named opt-in contract.
   - 168 TFLOPS at HiFi4;
   - 240 at BF16-HiFi2;
   - 470-554 at BFP8-LoFi.
-- **Decode is bound by unpack and math, not bytes.** That is why BFP4 weights bought 1.09x where 1.5x was predicted.
+- **Decode is bound by unpack and math, not bytes.** That is why BFP4 weights bought 1.09x where 1.5x was predicted. *(Corrected 2026-11-09: at `m` = 1 fidelity moves no product, and BFP8 / BFP4 weights take the 1.7B's step 9.83 -> 7.51 / 6.34 ms. The 1.09x of 2026-10-28 was read before the even deal, the column layout and the prefetch; [performance-log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1).)*
 - **Most of the order-changing levers stay opt-in by rule:** packer L1 accumulation, lower fidelity, split-K, flash-decode.
 
 tt-metal's default for LLMs is:

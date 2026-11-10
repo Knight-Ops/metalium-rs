@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1 bounded: the performance contract on this stack, before any plumbing](#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1) | 2026-11-09 | roadmap W1's first box (absorbs H13): `silicon_probe_performance_contract` and the 1.7B end to end per weight format. BFP8 weights alone: decode 9.83 -> **7.51 ms** (BFP4 6.34), under W1's 8.0 ms kill; fidelity moves nothing at `m` = 1; a BF16 `A` is **slower** today (decode products 1.4x, prefill at HiFi4 1.4-2.0x): a packed `A` takes the faces pair order and misses the packed thin row and the weight prefetch. H13 killed (0.94x); the packer-L1-accumulation ceiling up to 24% of a product, only under a packed `A`. §6 issue 1 settled: no prefill regression, the ~2,100 tokens/s rows are the stream-ceiling probe's chunks of 64 |
 | [Training on every tile, traced by default](#training-on-every-tile-traced-by-default-2026-11-09-card-0) | 2026-11-09 | roadmap W6/W8: every tile and traced training the defaults; MNIST 1.31 ms a step traced (eager 1 tile 2.17, burn-flex 2.3-2.6), the transformer 3.75 (8.52, 3.9-4.4); eager ops at `work:64:4`, captured on every unit (`set_capture_spread`); the "traced MNIST regression" bisected to `9977ad8` is the first step's block measurement (3.2 s once), not the steady state |
 | [tt-metal on the same card: Qwen3.5-4B](#tt-metal-on-the-same-card-qwen35-4b-2026-11-09-card-1) | 2026-11-09 | tt-metal's `qwen36` path, unchanged, on card 1: 38.0 ms a decode step on the card, 44-46 host-timed (BFP4/BFP8, LoFi, host argmax), against our 62.5 (~41 without our 21 ms greedy pick, BF16 weights); no single-device batch 32 |
 | [tt-metal on the same card: SmolLM2-1.7B and its products](#tt-metal-on-the-same-card-smollm2-17b-and-its-products-2026-11-09-card-1) | 2026-11-09 | roadmap W0, F1 closed: tt-metal v0.77 on card 1. SmolLM2-1.7B through `tt_transformers`, batch 1: 10.55 ms a step in performance mode, 11.3 all-BF16, 12.24 accuracy (ours 9.90, bit for bit). Batch 32: 24.82 ms, 1,289 tokens/s. TTFT 18.3 ms for a ~120-token prompt. Prefill GEMMs: BF16-HiFi2 122-204 TFLOPS, BFP8-LoFi 192-315 (ours 10.9-30.4). Decode products, DRAM-sharded BF16-HiFi2: 453-479 GB/s |
@@ -418,6 +419,122 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1 bounded: the performance contract on this stack, before any plumbing (2026-11-09, cards 0 and 1)
+
+Roadmap W1's first box ([tt-metal-parity.md](../plans/tt-metal-parity.md) §5 W1; ADR 0006), which absorbs H13 (the
+fast-prefill contract, [dataflow-compiler.md](dataflow-compiler.md)). Card 1 (the card of the 9.90 ms baseline and of
+tt-metal's table), release, safe image, every tile, `b438b9a` plus this change.
+
+**Two instruments.**
+- **`silicon_probe_performance_contract`** (new): one product at a time through `Session::matmul_dram`, traced, timed as
+  the slope between a trace of 8 copies (prefill: 3) and a trace of 1 (`tt_tests::bench::trace_slope_us`, now shared
+  with `silicon_probe_decode_stream`). `A` FP32 or BF16 (interleaved, as an activation); `B` stored BF16, BFP8 or BFP4
+  (laid by column, as a model's weights); HiFi4, HiFi2, LoFi. Every timed product is checked bit for bit against exact
+  sums (integer operands); a reading on values in [-1, 1] gives each configuration's PCC against an f64 product of the
+  source values. Runs `1794257871` (decode), `1794258133` (prefill and the reload hook).
+- **The 1.7B end to end** (`silicon_bench_models::traced_generation`, `TT_TILES=all`, fusion on) with its weights stored
+  BF16, BFP8 or BFP4 (`TT_WEIGHT_STORAGE`): F32 activations, HiFi4, the reference arithmetic otherwise. Runs
+  `1794260351`, `1794261034`, `1794261722`. Each run's tokens are checked against the eager schedule; BFP weights are
+  other values, so their tokens are not the reference's.
+
+**The probe does not calibrate for decode, so decode's verdict is the end-to-end run.** Its reference row (`A` FP32,
+`B` BF16, HiFi4) sums to 10.15 ms of products a step (24 layers and the head), more than the model's whole 9.90 ms
+step: an isolated one-row product packs its `A` row every time (the model's producer packs it once, a twin) and has no
+ops between copies for its weight prefetch to hide under. The probe's ratios between rows stand; its sums do not.
+
+### Decode
+
+| Weights (A F32, HiFi4) | step at 32 / 128 / 256 tokens, ms | tokens/s at 32 | prefill 32 / 128 / 256, tokens/s |
+|---|--:|--:|--:|
+| BF16 (the reference contract) | 9.83 / 10.35 / 10.98 | 101.8 | 1,098 / 3,084 / 3,890 |
+| BFP8 | **7.51** / 8.02 / 8.66 | 133.1 | 1,192 / 3,245 / 4,018 |
+| BFP4 | **6.34** / 6.86 / 7.49 | 157.8 | 1,218 / 3,380 / 4,117 |
+
+- **W1's decode kill does not fire.** The weights' bytes alone take the step 9.83 -> 7.51 ms (-24%), under the 8.0 ms
+  line, at batch 1 against tt-metal's 10.55 in its performance mode (BFP4/BFP8) on the same card. §5 predicted
+  5.5-6.5 ms for the whole contract; BFP4 alone gives 6.34.
+- **Fidelity moves nothing at `m` = 1:** every row within 1% across HiFi4, HiFi2 and LoFi (the probe, all 18
+  configurations). The m=1 products are not bound by math, as the 2026-10-31 correction said; ADR 0006's "bound by
+  unpack and math" was the stale reading.
+- **A BF16 `A` is slower today: 10.15 -> 14.35 ms of products** (the probe, `B` BF16). A one-row product packs an FP32
+  `A` row to `[K / 32, 32]` (`Session` `packed_thin_a`) and only a packed row takes the weight prefetch
+  (`weight_prefetch` requires `packed_a`); a BF16 `A` (`route.packed_a()`) takes neither and reads its `K / 32` tiles an
+  entry each on every unit. `down` (`K` = 8,192) shows it plainest: 184 us whatever `B` is (BF16, BFP8, BFP4), against
+  106 / 72 / 52 us with an FP32 `A`.
+- **At `m` = 32** (tt-metal's `decode_mm.py` rows; probe sums, no prefetch): the reference 17.4 ms; `A` BF16 x `B` BFP8
+  HiFi2 11.9, LoFi 11.0. tt-metal's 6.41 / 4.22 for the same products. There fidelity does count once `A` is BF16
+  (15.3 HiFi4 -> 14.3 HiFi2 -> 14.1 LoFi with a BF16 `B`).
+
+| m=1, probe, us (B GB/s) | qkv | o | gate\|up | down | head |
+|---|--:|--:|--:|--:|--:|
+| A FP32, B BF16, HiFi4 | 79.8 (325) | 38.2 (226) | 177.5 (390) | 105.9 (327) | 513.3 (404) |
+| A FP32, B BFP8, HiFi4 | 59.2 (239) | 33.1 (143) | 115.4 (327) | 72.3 (261) | 312.9 (362) |
+| A BF16, B BF16, HiFi4 | 98.4 (264) | 45.9 (188) | 243.5 (284) | 183.9 (188) | 626.3 (332) |
+| A BF16, B BFP8, HiFi2 | 64.8 (218) | 44.4 (106) | 152.7 (247) | 183.5 (103) | 394.6 (287) |
+
+### Prefill
+
+TFLOPS, the probe (each with `A`'s gathers skipped in brackets, `tensor::probe_skip_a_reads`):
+
+| shape | A FP32, B BF16, HiFi4 | A FP32, B BF16, LoFi | A BF16, B BF16, HiFi4 | ... HiFi2 | ... LoFi | A BF16, B BFP8, HiFi2 | ... LoFi |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `[2048,2048]@[2048,16384]` | 55.6 (69.3) | 55.8 | 29.7 (30.0) | 48.4 | 48.2 | 50.4 | 67.6 (84.6) |
+| `[1024,8192]@[8192,2048]` | 35.3 (47.7) | 36.0 | 25.4 (25.9) | 39.7 | 40.1 | 45.4 | 46.0 (86.7) |
+| `[2048,8192]@[8192,2048]` | 49.2 (70.7) | 49.7 | 24.9 (25.2) | 46.9 | 56.1 | 53.2 | 65.6 (84.4) |
+| `[4096,4096]@[4096,4096]` | 45.2 (66.3) | 46.1 | 27.9 (28.1) | 40.4 | 52.6 | 47.4 | 64.2 (72.0) |
+| 512-row qkv `[512,2048]@[2048,6144]` | 33.8 | 34.4 | 23.0 | 34.7 | 40.1 | 39.1 | 51.8 |
+| 512-row gate\|up `[512,2048]@[2048,16384]` | 47.7 | 48.7 | 26.3 | 37.6 | 43.1 | 41.4 | 49.6 |
+| 512-row down `[512,8192]@[8192,2048]` | 22.6 | 23.2 | 21.7 | 24.6 | 24.9 | 30.6 | 30.2 |
+
+- **Today's reference products are faster than the scoreboard's rows** (30.4 / 14.5 TFLOPS through Burn with an FP32
+  `B`, `1793388902`): with a BF16 `B` and timed as a slope, 35-56 TFLOPS.
+- **A BF16 `A` at HiFi4 is 1.4-2.0x slower than an FP32 `A`** on tt-metal's shapes (1.04-1.8x on the chunk's), and
+  skipping its gathers saves nothing: the kernel binds.
+  A packed tile is measured whole only in `SrcA` (`TileFormat::whole_tile_unpack`; silicon-operating-notes, "a BF16 or
+  BFP tile in `SrcB` (a packed `A`) is not yet measured whole and takes faces"), so a packed `A` turns `PairOrder::Auto`
+  into `Faces` for the whole product. Fewer phases hide it (HiFi2 recovers to about the FP32 rate), so at the
+  contract's fidelity the BF16 `A` buys little: BF16 x BF16 HiFi2 0.79-1.12x the reference, BF16 x BFP8 HiFi2
+  0.87-1.35x, BF16 x BFP8 LoFi 1.04-1.53x.
+- **§5's prediction (>= 60 TFLOPS at BF16-HiFi2 before W2): not met,** 25-48 TFLOPS. tt-metal's at the same shapes:
+  122-204 (BF16-HiFi2), 183-270 (BF16 x BFP8 LoFi).
+- **H13, killed.** Its contract (BF16 activations, HiFi2, packer L1 accumulation) on the 1.7B's 512-row chunk
+  (qkv + gate|up + down): 1,862 us at the reference -> 1,984 us at BF16 x BF16 HiFi2 (0.94x), 1,822 with the reload
+  skipped (its accumulation's ceiling, 1.02x), against its 1.15x kill. With BFP8 weights: 1,721 (1.08x) at HiFi2,
+  1,512 (1.23x) at LoFi.
+- **Packer L1 accumulation's ceiling** (`prefill_products_without_the_reload`, `matmul::probe_skip_reload`: each
+  continuing K chunk keeps its handshake but skips reloading its priors; the products are wrong, only time counts; the
+  hook's control `step241::a_skipped_reload_completes_and_is_another_product`, ttsim and card 0): under the reference
+  row 0-1.5% (an FP32 `A`'s reload hides); under a BF16 `A` at HiFi2/LoFi up to 24% of a product (0 on some shapes) (`[4096^3]` BF16 x BF16
+  HiFi2 3,399 -> 2,653 us; the 512-row gate|up 831 -> 630 us at BF16 x BFP8 HiFi2), none at HiFi4 (the faces order
+  binds). It pays only once a packed `A` runs whole tiles.
+- **End to end, BFP8 weights lift the prefill 3-9%** (3,890 -> 4,018 tokens/s at 256; BFP4 4,117).
+
+### Accuracy (a reading, not a gate)
+
+PCC against an f64 product of the source values, the decode shapes `gate|up` and `down` at `m` = 1 (the prefill shapes
+read the same to the fourth digit): BF16 `B` HiFi4 0.999999, HiFi2 0.999992-0.999995, LoFi 0.99991-0.99994; BFP8
+HiFi2 0.999986-0.999989, LoFi 0.99991-0.99992; BFP4 0.9952-0.9964 at every fidelity (BFP4's three bits fit LoFi's
+slice). tt-metal's on its own products: BF16-HiFi2 0.999994, BFP8 0.99997 / 0.99989 (HiFi2 / LoFi), BFP4 0.9937.
+
+### Also settled: §6 issue 1, the "1.7B prefill regression"
+
+There is none. The ~2,090 tokens/s at 256 tokens recorded since 2026-11-03 are `traced_generation_stream_ceiling`'s
+rows (its prefill in chunks of 64), not `traced_generation`'s (chunks of 64, 128 and 256): both run under the same
+filter, and in `1794260351` they read 2,102 and **3,890** tokens/s, against H15's 3,827. The 11-07 table's prefill
+column is the ceiling probe's. Also found on the way: a model benchmark attached the gate tile alone unless `TT_TILES`
+was set, and the 1.7B's capture then overflowed its program cache, which burn-fusion surfaced as 1,228 panics behind
+the first error; `silicon_bench_models` now runs on every tile unless `TT_TILES` says otherwise.
+
+### What this changes
+
+1. **BFP8 weights are W1's decode lever today,** with no new kernel: 7.51 ms, 1.4x tt-metal's batch-1 step on the same
+   card.
+2. **A BF16 activation needs two pieces before it pays:** a packed tile whole in `SrcB` (measured on ttsim, then an
+   isolated silicon gate), and the one-row packing and weight prefetch taking a BF16 row. Until then it is slower in
+   both decode and prefill.
+3. **Packer L1 accumulation comes after (2):** its ceiling, up to 24% of a product, shows only under a packed `A`.
+4. **Fidelity is a prefill and batched-decode lever, not a batch-1 one.**
 
 ## Training on every tile, traced by default (2026-11-09, card 0)
 

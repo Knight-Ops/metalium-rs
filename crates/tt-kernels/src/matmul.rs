@@ -495,6 +495,24 @@ pub fn probe_no_drain(on: bool) {
     PROBE_NO_DRAIN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A probe only (`silicon_probe_performance_contract`, roadmap W1): a continuing K chunk's unpack
+/// role skips reloading its priors into `Dst` (the `UnpackToDst` and the `Config` switches either
+/// side of it) but keeps the handshake with the math role (`cleared`, then `loaded`), so the
+/// protocol is unchanged and only the reload's work leaves. The products are **wrong** (each chunk
+/// adds to whatever `Dst` held); only their time means anything: the most packer L1 accumulation
+/// (the packer adding each chunk's partial to L1, no reload) could save. Process-wide, set before
+/// any product's programs are built (the program caches do not key on it).
+static PROBE_SKIP_RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn probe_skip_reload(on: bool) {
+    PROBE_SKIP_RELOAD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn skip_reload() -> bool {
+    PROBE_SKIP_RELOAD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Point both unpackers at a new pair of tile images, between `UNPACR`s.
 ///
 /// `REG3_Base_address` is sampled by the unpacker, so the previous unpack on
@@ -1302,7 +1320,10 @@ pub(crate) fn block_stream_kernel_looped(
     set(&mut unpack, B_COL_GPR, units(b_at) - b_slot);
     unpack.push(encode::adddmareg(A_ROW_GPR, A_ROW_STEP_GPR, A_ROW_GPR).unwrap());
     let col_block = unpack.len() as u32;
-    if continuing {
+    if continuing && skip_reload() {
+        unpack.extend(sync::take(layout.cleared, Before::UNPACKER));
+        unpack.extend(sync::post_after(Unit::Unpacker0, layout.loaded));
+    } else if continuing {
         unpack.extend(sync::take(layout.cleared, Before::UNPACKER));
         unpack.extend(crate::datapath::thread_config());
         unpack.extend(crate::datapath::clear_unpacker0_adcs());
@@ -1605,7 +1626,10 @@ pub(crate) fn block_stream_kernel_subblocked(
         ];
         for (_, sb, section) in plan.row(r) {
             let (w, x) = (sb.w, width_index(sb.w));
-            if continuing {
+            if continuing && skip_reload() {
+                p.extend(sync::take(layout.cleared, Before::UNPACKER));
+                p.extend(sync::post_after(Unit::Unpacker0, layout.loaded));
+            } else if continuing {
                 p.extend(sync::take(layout.cleared, Before::UNPACKER));
                 // Only what differs between the `Src` path and the `Dst` one is written, each way
                 // ([`reload_switch`]).
@@ -2962,20 +2986,24 @@ pub(crate) fn matmul_items_continuing(
             math.extend(i(sync::post_after(Unit::Matrix, reload.cleared)));
             math.extend(i(sync::take(reload.loaded, Before::MATRIX)));
             unpack.extend(i(sync::take(reload.cleared, Before::UNPACKER)));
-            unpack.extend(i(crate::datapath::thread_config()));
-            unpack.extend(i(crate::datapath::clear_unpacker0_adcs()));
-            let mut prior_words = ConfigWords::new();
-            crate::datapath::tile_unpack_config(&mut prior_words, prior);
-            unpack.extend(i(config_program(&prior_words)));
-            unpack.extend(i(crate::datapath::unpack_tile_to_dst(prior, 0)));
-            unpack.extend(i(sync::post_after(Unit::Unpacker0, reload.loaded)));
-            // Restore the complete Src configuration, including descriptor
-            // words and ADCs; UnpackToDst leaves different state behind.
-            unpack.extend(i(src_thread_config()));
-            unpack.extend(i(crate::datapath::clear_unpacker0_adcs()));
-            unpack.extend(i(config_program(&words)));
-            unpack.extend(i(adc.iter().copied()));
-            current = (u64::MAX, u64::MAX);
+            if skip_reload() {
+                unpack.extend(i(sync::post_after(Unit::Unpacker0, reload.loaded)));
+            } else {
+                unpack.extend(i(crate::datapath::thread_config()));
+                unpack.extend(i(crate::datapath::clear_unpacker0_adcs()));
+                let mut prior_words = ConfigWords::new();
+                crate::datapath::tile_unpack_config(&mut prior_words, prior);
+                unpack.extend(i(config_program(&prior_words)));
+                unpack.extend(i(crate::datapath::unpack_tile_to_dst(prior, 0)));
+                unpack.extend(i(sync::post_after(Unit::Unpacker0, reload.loaded)));
+                // Restore the complete Src configuration, including descriptor
+                // words and ADCs; UnpackToDst leaves different state behind.
+                unpack.extend(i(src_thread_config()));
+                unpack.extend(i(crate::datapath::clear_unpacker0_adcs()));
+                unpack.extend(i(config_program(&words)));
+                unpack.extend(i(adc.iter().copied()));
+                current = (u64::MAX, u64::MAX);
+            }
         } else {
             math.push(Item::I(encode::zeroacc(3, 0, 0, 0).unwrap()));
         }

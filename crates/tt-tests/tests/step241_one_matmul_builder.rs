@@ -401,3 +401,51 @@ fn derived_phases_are_hifi4_until_a_product_overflows() {
         }
     });
 }
+
+/// The control for `matmul::probe_skip_reload` (roadmap W1's bound on packer L1 accumulation,
+/// `silicon_probe_performance_contract`): with it on, every path that continues a K chunk from its
+/// priors (K blocks; 2-D blocks with `K` streamed, looped and not) still completes -- the
+/// handshake with the math role is kept -- and gives another product, so the hook reaches each
+/// path's reload. Set in the forked child, before its session builds any program (the hook is
+/// read when programs are built), so no other test's process sees it.
+#[test]
+fn a_skipped_reload_completes_and_is_another_product() {
+    with_session(|s| {
+        tt_kernels::matmul::probe_skip_reload(true);
+        s.set_spread(Spread::Fixed(4));
+        for (m, k, n, limit, block, what) in [CASES[2], CASES[4]] {
+            let ints = |len: usize, seed: usize| -> Vec<f32> {
+                (0..len)
+                    .map(|i| ((i * 7 + seed) % 5) as f32 - 2.0)
+                    .collect()
+            };
+            let (av, bv) = (ints(m * k, 1), ints(k * n, 3));
+            let a = s.upload(&av, m, k).unwrap();
+            let b = s.upload(&bv, k, n).unwrap();
+            s.set_matmul_k_block_limit(limit.and_then(std::num::NonZeroUsize::new));
+            s.set_block_stream(block);
+            let loops: &[bool] = match block {
+                BlockStream::Off => &[true],
+                _ => &[true, false],
+            };
+            for &looped in loops {
+                tt_kernels::matmul::set_block_loops(looped);
+                let c = mm(s, &a, &b, Fidelity::HiFi4);
+                let got = s.download(&c).unwrap();
+                s.free(c).unwrap();
+                let wrong = (0..m * n).any(|e| {
+                    let (i, j) = (e / n, e % n);
+                    let exact: f32 = (0..k).map(|q| av[i * k + q] * bv[q * n + j]).sum();
+                    got[e] != exact
+                });
+                assert!(wrong, "{what}, looped {looped}: the reload was not skipped");
+            }
+            tt_kernels::matmul::set_block_loops(true);
+            s.set_matmul_k_block_limit(None);
+            s.set_block_stream(BlockStream::Auto);
+            for t in [a, b] {
+                s.free(t).unwrap();
+            }
+        }
+    });
+}

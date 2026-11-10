@@ -20,14 +20,11 @@
 //! the tiles a stream left in the first and last unit's slots equal `B`'s in GDDR.
 #![cfg(feature = "silicon")]
 
-use std::time::Instant;
-
 use tt_device::tlb::WindowKind;
 use tt_isa::dm::TILE_SLOT;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, Spread, StreamOrder, TileChoice};
 use tt_kernels::tensor::DramTensor;
-use tt_kernels::trace::TraceId;
 use tt_tests::backend::device_index;
 use tt_tests::harness::BUDGET;
 use tt_ttsim::fork_scope;
@@ -53,34 +50,10 @@ fn floats(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The median of `SAMPLES` host-timed `replay` + `sync`, after `WARMUPS`, in microseconds.
-fn replay_us(s: &mut Card, trace: TraceId) -> f64 {
-    let mut v: Vec<f64> = (0..WARMUPS + SAMPLES)
-        .map(|_| {
-            let t = Instant::now();
-            s.replay(trace).unwrap();
-            s.sync().unwrap();
-            t.elapsed().as_secs_f64() * 1e6
-        })
-        .skip(WARMUPS)
-        .collect();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
-}
-
-/// One op's time on the card: a trace of `REPS` against a trace of one, each built by `op`.
-fn op_us(s: &mut Card, mut op: impl FnMut(&mut Card)) -> f64 {
-    let mut trace = |s: &mut Card, n: usize| {
-        s.begin_trace().unwrap();
-        for _ in 0..n {
-            op(s);
-        }
-        s.end_trace().unwrap()
-    };
-    let one = trace(s, 1);
-    let many = trace(s, REPS);
-    let (t1, tn) = (replay_us(s, one), replay_us(s, many));
-    (tn - t1) / (REPS - 1) as f64
+/// One op's time on the card: a trace of `REPS` against a trace of one, each built by `op`
+/// (`tt_tests::bench::trace_slope_us`).
+fn op_us(s: &mut Card, op: impl FnMut(&mut Card)) -> f64 {
+    tt_tests::bench::trace_slope_us(s, REPS, WARMUPS, SAMPLES, op)
 }
 
 fn bits(v: &[f32]) -> Vec<u32> {

@@ -116,7 +116,7 @@ card.
 |---|---|---|
 | Decode, batch 1 | **9.90 ms** (BF16 weights, bit for bit) | 10.55 performance (BFP4/BFP8), 11.3 all-BF16, 12.24 accuracy |
 | Decode, batch 32 | — | 24.82 ms a step, **1,289 tokens/s** (40.3 a user) |
-| Prefill, ~128 tokens | 3,040 tokens/s (2026-11-01; ~2,150 since, §6 issue 1) | ~6,600 tokens/s (TTFT 18.3 ms) |
+| Prefill, ~128 tokens | 3,084 tokens/s (2026-11-09, `1794260351`; §6 issue 1 settled: no regression) | ~6,600 tokens/s (TTFT 18.3 ms) |
 | Products, 24 layers + head (derived) | inside the 9.90 ms step | 7.34 ms BF16-HiFi2, 11.61 BF16-HiFi4, **4.22 BFP8-LoFi** |
 | GEMM 2048x8192x2048 | 14.3 TFLOPS (TF32-HiFi4) | 117 BF16-HiFi4, 204 BF16-HiFi2, 315 BFP8-LoFi |
 | Qwen3.5-4B decode, batch 1 ([log](../learnings/performance-log.md#tt-metal-on-the-same-card-qwen35-4b-2026-11-09-card-1)) | 62.5 ms host-timed, BF16 weights; ~21.4 of it the on-card greedy pick, ~41 without | 38.0 ms on the card, 44-46 host-timed (`qwen36` path; BFP4 MLP, BFP8 rest, LoFi; argmax on the host) |
@@ -254,11 +254,21 @@ They run in this order; W1-W4 can overlap.
   - **1.7B decode:**
     - **Bytes.** BFP8 weights are 1.81 GB, a 3.9 ms floor at 470 GB/s.
     - **Operands.** BF16 activations halve `A` and the small ops' bytes.
-    - **Math.** HiFi2/LoFi cut the products' unpack-and-math bound. That bound is why BFP4 gave only 1.09x.
+    - **Math.** HiFi2/LoFi cut the products' unpack-and-math bound. (Measured 2026-11-09: no such bound at `m` = 1; fidelity moves no decode product there, below.)
     - **Prediction:** 9.90 -> 5.5-6.5 ms. tt-metal's BFP8-LoFi products for this model total 4.2 ms on 8 compute cores (§2.3).
     - **Kill:** above 8.0 ms with the products still not read-bound.
   - **Prefill products:** 30 -> >= 60 TFLOPS from BF16 operands and HiFi2 alone, before W2. P7 measured 1.18-1.35x for LoFi with a BF16 `B` even under F32 activations.
 - **First step:** a product bench (`matmul_throughput`, `silicon_probe_pair_cost`) at the 1.7B's decode and prefill shapes, with BF16 `A`, BF16/BFP8 `B` and HiFi2/LoFi. Bound the gain before any Burn plumbing.
+- **Bounded (2026-11-09,** `silicon_probe_performance_contract` and the 1.7B per weight format, card 1; [log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1)):
+  - **The decode kill does not fire.** BFP8 weights alone: 9.83 -> **7.51 ms** a step (BFP4 6.34), with F32 activations at HiFi4.
+  - **Fidelity moves nothing at `m` = 1.** It counts in prefill and at `m` = 32.
+  - **A BF16 `A` is slower today,** in both:
+    - a packed tile is measured whole in `SrcA` only, so a packed `A` (in `SrcB`) takes the faces pair order: prefill at HiFi4 1.4-2.0x slower;
+    - a one-row BF16 `A` misses the packed row (`packed_thin_a`) and the weight prefetch: decode products 1.4x slower.
+  - **Prefill at BF16-HiFi2:** 25-48 TFLOPS against the predicted >= 60.
+  - **H13 killed** (0.94x on the 512-row chunk).
+  - **Packer L1 accumulation's ceiling** is up to 24% of a product, only under a packed `A`.
+  - **The order of the rest follows:** BFP8 weights (no new kernel); then a packed tile whole in `SrcB` and the one-row path for a BF16 row; then BF16 activations; then packer L1 accumulation.
 - **Gates:**
   - **Each op:** bit for bit against its specification model at the stated fidelity (step158's group adder, applied per phase), with negative controls.
   - **Each model:** teacher-forced top-1/top-5 against HuggingFace on a fixed prompt set, plus logit PCC. Thresholds are derived from a reference-contract run plus a stated margin; tt-metal accepts top-1 >= 90 and PCC >= 0.86-0.95 for 8B. Record ours with the derivation.
@@ -380,7 +390,7 @@ They run in this order; W1-W4 can overlap.
 
 ## 6. Bugs and issues found
 
-1. **A possible 1.7B prefill regression, unexplained.**
+1. **A possible 1.7B prefill regression: settled 2026-11-09, none.** The ~2,090 tokens/s at 256 tokens were `traced_generation_stream_ceiling`'s rows (its prefill in chunks of 64), which run under the same filter; `traced_generation` reads 3,890 at `HEAD` (`1794260351`). The record below is kept as found.
    - H15 recorded 1,075 / 3,040 / **3,827** tokens/s at 32 / 128 / 256 tokens (2026-11-01, `1793549551`, card 1).
    - Every later run of what looks like the same bench reads ~1,090 / ~2,150 / **~2,090**:
      - the 2026-11-03 C0 probe, "chunks of 64";

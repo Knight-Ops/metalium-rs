@@ -19,7 +19,7 @@
   - Burn's own suites on silicon: F32/F16 3,001 of 3,025, BF16 1,098 of 1,187, none listed for a missing op.
 - **Models run on the card,** traced:
   - ResNet-18 in 12.7 ms and ViT-Tiny in 7.7 ms;
-  - SmolLM2-1.7B decodes at ~101 tokens/s (9.90 ms a step, BF16-stored weights, bit for bit the F32 model);
+  - SmolLM2-1.7B decodes at ~101 tokens/s (9.90 ms a step, BF16-stored weights, bit for bit the F32 model); with BFP8 weights 7.51 ms (133 tokens/s; W1, not yet a default);
   - Qwen3.5-4B decodes in 62.5 ms a step (~21 of it a greedy pick, W4);
   - a 7,992-token prompt prefills in 5.98 s.
 
@@ -72,13 +72,28 @@ In order; W1-W4 can overlap. Each item's prediction, kill criterion and gate are
 - [ ] F12: does a reader of ours leak NoC VC state? tt-metal saw ~20% DRAM read loss after a DRAM-sharded reader.
 
 ### W1. The performance contract
-- [ ] **Bound it first.** Product benches (`matmul_throughput`, `silicon_probe_pair_cost`) at the 1.7B's decode and prefill shapes:
-  - BF16 `A`;
-  - BF16/BFP8 `B`;
-  - HiFi2/LoFi;
-  - packer L1 accumulation.
+**Bounded 2026-11-09** ([log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1); achievements):
+- BFP8 weights alone take the 1.7B's step 9.83 -> 7.51 ms, so the 8.0 ms kill (on the predicted step) does not fire.
+- Fidelity moves nothing at `m` = 1.
+- A BF16 `A` is slower until the `SrcB` box and the one-row box below land.
 
-  Kill if a decode step's predicted products stay above 8 ms. This absorbs H13, the fast-prefill contract.
+The first four boxes run in this order.
+- [ ] **BFP8 weights by default under the contract.**
+  - Measured end to end: 7.51 ms; BFP4 6.34 as the named option.
+  - Needs the contract switch and the model gate (below), since its tokens are not the reference's.
+- [ ] **A packed tile whole in `SrcB`.**
+  - A BF16 or BFP `A` takes the faces pair order today (`TileFormat::whole_tile_unpack` licenses `SrcA` only). Prefill at HiFi4 runs 1.4-2.0x slower than with an FP32 `A`.
+  - Measure it on ttsim, then in an isolated card-0 gate (the `PairOrder::SrcBWhole`/`Tiles` probes), and extend `whole_tile_unpack`.
+  - Predicted: a BF16 `A` at the FP32 `A`'s rate or better at every fidelity.
+  - Kill if a whole packed tile in `SrcB` is not bit for bit on silicon.
+- [ ] **The one-row path for a BF16 `A`.**
+  - `packed_thin_a` and the weight prefetch (`weight_prefetch` needs `packed_a`) take only an FP32 row today. A BF16 row reads its `K / 32` tiles an entry each on every unit: decode products 1.4x slower (`down` 184 us whatever `B` is).
+  - Pack a BF16 row and prefetch beside it.
+  - Predicted: at least the FP32 row's step with half its bytes.
+- [ ] **Packer L1 accumulation, after the `SrcB` box.**
+  - Ceiling: up to 24% of a product under a packed `A`, 0-1.5% under an FP32 `A` (`matmul::probe_skip_reload`).
+  - Needs a ttsim check of `Pack_L1_Acc` (else an isolated silicon gate and a divergence entry), the partial format stated, and a spec model.
+  - Delete `probe_skip_reload` when it lands or is killed.
 - [ ] **Native BF16 arithmetic:**
   - BF16 edges unpacked to `Src`, packed to BF16 slots (2 KiB);
   - `float_matmul` and the element-wise wrappers accept BF16 without `cast_native`;
@@ -91,7 +106,7 @@ In order; W1-W4 can overlap. Each item's prediction, kill criterion and gate are
   - the block copier refuses element-interleaving moves past ~400K elements.
 - [ ] **The BF16 embedding lookup without staging** (`gather_indexed_bf16` still stages; `step167` BF16 takes 229 s). B now has the room it lacked (10-14 KiB after the firmware diet).
 - [ ] **A BF16 KV cache, and attention reading it without widening** (`attention/widen` widens every call).
-- [ ] **BFP8 weights by default under the contract;** BFP4 gate/up as a named option; a BFP8 KV cache as a named option (F8).
+- [ ] **A BFP8 KV cache as a named option** (F8).
 - [ ] **The contract switch** `TtConfig::numerics(Reference | Performance)`, frozen into traces.
 - [ ] **Per-op specification models** at the stated fidelity (step158's group adder per phase).
 - [ ] **A model gate:** teacher-forced top-1/top-5 and logit PCC against HuggingFace, thresholds derived from a reference-contract run.
@@ -148,9 +163,6 @@ In order; W1-W4 can overlap. Each item's prediction, kill criterion and gate are
 - [ ] **Delete the knobs that lost** ([failed-approaches.md](../learnings/failed-approaches.md), "Knobs to delete").
 - [ ] **Auto-capture of a repeated graph** under `Fusion<TtBackend>`.
 - [ ] **The eager host-build cost.** An eager product's host build is 10.8 of its 19.7 ms; eager slows after a pulled capture (+85 MB live).
-- [ ] **A possible 1.7B prefill regression.**
-  - The 256-token prefill was 3,827 tokens/s on 2026-11-01 (`1793549551`) and has been ~2,090 in every run since 2026-11-03.
-  - Re-run `5a1640f` against `HEAD` with one command; bisect if they differ ([tt-metal-parity.md](tt-metal-parity.md) §6, issue 1).
 - [ ] **ResNet-18's untraced forward is ~11% slower than recorded** (2026-10-27); bisect.
 
 ### W7. Code consolidation (done inside the changes that touch the code)

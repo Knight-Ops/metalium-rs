@@ -891,6 +891,11 @@ performance, ADR 0006) and its predicted gain on the parity workload ([tt-metal-
   - *Prior art:* tt-metal's prefill runs BF16 activations, `packer_l1_acc`, HiFi2 (FP32 accumulation kept for `O`),
     and LoFi for BFP4 MLP weights (`models/tt_transformers/tt/model_config.py`). Thinking Machines and SGLang show a
     deterministic contract costs ~20-35% on GPUs, against a default that is not deterministic at all.
+  - *Result (2026-11-09, roadmap W1, `silicon_probe_performance_contract`, card 1):* **killed.**
+    - On the 1.7B's 512-row chunk (qkv + gate|up + down) the contract ran 0.94x the reference (1,862 -> 1,984 us). With its packer L1 accumulation's ceiling (the reload skipped) it was 1.02x.
+    - The claim's premise fails on this stack: a BF16 `A` is a packed `A`. A packed tile is measured whole only in `SrcA`, so the product takes the faces pair order, and at HiFi4 runs 1.4-2.0x slower than with an FP32 `A`.
+    - With BFP8 weights the chunk is 1.08x at HiFi2 and 1.23x at LoFi.
+    - Retry once a packed tile runs whole in `SrcB` ([failed-approaches.md](failed-approaches.md); [performance-log](performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1)).
 - **H14 Short-chunk products over the grid** (opened 2026-10-31, roadmap Track 2 follow-ups item 1).
   - *Claim:* a short prefill chunk's products (2-8 tile rows) are bound by the units their blocks occupy, not by
     compute or GDDR. Narrower blocks, and `A` pulled from a few holders (D5), spread them over the grid at the same
