@@ -1217,7 +1217,17 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
   with them, rows then through the RWCs): bit for bit the face order, with `A` whole or by faces, at HiFi4 and at three
   phases (`step239::whole_tile_orders_give_a_packed_weights_bits`, run alone first on card 0 `1793160473`). The unpack
   configuration is the faces order's; only `SETADCXX`'s count differs. `TileFormat::whole_tile_unpack` records which
-  unpacks are measured whole; a BF16 or BFP tile in `SrcB` (a packed `A`) is not yet measured whole and takes faces.
+  unpacks are measured whole.
+- **A BF16, BFP8, BFP4 or BFP2 tile unpacks whole into `SrcB` too** (a packed `A`, roadmap W1, 2026-11-10): unpacker
+  1, one `UNPACR` of 1,024 datums (512, rows 0-31, where only the first face row is live), the exponent section with
+  them, the configuration again the faces order's. Bit for bit the faces order and the decoded FP32 product, `A` BF16
+  laid as a weight or interleaved as an activation, beside every `B` format (FP32 transposed by the unpacker too), at
+  one, sixteen and all of a tile's rows, every fidelity, whole `K`, `K` blocks and 2-D blocks looped and not
+  (`probe_pair_src_rows::srcb_whole_packed_tile` / `both_whole_packed_tiles`, run alone first, card 0 `1794328961`,
+  `1794328968`; `step241::whole_tile_orders_give_every_packed_a_its_bits`, `1794328978`; ttsim agrees). The control
+  (`matmul::probe_half_whole_srcb`: only the first face row unpacked) changes over a quarter of the outputs under
+  both whole orders and none under faces (`1794328972`). `PairOrder::Auto` now holds both tiles whole for every pair
+  of edge formats; FP32 cut to BF16 (`Bf16FromFp32`) is still unmeasured and takes faces.
 - **Every pair of FP32, BF16 and BFP8/4/2 operands multiplies in one kernel**, each unpacked in its own format (BF16 and
   BFP moved as they are, FP32 cut to TF32), including TF32 in `SrcA` beside BF16 or BFP in `SrcB`: bit for bit the
   FP32 product of the decoded values (`step241`, card 0 `1793162345`).

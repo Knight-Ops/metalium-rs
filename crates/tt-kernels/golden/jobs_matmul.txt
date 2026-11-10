@@ -859,361 +859,361 @@ case [1, 2048] @ [2048, 6144] [Fp32, Bfp2] units 64 spread 120 pipeline true k N
   dealt Some(120)
 case [1, 2048] @ [2048, 2048] [Bf16, Fp32] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 901785f0 9f567ee3 f82aa4ec ae09bbe8 5d218808 a07a42b3 5aa1425e e45b4e2f 5c2a84b4 135e13c4 aee37fd5 6e2986e7 7d853d55 b8b1c51b 68f2cda4 d553df67
-  jobs 705cb300 c8fb2fa0 c7393152 987b6ec2 5f454ab3 f9fe40ed 04cdd1b6 4131e63d 491dfe23 6c3300d4 fa3b4a3c fb538ecf ca3ccb8a b1a41fe0 e5a8a102 a38f6ccb
-  jobs a53febfd 3bc47066 906ca1d8 e237fd0a a58cc43f 69455966 83bda5da 36f6164e b403dd75 7a0d4620 2313c4ec f286609c 1d03b632 c41be8a1 2175bdd6 a8542bae
-  jobs cc4fa1be 82de12bf bb99a75b d933a648 d3a8a14b 63fb8527 5bf66108 493aa6de ebf18c36 be885e22 c884bba2 727734a9 1e04f53a f24f28e9 2f600b64 481389eb
+  jobs 51ce1812 fb6fc3ba 304adcdf ba1164f5 eea08a3a bd8b8fa1 44b5c824 9d0c08cc 86eaa541 f0a451cd c5f04b82 58509a38 7280aa53 53903896 907116e3 d3dd2ad1
+  jobs 4d7241fa 287bd325 1970df01 d397d2c5 1f812b06 2cddaf24 f3e04bb4 ccdc275b 42402969 15f45650 d715cf77 163bff19 3d0ac459 91bc65d6 06876dfa 3de98449
+  jobs 555b38dd 70215338 dd4b8df9 f12925bf cf437526 37f13197 b2df6261 6f61dc4a 1ff26fe2 a5039dbd 2a0d1e6e e6861d19 aad8ce23 39288379 219a2648 59338b4f
+  jobs ba9359c3 666f1530 804fdf16 c2289f4c 34d0d69c 2fb74f48 236d7b25 1d11bcfe e03985f0 ae0a80a7 c90a95e1 b7a7ed01 e90ad410 47bb80e4 8bd03a6c ca6308a6
   dealt None
 case [96, 320] @ [320, 288] [Bf16, Fp32] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 069a8912 d0402cc7 5d591cb9
+  jobs aa731eb7 3020cffb f3177455
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bf16, Fp32] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs c8f84378 9ae3453e e26b8df6 fce2d88f eeb04c82 3d46e824 5331f216 dbe9e022 4b33ed9d a6ce337c d27d7783 00c9aae1 e977366e ac131efe 663d3cc6 cc6b6dfb
-  jobs 6f102871 c0e7021c a6bc1281 d699943e 6273bbfc 984e8d4f af468080 437bbb03 934d1ccc d3159119 6ae76a71 3ea45122 a54a1d04 222939d8 0e667ba6 b172c9d3
-  jobs 6fbeb00d e4ba044e 2c2dc786 e9aef67d 483b953f af931b26 0dd33601 10f37388 2b4a8286 3d6b1a98 1688a4e4 3ecd5f32 ea8cb209 dc7716c8 a8a38095 4339d09e
-  jobs 44acd622 dd40bb0a 59944092 a65f44b5
+  jobs 1d49664e bbb63920 12c7e484 650c9ce6 44ec78d5 a375904b 10f19f94 d4c9405e 1933681d c7a5f8e9 b6caa569 476fcf57 039c4b6e 17c01143 34cebd23 42bb5c20
+  jobs 7dabb2b1 3237250b 58eaf7e0 5587263c e978e967 cdacc2fc 69959239 be74368e 0db697ea 86afaefc d289717a b904c320 11558282 cb3bade3 8e5d02ca 55a05323
+  jobs 07c31705 6be56047 4d65878d 634c725d 49ef0af6 9d5a26dc 44face35 626be409 6f6a8411 2a53a1d8 0bf0e093 aeb79906 8abebe0e e226a9f8 8b1b4ec7 9b96d4ad
+  jobs a8b6a8ed 3481bb53 314d7090 fb7981e4
   dealt None
 case [1, 2048] @ [2048, 2048] [Bf16, Bf16] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs cf1823d9 609075d8 05655a2a 9fbc0eba 1548d830 bb21732f c1dcc61e 7307fe24 fdce54c3 b7ac7d5b 181a3bde 86ba2a9e 7d6b2995 95324199 b9eeb5c2 a8e3b0bc
-  jobs 688e535b 27892f8c f3e78793 00d0707b 0827ac07 c75ca41c bd2d42e8 e7869c0f a1886f8a ea04d168 d93bf1c5 d234a7c6 ebe69d15 915021ae 920eff57 8938f6ae
-  jobs 090081f3 bf2017b9 4fef7968 350bc7ab a4dd7eed 06604215 d482dbed 284ef486 bbaa32e2 de31c0b7 9ecf9ad5 8055ccbc d1f6153f cc5fc479 f27d3be5 ff3c03a1
-  jobs 1fa84cba 326cdafa 8f8abc15 6d8a5c4f 08a59df4 1807141a 5c736ddf 14ad988a 2f9ad4bb 92855518 331866e3 c7992167 57c41d4a a35a31e1 83ddf5e4 d1097cc3
+  jobs f8b10b84 3331a9e5 fa1ed78b b0e44501 e21aa61e 9f4638fc 8fcf5b42 8e827478 f0e2ebc9 e60b0fd2 028ee9d8 f894d1b8 cef63a54 34c37aed 7f85fada 42abd9bb
+  jobs ed5b2840 6044142b fc151249 a00cee3e ee812508 3237c6d3 f4728605 12518052 85f94b4a 1bdff160 97e3483a 9987df62 63da8ca4 78f83357 a3c6c907 78d8a93c
+  jobs d4edc136 882be01d c64c815f f9951fec f4d5baed 021b126c 4db204a8 ec461494 fc20ba24 dfc96c6b c1823a8d 777788de ec6f3348 6007fd34 ad65194b 0fca9207
+  jobs 3e00f460 12dae6f5 ac7787b5 8f9caa5e 1293039b b2b1352c ac4138b3 ac5b718e e0ede104 e1f8675c 7cd2781c 9a2261d5 78c46d20 99f8ed5a 756e9612 de6a4dac
   dealt None
 case [96, 320] @ [320, 288] [Bf16, Bf16] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs ea12a29e ae01ef48 fcbff64d
+  jobs a95f439b 24477397 6c0c44ca
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bf16, Bf16] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 4b9f8c8a 1334a5e6 cbc4b848 f89d98e1 99d933b0 0ebea035 bd3f9fbd ad9faca9 14eb124a a07e893e 1d373953 d8aa7dbb 11535c34 97b68215 acec71fe 59d02cfe
-  jobs 438622d3 b0935d7b b0b5754f 2e74eb6d 43af436e 61c2e7a0 fd0c67ff bdaf8e20 b9abec11 c4d7408e c6826710 de21cb69 c84a76b9 320eef0b e3fbf5f3 23b5dbd4
-  jobs 746f4879 c1048ce6 a75a1fd9 a91e7864 dc3c74c9 a8b00cc3 a6e76282 5c8ae99f a4b58740 6513008b d73b11e0 826c4c42 127fecf0 6a3455ff 436bfdab 2bd741e3
-  jobs ee0221d1 5a11ea13 42ef9f16 46b5c6d0
+  jobs dc714c87 b69bbb8e 5fe7bc20 efa2daec 0734561c c2a15fb5 e0b14ef5 bc4b3932 3c0f1d08 325229ba 66dfd61b b10579be 7f89bd84 f34d2823 14cb433e 2e2e693d
+  jobs c73a8c39 13f62ff5 411af62b 0659e009 e69ede69 5fe7cf1b d83e90f0 ef67a1d6 22a5fd59 15d8260b d1559ca4 9b8d0592 8463a5f2 092a0719 6486fb7a a6ce2f6d
+  jobs 3b8df3c0 0a5eb148 83b44ebc 7e61ab2b 92cb26c8 f705b743 fb925453 1f935f7c b1bccfeb fd5029e9 7cd888b4 1f64c6ad 504200bf 1ad07bf4 182ad233 08e685b4
+  jobs f33c8af9 41aeadb8 02019918 a139e54b
   dealt None
 case [1, 2048] @ [2048, 2048] [Bf16, Bfp8] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 87abf047 1dbeea8e 643ca294 90804881 2cd0c3a3 9d8701b8 587e9cf7 5d530bb3 4a5fbd50 2692f253 711dc94b d7db70b2 10d50c77 792cd3fe 386d9ce6 316be08c
-  jobs 6e7a01cf 3281c66c 4b0bb682 ca67a080 43977d51 c3fb63ab f5fca769 c2beaf51 c6ebe9f9 76023b0b e70a1aae 331f990e c1d3036c 90a814ff 1ef2248d 3a531419
-  jobs ccbc9c3e cdb2965f 70fd7db5 91869abf ffc68800 bc20c3ca 74ea5f23 a4ebb284 a1119a66 5d15347c 37fdad49 107efa7a 68702a5c d6f90f65 05ff2425 4cdf36f5
-  jobs 7f4cf758 9307db7c 73894294 e97ef036 362d75a1 52030c65 8f33311e 204feb3a f14f9497 9d5ba82c 0be62bec fc479376 9034c593 49d8ad12 d60fa42b 4fcacda7
+  jobs f18f6b0f 81692541 65d32ecd a7825d73 34832a7d 561c221e 72e1e0a9 e7e4da83 0376869b ae9a4555 608b27c6 e9f432e8 d0039b77 0795f59e f7245b1c c8a61ceb
+  jobs ec43d5ab 21e1aacc 5f6ec261 25d3bb5e 7f9c81e9 1c716fcb bfac1076 03c8b907 09fa0d64 38befca1 f3c32968 0613332a 34129c43 d3494ab4 f8ee79ca 0f5a671e
+  jobs be63b9d2 03bafbd0 2b4af371 5a78cbac 799f9429 861ccac4 dfea1a38 9663b8b6 2b3f3e4b 07b389ad b57cc29e cc1e5459 9ef2064f b68d20d5 30a74fc0 cf7d2627
+  jobs 24bac173 f5c84579 4a58d756 7723d4a1 1219f586 b1fc4155 b1560070 ddd9ac1d 27973743 b1fa402f 1cb83ddc c7db6a8a d3f91bd2 1038e6cb b79db48b 2b266384
   dealt None
 case [96, 320] @ [320, 288] [Bf16, Bfp8] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 37af8673 c4c53ce9 64243891
+  jobs 71baa0aa ff03ab3c f8ee0309
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bf16, Bfp8] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 30069b26 2c715ed8 9d9bfb13 b600d630 de846e40 1776b6bd 665f82fe 57a6d558 5ab053e3 4d0591e1 e05b756a bdf0ba88 d11172b1 beb3a6c6 65dfa032 a887e4b9
-  jobs b1c8f744 81656841 e1b9121c e9272549 97d591e0 354ad315 218d02ac 07b2ec6c f6a0e1a1 6c1b0038 0c092f79 caf787e4 dcd22570 25ed6d9a 05008c0f bcf7e043
-  jobs a66d2713 982518f0 12bb9d83 d1db0f50 a1c7eebd 32380bc8 fac01b42 a3be9efa 6a428bfc 11c29dbd ad99f333 0c899e5f 1228e76d 69207c66 def88f75 1287b7e2
-  jobs 31da240a 40e0769a 65e8e13c 65695cbc
+  jobs a86bbda4 1cc7b7e4 37fddf39 7571220d 7984cf23 c46ee064 364f2b5d a82c65a3 6cab5b25 c3fea32a b75168a6 5f959a06 263215ca b7df536a 473c7a2b d76919ef
+  jobs c6743b2b 71c9ccdf 65321e81 28a9b363 52fd3fea 76e4d98b 08ebf42f 32f23cca 30fbce6d 1f406f84 37289e62 e635f89e 7c5240d3 133e3892 4fdf2062 ede0f0bb
+  jobs 80e372be 351d4fe5 1e8c0d12 873db0dc 1895ec76 61255413 928484d3 97d21cd4 c3e063aa f025426c b5c5f566 45568693 206ba1f3 b16ec1c8 5dc84d51 d279b5ec
+  jobs a76839f7 e162b54e 293d8b95 6200cba5
   dealt None
 case [1, 2048] @ [2048, 2048] [Bf16, Bfp4] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs bc6aa3fd 901712bc e9e363e9 f1c2cddb 1614df60 f082c87b 9545afc5 9ccf7788 37fb8d49 32dac574 cf74a0e1 1e6c3697 685f8d71 deab8662 9da1a854 a895bf4a
-  jobs 31205982 97cdbf87 7953068c 184ce1ec 5d3bd42e 0f2de436 55687ba2 4b48ce12 0342a06d c333880c 5c808c6e 1f0deb57 2a8876dc 73fec402 baa1f02d aeaa664d
-  jobs 523419d4 c360cfcf d1161e74 e92a1610 122e3bc2 b61c7cb4 8b44e890 17d3f51b b49809cd 4c3c787c 8f3131e7 fef9da74 f25e327f 6e0cd44c 08875cea dd449a17
-  jobs 19791804 2a0a3f87 a4df7a0b 9097f4f1 5a59c537 6d89707a fcd687d6 7e8be69f 57f656c9 c76d4f8c d3270700 23484826 9775afd3 410b39e9 d48b4699 47d17efb
+  jobs 5bcfbc92 2b643b06 e49890c6 2c5150f1 d42b7b2b acf03f40 dc7cf851 eb660310 a1fa67ae d8406c9d c9831d01 3ffdcd42 ff726464 43c4261d ce008e58 c66d4796
+  jobs 9e6a2920 0f883254 db6c5b6d 62767dc0 d9012ca9 52628b74 b5841aae 609a8b75 b477ad25 45eeb1bc 4106c998 6d020c38 184c45d1 ef15f699 e7e6992e 69d1ae99
+  jobs 5d2fc87a 36726ebf 353ef145 31e65c9d 2fbe36a6 7e28daeb f13607e1 370c3c1d 5cfb4b94 c2274e22 d0746d68 810207ee f63e2f7a d9ede24e 1190f170 8b3a443e
+  jobs 7690069d 908e4447 d466fe3e 8e67bf93 c751b64d 8910a9f5 69d2dbb6 e1a22b43 79e8f419 c46507cc 98f0661b 795b7036 adc1d990 67d05596 85c484bd a159f0f7
   dealt None
 case [96, 320] @ [320, 288] [Bf16, Bfp4] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs a1da8866 e40f3b33 4ac3623d
+  jobs 3b0d0a16 6f1e8c4a 9069fc95
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bf16, Bfp4] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 2a5b35ac 7647b868 201c5912 f8e70e29 11233b5d f1ba8e23 b3945a73 e489b612 b2081352 6148d2af b2091e80 50fa691f 1c22f268 69db2b1e 4ec9b337 43953559
-  jobs b12381fa dbf709d0 50a32608 7dbc3b70 3cf9e483 2dea2184 0cf7d371 7b943c95 dcc5a9f7 5a184679 1726dbec 451d9539 581ecee1 386bc2c2 75dbf776 bb2ca764
-  jobs a03dff70 fd5a9981 adafc368 c3d6b420 758b63fb d6dfaefa faf3a980 9b75bd5a d51dc97a 72fc7b71 3f6892eb ca95ecce 6ef6c57a c0cc0b87 2f2a2e93 8d9652ba
-  jobs 94caae7d 468eb168 a986d526 b24878dc
+  jobs ea4daa43 e698d747 f769b42b fe465760 acc703df 32135b6d 88872d31 5d06217a fc2954cb 9dc441bf 4d188d65 cacaa6fe 3da959b6 be6394b9 723e6834 823f3646
+  jobs a8cb4b18 a105c6b6 5ba4275c 78f26323 e2fe9952 2d20c695 06910baa 4770c4c8 c07f5c61 0151b8f5 26d841d2 c0a2c8be 3e2db6cd 0f359bf8 2c9c6715 4ffaffd2
+  jobs b36836ec 5a31d33e a43ae905 cd105ebc 0b2d6f76 3869549c d86edf4b 7bf4420f 5a04e050 61aff28a e547ec83 ec37ef09 9b02eef2 4bc41a99 8b741a4b 9391132b
+  jobs e95fbcc4 23d74212 f44bffbc c0b7205e
   dealt None
 case [1, 2048] @ [2048, 2048] [Bf16, Bfp2] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 94081f27 55f34445 9d724b54 470e456e 51fd3f9b 75ae20c0 81860ef3 c6ed58fb 78ee5637 0d3dc53f 6f109060 85a193cd 176ea723 6a032bc6 b4bd5cfd 2f686ade
-  jobs 26eac98f 69a0e1e7 c1adcc1b eb36ef9a 6d85322f 4f3b860d aa838820 62fe4345 c6434105 da3d8dee 0e838b55 85699abe 3d1d9476 4ec72b35 68a4f2c6 b563e764
-  jobs 9b8865c8 31fe06ab 84b1fa31 6d5d9408 c6ec80b9 6cbd578e 52b66657 6dd3014a 216c0caa 53e73097 e9a3094a 745780c1 0b1fe587 d2358c90 1d8eca7d 49287343
-  jobs a0ebce33 8d0bb438 8745ccf3 d7f33e8e 5d02cceb 28287c7b bc3d2a97 69bf47d6 96e878d4 40e12689 37d899cc e63c06d0 ef6f7bfd b427a047 ca052d47 b51511f8
+  jobs 059368ac 1cf5492a e71abc36 aa27f667 7b278e9c 19b0ef7d 9e5f5c21 0b8a7b4d 7f0f0c4e 4f91874a deec4852 f4fcdb4a 0ff7c215 c6113f87 f732c381 2349d50a
+  jobs eeac81eb 7a3cf0a2 0111dec0 30cea2fe c6c68b53 4e011be7 69ce8a9d d2555f6d f9c51ce6 e46f84e2 0f23cf1e 0dbc3ec5 0525e1a5 131f19f8 61ab75c4 66ecd7f4
+  jobs 68562dbd 3093068d c917b107 252d00b0 22e4e8c0 fbe3b208 54ba6923 94678974 4912863a 3a580303 bb447295 0b0e41d5 5ec887d0 5a89c210 856785f8 8ec7d17f
+  jobs 3ee5e51f 62dc1a4d e16f9c07 27f6fc50 aed3e62b 7335a761 cfb7805a b3396aca 0f8705bb 2cbc6fb3 eb8c3dce a07106ff 9e7bce56 abfde6a5 36e9d836 8662a2e7
   dealt None
 case [96, 320] @ [320, 288] [Bf16, Bfp2] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 532f55ea 4f957bdf cfedac2e
+  jobs dc85a51d 6dd7798f 9a83def2
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bf16, Bfp2] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 732f43e5 25135c96 67addeeb 1ac58d32 b137ce42 6f375a23 c0e0d478 8a22ea91 fad60d74 04fa5952 65d7de8b cd1981d5 b8a2465b 48cc64d9 a404c3c2 7f025923
-  jobs d290abb7 6b6e0a92 4466b66b 13ea8702 0b423c99 8a203817 c1c10718 9598023c dab0cf49 5c547440 a60567b0 5f54413d f9657623 e6929446 9b439631 bb2867bb
-  jobs 80a2d155 e331fca0 8583c068 ce658672 34047a78 2671c9e9 c1010a7b 383cbe16 46e2eae8 febaae0d 2e0eb3d9 6c67aac6 f28e8bc4 f1b1bf53 d7129637 aed31d50
-  jobs 3d93e6f4 cbfd36f7 824b4308 dcb4c812
+  jobs b59eec88 d042a44a aa04e660 16fa7a44 d38f7670 76300289 dc64938f 2be7da71 c5909546 0e0fa6af c7595f88 2a76e360 7c0a6cfb 326bdec0 db7d25d9 7e3b5f58
+  jobs 87f65a6c 854a5ba5 6f255747 4ac99606 7d090183 5081afe8 00e6384f c8afc95d 35728efd 9172279d d31f94f1 c2082ce5 cff7210c dfdd835d e25b7daf cf49d6dc
+  jobs 58edc07c ae64ed7b 7e734609 723987c1 96a81dc8 b6ea0ed6 125abdd2 af4cdc92 22e29bc8 9e2bebf5 1de19646 964b6e15 10772f06 e2277c5d 2e8e1e83 ed6376ee
+  jobs 3870ae33 ec0a4f95 a6c256dc 78684fda
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp8, Fp32] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs f8dd7352 bcf67088 0c837292 dabfe78b 58a180c0 2867f961 b4df56ee e7aa0290 ebb44b09 e703a53c d35b3513 cc5e9c1e 57086adf 128a42bf eaa03413 71e2721f
-  jobs 1af90de5 ae0ff146 4196933e 61cb5ba1 fa86492a 9bd8a192 2e8f2beb cf69df6e 10c09cfb 76698ec0 eebb2a74 0223a005 a7da2973 8c5f78cf a741c295 a17e5abe
-  jobs b6d71712 cdd74dfb 7b7d9799 7d6f00ef 178e21a7 506c0b67 6a21cc76 bc542e64 0e6a7b5a d3485ead 8bc15bca b74422ce a5902125 775070a6 1bb758a3 b0952e4b
-  jobs 0811cbf7 8a34088b c8d6139e 9ca52125 1bea05a9 71aa4d01 bc1ccab4 ec4da7ce 5c9c3dca 609d3a1c 79c3e86a 11421d87 0e40e3c2 bbb40363 44871948 11a956a2
+  jobs e6f2cda4 783708b5 3508e0fd c79bdc8b ac344dda 8c6e49a0 444baee9 304eb24c da3996d5 723d353a d309062a 1979ca15 8099867f 4860149e 95a20b2b fbbbcd41
+  jobs 0230d0cb c13e535e 129be173 d7dbfbc4 12c7376c 4eee3d38 74284862 ed20de8c 3d1eb170 d5d920a7 30072591 8f24db2b 64311c01 4d665993 99c57ced 34983dac
+  jobs e4afbb38 41bb0869 c0d58de7 cb4d10d1 127ab07b 5d6f156b 44b62914 9ec3af6d a632311d 797ffd89 e8bea3df 3a08630b 844ce446 272e7dd3 3bf860eb faf7d2f9
+  jobs 9c25d766 119c7e72 edb21445 d0b694d0 dbf8a941 65d7fe4b 5f79f194 3662a9b4 d9a37318 65eb94e6 4b094c46 0f4169a1 71d85067 d7cc9de9 a90b2530 f269327b
   dealt None
 case [96, 320] @ [320, 288] [Bfp8, Fp32] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs fb0c8e8d 1fe8d2ed 4a2b5c99
+  jobs 605fb8ab a80a03b2 351a7b1c
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp8, Fp32] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 796493f6 55082389 bd627523 6971f80c 4cf1351c 487c16e4 2d438cde 14ddab3b 90119176 894b5f83 31d464b5 5c4fdfc0 316b2ad6 0d7e51c1 0d73bbe6 4d6ed793
-  jobs 8e3cfb23 37d9d9ce 7987d873 96e6875d a1315636 648fda0b e18cc67c 0b03aef9 6537165f 631c35c4 0c71f2bf 43cce27d bad648b1 8df339d4 fdc47b28 1be5fddc
-  jobs 9e790c5f 7f8f9bda 753a036f aa0210a2 c7437d7c 1c024a2f 333011f0 895d5aca b3c74bdd 6bf7f905 c371261a a2bce9e1 a22f3d4a f8c25133 97a7853d e4f315e0
-  jobs 6adc95b6 0fb73402 d4cce3ed 17cf371b
+  jobs c4585126 7b8d0c26 615570de 1da5e2fa b0dfad13 1cf0b456 4d700a98 f1d887fd 583e4cfe abea00ea b2be0380 fe5731a3 3c3ddc46 a9fe8d25 b837570a f66b019e
+  jobs be206e78 dab6983e e27033e7 83f71cd8 f4b34c09 2ec08d40 2d158544 7b257531 3c62917e 16e93efe b822f8c3 2f9c09da c5df70cd 7adcc2aa d89b5568 2083c108
+  jobs 2d6c9299 0fb6d8d9 dbb78ef6 3782aa14 e7a89005 15a11901 616fc940 316e355f 3edca985 6b1e7855 b19ad6a8 392995fd 157aa819 6ecee85f c058cf97 d8d3aac6
+  jobs 7b7a761f fe95d9ac 4c2e2f4e ebdc44b1
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp8, Bf16] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 669cea2b 3ae19274 1c162e13 6f0636c9 444c18be c98106e1 f5997efc c1e6fde4 ad1959f0 3c872043 2538248a ad590fe7 c6ddcb33 9a567207 321182f2 fa275310
-  jobs fc2b79de 980f4fad 97ea8b71 8c7547c0 23dc0399 173568a6 1f203876 fd85dd59 e6403e78 788ce6fd 82e2124d e31f3dd0 fcc5e2f5 87db70d7 d9a1a676 c6099a3d
-  jobs 1ac7a598 812c89c7 c9a6d897 fa13aa73 90dc32fe 48e6de8b 7fb96fcd 4735ed4e d8919d62 cf8a7831 dc152e34 2e75ae34 03d5fb35 732748d9 4032f9ee 912bc301
-  jobs a097b81a 8cc9090f ad33f526 0038957b dd27706d 93d79e78 340d9555 607566c8 dd44c7ab a9f96262 2bf75b4e 6deabadc 62fa6bec 5de7d2e0 d52e154a 2a3105a6
+  jobs 21901b36 2d0c9979 c79b6349 5de8a96c 05f97681 ea02d228 ed3655ca 3889ce2a 85589de7 a8fc7588 1c7c26e0 3d9261bd c0df4882 70ede879 677d1b3e b02f2df3
+  jobs 71cc928e 93c34572 923c980c 837150d1 0776a8a2 43a341ce ddf049d9 8c6dc073 b737652d 4a703594 1d033ae2 35a1158c bada5fb8 7c368afb 34c57619 c6ced474
+  jobs 708baec7 7223a2c8 8c577ef1 e8de6f49 387e428f 47cf38d2 da1ebc24 b12acbec dab0691c 54beeb32 6a4c1bae 524b1471 6daa2418 0ea02b79 cad6d0f3 ea9d231e
+  jobs b3962562 adc93a4a 298af567 af5d433e 1a3bb0cb d8181d1c 531132d3 91421c17 b80f6ab2 de9e3ab3 1d7f8644 68ea8079 2565c96d d35d1867 24fed2a2 43200d42
   dealt None
 case [96, 320] @ [320, 288] [Bfp8, Bf16] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 4f77bf3a 44312cf8 b1a14a59
+  jobs e402e85b ac0b8eb2 e476e966
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp8, Bf16] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 29f3e7a4 939bbdf9 3c81879b 14aec990 e4e9c92e 14eee9d0 f79d840e b3078aa0 b5f9ad9a 48d7ba45 84874190 74e14a11 3b2706c5 4424321b 9d8d3711 5bca92fe
-  jobs 0dea7303 11d8b57d fc191a26 25f5fd40 d2bf8c11 9b0031dd a86c1724 9654ce9f 0fc9f3ad c1731fd2 8bb5cd89 6a871849 adb153a1 eec28a91 c19b7342 772baa99
-  jobs 1c32bf58 5c87edd3 3319ee56 696ee16e 2d87a418 b72821e2 91749464 cc829b0a d7af7da4 13f49dbd 71cec715 25a72a74 61d154b0 2bc4e266 9072cfb1 c7a148f3
-  jobs 239dbe54 999683c5 5fabf28f a8966464
+  jobs 19ebed83 6287ad41 cfb0ac5e d5af9b2a e73cadbc 765164d4 f8800609 64158afb a3eb27da fbdafdd5 5a6667c6 0280b943 b3be3424 4dc73436 f9a03dcb f4c3fb6b
+  jobs 00e15052 bd7dca50 4a46757f b2cb427c 95f7f346 c5a6ef06 a39ff5d5 7faf6d35 f5c1db84 2fb1687a 8375a335 9a9a9f41 5f1914a1 b647fca3 2b540c2f 7ba9e883
+  jobs 0b174a1a 802ce0dc b74ea70e 01d244b8 b6d17f34 c18c4cab 3f0c9e44 e7d88e16 59d2ba4c 5f25fa80 f37c4fba 9347bc0f 8a8d704e 374c237b 9ad29faa 48018a69
+  jobs 59e4a8db 67392c55 dae61028 c0dd35eb
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp8, Bfp8] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs cc67eea7 78a621b1 f8eaaf4d 251a310c 13146f3f 45bad002 4a969d02 cfdb2828 8597632a a4f89405 91f5d1e2 8c85a17a d96efbec ad68b182 cce27779 89051acb
-  jobs 6b96cb47 231abc5c 171a80e8 81b15a6e c3a00bdc 2d1fff28 b3840ae9 a0bad33a 5ab58b51 9c69f9b5 d4be0db0 cf71b2d7 76ad05e1 ce7b7d2d 38b3a513 804d0824
-  jobs 1a1fc825 680705d9 cfcfb9fb b209c5a9 7b24610e 46473cfc 5392dcc8 56ba9f89 e771e19a ae83fbce 23e842af f33f903a 40bf9bc1 d9bd9c6f 2b887e18 5e8729be
-  jobs a4f54f81 7cef9219 7a676707 8e0d7c6e 4d827365 96aa04b3 94eea8a7 cbf31904 4af4be67 a1a4d3ee b718694e c02c7e89 42adfb66 1ea5a815 75ae98c3 df913bf0
+  jobs 36bbec78 4f93e722 987200b5 3fb3ccb5 6bb47d3b d423d207 c41d01bf 5e72a70e fdcfcf69 38e0499a b5ff93b8 26bc4b5b 0e01806b b2c3155d 774099be 4ad84e87
+  jobs 602d9dc6 26b49ef7 a6265d9c 5b5f01d6 8bbaca79 3c5ec3b5 1e393f4d 86694a38 4670c05e 635bfa4c ec821013 747de631 9c9bb1d5 39688f8a 54bfc8db 701c7554
+  jobs f817314c f8d2851c 73fa97a2 f82c7caa 97aad250 139ab86f fd3ac771 6b2a3e2c 69f2169c 1724c983 75658910 b2320aa3 d0692b57 ae277c19 9c5eb797 999b5602
+  jobs 22e7805a e80be78d f92d4164 df260f13 c5d05b52 9fab85f5 7336a8a2 de8c7b19 2c252d76 fe490315 0b5224ed 75c9b034 9c2751d6 28d1b51e 58dc31d7 2340f85a
   dealt None
 case [96, 320] @ [320, 288] [Bfp8, Bfp8] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs fcac539f 978473ab c5ed4666
+  jobs c443b701 69e7e623 b3bfd265
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp8, Bfp8] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 4eb07276 a80e5968 51e85135 b0295d92 5bb94cc5 1502d0a9 964d5922 b5bc76bc d53eca57 63689a76 252eb9da e8be9e97 0ac36bfa 5c8d829b af08ba75 5d6f4494
-  jobs fe0b7e10 fac2365c f9aa62ab b88177fb d0738ed3 986f5935 8aa64544 3db3fd41 2836fce2 6cc788d9 9092a1e6 2d49426f a83e871e 1e63378b 3356dce1 719880ac
-  jobs 90357809 52e9e55f 1aba6367 4efbf592 7dcdde17 5d402edd 569fc371 ca42fc8f ec482c63 46f6cc4b 08e6fcd2 3c336785 b554d92c 8045c6c7 1d232272 89a84746
-  jobs 682a8eec 2e12b6db 7afc3211 a7f1b2c9
+  jobs fadec9b1 e540cc36 ea1f6d06 422eebd2 0d3dcdb1 a617d171 3445739e 02b3d3a9 93a8a082 c8cbf9a1 42f81c9d 3f8230ed e9665044 e7eb4a12 33c88c17 9eecef1f
+  jobs 5c066165 c25d863f 330ece2f d7d0d251 443c8ecf 1987322f 9e0cd632 2b00594a 95a670c2 d33eb3b2 17ffccf6 6321cbec 0c4f12c0 13996692 7766bf84 25e8f758
+  jobs 29509e60 60b88a61 f1d700ac 5e984799 804b556d 557a3d5e 7fc8a5e1 e734fe54 d95cb1e9 0b6340b7 eaefc53b 4c7e2886 a58d29fc 881cb3de 9a3b1aad 6b2053f3
+  jobs 643bb782 450bf26d 95ef51b9 26ac3492
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp8, Bfp4] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 77aa1468 bf88785a e3d83e43 4cae8e9d 4d50b39f 4a4ea4ed 41c48787 88027ea4 42d0ca06 fb4864a1 c58da757 9e54eaac 3b397b4d a1ab5fe2 f9841968 8846b73b
-  jobs dfe4c145 be6a731b 35c7c880 b589cc7e b7a6bada fba9d78b 68cc7cde 997d2a6b 881cf2dc e4f78662 be7ea5f6 2dc8b2bd 1543d7bd 50c12045 7fd77fa0 b296d99a
-  jobs 9c2d8dce ee29971b 2c657abc 92f648a8 88090aec d380bc5e 77dc3361 a6ed3206 7209344d 62d045bc d7e9e9d3 d7fed708 00426b50 e8ad22cf 54e94404 c2ac687d
-  jobs ec5fb4b9 446f4a72 16db4f6b bda66612 85e8c5a5 8d6eadce 8243bd00 4b1f4b35 bbeb11a2 65f02d43 731eb158 4b1938d2 fd64fe6a c076567c 69a8e57f 6f8aafc5
+  jobs 488b8a2d 3fc46e49 890e717b 8a0cd2e1 41d49b61 4d9172fa 752f8dfc 9b464520 f0dc844b 86b47493 50374224 c8c8c17c 305d6dbc 6c4b4669 85b3e861 f7f4245d
+  jobs d93790db da0fe172 1a0bd367 e6fdc17c 536bb272 3b051752 bab96489 132d75ee fd8af82b b2df8b27 39331625 25085953 51859e6c 108cb4f7 f92d72a7 97fd3d0f
+  jobs 8a058eff 34a8d023 ee5cba82 25838750 56a559b4 03f2a34d a11b51a6 a0585ded fe83e30b cb8369fc 84d1d949 435a6f46 cdba1624 b764fedb 1498967b 4682585b
+  jobs ae966f6c c4f82e03 3f4f7c1b d0a1fa88 6e0fc9ea 6bbbcb49 f782c0fc 1d1507d0 03fd5f1e 8adc3d81 ac4ecd2b 652c7fa4 627ad195 8e32088c a01f92c4 96c3f1f3
   dealt None
 case [96, 320] @ [320, 288] [Bfp8, Bfp4] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 8ffc33ec 9c46c7d1 f5f5cc23
+  jobs f9d0dd45 62fb7b89 b54f20b6
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp8, Bfp4] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs a1335ccf 33d35d2b b98f020b 41f7de5b 6d19e576 7fb9307f 4a6b04ce adbbfb39 a87f6cf4 fbbe5d02 b9f10c51 cf6d3c13 4ede3ba3 ea1fb339 f9665fbe f291bd0f
-  jobs 03bceba5 9407f3bb 912bec90 e98ffa1f fbaf54e7 3a1df276 3195dc42 0714c798 c9b5a678 f5dcf53d d7c53cc0 0625aa32 a2f15360 ebb212f8 05a928c9 2b19d1b3
-  jobs 0dbd3caf 7dc4be43 954852d7 ce929962 936f1df5 d30581ad 295d19c7 80ed9882 79fe2361 6ea7c73e ce74c646 1b301dda c7a2266a dfa9a4c6 a6099424 aaf82b64
-  jobs 2729058e be332dc0 8b841b9e f7b097c4
+  jobs 82c631e8 97daa529 37e905ec f1d541a0 7cd3c347 dede6c4a eef403f4 850c2b93 8c4eaf14 531428ba ae1549a7 18297f6a 08312e9e 99a4278d 525eb4dc b55d9381
+  jobs 82497358 b5ab22e2 e5de4320 4c0b3eb2 c8c9eb70 098628c0 012f998d d2b40555 d67b9d1f abb85c69 234d36c9 aab54140 0d2a5ddb 49babed6 9f651c1b e317711c
+  jobs 4efba2ff 1555d7bc 0a0c8169 d2cc16a5 c248d62e 40708906 eb904915 daf6e9dd d328bfe9 29e25cc6 25455a68 009a8a8d a2c33f76 8b862dda e0feab70 d7cf07de
+  jobs fb595a59 7530685a f62953c4 eae67b6d
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp8, Bfp2] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs d075320d 9360d169 8e25c81d 2632d127 88617caa 2a03ca8a a51e690d fa499f6c 8bc97ea8 0ee4e399 1ebc2a32 9d44d96f a2d8ac97 c8c7dac4 33b73c70 752ded1f
-  jobs 7bd8bb3f 8ec60cde fff8d013 09b9ce5f 0bfb41fe a1fa9b39 0ef31a15 1884b7f2 b5de5d46 c01ccfc3 ee18e31f 83955a35 8f288483 ac13d712 99f9614d f9cbec28
-  jobs 6919bdb1 c74af1c2 5ad1dd27 8d531f2b 0fa2f1d5 dfc53247 3b4bb430 696f676e 2db73490 15fe2414 4a22bec2 74dd4ac4 765dfa45 2d264aab cbfea056 c9a0dc9c
-  jobs dee99790 8cbe583b 7f17486a 4c527e2e abfe8a07 e3eb387a 19f47693 4f4b3fbd a2e68fe2 ab1d28f2 6fe5b9c3 e6b028c6 015f1b79 7bce94b7 55337089 ba9bc0ee
+  jobs 293a232a e386f38c 9d772d5c 0b804ffa 90ad64a7 6be5991b 2407ccc7 739002bf 7c487133 820dc3e8 571fa700 45ded727 adfab0db 3102dccf 7194f29c 8b2f7614
+  jobs 3ab47d9c bfce6354 378f92a6 0f566f12 3c9c9f88 ade585ff 7bd35357 b87851a2 d1d39e47 a19773c0 58b06c6e af99e3af 6657ce94 2217838a 0395ab48 4d3664a9
+  jobs ed30ad05 5c97a05e e120de40 6be98c36 0cf14070 e84355a8 7d35f82e a1319a51 50834275 f2ca03a6 5babe969 800947d3 ba706751 2849a5b5 3e7c2fd6 91657251
+  jobs 8ea0dfae bb3703f9 0c204c7d 5c8ce647 016bed96 c6f88073 3acc06ab 28090ee6 c0b80d4b db5e018a 643b661c 455112b4 ce2cc226 0da1670c 21df5451 76eb27d3
   dealt None
 case [96, 320] @ [320, 288] [Bfp8, Bfp2] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 71ca3d0f 9b915a51 251cf85c
+  jobs d7a21f6b 7e80c67f d10ed9e1
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp8, Bfp2] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 58ff3685 189940a2 de448c68 bf56528b 6a6ed0f4 928cd50f d882253e b9ea6359 110b40ec a68d372b c096f643 19117c91 61c31841 4253f505 11132769 c330f684
-  jobs ceb80e9b cd895e6b 6e85a8b0 d979997c 331904f5 901e1600 50c34eb4 7f00aa3e b1348c50 171d5cd5 cb438bfc 05bc6aae 0e9436f6 65eea76b adb15c75 cbd366e5
-  jobs cf1da826 74975c41 47c82267 5e4220cc df722dc2 362b8c6f 5947e89c e8f7af03 845efedc ee3a4a91 30c4db9b 251bc550 42a319fd 1170404a ff3d4eb8 df4eb53f
-  jobs 8baba965 553cce71 d427d617 261656fc
+  jobs a6910515 59801af6 f14ff848 1801a58c 238b678e 5a184ff2 bb54b864 a0b4142b 325a2afa f640f982 afbade37 726be481 bc08f7bb 263e36ef a8944ba3 6a78671e
+  jobs e01c1994 bdc45f7f 91fd77fc 2e07f94a fbbae96c 7f20e985 49df92fc d48df166 ef33d21c 13ea6d79 8c543c22 f881bfd3 2896a38e 181d2f9e 288fb335 1802c45b
+  jobs bc1d2f14 513ea49c 56d1f222 1b4fed20 a9762e56 6b43a544 ebf8125f 09a5222f cdc1b17e 4269d905 30973784 6561d729 e6a4c87b 116e8ddb cdf64017 288c33d4
+  jobs 061a88cb 82795da1 bd027180 18e68d11
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp4, Fp32] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 2f66fdf8 459eee58 c64c109b 0c0b9372 31504878 ceb0bac5 5d120e55 046d5501 623f0ae7 e07f461f b5e85fc9 6e44b2af 4434975c 4467a1fc bc762652 522f92a7
-  jobs b0139caf b998e0e7 208d9676 d1555d41 74140e2c a9d73ee8 b8c9ff59 6f98d64c ae0d203f b0606000 b9942db3 c05b909d 52d1ae12 940d7ea8 b22c4fa1 81de071c
-  jobs 5fe89160 e42c4308 b39622ab 38e41288 105d0e5e eeb3a0a4 f02f1ea8 c9c97626 f559f9c1 8ce8830a 49bca46e 570bc87f 5834733f 14b405e4 ebe3932a 460c6c44
-  jobs a2ed036f 7c98caf2 beb673ed aba1f193 72915ee1 c17b95ef e78b72ea 3b1d46cf c6b4fb17 587a9f4d 9ab10766 710dcb32 4efbd2b0 22dfa8fc c1ae01ab 15e29614
+  jobs e09e338f 345c8972 769638d2 de234b10 b9e02804 70758782 49d6273c b35a358e 8c5107ab 9d142e67 0de78255 1c722c5d 20b7afcc 3f207a88 939750ce 0a844197
+  jobs 31eb2bf0 dadd9d35 b28a8368 f75367db bc800fa3 0b212428 0ef99e84 4928567e b5b87678 fa4490f9 8a57c7f6 a48a5fad bfbee66a 1eddbdda 1ffba9d1 fe29c672
+  jobs a954f980 b59698c9 e55c254b fe444c5f dc423578 8865fef3 d938f642 1cead328 8a5e700f ba9177e2 c73dc6cc 6ca38b73 beffb847 51e6626d 10c476e8 d456fa55
+  jobs f124d4df 9d97fb08 60a87813 3091ceb1 42283fe3 2852566b 159a7dce cd0c969b a0ed065e 24b1a0b8 72287294 51bb0316 2d5d4683 6dfe4dbd 2b6b2df0 f04aa5d7
   dealt None
 case [96, 320] @ [320, 288] [Bfp4, Fp32] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 969ff1d9 e5f708ba 12cd89ee
+  jobs f1314684 56ab28c2 b8c45457
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp4, Fp32] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 3e987ac7 8e051aca 9da2bcff 6a90f89e c02fc5c0 aeb7479e b47b416f f02d754c afe37e7a 90fc21f7 1444b1f0 1a9caae2 935b1681 1d5b2114 45ef47f5 e4cbd907
-  jobs 7a928d64 69bb46ff 9490591b 90984472 59c0890f 998b404e f7771798 619ed5fa a0c4c5c8 9d87b39d 7cee60a2 a59a8c7e 57c220a6 e4432150 5559f989 e73caa81
-  jobs c3d92577 c331ae04 bfab8356 05214a54 91ebe813 9a1d8fc9 c4341515 5bfd2212 dc9be484 0c33c6bb e623e41f ff65ef9b ffde13dc 9b83db51 d6039f2a 6897c632
-  jobs 26079d0a e2a5a699 e7a7a3f9 780b9a0b
+  jobs 461dbbbb 4c9c38d7 6e8ccdd6 0b8915f7 e4195f43 7ed2a8a4 d3f507c2 cd49ee91 88f1a93c df8792d8 a2a7b32e 264e2034 1bcea857 1bfe90d1 5f954403 8c2751c6
+  jobs 0b1bce33 0e58cd08 18fe4225 0cd6ef90 f72a5a28 a53b3192 6267e57e 3a71c81c 1afab880 cb56bbd1 aa9bde3c 32953c74 5eb3a80c 9f4424ca 9b772f8e 6ffccf1c
+  jobs 9e2b61a8 452f90d8 d7e95d37 0bdbbf85 ae8265bb f10164e6 80ae0b63 fe2f4048 a1c6b8d9 eef53e62 ca277637 2aeb556e 1ace138b a25e4cc3 e42e4d86 d622dbeb
+  jobs bac387e4 123774eb 3b8dc63e 7458d82c
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp4, Bf16] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 5d305b7b da2d27c4 3a30ef9c 2787b4d9 e9252dc7 a8c245a1 d4d38469 9e0dfd40 f8a27356 4b387ce2 7c4dcabd 69a224b4 b365bd63 14e394be e845fda2 9b251ad3
-  jobs 50f65ce2 947bee48 58ec5b79 5b68d4e1 0cf2cf57 f315e4af c8c8fffd 5aa82ce6 3f2e0efc 19635980 ede4082f 00ca5147 e35cad8d b84b113c 480c8680 20330ebc
-  jobs d2c3368d c442bae9 3e39a1ea 3fc26374 a8273e05 573790c5 41eeb449 1cd542cb 88560d60 a19f6c1b 777a859b 82627f33 51dd5e5a 90b462c5 13376aad bbf2b3d2
-  jobs 5fd5b4c3 6d17a427 e40d5e2f cfd81442 6217c477 cf215957 418bf395 ca5b87a6 0e233d6e 53e511e5 ae8a1665 51608c3d 9c8cecf5 7ad30859 4a083722 baa00755
+  jobs 231083e8 b652490f 6d50bc31 fd927f81 071e3e0f 46882e35 f50a44d0 041b86ed 42b7885c fc99b862 1ba00d33 a1455e5b 547b7a9c 304a5847 efac2585 0eaddefd
+  jobs 5f8a6fb1 be3e9af3 3bde2b20 16d87167 e17b3641 2ea5fa36 f19fcef0 866593df 2a15ade1 df19c661 02764c0c c91f9da3 2bd2194c 5523f959 b1a1c0a7 18e007cc
+  jobs 96a139a6 279cddc0 fe00be55 63792a91 c496665e e6a750d9 d5632a1b a19a4f93 eda2edb1 6d4dfe19 d86aa350 f13e4559 0638ac62 27a72ccd b090146b 48a8bd28
+  jobs d5e7b70d d4d324d3 d8fbadc6 33791b15 bf3f922e 97146313 46eac9f8 ad227c52 09a92c0e df4cf4c3 d6b173c9 3f3170b2 3f99eac8 ee73bf29 4a687d4e 8bc172d3
   dealt None
 case [96, 320] @ [320, 288] [Bfp4, Bf16] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs cc8661d5 f56e8b46 0b303ed5
+  jobs 420f0ac6 8ba39f24 f4cc4acf
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp4, Bf16] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 7881aa84 d260a896 41932251 8ee186c4 afec2c4e e724400e 822b04ca 2d7b20e2 6bfc62b3 15730434 0512ad2b 1b0e4e62 ae18483c 6d5a886d f8a59875 4e610922
-  jobs 470a172e 2b75fc2b afec74bb 7bcf18c8 057ee708 eeb24732 09447eec ee1d3c2e 1ae1e687 007c76fb 7280afa4 e56fa655 9457bd35 a846a19e f8a2f183 b608ba2e
-  jobs f30f2a16 17fba047 94fda6d0 10d1cb1c 02082314 725a02c7 dbe07d4d fd57a8bd 60bcf1d0 7b2c8680 ecf12f2f 42db7523 2dc0afee 6a049963 97707304 0ac6aa03
-  jobs d36a2a02 ed0ab79e d78ffa73 942202f7
+  jobs 71b6648b 959063f0 cb932200 2e005d97 f5a8fbf7 78067238 19f6bdf3 3e21e08d 3207c896 d111b640 44c255fe 7cfc610e 811fee4c d6c1914a bbc668d1 23b663cb
+  jobs edf3a980 7019b6a0 a2246f0d e373239d fcd8aa13 a42ba6fe 8fc9f08c 40fc575b 06b2d045 200b5f5d aead89ac e3749c59 ed05bce0 c171a947 5e551025 d95a28be
+  jobs bfa45673 33f1bb73 eaed7129 efbe32b5 d0551569 1ecc5200 ba435d12 adeb989c e8bec005 3058e45a a4695b68 e8bee057 6a15b005 402b5425 189b7204 3d8a413c
+  jobs 999f3e6a 7f209838 af131226 a03d65a4
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp4, Bfp8] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 59d46296 47706638 e4b419f0 160c892c 33916345 c87d19df 20d8ad84 4fdc7e7d d24752a7 488b6a1d ec6b6fae f79d5674 603b043d faf84035 d9ad7c18 50ad7275
-  jobs 42e9f4c2 ec1bc9aa fbb4e8c0 79c7ec1d d8ecdfef 123472d8 fbcf21f4 9ec4351c 6e98e35f af38c451 a694ddd8 d251ee92 86813ab5 d2fa8a83 545abaa7 0fdfac4c
-  jobs 91e0a34d 6d10a569 e893a620 e84273cf cd41816c 89e02b58 83c1d81b ad7f0b46 844bab78 86784701 4974aeb5 048f56c3 9fb812a7 b5b853fe 86e63340 c90c1d34
-  jobs 63acce34 8c347137 4fbf4f06 52c64aaa 49520af5 6a3f0150 6d7b9366 b00b5fc1 f1772a92 8a527322 4f2923e8 11f121a7 cd7d6a88 c00bb3f4 3a7e3da0 9f22fb8a
+  jobs a2d7b0c0 e7101147 84e96a6c d7e7b836 3af5f1bc 1cbaa1a2 503b5f77 c4767416 ba366095 71866a15 ca86244c c906fb6e f346791e 38b438be e7373f53 e0e57c7f
+  jobs 9a186d4e a55ef26e 503d6e45 0e9983a5 74be0fa6 eaff8f65 08dd8c5e dc61cf48 f79f8265 e4ba5f26 0b821999 ed57fbdb 4e9abf26 5c7168a9 b1e9a12b 94a06ba7
+  jobs 28debb1c bb5f9139 d13c98ca b206562d b21dd56c d5b482a0 aa822d20 c4503c80 5457ca52 7cc7da61 e3823e20 7b2d45b5 03c4e5b4 bbdc4c17 71059573 dc122eb2
+  jobs ccefc4c0 6266f3eb 8495a7bc 42c830d2 af12b88c 36359a4c 93917465 50b5b732 e5878a1f 7e5b3787 3a3212fa d1d2bcaa 4fe38c99 cb198e72 153eec47 73cde204
   dealt None
 case [96, 320] @ [320, 288] [Bfp4, Bfp8] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs e3c7d12c 9afc9d8a 16811344
+  jobs fc0ce54b 2b33e084 7a16119e
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp4, Bfp8] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs d7f3e293 808b7b25 d2001f42 5d2bfc3d 3b8113a9 d4c5608f 76d69075 277f9c0f 1fa95b15 4c289783 19e01990 9d13eed0 af3159df 158f483b 4515a174 bf7f1b8e
-  jobs e5dd93e5 8eb82abf 6b6bd141 fe59054d 3c9f376e d3739663 b8416dd5 dbc6f622 548db234 76c72bb4 e32f8405 8c22d618 873ef0f6 fc308d6a 30e29eea 75e60dca
-  jobs 18e45308 6eceb990 717916c5 f3fbf347 3d28c0ae 69f87530 681b03b1 a66ee402 8719f186 69c31233 a62bf555 2ae06d34 93321c54 c124ecb1 3036d2d3 89519e2e
-  jobs e2f7f190 45eb8693 4b36c26c b7c97061
+  jobs 9b22a240 3c0f2e14 7b64c35c a33ef9ac d7be2d8a 55366cf8 b904d937 db783d0c 4b970df9 a184d593 ad136604 168cd6c1 51e0b37c 4036342c 527af69d 7e82f9e1
+  jobs 5b496da1 7afc5688 f513afe6 321ddab4 168aaaa1 0d85529f fef4096a 3976b4f8 b0629617 187474df 54017f61 b0f7736d 2b6c9e0f 73c60074 0187c7e2 13c46ace
+  jobs b923ef65 06d05420 3d96e906 9bebe9e5 3b62a537 cdc13f7f 5631b24c 0886bea7 4352ca85 04b5a3f4 313f2e39 b61f13c9 53ff3921 40fe629b d90c5608 1847b7aa
+  jobs e6288c59 0b3feb67 454ba91d 639e09c1
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp4, Bfp4] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 18da740c dc6f9a1d b8059a58 b1f59a48 0fa2af91 3f2b0c68 3f2925ad 8f94df48 81facd51 05128f52 a1652038 feee5970 9c1bdfd1 c76f8af5 6c3c4271 945924ee
-  jobs b4c53c52 d7dd8175 c17b93ac 40f3bdd7 f661b175 2b38b380 1bf18a4f b7c88d95 50eb217e 5a6d9628 4835d3de 5507b965 5d7f3add 779bd2a8 8dc2c0bb 323d64bd
-  jobs 8a8b4c11 c5a58c76 aff50fc6 dc2b26e8 6a7d4cb8 ea897906 7f959e22 b01df2d1 f0671493 a255305d 11f0bfa6 662a35b7 b1265a10 617bfe34 121768b1 c5c3b213
-  jobs 592e9116 d5bb39b2 3d3ee057 f06e8be8 219fc5fd 9d236d61 d6e97f02 efb25b3e 2e6f1972 4863189c b70ec46c e0c1bffc b69199cb 8fc282de c840eafb 01fbd804
+  jobs 6528d2fa d35261b0 b9f52675 1ab65fae f51bcbf2 c77e6657 f98d7d99 48e3aad1 8597c5f2 58c477d8 816ca078 ef5f5bb2 91d4d8fe 8ce737bb 8f7b4f65 e520c308
+  jobs 06f197ef eb8e957e 4c9e2cae 4e3de06f d29cc570 f92a2bba c98b402c 4f39503e 4e442b69 99549e4a 5b0d21b0 d08b6614 a26d8174 70f616de 8b9814bf 8aa34deb
+  jobs 54ac9155 254b4dc6 dd350527 108ef23c b64cb326 c709d32d 3a3472da eb2bf758 af8b3d43 9adb3fc0 87e9a6e8 21e11b5f 6443d051 ac52868f 6e1db841 1171a78e
+  jobs f1fdffc0 74ddf894 4a76efb5 4d4a3435 d52dfe7e 6f3a5170 fdc419fb 2a36044d 22e3f43e b3906a17 6639d4dc b843f777 5998553e dc683ef4 a2b3b320 3a4124c2
   dealt None
 case [96, 320] @ [320, 288] [Bfp4, Bfp4] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs ade3e527 d0308549 db9c78d1
+  jobs 86523471 1b9f7cea b2492643
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp4, Bfp4] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 744a8c03 9ed06ba3 fe1d4ab5 2fc302bf 287e185b 1f546c30 48adfbdd 47932c40 45e72f7d dd1accd3 01f58f0e 10b7d594 de3d4b21 053ffc98 0e59ec10 bdec6e1e
-  jobs 762afb9b 4f5f733f 094658f6 d749a961 a47f9213 b1f8c539 8edd09df 94ae265e 33d36874 dc9f75dc 402d7225 ff615413 d3ee5302 bc5e36af f2175074 c84a374a
-  jobs df1a9de3 683966d2 c7e565f6 08ed51db 8618484b 0ab83125 f4a22321 b89c6c6f 78dc51f8 d9fd00e5 5aacba73 a094f1b5 a7953e9f eb301979 ce229554 7a1a66bc
-  jobs a12b06ef a979387c 2746d808 30d76545
+  jobs 6dff5ab5 1be16f0d 758adbcb d2644a70 e4812084 a9c1c561 365e3b11 d5c85624 2bf95b0c 7599bab7 959f06fa a9926589 eb2c1ff4 81d9d42e 0d3ace77 253ebd49
+  jobs 7ac1b422 1774d7b3 5e5e6fe5 95908693 2abcb9b5 23318138 6ad34dd4 98d1d081 4d7cb812 253f5fd5 cdb39d68 8da0638b 3e992957 3c9dce4d 22a45056 8fe3838a
+  jobs 4fa67d52 9c341816 4ee6e3b0 e5dbd21a 534893e0 851c5c76 c6dad40b 956607e4 c269b354 b1a9da31 289dce1b 6967158b affdd4b1 1d475284 c4804bb5 c89cc922
+  jobs 9d2f9f63 53670a43 780c2e5a 4aef5b8e
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp4, Bfp2] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs c3c402e5 ed92d7f1 466df0b6 a728ba3a 021c38b8 3b848b0d cfa319ac 0a6efd9a c2388f36 750ef342 89462286 93c28935 fb31e667 526b3299 ec5bf97a 30a90cb6
-  jobs 6aba7a34 ab251a45 348fefc4 012d3225 5c9940f9 c30c8f4a 888b995a 9a50ca72 059d03e0 68b8e95c 4b8e64fc 8a00c64d adb7ed19 8f30a43b 01800235 c875845d
-  jobs dafba5f0 ebcf315f 04237ea5 31892979 be72fb61 b2c10744 4573888f 9bc84e18 e73f087f 6f665854 4a4b57fa 53b3fadc 5478990b 04502a5c 226abe51 8532fdad
-  jobs 2810fff5 955d879a 41ae5cf8 bf51bdd4 b064a137 6df83d87 61c8b58d 7dd0c970 bc1249ca 8b318bd8 ac1c5364 2a12e801 af5b6e89 2554bfd9 c5af1a3c 324bd478
+  jobs 6192026c 93a5e473 05b6e71a bd949aa9 f006ecce 62348481 95b5a1e5 fb4c6411 672a18fc af5fbf93 87c70d06 b8261886 0666387f 4c140263 968a2fee c6dde10e
+  jobs 65e54fd8 95ec2300 d250a81c d929b26a 3d96804f b240610b 2dc9dcc6 5f328b8e f08a0938 fb196568 a2b49792 61e5df13 58c4df5b 404467e5 b61b9de2 df27461e
+  jobs 2d251fd8 6705b94e 4f830ae6 60cf6f5d 67c2afac 2509791d 7f287a45 0f5d4fc2 cea061d8 81e3142e 373fc70f 072424f8 144994b1 76999919 9c79cf89 49e0c5b7
+  jobs b63dacb2 37833a4d db6d2a15 4ee5dfba 4d0798bc 1c0bda88 b433a87b 2e89f819 f48a57f7 5395d9d2 60fec0d0 3d3887e4 23c3ff76 6c33a124 f2dbc11c 83225fa2
   dealt None
 case [96, 320] @ [320, 288] [Bfp4, Bfp2] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs e7b60fe9 f31c5d3a 5162665e
+  jobs b1b801ac 30119dc6 942b8903
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp4, Bfp2] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs e34ee425 da360f94 39be4dfc fc58a3cf bb4fe720 ba0ae5bd c0dd6e59 93e19091 00bc5de6 884a312b 4a7ed1ea eab588bc e323088d 94b49ef5 387c11d6 11249408
-  jobs e69e04cb bd84f062 93049b09 b931c28e e97f6397 abb292bf c2345f45 1a53f90b f6952ec2 72a4fb50 d1c9156d 9b5d14bd 62c2cd0c adf874dd 8bf79e6a 13523628
-  jobs 0aaed932 c8dc7cfa 906345ff 2d939367 9ab950f3 665b0ef6 cda3486f 2850e83d 92c7da18 d35f14e9 848f3015 5669be3c 0e788904 87e71aa1 284fd7bc c36a4c4a
-  jobs 1cecda96 619dbcef 6fd119bd 8de52736
+  jobs cf9813e8 8faf233c 6eeb3e9b 63eb6254 95a67f1f e0695fea 0aaa1acc 9a921241 91897970 7f526a3b 6970c80b 84f9ae52 346c7ce1 257a50e7 443c0198 fb4192e4
+  jobs cf429fba eb911b94 2fdea90d b8eb7673 bcd4bf44 1cec3efc 6b3747f3 0b54fd78 fdbbd868 0391974f 89dba266 850e756e 475d2324 ffc4250d 307af3f0 20fd07af
+  jobs 30f03f07 0fd6d411 20663220 187e31fc f8aed2db 11cb080f 064ce055 c3794450 30018c40 c3fe3611 8a75cfda 10613e93 a9210579 fb16ce56 33a4a96d f62482ca
+  jobs 8e8ce0e0 57de484e ca4e573f faf105f0
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp2, Fp32] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs a982404a 9200f77f 9a47f390 97238f1d 1387c0a8 4e05cf4f ba078b03 dc86aab1 01991b61 f7afc3d3 eb1dffbc 3f2e6f53 01160b51 08103cc8 0ecf1b50 2d0a3db4
-  jobs 13f34888 5028497b 8397ed69 3c23363b 59e41735 6af28612 bff92da5 6e6dfefe 953fc945 f1ab93d4 5ba03746 f2c98687 6835df6f f3f4c3da 6fa11e49 19dfbbc1
-  jobs 465bbe55 c1b472cd dd6d7a65 bce00290 ed5ab2ca 7da48bc9 ddcf3aaf 3e367813 f9b9f11e 08285c6e 1ac90677 edb1fd72 d86eba9f 91ffaa08 27fdad1a b771c6a4
-  jobs da68ea1a 4b891c48 17c1797f 683c4902 cf4651f3 d32c6806 9a4fe182 fa46ecce 705bf633 bc27f9a1 c19abdf4 e6493a6e adfe5e56 be678dc7 666a9303 4b03c10e
+  jobs 7fc4bd76 eb49518e 44a3b3bf 1d77564f b1aaec58 8c12e352 5bd4dc16 762b5117 971a40ee bca7521a 4fb9b084 641a23cc 746ab292 939f62f8 2a8dcf31 af984875
+  jobs b96bb9c7 f90d26c2 78a1aada 94081aa9 b2b59990 d1925be1 7c817750 eac284e3 1a46c755 514fc9aa 03d6fce3 9a53a6b6 67f627e6 c4c12e11 eb6c8493 9107411e
+  jobs 9de4df80 4c2d5d79 b8f35d4b bfa7d12c c4e5f0b4 80bf9ed1 e88c0b5e 8d66335e 6ab91738 6269a0bd 88b578a1 8ce04083 41c3317c 816e058e 1d4afeb7 3e60ccf7
+  jobs e6f15a42 fa2de1ba d2c226d9 0de82734 aa9045df a5b3a290 85d1a811 f2e2666d ac0e84d7 4205f4c9 30bc701d 2205d1d3 35eb5d06 72cea16f f7871146 ead5b1ef
   dealt None
 case [96, 320] @ [320, 288] [Bfp2, Fp32] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 82c806b9 340d60c2 188bb6dc
+  jobs 34330735 0991ff4c 7ccba843
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp2, Fp32] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs d3af9687 498c84a5 580f1e16 6842feab 49f2c7b4 0eb1e66f 40ff2b10 8cb241ed d2a290c9 32cda345 ed4a3ef4 4a13f8b7 9eb66dfd 931fe7d9 d4e79b6b bf563a45
-  jobs 86d8d27b 628af7b6 a1b797d6 abf4478a 25aa9ab8 7e9c4cab 99f8317a 8cf752f9 2adc57e4 ce40f032 9080c33e 7a9b518f c3e23674 06c2a57e cf667ac7 33f61b44
-  jobs 9dadcd61 6d95fd54 22e45ea6 8921bbf4 5f9e7fc1 e00166d3 795dd959 99de542c 2f481795 8ad2dfc0 7826e269 8d543a93 5ef6af7f 1df5f464 1eaf90ab 13849cba
-  jobs 36654715 09aab6f8 420ac797 fbb1b6bb
+  jobs 4354d9d8 66aba8f2 3bec8ebb b97d4956 b98d3d9b 6def4814 13f839db c8ff5411 50db97e0 6bd8261b 46916099 8098defc 96d4ae32 c390e384 86eb502c 3ad4d4ec
+  jobs 3179c8fa bfef6a32 dffcfaef a231f24f 00cdfccf 565d7543 b7b37c4a 4aed6320 3d1206f9 9a866274 c93409d0 24352f3d 3521bb47 40274b0f 823ec8be b34da837
+  jobs 82cfdfee 85f93c89 dba2fbe0 d964c962 cc4d16a3 6b22e97f 88a21a3a 742561fc b116cb84 cde490d4 0283d4fd 5a6c70f2 0794114d 642b687e 35ac6d4d c562a84b
+  jobs 8e1a9217 a474ff0e 2bf2dec9 b214c1d1
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp2, Bf16] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 83f97c94 534e23ec a67f168a b33b6f2c f617f401 bd31edae 55690c31 63fe0d8e e3de1d97 1137f52a e9960047 c6ab1a64 ff426b60 16b457bb ac0708af ba8ebf5d
-  jobs 2a59a138 6cc11e2e bbba3d57 68d0af42 ba84d2c9 a52536b8 e7ee2c7a e6b595be 3f75169b 694ef0c2 2777c460 113c58dd 44052be1 de0b80bd 339cfae1 97e5e854
-  jobs 6da76663 63e86428 071a7512 fe7c4e2a 7433506f 042d69af c00d6afe 9d062b7b fb0ff6b8 a08e0b0f 51774b43 c2051be2 2bbc64f5 b0fcae5d 940652e0 ea695ca6
-  jobs 90ec8183 86e199d0 6a1ab77d cb191c06 e6f22cb6 73467fcd 548bc7ca f1c230b8 c1819ff5 6a7f8d53 564bba2f 16793c7b 1a9276f7 e224d9e6 03fb86d0 45a1d5f5
+  jobs 17327684 206c4e87 3373e888 79f2bbc7 52ea6cb6 4343f486 92bc01c8 325ae5db 9f00edb4 46b4e5da 746ebf5d 819919a4 91887295 6c6d866f 720f2dd6 e8439bcf
+  jobs ea7ec374 b44830b7 239d7886 a806398d 49185103 f37a177f e6460ce4 ccf1bb81 6977c039 001b7a93 5b61684f fbb7c49b 65d5b46b d501884d 00fb5a7f 9fa72357
+  jobs 6292a954 8df04c41 ec8982b8 b2acbac7 710a8404 568faff9 33e11091 f15422b7 47e3f58c 544a8f01 e83de9fc dbaf42b1 535e65c7 7d13b175 9a7acb78 85d41652
+  jobs 6c36bcd3 c1b62610 463fb597 c07d00af bdc8ce19 2e00317b e7ce4260 e2ae6bcc 86407ed5 b52984f9 df9daca5 e349b2d6 f30a4ae9 daff19df 88ecf508 c2625048
   dealt None
 case [96, 320] @ [320, 288] [Bfp2, Bf16] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 2b2eaa92 354fce44 76d6a7db
+  jobs 2b4e4f73 5a146980 0711a43e
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp2, Bf16] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 87b6bd27 407764ae f69ec0ba c24d4f92 4bb2cb6e e2dfc9c2 234e0443 b960f5be 3a3efc28 1e10396c 03383674 6c6d49c9 a2911416 cc54b764 f81d86b8 616a15c1
-  jobs f11c976e 3336130a 73609194 a8630297 95a52e12 23946ccd 40beae5b 3b3c59a2 e7860820 abf51430 c2d8f6b3 61e22276 8be7c810 8e5f31ed 80095216 3a1d0331
-  jobs d6abc414 24eed971 b7467035 26ab409d 06a98068 9ab15824 34215651 cee9d6ed 7a8ec9c6 98483599 0253248d a237bbb2 1ae93c10 4d96ced2 80e67045 5f884a25
-  jobs 24ace2a6 fa457dd4 04474718 b1cc5e27
+  jobs 4ba87a49 a72ad513 43bb8ede 0d1fca5f ffddf8f7 8d4a64ba 9768e8cd 6b95bfeb c7aad2ec b05caec4 a1e77940 fdfaf7f1 f49e527a c217615c 0c66f2d4 3180408d
+  jobs 3f9967c2 ba1c3284 1c1d29a8 50a90a80 2f874ac9 96fc3377 67ebebfc 52d33ea9 e9cbb5e8 80bb38aa 43ff46c3 baaf9422 df9c7a72 bdfea04d 05b2ca29 13000d27
+  jobs ad50f949 fda51fe4 25087a4e a290b073 1b2d3b43 bb6b1df7 10f177e8 e304ef4e 142f3c29 ff8cfa73 c682215b 3e9a2db3 e79f3a78 f1c68995 a2d7d247 dd8eb250
+  jobs 914a2a2f 84e41ec9 785141ff b03d74f2
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp2, Bfp8] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs 0b64614c a43596db d4954b31 5979afb2 fdc44ceb 818cc3a7 424ede25 1c411889 f413e8b5 2a92da80 4544d4ff 5817ccd3 1c722bcf 96889141 65c6708b 46053cd1
-  jobs fa8f0a49 5b39c507 2c99e0bc fc47e5f7 2a85c942 0562838f 0ed067bc 3cac6399 975abf4d 7a7c8625 a3d5fc44 1cc43f6e 898c92b1 bbf66040 c6dfa8ca d4025bdc
-  jobs c93f898a 1cbf9bc7 f584192c f1220f9f 38f2be66 24be0108 fff507c1 389d97a3 5975b402 4d029016 fe97b98c f6152f7c bb802433 c9d14b97 7ad52ca1 d5f2ac0f
-  jobs d74b3a09 75b4fb65 ef916b83 bb7592a3 1c0e915e e51b68db 5c7aa7e2 bf487573 c1d36f8c 8c41e951 a7a05e81 334a6a22 f07e0e7a b5fac5e9 f854e049 bfb83056
+  jobs 04112da0 dd2a5568 03a20109 8cd5948e 51cdeff2 6d93b300 d6f865c8 4e5cdc0e aa29a7ee 4ec79886 804c9bd9 37907b91 12faaaf7 e5809893 952161fb 46cb10c4
+  jobs 3f817368 8da4ca9f bbf46ee8 41d4d001 b1d93b02 14e34b61 3db9bf1d 07fd2e8d 87c0b842 cf2257f0 ded6f728 f33fc646 296bbbc4 ccbf3add 8905e07f 8ef88286
+  jobs 94ab6f3d c066ef92 0a2d6b03 d3a8f68e f632d06b 2723f1f0 2e99a531 8c734406 3b6c23ec 717b12e3 93692a9a 4df15a72 fb6adca2 1e42b9a4 1527e39b c470ff4c
+  jobs 4756bb8d b9cb94b2 27add9f0 1af49624 d9d608d6 9f526de5 ceffc6ed 0d6c8f20 72073f6e 6794726a 3b163287 c1bf3dd5 4b716446 3aab287c be3a5eda a1d135d5
   dealt None
 case [96, 320] @ [320, 288] [Bfp2, Bfp8] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs fa1ce728 3ae84396 97e04c03
+  jobs 3a5d7fdb 6159e7d0 1992cf76
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp2, Bfp8] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs bbebc337 ce146551 222c6aa4 fdd748c9 6247dcf0 8c2bd80d a72ecfde 2ab70e0a 2c08ecc6 38a92311 d40c1f1a 2a73942d 7cd6aa0c 3834c2de 1a07a59c 3e85614b
-  jobs 422d2980 0450d90f 4adc2e5b 6738bda1 4dfa6c53 f6cf1969 a1de3e71 0b2d5a0c 8e706716 7f7cc479 dc4f2c30 4db61aa9 cefbd546 5cbc4714 cbd1a4a3 8199cacd
-  jobs 7c816257 9fa328fd 84acbbea e29090de 1c58958c cff2be5a 46fa94d7 486205a4 212c10cd 34d6c5a5 366879e1 e06ffc33 514334d9 aab2fa62 13574f9e ca597d68
-  jobs ca4ccc3c 69a1fa26 f2460208 89c98b71
+  jobs 69c1b669 9f4ecb6a 937b1224 f8d09195 63261ba8 2dcaa44c 048d2c15 a7ee6c81 1b8775f5 3e86a640 f1452c4c e62f8c17 bbce2eba 2f44a162 23a58eb4 382480da
+  jobs 012ac51e 320e613a a2d1164c 01584351 5e39c320 abc7ed9c ce306219 f0708200 ef9bf714 c211bf1a 6a725b1e ec4d16ff e4b43fb8 2ffc4f9a fa7181d2 afab784d
+  jobs b647f0a7 95d16432 63e211f6 6d3020ec e26c60c8 bd5cdcfa 656474dd aa9dd93c 2b505035 2ba08922 6869a3b2 f0400e90 470fb333 9a1274d7 8dd46e77 87e6e8ed
+  jobs 68794b88 b89cbacc f8efedba 868036a7
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp2, Bfp4] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs fb64a316 72b24129 cb334346 0b54600a 405d1fdb 6a871836 a8b4596b 1a938244 2a2d17b3 bc3c1c44 a76c6308 d1c49f1a eac89410 b2d27b75 020743ec ecce959f
-  jobs acc246fd 8c6ec73b f148d75d 71eb6425 a9586d0e 621fa8f8 53446ded 21236934 71a3d8d5 10b6230d 026a838f 385ad835 c54bd22d 8e58fbaa 7b7fe57e 607f122f
-  jobs 516bfa22 8a72459c c6e886ab e2b0937d bfdaeda1 856f43b2 9e6abe6c b2dff3ca 27efbebf a1bce221 d109de9d a5ca9b35 db0c572e efb9120b eab70b4f 51e76756
-  jobs 0288b667 34366989 ce0ac436 ec710d34 ce1415c9 cae757f1 bf7ab15a ef430f1d 61daedb8 22b553d8 27f270e5 064a778c a2d91004 14b190d8 90b6c5f2 b5cf8222
+  jobs d9858394 340dea56 64571aa3 250b137d 360b4967 43a7d6b6 443d1a27 02ba3eaf 98de41df 95b3c6e0 0816fbba 478b0e0e 45c6c456 1a009bed 626aa8f0 b0c0848e
+  jobs 00b0ae59 f848e790 58082c42 a96c99a5 188d5187 c9796bbd 7a7847e1 c5c5fa5e 529070d9 d1f5c811 c69d69f8 0165efde 78e509f2 0e7f747a 7e9d290c 61195465
+  jobs 468691e6 0ca17c14 939a8d95 b5145955 eae87709 63dea5fb a966564a 1af30de5 efbf14f3 49bc51da cc8e0a9a 1449f4f0 5c52a93c 2edca3b9 e7762e48 d5b3cb16
+  jobs d27d6523 02027504 50c12be0 1af99735 cbbfe476 2dc52a3f cbbf49b4 b997b42e 3c8f3c18 8593cf02 ff487446 fd1008cd 230e4b42 eb0c086d 66425f93 cc5d6fa8
   dealt None
 case [96, 320] @ [320, 288] [Bfp2, Bfp4] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs 1151cd89 aab12744 a1b4a957
+  jobs dabcbb23 afcb306c dcd63562
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp2, Bfp4] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs b683495a 642ba531 22e9e9ff 9177e91e a0232024 3fb1b007 05d6e8b2 fec833e3 e322254d a872c0a5 bfe976bf 8bc965aa 9155d90a e7605519 228852f5 24ffe8ca
-  jobs b69a4dfb 4998e730 c94fbab6 38f311ad 1f9daac1 5b4be70a 01061b72 a496fb74 1ddccb3b 0b4599c9 c7359ae1 cd55686e a9a07c30 035671ee 6468f7eb ab1bfdeb
-  jobs f239d108 04bd5db5 6c0f138a 5fe4c2eb a086f477 eb9ddc2f 7c029595 d36797e4 ad51fbe8 4a29f28a 377f66ec aa446f39 25ff6ab2 2aa49b59 e2058776 fb50ab0c
-  jobs ff3b3990 1699438b 0a4c47a5 ade4adfc
+  jobs c7388e56 1dcc308b 3ec6ca2b 1bcc00ac 939620f6 7c336848 cb14339b 0d5825b1 d66ba08b db3ee535 1fb2c9b0 29738a9f 90fe884f e3d75cd5 c05b321d 39dc7ed5
+  jobs b94268f9 0675c3cf e706abdb fc1046ef 7927531b 7c47556a 7036a3ed 8a103020 481c390e 224dbeb1 979b111c 67bbeff8 a1d88781 311ccde5 2ddc7987 659c5264
+  jobs b7ec8d0a 6cd711de 60d69fa4 2a6a3c14 6f11a076 f1f1a764 9e998c4a b8888dc4 094261d4 069071d3 85cd9b35 568112d9 a9f93077 745d8871 99ccfb62 1e3ac9f0
+  jobs 7768645c 5b627c0b ad644c4c 95744c39
   dealt None
 case [1, 2048] @ [2048, 2048] [Bfp2, Bfp2] units 64 spread 64 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360, 2167360]] jobs 64
-  jobs e617910c 828c9113 559cf4e2 821d8bc2 e2b9577f 37c3a9d1 1b331c1a 9accd111 4be44da5 d455ce9e 00acebdf d38c9c12 5870d5b6 6c76e050 7e6d9e82 c955f9b7
-  jobs 21333c51 c675b7f3 b731fa4e 81251bf9 7361d906 a59b6b5a 61dcdf6d 7f5e4afb 2b6054ae 9c85de42 d3384503 6ebe13d6 40f51a01 3a241cc7 411dc1d9 b7c8c4ee
-  jobs bc578844 54018c33 ba793911 7332e926 d26c0a57 b8ec8eaf dc143a88 eb9320ca da1cc65c ac8f2d11 5f97f271 8350c4d8 db24763c a1bbe999 c48e0880 39186d87
-  jobs 020eef79 015bb604 06a7652f 9ef1e7be af7ead5a 80b0dbde d508e111 9c276cf5 65dd29f3 f64b34ff b7d60d0b 1ab6c591 6f5d9680 1a736dcb 82d4bf34 518000da
+  jobs 8c23cc2e 656a43aa 32324934 7012c5f4 58c79a4a 47cb7aca 71bccac5 223da51e 0b7e03b1 309a1d41 7f2e95ae 7e433097 ee9c04f2 8ea30f95 2948ba4f 0fcdb251
+  jobs 59b68e0b 2cd6b032 484bcd26 caf9fbdd cdebbe95 758a9a0b b30e5cbd 3100bd32 0f241160 cb26542f f055c6a9 e520e3c8 260c1920 6be1698d 16c420de 756b7992
+  jobs 9357c4a3 8391a6ba a6dddf91 9bba66bd 4928cb97 b87dcf51 58974b29 a7f53067 72b79f2c 43c4bd89 a39ace19 badd3b0a 357f7c4c 49c594c3 d9b8b80e 8b68e576
+  jobs fe8e390b 6014a3eb 5380d2c0 949339a6 c7ec8b47 6e244623 901f6c45 291c3c44 89b2d7f1 00578827 e69ab6ee 706fd45d a53e49d4 a750bc68 3aacb156 83e06695
   dealt None
 case [96, 320] @ [320, 288] [Bfp2, Bfp2] units 3 spread 3 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 96x288 F32 at [[8, 1985229328, 0, 9, 0, 0, 0, 0], [70720, 70720, 70720, 70720, 70720, 70720, 70720, 70720]] jobs 3
-  jobs da3b2254 fb8765af ff76baf4
+  jobs 3a8e30cb 587512ad 02b8a85d
   dealt None
 case [1024, 2048] @ [2048, 2048] [Bfp2, Bfp2] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   out 1024x2048 F32 at [[8, 1985229328, 0, 64, 0, 0, 0, 0], [3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040, 3199040]] jobs 52
-  jobs 11c515b5 3e286df7 c549ce95 adc491aa 0991b21b 7c942ab0 0fec48b6 cb415120 edae1f6d f02048b1 09bd40e1 39cea239 bb4bdef5 7eba5546 51f32b60 b2c2352f
-  jobs 87f8481a 2de32d0d cdfe901f 73299a52 58f80636 f61d05fa 37ef9627 0273753d 28c062da abd09795 a2dc6cfd 9d7a070b 4f611321 4cdad2c2 d50a7133 fffb2fc9
-  jobs 8ad1dd39 58a1c569 b4cf3a01 64b2cb92 6379e710 b2e3726c 558e0087 5e05a6e7 b507ff4e 498b6c85 cbb064ca 8d0658b6 bac3e33a 1268677b 0a8f0fd4 2a1c6c75
-  jobs d9c161d2 4b64a2e0 2339c0d8 733446e9
+  jobs 82d49f33 744f5a6d d2d7c223 b9a4fe70 16ff0023 96dcc367 4dff0707 92b12320 e50e488c c668e62d dd0bccd3 3e9a0794 8013931f 4417baf4 949fa905 7bcca2bf
+  jobs 17803b61 f9d78185 92e9ef69 eccd3d41 34c3423e d929e8bc 3bdebec9 944313db ed0a92ce 4a6c8595 d4b08a54 d9c056e5 733657e8 f2a69892 b6ba7c58 16d28d4b
+  jobs 0cbf4c6a 1cb05786 e52c52d3 0ad01337 9ee11b3e 5a798cc3 27a9809f 386f12e5 493f369d 7af63c5b 8ead389c 45188011 51f909f1 5abccafc 7a310381 9873ae3c
+  jobs 47f2a807 42d89d68 118dfd02 84a31712
   dealt None

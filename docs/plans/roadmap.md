@@ -75,20 +75,15 @@ In order; W1-W4 can overlap. Each item's prediction, kill criterion and gate are
 **Bounded 2026-11-09** ([log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1); achievements):
 - BFP8 weights alone take the 1.7B's step 9.83 -> 7.51 ms, so the 8.0 ms kill (on the predicted step) does not fire.
 - Fidelity moves nothing at `m` = 1.
-- A BF16 `A` is slower until the `SrcB` box and the one-row box below land.
+- A BF16 `A` was slower until a packed tile ran whole in `SrcB`; at `m` = 1 it still is until the one-row box below lands.
 
-BFP8 weights are the inference default since 2026-11-10, behind the contract switch and the model gate `step269` (achievements). The next three boxes run in this order.
-- [ ] **A packed tile whole in `SrcB`.**
-  - A BF16 or BFP `A` takes the faces pair order today (`TileFormat::whole_tile_unpack` licenses `SrcA` only). Prefill at HiFi4 runs 1.4-2.0x slower than with an FP32 `A`.
-  - Measure it on ttsim, then in an isolated card-0 gate (the `PairOrder::SrcBWhole`/`Tiles` probes), and extend `whole_tile_unpack`.
-  - Predicted: a BF16 `A` at the FP32 `A`'s rate or better at every fidelity.
-  - Kill if a whole packed tile in `SrcB` is not bit for bit on silicon.
+BFP8 weights are the inference default since 2026-11-10, behind the contract switch and the model gate `step269` (achievements). A packed tile whole in `SrcB` landed the same day (achievements): a BF16 `A`'s prefill products 1.13-1.32x the FP32 `A`'s. The next two boxes run in this order.
 - [ ] **The one-row path for a BF16 `A`.**
   - `packed_thin_a` and the weight prefetch (`weight_prefetch` needs `packed_a`) take only an FP32 row today. A BF16 row reads its `K / 32` tiles an entry each on every unit: decode products 1.4x slower (`down` 184 us whatever `B` is).
   - Pack a BF16 row and prefetch beside it.
   - Predicted: at least the FP32 row's step with half its bytes.
-- [ ] **Packer L1 accumulation, after the `SrcB` box.**
-  - Ceiling: up to 24% of a product under a packed `A`, 0-1.5% under an FP32 `A` (`matmul::probe_skip_reload`).
+- [ ] **Packer L1 accumulation: below the 3% rule now; the owner decides whether it moves to failed-approaches.**
+  - Ceiling with a packed `A` whole in `SrcB` (2026-11-10): at most 2.5% of a product, none on the 1.7B's 512-row chunk (`matmul::probe_skip_reload`; [log](../learnings/performance-log.md#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0)). It was up to 24% only while a packed `A` took faces.
   - Needs a ttsim check of `Pack_L1_Acc` (else an isolated silicon gate and a divergence entry), the partial format stated, and a spec model.
   - Delete `probe_skip_reload` when it lands or is killed.
 - [ ] **Native BF16 arithmetic:**

@@ -513,6 +513,23 @@ fn skip_reload() -> bool {
     PROBE_SKIP_RELOAD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A negative control only (`step241::a_half_whole_srcb_unpack_is_another_product`, roadmap W1):
+/// an order that holds `A` whole in `SrcB` unpacks only its first face row (512 datums) even where
+/// both are live, so `SrcB` rows 32-63 keep whatever they held and the second face row's outputs
+/// are **wrong**. It shows a gate's forced order takes the whole `SrcB` unpack. Process-wide, set
+/// before any product's programs are built (the program caches do not key on it).
+static PROBE_HALF_WHOLE_SRCB: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn probe_half_whole_srcb(on: bool) {
+    PROBE_HALF_WHOLE_SRCB.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn half_whole_srcb() -> bool {
+    PROBE_HALF_WHOLE_SRCB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Point both unpackers at a new pair of tile images, between `UNPACR`s.
 ///
 /// `REG3_Base_address` is sampled by the unpacker, so the previous unpack on
@@ -2288,10 +2305,10 @@ pub enum PairOrder {
     /// The same unpacks, each `SrcB` half's phases interleaved with the other half's: two
     /// blocks between a block's `MVMUL`s rather than none.
     PhasesOuter,
-    /// [`PairOrder::Tiles`] for the routes its probes covered on silicon (`A` FP32 through TF32,
-    /// `B` FP32 through TF32 or BF16 through BF16), else [`PairOrder::Faces`]. The tiles kernel is
-    /// ~1.4-1.9x the faces kernel alone, and the 1.7B's prefill 7-14% faster (card 1,
-    /// `docs/plans/prefill-operand-reuse.md` P4).
+    /// [`PairOrder::Tiles`] where both operands' unpacks are measured whole on silicon
+    /// ([`TileFormat::whole_tile_unpack`]: FP32 through TF32, and BF16 or BFP as it is, in either
+    /// `Src`), else [`PairOrder::Faces`]. The tiles kernel is ~1.4-1.9x the faces kernel alone, and
+    /// the 1.7B's prefill 7-14% faster (card 1, `docs/plans/prefill-operand-reuse.md` P4).
     Auto,
     /// `B`'s whole tile in `SrcA` rows 0-63 (one 1,024-datum unpack, each face once a pair),
     /// `A`'s faces one at a time in `SrcB`: five unpacks a pair, four `Dst` blocks between a
@@ -2677,9 +2694,10 @@ fn whole_pair_code(
         .unwrap()
     };
     let mut adc = Vec::new();
+    let a_face_rows = if half_whole_srcb() { 1 } else { n_fi };
     for (u, whole, datums) in [
         (Unpacker::SrcA, a_whole, 4 * FACE_DATUMS),
-        (Unpacker::SrcB, b_whole, 2 * n_fi * FACE_DATUMS),
+        (Unpacker::SrcB, b_whole, 2 * a_face_rows * FACE_DATUMS),
     ] {
         if whole {
             adc.push(crate::datapath::set_adc_x(u, 0, datums - 1));
@@ -4613,8 +4631,9 @@ pub(crate) mod order;
 #[cfg(test)]
 mod tests {
     /// [`PairOrder::Auto`] holds both tiles whole exactly where each operand's unpack is measured
-    /// whole ([`TileFormat::whole_tile_unpack`]): the routes P4 licensed as before, and a packed
-    /// BFP weight beside TF32 since H7; a BF16 or BFP `A` in `SrcB` is not measured.
+    /// whole ([`TileFormat::whole_tile_unpack`]): the routes P4 licensed as before, a packed
+    /// BFP weight beside TF32 since H7, and a BF16 or BFP `A` in `SrcB` since roadmap W1; FP32 cut
+    /// to BF16 is not measured.
     /// The phases each pair of edge formats needs for every mantissa bit (H3): FP32 beside FP32
     /// keeps all four (TF32 in `SrcA` has a bit no phase takes); fewer bits in an edge, fewer phases.
     #[test]
@@ -4671,10 +4690,25 @@ mod tests {
             (SrcRoute::tf32_with_b(TileFormat::BFP4), PairOrder::Tiles),
             (SrcRoute::tf32_with_b(TileFormat::BFP2), PairOrder::Tiles),
             (SrcRoute::Bf16FromFp32, PairOrder::Faces),
-            (SrcRoute::Bf16FromBf16, PairOrder::Faces),
-            (SrcRoute::Bfp(crate::bfp::BfpFormat::Bfp8), PairOrder::Faces),
+            (SrcRoute::Bf16FromBf16, PairOrder::Tiles),
+            (SrcRoute::Bfp(crate::bfp::BfpFormat::Bfp8), PairOrder::Tiles),
+            (SrcRoute::Bfp(crate::bfp::BfpFormat::Bfp4), PairOrder::Tiles),
         ] {
             assert_eq!(auto(route), want, "{route:?}");
+        }
+        // Every pair of edge formats takes both tiles whole.
+        let all = [
+            TileFormat::FP32,
+            TileFormat::BF16,
+            TileFormat::BFP8,
+            TileFormat::BFP4,
+            TileFormat::BFP2,
+        ];
+        for a in all {
+            for b in all {
+                let route = SrcRoute::edges(a, b).unwrap();
+                assert_eq!(auto(route), PairOrder::Tiles, "{a:?} x {b:?}");
+            }
         }
     }
 

@@ -18,14 +18,20 @@
 //! - A BF16 operand whose padding is not known to be zero is repaired before it is read
 //!   (`Session::meet`), and gives the same bits.
 //!
+//! - **A packed `A`'s tile whole in `SrcB`** (roadmap W1): with `A` BF16 (laid as a weight or
+//!   interleaved as an activation) or BFP, the orders that hold it whole (`PairOrder::SrcBWhole`,
+//!   `PairOrder::Tiles`) give the decoded product at HiFi4 and at the pair's full-precision phases,
+//!   and the faces order's bits at HiFi2 and LoFi, beside every `B`, on every path.
+//!
 //! Controls: a packed operand's raw FP32 values give another product; a transposed packed `A` is
-//! refused.
+//! refused; `A` whole in `SrcB` with only its first face row unpacked
+//! (`matmul::probe_half_whole_srcb`) gives another product, and the faces order is untouched by it.
 //!
 //! BFP2 runs on silicon only (ttsim refuses its `Src` format); BF16 tiles are made on the host on
 //! ttsim (it refuses the packer's BF16 narrowing).
 use tt_isa::format::TileFormat;
 use tt_kernels::bfp::BfpFormat;
-use tt_kernels::matmul::{Fidelity, SrcRoute};
+use tt_kernels::matmul::{set_pair_order, Fidelity, PairOrder, SrcRoute};
 use tt_kernels::session::{Session, Spread, TileChoice};
 use tt_kernels::tensor::{BlockStream, DramTensor, Pad};
 use tt_ttsim::fork_scope;
@@ -444,6 +450,198 @@ fn a_skipped_reload_completes_and_is_another_product() {
             s.set_matmul_k_block_limit(None);
             s.set_block_stream(BlockStream::Auto);
             for t in [a, b] {
+                s.free(t).unwrap();
+            }
+        }
+    });
+}
+
+/// `vals` rounded to BF16 and uploaded interleaved, as an activation lies
+/// (`Session::upload_bf16`), and the FP32 tensor of its values.
+fn bf16_activation<T: tt_device::Transport>(
+    s: &mut Session<T>,
+    vals: &[f32],
+    rows: usize,
+    cols: usize,
+) -> (DramTensor, DramTensor) {
+    let rounded: Vec<f32> = vals.iter().map(|&v| bf16(v)).collect();
+    let bits: Vec<u16> = rounded.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+    (
+        DramTensor::from_bf16(s.upload_bf16(&bits, rows, cols).unwrap(), Pad::Zero),
+        s.upload(&rounded, rows, cols).unwrap(),
+    )
+}
+
+/// Specials (signed zeros, subnormals, wide binades) kept in range: no product overflows FP32,
+/// so the full-precision phases are HiFi4's bits (H3's boundary, above).
+fn in_range(seed: u64, n: usize) -> Vec<f32> {
+    specials(seed, n)
+        .into_iter()
+        .map(|x| {
+            if x.abs() > 1.0 {
+                x.signum() * 1.0e15
+            } else {
+                x
+            }
+        })
+        .collect()
+}
+
+/// Roadmap W1, "a packed tile whole in `SrcB`": a packed `A` (BF16 laid as a weight or as an
+/// activation, BFP8/4, BFP2 on silicon) held whole in `SrcB` (`PairOrder::SrcBWhole`, and with `B`
+/// whole too, `PairOrder::Tiles`) beside every `B`:
+/// - the product of the decoded values (FP32, `PairOrder::Auto`) at HiFi4 and at the pair's
+///   full-precision phases;
+/// - the faces order's bits at HiFi2 and LoFi, where the product is no longer the FP32 one;
+///
+/// on every path a product takes, and on sixteen rows (one face row live in a tile's second
+/// half) and one (the 512-datum unpack).
+#[test]
+fn whole_tile_orders_give_every_packed_a_its_bits() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        let mut cases = CASES.to_vec();
+        cases.push((16, 256, 96, None, BlockStream::Off, "sixteen rows"));
+        let mut kinds: Vec<(TileFormat, bool)> = vec![(TileFormat::BF16, true)];
+        kinds.extend(
+            formats()
+                .into_iter()
+                .filter(|&f| f != TileFormat::FP32)
+                .map(|f| (f, false)),
+        );
+        let orders = [PairOrder::SrcBWhole, PairOrder::Tiles];
+        for (fa, activation) in kinds {
+            for fb in formats() {
+                let full = SrcRoute::edges(fa, fb).unwrap().full_precision();
+                for (seed, &(m, k, n, limit, block, what)) in cases.iter().enumerate() {
+                    let what = format!(
+                        "{:?}{} x {:?}, {what}",
+                        fa.l1(),
+                        if activation { " activation" } else { "" },
+                        fb.l1()
+                    );
+                    let seed = seed as u64;
+                    let av = in_range(700 + seed, m * k);
+                    let (a, da) = if activation {
+                        bf16_activation(s, &av, m, k)
+                    } else {
+                        operand(s, fa, &av, m, k)
+                    };
+                    let (b, db) = operand(s, fb, &in_range(800 + seed, k * n), k, n);
+                    s.set_matmul_k_block_limit(limit.and_then(std::num::NonZeroUsize::new));
+                    s.set_block_stream(block);
+                    let loops: &[bool] = match block {
+                        BlockStream::Off => &[true],
+                        _ => &[true, false],
+                    };
+                    for &looped in loops {
+                        tt_kernels::matmul::set_block_loops(looped);
+                        set_pair_order(PairOrder::Auto);
+                        let want = mm(s, &da, &db, Fidelity::HiFi4);
+                        let want_v = s.download(&want).unwrap();
+                        s.free(want).unwrap();
+                        assert!(want_v.iter().any(|&v| v != 0.0), "{what}: an empty product");
+                        let mut fidelities = vec![Fidelity::HiFi4];
+                        if full != Fidelity::HiFi4 {
+                            fidelities.push(full);
+                        }
+                        for order in orders {
+                            set_pair_order(order);
+                            for &fidelity in &fidelities {
+                                let got = mm(s, &a, &b, fidelity);
+                                assert_bits(
+                                    &format!("{what}, looped {looped}, {order:?}, {fidelity:?}"),
+                                    &s.download(&got).unwrap(),
+                                    &want_v,
+                                );
+                                s.free(got).unwrap();
+                            }
+                        }
+                        for fidelity in [Fidelity::HiFi2, Fidelity::Lo] {
+                            set_pair_order(PairOrder::Faces);
+                            let faces = mm(s, &a, &b, fidelity);
+                            let faces_v = s.download(&faces).unwrap();
+                            s.free(faces).unwrap();
+                            for order in orders {
+                                set_pair_order(order);
+                                let got = mm(s, &a, &b, fidelity);
+                                assert_bits(
+                                    &format!(
+                                        "{what}, looped {looped}, {order:?}, {fidelity:?} against faces"
+                                    ),
+                                    &s.download(&got).unwrap(),
+                                    &faces_v,
+                                );
+                                s.free(got).unwrap();
+                            }
+                        }
+                    }
+                    set_pair_order(PairOrder::Auto);
+                    tt_kernels::matmul::set_block_loops(true);
+                    for t in [a, da, b, db] {
+                        s.free(t).unwrap();
+                    }
+                }
+                s.set_matmul_k_block_limit(None);
+                s.set_block_stream(BlockStream::Auto);
+            }
+        }
+    });
+}
+
+/// The control for the gate above: with `matmul::probe_half_whole_srcb` an order that holds `A`
+/// whole in `SrcB` unpacks only its first face row, so a tile's rows 16-31 take stale `SrcB` rows
+/// and the product differs from the exact one (small integers) in many outputs; the faces order, which never
+/// unpacks `A` whole, is untouched. So the gate's forced orders do take the whole `SrcB` unpack.
+/// Set in the forked child before its session builds any program (the hook is read when programs
+/// are built).
+#[test]
+fn a_half_whole_srcb_unpack_is_another_product() {
+    with_session(|s| {
+        tt_kernels::matmul::probe_half_whole_srcb(true);
+        s.set_spread(Spread::Fixed(4));
+        let (m, k, n) = (64, 256, 96);
+        let ints = |len: usize, seed: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i * 7 + seed) % 5) as f32 - 2.0)
+                .collect()
+        };
+        let (av, bv) = (ints(m * k, 1), ints(k * n, 3));
+        // The host's exact sums (the hook would cut an FP32 `A` held whole as well).
+        let want_v: Vec<f32> = (0..m * n)
+            .map(|e| {
+                let (i, j) = (e / n, e % n);
+                (0..k).map(|q| av[i * k + q] * bv[q * n + j]).sum()
+            })
+            .collect();
+        for fa in [TileFormat::BF16, TileFormat::BFP8] {
+            let (a, da) = operand(s, fa, &av, m, k);
+            let (b, db) = operand(s, TileFormat::BF16, &bv, k, n);
+            for order in [PairOrder::Faces, PairOrder::SrcBWhole, PairOrder::Tiles] {
+                set_pair_order(order);
+                let got = mm(s, &a, &b, Fidelity::HiFi4);
+                let got_v = s.download(&got).unwrap();
+                s.free(got).unwrap();
+                let differ = got_v
+                    .iter()
+                    .zip(&want_v)
+                    .filter(|(g, w)| g.to_bits() != w.to_bits())
+                    .count();
+                if order == PairOrder::Faces {
+                    assert_eq!(
+                        differ, 0,
+                        "{fa:?}: the faces order does not unpack `A` whole"
+                    );
+                } else {
+                    assert!(
+                        differ >= m * n / 4,
+                        "{fa:?}, {order:?}: only {differ} of {} outputs differ",
+                        m * n
+                    );
+                }
+            }
+            set_pair_order(PairOrder::Auto);
+            for t in [a, da, b, db] {
                 s.free(t).unwrap();
             }
         }

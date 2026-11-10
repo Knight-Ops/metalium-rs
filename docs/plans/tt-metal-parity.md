@@ -269,6 +269,7 @@ They run in this order; W1-W4 can overlap.
   - **H13 killed** (0.94x on the 512-row chunk).
   - **Packer L1 accumulation's ceiling** is up to 24% of a product, only under a packed `A`.
   - **The order of the rest follows:** BFP8 weights (no new kernel); then a packed tile whole in `SrcB` and the one-row path for a BF16 row; then BF16 activations; then packer L1 accumulation.
+- **A packed tile whole in `SrcB` (2026-11-10,** card 0; [log](../learnings/performance-log.md#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0)): bit for bit, licensed. A BF16 `A`'s prefill products at HiFi4 29-70 TFLOPS, 1.13-1.32x the FP32 `A`; at BF16-HiFi2 >= 60 on two of seven shapes. H13's chunk 1.27x (1.34x with BFP8). Packer L1 accumulation's ceiling falls to <= 2.5%, below the 3% rule.
 - **First box landed (2026-11-10;** [log](../learnings/performance-log.md#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1)):
   - **The switch:** `burn_tt::Numerics`, recorded in traces.
   - **The default:** tt-models' `for_inference` stores BFP8 weights under the performance contract.

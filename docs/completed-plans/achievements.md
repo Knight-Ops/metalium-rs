@@ -273,6 +273,17 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
     unfused (`1794286677`). `fuse` now drops the parts: 399.0 MB (`1794286904`, gate
     `step240::a_fused_stored_model_holds_each_weight_once`).
 
+- **W1: a packed tile whole in `SrcB`** (2026-11-10, card 0;
+  [log](../learnings/performance-log.md#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0)).
+  - A BF16 (as a weight or an activation), BFP8, BFP4 or BFP2 `A` unpacked whole into `SrcB`, its first face row alone
+    where only that is live: bit for bit the faces order on ttsim and card 0 (`probe_pair_src_rows`,
+    `step241::whole_tile_orders_give_every_packed_a_its_bits` with its control `probe_half_whole_srcb`;
+    `1794328961`-`1794328978`). `TileFormat::whole_tile_unpack` licenses it; `PairOrder::Auto` holds both tiles whole
+    for every pair of edge formats. No default path changed (FP32-`A` programs word for word the same).
+  - A BF16 `A`'s prefill products at HiFi4 22-30 -> **29-70 TFLOPS**, 1.13-1.32x the FP32 `A` (it was 0.51-0.96x);
+    fidelity no longer moves them, `A`'s gathers bind instead. H13's chunk 1.27x the reference (1.34x with BFP8
+    weights), so its kill no longer fires; packer L1 accumulation's ceiling falls to at most 2.5% of a product.
+
 ## Prefill and long context
 
 Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-context.md](../plans/long-context.md).

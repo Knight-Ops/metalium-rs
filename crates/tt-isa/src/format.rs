@@ -178,22 +178,20 @@ impl TileFormat {
     /// - FP32 as TF32, into either `Src`, and BF16 into `SrcA` (`docs/plans/prefill-operand-reuse.md`
     ///   P4, card 1);
     /// - BFP8, BFP4 and BFP2 into `SrcA`, hypothesis H7 of `docs/learnings/dataflow-compiler.md`
-    ///   (`step239`, ttsim and card 0 `1793160473`).
+    ///   (`step239`, ttsim and card 0 `1793160473`);
+    /// - BF16, BFP8, BFP4 and BFP2 into `SrcB` (a packed `A`, roadmap W1), the whole tile or its
+    ///   first face row alone (`step241::whole_tile_orders_give_every_packed_a_its_bits` and its
+    ///   control, `probe_pair_src_rows`; ttsim, and card 0 `1794328961`-`1794328978`).
     ///
     /// BF16 and the block floats are moved into `Src` as they are, so either e8 type names the same
-    /// conversion. The rest are unmeasured, not refused by the hardware: a schedule takes the face
-    /// order there.
-    pub const fn whole_tile_unpack(self, to: SrcType, src: Src) -> bool {
+    /// conversion. The rest (FP32 cut to BF16, the FP16-type formats) are unmeasured, not refused
+    /// by the hardware: a schedule takes the face order there.
+    pub const fn whole_tile_unpack(self, to: SrcType, _src: Src) -> bool {
         use L1Format as F;
         use SrcType as S;
         matches!(
-            (self.l1, to, src),
-            (F::Fp32, S::Tf32, _)
-                | (
-                    F::Bf16 | F::Bfp8 | F::Bfp4 | F::Bfp2,
-                    S::Tf32 | S::Bf16,
-                    Src::A
-                )
+            (self.l1, to),
+            (F::Fp32, S::Tf32) | (F::Bf16 | F::Bfp8 | F::Bfp4 | F::Bfp2, S::Tf32 | S::Bf16)
         )
     }
 
