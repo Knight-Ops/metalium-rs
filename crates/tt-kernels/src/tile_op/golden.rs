@@ -551,6 +551,7 @@ fn session_reads() -> Reads {
         prefetch_units: [crate::session::PREFETCH_UNITS; 2],
         block_stream: BlockStream::Auto,
         reuse: tensor::Reuse::Off,
+        out: crate::matmul::Out::Fp32,
     }
 }
 

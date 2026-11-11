@@ -81,9 +81,10 @@ pub fn eltwise(
     };
     let ct = a.grid()[1];
     let out_elem = tensor::result_elem(op.kind, formats);
-    if let (Some(_), false) = (twin, out_elem == tensor::Elem::F32) {
+    if let Some(twin) = twin.filter(|t| t.elem != out_elem) {
         return Err(TensorError::Shape(format!(
-            "a packed twin for a {out_elem:?} result"
+            "a packed {:?} twin for a {out_elem:?} result",
+            twin.elem
         )));
     }
     if let Some(twin) = twin {

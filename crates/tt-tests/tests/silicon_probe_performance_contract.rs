@@ -217,8 +217,28 @@ fn operand(
 }
 
 fn product(s: &mut Card, a: &DramTensor, b: &DramTensor, fidelity: Fidelity) -> DramTensor {
-    s.matmul_dram(a, false, b, false, SrcRoute::Tf32FromFp32, fidelity, BUDGET)
-        .unwrap_or_else(|e| panic!("{e}"))
+    product_as(s, a, b, fidelity, tt_kernels::tensor::Elem::F32)
+}
+
+/// [`product`] with a result of `out` (F32, or BF16: roadmap W1, native BF16 arithmetic).
+fn product_as(
+    s: &mut Card,
+    a: &DramTensor,
+    b: &DramTensor,
+    fidelity: Fidelity,
+    out: tt_kernels::tensor::Elem,
+) -> DramTensor {
+    s.matmul_dram_as(
+        a,
+        false,
+        b,
+        false,
+        SrcRoute::Tf32FromFp32,
+        fidelity,
+        BUDGET,
+        out,
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The output elements a check reads: every row up to 32, then a stride; columns a stride, and
@@ -494,19 +514,25 @@ fn prefill(skip_reload: bool) {
                 );
                 let (a, a_dec) = operand(&mut s, fa, false, &av, m, k);
                 let (b, b_dec) = operand(&mut s, fb, true, &bv, k, n);
-                let variants: &[(bool, &str)] = if skip_reload {
-                    &[(false, ", without the reload")]
+                use tt_kernels::tensor::Elem;
+                // A BF16 result (roadmap W1): each output rounded in `Dst`, packed as BF16.
+                let variants: &[(bool, Elem, &str)] = if skip_reload {
+                    &[(false, Elem::F32, ", without the reload")]
                 } else {
-                    &[(false, ""), (true, ", without A's gathers")]
+                    &[
+                        (false, Elem::F32, ""),
+                        (true, Elem::F32, ", without A's gathers"),
+                        (false, Elem::BF16, ", a BF16 result"),
+                    ]
                 };
-                for &(skip_a, variant) in variants {
+                for &(skip_a, out, variant) in variants {
                     tt_kernels::tensor::probe_skip_a_reads(skip_a);
                     let mut outs = Vec::new();
                     let us = trace_slope_us(&mut s, PREFILL_REPS, 1, SAMPLES, |s| {
-                        outs.push(product(s, &a, &b, fidelity))
+                        outs.push(product_as(s, &a, &b, fidelity, out))
                     });
                     tt_kernels::tensor::probe_skip_a_reads(false);
-                    if !skip_a && !skip_reload {
+                    if !skip_a && !skip_reload && out == Elem::F32 {
                         let got = s.download(outs.last().unwrap()).unwrap();
                         check_exact(&what, &got, &a_dec, &b_dec, [m, k, n]);
                     }

@@ -8628,8 +8628,47 @@ impl<T: Transport> Session<T> {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<DramTensor, TensorError> {
+        self.matmul_dram_as(
+            a,
+            a_transposed,
+            b,
+            b_transposed,
+            route,
+            fidelity,
+            budget,
+            tensor::Elem::F32,
+        )
+    }
+
+    /// [`Session::matmul_dram`] with a result of `out`: F32, or BF16 (roadmap W1, native BF16
+    /// arithmetic) -- each output tile rounded once its `K` chain is done, by the compress's
+    /// quantize, and packed as BF16, bit for bit `bf16_from_f32` of the F32 product
+    /// (`tile_op::matmul()`). A BF16 result has no K-blocked schedule and no packed twin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_dram_as(
+        &mut self,
+        a: &DramTensor,
+        a_transposed: bool,
+        b: &DramTensor,
+        b_transposed: bool,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        out_elem: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         use tt_isa::format::TileFormat;
+        let out = match out_elem {
+            tensor::Elem::F32 => crate::matmul::Out::Fp32,
+            tensor::Elem::BF16 => tensor::bf16_result(),
+            other => {
+                return Err(TensorError::Elem {
+                    op: "a matmul's result".into(),
+                    got: other,
+                    wants: tensor::Elem::F32,
+                })
+            }
+        };
         // Before any padding fill: an integer tensor is refused untouched.
         for t in [a, b] {
             if matches!(t.elem, tensor::Elem::I32 | tensor::Elem::Bool) {
@@ -8674,8 +8713,16 @@ impl<T: Transport> Session<T> {
         // transpose and physically packed BF16 remain raw-copy operations.
         if b_transposed && [b.rows, b.cols] == [16, 16] && route == SrcRoute::Tf32FromFp32 {
             let prepared = self.transpose_src_block(b, route)?;
-            let result =
-                self.matmul_dram(a, a_transposed, &prepared, false, route, fidelity, budget);
+            let result = self.matmul_dram_as(
+                a,
+                a_transposed,
+                &prepared,
+                false,
+                route,
+                fidelity,
+                budget,
+                out_elem,
+            );
             let _ = self.free(prepared);
             return result;
         }
@@ -8765,9 +8812,11 @@ impl<T: Transport> Session<T> {
             && matches!(route, SrcRoute::Tf32FromFp32 | SrcRoute::Edges { .. });
         // The op that made `A` may have packed it already (`Session::set_packed_twins`): an F32
         // row only, which is what a twin is.
-        let twin = (packs && a.elem == tensor::Elem::F32)
+        // A BF16 row's twin is BF16 too (roadmap W1).
+        let twin = packs
             .then(|| self.packed_twin(a).cloned())
-            .flatten();
+            .flatten()
+            .filter(|t| t.elem == a.elem);
         let packed = if packs && twin.is_none() {
             // On the product's own units: the rest stay out of the op (a unit that sits out ops
             // is free for other work, `decode-to-bandwidth.md` Phase 5).
@@ -8903,7 +8952,7 @@ impl<T: Transport> Session<T> {
         // does ([`Session::set_packed_twins`]): the norm after a residual sum reads it.
         let n = if b_transposed { b.rows } else { b.cols };
         let out_twin = if m == 1 && n % 32 == 0 {
-            self.new_twin(1, n, tensor::Elem::F32)?
+            self.new_twin(1, n, crate::tile_op::matmul::result_elem(out))?
         } else {
             None
         };
@@ -8937,6 +8986,7 @@ impl<T: Transport> Session<T> {
                         prefetch_units,
                         block_stream,
                         reuse,
+                        out,
                     },
                     &prefetch,
                     spread,
@@ -9578,12 +9628,13 @@ impl<T: Transport> Session<T> {
             && rows == 1
             && cols % 32 == 0
             && cols / 32 >= PACKED_A_K_TILES
-            && elem == tensor::Elem::F32)
+            && matches!(elem, tensor::Elem::F32 | tensor::Elem::BF16))
         {
             return Ok(None);
         }
-        let twin = DramTensor::alloc(&mut self.dram_state()?.alloc, cols / 32, 32)?;
-        twin.set_pad(tensor::Pad::Undefined);
+        // A BF16 row's twin as `tensor::pack_row` lays one: BF16 face rows in FP32-sized slots,
+        // which a product's packed `A` reads (roadmap W1).
+        let twin = tensor::packed_row_tensor(&mut self.dram_state()?.alloc, cols / 32, elem)?;
         Ok(Some(twin))
     }
 

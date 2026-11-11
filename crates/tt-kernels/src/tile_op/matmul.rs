@@ -65,7 +65,11 @@ pub enum Schedule {
 
 /// `op(A) @ op(B)` of `[m, k] @ [k, n]` (after the transposes) as a [`TileOp`] under `schedule`;
 /// `unpack_b`: a transposed `B` is transposed by the unpacker, read as it lies; `packed`, a
-/// one-row `A` also packed `[K / 32, 32]` (`tensor::pack_row`), read from there.
+/// one-row `A` also packed `[K / 32, 32]` (`tensor::pack_row`), read from there. The result is
+/// packed as `out` says ([`matmul::Out`]): FP32, or -- roadmap W1, native BF16 arithmetic -- each
+/// output rounded to BF16 once its `K` chain is done, in the run of its last `K` chunk, and packed
+/// as BF16 into a BF16 result. Every partial before stays FP32, in `Dst` or an L1 half; the
+/// schedule whose partials go through the result in GDDR (`KBlocks`) is refused a BF16 one.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul(
     a: Side,
@@ -76,7 +80,15 @@ pub fn matmul(
     unpack_b: bool,
     packed: Option<TensorRef>,
     schedule: Schedule,
+    out: matmul::Out,
 ) -> Result<TileOp> {
+    if out != matmul::Out::Fp32 && matches!(schedule, Schedule::KBlocks { .. }) {
+        return Err(TensorError::Shape(format!(
+            "a product with a {out:?} result has no K-blocked schedule: its partials would \
+             pass through the result ([{m}, {k}] @ [{k}, {n}])"
+        )));
+    }
+    let out_elem = result_elem(out);
     let combine = match &schedule {
         Schedule::BlockStream { tiles } => Combine::L1Halves { chunk: tiles[1] },
         Schedule::Blocks { .. } => Combine::InDst,
@@ -129,7 +141,7 @@ pub fn matmul(
             // Placed when the op is built (`TileOp::build`), or by the caller of `TileOp::jobs`.
             layout: Layout::Tiles(Default::default()),
             map: map(false, 0, 1),
-            elem: Elem::F32,
+            elem: out_elem,
             live_rows: false,
         }],
         body: Box::new(Mma {
@@ -140,12 +152,21 @@ pub fn matmul(
             b_by_column: packed.is_some() && !b.transposed && b.at.col_tiles != 0,
             kt: k.div_ceil(32),
             schedule,
+            out,
         }),
         contract: NumericContract::Program,
-        out: ([m, n], Elem::F32),
+        out: ([m, n], out_elem),
         ahead: Vec::new(),
         share: None,
     })
+}
+
+/// The element type of a product's result packed as `out` says.
+pub(crate) fn result_elem(out: matmul::Out) -> Elem {
+    match out {
+        matmul::Out::Bf16 | matmul::Out::Bf16Unrounded => Elem::BF16,
+        matmul::Out::Fp32 | matmul::Out::Bf16AsFp32 => Elem::F32,
+    }
 }
 
 /// The Matrix Unit's programs over a run of output tiles.
@@ -162,6 +183,8 @@ struct Mma {
     b_by_column: bool,
     kt: usize,
     schedule: Schedule,
+    /// How the result is packed, in the run of each output's last `K` chunk ([`matmul()`]).
+    out: matmul::Out,
 }
 
 /// The columns `cols` deals, or every `every`.
@@ -274,6 +297,12 @@ impl Microkernel for Mma {
         } = *chunk;
         let [rows, count, cols] = tiles;
         let live = LiveRows::for_last(rows, live);
+        // Only the last `K` chunk's run writes the result; every chunk before packs an FP32
+        // partial the next continues.
+        let out = match k0 + count == self.kt {
+            true => self.out,
+            false => matmul::Out::Fp32,
+        };
         let (route, fidelity, unpack_b) = (self.route, self.fidelity, self.unpack_b);
         let code = |a_at, b_at, out, init, roles, loops, prior, resident, mop| RunCode {
             operands: [Some(a_at), Some(b_at), None],
@@ -301,6 +330,7 @@ impl Microkernel for Mma {
                     unpack_b,
                     live,
                     dst.as_ref(),
+                    out,
                 );
                 let init = match held {
                     Some(plan) => matmul::subblock_init(&layout.init, layout.sems, plan),
@@ -361,8 +391,9 @@ impl Microkernel for Mma {
                     *allow_mop,
                     unpack_b,
                     live,
+                    out,
                     || {
-                        matmul::matmul_kernel_with(
+                        matmul::matmul_kernel_as(
                             &outputs,
                             sems,
                             route.src_formats(),
@@ -370,6 +401,7 @@ impl Microkernel for Mma {
                             *allow_mop,
                             unpack_b,
                             live,
+                            out,
                         )
                     },
                 );
@@ -417,6 +449,7 @@ impl Microkernel for Mma {
                     false,
                     unpack_b,
                     live,
+                    out,
                     || {
                         (
                             matmul::k_block_kernel(
@@ -426,6 +459,7 @@ impl Microkernel for Mma {
                                 fidelity,
                                 unpack_b,
                                 live,
+                                out,
                             ),
                             [None; 3],
                         )
@@ -458,9 +492,12 @@ impl Microkernel for Mma {
                     false,
                     unpack_b,
                     live,
+                    out,
                     || {
                         (
-                            matmul::k_block_kernel(&chunk, reload, route, fidelity, unpack_b, live),
+                            matmul::k_block_kernel(
+                                &chunk, reload, route, fidelity, unpack_b, live, out,
+                            ),
                             [None; 3],
                         )
                     },
@@ -573,6 +610,8 @@ pub(crate) struct Plan {
     /// prefetching ones alike, each unit's share by its weight (indexed by unit; empty: even)
     /// ([`crate::tensor::dealt_runs`], X10's probe). `None`: [`thin_runs`] over the own units.
     pub(crate) deal: Option<Vec<u32>>,
+    /// How the result is packed ([`matmul()`]): FP32, or BF16 into a BF16 result.
+    pub(crate) out: matmul::Out,
 }
 
 impl Plan {
@@ -633,6 +672,7 @@ impl Plan {
             self.unpack_b,
             self.packed_a,
             schedule,
+            self.out,
         )?;
         op.results[0].layout = crate::tile_op::Layout::Tiles(rc);
         op.ahead = self.busy.clone();

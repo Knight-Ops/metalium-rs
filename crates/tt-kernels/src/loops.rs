@@ -152,6 +152,43 @@ fn words_mop(times: u32, len: usize) -> usize {
     1 + len + 2 * mop_count(times) as usize
 }
 
+/// `code` -- a program that records and replays its own loops (the SFPU builder's row loops) --
+/// as items: each body it records at a slot and replays there, a [`Item::Repeat`] of it, so a
+/// role program it joins keeps its loops, the planner owning the replay buffer ([`lower_with`]);
+/// the backend receives the same stream. Refuses a replay of a body recorded elsewhere.
+pub fn items_of(code: &crate::code::Code) -> Vec<Item> {
+    let ins = code.expand();
+    let field = |i: &Instruction, name: &str| i.operand(name).expect("a REPLAY field");
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < ins.len() {
+        let i = ins[at];
+        if !core::ptr::eq(i.def(), &defs::REPLAY) {
+            out.push(Item::I(i));
+            at += 1;
+            continue;
+        }
+        let (index, count) = (field(&i, "Index"), field(&i, "Count") as usize);
+        assert!(
+            field(&i, "Load") == 1 && field(&i, "Exec") == 1,
+            "a replay of a body recorded elsewhere"
+        );
+        let body: Vec<Item> = ins[at + 1..at + 1 + count]
+            .iter()
+            .map(|&x| Item::I(x))
+            .collect();
+        at += 1 + count;
+        let again = frontend::replay(index, count).expect("a recorded body's slot");
+        let mut times = 1;
+        while ins.get(at) == Some(&again) {
+            times += 1;
+            at += 1;
+        }
+        out.push(Item::Repeat { times, body });
+    }
+    out
+}
+
 /// Lower `items`: see the module documentation.
 pub fn lower(items: &[Item]) -> Lowered {
     lower_with(items, true)

@@ -316,6 +316,13 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   tile long. Measured on the way: the pack from 32-bit `Dst` to BF16 truncates (silicon-operating-notes), which is why
   the quantize stays. A row broadcast and kinds taking `Bool` or `I32` still widen.
 
+- **W1: products with a BF16 result, and a BF16 packed twin** (2026-11-11, ttsim and card 0 `1794408773`, cost card 1
+  `1794408399`; [log](../learnings/performance-log.md#w1-products-with-a-bf16-result-and-a-bf16-packed-twin-2026-11-11-cards-0-and-1)).
+  `Session::matmul_dram_as(.., Elem::BF16)` rounds each output in `Dst` once its `K` chain is done and packs it as
+  BF16: bit for bit `bf16_from_f32` of the F32 product over every schedule (blocks, the one-row packed path, streamed
+  `K`, the block stream's three kernels) and FP32, BF16 and BFP8 operands; `K` blocks refused by name. A one-row BF16
+  result keeps a BF16 twin that products read. The quantize costs 6-9% of a short-`K` prefill product, ~0 of `down`.
+
 ## Prefill and long context
 
 Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-context.md](../plans/long-context.md).

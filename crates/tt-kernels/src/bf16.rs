@@ -125,6 +125,26 @@ pub(crate) fn quantize_code(row: u32) -> crate::code::Code {
     p.finish_code()
 }
 
+/// [`quantize_code`] of `Dst` rows `row..row + 64`, its first `rows` tensor rows
+/// (`sfpu::with_rows`), as loop items for a role program the loop planner lowers
+/// (`loops::items_of`): a product's math role, which quantizes each BF16 output once its `K`
+/// chain is done (roadmap W1). From `Dst` row counter zero, as its row loops step it.
+pub(crate) fn quantize_items(row: u32, rows: u32) -> Vec<crate::loops::Item> {
+    let code = if rows >= 32 {
+        quantize_code(row)
+    } else {
+        crate::sfpu::with_rows(rows, || quantize_code(row))
+    };
+    let mut items = vec![crate::loops::Item::I(
+        tt_isa::isa::generated::encode::Setrwc::ZERO
+            .dst(1)
+            .encode()
+            .unwrap(),
+    )];
+    items.extend(crate::loops::items_of(&code));
+    items
+}
+
 fn roles(layout: &kernel::Layout, compress: bool) -> [Vec<Instruction>; 3] {
     let s = layout.sems;
     let mut unpack = datapath::thread_config();
@@ -509,6 +529,29 @@ mod tests {
                 got,
                 [0, 0x80000000, 0x3f800000, 0x3f820000, 0x7fc00000][i % 5],
                 "{i}"
+            );
+        }
+    }
+
+    /// The quantize as loop items is the quantize: the backend receives the same stream,
+    /// recorded or written out, whole tiles or a decode row's (`loops::items_of`).
+    #[test]
+    fn quantize_items_are_the_quantize() {
+        use crate::loops::{frontend_stream, lower_with, Item};
+        for rows in [32, 16, 8, 1] {
+            let code = if rows == 32 {
+                super::quantize_code(128)
+            } else {
+                crate::sfpu::with_rows(rows, || super::quantize_code(128))
+            };
+            let want = frontend_stream(&code.expand(), None).unwrap();
+            let items = super::quantize_items(128, rows);
+            assert_eq!(Item::unrolled(&items[1..]), want, "{rows} rows");
+            let lowered = lower_with(&items[1..], false);
+            assert_eq!(
+                frontend_stream(&lowered.words, None).unwrap(),
+                want,
+                "{rows} rows"
             );
         }
     }

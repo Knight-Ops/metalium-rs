@@ -693,8 +693,16 @@ pub fn matmul_roles_with(
     fmts: SrcFormats,
     fidelity: Fidelity,
 ) -> [Vec<Instruction>; 3] {
-    let [unpack, math, pack] =
-        matmul_items_reloading(outputs, sems, fmts, fidelity, None, false, LiveRows::All);
+    let [unpack, math, pack] = matmul_items_reloading(
+        outputs,
+        sems,
+        fmts,
+        fidelity,
+        None,
+        false,
+        LiveRows::All,
+        Out::Fp32,
+    );
     // `REPLAY` alone for now: a kernel step does not carry a MOP
     // configuration to the roles' mailboxes yet (X2b).
     let lower = |items: &[Item]| crate::loops::lower_with(items, false).words;
@@ -740,8 +748,34 @@ pub fn matmul_kernel_with(
     b_transposed: bool,
     live: LiveRows,
 ) -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]) {
+    matmul_kernel_as(
+        outputs,
+        sems,
+        fmts,
+        fidelity,
+        allow_mop,
+        b_transposed,
+        live,
+        Out::Fp32,
+    )
+}
+
+/// [`matmul_kernel_with`], each output packed as `out` says: FP32, or rounded to BF16 by the
+/// compress's quantize in the math role once its `K` chain is done, then packed as BF16
+/// ([`Out`]; roadmap W1, native BF16 arithmetic).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_kernel_as(
+    outputs: &[OutputTile],
+    sems: MatmulSemaphores,
+    fmts: SrcFormats,
+    fidelity: Fidelity,
+    allow_mop: bool,
+    b_transposed: bool,
+    live: LiveRows,
+    out: Out,
+) -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]) {
     let [unpack, math, pack] =
-        matmul_items_reloading(outputs, sems, fmts, fidelity, None, b_transposed, live);
+        matmul_items_reloading(outputs, sems, fmts, fidelity, None, b_transposed, live, out);
     // With `allow_mop`, a `MOP` on the math role only: on silicon (row AE) one
     // on the unpack or pack role made MNIST inference slower (0.487 -> 0.500,
     // 0.528 ms a batch), and the math role's is no faster end to end on the
@@ -752,6 +786,37 @@ pub fn matmul_kernel_with(
         crate::loops::lower_with(&pack, false),
     );
     ([u.words, m.words, p.words], [u.mop, m.mop, p.mop])
+}
+
+/// What a product's pack writes ([`crate::sfpu::kernel::Out`]): FP32, or its result rounded to
+/// BF16 and packed as BF16 (roadmap W1, native BF16 arithmetic).
+pub use crate::sfpu::kernel::Out;
+
+/// The math role's end of a group of output tiles whose `K` chains are done, at `Dst` rows `rows`
+/// (`DEST_TARGET_REG_CFG_MATH_Offset` zero): a BF16 result's tiles each rounded once in `Dst` by the
+/// compress's quantize (`bf16::quantize_items`), over the rows computed, once the Matrix Unit is
+/// done (the caller waits for it); then `ready` for the packer, once the unit last used is.
+fn finish_output(out: Out, rows: &[u32], live: LiveRows, ready: Semaphore) -> Vec<Item> {
+    let mut p = Vec::new();
+    let unit = if out.quantized() {
+        for &row in rows {
+            p.extend(crate::bf16::quantize_items(row, live.rows()));
+        }
+        Unit::Sfpu
+    } else {
+        Unit::Matrix
+    };
+    p.extend(sync::post_after(unit, ready).into_iter().map(Item::I));
+    p
+}
+
+/// `THCON_SEC0_REG1_Out_data_format` for `out`'s pack from 32-bit `Dst`.
+fn out_format(out: Out) -> u32 {
+    let f = match out {
+        Out::Bf16 | Out::Bf16Unrounded => L1Format::Bf16,
+        Out::Fp32 | Out::Bf16AsFp32 => L1Format::Fp32,
+    };
+    f.code().expect("FP32's and BF16's codes are measured")
 }
 
 /// Key of the matmul's shared block (`crate::loops::Item::Shared`): one tile
@@ -815,6 +880,15 @@ impl LiveRows {
             Self::for_rows(live as usize)
         } else {
             LiveRows::All
+        }
+    }
+
+    /// The rows of each output tile computed: 32, 16 or 8.
+    pub fn rows(self) -> u32 {
+        match self {
+            LiveRows::All => 32,
+            LiveRows::Sixteen => 16,
+            LiveRows::Eight => 8,
         }
     }
 
@@ -1267,6 +1341,7 @@ pub(crate) fn block_stream_bytes([mb, kq, nb]: [usize; 3], slots: Slots) -> u64 
 
 /// The three role programs of a [`BlockStreamLayout`] chunk: every output tile of the block over
 /// the chunk's pairs, continuing from `priors` when given.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn block_stream_kernel(
     layout: &Layout,
     priors: Option<&[u64]>,
@@ -1275,6 +1350,7 @@ pub(crate) fn block_stream_kernel(
     fidelity: Fidelity,
     b_transposed: bool,
     live: LiveRows,
+    out: Out,
 ) -> [Vec<Instruction>; 3] {
     let items = matmul_items_continuing(
         &layout.outputs,
@@ -1288,6 +1364,7 @@ pub(crate) fn block_stream_kernel(
         }),
         b_transposed,
         live,
+        out,
     );
     items.map(|items| crate::loops::lower_with(&items, false).words)
 }
@@ -1321,6 +1398,7 @@ pub(crate) fn block_stream_kernel_looped(
     fidelity: Fidelity,
     b_transposed: bool,
     live: LiveRows,
+    out: Out,
 ) -> Option<crate::code::LoopedRoles> {
     use crate::code::Loop;
     use crate::datapath::{pack_dest_units, tile_base_units as units};
@@ -1438,7 +1516,10 @@ pub(crate) fn block_stream_kernel_looped(
         times: count as u32,
         body: pair_math,
     }]));
-    math.extend(sync::post_after(Unit::Matrix, layout.sems.ready));
+    if out.quantized() {
+        math.push(backend::wait_for_matrix(Before::EVERYTHING).unwrap());
+    }
+    math.extend(lowered(finish_output(out, &[0], live, layout.sems.ready)));
     let outputs = (rows * cols) as u32;
     let math_loops = vec![Loop {
         start: block,
@@ -1451,6 +1532,8 @@ pub(crate) fn block_stream_kernel_looped(
     let mut pw = ConfigWords::new();
     crate::datapath::pack_config(&mut pw, out0);
     with_throttle_override(&mut pw);
+    pw.set(thcon::THCON_SEC0_REG1_Out_data_format, out_format(out))
+        .unwrap();
     let mut pack = config_program(&pw);
     set(&mut pack, SLOT_GPR, slot);
     set(&mut pack, OUT_GPR, pack_dest_units(out0) - slot);
@@ -1570,6 +1653,7 @@ pub(crate) fn block_stream_kernel_subblocked(
     b_transposed: bool,
     live: LiveRows,
     plan: &crate::tile_op::dst::RowPlan,
+    out: Out,
 ) -> Option<crate::code::LoopedRoles> {
     use crate::code::Loop;
     use crate::datapath::{pack_dest_units, tile_base_units as units};
@@ -1827,7 +1911,18 @@ pub(crate) fn block_stream_kernel_subblocked(
                     times: count as u32,
                     body: step,
                 });
-                i(&mut p, &sync::post_after(Unit::Matrix, layout.sems.ready));
+                if out.quantized() {
+                    // From row 0 of `Dst`: the tiles' rows are the quantize's own addresses.
+                    i(
+                        &mut p,
+                        &[
+                            backend::wait_for_matrix(Before::EVERYTHING).unwrap(),
+                            offset(0),
+                        ],
+                    );
+                }
+                let rows: Vec<u32> = (0..w).map(|t| row_of(section, t)).collect();
+                p.extend(finish_output(out, &rows, live, layout.sems.ready));
             }
         }
         lowered(p)
@@ -1854,6 +1949,8 @@ pub(crate) fn block_stream_kernel_subblocked(
     let mut pw = ConfigWords::new();
     crate::datapath::pack_config(&mut pw, out0);
     with_throttle_override(&mut pw);
+    pw.set(thcon::THCON_SEC0_REG1_Out_data_format, out_format(out))
+        .unwrap();
     let mut pack = config_program(&pw);
     set(&mut pack, SLOT_GPR, slot);
     set(&mut pack, OUT_GPR, pack_dest_units(out0) - slot);
@@ -2116,6 +2213,7 @@ pub(crate) fn block_stream_programs(
     b_transposed: bool,
     live: LiveRows,
     dst: Option<&crate::tile_op::dst::RowPlan>,
+    out: Out,
 ) -> BlockPrograms {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -2131,7 +2229,12 @@ pub(crate) fn block_stream_programs(
         u64,
         MatmulSemaphores,
         bool,
-        (PairOrder, Option<crate::tile_op::dst::RowPlan>, DstMutation),
+        (
+            PairOrder,
+            Option<crate::tile_op::dst::RowPlan>,
+            DstMutation,
+            Out,
+        ),
     );
     static CACHE: OnceLock<Mutex<HashMap<Key, BlockPrograms>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
@@ -2153,7 +2256,7 @@ pub(crate) fn block_stream_programs(
         crate::l1::arena().end,
         layout.sems,
         looped,
-        (pair_order(), dst.cloned(), dst_mutation()),
+        (pair_order(), dst.cloned(), dst_mutation(), out),
     );
     let count = |v: &BlockPrograms| {
         if v.2.is_some() {
@@ -2165,8 +2268,18 @@ pub(crate) fn block_stream_programs(
         return v.clone();
     }
     let subblocked = dst.and_then(|plan| {
-        block_stream_kernel_subblocked(layout, c, tiles, route, fidelity, b_transposed, live, plan)
-            .map(|built| (built, plan.plan))
+        block_stream_kernel_subblocked(
+            layout,
+            c,
+            tiles,
+            route,
+            fidelity,
+            b_transposed,
+            live,
+            plan,
+            out,
+        )
+        .map(|built| (built, plan.plan))
     });
     let held = subblocked.as_ref().map(|(_, plan)| *plan);
     let built = subblocked
@@ -2182,6 +2295,7 @@ pub(crate) fn block_stream_programs(
                         fidelity,
                         b_transposed,
                         live,
+                        out,
                     )
                 })
                 .flatten()
@@ -2196,6 +2310,7 @@ pub(crate) fn block_stream_programs(
                 fidelity,
                 b_transposed,
                 live,
+                out,
             );
             (roles, Default::default())
         });
@@ -2206,6 +2321,7 @@ pub(crate) fn block_stream_programs(
 }
 
 /// First/continuation programs share the Matrix Unit's original product order.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn k_block_kernel(
     layout: &Layout,
     reload: Option<Reload>,
@@ -2213,6 +2329,7 @@ pub(crate) fn k_block_kernel(
     fidelity: Fidelity,
     b_transposed: bool,
     live: LiveRows,
+    out: Out,
 ) -> [Vec<Instruction>; 3] {
     let items = matmul_items_reloading(
         &layout.outputs,
@@ -2222,6 +2339,7 @@ pub(crate) fn k_block_kernel(
         reload,
         b_transposed,
         live,
+        out,
     );
     items.map(|items| crate::loops::lower_with(&items, false).words)
 }
@@ -2258,6 +2376,7 @@ pub fn matmul_items(
         None,
         false,
         LiveRows::All,
+        Out::Fp32,
     )
 }
 
@@ -2277,6 +2396,7 @@ pub(crate) fn matmul_items_reloading(
     reload: Option<Reload>,
     b_transposed: bool,
     live: LiveRows,
+    out: Out,
 ) -> [Vec<Item>; 3] {
     if reload.is_some() {
         assert_eq!(
@@ -2298,6 +2418,7 @@ pub(crate) fn matmul_items_reloading(
         }),
         b_transposed,
         live,
+        out,
     )
 }
 
@@ -2995,6 +3116,7 @@ pub(crate) fn matmul_items_continuing(
     reload: Option<Continuation<'_>>,
     b_transposed: bool,
     live: LiveRows,
+    out: Out,
 ) -> [Vec<Item>; 3] {
     if let Some(r) = reload {
         assert_eq!(
@@ -3109,7 +3231,12 @@ pub(crate) fn matmul_items_continuing(
                 }
             }
         }
-        math.extend(i(sync::post_after(Unit::Matrix, sems.ready)));
+        if out.quantized() {
+            math.push(Item::I(
+                backend::wait_for_matrix(Before::EVERYTHING).unwrap(),
+            ));
+        }
+        math.extend(finish_output(out, &[0], live, sems.ready));
 
         // The packer's whole configuration before the first output; then only where each output
         // goes, the one word that differs (`docs/plans/long-context.md` A3): every `PACR` sees what
@@ -3119,6 +3246,11 @@ pub(crate) fn matmul_items_continuing(
         if pack.is_empty() {
             crate::datapath::pack_config(&mut pw, output.out);
             with_throttle_override(&mut pw);
+            pw.set(
+                tt_isa::cfg::generated::thcon::THCON_SEC0_REG1_Out_data_format,
+                out_format(out),
+            )
+            .unwrap();
         } else {
             pw.set(
                 tt_isa::cfg::generated::thcon::THCON_SEC0_REG1_L1_Dest_addr,
@@ -4401,6 +4533,7 @@ pub(crate) fn kernel_programs(
     allow_mop: bool,
     b_transposed: bool,
     live: LiveRows,
+    out: Out,
     build: impl FnOnce() -> ([Vec<Instruction>; 3], [Option<MopConfig>; 3]),
 ) -> (
     std::sync::Arc<[Vec<Instruction>; 3]>,
@@ -4420,6 +4553,7 @@ pub(crate) fn kernel_programs(
         bool,
         bool,
         LiveRows,
+        Out,
         u64,
         u64,
         PairOrder,
@@ -4436,6 +4570,7 @@ pub(crate) fn kernel_programs(
         allow_mop,
         b_transposed,
         live,
+        out,
         // The layout was planned in the arena (`crate::l1::arena`), `B`'s ring against
         // `crate::l1::ring_end`.
         crate::l1::arena().end,
@@ -4785,6 +4920,7 @@ mod tests {
                 None,
                 false,
                 LiveRows::All,
+                Out::Fp32,
             );
             let stream = crate::loops::Item::unrolled(&pack);
             let (seen, _) = crate::code::transfers(&stream);

@@ -627,6 +627,7 @@ mod tests {
             prefetch_units: [crate::session::PREFETCH_UNITS; 2],
             block_stream: BlockStream::Fixed(block),
             reuse,
+            out: crate::matmul::Out::Fp32,
         };
         let (work, ..) = tensor::matmul_dram_prefetching(
             &mut alloc,

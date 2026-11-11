@@ -1718,6 +1718,7 @@ pub fn matmul_dram(
             prefetch_units: [usize::MAX; 2],
             block_stream: BlockStream::Off,
             reuse: Reuse::Off,
+            out: crate::matmul::Out::Fp32,
         },
     )
 }
@@ -2011,6 +2012,8 @@ pub(crate) struct Reads {
     pub block_stream: BlockStream,
     /// Whether a blocked product's units share their reads of `A`, and of `B` ([`Reuse`]).
     pub reuse: Reuse,
+    /// How the result is packed (`tile_op::matmul()`): FP32, or a BF16 result (roadmap W1).
+    pub out: crate::matmul::Out,
 }
 
 /// Whether the units of a product of 2-D blocks with `K` streamed ([`BlockStream`]) that read
@@ -2181,6 +2184,23 @@ pub const fn packed_row_bytes(format: TileFormat) -> u64 {
 /// FP32 or BF16 (a BF16 activation, roadmap W1): the packed row keeps `t`'s format, its face
 /// rows [`packed_row_bytes`] long. A BFP row is refused: its exponents are shared along 16
 /// datums of a face row, which one row's move cannot carry alone.
+/// The tensor a packed row of `kt` tiles of `elem` (F32 or BF16) is laid in ([`pack_row`], a
+/// packed twin): `[kt, 32]` in FP32-sized slots whatever the format, which a product reads with
+/// `READ_RUN` a `TILE_SLOT` a tile; its padding undefined.
+pub(crate) fn packed_row_tensor(
+    alloc: &mut DramAlloc,
+    kt: usize,
+    elem: Elem,
+) -> Result<DramTensor> {
+    Ok(DramTensor {
+        rows: kt,
+        cols: 32,
+        elem,
+        placement: alloc.alloc_slots(kt.div_ceil(32), TILE_SLOT)?,
+        pad: std::cell::Cell::new(Pad::Undefined),
+    })
+}
+
 pub fn pack_row(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work> {
     use tt_isa::dm::op;
     let row_bytes = match t.elem {
@@ -2205,15 +2225,7 @@ pub fn pack_row(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<W
     let face = 16 * row_bytes;
     let kt = t.cols / 32;
     let stage = staging("packed row slots", GROUP.min(kt))?;
-    // FP32-sized slots whatever the format: a product reads the packed row with `READ_RUN`,
-    // which steps through GDDR (and L1) a `TILE_SLOT` a tile.
-    let out = DramTensor {
-        rows: kt,
-        cols: 32,
-        elem: t.elem,
-        placement: alloc.alloc_slots(kt.div_ceil(32), TILE_SLOT)?,
-        pad: std::cell::Cell::new(Pad::Undefined),
-    };
+    let out = packed_row_tensor(alloc, kt, t.elem)?;
     let jobs = runs(kt, units, GROUP)
         .into_iter()
         .map(|run| {
@@ -2426,6 +2438,7 @@ pub(crate) fn matmul_dram_prefetching(
                 crate::tile_op::matmul::Schedule::BlockStream {
                     tiles: layout.tiles,
                 },
+                reads.out,
             )?;
             op.share = crate::tile_op::reuse::share(reuse, tiles);
             let work = op.build(alloc, units, Overlap::Off)?;
@@ -2446,7 +2459,7 @@ pub(crate) fn matmul_dram_prefetching(
     let col_runs = thin_runs([mt, kt, nt], [kc, nc], staging, units);
     let [mc, nc] = blocks([mt, nt], [mc, nc], units);
     let (ra, rb) = (a.tensor_ref(), b.tensor_ref());
-    let c = DramTensor::alloc(alloc, m, n)?;
+    let c = DramTensor::alloc_elem(alloc, m, n, crate::tile_op::matmul::result_elem(reads.out))?;
     let rc = c.tensor_ref();
     let mut jobs = Vec::new();
     if reads.packed_a.is_some() && (m != 1 || a_transposed) {
@@ -2483,6 +2496,7 @@ pub(crate) fn matmul_dram_prefetching(
             && kc < kt,
         busy: busy.to_vec(),
         deal: deal.map(<[u32]>::to_vec),
+        out: reads.out,
     };
     let prefetch = &prefetch[..prefetch
         .len()
@@ -2674,12 +2688,20 @@ fn packed_k_block(
             ..layout
         };
         let fits = [None, Some(reload)].into_iter().all(|r| {
-            matmul::k_block_kernel(&layout, r, route, fidelity, false, matmul::LiveRows::All)
-                .iter()
-                .all(|p| {
-                    p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
-                        && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
-                })
+            matmul::k_block_kernel(
+                &layout,
+                r,
+                route,
+                fidelity,
+                false,
+                matmul::LiveRows::All,
+                matmul::Out::Fp32,
+            )
+            .iter()
+            .all(|p| {
+                p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                    && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+            })
         });
         if fits {
             return Ok(kc);
@@ -2719,12 +2741,20 @@ pub(crate) fn stream_chunks(
         };
         let fits = (0..2).all(|c| {
             let (l, r) = layout.chunk(c, c * kq, kq, route.packed_row_bytes());
-            matmul::k_block_kernel(&l, r, route, fidelity, false, matmul::LiveRows::All)
-                .iter()
-                .all(|p| {
-                    p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
-                        && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
-                })
+            matmul::k_block_kernel(
+                &l,
+                r,
+                route,
+                fidelity,
+                false,
+                matmul::LiveRows::All,
+                matmul::Out::Fp32,
+            )
+            .iter()
+            .all(|p| {
+                p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                    && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+            })
         });
         if fits {
             return Ok((kq, layout));
@@ -2740,12 +2770,20 @@ pub(crate) fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -
     loop {
         if let Ok((layout, reload)) = crate::l1::unnoted(|| matmul::k_block_layout(kc)) {
             let fits = [None, Some(reload)].into_iter().all(|r| {
-                matmul::k_block_kernel(&layout, r, route, fidelity, false, matmul::LiveRows::All)
-                    .iter()
-                    .all(|p| {
-                        p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
-                            && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
-                    })
+                matmul::k_block_kernel(
+                    &layout,
+                    r,
+                    route,
+                    fidelity,
+                    false,
+                    matmul::LiveRows::All,
+                    matmul::Out::Fp32,
+                )
+                .iter()
+                .all(|p| {
+                    p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                        && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+                })
             });
             if fits {
                 return Ok(kc);
@@ -3228,6 +3266,7 @@ fn block_stream_programs_fit(
             false,
             matmul::LiveRows::All,
             dst.as_ref(),
+            crate::matmul::Out::Fp32,
         );
         roles.iter().zip(loops.iter()).all(|(p, l)| {
             let code = crate::code::Code {
@@ -3577,6 +3616,7 @@ pub(crate) fn matmul_dram_batched_limited(
                     crate::tile_op::matmul::Schedule::BlockStream {
                         tiles: layout.tiles,
                     },
+                    crate::matmul::Out::Fp32,
                 )
                 .and_then(|mut op| {
                     op.results[0].layout = crate::tile_op::Layout::Tiles(rc);
@@ -3613,6 +3653,7 @@ pub(crate) fn matmul_dram_batched_limited(
         stream_k: false,
         busy: Vec::new(),
         deal: None,
+        out: crate::matmul::Out::Fp32,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -3774,15 +3815,22 @@ pub(crate) fn eltwise_formats(
         t.expect(&format!("{} on BF16 operands", name()), Elem::BF16)?;
     }
     let out = match sig.out {
-        Elem::F32 => match PROBE_BF16_RESULT.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => Out::Bf16AsFp32,
-            2 => Out::Fp32,
-            3 => Out::Bf16Unrounded,
-            _ => Out::Bf16,
-        },
+        Elem::F32 => bf16_result(),
         _ => Out::Fp32,
     };
     Ok(Formats { bf16_in: true, out })
+}
+
+/// How a result asked for as BF16 is made: [`Out::Bf16`](crate::sfpu::kernel::Out::Bf16), or
+/// what [`probe_bf16_result`] names for a gate.
+pub(crate) fn bf16_result() -> crate::sfpu::kernel::Out {
+    use crate::sfpu::kernel::Out;
+    match PROBE_BF16_RESULT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Out::Bf16AsFp32,
+        2 => Out::Fp32,
+        3 => Out::Bf16Unrounded,
+        _ => Out::Bf16,
+    }
 }
 
 /// The element type of `kind`'s result held as `formats` says.
@@ -3801,8 +3849,8 @@ pub(crate) fn eltwise_output(kind: u32, operands: &[&DramTensor]) -> Result<Elem
 
 static PROBE_BF16_RESULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// What an element-wise op on BF16 operands makes of an F32 kind's result, for gates only
-/// (`step270_native_bf16`): `Bf16` (the default, and the only form outside a gate);
+/// What an element-wise op on BF16 operands makes of an F32 kind's result, and a product asked
+/// for a BF16 result (`Session::matmul_dram_as`), for gates only (`step270_native_bf16`): `Bf16` (the default, and the only form outside a gate);
 /// `Bf16AsFp32`, rounded and packed as FP32, the simulator's form since ttsim refuses the BF16
 /// pack (`PACR` mode 0x105); and the negative controls `Fp32` (not rounded) and `Bf16Unrounded`
 /// (packed as BF16 without the quantize, which the packer truncates).
@@ -3912,10 +3960,13 @@ pub(crate) fn twin_one_row_scatters(jobs: &mut [Job], c: &DramTensor, twin: &Dra
 
 /// The writes that put one-row tiles' data rows, packed, into `twin` (`[K / 32, 32]`, as
 /// [`pack_row`] lays them out): output tiles `first..first + count`, each in the slot after the
-/// last from `at` with its data in row 0, two 64-byte face-row writes a tile on the writer.
+/// last from `at` with its data in row 0, two face-row writes a tile on the writer -- 64 bytes
+/// for an FP32 twin, 32 for a BF16 one (a BF16 result's tiles are packed as BF16, their faces
+/// 512 bytes apart; roadmap W1).
 pub fn packed_twin_writes(twin: &DramTensor, first: usize, count: usize, at: u64) -> Vec<[u32; 8]> {
     use tt_isa::dm::op;
-    const FACE: u64 = 1024;
+    let row = packed_row_bytes(twin.format());
+    let face = 16 * row;
     (0..count)
         .flat_map(|n| {
             let (kk, slot) = (first + n, at + n as u64 * TILE_SLOT);
@@ -3925,10 +3976,10 @@ pub fn packed_twin_writes(twin: &DramTensor, first: usize, count: usize, at: u64
                     op::WRITE,
                     dst.channel().index() as u32,
                     0,
-                    (dst.offset() + TILE_DATA + (2 * (r / 16) + half) * FACE + (r % 16) * 64)
+                    (dst.offset() + TILE_DATA + (2 * (r / 16) + half) * face + (r % 16) * row)
                         as u32,
-                    (slot + TILE_DATA + half * FACE) as u32,
-                    64,
+                    (slot + TILE_DATA + half * face) as u32,
+                    row as u32,
                     0,
                     0,
                 ]
@@ -7790,6 +7841,7 @@ mod tests {
                     prefetch_units: [usize::MAX; 2],
                     block_stream: super::BlockStream::Off,
                     reuse: super::Reuse::Off,
+                    out: crate::matmul::Out::Fp32,
                 },
                 &prefetch,
                 spread,
@@ -7936,6 +7988,7 @@ mod tests {
                 prefetch_units: [usize::MAX; 2],
                 block_stream: super::BlockStream::Off,
                 reuse: super::Reuse::Off,
+                out: crate::matmul::Out::Fp32,
             };
             let work = super::matmul_dram_limited(
                 &mut alloc,
@@ -8022,6 +8075,7 @@ mod tests {
                         prefetch_units: [usize::MAX; 2],
                         block_stream: super::BlockStream::Off,
                         reuse: super::Reuse::Off,
+                        out: crate::matmul::Out::Fp32,
                     },
                 )
                 .unwrap();
@@ -8113,6 +8167,7 @@ mod tests {
                         prefetch_units: [usize::MAX; 2],
                         block_stream: super::BlockStream::Off,
                         reuse: super::Reuse::Off,
+                        out: crate::matmul::Out::Fp32,
                     },
                 )
                 .unwrap();
@@ -8195,6 +8250,7 @@ mod tests {
                     prefetch_units: [usize::MAX; 2],
                     block_stream: super::BlockStream::Off,
                     reuse: super::Reuse::Off,
+                    out: crate::matmul::Out::Fp32,
                 },
                 &[],
                 units,
@@ -8286,6 +8342,7 @@ mod tests {
                     prefetch_units: [usize::MAX; 2],
                     block_stream: super::BlockStream::Off,
                     reuse: super::Reuse::Off,
+                    out: crate::matmul::Out::Fp32,
                 },
             )
             .unwrap();
@@ -8366,6 +8423,7 @@ mod tests {
                         prefetch_units: [usize::MAX, 40],
                         block_stream: super::BlockStream::Off,
                         reuse: super::Reuse::Off,
+                        out: crate::matmul::Out::Fp32,
                     },
                     &prefetch,
                     spread,
@@ -8750,6 +8808,7 @@ mod block_stream_tests {
             prefetch_units: [usize::MAX; 2],
             block_stream: mode,
             reuse: Reuse::Off,
+            out: crate::matmul::Out::Fp32,
         }
     }
 
@@ -8865,6 +8924,7 @@ mod block_stream_tests {
                 Fidelity::HiFi4,
                 false,
                 matmul::LiveRows::All,
+                crate::matmul::Out::Fp32,
             )
             .expect("the loops fit");
             std::array::from_fn(|t| {

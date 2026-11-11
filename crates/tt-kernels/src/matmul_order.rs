@@ -798,6 +798,7 @@ mod tests {
             None,
             b_transposed,
             live,
+            crate::matmul::Out::Fp32,
         )
     }
 
@@ -857,6 +858,7 @@ mod tests {
                         fidelity,
                         b_transposed,
                         LiveRows::All,
+                        crate::matmul::Out::Fp32,
                     )
                     .expect("fits");
                     let stream = |t: usize| {
@@ -917,6 +919,7 @@ mod tests {
                             fidelity,
                             false,
                             LiveRows::All,
+                            crate::matmul::Out::Fp32,
                         )
                         .expect("fits");
                         let math = crate::code::Code {
@@ -969,6 +972,7 @@ mod tests {
                                 fidelity,
                                 false,
                                 LiveRows::All,
+                                crate::matmul::Out::Fp32,
                             )
                             .expect("fits");
                             let math = crate::code::Code {
@@ -1144,6 +1148,7 @@ mod tests {
                 b_transposed,
                 LiveRows::All,
                 plan,
+                crate::matmul::Out::Fp32,
             )
             .expect("fits"),
             None => block_stream_kernel_looped(
@@ -1154,6 +1159,7 @@ mod tests {
                 fidelity,
                 b_transposed,
                 LiveRows::All,
+                crate::matmul::Out::Fp32,
             )
             .expect("fits"),
         };
@@ -1321,6 +1327,7 @@ mod tests {
                         false,
                         LiveRows::All,
                         &plan,
+                        crate::matmul::Out::Fp32,
                     )
                     .unwrap_or_else(|| {
                         panic!("{tiles:?} {route:?} chunk {c}: no subblocked programs")

@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: products with a BF16 result, and a BF16 packed twin](#w1-products-with-a-bf16-result-and-a-bf16-packed-twin-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's third phase: each output rounded in `Dst` once its `K` chain is done (the last `K` chunk's run), packed as BF16; every schedule but `K` blocks; the quantize costs 6-9% of a short-`K` chunk product and ~0 of `down` (BF16 x BFP8, card 1), below the BF16 `A`'s gain: not killed |
 | [W1: BF16 tensors in their own slots, named in the tensor reference](#w1-bf16-tensors-in-their-own-slots-named-in-the-tensor-reference-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's first phase: `TensorRef::slot` (word 6); `READ_RUN`/`WRITE_RUN`/`SCATTER` step and size GDDR by it, other records refuse it; `alloc_elem` gives BF16 2,112-byte slots; `dm_b` +364 bytes; the 1.7B within the run-to-run band under both contracts (a first cut that branched per tile in `GATHER` cost 0.3-0.7% and was redone) |
 | [W1: native BF16 arithmetic bounded before building](#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0) | 2026-11-11 | the 1.7B's chunk products with a BF16 `A` (BFP8 `B`, HiFi4): **1.19x** at 256 rows, **1.24x** at 512 (4.7 / 8.7 ms a chunk); a 256-token prefill predicted ~1.08x; decode ~0 at short context, at most ~0.9 ms at 2K from a BF16 cache (attention is not byte-bound); a BF16 edge equals its widened FP32 edge over all 65,536 patterns (`step270`, ttsim and card 0) |
 | [W1: the one-row path for a BF16 `A`, its decode products at the FP32 `A`'s step](#w1-the-one-row-path-for-a-bf16-a-its-decode-products-at-the-fp32-as-step-2026-11-10-cards-0-and-1) | 2026-11-10 | roadmap W1's next box: a BF16 row packed in its own format (32-byte face rows, FP32-sized slots), prefetched, busy-prefetched and streamed as an FP32 row, bit for bit (card 0); decode products at `m` = 1, BF16 x BFP8 HiFi2 10.74 -> **6.99 ms** (FP32 `A` 7.00), BF16 x BF16 14.33 -> 10.34 (10.19); `down` 177 -> 71 us; no model gains until BF16 activations |
@@ -424,6 +425,49 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: products with a BF16 result, and a BF16 packed twin (2026-11-11, cards 0 and 1)
+
+Native BF16 arithmetic's third phase (roadmap W1; [bound](#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0)).
+A BF16 stream needs its products to make BF16: a separate narrowing op after each would cost more than the BF16 `A`
+saves (decode: seven ops a layer).
+
+**What changed.** `Session::matmul_dram_as(.., Elem::BF16)`: once an output tile's `K` chain is done the math role
+waits for the Matrix Unit, rounds the tile in `Dst` with the compress's own quantize (`bf16::quantize_items`, its row
+loop handed to the loop planner as items so the role keeps its replayed loops) over the rows it computed (a decode
+row's eight), and the packer writes it as BF16 (`Out_data_format` 5, which truncates the already-rounded word). Only
+the run of an output's last `K` chunk does: every chunk before packs its FP32 partial for the next. The four kernel
+families take it (`matmul_items_continuing` for `K` whole, the one-row packed path and streamed `K`; the block
+stream's subblocked, looped and written-out kernels, each tile at its own `Dst` rows with the math offset at zero).
+`K` blocked through the result in GDDR is refused a BF16 result by name (burn-tt narrows the F32 product there). A
+one-row BF16 result keeps a BF16 packed twin (32-byte face rows in FP32-sized slots, as `pack_row` lays a BF16 row),
+which a product reads as its packed `A`.
+
+**Gates** (`step270_native_bf16`, ttsim and card 0, `1794408773`): every schedule, FP32 and BF16 `A`s, BF16, FP32 and
+BFP8 `B`s, ragged and whole, 11 cases: unrounded, the F32 product bit for bit; rounded and packed as FP32 (ttsim's
+form), the F32 product rounded by the host's model; on silicon `bf16_from_f32` of the F32 product, bit for bit, and
+the truncating pack without the quantize differs. Mutations each fail it: rounding every chunk (the streamed case
+first), the subblocked or looped kernel without its quantize. The twin holds its row (an element-wise result's, a
+product's), and a product through it is the product of a copy without one; a twin written at FP32 strides fails
+(2,015 of 2,048 datums).
+
+**The quantize's cost** (card 1, `silicon_probe_performance_contract::prefill_products`, BF16 `A`, BFP8 `B`, slope-timed,
+`1794408399`; FP32 result -> BF16 result, us):
+
+| product | HiFi4 | HiFi2 |
+|---|--:|--:|
+| [256, 2048] @ [2048, 6144] | 178.7 -> 191.2 (+7.0%) | 172.4 -> 189.3 (+9.8%) |
+| [256, 2048] @ [2048, 16384] | 341.3 -> 366.0 (+7.2%) | 335.0 -> 364.7 (+8.9%) |
+| [256, 8192] @ [8192, 2048] | 388.5 -> 389.8 (+0.3%) | 386.6 -> 388.4 (+0.5%) |
+| [512, 2048] @ [2048, 6144] | 268.0 -> 292.6 (+9.2%) | 264.4 -> 284.6 (+7.6%) |
+| [512, 2048] @ [2048, 16384] | 547.5 -> 581.5 (+6.2%) | 532.3 -> 565.4 (+6.2%) |
+| [512, 8192] @ [8192, 2048] | 582.1 -> 581.1 (0%) | 577.3 -> 583.5 (+1.1%) |
+
+Per output tile the quantize is a fixed ~32 SFPU instructions a row group, so it shows on the short-`K` products and
+vanishes into `down`'s. A 256-token chunk's products pay ~43 us a layer, ~1 ms a chunk, against the ~5 ms the BF16
+`A` saves (the bound's 1.19-1.24x on the products): **the kill does not fire.** The SFPU pass runs between a
+subblock's `MVMUL`s and its pack; overlapping it with the next subblock's `MVMUL`s (two math streams) is the lever if
+it ever matters.
 
 ## W1: BF16 tensors in their own slots, named in the tensor reference (2026-11-11, cards 0 and 1)
 
