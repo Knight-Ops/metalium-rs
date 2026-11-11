@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: BF16 tensors in their own slots, named in the tensor reference](#w1-bf16-tensors-in-their-own-slots-named-in-the-tensor-reference-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's first phase: `TensorRef::slot` (word 6); `READ_RUN`/`WRITE_RUN`/`SCATTER` step and size GDDR by it, other records refuse it; `alloc_elem` gives BF16 2,112-byte slots; `dm_b` +364 bytes; the 1.7B within the run-to-run band under both contracts (a first cut that branched per tile in `GATHER` cost 0.3-0.7% and was redone) |
 | [W1: native BF16 arithmetic bounded before building](#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0) | 2026-11-11 | the 1.7B's chunk products with a BF16 `A` (BFP8 `B`, HiFi4): **1.19x** at 256 rows, **1.24x** at 512 (4.7 / 8.7 ms a chunk); a 256-token prefill predicted ~1.08x; decode ~0 at short context, at most ~0.9 ms at 2K from a BF16 cache (attention is not byte-bound); a BF16 edge equals its widened FP32 edge over all 65,536 patterns (`step270`, ttsim and card 0) |
 | [W1: the one-row path for a BF16 `A`, its decode products at the FP32 `A`'s step](#w1-the-one-row-path-for-a-bf16-a-its-decode-products-at-the-fp32-as-step-2026-11-10-cards-0-and-1) | 2026-11-10 | roadmap W1's next box: a BF16 row packed in its own format (32-byte face rows, FP32-sized slots), prefetched, busy-prefetched and streamed as an FP32 row, bit for bit (card 0); decode products at `m` = 1, BF16 x BFP8 HiFi2 10.74 -> **6.99 ms** (FP32 `A` 7.00), BF16 x BF16 14.33 -> 10.34 (10.19); `down` 177 -> 71 us; no model gains until BF16 activations |
 | [W1: a packed tile whole in `SrcB`, a BF16 `A` past the FP32 `A`'s rate](#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0) | 2026-11-10 | roadmap W1's second box: a BF16/BFP `A` whole in `SrcB`, bit for bit (card 0), licensed in `whole_tile_unpack`; BF16 `A` HiFi4 prefill 22-30 -> **29-70 TFLOPS**, 1.13-1.32x the FP32 `A`, fidelity no longer binding; H13 1.27x (1.34x with BFP8); packer L1 accumulation's ceiling now <= 2.5% |
@@ -423,6 +424,51 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: BF16 tensors in their own slots, named in the tensor reference (2026-11-11, cards 0 and 1)
+
+Native BF16 arithmetic's first phase (roadmap W1; [bound](#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0)).
+A BF16 activation must be read by products (`GATHER`, which steps a packed operand by its format's slot, 2,112 bytes)
+and by element-wise and movement ops (`READ_RUN`, which stepped every tensor by an FP32 tile's 4,160). A tensor's
+slots were not part of its reference, so the two could not meet: `alloc_elem` gave a BF16 tensor FP32 slots, and a
+BF16 tensor in its own slots was misread by any run.
+
+**What changed.**
+- **`TensorRef::slot`** (word 6 of the first entry; 0 for `TILE_SLOT`, so every existing encoding is unchanged, or
+  `BF16_TILE_SLOT`; anything else, or BF16 laid by column, refused). `READ_RUN`/`WRITE_RUN` and `SCATTER` step GDDR by
+  it, read a BF16 tile whole (2,112 bytes) and write its 2,048 bytes of data; L1 keeps its `TILE_SLOT` stride, so no
+  kernel's slots move. Every other record refuses a BF16 slot (`RANGE`), as do the moves that work on FP32 datums
+  (`READ_TRANSPOSED`, `READ_BROADCAST_COL`). A `GATHER` operand's slot must agree with its format flags.
+- **`DramTensor::alloc_elem`** gives `Elem::BF16` 2,112-byte slots, and `Placement::tensor_ref` names them (interleaved
+  only; a BF16 weight laid by column names none, its `GATHER` flags give it). The 32-bit datum transfers
+  (`write_bits`, the downloads and the DMA download) refuse a tensor in non-FP32 slots by name.
+- **The hot path is unchanged:** `GATHER` keeps its constant stride; only runs and scatters compute theirs, once a
+  record. A first cut that took the stride from the reference on every tile (`Cursor::next`) slowed every 1.7B row by
+  0.1-0.7% (`1794372262`, `1794372946`) and was redone. B's safe image grows 364 bytes (37,596 -> 37,960; room 14,264).
+
+**Gates.**
+- `step270_native_bf16::a_bf16_tensor_is_copied_in_its_own_slots` (ttsim, card 0): a `[67, 300]` BF16 tensor (30 tiles,
+  ragged) copied through `READ_RUN`/`WRITE_RUN` into BF16 slots with every datum's bits; a bit download refused by name.
+  Control `tensor::probe_unnamed_slot` (the source named with no slot, as before): the copy moves other tiles' bytes.
+  The control's first form unnamed both ends and passed: a run stepping both at 4,160 with 4,160-byte reads is a byte
+  copy of the region.
+- `tt-isa` record tests: slots step and size runs and scatters, refusals by record and move.
+- The pinned matmul jobs: 54 of 224 cases change, every one with a BF16 operand (its reference names its slot, and its
+  bases move with the smaller slots); re-blessed.
+- `step172`/`step173` in the safe, fast and guarded read modes; card 0: `step270`, `step76`/`77`, `step204`, `step216`,
+  `step232`/`233`/`239`/`241`, `step12_mnist` (golden unchanged), 40 of 40 (and 51 of 51 with the first cut).
+
+**The 1.7B** (card 1, `traced_generation`, one burn-flex sample; before `1794349089` / `1794349769`, after `1794373840` /
+`1794374519`):
+
+| contract | decode step at 32 / 128 / 256 tokens, ms | prefill 32 / 128 / 256, tokens/s |
+|---|--:|--:|
+| performance | 7.52 / 8.03 / 8.62 -> **7.51 / 8.03 / 8.67** | 1,191 / 3,241 / 4,019 -> 1,188 / 3,263 / 4,004 |
+| reference | 9.82 / 10.32 / 10.95 -> **9.82 / 10.33 / 10.95** | 1,099 / 3,092 / 3,891 -> 1,096 / 3,084 / 3,888 |
+
+The rows move both ways; the one past 0.5% (+0.6%, the performance step at 256) is within that row's band for unchanged
+programs (8.62-8.68 ms, `1794349089` and `1794291915`). Found on the way: the bench at 9 burn-flex samples overruns the
+runner's 900 s; `TT_GEN_FLEX_SAMPLES=1` as the baselines ran.
 
 ## W1: native BF16 arithmetic bounded before building (2026-11-11, card 0)
 

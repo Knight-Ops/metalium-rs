@@ -66,6 +66,7 @@ fn b_ref() -> record::TensorRef {
         first: 0,
         ct: COLS,
         col_tiles: 0,
+        slot: 0,
     }
 }
 

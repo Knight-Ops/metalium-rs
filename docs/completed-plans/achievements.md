@@ -299,6 +299,14 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
     pinned jobs grown by BF16 cases only. Found on the way: `Session::download_bf16` refused a BF16 tensor in
     FP32-sized slots; it reads each slot at its own length.
 
+- **W1: BF16 tensors in their own slots** (2026-11-11, gates card 0, the 1.7B card 1;
+  [log](../learnings/performance-log.md#w1-bf16-tensors-in-their-own-slots-named-in-the-tensor-reference-2026-11-11-cards-0-and-1)).
+  A tensor reference names its slots (`TensorRef::slot`): `READ_RUN`, `WRITE_RUN` and `SCATTER` step and size GDDR by
+  them, every other record refuses a BF16 slot by name, and `alloc_elem` gives a BF16 tensor 2,112-byte slots (the
+  new-architectures defect "a BF16 tensor takes an F32 slot", for `alloc_elem` and every op allocating through it;
+  Nemotron's fit not re-run). Gate `step270_native_bf16` with its control `tensor::probe_unnamed_slot`; the 1.7B within
+  its run-to-run band under both contracts.
+
 ## Prefill and long context
 
 Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-context.md](../plans/long-context.md).

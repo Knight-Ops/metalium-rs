@@ -518,6 +518,7 @@ fn records_against_entries() {
             first: 0,
             ct: 32,
             col_tiles: 0,
+            slot: 0,
         };
         let plain = |n: u32| -> Vec<[u32; 8]> {
             (0..n)

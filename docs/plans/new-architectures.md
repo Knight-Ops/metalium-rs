@@ -170,7 +170,7 @@ What `burn-tt` did that the host could not show (each a roadmap item; none is ch
    probe was killed at a 16 GB cap during the prompt; one layer, and three or four, stay flat over repeated passes,
    so the cause is not yet located. Not gated; BF16 weights go through `Bf16Stored` storage instead (the shipped
    1.7B configuration).
-3. **A BF16 tensor takes an F32 tile's slot in GDDR** (`DramTensor::alloc_elem` allocates `TILE_SLOT`, the FP32 slot,
+3. **Fixed 2026-11-11 for `alloc_elem`** (`TensorRef::slot`, roadmap W1; Nemotron's fit not re-run). **A BF16 tensor takes an F32 tile's slot in GDDR** (`DramTensor::alloc_elem` allocates `TILE_SLOT`, the FP32 slot,
    for every element type): BF16 halves bandwidth, not capacity. Nemotron's 5.6 GB BF16 per-layer table needs 11.3
    GB of GDDR, and its model did not fit. (`Bf16Stored` storage has compact slots.)
 4. **A cast of a freshly loaded tensor uploads the original first**: burn-tt holds a loaded tensor on the host until

@@ -4551,6 +4551,7 @@ impl<T: Transport> Session<T> {
     /// to host memory. `None` if there is no host memory (or a capture is on).
     /// The caller has synced.
     fn dma_download(&mut self, t: &DramTensor) -> Result<Option<Vec<f32>>, TensorError> {
+        t.expect_fp32_slots("read as 32-bit datums")?;
         if self.capture.is_some()
             || self.staging().is_none()
             || t.placement.layout() == tensor::Layout::ByColumn

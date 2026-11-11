@@ -12,10 +12,44 @@
 //! `bf16_to_f32(A)` (the expand) as an FP32 edge. That covers signed zeros, subnormals,
 //! infinities, NaN payloads and every normal. The negative control sets bit 13 of every
 //! widened datum, which survives the edge's TF32 cut: the products must then differ.
+//!
+//! **A BF16 tensor lives in its own slots, and data movement keeps it there**
+//! (`a_bf16_tensor_is_copied_in_its_own_slots`). `DramTensor::alloc_elem` gives a BF16 tensor
+//! 2,112-byte slots, and its reference names them (`TensorRef::slot`), so `READ_RUN` and
+//! `WRITE_RUN` step by them: a copy of a `[67, 300]` BF16 tensor (30 tiles over every channel,
+//! ragged edges) lands in BF16 slots with every datum's bits. The control names no slot for the
+//! source (`tensor::probe_unnamed_slot`, as every reference was before slots were named): the
+//! same copy then reads it at FP32 slots and moves other tiles' bytes. A download as 32-bit
+//! datums, which would read 4,096 bytes a tile, is refused by name.
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, TileChoice};
 use tt_kernels::tensor::{DramTensor, Pad};
 use tt_ttsim::fork_scope;
+
+fn open() -> Session<impl tt_device::Transport> {
+    #[cfg(not(feature = "silicon"))]
+    let mut s = {
+        let sim = Box::leak(Box::new(tt_ttsim::Simulator::open().unwrap()));
+        let dev = tt_device::Device::open(sim.transport()).unwrap();
+        Session::open(
+            dev,
+            tt_firmware_images::ROLES,
+            TileChoice::Count(2),
+            |_, _| Ok(None),
+        )
+        .unwrap()
+    };
+    #[cfg(feature = "silicon")]
+    let mut s = Session::open_card(
+        tt_tests::backend::device_index(),
+        tt_firmware_images::ROLES,
+        TileChoice::Count(2),
+    )
+    .unwrap();
+    s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
+        .unwrap();
+    s
+}
 
 fn product(s: &mut Session<impl tt_device::Transport>, a: &DramTensor, b: &DramTensor) -> Vec<u32> {
     let out = s
@@ -115,6 +149,46 @@ fn a_bf16_edge_is_its_widened_fp32_edge() {
         for t in [widened, b, marked, a] {
             s.free(t).unwrap();
         }
+    }) {
+        panic!("{e}");
+    }
+}
+
+#[test]
+fn a_bf16_tensor_is_copied_in_its_own_slots() {
+    if let Err(e) = fork_scope(|| {
+        let mut s = open();
+        let (rows, cols) = (67, 300);
+        // Every pattern class, then noise: a copy moves bits, whatever they are.
+        let bits: Vec<u16> = (0..rows * cols)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761).rotate_left(7) as u16)
+            .collect();
+        let source =
+            DramTensor::from_bf16(s.upload_bf16(&bits, rows, cols).unwrap(), Pad::Undefined);
+        let copy = s.copy(&source).unwrap();
+        assert_eq!(copy.elem, tt_kernels::tensor::Elem::BF16);
+        assert_eq!(copy.slot(0).len(), 2112, "a BF16 copy takes BF16 slots");
+        let got = s.download_bf16(&copy.as_bf16().unwrap()).unwrap();
+        let differ = (0..rows * cols).filter(|&i| got[i] != bits[i]).count();
+        assert_eq!(differ, 0, "{differ} of {} datums differ", rows * cols);
+        // Its slots are no FP32 tile's: the 32-bit datum paths refuse it by name.
+        let refused = s.download_bits(&copy).unwrap_err().to_string();
+        assert!(refused.contains("2112-byte slots"), "{refused}");
+
+        // The control: the same copy with the source's slots unnamed reads it in FP32-sized steps.
+        tt_kernels::tensor::probe_unnamed_slot(Some(&source));
+        let wrong = s.copy(&source);
+        tt_kernels::tensor::probe_unnamed_slot(None);
+        let wrong = wrong.unwrap();
+        let read = s.download_bf16(&wrong.as_bf16().unwrap()).unwrap();
+        let moved = (0..rows * cols).filter(|&i| read[i] != bits[i]).count();
+        assert!(
+            moved > rows * cols / 2,
+            "control: only {moved} datums moved"
+        );
+        s.free(wrong).unwrap();
+        s.free(copy).unwrap();
+        s.free(source).unwrap();
     }) {
         panic!("{e}");
     }

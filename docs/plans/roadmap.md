@@ -86,15 +86,14 @@ A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmet
   - Ceiling with a packed `A` whole in `SrcB` (2026-11-10): at most 2.5% of a product, none on the 1.7B's 512-row chunk (`matmul::probe_skip_reload`; [log](../learnings/performance-log.md#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0)). It was up to 24% only while a packed `A` took faces.
   - Needs a ttsim check of `Pack_L1_Acc` (else an isolated silicon gate and a divergence entry), the partial format stated, and a spec model.
   - Delete `probe_skip_reload` when it lands or is killed.
-- [ ] **Native BF16 arithmetic,** through the 1.7B on a BF16 stream. Bounded 2026-11-11 ([log](../learnings/performance-log.md#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0)): bit for bit today's widen-compute-narrow composition, so no op branches on the contract. Predicted a 256-token prefill ~1.08x (chunk products 1.19-1.24x), decode ~0 at short context and at most ~5% at 2K. Phases: BF16 slots in GDDR; SFPU ops with BF16 operands and results; products with a BF16 result (quantize on the last K chunk; kill if its cost eats the prefill gain) and a BF16 packed twin; burn-tt routing without `cast_native`; the 1.7B's norm, rope, attention and cache in BF16; tt-models' stream from the contract, `step269`, the bench and the default under the 0.5% rule.
+- [ ] **Native BF16 arithmetic,** through the 1.7B on a BF16 stream. Bounded 2026-11-11 ([log](../learnings/performance-log.md#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0)): bit for bit today's widen-compute-narrow composition, so no op branches on the contract. Predicted a 256-token prefill ~1.08x (chunk products 1.19-1.24x), decode ~0 at short context and at most ~5% at 2K. Phases: BF16 slots in GDDR (done 2026-11-11, `TensorRef::slot`); SFPU ops with BF16 operands and results; products with a BF16 result (quantize on the last K chunk; kill if its cost eats the prefill gain) and a BF16 packed twin; burn-tt routing without `cast_native`; the 1.7B's norm, rope, attention and cache in BF16; tt-models' stream from the contract, `step269`, the bench and the default under the 0.5% rule.
   - BF16 edges unpacked to `Src`, packed to BF16 slots (2 KiB);
   - a one-row BF16 result writes its packed twin in BF16 (`Session::set_packed_twins` writes F32 twins only, so a BF16 `A` is packed again at every product today);
   - `float_matmul` and the element-wise wrappers accept BF16 without `cast_native`;
   - BF16 tensors in BF16 GDDR slots.
-- [ ] **Fix the five BF16 defects found by the new architectures** (worked around, never fixed; [new-architectures.md](new-architectures.md)):
+- [ ] **Fix the four BF16 defects left from the new architectures** (worked around, never fixed; [new-architectures.md](new-architectures.md)):
   - a BF16 product with a transposed `B` copies it plain (> 40 GB of host bookkeeping at 248K x 2,560);
   - `Precision::Bf16` grows host memory without bound on Qwen3.5;
-  - a BF16 tensor takes an F32 slot in GDDR (`alloc_elem`);
   - casting a just-loaded tensor uploads the original first;
   - the block copier refuses element-interleaving moves past ~400K elements.
 - [ ] **The BF16 embedding lookup without staging** (`gather_indexed_bf16` still stages; `step167` BF16 takes 229 s). B now has the room it lacked (10-14 KiB after the firmware diet). It also ends a second copy in today's defaults: a tied Llama (the 1.7B) keeps its table F32 for the lookup and a stored, untied head beside it.

@@ -195,11 +195,24 @@ impl Placement {
             }
             None => 0,
         };
+        // An interleaved tensor of BF16 slots names them, so a record that steps by its slots
+        // (`READ_RUN`, `WRITE_RUN`, `SCATTER`) steps by 2,112 bytes and every other record refuses
+        // it. A packed tensor laid by column, or of BFP slots, names none: only a `GATHER` reads
+        // those, by its format flags.
+        let slot = if col_tiles == 0
+            && self.slot_bytes == tt_isa::dm::BF16_TILE_SLOT
+            && PROBE_UNNAMED_SLOT.load(std::sync::atomic::Ordering::Relaxed) != self.serial + 1
+        {
+            tt_isa::dm::BF16_TILE_SLOT as u32
+        } else {
+            0
+        };
         let mut r = TensorRef {
             n: self.channels.len() as u8,
             first: self.first as u32,
             ct: ct as u32,
             col_tiles,
+            slot,
             ..TensorRef::default()
         };
         for (i, (c, b)) in self.channels.iter().zip(&self.base).enumerate() {
@@ -861,14 +874,20 @@ impl DramTensor {
         Self::alloc_elem(alloc, rows, cols, Elem::F32)
     }
 
-    /// Allocate a `[rows, cols]` tensor of `elem`, contents undefined.
+    /// Allocate a `[rows, cols]` tensor of `elem`, contents undefined. A BF16 tensor takes BF16
+    /// slots (2,112 bytes a tile, half an FP32 tile's), which its reference names
+    /// ([`tt_isa::dm::record::TensorRef::slot`]); every other elem an FP32 tile's.
     pub fn alloc_elem(alloc: &mut DramAlloc, rows: usize, cols: usize, elem: Elem) -> Result<Self> {
         let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
+        let slot = match elem {
+            Elem::BF16 => tt_isa::dm::BF16_TILE_SLOT,
+            _ => TILE_SLOT,
+        };
         let t = DramTensor {
             rows,
             cols,
             elem,
-            placement: alloc.alloc(tiles)?,
+            placement: alloc.alloc_slots(tiles, slot)?,
             pad: std::cell::Cell::new(Pad::Undefined),
         };
         t.set_pad(Pad::Undefined);
@@ -910,6 +929,19 @@ impl DramTensor {
         let t = Self::alloc_elem(alloc, rows, cols, elem)?;
         t.write_bits(dev, w, values)?;
         Ok(t)
+    }
+
+    /// Refuse a tensor whose slots are not an FP32 tile's (BF16 or BFP tiles: a BF16 tensor's
+    /// datums go through `Session::upload_bf16` / `download_bf16`, a BFP one's through its
+    /// [`DramTensor::as_bfp`]) where `what` moves 4-byte datums a 4,096-byte tile.
+    pub(crate) fn expect_fp32_slots(&self, what: &str) -> Result<()> {
+        if self.placement.slot_bytes == TILE_SLOT {
+            return Ok(());
+        }
+        Err(TensorError::Shape(format!(
+            "a {:?} tensor in {}-byte slots is not {what}: use its own format's transfer",
+            self.elem, self.placement.slot_bytes
+        )))
     }
 
     /// Refuse anything but `want`, naming `op`.
@@ -974,6 +1006,7 @@ impl DramTensor {
     /// The checks every write makes: `len` datums for this tensor, its own
     /// slots (not a view's), and a `Bool` tensor's `bits` only `0` and `1`.
     pub fn check_write(&self, len: usize, bits: Option<&[u32]>) -> Result<()> {
+        self.expect_fp32_slots("written as 32-bit datums")?;
         if let (Elem::Bool, Some(values)) = (self.elem, bits) {
             if let Some(i) = values.iter().position(|&v| v > 1) {
                 return Err(TensorError::Shape(format!(
@@ -1108,6 +1141,7 @@ impl DramTensor {
     }
 
     fn download_any<T: Transport>(&self, dev: &mut Device<T>, w: &Window) -> Result<Vec<f32>> {
+        self.expect_fp32_slots("read as 32-bit datums")?;
         // A small tensor, or a view: tile by tile, and of each tile only the
         // faces and face rows its data reaches -- a `[1, n]` row is 64 bytes
         // from each of two faces, not 4 KiB per tile.
@@ -1933,6 +1967,20 @@ static PROBE_COLUMN_SHIFT: std::sync::atomic::AtomicBool =
 #[doc(hidden)]
 pub fn probe_column_shift(on: bool) {
     PROBE_COLUMN_SHIFT.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Native BF16's negative control (`step270_native_bf16`): one tensor of BF16 slots (its
+/// allocation's serial plus one; 0 for none) named with no slot, as every reference was before
+/// slots were named, so a run steps it at FP32 slots and reads other tiles' bytes. Host paths
+/// (writes, downloads) still address it by [`Placement::slot`].
+static PROBE_UNNAMED_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Name `t`'s BF16 slots as none ([`PROBE_UNNAMED_SLOT`]), or stop (`None`): a gate's control,
+/// never a result.
+#[doc(hidden)]
+pub fn probe_unnamed_slot(t: Option<&DramTensor>) {
+    let v = t.map_or(0, |t| t.placement.serial + 1);
+    PROBE_UNNAMED_SLOT.store(v, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// How a GDDR matmul reads `A` ([`matmul_dram_limited`]).

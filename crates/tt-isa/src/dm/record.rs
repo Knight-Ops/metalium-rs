@@ -16,7 +16,7 @@
 //! below, followed by two entries per tensor; [`len`] says how many entries in
 //! all. Records sit in a list among plain entries, and a list never splits one.
 
-use super::{op, TILE_DATA, TILE_SLOT};
+use super::{op, BF16_TILE_SLOT, TILE_DATA, TILE_SLOT};
 
 /// One matmul block's operands, GDDR -> L1: `[GATHER, flags, a_at, b_at, i0,
 /// rows, j0, cols]` + `A` + `B`. Row `i` of the block's `A` tiles, `K` tile
@@ -238,6 +238,9 @@ impl PrefetchCursor {
         }
         let (_, cols) = (extent(rows)?, extent(cols)?);
         let (_, b) = (tensor_any(rec, 1)?, tensor_any(rec, 3)?);
+        if !slot_agrees(&b, slot as u64) {
+            return Err(super::error::RANGE);
+        }
         let span = gather_span(rec, &b, flags, b_at, kt, j0, cols, slot)?;
         let thin = (flags >> GATHER_ROWS_SHIFT) & 0x1f;
         if thin > 16 || (thin != 0 && a_t) {
@@ -543,6 +546,15 @@ pub struct TensorRef {
     pub ct: u32,
     /// `0`: interleaved. Otherwise laid by column, each column this many tiles long.
     pub col_tiles: u32,
+    /// The bytes of each tile's slot in GDDR: `0` for [`TILE_SLOT`] (an FP32 tile, and every
+    /// tensor before slots were named), or [`BF16_TILE_SLOT`] for a tensor of BF16 tiles in
+    /// slots of their own size (roadmap W1, native BF16 arithmetic). [`READ_RUN`], [`WRITE_RUN`],
+    /// [`SCATTER`] and [`GATHER`] step and size their GDDR accesses by it (a BF16 tile is read
+    /// whole, its 2,112 bytes, and written as its 2,048 bytes of data); L1 keeps its
+    /// [`TILE_SLOT`] stride, so a kernel's slots do not move. Every other record, and the moves
+    /// that work on FP32 datums ([`op::READ_TRANSPOSED`], [`op::READ_BROADCAST_COL`]), refuse a
+    /// BF16 slot ([`super::error::RANGE`]).
+    pub slot: u32,
 }
 
 /// Word 4 of a tensor reference's first entry: the tensor is laid by column
@@ -557,8 +569,9 @@ pub const REF_BY_COLUMN: u32 = 2;
 pub const REF_L1_BY_COLUMN: u32 = 4;
 
 impl TensorRef {
-    /// `[n, channels (four bits each), first, ct, flags, col_tiles, 0, 0]` and the bases: `flags`
-    /// is [`REF_BY_COLUMN`] for a tensor laid by column, else 0, as is `col_tiles`.
+    /// `[n, channels (four bits each), first, ct, flags, col_tiles, slot, 0]` and the bases:
+    /// `flags` is [`REF_BY_COLUMN`] for a tensor laid by column, else 0, as is `col_tiles`;
+    /// `slot` is [`TensorRef::slot`] (0 for [`TILE_SLOT`]).
     pub fn encode(&self) -> [[u32; 8]; 2] {
         let mut packed = 0u32;
         for (i, c) in self.channels.iter().enumerate() {
@@ -577,7 +590,7 @@ impl TensorRef {
                 self.ct,
                 flags,
                 self.col_tiles,
-                0,
+                self.slot,
                 0,
             ],
             self.base,
@@ -602,6 +615,10 @@ impl TensorRef {
         } else {
             0
         };
+        // A slot is FP32's (0) or BF16's; a BF16 tensor is interleaved.
+        if m[6] != 0 && (m[6] != BF16_TILE_SLOT as u32 || col_tiles != 0) {
+            return Err(super::error::RANGE);
+        }
         let mut channels = [0u8; 8];
         for (i, c) in channels.iter_mut().enumerate() {
             *c = ((m[1] >> (4 * i)) & 0xF) as u8;
@@ -613,10 +630,31 @@ impl TensorRef {
             first: m[2],
             ct: m[3],
             col_tiles,
+            slot: m[6],
         })
     }
 
-    /// `(channel, offset)` of tile `(i, j)`'s slot.
+    /// The bytes of a tile's slot in GDDR ([`TensorRef::slot`]).
+    pub const fn slot_bytes(&self) -> u64 {
+        if self.slot == 0 {
+            TILE_SLOT
+        } else {
+            self.slot as u64
+        }
+    }
+
+    /// The bytes of a tile's data, after its [`TILE_DATA`] header: 4,096 for FP32, 2,048 for BF16.
+    const fn data_bytes(&self) -> u32 {
+        if self.slot == 0 {
+            4096
+        } else {
+            2048
+        }
+    }
+
+    /// `(channel, offset)` of tile `(i, j)`'s slot, in FP32 slots: a [`GATHER`]'s (whose packed
+    /// operands name their slot in its flags). [`READ_RUN`] and its kin step by the tensor's own
+    /// ([`TensorRef::tile_in`] with [`TensorRef::slot_bytes`]).
     fn tile(&self, i: u32, j: u32) -> Result<(u32, u32), u32> {
         self.tile_in(i, j, TILE_SLOT)
     }
@@ -814,21 +852,36 @@ impl BSpan {
 
 /// The reference at `rec[at]`, interleaved: every record but a [`GATHER`]'s `B` reads only
 /// those, and refuses one laid by column ([`super::error::LAYOUT`]) rather than misaddress it.
+/// Its slots are FP32's: a BF16 slot ([`TensorRef::slot`]) is refused ([`super::error::RANGE`]).
 fn tensor(rec: &[[u32; 8]], at: usize) -> Result<TensorRef, u32> {
-    tensor_of(rec, at, false)
+    tensor_of(rec, at, false, false)
 }
 
-/// The reference at `rec[at]` in either layout: a [`GATHER`]'s operands.
+/// [`tensor`] in slots of either size: [`READ_RUN`], [`WRITE_RUN`] and [`SCATTER`]'s tensor.
+fn tensor_slotted(rec: &[[u32; 8]], at: usize) -> Result<TensorRef, u32> {
+    tensor_of(rec, at, false, true)
+}
+
+/// The reference at `rec[at]` in either layout and slot: a [`GATHER`]'s operands.
 fn tensor_any(rec: &[[u32; 8]], at: usize) -> Result<TensorRef, u32> {
-    tensor_of(rec, at, true)
+    tensor_of(rec, at, true, true)
 }
 
-/// [`tensor`] (`any` false) or [`tensor_any`]: one body (the B image's room).
+/// Whether a [`GATHER`] operand's slot agrees with the one its format flags give it: a reference
+/// that names no slot (0) takes the flags'; one that names BF16's must be read as BF16.
+fn slot_agrees(x: &TensorRef, slot: u64) -> bool {
+    x.slot == 0 || x.slot_bytes() == slot
+}
+
+/// [`tensor`], [`tensor_slotted`] or [`tensor_any`]: one body (the B image's room).
 #[inline(never)]
-fn tensor_of(rec: &[[u32; 8]], at: usize, any: bool) -> Result<TensorRef, u32> {
+fn tensor_of(rec: &[[u32; 8]], at: usize, any: bool, slotted: bool) -> Result<TensorRef, u32> {
     let x = TensorRef::decode([rec[at], rec[at + 1]])?;
     if !any && (x.col_tiles != 0 || l1_by_column(rec, at)) {
         return Err(super::error::LAYOUT);
+    }
+    if !slotted && x.slot != 0 {
+        return Err(super::error::RANGE);
     }
     Ok(x)
 }
@@ -1123,6 +1176,9 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             }
             let (rows, cols) = (extent(rows)?, extent(cols)?);
             let (a, b) = (tensor_any(rec, 1)?, tensor_any(rec, 3)?);
+            if !slot_agrees(&a, a_slot) || !slot_agrees(&b, b_slot) {
+                return Err(super::error::RANGE);
+            }
             // Tile (i, j) of op(X), into L1 at `to`.
             let fetch =
                 |x: &TensorRef, t: bool, i: u32, j: u32, to: u32| -> Result<[u32; 8], u32> {
@@ -1224,11 +1280,12 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         SCATTER => {
             let [_, out_at, stride, i0, rows, j0, cols, _] = h;
             let (rows, cols) = (extent(rows)?, extent(cols)?);
-            let c = tensor(rec, 1)?;
+            let c = tensor_slotted(rec, 1)?;
+            let (whole, data) = (c.slot_bytes(), c.data_bytes());
             for i in 0..rows {
                 let mut row = c.cursor(i0 + i, j0)?;
                 for j in 0..cols {
-                    let (ch, off) = row.next()?;
+                    let (ch, off) = row.next_with_slot(whole)?;
                     let out = out_at + (i * cols + j) * stride;
                     emit([
                         op::WRITE,
@@ -1236,7 +1293,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                         (i + j) % PORTS,
                         off + TILE_DATA as u32,
                         out,
-                        4096,
+                        data,
                         0,
                         0,
                     ])?;
@@ -1246,7 +1303,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         READ_RUN | WRITE_RUN => {
             let [_, first, count, at, flags, grid_ct, grid_rt, _] = h;
             let count = extent(count)?;
-            let x = tensor(rec, 1)?;
+            let x = tensor_slotted(rec, 1)?;
             let read = READS && (!WRITES || h[0] == READ_RUN);
             let (row, col) = (read && flags & 1 != 0, read && flags & 2 != 0);
             // The grid the run counts over: the output's for a broadcast, the
@@ -1264,6 +1321,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             if transposed && (row || col || column_major) {
                 return Err(super::error::LENGTH);
             }
+            // The moves that work on FP32 datums take FP32 tiles only.
+            if x.slot != 0 && (transposed || (col && flags & 16 == 0)) {
+                return Err(super::error::RANGE);
+            }
+            let (whole, data) = (x.slot_bytes() as u32, x.data_bytes());
             let (mut i, mut j) = if column_major {
                 let (q, r) = (first / grid_rt, first % grid_rt);
                 (r, q)
@@ -1290,9 +1352,13 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 }
                 let slot = at + n * TILE_SLOT as u32;
                 let (ch, off) = match run.as_mut() {
-                    Some(r) => r.next()?,
+                    Some(r) => r.next_with_slot(whole as u64)?,
                     None if transposed => x.tile(j, i)?,
-                    None => x.tile(if row { 0 } else { i }, if col { 0 } else { j })?,
+                    None => x.tile_in(
+                        if row { 0 } else { i },
+                        if col { 0 } else { j },
+                        whole as u64,
+                    )?,
                 };
                 let op = if col && flags & 16 == 0 {
                     op::READ_BROADCAST_COL
@@ -1302,7 +1368,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     op::READ
                 };
                 emit(if read {
-                    [op, ch, n % PORTS, off, slot, TILE_SLOT as u32, 0, 0]
+                    [op, ch, n % PORTS, off, slot, whole, 0, 0]
                 } else {
                     [
                         op::WRITE,
@@ -1310,7 +1376,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                         n % PORTS,
                         off + TILE_DATA as u32,
                         slot + TILE_DATA as u32,
-                        4096,
+                        data,
                         0,
                         0,
                     ]
@@ -3300,5 +3366,131 @@ mod tests {
                 head[0]
             );
         }
+    }
+
+    use crate::dm::error::RANGE;
+
+    /// `x` with BF16 slots ([`TensorRef::slot`]).
+    fn bf16(x: TensorRef) -> TensorRef {
+        TensorRef {
+            slot: BF16_TILE_SLOT as u32,
+            ..x
+        }
+    }
+
+    fn entries<const READS: bool>(rec: &[[u32; 8]]) -> Result<Vec<[u32; 8]>, u32> {
+        let mut out = Vec::new();
+        let push = |e| {
+            out.push(e);
+            Ok(())
+        };
+        if READS {
+            expand_reads(rec, |_| 0, push)?;
+        } else {
+            expand_writes(rec, |_| 0, push)?;
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn a_tensor_ref_names_its_slot_and_refuses_any_other() {
+        let x = bf16(t(3, 5));
+        assert_eq!(x.encode()[0][6], BF16_TILE_SLOT as u32);
+        assert_eq!(TensorRef::decode(x.encode()), Ok(x));
+        assert_eq!(t(3, 5).encode()[0][6], 0, "an FP32 reference is unchanged");
+        for bad in [1, 2048, TILE_SLOT as u32, 1088] {
+            let mut w = x.encode();
+            w[0][6] = bad;
+            assert_eq!(TensorRef::decode(w), Err(RANGE), "slot {bad}");
+        }
+        let mut by_col = x.encode();
+        by_col[0][4] = REF_BY_COLUMN;
+        by_col[0][5] = 2;
+        assert_eq!(TensorRef::decode(by_col), Err(RANGE), "BF16 laid by column");
+    }
+
+    #[test]
+    fn a_run_steps_and_sizes_bf16_slots_as_their_own() {
+        // Tiles 2..7 of a [2, 5]-tile tensor over 3 channels: the same channels and slot numbers
+        // as an FP32 tensor's, 2,112 bytes apart in GDDR and read whole; L1 keeps TILE_SLOT apart.
+        let (fp32, half) = (t(3, 5), bf16(t(3, 5)));
+        let run = |x: &TensorRef, op: u32| {
+            let [x0, x1] = x.encode();
+            [[op, 2, 5, 0x2_0000, 0, 5, 0, 0], x0, x1]
+        };
+        let wide = entries::<true>(&run(&fp32, READ_RUN)).unwrap();
+        let narrow = entries::<true>(&run(&half, READ_RUN)).unwrap();
+        assert_eq!(narrow.len(), 5);
+        for (n, (w, b)) in wide.iter().zip(&narrow).enumerate() {
+            let tile = 2 + n as u32;
+            let (slot, c) = (tile / 3, tile % 3);
+            assert_eq!(b[1], w[1], "channel of tile {tile}");
+            assert_eq!(w[3], fp32.base[c as usize] + slot * TILE_SLOT as u32);
+            assert_eq!(b[3], half.base[c as usize] + slot * BF16_TILE_SLOT as u32);
+            assert_eq!(b[4], w[4], "L1 slot of tile {tile}");
+            assert_eq!((w[5], b[5]), (TILE_SLOT as u32, BF16_TILE_SLOT as u32));
+        }
+        // A write moves the data, 2,048 bytes of it, to the same places.
+        let writes = entries::<false>(&run(&half, WRITE_RUN)).unwrap();
+        for (w, r) in writes.iter().zip(&narrow) {
+            assert_eq!(
+                (w[0], w[3], w[5]),
+                (op::WRITE, r[3] + TILE_DATA as u32, 2048)
+            );
+        }
+        // A row broadcast and a column read as it lies are plain reads: taken.
+        for flags in [1, 2 | 16] {
+            let mut rec = run(&half, READ_RUN);
+            rec[0][4] = flags;
+            assert!(entries::<true>(&rec).is_ok(), "flags {flags}");
+        }
+        // The moves on FP32 datums are not.
+        for flags in [2, 8] {
+            let mut rec = run(&half, READ_RUN);
+            rec[0][4] = flags;
+            assert_eq!(entries::<true>(&rec), Err(RANGE), "flags {flags}");
+        }
+    }
+
+    #[test]
+    fn a_scatter_writes_a_bf16_tiles_data_into_its_own_slot() {
+        let c = bf16(t(2, 4));
+        let [c0, c1] = c.encode();
+        let rec = [[SCATTER, 0x2_0000, TILE_SLOT as u32, 1, 1, 1, 2, 0], c0, c1];
+        let writes = entries::<false>(&rec).unwrap();
+        // Tiles (1, 1) and (1, 2): tile 5 and 6, slots 2 and 3 on channels 1 and 0.
+        let want = [(1, 2, 0x2_0000), (0, 3, 0x2_0000 + TILE_SLOT as u32)];
+        assert_eq!(writes.len(), 2);
+        for (w, (ch, slot, from)) in writes.iter().zip(want) {
+            let at = c.base[ch as usize] + slot * BF16_TILE_SLOT as u32 + TILE_DATA as u32;
+            assert_eq!(
+                [w[0], w[1], w[3], w[4], w[5]],
+                [op::WRITE, ch, at, from, 2048]
+            );
+        }
+    }
+
+    #[test]
+    fn records_that_move_fp32_tiles_refuse_bf16_slots() {
+        let half = bf16(t(2, 2));
+        let [x0, x1] = half.encode();
+        for head in [
+            [SELECT_ROWS, 0x3_0000, 1, 32, 0, 2, 0x2_0000, 0],
+            [SCATTER_ROWS, 0x3_0000, 1, 32, 0, 2, 0x2_0000, 0],
+        ] {
+            assert_eq!(
+                expand(&[head, x0, x1], |_| Ok(())),
+                Err(RANGE),
+                "op {:#x}",
+                head[0]
+            );
+        }
+        // A gather's operand: a BF16 slot needs the BF16 format flag.
+        let fp32 = b_gather(0, 2, 0, 2, &half, false);
+        assert_eq!(expanded_reads(&fp32), Err(RANGE), "an FP32 B in BF16 slots");
+        let named = b_gather(GATHER_B_BF16, 2, 0, 2, &half, false);
+        let unnamed = b_gather(GATHER_B_BF16, 2, 0, 2, &t(2, 2), false);
+        assert_eq!(expanded_reads(&named), expanded_reads(&unnamed));
+        assert!(expanded_reads(&named).is_ok());
     }
 }
