@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: native BF16 arithmetic bounded before building](#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0) | 2026-11-11 | the 1.7B's chunk products with a BF16 `A` (BFP8 `B`, HiFi4): **1.19x** at 256 rows, **1.24x** at 512 (4.7 / 8.7 ms a chunk); a 256-token prefill predicted ~1.08x; decode ~0 at short context, at most ~0.9 ms at 2K from a BF16 cache (attention is not byte-bound); a BF16 edge equals its widened FP32 edge over all 65,536 patterns (`step270`, ttsim and card 0) |
 | [W1: the one-row path for a BF16 `A`, its decode products at the FP32 `A`'s step](#w1-the-one-row-path-for-a-bf16-a-its-decode-products-at-the-fp32-as-step-2026-11-10-cards-0-and-1) | 2026-11-10 | roadmap W1's next box: a BF16 row packed in its own format (32-byte face rows, FP32-sized slots), prefetched, busy-prefetched and streamed as an FP32 row, bit for bit (card 0); decode products at `m` = 1, BF16 x BFP8 HiFi2 10.74 -> **6.99 ms** (FP32 `A` 7.00), BF16 x BF16 14.33 -> 10.34 (10.19); `down` 177 -> 71 us; no model gains until BF16 activations |
 | [W1: a packed tile whole in `SrcB`, a BF16 `A` past the FP32 `A`'s rate](#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0) | 2026-11-10 | roadmap W1's second box: a BF16/BFP `A` whole in `SrcB`, bit for bit (card 0), licensed in `whole_tile_unpack`; BF16 `A` HiFi4 prefill 22-30 -> **29-70 TFLOPS**, 1.13-1.32x the FP32 `A`, fidelity no longer binding; H13 1.27x (1.34x with BFP8); packer L1 accumulation's ceiling now <= 2.5% |
 | [W1: BFP8 weights the inference default, behind the contract switch and a model gate](#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1) | 2026-11-10 | roadmap W1's first box closed: `burn_tt::Numerics`, `Llama`/`Qwen35::for_inference`, the model gate `step269` (BFP8: top-1 98.28%, top-5 100%, PCC 0.99968 over 232 teacher-forced positions; BFP4 `gate\|up` 86.64% / 0.93, recorded). 1.7B decode under the performance contract **7.52 ms** (reference 9.81). Also: a fused, stored Llama held `q`, `k`, `v`, `gate`, `up` twice (135M BF16 543 -> 399 MB) |
@@ -422,6 +423,50 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: native BF16 arithmetic bounded before building (2026-11-11, card 0)
+
+Roadmap W1's next box, native BF16 arithmetic ([tt-metal-parity.md](../plans/tt-metal-parity.md) §5 W1), taken through
+the 1.7B on a BF16 activation stream. The big-bet rule asks for its end-to-end prediction first. Release, safe image,
+every tile, `0fb93a4` plus this change.
+
+**The design it bounds.** A native BF16 op computes what today's composition computes (widen each BF16 operand with
+the expand, run the F32 op, narrow once with the SFPU ties-even quantize and a BF16 pack), so it is a schedule choice
+under ADR 0005, legal under both contracts. Only the model's activation dtype depends on the contract.
+
+**A BF16 edge is its widened FP32 edge** (`step270_native_bf16::a_bf16_edge_is_its_widened_fp32_edge`, ttsim and card 0,
+`1794369081`). Each of the 65,536 BF16 patterns, as a row of `A` against `B = [[1.0]]`, gives the same product bits read as
+a BF16 edge (`SrcRoute::Edges`) as read from the expand's FP32 result. On both, the expand widens every pattern to its
+bits shifted left 16: signed zeros, subnormals, infinities and NaN payloads kept. The control (bit 13 set in every
+widened datum, which survives the TF32 cut) changes the products.
+
+**Prefill products** (`silicon_probe_performance_contract::prefill_products`, `TT_CONTRACT_PREFILL` the 1.7B's four
+products at 256 and 512 rows, `TT_CONTRACT_PREFILL_CONFIGS=fp32:bfp8:hifi4,bf16:bfp8:hifi4`, the new knob; `1794368656`).
+The performance contract's weights and today's fidelity, `A` FP32 (today's stream) against BF16:
+
+| us (TFLOPS) | qkv | o | gate\|up | down | a layer | ratio |
+|---|--:|--:|--:|--:|--:|--:|
+| 256 rows, `A` FP32 | 214.9 (30.0) | 119.1 (18.0) | 399.4 (43.0) | 471.7 (18.2) | 1,205 | |
+| 256 rows, `A` BF16 | 177.3 (36.3) | 101.4 (21.2) | 341.2 (50.4) | 389.2 (22.1) | 1,009 | **1.19x** |
+| 512 rows, `A` FP32 | 331.1 (38.9) | 189.3 (22.7) | 692.9 (49.6) | 664.0 (25.9) | 1,877 | |
+| 512 rows, `A` BF16 | 266.5 (48.4) | 146.2 (29.4) | 544.2 (63.1) | 557.3 (30.8) | 1,514 | **1.24x** |
+
+- A 256-row chunk's products save 196 us a layer, **4.7 ms** a chunk; a 512-row chunk's 363 us, **8.7 ms**.
+- `A`'s gathers still cost: skipping them takes the 256-row layer to 806 (BF16) against 846 us (FP32).
+
+**Predictions.**
+- **Prefill:** a 256-token prompt (63.7 ms at 4,019 tokens/s, `1794349089`) loses ~4.7 ms of products: **~1.08x**, less
+  the quantize's cost on each result tile and plus whatever half bytes buy the other ops. Under the plan's 1.10-1.24x,
+  which took products as 79% of a chunk (a 64-token chunk of 2026-10-31); they are ~45% of a 256-token prompt now.
+- **Decode at short context: ~0.** At `m` = 1 the products are bound by `B`'s reads (6.99 against 7.00 ms, above), and
+  the other ops by latency (2.98 ms for 47 MB, `1793023409`).
+- **Decode at long context: at most ~5% at 2K.** The step grows 4.9 us a position (7.52 -> 8.62 ms from 32 to 256 tokens),
+  and the F32 cache is 393 KB a position, 0.84 us at 470 GB/s: attention is not byte-bound, so a BF16 cache saves at most
+  ~0.42 us a position, ~0.9 ms at 2,048.
+- **The kill does not fire** (below 1.05x on prefill and no decode gain). The quantize's cost is measured with P3's
+  products; if it eats the prefill gain, the box stops there.
+- **What it unblocks:** W3's `m` = 32 products (BF16 x BFP8 HiFi2 11.9 against 17.4 ms), the derived fidelity (it moves
+  products only once `A` is BF16), the BF16 KV cache, and Burn's own BF16 arithmetic without cast ops.
 
 ## W1: the one-row path for a BF16 `A`, its decode products at the FP32 `A`'s step (2026-11-10, cards 0 and 1)
 

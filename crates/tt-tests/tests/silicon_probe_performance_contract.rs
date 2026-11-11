@@ -34,7 +34,8 @@
 //!
 //! Knobs: `TT_CONTRACT_ROWS` (`1,32`), `TT_CONTRACT_A` (`fp32,bf16`), `TT_CONTRACT_B`
 //! (`bf16,bfp8,bfp4`), `TT_CONTRACT_FIDELITIES` (`hifi4,hifi2,lo`), `TT_CONTRACT_STEP_MS`
-//! (`9.90`), `TT_CONTRACT_PREFILL` (`m,k,n;...`). Silicon only, a probe:
+//! (`9.90`), `TT_CONTRACT_PREFILL` (`m,k,n;...`), `TT_CONTRACT_PREFILL_CONFIGS`
+//! (`a:b:fidelity,...`). Silicon only, a probe:
 //! `cargo xtask bench --device 1 --filter silicon_probe_performance_contract`.
 #![cfg(feature = "silicon")]
 
@@ -450,6 +451,24 @@ fn prefill_shapes() -> Vec<[usize; 3]> {
     })
 }
 
+/// `TT_CONTRACT_PREFILL_CONFIGS` (`a:b:fidelity,...`, e.g. `fp32:bfp8:hifi4,bf16:bfp8:hifi4`), or
+/// `PREFILL_CONFIGS`.
+fn prefill_configs() -> Vec<(TileFormat, TileFormat, Fidelity)> {
+    std::env::var("TT_CONTRACT_PREFILL_CONFIGS").map_or(PREFILL_CONFIGS.to_vec(), |v| {
+        v.split(',')
+            .map(|c| {
+                let p: Vec<&str> = c.trim().split(':').collect();
+                assert_eq!(
+                    p.len(),
+                    3,
+                    "TT_CONTRACT_PREFILL_CONFIGS: a:b:fidelity, not {c}"
+                );
+                (format_named(p[0]), format_named(p[1]), fidelity_named(p[2]))
+            })
+            .collect()
+    })
+}
+
 fn prefill(skip_reload: bool) {
     fork_scope(|| {
         // In the child, before its session builds any program.
@@ -466,7 +485,7 @@ fn prefill(skip_reload: bool) {
         for [m, k, n] in prefill_shapes() {
             let (av, bv) = (integers(m * k, 1), integers(k * n, 3));
             let flops = 2.0 * (m * k * n) as f64;
-            for &(fa, fb, fidelity) in &PREFILL_CONFIGS {
+            for &(fa, fb, fidelity) in &prefill_configs() {
                 let what = format!(
                     "prefill [{m},{k}]@[{k},{n}] A {} B {} {}",
                     name(fa),
