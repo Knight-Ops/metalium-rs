@@ -21,7 +21,13 @@
 //! - **An honest claim.** The output's padding rows hold later packed rows' products: its claim
 //!   is `Undefined`.
 //!
-//! The unit test `a_packed_a_is_read_in_k_over_1024_tiles` (tt-kernels) counts the reads.
+//! - **A BF16 row** (roadmap W1: a BF16 activation): packed in its own format, its face rows 32
+//!   bytes, in FP32-sized slots; the product of the row read whole, and of an FP32 `A` of the same
+//!   values, bit for bit, case by case, streamed or not. The control relays it at FP32's strides
+//!   (`matmul::probe_fp32_row_strides`) and gets another product.
+//!
+//! The unit tests `a_packed_a_is_read_in_k_over_1024_tiles` and
+//! `a_packed_bf16_a_is_read_in_k_over_1024_tiles` (tt-kernels) count the reads.
 
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, TileChoice};
@@ -220,5 +226,135 @@ fn a_packed_a_gives_the_unpacked_products_bits() {
                 s.free(t).unwrap();
             }
         }
+    });
+}
+
+/// `x` cut to BF16 (its top 16 bits): the bits a BF16 activation holds, and the values they are.
+fn bf16_of(x: &[f32]) -> (Vec<u16>, Vec<f32>) {
+    let bits: Vec<u16> = x.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+    let vals = bits
+        .iter()
+        .map(|&b| f32::from_bits((b as u32) << 16))
+        .collect();
+    (bits, vals)
+}
+
+/// A BF16 activation `[1, k]` ([`tensor::DramTensor::from_bf16`], interleaved, padding zero).
+fn bf16_row<T: tt_device::Transport>(s: &mut Session<T>, bits: &[u16]) -> tensor::DramTensor {
+    let k = bits.len();
+    tensor::DramTensor::from_bf16(s.upload_bf16(bits, 1, k).unwrap(), Pad::Zero)
+}
+
+/// A BF16 row's packing (roadmap W1): the host's `[K / 32, 32]` reshape of its bits, in the
+/// packed row's FP32-sized slots, its format kept.
+#[test]
+fn a_packed_bf16_row_is_the_rows_reshape() {
+    with_session(|s| {
+        for k in [1024, 1056, 8192] {
+            let (bits, _) = bf16_of(&with_specials(k as u64, k));
+            let t = bf16_row(s, &bits);
+            let packed = s.pack_row(&t).unwrap();
+            assert_eq!([packed.rows, packed.cols], [k / 32, 32]);
+            assert_eq!(packed.elem, tensor::Elem::BF16, "K {k}: the format kept");
+            if (k / 32) % 32 != 0 {
+                assert_eq!(packed.pad(), Pad::Undefined, "K {k}: the claim");
+            }
+            let got = s.download_bf16(&packed.as_bf16().unwrap()).unwrap();
+            assert_eq!(got, bits, "K {k}: the reshape, bit for bit");
+            for t in [t, packed] {
+                s.free(t).unwrap();
+            }
+            println!("K {k}: BF16 packed bit for bit");
+        }
+    });
+}
+
+/// A one-row BF16 `A` read from its packed row (roadmap W1) is the product of the row read as
+/// whole BF16 tiles (`set_packed_thin_a` off), streamed or not, case by case -- and the product of
+/// an FP32 `A` holding the same values (a BF16 tile unpacked is the FP32 product of the values
+/// it decodes to, `step241`). Another BF16 row's product through the same slots first.
+#[test]
+fn a_packed_bf16_a_gives_the_unpacked_products_bits() {
+    with_session(|s| {
+        for (i, c) in CASES.iter().enumerate() {
+            let &Case { k, n, b_t, k_block } = c;
+            let label = format!("BF16 [1, {k}] @ [{k}, {n}] b_t {b_t} k_block {k_block:?}");
+            let (rows, cols) = if b_t { (n, k) } else { (k, n) };
+            let (bits, vals) = bf16_of(&with_specials(10 + i as u64, k));
+            let a = bf16_row(s, &bits);
+            let (other_bits, _) = bf16_of(&floats(20 + i as u64, k));
+            let other = bf16_row(s, &other_bits);
+            let a32 = s.upload(&vals, 1, k).unwrap();
+            let b = s
+                .upload(&floats(30 + i as u64, rows * cols), rows, cols)
+                .unwrap();
+            s.set_matmul_k_block_limit(k_block.and_then(std::num::NonZeroUsize::new));
+            let product = |s: &mut Session<_>, x: &tensor::DramTensor, packed, streamed| {
+                s.set_packed_thin_a(packed);
+                s.set_streamed_k(streamed);
+                let out = s.matmul_dram(x, false, &b, b_t, ROUTE, Fidelity::HiFi4, BUDGET);
+                s.set_packed_thin_a(true);
+                s.set_streamed_k(true);
+                out.unwrap_or_else(|e| panic!("{label}: {e}"))
+            };
+            let whole = product(s, &a, false, false);
+            let want = s.download(&whole).unwrap();
+            let fp32 = product(s, &a32, false, false);
+            assert_bits(
+                &s.download(&fp32).unwrap(),
+                &want,
+                &format!("{label}: FP32 A"),
+            );
+            for streamed in [false, true] {
+                let primed = product(s, &other, true, streamed);
+                let got = product(s, &a, true, streamed);
+                let label = format!("{label} streamed {streamed}");
+                assert_bits(&s.download(&got).unwrap(), &want, &label);
+                assert_eq!(got.pad(), Pad::Undefined, "{label}: the claim");
+                for t in [primed, got] {
+                    s.free(t).unwrap();
+                }
+                println!("{label}: bit for bit");
+            }
+            s.set_matmul_k_block_limit(None);
+            for t in [whole, fp32, a, other, a32, b] {
+                s.free(t).unwrap();
+            }
+        }
+    });
+}
+
+/// The negative control: a BF16 row's pairs stepped by FP32's 64-byte face rows
+/// (`matmul::probe_fp32_row_strides`) unpack the wrong values, so the packed product is not the
+/// whole-tile one. In a session of its own: the hook is set before any program is built.
+#[test]
+fn a_bf16_row_relayed_at_fp32_strides_is_another_product() {
+    with_session(|s| {
+        let (k, n) = (2048, 96);
+        let (bits, _) = bf16_of(&floats(41, k));
+        let a = bf16_row(s, &bits);
+        let b = s.upload(&floats(42, k * n), k, n).unwrap();
+        s.set_packed_thin_a(false);
+        let whole = s
+            .matmul_dram(&a, false, &b, false, ROUTE, Fidelity::HiFi4, BUDGET)
+            .unwrap();
+        let want = s.download(&whole).unwrap();
+        tt_kernels::matmul::probe_fp32_row_strides(true);
+        s.set_packed_thin_a(true);
+        let got = s
+            .matmul_dram(&a, false, &b, false, ROUTE, Fidelity::HiFi4, BUDGET)
+            .unwrap();
+        let got = s.download(&got).unwrap();
+        tt_kernels::matmul::probe_fp32_row_strides(false);
+        let differ = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        assert!(
+            differ > n / 2,
+            "only {differ} of {n} columns differ: the control is blind"
+        );
+        println!("FP32 strides on a BF16 row: {differ} of {n} columns differ");
     });
 }

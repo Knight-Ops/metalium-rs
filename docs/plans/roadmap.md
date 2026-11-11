@@ -75,19 +75,20 @@ In order; W1-W4 can overlap. Each item's prediction, kill criterion and gate are
 **Bounded 2026-11-09** ([log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1); achievements):
 - BFP8 weights alone take the 1.7B's step 9.83 -> 7.51 ms, so the 8.0 ms kill (on the predicted step) does not fire.
 - Fidelity moves nothing at `m` = 1.
-- A BF16 `A` was slower until a packed tile ran whole in `SrcB`; at `m` = 1 it still is until the one-row box below lands.
+- A BF16 `A` was slower until a packed tile ran whole in `SrcB` (prefill) and a BF16 row was packed (decode), both 2026-11-10.
 
-BFP8 weights are the inference default since 2026-11-10, behind the contract switch and the model gate `step269` (achievements). A packed tile whole in `SrcB` landed the same day (achievements): a BF16 `A`'s prefill products 1.13-1.32x the FP32 `A`'s. The next two boxes run in this order.
-- [ ] **The one-row path for a BF16 `A`.**
-  - `packed_thin_a` and the weight prefetch (`weight_prefetch` needs `packed_a`) take only an FP32 row today. A BF16 row reads its `K / 32` tiles an entry each on every unit: decode products 1.4x slower (`down` 184 us whatever `B` is).
-  - Pack a BF16 row and prefetch beside it.
-  - Predicted: at least the FP32 row's step with half its bytes.
+BFP8 weights are the inference default since 2026-11-10, behind the contract switch and the model gate `step269` (achievements). The same day (achievements):
+- a packed tile whole in `SrcB`: a BF16 `A`'s prefill products 1.13-1.32x the FP32 `A`'s;
+- the one-row path for a BF16 `A`: its decode products at the FP32 `A`'s step (BFP8 `B`, HiFi2: 10.74 -> 6.99 ms of products, FP32 `A` 7.00).
+
+A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmetic (below) is what turns it into a gain on a model. Packer L1 accumulation first needs the owner's decision.
 - [ ] **Packer L1 accumulation: below the 3% rule now; the owner decides whether it moves to failed-approaches.**
   - Ceiling with a packed `A` whole in `SrcB` (2026-11-10): at most 2.5% of a product, none on the 1.7B's 512-row chunk (`matmul::probe_skip_reload`; [log](../learnings/performance-log.md#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0)). It was up to 24% only while a packed `A` took faces.
   - Needs a ttsim check of `Pack_L1_Acc` (else an isolated silicon gate and a divergence entry), the partial format stated, and a spec model.
   - Delete `probe_skip_reload` when it lands or is killed.
 - [ ] **Native BF16 arithmetic:**
   - BF16 edges unpacked to `Src`, packed to BF16 slots (2 KiB);
+  - a one-row BF16 result writes its packed twin in BF16 (`Session::set_packed_twins` writes F32 twins only, so a BF16 `A` is packed again at every product today);
   - `float_matmul` and the element-wise wrappers accept BF16 without `cast_native`;
   - BF16 tensors in BF16 GDDR slots.
 - [ ] **Fix the five BF16 defects found by the new architectures** (worked around, never fixed; [new-architectures.md](new-architectures.md)):
@@ -149,7 +150,6 @@ BFP8 weights are the inference default since 2026-11-10, behind the contract swi
 - [x] **The grid by default** (2026-11-09): `Topology::single` and burn-tt's auto-attach open every tile; an eager op runs at `work:64:4` and a captured one on every unit (`Session::set_capture_spread`); `TT_SPREAD` sets both. On card 0, MNIST eager 2.17 -> 1.55-1.81 ms a step and traced 1.31; the transformer eager 8.5 -> 9.4 (its ops are tiny), traced 3.75 ([performance-log](../learnings/performance-log.md#training-on-every-tile-traced-by-default-2026-11-09-card-0)).
 - [ ] **The grid's leftovers:**
   - the tiny transformer's eager step is still 10% slower on every tile than on one (~5 us of host a unit an op): a per-op spread with a cheaper catch-up, or auto-capture;
-  - per card for a mesh;
   - per card for a mesh;
   - an autotune cache keyed by `(op, shape, dtype)`;
   - B16 placement.

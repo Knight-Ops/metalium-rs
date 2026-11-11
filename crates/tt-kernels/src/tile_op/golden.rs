@@ -611,6 +611,7 @@ impl Product {
         } else {
             self.a[1]
         };
+        // The packed row in FP32 slots whatever its format, as `tensor::pack_row` allocates it.
         let p = operand(&mut alloc, [k / 32, 32], Elem::F32);
         let mut reads = self.reads;
         // As `Session::matmul_dram` reads a packed `A`: whole tiles of its format.
@@ -827,6 +828,34 @@ fn matmul_jobs_are_pinned() {
                     p.packed_a = true;
                     p.prefetch = true;
                     p.spread = 120;
+                    p.run(out, PairOrder::Auto);
+                }
+            }
+        }
+        // A one-row BF16 `A` packed (roadmap W1): its pairs a BF16 face row (32 bytes) apart in
+        // the packed tiles, its ring in FP32 slots; whole, K-blocked, streamed, prefetched and
+        // read ahead while busy, beside BF16 and BFP8 weights.
+        for fb in [TileFormat::BF16, TileFormat::BFP8] {
+            for (k, n) in [(2048, 2048), (8192, 2048), (1056, 200)] {
+                for (stream_k, limit) in [(false, None), (true, None), (false, Some(64))] {
+                    let mut p = Product::new([1, k], [k, n], 64);
+                    p.formats = [TileFormat::BF16, fb];
+                    p.packed_a = true;
+                    p.reads.stream_k = stream_k;
+                    p.max_k_tiles = limit;
+                    p.run(out, PairOrder::Auto);
+                }
+            }
+            for (k, n, stream_k) in [(2048, 6144, false), (8192, 2048, true)] {
+                for busy in [false, true] {
+                    let mut p = Product::new([1, k], [k, n], 64);
+                    p.formats = [TileFormat::BF16, fb];
+                    p.packed_a = true;
+                    p.reads.stream_k = stream_k;
+                    p.reads.prefetch_units = [crate::session::PREFETCH_UNITS, 40];
+                    p.prefetch = true;
+                    p.spread = 120;
+                    p.busy = busy;
                     p.run(out, PairOrder::Auto);
                 }
             }

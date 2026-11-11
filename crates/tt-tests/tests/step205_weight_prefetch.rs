@@ -898,3 +898,91 @@ fn a_busy_unit_reads_ahead_from_its_own_anchor_but_not_across_an_op_in_its_ring(
         }
     });
 }
+
+/// Roadmap W1: a BF16 `A` (a BF16 activation) packed is a packed row too, so its products
+/// prefetch as an FP32 row's do, `K` whole and streamed (a K-block limit of 8, unpipelined, as
+/// claim six). Three products of uploaded BF16 rows with element-wise ops on units 0-3 between
+/// (no op makes a BF16 activation yet): with the prefetch on, the second and third take units
+/// 4-7; the capture's run and its replays are the ops run fresh, bit for bit, as is a capture with
+/// the prefetch off.
+#[test]
+fn bf16_rows_prefetch_as_fp32_rows_do() {
+    for streamed in [false, true] {
+        with_session(|s| {
+            s.set_spread(Spread::Fixed(4));
+            if streamed {
+                s.set_matmul_k_block_limit(std::num::NonZeroUsize::new(8));
+                s.set_pipeline(false);
+            }
+            let chain = Chain::upload(s);
+            let xs: Vec<DramTensor> = (0..3)
+                .map(|i| {
+                    let bits: Vec<u16> = values(40 + i, K)
+                        .iter()
+                        .map(|v| (v.to_bits() >> 16) as u16)
+                        .collect();
+                    let t = s.upload_bf16(&bits, 1, K).unwrap();
+                    DramTensor::from_bf16(t, tt_kernels::tensor::Pad::Zero)
+                })
+                .collect();
+            let forward = |s: &mut Session<_>| {
+                let h = mm(s, &xs[0], &chain.w[0]);
+                let hs = ew(s, kind::MUL_SCALAR, 0.5, &h);
+                let g = mm(s, &xs[1], &chain.w[1]);
+                let gr = ew(s, kind::RELU, 0.0, &g);
+                let y = mm(s, &xs[2], &chain.w[2]);
+                for t in [h, g] {
+                    s.free(t).unwrap();
+                }
+                [hs, gr, y]
+            };
+            let download = |s: &mut Session<_>, out: &[DramTensor; 3]| -> Vec<Vec<f32>> {
+                out.iter().map(|t| s.download(t).unwrap()).collect()
+            };
+            let fresh_out = forward(s);
+            let fresh = download(s, &fresh_out);
+            for t in fresh_out {
+                s.free(t).unwrap();
+            }
+            let what = if streamed { "streamed" } else { "K whole" };
+            for prefetch in [false, true] {
+                s.set_weight_prefetch(prefetch);
+                s.set_stream_prefetch(prefetch);
+                s.begin_trace().unwrap();
+                let out = forward(s);
+                let id = s.end_trace().unwrap();
+                s.set_weight_prefetch(true);
+                s.set_stream_prefetch(true);
+                let ops = s.trace_ops(id).unwrap();
+                let gathers = ops
+                    .iter()
+                    .filter(|op| op.what == "streamed matmul gather")
+                    .count();
+                assert_eq!(gathers, if streamed { 3 } else { 0 }, "{what}: streamed K");
+                let used = on_idle_units(s, id).into_iter().filter(|&u| u).count();
+                let want_used = if prefetch { 2 } else { 0 };
+                assert_eq!(used, want_used, "{what}, prefetch {prefetch}: units 4-7");
+                let mut runs = vec![download(s, &out)];
+                for _ in 0..2 {
+                    s.replay(id).unwrap();
+                    s.sync().unwrap();
+                    runs.push(download(s, &out));
+                }
+                s.release_trace(id).unwrap();
+                for (r, run) in runs.iter().enumerate() {
+                    for (o, (got, want)) in run.iter().zip(&fresh).enumerate() {
+                        let label = format!("{what}, prefetch {prefetch}, run {r}, output {o}");
+                        assert_bits(&label, got, want);
+                    }
+                }
+                for t in out {
+                    s.free(t).unwrap();
+                }
+                println!("{what}, prefetch {prefetch}: {used} products on units 4-7, bit for bit");
+            }
+            for t in chain.w.into_iter().chain(xs) {
+                s.free(t).unwrap();
+            }
+        });
+    }
+}

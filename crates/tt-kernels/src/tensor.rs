@@ -2112,6 +2112,16 @@ pub fn thin_rows(m: usize, a_transposed: bool) -> u32 {
     }
 }
 
+/// Bytes of one face row (16 datums) of a packed row's tiles ([`pack_row`]): 64 in FP32, 32 in
+/// BF16. A packed `A`'s pairs start `K` tile `kk`'s unpack this many bytes a row into its packed
+/// face ([`crate::matmul::packed_a_pairs`]). Only FP32 and BF16 rows are packed.
+pub const fn packed_row_bytes(format: TileFormat) -> u64 {
+    match format.l1() {
+        tt_isa::tile::L1Format::Bf16 => 32,
+        _ => 64,
+    }
+}
+
 /// One row of `K` values (`t`, `[1, K]`, `K` a multiple of 32) laid out `[K / 32, 32]`: row
 /// `kk` is `t`'s columns `32 kk..32 kk + 32`, the row of `t`'s tile `kk` that holds data. A
 /// product's packed `A` ([`Reads::packed_a`]): it reads `K / 1024` tiles, where a thin read
@@ -2119,9 +2129,22 @@ pub fn thin_rows(m: usize, a_transposed: bool) -> u32 {
 /// tile) and writes each row's two face rows into place (two `WRITE`s), B reading and NC
 /// writing ([`Step::Transfer`]), no kernel. Data movement only, so bit for bit; the last tile's
 /// rows past `K / 32` are not written (padding, `Undefined`).
+///
+/// FP32 or BF16 (a BF16 activation, roadmap W1): the packed row keeps `t`'s format, its face
+/// rows [`packed_row_bytes`] long. A BFP row is refused: its exponents are shared along 16
+/// datums of a face row, which one row's move cannot carry alone.
 pub fn pack_row(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work> {
     use tt_isa::dm::op;
-    t.expect("a packed row", Elem::F32)?;
+    let row_bytes = match t.elem {
+        Elem::F32 | Elem::BF16 => packed_row_bytes(t.format()),
+        other => {
+            return Err(TensorError::Elem {
+                op: "a packed row".into(),
+                got: other,
+                wants: Elem::F32,
+            })
+        }
+    };
     if t.rows != 1 || t.cols % 32 != 0 {
         return Err(TensorError::Shape(format!(
             "a packed row is [1, K] with K whole tiles, not [{}, {}]",
@@ -2130,10 +2153,19 @@ pub fn pack_row(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<W
     }
     // Two writes a tile: a batch's side stays within `TRANSFER_SIDE_MAX`.
     const GROUP: usize = 64;
-    const FACE: u64 = 1024;
+    // A face is 16 face rows.
+    let face = 16 * row_bytes;
     let kt = t.cols / 32;
     let stage = staging("packed row slots", GROUP.min(kt))?;
-    let out = DramTensor::alloc(alloc, kt, 32)?;
+    // FP32-sized slots whatever the format: a product reads the packed row with `READ_RUN`,
+    // which steps through GDDR (and L1) a `TILE_SLOT` a tile.
+    let out = DramTensor {
+        rows: kt,
+        cols: 32,
+        elem: t.elem,
+        placement: alloc.alloc_slots(kt.div_ceil(32), TILE_SLOT)?,
+        pad: std::cell::Cell::new(Pad::Undefined),
+    };
     let jobs = runs(kt, units, GROUP)
         .into_iter()
         .map(|run| {
@@ -2147,20 +2179,20 @@ pub fn pack_row(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<W
                     (kk % tt_isa::dram::PORTS as usize) as u32,
                     (src.offset() + TILE_DATA) as u32,
                     (slot + TILE_DATA) as u32,
-                    (FACE + 64) as u32,
+                    (face + row_bytes) as u32,
                     0,
                     0,
                 ]);
                 let (dst, r) = (out.tile(kk / 32, 0), (kk % 32) as u64);
                 for half in 0..2u64 {
-                    let face = 2 * (r / 16) + half;
+                    let f = 2 * (r / 16) + half;
                     write.push([
                         op::WRITE,
                         dst.channel().index() as u32,
                         0,
-                        (dst.offset() + TILE_DATA + face * FACE + (r % 16) * 64) as u32,
-                        (slot + TILE_DATA + half * FACE) as u32,
-                        64,
+                        (dst.offset() + TILE_DATA + f * face + (r % 16) * row_bytes) as u32,
+                        (slot + TILE_DATA + half * face) as u32,
+                        row_bytes as u32,
                         0,
                         0,
                     ]);
@@ -2262,10 +2294,21 @@ pub(crate) fn matmul_dram_prefetching(
             "a packed `B` is read untransposed: store its transpose".into(),
         ));
     }
-    if route.packed_a().is_some() && (a_transposed || reads.thin || reads.packed_a.is_some()) {
-        return Err(TensorError::Shape(
-            "a packed `A` is read untransposed and as whole tiles".into(),
-        ));
+    // A packed `A` is read untransposed and as whole tiles, or -- BF16 only -- as a packed row
+    // ([`pack_row`]).
+    let packed_row_ok = route.packed_a() == Some(TileFormat::BF16);
+    if route.packed_a().is_some()
+        && (a_transposed || reads.thin || (reads.packed_a.is_some() && !packed_row_ok))
+    {
+        return Err(TensorError::Shape(format!(
+            "a packed `A` ({:?}) is read untransposed and as whole tiles{}",
+            route.packed_a(),
+            if packed_row_ok {
+                ""
+            } else {
+                ", or as a packed row in BF16 only"
+            }
+        )));
     }
     let (m, ka) = if a_transposed {
         (a.cols, a.rows)
@@ -2569,12 +2612,17 @@ fn packed_k_block(
         }
         // A measurement: the block chosen is noted where it is placed (`tile_op::allocate`).
         let Ok((layout, reload)) = crate::l1::unnoted(|| {
-            matmul::k_block_layout_with(kc, packed_a_slots(kc), route.slots())
+            matmul::k_block_layout_with(kc, packed_a_slots(kc), route.packed_row_slots())
         }) else {
             continue;
         };
         let layout = matmul::Layout {
-            outputs: matmul::packed_a_pairs(&layout.outputs, layout.a_at, 0),
+            outputs: matmul::packed_a_pairs(
+                &layout.outputs,
+                layout.a_at,
+                0,
+                route.packed_row_bytes(),
+            ),
             ..layout
         };
         let fits = [None, Some(reload)].into_iter().all(|r| {
@@ -2622,7 +2670,7 @@ pub(crate) fn stream_chunks(
             continue;
         };
         let fits = (0..2).all(|c| {
-            let (l, r) = layout.chunk(c, c * kq, kq);
+            let (l, r) = layout.chunk(c, c * kq, kq, route.packed_row_bytes());
             matmul::k_block_kernel(&l, r, route, fidelity, false, matmul::LiveRows::All)
                 .iter()
                 .all(|p| {
@@ -7847,6 +7895,99 @@ mod tests {
                 assert_eq!(
                     off.reads - on.reads,
                     kt - packed_tiles + (thin_blocks - packed_blocks),
+                    "[{k}, {n}] unit {u}"
+                );
+            }
+        }
+    }
+
+    /// A BF16 `A` packed ([`super::pack_row`], roadmap W1) is read as its `K / 1024` packed tiles,
+    /// a [`TILE_SLOT`] each (`READ_RUN`), where unpacked it reads `K / 32` whole BF16 tiles; `B`
+    /// is read as before. `down`'s K blocks are the FP32 row's: the packed ring is FP32 slots
+    /// whatever `A`'s format.
+    #[test]
+    fn a_packed_bf16_a_is_read_in_k_over_1024_tiles() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        use tt_isa::dm::BF16_TILE_SLOT;
+        use tt_isa::format::TileFormat;
+        let units = 64;
+        let route = SrcRoute::edges(TileFormat::BF16, TileFormat::FP32).unwrap();
+        assert_eq!(route.packed_row_bytes(), 32);
+        assert_eq!(route.packed_row_slots().a, TILE_SLOT);
+        let fp32 = super::packed_k_block(256, None, SrcRoute::Tf32FromFp32, Fidelity::HiFi4);
+        let bf16 = super::packed_k_block(256, None, route, Fidelity::HiFi4);
+        assert_eq!(bf16.unwrap(), fp32.unwrap());
+        for (k, n, limit) in [
+            (2048, 6144, None),
+            (2048, 16384, None),
+            (8192, 2048, Some(64)),
+            (8192, 2048, None),
+        ] {
+            let reads_per_unit = |packed: bool| {
+                let mut alloc = DramAlloc::new(&Dram::FULL);
+                let a = DramTensor::alloc_elem(&mut alloc, 1, k, Elem::BF16).unwrap();
+                let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+                let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+                let work = super::matmul_dram_limited(
+                    &mut alloc,
+                    &a,
+                    false,
+                    &b,
+                    false,
+                    route,
+                    Fidelity::HiFi4,
+                    units,
+                    false,
+                    false,
+                    limit.and_then(std::num::NonZeroUsize::new),
+                    super::Reads {
+                        thin: false,
+                        resident_a: true,
+                        unpack_b: false,
+                        packed_a: packed.then(|| p.tensor_ref()),
+                        stream_k: false,
+                        stream_prefetch: false,
+                        prefetch_units: [usize::MAX; 2],
+                        block_stream: super::BlockStream::Off,
+                        reuse: super::Reuse::Off,
+                    },
+                )
+                .unwrap();
+                let mut per_unit = vec![crate::profile_mode::OpBytes::default(); units];
+                for (j, job) in work.jobs.iter().enumerate() {
+                    for step in job {
+                        if let Step::List { entries, .. } = step {
+                            per_unit[j % units].count(entries);
+                        }
+                    }
+                }
+                per_unit
+            };
+            let (off, on) = (reads_per_unit(false), reads_per_unit(true));
+            // `K` whole: the packed tiles once a unit, against the whole BF16 tiles.
+            if k == 8192 {
+                continue;
+            }
+            let packed_tiles = (k as u64 / 32).div_ceil(32);
+            for u in 0..units {
+                let (off, on) = (off[u], on[u]);
+                assert_eq!(on.b, off.b, "[{k}, {n}] unit {u}: B unchanged");
+                assert_eq!(
+                    on.a, 0,
+                    "[{k}, {n}] unit {u}: the gather leaves A to the packed row"
+                );
+                if off.b == 0 {
+                    continue;
+                }
+                assert_eq!(off.a % BF16_TILE_SLOT, 0, "[{k}, {n}] unit {u}");
+                assert_eq!(
+                    on.read,
+                    on.b + packed_tiles * TILE_SLOT,
+                    "[{k}, {n}] unit {u}"
+                );
+                assert_eq!(
+                    off.reads - on.reads,
+                    off.a / BF16_TILE_SLOT - packed_tiles,
                     "[{k}, {n}] unit {u}"
                 );
             }

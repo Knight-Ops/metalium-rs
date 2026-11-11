@@ -1228,6 +1228,16 @@ phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a
   (`matmul::probe_half_whole_srcb`: only the first face row unpacked) changes over a quarter of the outputs under
   both whole orders and none under faces (`1794328972`). `PairOrder::Auto` now holds both tiles whole for every pair
   of edge formats; FP32 cut to BF16 (`Bf16FromFp32`) is still unmeasured and takes faces.
+- **A BF16 `A` unpacks into `SrcB` from a 32-byte face row of a packed row** (roadmap W1, 2026-11-10): a one-row BF16
+  `A` packed `[K / 32, 32]` (`tensor::pack_row`) has `K` tile `kk`'s unpack start `(kk % 16) * 32` bytes into packed
+  face `2 ((kk % 32) / 16)`, a BF16 face row, where an FP32 row's starts on 64-byte rows (`matmul::packed_a_pairs`).
+  The unpacker reads from there as from a tile's base, under the faces order and the 512-datum whole unpack alike:
+  `SrcB`'s row 0 is `K` tile `kk`'s row 0, bit for bit the row read as whole BF16 tiles, beside `B` FP32, BF16 and
+  BFP8, every fidelity, `K` 1,024, 1,056 and 2,048, on one unit (`probe_pair_src_rows::srcb_packed_bf16_row`, ttsim,
+  then alone on card 0 `1794347716`); and through the product path, whole, K-blocked, streamed and prefetched
+  (`step204`, `step205`, `step216`, card 0 `1794348020`). The control, relayed at FP32's 64-byte rows
+  (`matmul::probe_fp32_row_strides`), changes every output column. The packed row's tiles are a `TILE_SLOT` apart
+  in GDDR and in L1 whatever its format: `READ_RUN` steps by it.
 - **Every pair of FP32, BF16 and BFP8/4/2 operands multiplies in one kernel**, each unpacked in its own format (BF16 and
   BFP moved as they are, FP32 cut to TF32), including TF32 in `SrcA` beside BF16 or BFP in `SrcB`: bit for bit the
   FP32 product of the decoded values (`step241`, card 0 `1793162345`).

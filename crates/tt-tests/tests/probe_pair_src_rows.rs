@@ -13,6 +13,8 @@
 //!   `A` stored BF16 (laid as a weight or interleaved as an activation), BFP8 or BFP4 (BFP2 on
 //!   silicon only: ttsim refuses its `Src` format, `step94`), unpacked whole in its own format with
 //!   its exponent section, beside `B` FP32 (plain and transposed), BF16 and BFP8.
+//! - **A one-row BF16 `A` from its packed row** (roadmap W1; `srcb_packed_bf16_row`): `K` tile `kk`
+//!   unpacked from a 32-byte BF16 face row of the packed tile, against the row unpacked.
 //! - **The throttle override** (`matmul::probe_throttle_override`): `REG1_ovrd_default_throttle_mode`
 //!   with unpacker 0 at x1 and x2, under the faces order and both tiles whole.
 //!
@@ -277,6 +279,59 @@ fn packed_probe<T: tt_device::Transport>(s: &mut Session<T>, order: PairOrder) {
         for t in [b, bt_, b16, b8] {
             s.free(t).unwrap();
         }
+    }
+}
+
+/// A one-row BF16 `A` read from its packed row (`tensor::pack_row`, roadmap W1): `K` tile `kk`'s
+/// unpack starts a BF16 face row (32 bytes) into its packed face, not on a 64-byte FP32 one
+/// (`matmul::packed_a_pairs`). Against the same product with the row unpacked
+/// (`set_packed_thin_a(false)`: whole BF16 tiles), bit for bit, under `order`, at `K` of 1024,
+/// 1056 (a last packed tile of one row) and 2048, beside `B` FP32, BF16 and BFP8, every
+/// fidelity; and at HiFi4 exact against the host's integer sums.
+fn packed_bf16_row_probe<T: tt_device::Transport>(s: &mut Session<T>, order: PairOrder) {
+    let n = 96;
+    for k in [1024, 1056, 2048] {
+        let bv = values(k * n, 5, true);
+        let b = s.upload(&bv, k, n).unwrap();
+        let bits: Vec<u16> = bv.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+        let b16 = s.upload_bf16_weight(&bits, k, n).unwrap();
+        let b8 = DramTensor::from_bfp(s.bfp_from_f32(&b, BfpFormat::Bfp8).unwrap());
+        let av = values(k, 1, true);
+        let (a, _) = packed(s, PackedA::Bf16Activation, &av, 1, k);
+        for fidelity in [
+            Fidelity::Lo,
+            Fidelity::HiFi2,
+            Fidelity::HiFi3,
+            Fidelity::HiFi4,
+        ] {
+            for (what, y) in [("B", &b), ("B16", &b16), ("B8", &b8)] {
+                set_pair_order(order);
+                s.set_packed_thin_a(false);
+                let want = product(s, &a, false, y, false, fidelity);
+                s.set_packed_thin_a(true);
+                let got = product(s, &a, false, y, false, fidelity);
+                let what = format!("{order:?}, K {k}, {what}, {fidelity:?}");
+                same(&got, &want, &what);
+                if fidelity == Fidelity::HiFi4 && what.ends_with("B, HiFi4") {
+                    for j in 0..n {
+                        let sum: f32 = (0..k).map(|q| av[q] * bv[q * n + j]).sum();
+                        assert_eq!(got[j], sum, "{what}: exact at column {j}");
+                    }
+                }
+            }
+        }
+        set_pair_order(PairOrder::Faces);
+        for t in [a, b, b16, b8] {
+            s.free(t).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "a probe: a one-row BF16 A read from its packed row, 32-byte face rows"]
+fn srcb_packed_bf16_row() {
+    for order in [PairOrder::Faces, PairOrder::SrcBWhole, PairOrder::Auto] {
+        with_session(|s| packed_bf16_row_probe(s, order));
     }
 }
 

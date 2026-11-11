@@ -189,10 +189,7 @@ impl Mma {
         match self.packed {
             true => (
                 tensor::packed_a_slots(self.kt),
-                Slots {
-                    a: TILE_SLOT,
-                    b: self.route.b_slot(),
-                },
+                self.route.packed_row_slots(),
                 staging == Staging::Slots,
             ),
             false => (mt * kt, self.route.slots(), false),
@@ -204,6 +201,15 @@ impl Mma {
         match self.packed {
             true => tensor::packed_a_slots(count),
             false => count,
+        }
+    }
+
+    /// A K block's slot sizes: a packed `A`'s ring in [`TILE_SLOT`]s whatever its format
+    /// ([`SrcRoute::packed_row_slots`]), else each operand's own.
+    fn k_block_slot_sizes(&self) -> Slots {
+        match self.packed {
+            true => self.route.packed_row_slots(),
+            false => self.route.slots(),
         }
     }
 }
@@ -235,7 +241,7 @@ impl Microkernel for Mma {
             }
             Schedule::KBlocks { .. } => {
                 let count = chunk.tiles[1];
-                Shape::KBlock(count, self.k_block_slots(count), self.route.slots())
+                Shape::KBlock(count, self.k_block_slots(count), self.k_block_slot_sizes())
             }
             Schedule::Stream { kq, .. } => {
                 Shape::Stream(*kq, tensor::packed_a_slots(self.kt), self.route.b_slot())
@@ -338,7 +344,7 @@ impl Microkernel for Mma {
                     }
                 }
                 let outputs = match self.packed {
-                    true => matmul::packed_a_pairs(&outputs, a_at, 0),
+                    true => matmul::packed_a_pairs(&outputs, a_at, 0, route.packed_row_bytes()),
                     false => outputs,
                 };
                 // The cache tells the stagings and halves apart: their programs name different
@@ -388,10 +394,15 @@ impl Microkernel for Mma {
                 ))
             }
             Schedule::KBlocks { .. } => {
-                let (layout, reload) = matmul::k_block_placed(count, route.slots(), l1);
+                let (layout, reload) = matmul::k_block_placed(count, self.k_block_slot_sizes(), l1);
                 let layout = match self.packed {
                     true => matmul::Layout {
-                        outputs: matmul::packed_a_pairs(&layout.outputs, layout.a_at, k0),
+                        outputs: matmul::packed_a_pairs(
+                            &layout.outputs,
+                            layout.a_at,
+                            k0,
+                            route.packed_row_bytes(),
+                        ),
                         ..layout
                     },
                     false => layout,
@@ -434,7 +445,7 @@ impl Microkernel for Mma {
             }
             Schedule::Stream { .. } => {
                 let layout = StreamLayout::placed(route.b_slot(), l1);
-                let (chunk, reload) = layout.chunk(c, k0, count);
+                let (chunk, reload) = layout.chunk(c, k0, count, route.packed_row_bytes());
                 // The programs name this chunk's `K` range in the packed `A`, its half and the
                 // layout `A`'s slots fix.
                 let variant = 0x1_0000 | (tensor::packed_a_slots(self.kt) as u32) << 8 | c as u32;

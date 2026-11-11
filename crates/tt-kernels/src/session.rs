@@ -3870,8 +3870,11 @@ impl<T: Transport> Session<T> {
         let ct = tensor.cols.div_ceil(32);
         let d = self.dram.as_ref().expect("BF16 requires enabled GDDR");
         for t in 0..tensor.tile_count() {
-            let mut image = vec![0u8; crate::bf16::TILE_SLOT as usize];
-            self.dev.dram_read(&d.w4, tensor.slot(t), &mut image)?;
+            // The slot as it was allocated: a BF16 slot, or an FP32-sized one (a packed row,
+            // `tensor::pack_row`); the datums sit at the same offsets in either.
+            let slot = tensor.slot(t);
+            let mut image = vec![0u8; slot.len() as usize];
+            self.dev.dram_read(&d.w4, slot, &mut image)?;
             for r in 0..32 {
                 for c in 0..32 {
                     let row = t / ct * 32 + r;
@@ -8743,16 +8746,20 @@ impl<T: Transport> Session<T> {
         let unpack_b = self.unpack_transposed_b;
         // One row over a long `K`: every unit would read `A`'s `K / 32` tiles, an entry each,
         // so it is packed `[K / 32, 32]` once, spread over the product's units, and each unit
-        // reads `K / 1024`.
+        // reads `K / 1024`. An FP32 or a BF16 `A` (a BF16 activation, roadmap W1): the packed row
+        // keeps its format ([`tensor::pack_row`]).
         let packs = self.packed_thin_a
             && m == 1
             && !a_transposed
             && a.cols % 32 == 0
             && kt >= PACKED_A_K_TILES
-            && route.packed_a().is_none()
+            && matches!(route.packed_a(), None | Some(TileFormat::BF16))
             && matches!(route, SrcRoute::Tf32FromFp32 | SrcRoute::Edges { .. });
-        // The op that made `A` may have packed it already (`Session::set_packed_twins`).
-        let twin = packs.then(|| self.packed_twin(a).cloned()).flatten();
+        // The op that made `A` may have packed it already (`Session::set_packed_twins`): an F32
+        // row only, which is what a twin is.
+        let twin = (packs && a.elem == tensor::Elem::F32)
+            .then(|| self.packed_twin(a).cloned())
+            .flatten();
         let packed = if packs && twin.is_none() {
             // On the product's own units: the rest stay out of the op (a unit that sits out ops
             // is free for other work, `decode-to-bandwidth.md` Phase 5).

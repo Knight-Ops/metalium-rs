@@ -530,6 +530,19 @@ fn half_whole_srcb() -> bool {
     PROBE_HALF_WHOLE_SRCB.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A negative control only (`step204::a_bf16_row_relayed_at_fp32_strides_is_another_product`,
+/// roadmap W1): a packed row's pairs ([`packed_a_pairs`]) step by FP32's 64-byte face rows whatever
+/// `A`'s format, so a BF16 row's `K` tile `kk` is unpacked from the wrong place and the product is
+/// **wrong**. It shows the gate reads a BF16 row at its own strides. Process-wide, set before any
+/// product's programs are built (the program caches do not key on it).
+static PROBE_FP32_ROW_STRIDES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn probe_fp32_row_strides(on: bool) {
+    PROBE_FP32_ROW_STRIDES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Point both unpackers at a new pair of tile images, between `UNPACR`s.
 ///
 /// `REG3_Base_address` is sampled by the unpacker, so the previous unpack on
@@ -823,15 +836,22 @@ impl LiveRows {
 }
 
 /// `outputs` with each pair's `A` tile where a packed `A` ([`crate::tensor::pack_row`]) holds
-/// it: its packed tiles read into the slots from `a_at`, the first holding `K` tile `k0 / 32 *
-/// 32`, and pair `q` this block's `K` tile `k0 + q`. The unpacker reads a face as 16 rows of 64
-/// bytes from its base (past a 16-byte header): `K` tile `kk`'s faces `(0, 0)` and `(0, 1)`
-/// start at row `kk % 16` of the packed faces `((kk % 32) / 16, 0)` and `((kk % 32) / 16, 1)`,
-/// which are 1024 bytes apart as a tile's faces `(0, 0)` and `(0, 1)` are. So `SrcB`'s row 0 is
-/// `K` tile `kk`'s row 0, and its other rows hold later packed rows, which only reach output
-/// rows past the one a packed product has.
-pub fn packed_a_pairs(outputs: &[OutputTile], a_at: u64, k0: usize) -> Vec<OutputTile> {
-    packed_a_pairs_from(outputs, a_at, k0 / 32, k0)
+/// it: its packed tiles read into the slots from `a_at` (a [`tt_isa::dm::TILE_SLOT`] apart in
+/// any format, as `READ_RUN` lays them), the first holding `K` tile `k0 / 32 * 32`, and pair `q`
+/// this block's `K` tile `k0 + q`. The unpacker reads a face as 16 rows of `row_bytes`
+/// ([`SrcRoute::packed_row_bytes`]: 64 in FP32, 32 in BF16) from its base (past a 16-byte
+/// header): `K` tile `kk`'s faces `(0, 0)` and `(0, 1)` start at row `kk % 16` of the packed faces
+/// `((kk % 32) / 16, 0)` and `((kk % 32) / 16, 1)`, which are a face (`16 row_bytes`) apart as a
+/// tile's faces `(0, 0)` and `(0, 1)` are -- under the faces order and the 512-datum whole
+/// unpack alike. So `SrcB`'s row 0 is `K` tile `kk`'s row 0, and its other rows hold later packed
+/// rows, which only reach output rows past the one a packed product has.
+pub fn packed_a_pairs(
+    outputs: &[OutputTile],
+    a_at: u64,
+    k0: usize,
+    row_bytes: u64,
+) -> Vec<OutputTile> {
+    packed_a_pairs_from(outputs, a_at, k0 / 32, k0, row_bytes)
 }
 
 /// [`packed_a_pairs`] with the slots from `a_at` holding the packed tiles from `first` on (a
@@ -841,7 +861,12 @@ pub fn packed_a_pairs_from(
     a_at: u64,
     first: usize,
     k0: usize,
+    row_bytes: u64,
 ) -> Vec<OutputTile> {
+    let row_bytes = match PROBE_FP32_ROW_STRIDES.load(std::sync::atomic::Ordering::Relaxed) {
+        true => 64,
+        false => row_bytes,
+    };
     outputs
         .iter()
         .map(|o| OutputTile {
@@ -853,7 +878,10 @@ pub fn packed_a_pairs_from(
                     let kk = k0 + q;
                     let tile = (kk / 32 - first) as u64;
                     let r = (kk % 32) as u64;
-                    let a = a_at + tile * tt_isa::dm::TILE_SLOT + (r / 16) * 2048 + (r % 16) * 64;
+                    let a = a_at
+                        + tile * tt_isa::dm::TILE_SLOT
+                        + (r / 16) * 32 * row_bytes
+                        + (r % 16) * row_bytes;
                     (a, b)
                 })
                 .collect(),
@@ -961,7 +989,13 @@ pub(crate) struct StreamLayout {
 impl StreamLayout {
     /// Chunk `c` (its `K` tiles from `k0`, `kq` of them) as a K block: its layout, `A`'s pairs
     /// in the packed `A`, and its reload of the partial before it.
-    pub fn chunk(&self, c: usize, k0: usize, kq: usize) -> (Layout, Option<Reload>) {
+    pub fn chunk(
+        &self,
+        c: usize,
+        k0: usize,
+        kq: usize,
+        row_bytes: u64,
+    ) -> (Layout, Option<Reload>) {
         let h = c % 2;
         let outputs = vec![OutputTile {
             pairs: (0..kq)
@@ -972,7 +1006,7 @@ impl StreamLayout {
         let layout = Layout {
             a_at: self.a_at,
             b_at: self.b_at[h],
-            outputs: packed_a_pairs_from(&outputs, self.a_at, 0, k0),
+            outputs: packed_a_pairs_from(&outputs, self.a_at, 0, k0, row_bytes),
             sems: self.sems,
             init: self.init.clone(),
         };
@@ -4009,6 +4043,24 @@ impl SrcRoute {
         }
     }
 
+    /// Bytes of a face row of a one-row `A` packed `[K / 32, 32]` in `A`'s format
+    /// ([`crate::tensor::pack_row`], [`packed_a_pairs`]): 64 for FP32, 32 for BF16.
+    pub const fn packed_row_bytes(self) -> u64 {
+        match self.packed_a() {
+            Some(format) => crate::tensor::packed_row_bytes(format),
+            None => crate::tensor::packed_row_bytes(TileFormat::FP32),
+        }
+    }
+
+    /// The slots of a product whose `A` is a packed row: `A`'s a [`tt_isa::dm::TILE_SLOT`] apart
+    /// whatever its format (`READ_RUN` steps by it), `B`'s its own ([`SrcRoute::b_slot`]).
+    pub const fn packed_row_slots(self) -> Slots {
+        Slots {
+            a: tt_isa::dm::TILE_SLOT,
+            b: self.b_slot(),
+        }
+    }
+
     /// The route of a weight stored BF16 beside an FP32 `A`.
     pub const TF32_WITH_BF16_B: SrcRoute = SrcRoute::Edges {
         a: TileFormat::FP32,
@@ -5009,7 +5061,7 @@ mod tests {
             .windows(2)
             .all(|p| p[1].1 - p[0].1 == BF16_TILE_SLOT));
         let s = k_stream_layout(16, 2, BF16_TILE_SLOT).unwrap();
-        let (c, _) = s.chunk(1, 16, 16);
+        let (c, _) = s.chunk(1, 16, 16, 64);
         assert!(c.outputs[0]
             .pairs
             .windows(2)

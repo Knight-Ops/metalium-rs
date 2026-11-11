@@ -396,3 +396,55 @@ case [96, 320] @ [320, 288] [Bfp2, Bfp2] units 3 spread 3 pipeline true k None p
   planned top 0x35a80 need 0xfc000
 case [1024, 2048] @ [2048, 2048] [Bfp2, Bfp2] units 120 spread 120 pipeline true k None packed_a false prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
   planned top 0x98400 need 0x98400
+case [1, 2048] @ [2048, 2048] [Bf16, Bf16] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 2048] @ [2048, 2048] [Bf16, Bf16] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 2048] @ [2048, 2048] [Bf16, Bf16] units 64 spread 64 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 8192] @ [8192, 2048] [Bf16, Bf16] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x691c0 need 0x691c0
+case [1, 8192] @ [8192, 2048] [Bf16, Bf16] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x6d2c0 need 0x6d2c0
+case [1, 8192] @ [8192, 2048] [Bf16, Bf16] units 64 spread 64 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x46140 need 0x46140
+case [1, 1056] @ [1056, 200] [Bf16, Bf16] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xee2c0
+case [1, 1056] @ [1056, 200] [Bf16, Bf16] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xee2c0
+case [1, 1056] @ [1056, 200] [Bf16, Bf16] units 64 spread 64 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xee2c0
+case [1, 2048] @ [2048, 6144] [Bf16, Bf16] units 64 spread 120 pipeline true k None packed_a true prefetch true busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 2048] @ [2048, 6144] [Bf16, Bf16] units 64 spread 120 pipeline true k None packed_a true prefetch true busy true "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 8192] @ [8192, 2048] [Bf16, Bf16] units 64 spread 120 pipeline true k None packed_a true prefetch true busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x6d2c0 need 0x6d2c0
+case [1, 8192] @ [8192, 2048] [Bf16, Bf16] units 64 spread 120 pipeline true k None packed_a true prefetch true busy true "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x6d2c0 need 0x6d2c0
+case [1, 2048] @ [2048, 2048] [Bf16, Bfp8] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 2048] @ [2048, 2048] [Bf16, Bfp8] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 2048] @ [2048, 2048] [Bf16, Bfp8] units 64 spread 64 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 8192] @ [8192, 2048] [Bf16, Bfp8] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x4b1c0 need 0x4b1c0
+case [1, 8192] @ [8192, 2048] [Bf16, Bfp8] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x4f2c0 need 0x4f2c0
+case [1, 8192] @ [8192, 2048] [Bf16, Bfp8] units 64 spread 64 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x37140 need 0x37140
+case [1, 1056] @ [1056, 200] [Bf16, Bfp8] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xee2c0
+case [1, 1056] @ [1056, 200] [Bf16, Bfp8] units 64 spread 64 pipeline true k None packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xee2c0
+case [1, 1056] @ [1056, 200] [Bf16, Bfp8] units 64 spread 64 pipeline true k Some(64) packed_a true prefetch false busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xee2c0
+case [1, 2048] @ [2048, 6144] [Bf16, Bfp8] units 64 spread 120 pipeline true k None packed_a true prefetch true busy false "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 2048] @ [2048, 6144] [Bf16, Bfp8] units 64 spread 120 pipeline true k None packed_a true prefetch true busy true "thin 1 resident 1 unpack_b 1 stream_k 0 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x100000 need 0xe5080
+case [1, 8192] @ [8192, 2048] [Bf16, Bfp8] units 64 spread 120 pipeline true k None packed_a true prefetch true busy false "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x4f2c0 need 0x4f2c0
+case [1, 8192] @ [8192, 2048] [Bf16, Bfp8] units 64 spread 120 pipeline true k None packed_a true prefetch true busy true "thin 1 resident 1 unpack_b 1 stream_k 1 stream_prefetch 1 prefetch_units [40, 40] block Auto" Auto
+  planned top 0x4f2c0 need 0x4f2c0

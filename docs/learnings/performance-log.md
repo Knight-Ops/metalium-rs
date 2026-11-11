@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: the one-row path for a BF16 `A`, its decode products at the FP32 `A`'s step](#w1-the-one-row-path-for-a-bf16-a-its-decode-products-at-the-fp32-as-step-2026-11-10-cards-0-and-1) | 2026-11-10 | roadmap W1's next box: a BF16 row packed in its own format (32-byte face rows, FP32-sized slots), prefetched, busy-prefetched and streamed as an FP32 row, bit for bit (card 0); decode products at `m` = 1, BF16 x BFP8 HiFi2 10.74 -> **6.99 ms** (FP32 `A` 7.00), BF16 x BF16 14.33 -> 10.34 (10.19); `down` 177 -> 71 us; no model gains until BF16 activations |
 | [W1: a packed tile whole in `SrcB`, a BF16 `A` past the FP32 `A`'s rate](#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0) | 2026-11-10 | roadmap W1's second box: a BF16/BFP `A` whole in `SrcB`, bit for bit (card 0), licensed in `whole_tile_unpack`; BF16 `A` HiFi4 prefill 22-30 -> **29-70 TFLOPS**, 1.13-1.32x the FP32 `A`, fidelity no longer binding; H13 1.27x (1.34x with BFP8); packer L1 accumulation's ceiling now <= 2.5% |
 | [W1: BFP8 weights the inference default, behind the contract switch and a model gate](#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1) | 2026-11-10 | roadmap W1's first box closed: `burn_tt::Numerics`, `Llama`/`Qwen35::for_inference`, the model gate `step269` (BFP8: top-1 98.28%, top-5 100%, PCC 0.99968 over 232 teacher-forced positions; BFP4 `gate\|up` 86.64% / 0.93, recorded). 1.7B decode under the performance contract **7.52 ms** (reference 9.81). Also: a fused, stored Llama held `q`, `k`, `v`, `gate`, `up` twice (135M BF16 543 -> 399 MB) |
 | [W1 bounded: the performance contract on this stack, before any plumbing](#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1) | 2026-11-09 | roadmap W1's first box (absorbs H13): `silicon_probe_performance_contract` and the 1.7B end to end per weight format. BFP8 weights alone: decode 9.83 -> **7.51 ms** (BFP4 6.34), under W1's 8.0 ms kill; fidelity moves nothing at `m` = 1; a BF16 `A` is **slower** today (decode products 1.4x, prefill at HiFi4 1.4-2.0x): a packed `A` takes the faces pair order and misses the packed thin row and the weight prefetch. H13 killed (0.94x); the packer-L1-accumulation ceiling up to 24% of a product, only under a packed `A`. §6 issue 1 settled: no prefill regression, the ~2,100 tokens/s rows are the stream-ceiling probe's chunks of 64 |
@@ -421,6 +422,72 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: the one-row path for a BF16 `A`, its decode products at the FP32 `A`'s step (2026-11-10, cards 0 and 1)
+
+Roadmap W1's next box ([tt-metal-parity.md](../plans/tt-metal-parity.md) §5 W1). A one-row product over a long `K`
+packs an FP32 `A` `[K / 32, 32]` (`tensor::pack_row`), and only a packed row takes the weight prefetch, the busy
+prefetch and the streamed `K`. A BF16 `A` took none of them and read its `K / 32` tiles whole on every unit: decode
+products 1.4x the FP32 `A`'s ("W1 bounded", below). Release, safe image, every tile.
+
+**What changed.**
+- **`pack_row` packs a BF16 row in its own format**: one read a tile (face 0 and face 1's first row, 544 bytes), two
+  32-byte writes. The packed row sits in FP32-sized slots whatever its format, because `READ_RUN` steps a `TILE_SLOT`
+  a tile in GDDR and in L1. A BFP row is refused by name.
+- **The pairs step by the format's face row** (`matmul::packed_a_pairs`, `SrcRoute::packed_row_bytes`): `K` tile `kk`
+  unpacks from `(kk % 16) * 32` bytes into packed face `2 ((kk % 32) / 16)`. The K-block and stream layouts keep the
+  ring in FP32 slots (`SrcRoute::packed_row_slots`); a BF16 `A`'s own slot (2,112 bytes) would have laid it at the
+  wrong stride.
+- **`Session::matmul_dram` packs an `A` of FP32 or BF16**; a packed twin is looked up for an F32 `A` only. The
+  prefetch, busy prefetch and stream follow the packed row with no new knob. No mover or firmware change.
+- **Found on the way:** `Session::download_bf16` read every slot as 2,112 bytes and refused any BF16 tensor in
+  FP32-sized slots. It now reads each slot at its own length.
+
+**Bit for bit.** Every gate on ttsim, then card 0:
+- the probe, alone on one unit: `probe_pair_src_rows::srcb_packed_bf16_row` (`1794347716`), under the faces, `SrcB`
+  whole and `Auto` orders;
+- the product path: `step204` (the packing against the host's reshape; the products, whole, K-blocked and streamed,
+  against the row read whole and against an FP32 `A` of the same values), `step205`'s `bf16_rows_prefetch_as_fp32_rows_do`,
+  `step216`'s `a_bf16_rows_products_read_their_b_under_the_ops_before_it` (`1794348020`, 27 of 27 with `step241`);
+- `step233`, `step239` and `step240` (`1794348366`), and `step12_mnist` (`1794348056`).
+
+The control, `matmul::probe_fp32_row_strides` (the BF16 row relayed at 64-byte rows), changes 96 of 96 columns. The
+pinned jobs only grew: 26 BF16-row cases, every existing job word for word the same.
+
+**Decode products** (`silicon_probe_performance_contract::decode_products`, card 0, `TT_CONTRACT_A=fp32,bf16`,
+`TT_CONTRACT_B=bf16,bfp8`; before `1794332034`, after `1794348097`). Products a 1.7B step (24 layers and the head) at
+`m` = 1, ms. The probe packs `A` at every product and hides no prefetch, so its sums are not a step:
+
+| `B`, fidelity | BF16 `A` before | BF16 `A` after | FP32 `A` (same run) | after / FP32 |
+|---|--:|--:|--:|--:|
+| BF16, HiFi4 | 14.33 | **10.34** | 10.19 | 1.015 |
+| BF16, HiFi2 | 14.30 | **10.22** | 10.15 | 1.007 |
+| BF16, LoFi | 14.31 | **10.17** | 10.20 | 0.997 |
+| BFP8, HiFi4 | 10.84 | **7.03** | 7.01 | 1.002 |
+| BFP8, HiFi2 (the contract) | 10.74 | **6.99** | 7.00 | 0.998 |
+| BFP8, LoFi | 10.79 | **6.99** | 6.99 | 1.001 |
+
+- **Per product** (`B` BFP8, HiFi2, us): qkv 63.4 -> 59.7 (FP32 `A` 59.2), o 43.2 -> 32.2 (32.6), gate|up 148.9 -> 115.1
+  (115.8), down 176.9 -> **71.3** (71.2), head 366.6 -> 312.5 (312.1).
+- **The prediction** (at least the FP32 row's step) **holds within -0.3% to +1.5%.** The kill (> 3% above) does not
+  fire. Half of `A`'s bytes buy nothing measurable: the products are bound by `B`'s reads.
+- **Unchanged:** the FP32-`A` rows (10.17 -> 10.19 ms with `B` BF16 at HiFi4; 7.03 -> 7.00 BFP8 HiFi2), and every
+  `m` = 32 row within 1% (the packing is `m` = 1's).
+
+**End to end** (the 1.7B, `traced_generation`, card 1, the cards of the baselines; activations FP32, so its programs
+are word for word the same):
+
+| contract | step at 32 / 128 / 256 tokens, ms | prefill 32 / 128 / 256, tokens/s | runs (before -> after) |
+|---|--:|--:|---|
+| performance | 7.52 / 8.02 / 8.68 -> **7.52 / 8.03 / 8.62** | 1,190 / 3,259 / 4,012 -> 1,191 / 3,241 / 4,019 | `1794291915` -> `1794349089` |
+| reference | 9.81 / 10.31 / 10.93 -> **9.82 / 10.32 / 10.95** | 1,098 / 3,091 / 3,881 -> 1,099 / 3,092 / 3,891 | `1794292593` -> `1794349769` |
+
+Every row within -0.7% to +0.2%. The one past 0.5%, the 128-token prefill under the performance contract (-0.55%), runs
+the programs it ran before, so it is the run-to-run spread, not this change.
+
+**What this changes.** A BF16 `A` is no slower than an FP32 one at any `m`. No model gains yet: none makes a BF16
+activation, so native BF16 arithmetic is the box that turns this into a step. When it lands, a one-row BF16 result
+should write a BF16 packed twin. Today a BF16 `A` is packed again at every product, as the probe's rows are.
 
 ## W1: a packed tile whole in `SrcB`, a BF16 `A` past the FP32 `A`'s rate (2026-11-10, card 0)
 

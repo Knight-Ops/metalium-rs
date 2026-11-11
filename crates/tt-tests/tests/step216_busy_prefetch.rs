@@ -523,3 +523,116 @@ fn what_a_product_reads_ahead_is_counted_as_its_own() {
         }
     });
 }
+
+/// Roadmap W1: a BF16 `A` (a BF16 activation) packed reads its `B` ahead on busy units as an FP32
+/// row does. Three products of uploaded BF16 rows (no op makes a BF16 activation yet), an
+/// element-wise op of each product's result on the same four units after it, the prefetch on idle
+/// units off: with the busy prefetch on, the capture's run and replays are the ops run fresh, bit
+/// for bit, as with it off; and the later products' lists move ahead of the op before each.
+#[test]
+fn a_bf16_rows_products_read_their_b_under_the_ops_before_it() {
+    with_session(|s| {
+        s.set_spread(Spread::Fixed(4));
+        s.set_weight_prefetch(false);
+        let w = [(1, K), (2, K), (3, 256)]
+            .map(|(seed, n)| s.upload(&values(seed, K * n), K, n).unwrap());
+        let xs: Vec<DramTensor> = (0..3)
+            .map(|i| {
+                let bits: Vec<u16> = values(40 + i, K)
+                    .iter()
+                    .map(|v| (v.to_bits() >> 16) as u16)
+                    .collect();
+                let t = s.upload_bf16(&bits, 1, K).unwrap();
+                DramTensor::from_bf16(t, tt_kernels::tensor::Pad::Zero)
+            })
+            .collect();
+        let forward = |s: &mut Session<_>| {
+            let mm = |s: &mut Session<_>, a: &DramTensor, b: &DramTensor| {
+                s.matmul_dram(
+                    a,
+                    false,
+                    b,
+                    false,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    1 << 40,
+                )
+                .unwrap()
+            };
+            let ew = |s: &mut Session<_>, kind, scalar, a: &DramTensor| {
+                s.eltwise(
+                    Eltwise {
+                        kind,
+                        scalar,
+                        scalar2: 0.0,
+                    },
+                    a,
+                    None,
+                )
+                .unwrap()
+            };
+            let h = mm(s, &xs[0], &w[0]);
+            let hs = ew(s, kind::MUL_SCALAR, 0.5, &h);
+            let g = mm(s, &xs[1], &w[1]);
+            let gr = ew(s, kind::RELU, 0.0, &g);
+            let y = mm(s, &xs[2], &w[2]);
+            for t in [h, g] {
+                s.free(t).unwrap();
+            }
+            [hs, gr, y]
+        };
+        let fresh_out = forward(s);
+        let fresh: Vec<Vec<f32>> = fresh_out.iter().map(|t| s.download(t).unwrap()).collect();
+        for t in fresh_out {
+            s.free(t).unwrap();
+        }
+        let mut ranges: Vec<Ranges> = Vec::new();
+        for on in [false, true] {
+            s.set_busy_prefetch(on);
+            s.begin_trace().unwrap();
+            let out = forward(s);
+            let id = s.end_trace().unwrap();
+            s.set_busy_prefetch(true);
+            for run in 0..3 {
+                if run > 0 {
+                    s.replay(id).unwrap();
+                    s.sync().unwrap();
+                }
+                for (o, (t, want)) in out.iter().zip(&fresh).enumerate() {
+                    let label = format!("busy prefetch {on}, run {run}, output {o}");
+                    assert_bits(&label, &s.download(t).unwrap(), want);
+                }
+            }
+            ranges.push(
+                s.trace_ops(id)
+                    .unwrap()
+                    .iter()
+                    .map(|op| op.entries[..4].to_vec())
+                    .collect(),
+            );
+            s.release_trace(id).unwrap();
+            for t in out {
+                s.free(t).unwrap();
+            }
+        }
+        let (off_ranges, on_ranges) = (&ranges[0], &ranges[1]);
+        assert_eq!(off_ranges.len(), on_ranges.len(), "the same ops");
+        let mut moved = 0;
+        for (a, b) in off_ranges.iter().zip(on_ranges) {
+            for u in 0..4 {
+                let (a, b) = (&a[u], &b[u]);
+                if a.start != a.end && b.len() == a.len() && b.start >= a.start + 5 {
+                    moved += 1;
+                }
+            }
+        }
+        println!("BF16 rows: ops moved down by a prefetch moved in ahead of them: {moved}");
+        assert!(
+            moved >= 8,
+            "each later product's list moved ahead on four units: {moved}"
+        );
+        for t in w.into_iter().chain(xs) {
+            s.free(t).unwrap();
+        }
+    });
+}

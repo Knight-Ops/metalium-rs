@@ -284,6 +284,21 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
     fidelity no longer moves them, `A`'s gathers bind instead. H13's chunk 1.27x the reference (1.34x with BFP8
     weights), so its kill no longer fires; packer L1 accumulation's ceiling falls to at most 2.5% of a product.
 
+- **W1: the one-row path for a BF16 `A`** (2026-11-10, gates card 0, the 1.7B card 1;
+  [log](../learnings/performance-log.md#w1-the-one-row-path-for-a-bf16-a-its-decode-products-at-the-fp32-as-step-2026-11-10-cards-0-and-1)).
+  - A one-row BF16 `A` is packed `[K / 32, 32]` in its own format (`tensor::pack_row`), its tiles in FP32-sized slots,
+    and read from 32-byte face rows (`matmul::packed_a_pairs`, `SrcRoute::packed_row_bytes`). So it takes the weight
+    prefetch, the busy prefetch and the streamed `K` as an FP32 row does. Bit for bit the row read whole and an FP32
+    `A` of its values, on ttsim and card 0: the isolated probe `probe_pair_src_rows::srcb_packed_bf16_row`
+    (`1794347716`), then `step204`, `step205` and `step216` (`1794348020`). The control,
+    `matmul::probe_fp32_row_strides`, changes every column.
+  - Decode products a 1.7B step at `m` = 1: BF16 x BFP8 HiFi2 10.74 -> **6.99 ms** (FP32 `A` 7.00), BF16 x BF16 14.33 ->
+    10.34 (10.19); `down` 177 -> 71 us (`1794332034` -> `1794348097`). A BF16 `A` is no slower than an FP32 one at
+    any `m`; no model gains until BF16 activations (native BF16 arithmetic).
+  - Nothing else moved: the 1.7B 7.52 / 9.82 ms a step under the two contracts (`1794349089`, `1794349769`), the
+    pinned jobs grown by BF16 cases only. Found on the way: `Session::download_bf16` refused a BF16 tensor in
+    FP32-sized slots; it reads each slot at its own length.
+
 ## Prefill and long context
 
 Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-context.md](../plans/long-context.md).
