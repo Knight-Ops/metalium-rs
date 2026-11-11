@@ -344,6 +344,26 @@ fn sim_factory(
                 c.budget,
             )
         }
+        fn matmul_dram_bf16(
+            &mut self,
+            a: burn_tt::BufferId,
+            ta: bool,
+            b: burn_tt::BufferId,
+            tb: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            let c = &self.config;
+            self.buffers.matmul_as(
+                &mut self.session,
+                a,
+                ta,
+                b,
+                tb,
+                c.route,
+                c.fidelity,
+                c.budget,
+                tt_kernels::tensor::Elem::BF16,
+            )
+        }
         fn matmul_dram_at(
             &mut self,
             a: burn_tt::BufferId,

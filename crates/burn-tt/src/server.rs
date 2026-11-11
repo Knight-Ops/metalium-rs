@@ -179,6 +179,22 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// [`Engine::matmul_dram`] with a BF16 result (roadmap W1, native BF16 arithmetic): the F32
+    /// product narrowed once, ties-even (`Session::bf16_from_f32`'s rounding). An engine with its
+    /// own native product (`Session::matmul_dram_as`, each output rounded in `Dst` before a BF16
+    /// pack, bit for bit this) takes it; the default runs the composition.
+    fn matmul_dram_bf16(
+        &mut self,
+        a: BufferId,
+        a_transposed: bool,
+        b: BufferId,
+        b_transposed: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (c, _) = self.matmul_dram(a, a_transposed, b, b_transposed)?;
+        let out = self.cast_float(c, true);
+        self.free(c);
+        out
+    }
     /// [`Engine::matmul_dram`] at `fidelity` in place of the engine's own (`MatmulMode::Accurate`
     /// multiplies integer slices at `Fidelity::Lo`). An engine that cannot refuses.
     fn matmul_dram_at(
@@ -1358,6 +1374,35 @@ impl DramBuffers {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.matmul_as(
+            s,
+            a,
+            a_transposed,
+            b,
+            b_transposed,
+            route,
+            fidelity,
+            budget,
+            Elem::F32,
+        )
+    }
+
+    /// [`DramBuffers::matmul`] with a result of `out` (F32, or BF16: `Session::matmul_dram_as`,
+    /// roadmap W1). A BF16 result the session has no schedule for (`K` blocked through the
+    /// result) is the F32 product narrowed, which it is bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_as<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        a_transposed: bool,
+        b: BufferId,
+        b_transposed: bool,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        out: Elem,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let (ta, tb) = (self.operand(a)?, self.operand(b)?);
         // A packed operand's values are exact in either `Src` type: its edge picks the route.
         let route = match (ta.elem, tb.elem) {
@@ -1366,8 +1411,8 @@ impl DramBuffers {
             }
             _ => route,
         };
-        let c = s
-            .matmul_dram(
+        let product = |s: &mut Session<T>, out| {
+            s.matmul_dram_as(
                 &ta,
                 a_transposed,
                 &tb,
@@ -1375,12 +1420,29 @@ impl DramBuffers {
                 route,
                 fidelity,
                 budget,
+                out,
             )
-            .map_err(TtError::from)?;
-        let dims = [c.rows, c.cols];
-        self.next += 1;
-        self.live.insert(self.next, c);
-        Ok((self.next, dims))
+        };
+        let c = match product(s, out) {
+            Err(tt_kernels::tensor::TensorError::Shape(e))
+                if out == Elem::BF16 && e.contains("K-blocked") =>
+            {
+                let wide = product(s, Elem::F32).map_err(TtError::from)?;
+                let narrowed = s.bf16_from_f32(&wide);
+                let _ = s.free(wide);
+                return Ok(self.insert_bf16(narrowed.map_err(TtError::from)?));
+            }
+            c => c.map_err(TtError::from)?,
+        };
+        Ok(self.insert_any(c))
+    }
+
+    /// `t` under a new id: a BF16 tensor among the BF16 buffers, every other in the live map.
+    fn insert_any(&mut self, t: tt_kernels::tensor::DramTensor) -> (BufferId, [usize; 2]) {
+        match t.as_bf16() {
+            Some(bf16) => self.insert_bf16(bf16),
+            None => self.insert(t),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1677,6 +1739,19 @@ impl DramBuffers {
         dims: [usize; 2],
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         if let Some(t) = self.bf16.get(&a) {
+            // Untransposed blocks on tile boundaries: whole tiles in their own slots
+            // (`Session::copy_blocks`, `READ_RUN`/`WRITE_RUN` step by a BF16 slot), as an F32
+            // tensor's move; anything else is the bit repack below.
+            if moves.iter().all(|m| !m.transposed) {
+                let source = tt_kernels::tensor::DramTensor::from_bf16(
+                    t.clone(),
+                    tt_kernels::tensor::Pad::Undefined,
+                );
+                if let Ok(c) = s.copy_blocks(&source, moves, dims) {
+                    return Ok(self.insert_any(c));
+                }
+            }
+            let t = self.bf16.get(&a).expect("checked above");
             let [rows, cols] = dims;
             let count = rows
                 .checked_mul(cols)
@@ -1749,16 +1824,15 @@ impl DramBuffers {
                 return self.matrix_eltwise(s, op, a, b, precision, fidelity);
             }
         }
-        let ta = self.get(a)?.clone();
-        let tb = b.map(|b| self.get(b).cloned()).transpose()?;
-        let tc = c.map(|c| self.get(c).cloned()).transpose()?;
+        // BF16 buffers as they lie: an element-wise op on BF16 operands is its widened op
+        // rounded once (`Session::eltwise3`, roadmap W1), its result BF16.
+        let ta = self.operand(a)?;
+        let tb = b.map(|b| self.operand(b)).transpose()?;
+        let tc = c.map(|c| self.operand(c)).transpose()?;
         let c = s
             .eltwise3(op, &ta, tb.as_ref(), tc.as_ref())
             .map_err(TtError::from)?;
-        let dims = [c.rows, c.cols];
-        self.next += 1;
-        self.live.insert(self.next, c);
-        Ok((self.next, dims))
+        Ok(self.insert_any(c))
     }
 
     pub fn eltwise_blocks<T: tt_device::Transport>(
@@ -1769,20 +1843,31 @@ impl DramBuffers {
         b: Option<BlockArg>,
         c: Option<BlockArg>,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let block = |x: BlockArg| -> Result<tt_kernels::tensor::BlockOperand<'_>, TtError> {
-            Ok(tt_kernels::tensor::BlockOperand {
-                tensor: self.get(x.id)?,
+        // BF16 buffers as they lie, as `eltwise_op` reads them (roadmap W1).
+        let (ta, tb, tc) = (
+            self.operand(a.id)?,
+            b.map(|b| self.operand(b.id)).transpose()?,
+            c.map(|c| self.operand(c.id)).transpose()?,
+        );
+        fn block(
+            t: &tt_kernels::tensor::DramTensor,
+            x: BlockArg,
+        ) -> tt_kernels::tensor::BlockOperand<'_> {
+            tt_kernels::tensor::BlockOperand {
+                tensor: t,
                 at: x.at,
                 dims: x.dims,
-            })
-        };
-        let (ta, tb, tc) = (
-            block(a)?,
-            b.map(block).transpose()?,
-            c.map(block).transpose()?,
-        );
-        let out = s.eltwise_blocks(op, ta, tb, tc).map_err(TtError::from)?;
-        Ok(self.insert(out))
+            }
+        }
+        let out = s
+            .eltwise_blocks(
+                op,
+                block(&ta, a),
+                tb.as_ref().zip(b).map(|(t, x)| block(t, x)),
+                tc.as_ref().zip(c).map(|(t, x)| block(t, x)),
+            )
+            .map_err(TtError::from)?;
+        Ok(self.insert_any(out))
     }
 
     pub fn rope_blocks<T: tt_device::Transport>(
@@ -3350,6 +3435,19 @@ pub(crate) fn rms_norm(
     )
 }
 
+/// Each row's `sqrt(mean(a a) + eps)`, `[rows, 1]` F32 (`Engine::rms`, `Session::rms`), without
+/// waiting.
+pub(crate) fn rms_stat(device: TtDevice, a: BufferId, eps: f32) -> (BufferId, [usize; 2]) {
+    let [rows, _] = dims_of(a);
+    submit(
+        "rms",
+        device,
+        [rows, 1],
+        move || format!("RMS statistic, eps {eps:e}"),
+        move |engine, ids| engine.rms(ids.get(a)?, eps),
+    )
+}
+
 pub(crate) fn scan(
     device: TtDevice,
     a: BufferId,
@@ -3402,6 +3500,41 @@ pub(crate) fn matmul_dram(
             }
         }
     })
+}
+
+/// [`matmul_dram`] with a BF16 result (`Engine::matmul_dram_bf16`; roadmap W1), without waiting. At
+/// a fidelity override, the product at it narrowed once (`cast_float`), which the native one is.
+pub(crate) fn matmul_dram_bf16(
+    device: TtDevice,
+    a: BufferId,
+    a_transposed: bool,
+    b: BufferId,
+    b_transposed: bool,
+) -> (BufferId, [usize; 2]) {
+    let ([ar, ac], [br, bc]) = (dims_of(a), dims_of(b));
+    let m = if a_transposed { ac } else { ar };
+    let n = if b_transposed { br } else { bc };
+    submit(
+        "matmul_dram",
+        device,
+        [m, n],
+        move || "matmul, a BF16 result".into(),
+        {
+            let fidelity = crate::matmul_mode::fidelity_override();
+            move |engine, ids| {
+                let (a, b) = (ids.get(a)?, ids.get(b)?);
+                match fidelity {
+                    None => engine.matmul_dram_bf16(a, a_transposed, b, b_transposed),
+                    Some(f) => {
+                        let (c, _) = engine.matmul_dram_at(a, a_transposed, b, b_transposed, f)?;
+                        let out = engine.cast_float(c, true);
+                        engine.free(c);
+                        out
+                    }
+                }
+            }
+        },
+    )
 }
 
 /// A batched matmul over blocks on the device with `layout`
@@ -3896,6 +4029,26 @@ impl Engine for KmdEngine {
             self.route,
             self.fidelity,
             self.budget,
+        )
+    }
+    fn matmul_dram_bf16(
+        &mut self,
+        a: BufferId,
+        ta: bool,
+        b: BufferId,
+        tb: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.matmul_as(
+            &mut self.session,
+            a,
+            ta,
+            b,
+            tb,
+            self.route,
+            self.fidelity,
+            self.budget,
+            Elem::BF16,
         )
     }
     fn matmul_dram_at(

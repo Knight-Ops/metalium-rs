@@ -3849,6 +3849,20 @@ pub(crate) fn eltwise_output(kind: u32, operands: &[&DramTensor]) -> Result<Elem
 
 static PROBE_BF16_RESULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+static PROBE_TILE_CASTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The F32 <-> BF16 conversions a job a tile (`bf16::expand`, `bf16::compress`) instead of the
+/// SFPU kernel's runs (`tile_op::cast`): the oracle `step270_native_bf16` holds the runs to.
+/// Gates only.
+#[doc(hidden)]
+pub fn probe_tile_casts(on: bool) {
+    PROBE_TILE_CASTS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn probing_tile_casts() -> bool {
+    PROBE_TILE_CASTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What an element-wise op on BF16 operands makes of an F32 kind's result, and a product asked
 /// for a BF16 result (`Session::matmul_dram_as`), for gates only (`step270_native_bf16`): `Bf16` (the default, and the only form outside a gate);
 /// `Bf16AsFp32`, rounded and packed as FP32, the simulator's form since ttsim refuses the BF16

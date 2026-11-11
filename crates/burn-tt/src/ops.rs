@@ -70,9 +70,12 @@ pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
 /// engine without GDDR.
 fn packed_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     use crate::storage::StorageFormat;
+    // An F32 `a` against a logical F32 weight; or (roadmap W1) a BF16 `a` against a logical BF16
+    // one, stored BFP, with a BF16 result.
+    let bf16 = a.dtype() == DType::BF16 && b.dtype() == DType::BF16;
     if b.storage_format() == StorageFormat::F32
         || a.storage_format() != StorageFormat::F32
-        || a.dtype() != DType::F32
+        || !(a.dtype() == DType::F32 || bf16)
         || b.is_transposed()
         || b.is_view()
         || !crate::server::supports_dram(a.device)
@@ -94,14 +97,24 @@ fn packed_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     out.push(n);
     let a = float::float_reshape(a.clone(), burn_backend::Shape::new([rows, k]));
     let (da, db) = (a.to_dram().clone(), b.to_dram().clone());
-    let (id, dims) =
-        crate::server::matmul_dram(a.device, da.buffer.id, da.transposed, db.buffer.id, false);
+    let (id, dims) = match bf16 {
+        true => crate::server::matmul_dram_bf16(
+            a.device,
+            da.buffer.id,
+            da.transposed,
+            db.buffer.id,
+            false,
+        ),
+        false => {
+            crate::server::matmul_dram(a.device, da.buffer.id, da.transposed, db.buffer.id, false)
+        }
+    };
     Some(device_result_shaped(
         a.device,
         id,
         dims,
         burn_backend::Shape::from(out),
-        DType::F32,
+        if bf16 { DType::BF16 } else { DType::F32 },
     ))
 }
 
@@ -339,11 +352,11 @@ pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
         a.buffer.cols, b.buffer.rows,
         "BF16 matmul inner dimensions differ"
     );
-    let (id, dims) = crate::server::matmul_dram(lhs.device, a.buffer.id, false, b.buffer.id, false);
-    Some(cast_native(
-        device_result(lhs.device, id, dims),
-        DType::BF16,
-    ))
+    // A BF16 result: each output rounded once in `Dst` and packed as BF16 (roadmap W1), bit for
+    // bit the F32 product narrowed.
+    let (id, dims) =
+        crate::server::matmul_dram_bf16(lhs.device, a.buffer.id, false, b.buffer.id, false);
+    Some(device_view(lhs.device, id, dims, None, DType::BF16))
 }
 
 /// Materialized matrix products for each logical batch, including ragged,
@@ -1557,8 +1570,32 @@ fn device_op_ungated(
     // Any rank: each operand as the matrix it is stored as
     // (`crate::tensor::stored_dims`), of the element type the kind computes on.
     let sig = tt_kernels::sfpu::ops::elems(kind);
+    // BF16 operands (roadmap W1, native BF16 arithmetic): read as they lie where the kind takes
+    // F32 alone and every operand is BF16 -- the op is then its widened op rounded once
+    // (`Session::eltwise3`), the composition below bit for bit -- else widened and narrowed.
+    let operands = || [Some(a), b, c].into_iter().flatten();
+    let bf16 = operands().any(|t| t.dtype() == DType::BF16);
+    if bf16 {
+        let all_f32 = sig.inputs.iter().all(|&e| e == Elem::F32);
+        let all_bf16 = operands().all(|t| t.dtype() == DType::BF16);
+        // A row broadcast has no BF16 form in the kernel (`sfpu::kernel::widened_rows`).
+        let row = |x: &TtTensor, y: &TtTensor| {
+            matches!(
+                (x.stored(), y.stored()),
+                (Some([xr, _]), Some([1, _])) if xr != 1
+            ) && x.shape() != y.shape()
+        };
+        let rows = b.is_some_and(|b| row(a, b) || row(b, a));
+        if !(all_f32 && all_bf16 && !rows) || kind == k::ADD_ROW {
+            return bf16_widened(op, a, b, c);
+        }
+    }
     let fits = |t: &TtTensor, i: usize| {
-        t.is_storable() && t.elem() == sig.inputs.get(i).copied() && t.device == device
+        let elem = match t.dtype() {
+            DType::BF16 => Some(Elem::F32),
+            _ => t.elem(),
+        };
+        t.is_storable() && elem == sig.inputs.get(i).copied() && t.device == device
     };
     if !fits(a, 0) || b.is_some_and(|b| !fits(b, 1)) || c.is_some_and(|c| !fits(c, 2)) {
         return None;
@@ -1628,6 +1665,25 @@ fn device_op_ungated(
         }
     };
     Some(device_result_shaped(device, id, dims, a.shape(), dtype))
+}
+
+/// [`device_op_ungated`] on BF16 operands it does not read natively: each widened, the op in F32,
+/// an F32 result narrowed once -- the composition burn-tt runs for any BF16 op it has no native
+/// form of.
+fn bf16_widened(
+    op: tt_kernels::tensor::Eltwise,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+    c: Option<&TtTensor>,
+) -> Option<TtTensor> {
+    let wide = |t: &TtTensor| float_compute_input(t.clone());
+    let (wa, wb, wc) = (wide(a), b.map(wide), c.map(wide));
+    let out = device_op_ungated(op, &wa, wb.as_ref(), wc.as_ref())?;
+    // The result's dtype is `a`'s where the kind keeps its element type, as the native op's is.
+    Some(match (out.dtype(), a.dtype()) {
+        (DType::F32, DType::BF16) => cast_native(out, DType::BF16),
+        _ => out,
+    })
 }
 
 /// Whether `y` broadcasts to `x` as a block of whole tile rows repeated down `x`'s matrix

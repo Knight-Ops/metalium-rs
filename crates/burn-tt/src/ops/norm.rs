@@ -159,9 +159,49 @@ fn rms_norm_composed(x: TtTensor, gamma: TtTensor, eps: f32) -> TtTensor {
     TtBackend::float_mul(normed, gamma)
 }
 
-/// [`rms_norm_native`], else [`rms_norm_composed`]: charged to an op of its own, `rms_norm`.
+/// Burn's `RmsNorm::forward` on a BF16 `x` and `gamma` (roadmap W1, native BF16 arithmetic): the
+/// statistic in F32 on `x` widened, cast to BF16; then `x / rms` and `* gamma`, each a BF16 op that
+/// rounds once (`float_div`, `float_mul` on BF16 operands) -- the module's three roundings, bit for
+/// bit. The statistic is one op (`Session::rms`) where it fits a job, else Burn's four.
+fn rms_norm_bf16(x: TtTensor, gamma: TtTensor, eps: f32) -> TtTensor {
+    use burn_backend::ops::FloatTensorOps;
+    let rank = x.shape().num_dims();
+    let wide = crate::ops::float_compute_input(x.clone());
+    let shape = wide.shape().to_vec();
+    let cols = shape[rank - 1];
+    let one_op = wide.is_storable()
+        && crate::server::supports_dram(wide.device)
+        && tt_kernels::sfpu::norm::fits(cols)
+        && !shape.contains(&0);
+    let stat = if one_op {
+        let d = plain_dram(&wide);
+        let (id, dims) = crate::server::rms_stat(wide.device, d.buffer.id, eps);
+        let mut at = shape.clone();
+        at[rank - 1] = 1;
+        device_result_shaped(wide.device, id, dims, at.into(), DType::F32)
+    } else {
+        let squares = TtBackend::float_mul(wide.clone(), wide);
+        let mean = TtBackend::float_mean_dim(squares, rank - 1);
+        let shifted = TtBackend::float_add_scalar(mean, (eps as f64).into());
+        TtBackend::float_sqrt(shifted)
+    };
+    let rms = crate::ops::cast_native(stat, DType::BF16);
+    let normed = TtBackend::float_div(x, rms);
+    let mut at = vec![1; rank];
+    at[rank - 1] = gamma.shape().num_elements();
+    let gamma = TtBackend::float_reshape(gamma, at.into());
+    TtBackend::float_mul(normed, gamma)
+}
+
+/// [`rms_norm_native`], else [`rms_norm_composed`] ([`rms_norm_bf16`] for BF16): charged to an op
+/// of its own, `rms_norm`.
 pub(crate) fn rms_norm_tt(x: TtTensor, gamma: TtTensor, eps: f32) -> TtTensor {
     let _op = crate::report::enter("rms_norm", true);
+    if x.dtype() == DType::BF16 && gamma.dtype() == DType::BF16 {
+        let out = rms_norm_bf16(x, gamma, eps);
+        crate::report::made(true);
+        return out;
+    }
     let out = rms_norm_native(&x, &gamma, eps).unwrap_or_else(|| rms_norm_composed(x, gamma, eps));
     crate::report::made(true);
     out
@@ -283,8 +323,9 @@ pub fn rms_norm<B: burn_backend::Backend, const D: usize>(
         }
     }
     // `RmsNorm::forward` takes a half type's statistic in F32 and casts it back: that composition
-    // is the module's own.
-    if x.dtype() != DType::F32 || gamma.dtype() != DType::F32 || !scaled_on() {
+    // is the module's own, which a BF16 pair takes as it is (`rms_norm_bf16`).
+    let pair = (x.dtype(), gamma.dtype());
+    if !matches!(pair, (DType::F32, DType::F32) | (DType::BF16, DType::BF16)) || !scaled_on() {
         return None;
     }
     let eps = eps as f32;

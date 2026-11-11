@@ -26,6 +26,10 @@
 //! 3. **Its named option** (BFP4 `gate|up`): its agreement recorded, not held to a threshold. On
 //!    this model it misses tt-metal's acceptance floors (top-1 90%, PCC 0.95), and the owner kept
 //!    it as a recorded option (2026-11-10), to be judged again on the 8B-class model (W5).
+//! 4. **A BF16 activation stream** (roadmap W1, `WeightOptions::bf16_stream`: the activations
+//!    between ops BF16, the weights logical BF16 stored BFP8, the head and the attention block
+//!    F32): its agreement recorded. It missed the BFP8 run's top-1 threshold by one position on
+//!    2026-11-11 (227 of 232); whether it is held to it is the owner's call.
 //!
 //! Negative control: the correlation falls strictly from BF16 to BFP8 to BFP4 weights, so each
 //! run really computed with its contract's formats (a `for_inference` that ignored its contract
@@ -169,7 +173,10 @@ fn run(cases: &[Case]) {
         let bfp8 = agreement(cases, &bfp8, &flex);
         report("performance contract (BFP8 weights)", &bfp8);
 
-        let bfp4 = WeightOptions { mlp_bfp4: true };
+        let bfp4 = WeightOptions {
+            mlp_bfp4: true,
+            ..Default::default()
+        };
         let bfp4 = device_logits(&model, Numerics::Performance, bfp4, cases, &d);
         let bfp4 = agreement(cases, &bfp4, &flex);
         report("performance contract, BFP4 gate|up", &bfp4);
@@ -187,6 +194,18 @@ fn run(cases: &[Case]) {
             baseline.pcc_mean > bfp8.pcc_mean && bfp8.pcc_mean > bfp4.pcc_mean,
             "the correlation does not fall with the weights' bits: {baseline} / {bfp8} / {bfp4}"
         );
+
+        // A BF16 activation stream (roadmap W1, native BF16 arithmetic): recorded, not held to a
+        // threshold. On 2026-11-11 (card 0, `1794418406`) it trips BFP8's top-1 threshold by one
+        // position (227 of 232 against 228; top-5 100%, mean PCC 0.999594): the owner's call,
+        // the thresholds unchanged.
+        let stream = WeightOptions {
+            bf16_stream: true,
+            ..Default::default()
+        };
+        let stream = device_logits(&model, Numerics::Performance, stream, cases, &d);
+        let stream = agreement(cases, &stream, &flex);
+        report("performance contract, a BF16 stream", &stream);
     });
 }
 

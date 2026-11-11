@@ -240,3 +240,133 @@ impl Microkernel for Sfpu {
         })
     }
 }
+
+/// `a`'s datums converted between FP32 and BF16 (roadmap W1, native BF16 arithmetic): the SFPU
+/// kernel's run of tiles, each BF16 tile widened into `Dst` as `bf16::expand` widens it (each FP32
+/// one read as it is), its datums moved untouched (`Int32` loads and stores), and -- to BF16 --
+/// rounded by the compress's quantize before a BF16 pack. Bit for bit `bf16::expand` and
+/// `bf16::compress`, over runs of tiles a job, where those take a job a tile. `to` is F32 for a
+/// BF16 `a`, BF16 for an F32 one.
+pub fn cast(a: BlockOperand<'_>, to: tensor::Elem) -> Result<TileOp> {
+    use crate::sfpu::kernel::{Formats, Out};
+    let from = a.tensor.elem;
+    let formats = match (from, to) {
+        (tensor::Elem::BF16, tensor::Elem::F32) => Formats {
+            bf16_in: true,
+            out: Out::Fp32,
+        },
+        (tensor::Elem::F32, tensor::Elem::BF16) => Formats {
+            bf16_in: false,
+            out: Out::Bf16,
+        },
+        _ => {
+            return Err(TensorError::Shape(format!(
+                "a cast from {from:?} to {to:?}: F32 and BF16 only"
+            )))
+        }
+    };
+    let ra = a.tensor_ref("a cast's block")?;
+    let a = a.shape_only();
+    let same = TileMap {
+        rows: Dim::of(0),
+        cols: Dim::of(1),
+    };
+    Ok(TileOp {
+        domain: vec![Iter::parallel(a.rows), Iter::parallel(a.cols)],
+        operands: vec![Access {
+            layout: Layout::Tiles(ra),
+            map: same,
+            elem: from,
+            live_rows: false,
+        }],
+        results: vec![Access {
+            layout: Layout::Tiles(Default::default()),
+            map: same,
+            elem: to,
+            live_rows: false,
+        }],
+        body: Box::new(Cast { formats }),
+        contract: NumericContract::Program,
+        ahead: Vec::new(),
+        share: None,
+        out: ([a.rows, a.cols], to),
+    })
+}
+
+/// [`cast`]'s run of tiles: the SFPU kernel's roles over a raw copy of each tile, `A` to the
+/// result's rows, then the quantize where the result is BF16.
+struct Cast {
+    formats: crate::sfpu::kernel::Formats,
+}
+
+impl Cast {
+    /// The math of one tile: every row group's bits moved from `A`'s rows to the result's.
+    fn math(&self) -> crate::code::Code {
+        use crate::sfpu::kernel::{A_ROW, OUT_ROW};
+        use crate::sfpu::{Format, LReg, Program};
+        let mut p = Program::new();
+        p.for_each_row_group(64, |p, o| {
+            p.load(LReg::L0, Format::Int32, A_ROW + o);
+            p.store(LReg::L0, Format::Int32, OUT_ROW + o);
+        });
+        let copy = p.finish_code();
+        match self.formats.out.quantized() {
+            true => copy.then(crate::bf16::quantize_code(OUT_ROW)),
+            false => copy,
+        }
+    }
+}
+
+impl Microkernel for Cast {
+    fn lists(&self, _chunked: bool) -> [&'static str; 2] {
+        ["cast gather", "cast scatter"]
+    }
+
+    fn group(&self, half: bool) -> Option<usize> {
+        // The looped roles are one tile's whatever the run (`sfpu::kernel::roles_looped`): the
+        // arena alone bounds a run.
+        let arena = if half {
+            crate::matmul::half()
+        } else {
+            crate::l1::arena().len()
+        };
+        Some(
+            64.min(crate::sfpu::kernel::max_tiles_in(Operands::Unary, arena))
+                .max(1),
+        )
+    }
+
+    fn needs(&self, at: &At<'_>) -> Result<Arc<Requirements>> {
+        static MEMO: allocate::Declared<(usize, Operands)> = OnceLock::new();
+        let &At::Run { len, .. } = at else {
+            return Err(at.refused());
+        };
+        Ok(allocate::declared(&MEMO, (len, Operands::Unary), || {
+            crate::sfpu::kernel::requirements(len, Operands::Unary)
+        }))
+    }
+
+    fn code(&self, at: &At<'_>, l1: &Placed) -> Result<RunCode> {
+        let &At::Run { len, .. } = at else {
+            return Err(at.refused());
+        };
+        let layout = crate::sfpu::kernel::Layout::placed(len, Operands::Unary, l1);
+        let (roles, loops) = crate::sfpu::kernel::roles_code_as(
+            &layout,
+            Operands::Unary,
+            &self.math(),
+            self.formats,
+        );
+        Ok(RunCode {
+            operands: [Some(layout.a_at), None, None],
+            prior: None,
+            out: layout.out_at,
+            stride: 0,
+            resident: None,
+            mop: [None; 3],
+            init: layout.init.clone(),
+            roles: Arc::new(roles),
+            loops: Arc::new(loops),
+        })
+    }
+}

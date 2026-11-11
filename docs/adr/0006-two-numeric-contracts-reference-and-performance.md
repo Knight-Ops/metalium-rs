@@ -106,6 +106,11 @@ The inference default. Its per-op rule:
   - no burn-tt op branches on the contract yet.
 
   Its specification model is therefore exact: the F32 model holding the weights' rounded values (`step240`). The model gate is `step269_performance_contract`. BF16 activations, derived fidelity and packer L1 accumulation extend both as their boxes land.
+- **BF16 activations, an option (2026-11-11, roadmap W1):** `WeightOptions::bf16_stream`. Every native BF16 op is bit
+  for bit the widen-compute-narrow composition it replaces, so the option is a model choice, not a contract branch:
+  its specification is Burn's own composition on BF16 (each op rounding once). It is not the default: on the 1.7B it
+  runs behind the FP32 stream and misses `step269`'s top-1 threshold by one position (performance-log, "burn-tt on
+  BF16, and the 1.7B on a BF16 stream").
 
 ## Consequences
 **Results under the performance contract change** with the contract's version, never with the grid, the card or the schedule.

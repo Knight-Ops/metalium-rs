@@ -209,7 +209,11 @@ fn project_split<B: Backend, const N: usize>(
     whole: &Linear<B>,
     widths: [usize; N],
 ) -> [Tensor<B, 3>; N] {
-    let y = project(x, whole);
+    split(project(x, whole), widths)
+}
+
+/// `y`'s column blocks of `widths`, left to right: views of it.
+fn split<B: Backend, const N: usize>(y: Tensor<B, 3>, widths: [usize; N]) -> [Tensor<B, 3>; N] {
     let [n, t, _] = y.dims();
     let mut at = 0;
     widths.map(|w| {
@@ -347,12 +351,24 @@ impl<B: Backend> Layer<B> {
         let heads =
             |p: Tensor<B, 3>, count: usize| p.reshape([n, t, count, head_dim]).swap_dims(1, 2);
         let (qw, kvw) = (cfg.heads * head_dim, kv_heads * head_dim);
+        // Under a stream of another dtype than the cache's (a BF16 stream, an F32 cache), the
+        // attention block computes in the cache's: its inputs widened here -- a fused product
+        // whole, before it is split, so no view of it is cast -- and its output narrowed after its
+        // heads are laid back along the row.
+        let (stream, kv_dtype) = (x.dtype(), cache_k.dtype());
+        let to_cache = |t: Tensor<B, 3>| {
+            if t.dtype() == kv_dtype {
+                t
+            } else {
+                t.cast(kv_dtype)
+            }
+        };
         let [q, k, v] = match &a.qkv {
-            Some(qkv) => project_split(h, qkv, [qw, kvw, kvw]),
+            Some(qkv) => split(to_cache(project(h, qkv)), [qw, kvw, kvw]),
             None => [
-                project(h.clone(), part(&a.q_proj)),
-                project(h.clone(), part(&a.k_proj)),
-                project(h, part(&a.v_proj)),
+                to_cache(project(h.clone(), part(&a.q_proj))),
+                to_cache(project(h.clone(), part(&a.k_proj))),
+                to_cache(project(h, part(&a.v_proj))),
             ],
         };
         let q = rope.apply(heads(q, cfg.heads));
@@ -411,10 +427,13 @@ impl<B: Backend> Layer<B> {
         );
         // Unfolded (a no-op unless the query heads were folded into rows above).
         let out = out.reshape([n, cfg.heads, t, head_dim]);
-        let context = hook(
-            "attn_ctx",
-            out.swap_dims(1, 2).reshape([n, t, cfg.heads * head_dim]),
-        );
+        let context = out.swap_dims(1, 2).reshape([n, t, cfg.heads * head_dim]);
+        let context = if context.dtype() == stream {
+            context
+        } else {
+            context.cast(stream)
+        };
+        let context = hook("attn_ctx", context);
         let x = residual(x, project(context, &a.o_proj));
 
         let h = normed(&self.post_attention_layernorm, x.clone());
@@ -535,6 +554,24 @@ pub struct Llama<B: Backend> {
     /// The numeric contract the model was made for ([`Llama::for_inference`]), or `None` for one
     /// put together otherwise. Not a parameter.
     numerics: Option<burn_tt::Numerics>,
+    /// The activations' dtype between ops where it is not the embedding table's (and the cache's):
+    /// BF16 under `WeightOptions::bf16_stream`, each looked-up row narrowed into it, the queries,
+    /// keys and values widened to the cache's after their projections and the attention output
+    /// narrowed back. Not a parameter.
+    stream: Option<DType>,
+}
+
+/// Casts every vector parameter (the norms' scales) to `0`'s dtype.
+struct Vectors(DType);
+
+impl<B: Backend> ModuleMapper<B> for Vectors {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        if D != 1 {
+            return param;
+        }
+        let dtype = self.0;
+        param.map(|t| t.cast(dtype))
+    }
 }
 
 /// Widens every float parameter to F32.
@@ -559,6 +596,7 @@ impl<B: Backend> Llama<B> {
             lm_head: (!config.tied_head).then(|| linear(config.hidden, config.vocab, device)),
             config: *config,
             numerics: None,
+            stream: None,
         }
     }
 
@@ -957,7 +995,8 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         cache: &LlamaCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let x = self.embed(tokens);
-        self.fixed_chunk_within(x, start, last, len, cache, cache.kv.dtype())
+        let stream = self.stream.unwrap_or_else(|| cache.kv.dtype());
+        self.fixed_chunk_within(x, start, last, len, cache, stream)
     }
 
     fn step(
@@ -968,7 +1007,8 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         cache: &LlamaCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let x = self.embed(token);
-        self.fixed_step_within(x, position, len, cache, cache.kv.dtype())
+        let stream = self.stream.unwrap_or_else(|| cache.kv.dtype());
+        self.fixed_step_within(x, position, len, cache, stream)
     }
 }
 
@@ -1100,6 +1140,12 @@ impl<B: burn_tt::storage::StorageBackend> Llama<B> {
             &crate::quant::Plan::for_numerics(numerics, options),
             &crate::quant::Native,
         );
+        if options.bf16_stream {
+            // The norms' scales in the stream's dtype (exact: a checkpoint's BF16 values). The
+            // table (and so the cache) stays F32 until the BF16 lookup and cache write land.
+            model = model.map(&mut Vectors(DType::BF16));
+            model.stream = Some(DType::BF16);
+        }
         model.numerics = Some(numerics);
         model
     }

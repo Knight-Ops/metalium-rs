@@ -434,8 +434,10 @@ pub struct Gemma4<B: Backend> {
 
 /// Widens every float parameter to F32, on its data (exact): a freshly loaded burn-tt tensor is
 /// still on the host, and widening it there uploads only the F32 tensor, where a cast on the
-/// device would first upload the BF16 one (in an F32 tile's slot) and free it after, leaving GDDR
-/// in holes the 11.3 GB per-layer table then finds no run in (`step261_gemma4`, 2026-10-30).
+/// device would first upload the BF16 one (then in an F32 tile's slot; BF16 tensors have taken
+/// slots of their own since 2026-11-11, roadmap W1, not re-measured here) and free it after,
+/// leaving GDDR in holes the 11.3 GB per-layer table then finds no run in (`step261_gemma4`,
+/// 2026-10-30).
 struct ToF32;
 
 fn widen<B: Backend, const D: usize>(t: Tensor<B, D>) -> Tensor<B, D> {
@@ -520,8 +522,10 @@ impl<B: Backend> Gemma4<B> {
     }
 
     /// The same model with its two embedding tables widened to F32 as well. On burn-tt a BF16
-    /// tensor takes an F32 tile's slot in GDDR, so the BF16 per-layer table would hold 11.3 GB
-    /// anyway, and an F32 table is looked up by a row select and multiplied by the head as it lies.
+    /// tensor took an F32 tile's slot in GDDR when this was measured (2026-10-30; its own slots
+    /// since 2026-11-11, roadmap W1, the fit not re-run), so the BF16 per-layer table would hold
+    /// 11.3 GB anyway, and an F32 table is looked up by a row select and multiplied by the head
+    /// as it lies.
     /// Widened on their data, as [`Precision::F32`] widens the rest.
     pub fn with_f32_tables(self) -> Self {
         Self {

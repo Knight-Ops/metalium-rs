@@ -1055,7 +1055,8 @@ fn weight_storage_probe() -> Option<Option<tt_models::quant::Format>> {
 
 /// The numeric contract a model bench runs under (ADR 0006): `TT_NUMERICS` (`reference` or
 /// `performance`), by default `performance`, the inference contract; `TT_MLP_BFP4=1` its named
-/// option, BFP4 for `gate|up`.
+/// option, BFP4 for `gate|up`; `TT_BF16_STREAM=1` a BF16 activation stream (roadmap W1,
+/// `WeightOptions::bf16_stream`).
 fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
     let numerics = burn_tt::Numerics::from_env()
         .unwrap_or(Ok(burn_tt::Numerics::Performance))
@@ -1065,7 +1066,18 @@ fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
         Ok("1") => true,
         Ok(other) => panic!("TT_MLP_BFP4={other}: expected 0 or 1"),
     };
-    (numerics, tt_models::quant::WeightOptions { mlp_bfp4 })
+    let bf16_stream = match std::env::var("TT_BF16_STREAM").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => panic!("TT_BF16_STREAM={other}: expected 0 or 1"),
+    };
+    (
+        numerics,
+        tt_models::quant::WeightOptions {
+            mlp_bfp4,
+            bf16_stream,
+        },
+    )
 }
 
 /// The plan a bench's model is stored by: [`weight_storage_probe`]'s, else [`bench_contract`]'s.

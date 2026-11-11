@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: burn-tt on BF16, and the 1.7B on a BF16 stream (an option)](#w1-burn-tt-on-bf16-and-the-17b-on-a-bf16-stream-an-option-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's routing phase and a first model run: 21 Burn ops, products, BFP storage of BF16, casts over runs of tiles, RMSNorm on BF16; the 1.7B on a BF16 stream works but runs behind the FP32 stream (decode 9.20 against 7.51 ms at 32 tokens, prefill 2,936 against 4,004 tokens/s at 256) and trips step269's top-1 threshold by one position: the default stays the FP32 stream, the BF16 one an option; what it lacks, measured |
 | [W1: products with a BF16 result, and a BF16 packed twin](#w1-products-with-a-bf16-result-and-a-bf16-packed-twin-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's third phase: each output rounded in `Dst` once its `K` chain is done (the last `K` chunk's run), packed as BF16; every schedule but `K` blocks; the quantize costs 6-9% of a short-`K` chunk product and ~0 of `down` (BF16 x BFP8, card 1), below the BF16 `A`'s gain: not killed |
 | [W1: BF16 tensors in their own slots, named in the tensor reference](#w1-bf16-tensors-in-their-own-slots-named-in-the-tensor-reference-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's first phase: `TensorRef::slot` (word 6); `READ_RUN`/`WRITE_RUN`/`SCATTER` step and size GDDR by it, other records refuse it; `alloc_elem` gives BF16 2,112-byte slots; `dm_b` +364 bytes; the 1.7B within the run-to-run band under both contracts (a first cut that branched per tile in `GATHER` cost 0.3-0.7% and was redone) |
 | [W1: native BF16 arithmetic bounded before building](#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0) | 2026-11-11 | the 1.7B's chunk products with a BF16 `A` (BFP8 `B`, HiFi4): **1.19x** at 256 rows, **1.24x** at 512 (4.7 / 8.7 ms a chunk); a 256-token prefill predicted ~1.08x; decode ~0 at short context, at most ~0.9 ms at 2K from a BF16 cache (attention is not byte-bound); a BF16 edge equals its widened FP32 edge over all 65,536 patterns (`step270`, ttsim and card 0) |
@@ -425,6 +426,55 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: burn-tt on BF16, and the 1.7B on a BF16 stream (an option) (2026-11-11, cards 0 and 1)
+
+Native BF16 arithmetic's routing phase, then the 1.7B run on a BF16 activation stream to see what is left
+(roadmap W1; [bound](#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0)).
+
+**burn-tt.** Twenty-one Burn ops that are one element-wise op on the card take BF16 operands as they lie
+(`gen_burn.rs`'s `NATIVE_BF16`), bit for bit `op(x.cast(F32)).cast(BF16)`, one job each; a BF16 product's result is
+BF16 from the card (`Engine::matmul_dram_bf16`); a logical BF16 weight may be stored BFP (`with_storage`), which a
+BF16 activation multiplies with a BF16 result; the casts run over runs of tiles (`tile_op::cast`), a job a run where
+they took a job a tile; RMSNorm on BF16 takes its F32 statistic in one op (Burn's module bit for bit, 5 jobs against 9
+at a decode row); an element-wise op over blocks reads BF16 buffers; an untransposed block copy of a BF16 tensor moves
+whole tiles (`Session::copy_blocks`), not datums. Gates: `step76` (12 ops and a product against their compositions, a
+row broadcast widened; the BFP8 weight; the norm), `step270::casts_over_runs_are_the_casts_a_tile`, conformance (ttsim
+3,025 and the BF16 suites on card 0, `1794409578`: 17 BF16 conv entries left the list, passing since before
+`9f873b8`), `step12_mnist`, `step77`/`90`/`94`. tt-mnist BF16 5.32 -> 5.04 ms a traced step (burn-flex 3.49, F32 1.36).
+
+**The 1.7B on a BF16 stream** (`WeightOptions::bf16_stream`, `TT_BF16_STREAM=1`): activations BF16 between ops, the
+body's weights logical BF16 stored BFP8, the norms' scales BF16; the embedding table F32 (each looked-up row narrowed:
+the BF16 lookup still stages), the head logical F32 (F32 logits), and the attention block F32 (the fused `q|k|v`
+product widened whole before it is split, the context narrowed after its heads are laid back), since the cache write
+has no BF16 form. Card 1, `traced_generation`, decode step at 32 / 128 / 256 tokens and prefill at 32 / 128 / 256:
+
+| run | decode, ms | prefill, tokens/s |
+|---|--:|--:|
+| FP32 stream (the default, BFP8 weights; `1794373840`) | 7.51 / 8.03 / 8.67 | 1,188 / 3,263 / 4,004 |
+| BF16 stream, first (`1794411034`) | 12.60 / 13.05 / 13.71 | 346 / 986 / 1,258 |
+| the casts over runs (`1794412350`) | 12.64 / 13.10 / 13.74 | 349 / 995 / 1,267 |
+| `q|k|v` widened whole, the context after its reshape (`1794417125`) | 9.21 / 9.69 / 10.37 | 703 / 2,142 / 2,928 |
+| BF16 block copies by tile (`1794420851`) | 9.20 / 9.73 / 10.36 | 704 / 2,137 / 2,936 |
+
+The profile (`--profile`, card 1, `1794414535`, then `1794418401`) said where the time went: first, casts of views
+(`q`, `k`, `v` as column blocks of the fused product, the attention context) through the BF16 bit repack, a datum an
+entry (570 us a cast, 1,279 us a reshape, in a 256-token chunk); the casts' own job a tile cost nothing measurable.
+Now, of a decode replay's 8.95 ms on the card: products 4.10 ms, the norms 2.17 ms (the statistic, its cast, the
+division and the scale, five jobs where the FP32 stream's norm is one), `silu(gate) * up` 0.71 ms (three jobs where
+the FP32 stream's is one), attention's rows 0.63, rope and the cache writes 0.54, casts ~0.5.
+
+**Quality** (`step269`, card 0, `1794418406`): top-1 97.84% (227 of 232), top-5 100%, mean PCC 0.999594, against
+BFP8 weights' 98.28% / 100% / 0.999678 on the same set: it misses the gate's top-1 threshold (the reference's less two
+points) by one position. Recorded, not held; the thresholds stand.
+
+The defaults after all of it (card 1): the FP32 stream 7.52 / 8.03 / 8.64 ms, 1,187 / 3,241 / 4,019 tokens/s
+(`1794422115`), within its run-to-run band; the reference contract 9.84 / 10.35 / 10.98 ms, 1,096 / 3,082 / 3,886 tokens/s (`1794423342`; before, 9.82 / 10.33 / 10.95), within its band.
+
+**Decision (the 0.5% rule):** the default stays the FP32 stream; the BF16 stream is an option. What it needs to be
+judged again, each a BF16 form of an op the FP32 stream runs as one: the norm with its three roundings in one kernel,
+`silu(gate) * up` with its three, and the attention block on BF16 (rope, the cache write as a bit copy, attention's
+reads) so nothing is cast.
 
 ## W1: products with a BF16 result, and a BF16 packed twin (2026-11-11, cards 0 and 1)
 

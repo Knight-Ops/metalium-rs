@@ -38,7 +38,7 @@ mod sfpu;
 
 pub(crate) use matmul::matmul;
 pub use reduce::reduce;
-pub use sfpu::eltwise;
+pub use sfpu::{cast, eltwise};
 
 #[cfg(test)]
 mod golden;

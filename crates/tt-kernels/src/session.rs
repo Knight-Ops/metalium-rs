@@ -3544,6 +3544,13 @@ impl<T: Transport> Session<T> {
         input: &DramTensor,
         layout: tensor::Layout,
     ) -> Result<crate::bf16::Bf16Tensor, TensorError> {
+        // Interleaved: the SFPU kernel's runs of tiles (`tile_op::cast`), bit for bit the
+        // compress's job a tile.
+        if layout == tensor::Layout::Interleaved && !tensor::probing_tile_casts() {
+            input.expect("BF16 conversion", tensor::Elem::F32)?;
+            let out = self.cast_runs(input, tensor::Elem::BF16)?;
+            return Ok(out.as_bf16().expect("a BF16 result"));
+        }
         let (out, jobs) = crate::bf16::compress(&mut self.dram_state()?.alloc, input, layout)?;
         if let Err(error) = self.submit_jobs(jobs, RESET_BUDGET) {
             self.dram_state()?.alloc.free(&out.placement);
@@ -3557,8 +3564,25 @@ impl<T: Transport> Session<T> {
         &mut self,
         input: &crate::bf16::Bf16Tensor,
     ) -> Result<DramTensor, TensorError> {
+        // The SFPU kernel's runs of tiles (`tile_op::cast`), bit for bit the expand's job a tile.
+        if !tensor::probing_tile_casts() {
+            let t = DramTensor::from_bf16(input.clone(), tensor::Pad::Undefined);
+            let out = self.cast_runs(&t, tensor::Elem::F32)?;
+            out.set_pad(tensor::Pad::Undefined);
+            return Ok(out);
+        }
         let work = crate::bf16::expand(&mut self.dram_state()?.alloc, input)?;
         self.execute(work, RESET_BUDGET)
+    }
+
+    /// `t` converted to `to` (F32 <-> BF16) over runs of tiles on the product's units
+    /// (`tile_op::cast`).
+    fn cast_runs(&mut self, t: &DramTensor, to: tensor::Elem) -> Result<DramTensor, TensorError> {
+        let units = self.spread_for(tiles_of(t));
+        let overlap = self.overlap();
+        let mut op = crate::tile_op::cast(tensor::BlockOperand::whole(t), to)?;
+        let work = op.build(&mut self.dram_state()?.alloc, units, overlap)?;
+        self.execute_on(work, units, RESET_BUDGET)
     }
 
     /// `input` stored as a BF16 weight ([`tensor::Elem::BF16`], half the bytes): what a product

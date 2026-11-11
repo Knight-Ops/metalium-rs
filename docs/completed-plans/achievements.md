@@ -323,6 +323,33 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   `K`, the block stream's three kernels) and FP32, BF16 and BFP8 operands; `K` blocks refused by name. A one-row BF16
   result keeps a BF16 twin that products read. The quantize costs 6-9% of a short-`K` prefill product, ~0 of `down`.
 
+- **W1: burn-tt routes BF16 natively** (2026-11-11, card 0). Twenty-one Burn ops that are one element-wise op on the card
+  (`add`, `sub`, `mul`, `div` and their scalar forms, `exp`, `log`, `neg`, `abs`, `sqrt`, `recip`, `tanh`, `erf`,
+  `sin`, `cos`, `log1p`, `relu`, `sigmoid`) take BF16 operands as they lie (`gen_burn.rs`'s `NATIVE_BF16`): one job each, no cast,
+  bit for bit `op(x.cast(F32)).cast(BF16)` (`step76_burn_bf16::bf16_ops_run_natively_bit_for_bit_their_widened_composition`);
+  forms the kernel has no BF16 form of (a row broadcast, kinds taking `Bool`/`I32`) widen and narrow. A BF16 product's
+  result is BF16 from the card (`Engine::matmul_dram_bf16`), and a logical BF16 weight may be stored BFP
+  (`with_storage`), which a BF16 activation multiplies with a BF16 result. Conformance unchanged (ttsim 3,025, and the
+  BF16 suites on card 0); `step12_mnist` 8/8; tt-mnist BF16 5.32 -> 5.04 ms a traced step (burn-flex 3.49, F32 1.36).
+  Found on the way: 17 BF16 conv entries of the silicon expected-failures list pass, and already did at `9f873b8`;
+  they left the list.
+
+- **W1: the casts over runs of tiles; RMSNorm on BF16 in one statistic** (2026-11-11, ttsim and card 0).
+  `Session::bf16_to_f32` and `bf16_from_f32` run the SFPU kernel over runs of tiles (`tile_op::cast`: the expand's
+  widening, a raw copy, the compress's quantize), a job a run where they took a job a tile, bit for bit
+  (`step270::casts_over_runs_are_the_casts_a_tile`, every pattern and class). `burn_tt::rms_norm` takes a BF16 `x` and
+  scale: the F32 statistic in one op, cast to BF16, then `x / rms` and `* gamma` natively -- Burn's module bit for bit,
+  5 jobs against its 9 at a decode row, 8 against 12 at a block (`step76::bf16_rms_norm_is_the_module_bit_for_bit`).
+  `sigmoid` joins the native list, and an element-wise op over blocks reads BF16 buffers.
+
+- **W1: the 1.7B on a BF16 stream, an option** (2026-11-11, cards 0 and 1;
+  [log](../learnings/performance-log.md#w1-burn-tt-on-bf16-and-the-17b-on-a-bf16-stream-an-option-2026-11-11-cards-0-and-1)).
+  `WeightOptions::bf16_stream` (`TT_BF16_STREAM=1` in the bench): BF16 activations between ops, the body's weights
+  logical BF16 stored BFP8, the attention block and the head F32. Decode 9.20 / 9.73 / 10.36 ms, prefill 704 / 2,137 /
+  2,936 tokens/s, behind the FP32 stream's 7.51 ms and 4,004 tokens/s (from 12.60 ms and 346 tokens/s at its first
+  run, the casts of views removed); `step269` top-1 97.84%, one position under its threshold. The default stays the
+  FP32 stream; the profile names what the option lacks (the norm, `silu * up` and the attention block on BF16).
+
 ## Prefill and long context
 
 Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-context.md](../plans/long-context.md).

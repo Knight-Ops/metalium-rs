@@ -50,6 +50,13 @@
 //! differs. The schedule whose partials pass through the result (`K` blocks) refuses a BF16 one
 //! by name.
 //!
+//! **The casts run as runs of tiles, bit for bit** (`casts_over_runs_are_the_casts_a_tile`).
+//! `Session::bf16_to_f32` and `bf16_from_f32` run the SFPU kernel over runs of tiles
+//! (`tile_op::cast`: the expand's widening, a raw copy, the compress's quantize) where they took a
+//! job a tile (`bf16::expand`, `bf16::compress`): every BF16 pattern widened, and FP32 values of
+//! every class narrowed (silicon: a BF16 pack), equal those of the job-a-tile forms
+//! (`tensor::probe_tile_casts`), ragged edges included.
+//!
 //! **A BF16 row keeps a BF16 twin** (`a_bf16_row_keeps_a_bf16_twin`, silicon: a BF16 pack). A
 //! one-row BF16 result -- an element-wise op's, a product's -- also writes its row packed
 //! `[K / 32, 32]` as `pack_row` lays a BF16 row (32-byte face rows in FP32-sized slots), and a
@@ -734,6 +741,72 @@ fn a_bf16_row_keeps_a_bf16_twin() {
         );
         for t in [p, q, copy, r, w, x, y] {
             s.free(t).unwrap();
+        }
+    }) {
+        panic!("{e}");
+    }
+}
+
+#[test]
+fn casts_over_runs_are_the_casts_a_tile() {
+    if let Err(e) = fork_scope(|| {
+        let mut s = open();
+        for (rows, cols) in [(256, 256), (67, 300)] {
+            let n = rows * cols;
+            let bits: Vec<u16> = (0..n)
+                .map(|i| (i % 65536) as u16 ^ (i / 65536) as u16)
+                .collect();
+            let t = s.upload_bf16(&bits, rows, cols).unwrap();
+            let run = s.bf16_to_f32(&t).unwrap();
+            tensor::probe_tile_casts(true);
+            let tile = s.bf16_to_f32(&t);
+            tensor::probe_tile_casts(false);
+            let tile = tile.unwrap();
+            let (a, b) = (
+                s.download_bits(&run).unwrap(),
+                s.download_bits(&tile).unwrap(),
+            );
+            let differ = (0..n).filter(|&i| a[i] != b[i]).count();
+            assert_eq!(
+                differ, 0,
+                "[{rows}, {cols}] widened: {differ} of {n} differ"
+            );
+
+            #[cfg(feature = "silicon")]
+            {
+                // FP32 of every class: the widened patterns, each with low bits set (ties among
+                // them: 0x8000), and their NaN payloads.
+                let wide: Vec<f32> = a
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &w)| f32::from_bits(w | [0, 0x8000, 0x7fff, 0x1234][i % 4]))
+                    .collect();
+                let f = s.upload(&wide, rows, cols).unwrap();
+                let run = s.bf16_from_f32(&f).unwrap();
+                tensor::probe_tile_casts(true);
+                let tile = s.bf16_from_f32(&f);
+                tensor::probe_tile_casts(false);
+                let tile = tile.unwrap();
+                let (x, y) = (
+                    s.download_bf16(&run).unwrap(),
+                    s.download_bf16(&tile).unwrap(),
+                );
+                let differ = (0..n).filter(|&i| x[i] != y[i]).count();
+                assert_eq!(
+                    differ, 0,
+                    "[{rows}, {cols}] narrowed: {differ} of {n} differ"
+                );
+                let model = (0..n)
+                    .filter(|&i| u32::from(x[i]) << 16 != round_bf16(wide[i].to_bits()))
+                    .count();
+                assert_eq!(model, 0, "[{rows}, {cols}]: the host model disagrees");
+                s.free(f).unwrap();
+                s.free_bf16(run).unwrap();
+                s.free_bf16(tile).unwrap();
+            }
+            s.free(run).unwrap();
+            s.free(tile).unwrap();
+            s.free_bf16(t).unwrap();
         }
     }) {
         panic!("{e}");
