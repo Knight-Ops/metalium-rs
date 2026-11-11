@@ -36,6 +36,10 @@ pub fn eltwise(
     );
     let (a, b, c) = (&a, b.as_ref(), c.as_ref());
     let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
+    let formats = tensor::eltwise_formats(
+        kind,
+        &[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>(),
+    )?;
     let op = Eltwise { kind, ..op };
     if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
         return Err(TensorError::Shape(
@@ -46,6 +50,11 @@ pub fn eltwise(
     else {
         return Ok(None);
     };
+    if formats.bf16_in && crate::sfpu::kernel::widened_rows(operands).is_none() {
+        return Err(TensorError::Shape(format!(
+            "element-wise {kind:#x} on BF16 operands with {bcast:?}: no BF16 form (widen them)"
+        )));
+    }
     // A ternary op's third operand: `A`'s shape, of the kind's type.
     let rc = match (operands, c) {
         (Operands::Ternary, Some(c)) => {
@@ -55,9 +64,7 @@ pub fn eltwise(
                     c.rows, c.cols, a.rows, a.cols
                 )));
             }
-            if let Some(&want) = crate::sfpu::ops::elems(kind).inputs.get(2) {
-                c.expect(&format!("element-wise op {kind:#x}"), want)?;
-            }
+            // Its type is checked with the others' (`eltwise_formats`).
             rc
         }
         (Operands::Ternary, None) => {
@@ -73,6 +80,12 @@ pub fn eltwise(
         _ => None,
     };
     let ct = a.grid()[1];
+    let out_elem = tensor::result_elem(op.kind, formats);
+    if let (Some(_), false) = (twin, out_elem == tensor::Elem::F32) {
+        return Err(TensorError::Shape(format!(
+            "a packed twin for a {out_elem:?} result"
+        )));
+    }
     if let Some(twin) = twin {
         if (a.rows, twin.rows, twin.cols) != (1, ct, 32) {
             return Err(TensorError::Shape(format!(
@@ -125,7 +138,6 @@ pub fn eltwise(
             live_rows: false,
         });
     }
-    let out_elem = tensor::output_elem(op.kind);
     let mut results = vec![Access {
         // Placed when the op is built (`TileOp::build`).
         layout: Layout::Tiles(Default::default()),
@@ -150,6 +162,7 @@ pub fn eltwise(
             bcast,
             operands,
             rows: tensor::eltwise_rows(op.kind, a.rows),
+            formats,
         }),
         contract: NumericContract::Program,
         ahead: Vec::new(),
@@ -166,6 +179,8 @@ struct Sfpu {
     operands: Operands,
     /// The rows of each tile the program computes (`tensor::eltwise_rows`).
     rows: u32,
+    /// FP32, or BF16 operands and result (`sfpu::kernel::Formats`; roadmap W1).
+    formats: crate::sfpu::kernel::Formats,
 }
 
 impl Microkernel for Sfpu {
@@ -174,7 +189,13 @@ impl Microkernel for Sfpu {
     }
 
     fn group(&self, half: bool) -> Option<usize> {
-        Some(tensor::sfpu_group(self.op, self.bcast, self.operands, half))
+        Some(tensor::sfpu_group(
+            self.op,
+            self.bcast,
+            self.operands,
+            half,
+            self.formats,
+        ))
     }
 
     fn needs(&self, at: &At<'_>) -> Result<Arc<Requirements>> {
@@ -202,6 +223,7 @@ impl Microkernel for Sfpu {
             half,
             self.rows,
             b_once,
+            self.formats,
             l1,
         )?;
         Ok(RunCode {

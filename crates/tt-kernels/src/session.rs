@@ -7366,7 +7366,8 @@ impl<T: Transport> Session<T> {
         let units = self.follow_runs(a, units);
         let overlap = self.overlap();
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
-        let twin = self.new_twin(a.rows, a.cols, tensor::output_elem(kind))?;
+        let operands: Vec<&DramTensor> = [Some(a), b, c].into_iter().flatten().collect();
+        let twin = self.new_twin(a.rows, a.cols, tensor::eltwise_output(kind, &operands)?)?;
         let alloc = &mut self.dram_state()?.alloc;
         // The SFPU's, or refused: the mover only moves data.
         let work = match tensor::sfpu_eltwise(alloc, op, a, b, c, units, overlap, twin.as_ref()) {
@@ -7408,7 +7409,13 @@ impl<T: Transport> Session<T> {
         let tiles = |x: &tensor::BlockOperand<'_>| x.dims[0].div_ceil(32) * x.dims[1].div_ceil(32);
         let units = self.spread_for(tiles(&a).max(b.as_ref().map_or(0, tiles)));
         let overlap = self.overlap();
-        let twin = self.new_twin(a.dims[0], a.dims[1], tensor::output_elem(op.kind))?;
+        let shapes: Vec<DramTensor> = [Some(a), b, c]
+            .into_iter()
+            .flatten()
+            .map(|x| x.shape_only())
+            .collect();
+        let out_elem = tensor::eltwise_output(op.kind, &shapes.iter().collect::<Vec<_>>())?;
+        let twin = self.new_twin(a.dims[0], a.dims[1], out_elem)?;
         let alloc = &mut self.dram_state()?.alloc;
         let work = match crate::tile_op::eltwise(op, a, b, c, twin.as_ref())
             .and_then(|o| o.map(|mut o| o.build(alloc, units, overlap)).transpose())

@@ -3125,6 +3125,32 @@ pub fn code_for_rows(
     super::with_rows(rows, || code_for(kind, scalars, bcast))
 }
 
+/// [`code_for_rows`], its result then rounded to BF16 in place where `quantized`
+/// (`bf16::quantize_code` over `OUT_ROW`'s tile, for the same rows): a BF16 run's math
+/// (`sfpu::kernel::Formats`; roadmap W1, native BF16 arithmetic).
+pub fn code_for_rows_as(
+    kind: u32,
+    scalars: [f32; 2],
+    bcast: Broadcast,
+    rows: u32,
+    quantized: bool,
+) -> Option<(Operands, crate::code::Code)> {
+    let build = || {
+        code_for(kind, scalars, bcast).map(|(o, c)| {
+            if quantized {
+                (o, c.then(crate::bf16::quantize_code(OUT_ROW)))
+            } else {
+                (o, c)
+            }
+        })
+    };
+    if rows >= 32 || !row_limited(kind) {
+        build()
+    } else {
+        super::with_rows(rows, build)
+    }
+}
+
 /// The program for `kind` with its second operand broadcast as `bcast`, and
 /// what operands it takes; `None` where there is none. A row broadcast reads
 /// the row's two faces from where the kernel lays them, which depends on the

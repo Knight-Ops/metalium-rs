@@ -66,6 +66,61 @@ pub enum Operands {
     Ternary,
 }
 
+/// How a run holds its operands and its result (roadmap W1, native BF16 arithmetic;
+/// `docs/plans/tt-metal-parity.md` §5 W1). A BF16 run computes what widening each operand
+/// (`bf16::expand`), the F32 op, and narrowing its result (`bf16::compress`) compute, bit for
+/// bit: its prologue is the expand's own sequence -- each operand through `SrcA` in eight chunks
+/// of 128 datums, a `MOVA2D` each into its `Dst` rows, FP32 there -- its program is the F32 op's,
+/// and its result is rounded by the compress's own SFPU quantize (`bf16::quantize_code`) before
+/// the pack. The caller appends that quantize to the op's program
+/// (`sfpu::ops::code_for_rows_as`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Formats {
+    /// Every operand a BF16 tile in its L1 slot: its header, then 1,024 two-byte datums (as
+    /// `record::READ_RUN` reads a BF16 tensor's slot whole).
+    pub bf16_in: bool,
+    pub out: Out,
+}
+
+impl Formats {
+    /// FP32 operands, an FP32 result: every run before native BF16.
+    pub const FP32: Formats = Formats {
+        bf16_in: false,
+        out: Out::Fp32,
+    };
+
+    /// The format the packer writes.
+    pub fn pack(&self) -> tt_isa::tile::L1Format {
+        match self.out {
+            Out::Bf16 | Out::Bf16Unrounded => tt_isa::tile::L1Format::Bf16,
+            Out::Fp32 | Out::Bf16AsFp32 => tt_isa::tile::L1Format::Fp32,
+        }
+    }
+}
+
+/// What a run's result is ([`Formats`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Out {
+    /// FP32 datums, as computed.
+    #[default]
+    Fp32,
+    /// Rounded to BF16 and packed as BF16: 2,048 bytes of data a tile.
+    Bf16,
+    /// Rounded to BF16 and packed as FP32, the BF16 bits in each datum's high half: the
+    /// simulator gate's form of [`Out::Bf16`], whose pack ttsim refuses (`PACR` mode 0x105).
+    Bf16AsFp32,
+    /// Packed as BF16 without the rounding, which the packer then truncates: a gate's negative
+    /// control only (`tensor::probe_bf16_result`), never a result.
+    Bf16Unrounded,
+}
+
+impl Out {
+    /// Whether the result is rounded to BF16 before its pack.
+    pub fn quantized(self) -> bool {
+        matches!(self, Out::Bf16 | Out::Bf16AsFp32)
+    }
+}
+
 /// The `Dst` row of the broadcast row's group for row group `g` of a tile:
 /// faces 0 and 2 (row groups 0..4 and 8..12) take columns 0..16, faces 1 and 3
 /// columns 16..32.
@@ -222,7 +277,18 @@ pub fn roles_code(
     operands: Operands,
     math: &crate::code::Code,
 ) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
-    roles_code_validated(layout, operands, math, false)
+    roles_code_as(layout, operands, math, Formats::FP32)
+}
+
+/// [`roles_code`] with the operands and result held as `formats` says. A BF16 run's `math`
+/// already ends in the quantize its result takes, where it takes one ([`Formats`]).
+pub fn roles_code_as(
+    layout: &Layout,
+    operands: Operands,
+    math: &crate::code::Code,
+    formats: Formats,
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
+    roles_code_validated(layout, operands, math, false, formats)
 }
 
 pub(crate) fn roles_code_validated(
@@ -230,9 +296,107 @@ pub(crate) fn roles_code_validated(
     operands: Operands,
     math: &crate::code::Code,
     checked: bool,
+    formats: Formats,
 ) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
-    roles_looped(layout, operands, math, checked)
-        .unwrap_or_else(|| roles_unrolled(layout, operands, math, checked))
+    assert!(
+        !formats.bf16_in || widened_rows(operands).is_some(),
+        "{operands:?} has no BF16 form"
+    );
+    assert!(
+        !(checked && formats != Formats::FP32),
+        "a checked run is FP32"
+    );
+    roles_looped(layout, operands, math, checked, formats)
+        .unwrap_or_else(|| roles_unrolled(layout, operands, math, checked, formats))
+}
+
+/// The `Dst` rows a BF16 run widens its operands' tiles into, in the order it reads them; `None`
+/// for a row broadcast, whose kernel lays `B`'s row out by face rows (no BF16 form yet).
+pub fn widened_rows(operands: Operands) -> Option<&'static [u32]> {
+    match operands {
+        Operands::Unary => Some(&[A_ROW]),
+        Operands::Binary | Operands::ColBroadcast => Some(&[A_ROW, B_ROW]),
+        Operands::Ternary => Some(&[A_ROW, B_ROW, C_ROW]),
+        Operands::RowBroadcast => None,
+    }
+}
+
+/// One chunk of a BF16 widening, as `bf16::expand` moves it: the `UNPACR` that hands `SrcA` to
+/// the Matrix Unit (T0), and the `MOVA2D` of its eight rows to `Dst` row `row`, the wait for it
+/// and the bank's release (T1).
+fn bf16_chunk(row: u32) -> (Instruction, [Instruction; 3]) {
+    use tt_isa::isa::generated::encode::{Mova2D, UnpacrRegular};
+    let (unpack, banks) = tt_isa::matrix::Banks::after_reset()
+        .unpack_a(UnpacrRegular::ZERO.multi_context_mode(1))
+        .unwrap();
+    let (mova, banks) = banks
+        .mova2d(Mova2D::ZERO.move8_rows(1).dst_row(row))
+        .unwrap();
+    let (release, _) = banks.release_a().unwrap();
+    (
+        unpack,
+        [
+            mova,
+            backend::wait_for_matrix(Before::EVERYTHING).unwrap(),
+            release,
+        ],
+    )
+}
+
+/// Chunks a BF16 tile is widened in, and the bytes of L1 each covers.
+const CHUNKS: u32 = TILE_DATUMS / crate::datapath::BF16_CHUNK_DATUMS;
+const CHUNK_BYTES: u64 = crate::datapath::BF16_CHUNK_DATUMS as u64 * 2;
+
+/// The math role's start of a tile of a BF16 run: each chunk taken from the unpacker as it lands
+/// and moved to its operand's `Dst` rows, `free` handed back after every chunk but the tile's
+/// last (the packer hands back that one); the SFPU's program follows, with the operands in
+/// `Dst`. As `bf16::expand`'s math role does each tile's eight.
+fn widen_math(operands: Operands, s: SfpuSemaphores) -> Vec<Instruction> {
+    let rows = widened_rows(operands).expect("checked by the caller");
+    let mut m = Vec::new();
+    for (k, &row) in rows.iter().enumerate() {
+        for c in 0..CHUNKS {
+            m.extend(sync::take(s.unpacked, Before::MATRIX));
+            m.extend(bf16_chunk(row + 8 * c).1);
+            if !(k + 1 == rows.len() && c + 1 == CHUNKS) {
+                m.extend(sync::post_after(Unit::Matrix, s.free));
+            }
+        }
+    }
+    m
+}
+
+/// The unpack role's start: everything the unpacker's address generators read, set here -- a
+/// kernel inherits the thread's ADCs from whatever ran before (a matmul leaves Z at its last
+/// face), and a stale counter moves where a tile is read from (`tt-metal-concepts-review.md`
+/// G11) -- and its configuration: whole FP32 tiles into `Dst`, or a BF16 run's chunks into
+/// `SrcA` (`datapath::bf16_chunk_config`, with the `Src` path's `ThreadConfig`).
+fn unpack_prelude(layout: &Layout, bf16: bool) -> Vec<Instruction> {
+    let mut unpack = if bf16 {
+        crate::datapath::src_thread_config()
+    } else {
+        thread_config()
+    };
+    unpack.extend(crate::datapath::clear_unpacker0_adcs());
+    let mut words = ConfigWords::new();
+    if bf16 {
+        crate::datapath::bf16_chunk_config(&mut words, layout.a_at);
+    } else {
+        tile_unpack_config(&mut words, layout.a_at);
+    }
+    unpack.extend(config_program(&words));
+    unpack
+}
+
+/// The math role's start: a BF16 run's moves take the Matrix Unit's address counters and
+/// modifiers as `bf16::expand`'s do (`matmul::math_prelude`, which leaves address modifier 0
+/// stepping nothing, as the SFPU's `Dst` accesses take it).
+fn math_prelude(bf16: bool) -> Vec<Instruction> {
+    if bf16 {
+        crate::matmul::math_prelude()
+    } else {
+        vec![state_id()]
+    }
 }
 
 /// GPRs the looped roles keep their tiles' addresses in (`roles_looped`): clear of
@@ -248,6 +412,10 @@ const UNPACK_STRIDE_GPR: u32 = 36;
 const OUT_GPR: u32 = 37;
 const STATUS_GPR: u32 = 38;
 const PACK_STRIDE_GPR: u32 = 39;
+/// A BF16 run's chunk being read, the step to the next chunk (256 bytes), and zero.
+const CHUNK_GPR: u32 = 40;
+const CHUNK_STRIDE_GPR: u32 = 41;
+const NO_STEP_GPR: u32 = 42;
 
 /// The roles with every tile's unpack and pack the same words, its addresses
 /// stepped in GPRs a slot a tile, the tile's block stored once and repeated
@@ -261,6 +429,7 @@ fn roles_looped(
     operands: Operands,
     math: &crate::code::Code,
     checked: bool,
+    formats: Formats,
 ) -> Option<crate::code::LoopedRoles> {
     use crate::code::Loop;
     use crate::datapath::{pack_dest_units, pack_tile_from_dst_gpr, unpack_datums_to_dst_gpr};
@@ -276,13 +445,14 @@ fn roles_looped(
     let back = |units: u32| units.checked_sub(stride).expect("a slot below the arena");
     let base = |l1: u64| crate::datapath::tile_base_units(l1);
 
-    let mut unpack = thread_config();
-    unpack.extend(crate::datapath::clear_unpacker0_adcs());
-    let mut words = ConfigWords::new();
-    tile_unpack_config(&mut words, layout.a_at);
-    unpack.extend(config_program(&words));
+    let bf16 = formats.bf16_in;
+    let mut unpack = unpack_prelude(layout, bf16);
     let set = |p: &mut Vec<Instruction>, gpr: u32, v: u32| p.extend(set_gpr(gpr, v).unwrap());
     set(&mut unpack, UNPACK_STRIDE_GPR, stride);
+    if bf16 {
+        set(&mut unpack, CHUNK_STRIDE_GPR, (CHUNK_BYTES / 16) as u32);
+        set(&mut unpack, NO_STEP_GPR, 0);
+    }
     set(&mut unpack, A_GPR, back(base(layout.a_at)));
     let step = Some(UNPACK_STRIDE_GPR);
     // `B` held once is read from one slot: never stepped.
@@ -311,9 +481,41 @@ fn roles_looped(
         _ => panic!("{operands:?} with no B slots"),
     }
     let unpack_block = unpack.len() as u32;
-    unpack.extend(sync::take(s.free, Before::UNPACKER));
-    unpack.extend(unpack_datums_to_dst_gpr(A_GPR, step, TILE_DATUMS, A_ROW));
+    if bf16 {
+        // Each operand's tile in chunks: the chunk's base is the tile's (stepped a tile first,
+        // unless held once) plus 256 bytes a chunk.
+        let mut tiles = vec![(A_GPR, step)];
+        match operands {
+            Operands::Binary | Operands::ColBroadcast => tiles.push((B_GPR, b_step)),
+            Operands::Ternary => tiles.extend([(B_GPR, step), (C_GPR, step)]),
+            _ => {}
+        }
+        for (gpr, step) in tiles {
+            for c in 0..CHUNKS {
+                unpack.extend(sync::take(s.free, Before::UNPACKER));
+                let mut adds = Vec::new();
+                if c == 0 {
+                    if let Some(stride) = step {
+                        adds.push((gpr, stride, gpr));
+                    }
+                    adds.push((CHUNK_GPR, NO_STEP_GPR, gpr));
+                } else {
+                    adds.push((CHUNK_GPR, CHUNK_STRIDE_GPR, CHUNK_GPR));
+                }
+                unpack.extend(crate::datapath::unpack_src_chunk_gpr(
+                    &adds,
+                    CHUNK_GPR,
+                    bf16_chunk(0).0,
+                ));
+                unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
+            }
+        }
+    } else {
+        unpack.extend(sync::take(s.free, Before::UNPACKER));
+        unpack.extend(unpack_datums_to_dst_gpr(A_GPR, step, TILE_DATUMS, A_ROW));
+    }
     match operands {
+        _ if bf16 => {}
         Operands::Binary | Operands::ColBroadcast => {
             unpack.extend(unpack_datums_to_dst_gpr(B_GPR, b_step, TILE_DATUMS, B_ROW));
         }
@@ -337,16 +539,22 @@ fn roles_looped(
         }
         Operands::Unary => {}
     }
-    unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
+    if !bf16 {
+        unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
+    }
     let unpack_loop = Loop {
         start: unpack_block,
         len: unpack.len() as u32 - unpack_block,
         count: tiles,
     };
 
-    let mut m = vec![state_id()];
+    let mut m = math_prelude(bf16);
     let block = m.len() as u32;
-    m.extend(sync::take(s.unpacked, Before::SFPU));
+    if bf16 {
+        m.extend(widen_math(operands, s));
+    } else {
+        m.extend(sync::take(s.unpacked, Before::SFPU));
+    }
     let at = m.len() as u32;
     m.extend_from_slice(&math.ins);
     m.extend(sync::post_after(Unit::Sfpu, s.computed));
@@ -373,10 +581,11 @@ fn roles_looped(
     }
     let pack_block = pack.len() as u32;
     pack.extend(sync::take(s.computed, Before::PACKER));
-    pack.extend(pack_tile_from_dst_gpr(
+    pack.extend(crate::datapath::pack_tile_from_dst_gpr_as(
         OUT_GPR,
         Some(PACK_STRIDE_GPR),
         OUT_ROW,
+        formats.pack(),
     ));
     if checked {
         pack.extend(pack_tile_from_dst_gpr(
@@ -407,28 +616,46 @@ fn roles_unrolled(
     operands: Operands,
     math: &crate::code::Code,
     checked: bool,
+    formats: Formats,
 ) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
     use crate::code::Loop;
     let s = layout.sems;
     let slot = |base: u64, n: usize| base + n as u64 * TILE_SLOT;
     let b_slot = |base: u64, n: usize| slot(base, if layout.b_once { 0 } else { n });
+    let bf16 = formats.bf16_in;
 
-    // Everything the unpacker's address generators read, set here: a kernel
-    // inherits the thread's ADCs from whatever ran before (a matmul leaves Z
-    // at its last face), and a stale counter moves where a tile is read from
-    // (`tt-metal-concepts-review.md` G11).
-    let mut unpack = thread_config();
-    unpack.extend(crate::datapath::clear_unpacker0_adcs());
-    let mut words = ConfigWords::new();
-    tile_unpack_config(&mut words, layout.a_at);
-    unpack.extend(config_program(&words));
-    let mut m = vec![state_id()];
+    let mut unpack = unpack_prelude(layout, bf16);
+    let mut m = math_prelude(bf16);
     let mut math_loops = Vec::new();
     let mut pack = vec![state_id()];
     for n in 0..layout.tiles {
-        unpack.extend(sync::take(s.free, Before::UNPACKER));
-        unpack.extend(unpack_tile_to_dst(slot(layout.a_at, n), A_ROW));
+        if bf16 {
+            let mut tiles = vec![slot(layout.a_at, n)];
+            match (operands, layout.b_at) {
+                (Operands::Binary | Operands::ColBroadcast, Some(b)) => tiles.push(b_slot(b, n)),
+                (Operands::Ternary, Some(b)) => {
+                    let c = layout.c_at.expect("a ternary layout has C slots");
+                    tiles.extend([slot(b, n), slot(c, n)]);
+                }
+                (Operands::Unary, _) => {}
+                _ => panic!("{operands:?} with no B slots"),
+            }
+            for at in tiles {
+                for c in 0..CHUNKS {
+                    unpack.extend(sync::take(s.free, Before::UNPACKER));
+                    unpack.extend(crate::datapath::unpack_src_chunk(
+                        at + c as u64 * CHUNK_BYTES,
+                        bf16_chunk(0).0,
+                    ));
+                    unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
+                }
+            }
+        } else {
+            unpack.extend(sync::take(s.free, Before::UNPACKER));
+            unpack.extend(unpack_tile_to_dst(slot(layout.a_at, n), A_ROW));
+        }
         match (operands, layout.b_at) {
+            _ if bf16 => {}
             (Operands::Binary | Operands::ColBroadcast, Some(b)) => {
                 unpack.extend(unpack_tile_to_dst(b_slot(b, n), B_ROW));
             }
@@ -453,11 +680,17 @@ fn roles_unrolled(
             (Operands::Unary, _) => {}
             _ => panic!("{operands:?} with no B slots"),
         }
-        unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
+        if !bf16 {
+            unpack.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
+        }
 
         if n == 0 {
             let block = m.len() as u32;
-            m.extend(sync::take(s.unpacked, Before::SFPU));
+            if bf16 {
+                m.extend(widen_math(operands, s));
+            } else {
+                m.extend(sync::take(s.unpacked, Before::SFPU));
+            }
             let at = m.len() as u32;
             m.extend_from_slice(&math.ins);
             m.extend(sync::post_after(Unit::Sfpu, s.computed));
@@ -475,9 +708,10 @@ fn roles_unrolled(
         }
 
         pack.extend(sync::take(s.computed, Before::PACKER));
-        pack.extend(pack_tile_from_dst(
+        pack.extend(crate::datapath::pack_tile_from_dst_as(
             slot(layout.out_at, n) + tt_isa::dm::TILE_DATA,
             OUT_ROW,
+            formats.pack(),
         ));
         if checked {
             pack.extend(pack_tile_from_dst(
@@ -523,16 +757,25 @@ mod tests {
             (Operands::ColBroadcast, true, false),
             (Operands::Ternary, false, false),
         ];
-        for (operands, b_once, checked) in cases {
+        let bf16 = |out| Formats { bf16_in: true, out };
+        let formats = [Formats::FP32, bf16(Out::Bf16), bf16(Out::Bf16AsFp32)];
+        let cases = cases
+            .into_iter()
+            .flat_map(|c| formats.map(|f| (c, f)))
+            .filter(|&((operands, _, checked), f)| {
+                f == Formats::FP32 || (!checked && widened_rows(operands).is_some())
+            });
+        for ((operands, b_once, checked), formats) in cases {
             let mut sizes = Vec::new();
             // A checked op packs its status to the `C` slots.
             let planned = if checked { Operands::Ternary } else { operands };
             for tiles in [2, 3, 7, 32, 64].map(|n| n.min(max_tiles(planned))) {
                 let mut layout = plan_layout(tiles, planned).unwrap();
                 layout.b_once = b_once;
-                let (looped, loops) =
-                    roles_looped(&layout, operands, &math, checked).expect("a loop counts it");
-                let (unrolled, unrolled_loops) = roles_unrolled(&layout, operands, &math, checked);
+                let (looped, loops) = roles_looped(&layout, operands, &math, checked, formats)
+                    .expect("a loop counts it");
+                let (unrolled, unrolled_loops) =
+                    roles_unrolled(&layout, operands, &math, checked, formats);
                 for t in 0..3 {
                     let expand = |ins: &[Instruction], ls: &[crate::code::Loop]| {
                         crate::code::Code {
@@ -546,7 +789,8 @@ mod tests {
                         evaluate(&expand(&unrolled[t], &unrolled_loops[t])),
                     );
                     let what = format!(
-                        "{operands:?} b_once {b_once} checked {checked}, {tiles} tiles, role {t}"
+                        "{operands:?} b_once {b_once} checked {checked} {formats:?}, {tiles} \
+                         tiles, role {t}"
                     );
                     assert_eq!(a.0.len(), b.0.len(), "{what}: unpacks and packs");
                     for (n, (x, y)) in a.0.iter().zip(&b.0).enumerate() {
@@ -575,14 +819,15 @@ mod tests {
     fn the_evaluator_sees_a_wrong_stride() {
         let math = crate::code::Code::plain(vec![tt_isa::sfpu::nop()]);
         let layout = plan_layout(4, Operands::Binary).unwrap();
-        let (mut looped, loops) = roles_looped(&layout, Operands::Binary, &math, false).unwrap();
+        let (mut looped, loops) =
+            roles_looped(&layout, Operands::Binary, &math, false, Formats::FP32).unwrap();
         let wrong = tt_isa::backend::set_gpr(UNPACK_STRIDE_GPR, 2 * 260).unwrap();
         let at = looped[0]
             .windows(2)
             .position(|w| w == tt_isa::backend::set_gpr(UNPACK_STRIDE_GPR, 260).unwrap())
             .expect("the stride is set");
         looped[0][at..at + 2].copy_from_slice(&wrong);
-        let (unrolled, _) = roles_unrolled(&layout, Operands::Binary, &math, false);
+        let (unrolled, _) = roles_unrolled(&layout, Operands::Binary, &math, false, Formats::FP32);
         let a = evaluate(
             &crate::code::Code {
                 ins: looped[0].clone(),

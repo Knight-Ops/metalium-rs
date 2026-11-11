@@ -890,6 +890,18 @@ pub fn pack_dest_units(l1_dest: u64) -> u32 {
 /// [`unpack_datums_to_dst_gpr`]: every word [`pack_tile_from_dst`] writes,
 /// that one from the GPR.
 pub fn pack_tile_from_dst_gpr(dest_gpr: u32, step: Option<u32>, row: u32) -> Vec<Instruction> {
+    pack_tile_from_dst_gpr_as(dest_gpr, step, row, L1Format::Fp32)
+}
+
+/// [`pack_tile_from_dst_gpr`] writing `out` to L1: FP32, or BF16 (1,024 two-byte datums, the
+/// high half of each `Dst` datum, which [`crate::bf16`]'s quantize has already rounded; as
+/// `bf16::compress` packs). ttsim refuses the BF16 pack (`PACR` mode 0x105).
+pub fn pack_tile_from_dst_gpr_as(
+    dest_gpr: u32,
+    step: Option<u32>,
+    row: u32,
+    out: L1Format,
+) -> Vec<Instruction> {
     use tt_isa::backend::{self, Before};
     let mut p = vec![backend::wait_for_packer(Before::CONFIG).unwrap()];
     if let Some(stride) = step {
@@ -903,6 +915,8 @@ pub fn pack_tile_from_dst_gpr(dest_gpr: u32, step: Option<u32>, row: u32) -> Vec
     pack_config(&mut words, 16);
     words
         .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
+        .unwrap()
+        .set(thcon::THCON_SEC0_REG1_Out_data_format, pack_out_code(out))
         .unwrap();
     for &(addr32, value) in words.words() {
         if addr32 != dest {
@@ -929,12 +943,19 @@ pub fn pack_tile_from_dst_gpr(dest_gpr: u32, step: Option<u32>, row: u32) -> Vec
 /// adds `DEST_TARGET_REG_CFG_PACK_SEC0_Offset << 4` datums, a row each
 /// (`Packers/InputAddressGenerator.md`).
 pub fn pack_tile_from_dst(l1_dest: u64, row: u32) -> Vec<Instruction> {
+    pack_tile_from_dst_as(l1_dest, row, L1Format::Fp32)
+}
+
+/// [`pack_tile_from_dst`] writing `out` to L1 ([`pack_tile_from_dst_gpr_as`]).
+pub fn pack_tile_from_dst_as(l1_dest: u64, row: u32, out: L1Format) -> Vec<Instruction> {
     use tt_isa::backend::{self, Before};
     let mut p = vec![backend::wait_for_packer(Before::CONFIG).unwrap()];
     let mut words = ConfigWords::new();
     pack_config(&mut words, l1_dest);
     words
         .set(global::DEST_TARGET_REG_CFG_PACK_SEC0_Offset, row)
+        .unwrap()
+        .set(thcon::THCON_SEC0_REG1_Out_data_format, pack_out_code(out))
         .unwrap();
     p.extend(config_program(&words));
     p.push(
@@ -946,6 +967,84 @@ pub fn pack_tile_from_dst(l1_dest: u64, row: u32) -> Vec<Instruction> {
     );
     p.extend(pack_rows(TILE_DST_ROWS));
     p
+}
+
+/// `THCON_SEC0_REG1_Out_data_format` for a pack of 32-bit `Dst` to `out`: FP32 or BF16 only.
+fn pack_out_code(out: L1Format) -> u32 {
+    assert!(
+        matches!(out, L1Format::Fp32 | L1Format::Bf16),
+        "a pack from 32-bit Dst writes FP32 or BF16, not {out:?}"
+    );
+    out.code().expect("FP32's and BF16's codes are measured")
+}
+
+/// Datums of a BF16 tile each `SrcA` chunk of a widening carries: eight rows of sixteen, which
+/// one `MOVA2D` moves (`bf16::expand`'s sequence, roadmap W1).
+pub const BF16_CHUNK_DATUMS: u32 = 128;
+
+/// Unpacker 0's configuration for the chunks of BF16 tiles into `SrcA` ([`unpack_src_chunk`]):
+/// `bf16::expand`'s, the first chunk at `l1`, with the Matrix Unit's `Dst` FP32 and its zero
+/// flags off (`MOVA2D` then writes every BF16 pattern widened, as the expand does). The thread
+/// takes [`src_thread_config`].
+pub fn bf16_chunk_config(words: &mut ConfigWords, l1: u64) {
+    unpack_src_config(
+        words,
+        Unpacker::SrcA,
+        flat_descriptor(BF16_CHUNK_DATUMS).with_in_data_format_raw(bf16_code()),
+        l1,
+        bf16_code(),
+    );
+    words.set(alu::ALU_ACC_CTRL_Fp32_enabled, 1).unwrap();
+    words
+        .set(alu::ALU_ACC_CTRL_Zero_Flag_disabled_src, 1)
+        .unwrap();
+}
+
+/// Unpack the chunk of a BF16 tile image at `l1` ([`bf16_chunk_config`]; `l1` is the slot's start
+/// plus 256 bytes a chunk, the header stepped over as for a whole tile) into `SrcA`, handing the
+/// bank to the Matrix Unit: `unpack` is the `UNPACR` [`tt_isa::matrix::Banks::unpack_a`] gave.
+pub fn unpack_src_chunk(l1: u64, unpack: Instruction) -> Vec<Instruction> {
+    use tt_isa::backend::{self, Before};
+    let mut p = vec![backend::wait_for_unpacker0(Before::CONFIG).unwrap()];
+    let mut words = ConfigWords::new();
+    words
+        .set(thcon::THCON_SEC0_REG3_Base_address, tile_base_units(l1))
+        .unwrap();
+    p.extend(config_program(&words));
+    p.extend(src_chunk_tail(unpack));
+    p
+}
+
+/// [`unpack_src_chunk`] with the base from `cur_gpr` (in [`tile_base_units`]), after `adds` --
+/// each `(result, right, left)`, `result = left + right` over GPRs, in order -- have set it: the
+/// same words for every chunk and tile, as [`unpack_datums_to_dst_gpr`] steps a tile's base.
+pub fn unpack_src_chunk_gpr(
+    adds: &[(u32, u32, u32)],
+    cur_gpr: u32,
+    unpack: Instruction,
+) -> Vec<Instruction> {
+    use tt_isa::backend::{self, Before};
+    let mut p = vec![backend::wait_for_unpacker0(Before::CONFIG).unwrap()];
+    for &(result, right, left) in adds {
+        p.push(encode::adddmareg(result, right, left).unwrap());
+    }
+    p.push(gpr_settled());
+    p.push(backend::write_word(cur_gpr, thcon::THCON_SEC0_REG3_Base_address.addr32()).unwrap());
+    p.extend(src_chunk_tail(unpack));
+    p
+}
+
+fn src_chunk_tail(unpack: Instruction) -> Vec<Instruction> {
+    use tt_isa::backend;
+    vec![
+        backend::stallwait(
+            backend::block::UNPACKER | backend::block::CONFIG,
+            backend::cond::CONFIG_BUSY,
+        )
+        .unwrap(),
+        set_adc_x(Unpacker::SrcA, 0, BF16_CHUNK_DATUMS - 1),
+        unpack,
+    ]
 }
 
 /// The optional packer stages of [`tt_isa::packer`], staged together with

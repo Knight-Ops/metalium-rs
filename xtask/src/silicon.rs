@@ -387,6 +387,10 @@ pub const SMOKE: &[&str] = &[
     // products read by column and blocks a tile at a time, bit for bit against interleaved,
     // eager and replayed; the weight holds what was stored; its channels rotated give other bits.
     "step268_column_weights::",
+    // Roadmap W1, native BF16 arithmetic: a BF16 edge is its widened edge over every pattern;
+    // BF16 tensors in their own slots; element-wise ops on BF16 operands are their widened op
+    // rounded once, bit for bit, and without the quantize differ.
+    "step270_native_bf16::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     // ADR 0006, roadmap W1: the performance contract's model gate on its first two prompts

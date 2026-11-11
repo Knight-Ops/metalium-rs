@@ -21,9 +21,26 @@
 //! source (`tensor::probe_unnamed_slot`, as every reference was before slots were named): the
 //! same copy then reads it at FP32 slots and moves other tiles' bytes. A download as 32-bit
 //! datums, which would read 4,096 bytes a tile, is refused by name.
+//!
+//! **An element-wise op on BF16 operands is its widened op, rounded once**
+//! (`an_eltwise_op_on_bf16_is_its_widened_op_rounded`). Each operand is read as a BF16 tile, widened
+//! into `Dst` by the expand's own sequence, the F32 op's program runs, and the result is rounded by
+//! the compress's quantize before a BF16 pack (`sfpu::kernel::Formats`). Over unary, scalar,
+//! binary, column- and block-broadcast, ternary and comparison kinds -- the 1.7B's `silu`, `silu *
+//! up` and residual `add` among them -- at whole tiles, ragged edges and a decode step's one row,
+//! and over every BF16 class (signed zeros, subnormals, infinities, NaN payloads, extremes):
+//! (i) unrounded (`Out::Fp32`), the op's FP32 result is the F32 op's on the widened operands, bit
+//! for bit: the prologue is the expand; (ii) rounded and packed as FP32 (`Out::Bf16AsFp32`, the
+//! simulator's form), it is that result rounded by the host's ties-even model (NaNs quieted,
+//! subnormals flushed), and the rounding changes datums (a control on (i)); (iii) on silicon, the
+//! BF16 result is `bf16_from_f32` of the F32 op on the widened operands, bit for bit, and so is the
+//! host model. The negative control packs BF16 without the quantize (`Out::Bf16Unrounded`): it
+//! must then differ.
 use tt_kernels::matmul::{Fidelity, SrcRoute};
 use tt_kernels::session::{Session, TileChoice};
-use tt_kernels::tensor::{DramTensor, Pad};
+use tt_kernels::sfpu::kernel::Out;
+use tt_kernels::sfpu::ops::kind_sfpu;
+use tt_kernels::tensor::{self, DramTensor, Eltwise, Pad};
 use tt_ttsim::fork_scope;
 
 fn open() -> Session<impl tt_device::Transport> {
@@ -189,6 +206,226 @@ fn a_bf16_tensor_is_copied_in_its_own_slots() {
         s.free(wrong).unwrap();
         s.free(copy).unwrap();
         s.free(source).unwrap();
+    }) {
+        panic!("{e}");
+    }
+}
+
+/// BF16 ties-even narrowing of FP32 bits, NaNs quieted (sign and high payload kept), BF16
+/// subnormals to signed zero: what `Session::bf16_from_f32` documents, as the high half of an
+/// FP32 word. The host's model, independent of the SFPU program it checks.
+fn round_bf16(x: u32) -> u32 {
+    let r = if x & 0x7fff_ffff > 0x7f80_0000 {
+        x | 0x0040_0000
+    } else {
+        x.wrapping_add(0x7fff + ((x >> 16) & 1))
+    } & 0xffff_0000;
+    if r & 0x7fff_ffff < 0x0080_0000 {
+        r & 0x8000_0000
+    } else {
+        r
+    }
+}
+
+/// `n` BF16 patterns, `salt` choosing which: every class first (signed zeros, the smallest and
+/// largest subnormals and normals, infinities, quiet and signalling NaNs with payloads, ones and
+/// ties-prone mantissas), then noise over every exponent.
+fn patterns(n: usize, salt: u32) -> Vec<u16> {
+    const SPECIAL: [u16; 20] = [
+        0x0000, 0x8000, 0x0001, 0x807f, 0x0080, 0x8080, 0x7f7f, 0xff7f, 0x7f80, 0xff80, 0x7fc0,
+        0xffc1, 0x7f81, 0xff9f, 0x3f80, 0xbf80, 0x3f81, 0x4049, 0x3c00, 0x4b00,
+    ];
+    (0..n)
+        .map(|i| {
+            let h = (i as u32 ^ salt.wrapping_mul(0x9e37_79b9))
+                .wrapping_mul(2_654_435_761)
+                .rotate_left(13);
+            if (i as u32 + salt) % 7 == 0 {
+                SPECIAL[(h % SPECIAL.len() as u32) as usize]
+            } else {
+                // Mostly moderate exponents, so products and sums stay finite and round.
+                let sign = (h >> 31) as u16;
+                let exp = 0x60 + (h >> 8) % 0x40;
+                sign << 15 | (exp as u16) << 7 | (h & 0x7f) as u16
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn an_eltwise_op_on_bf16_is_its_widened_op_rounded() {
+    use tt_kernels::kind;
+    let op = |kind, scalar| Eltwise {
+        kind,
+        scalar,
+        scalar2: 0.0,
+    };
+    // (op, the operands' shapes): the first is the result's.
+    let (m, n) = (67, 100);
+    let cases: Vec<(Eltwise, Vec<[usize; 2]>)> = vec![
+        (op(kind_sfpu::SILU, 0.0), vec![[m, n]]),
+        (op(kind_sfpu::EXP, 0.0), vec![[m, n]]),
+        (op(kind_sfpu::RSQRT, 0.0), vec![[m, n]]),
+        (op(kind::MUL_SCALAR, 0.125), vec![[m, n]]),
+        (op(kind::ADD_SCALAR, 1.5), vec![[m, n]]),
+        (op(kind::ADD, 0.0), vec![[m, n], [m, n]]),
+        (op(kind::SUB, 0.0), vec![[m, n], [m, n]]),
+        (op(kind::MUL, 0.0), vec![[m, n], [m, n]]),
+        (op(kind_sfpu::SILU_MUL, 0.0), vec![[m, n], [m, n]]),
+        (op(kind::MUL, 0.0), vec![[m, n], [m, 1]]),
+        (op(kind::ADD, 0.0), vec![[96, n], [32, n]]),
+        (op(kind_sfpu::MUL_ADD, 0.0), vec![[m, n], [m, n], [m, n]]),
+        (op(kind_sfpu::LT, 0.0), vec![[m, n], [m, n]]),
+        // A decode step's one row: a row-limited program, its quantize over that row alone.
+        (op(kind::ADD, 0.0), vec![[1, 300], [1, 300]]),
+        (op(kind_sfpu::SILU_MUL, 0.0), vec![[1, 300], [1, 300]]),
+    ];
+    if let Err(e) = fork_scope(|| {
+        let mut s = open();
+        let mut rounded = 0;
+        #[allow(unused_mut)]
+        let mut truncated = 0;
+        for (case, (op, shapes)) in cases.iter().enumerate() {
+            let what = format!("case {case}: {:#x} on {shapes:?}", op.kind);
+            let bits: Vec<Vec<u16>> = shapes
+                .iter()
+                .enumerate()
+                .map(|(k, &[r, c])| patterns(r * c, (case * 3 + k) as u32))
+                .collect();
+            let inputs: Vec<DramTensor> = shapes
+                .iter()
+                .zip(&bits)
+                .map(|(&[r, c], b)| {
+                    DramTensor::from_bf16(s.upload_bf16(b, r, c).unwrap(), Pad::Zero)
+                })
+                .collect();
+            let widened: Vec<DramTensor> = inputs
+                .iter()
+                .map(|t| s.bf16_to_f32(&t.as_bf16().unwrap()).unwrap())
+                .collect();
+            let run = |s: &mut Session<_>, xs: &[DramTensor]| {
+                s.eltwise3(*op, &xs[0], xs.get(1), xs.get(2)).unwrap()
+            };
+            let wide = run(&mut s, &widened);
+            let f32_result = wide.elem == tensor::Elem::F32;
+            let wide_bits = s.download_bits(&wide).unwrap();
+            let expect: Vec<u32> = if f32_result {
+                wide_bits.iter().map(|&w| round_bf16(w)).collect()
+            } else {
+                wide_bits.clone()
+            };
+
+            // (i) Unrounded: the prologue is the expand.
+            tensor::probe_bf16_result(Out::Fp32);
+            let unrounded = run(&mut s, &inputs);
+            tensor::probe_bf16_result(Out::Bf16);
+            assert_eq!(unrounded.elem, wide.elem, "{what}");
+            let got = s.download_bits(&unrounded).unwrap();
+            let differ = (0..got.len()).filter(|&i| got[i] != wide_bits[i]).count();
+            assert_eq!(
+                differ,
+                0,
+                "{what}: unrounded, {differ} of {} differ",
+                got.len()
+            );
+            s.free(unrounded).unwrap();
+            if !f32_result {
+                // A comparison's result is no float: nothing to round.
+                let native = run(&mut s, &inputs);
+                assert_eq!(native.elem, wide.elem, "{what}");
+                assert_eq!(s.download_bits(&native).unwrap(), wide_bits, "{what}");
+                s.free(native).unwrap();
+            } else {
+                // (ii) Rounded, packed as FP32.
+                tensor::probe_bf16_result(Out::Bf16AsFp32);
+                let as_fp32 = run(&mut s, &inputs);
+                tensor::probe_bf16_result(Out::Bf16);
+                let got = s.download_bits(&as_fp32).unwrap();
+                let differ: Vec<_> = (0..got.len()).filter(|&i| got[i] != expect[i]).collect();
+                assert!(
+                    differ.is_empty(),
+                    "{what}: rounded, {} of {} differ, first {:?}",
+                    differ.len(),
+                    got.len(),
+                    differ
+                        .iter()
+                        .take(6)
+                        .map(|&i| format!(
+                            "{i}: {:#010x} for {:#010x} (of {:#010x})",
+                            got[i], expect[i], wide_bits[i]
+                        ))
+                        .collect::<Vec<_>>()
+                );
+                rounded += (0..got.len()).filter(|&i| got[i] != wide_bits[i]).count();
+                s.free(as_fp32).unwrap();
+
+                #[cfg(feature = "silicon")]
+                {
+                    // (iii) The BF16 result, against the composition it replaces.
+                    let native = run(&mut s, &inputs);
+                    assert_eq!(native.elem, tensor::Elem::BF16, "{what}");
+                    assert_eq!(native.slot(0).len(), 2112, "{what}: BF16 slots");
+                    let got = s.download_bf16(&native.as_bf16().unwrap()).unwrap();
+                    let composed = s.bf16_from_f32(&wide).unwrap();
+                    let want = s.download_bf16(&composed).unwrap();
+                    let differ: Vec<_> = (0..got.len()).filter(|&i| got[i] != want[i]).collect();
+                    assert!(
+                        differ.is_empty(),
+                        "{what}: BF16, {} of {} differ from the composition, first {:?}",
+                        differ.len(),
+                        got.len(),
+                        differ
+                            .iter()
+                            .take(6)
+                            .map(|&i| format!("{i}: {:#06x} for {:#06x}", got[i], want[i]))
+                            .collect::<Vec<_>>()
+                    );
+                    let model = (0..want.len())
+                        .filter(|&i| u32::from(want[i]) << 16 != expect[i])
+                        .count();
+                    assert_eq!(
+                        model, 0,
+                        "{what}: the host model disagrees with bf16_from_f32"
+                    );
+                    // The negative control: no quantize, and the pack truncates.
+                    tensor::probe_bf16_result(Out::Bf16Unrounded);
+                    let control = run(&mut s, &inputs);
+                    tensor::probe_bf16_result(Out::Bf16);
+                    let read = s.download_bf16(&control.as_bf16().unwrap()).unwrap();
+                    let changed = (0..read.len()).filter(|&i| read[i] != want[i]).count();
+                    // Exact kinds (a power-of-two scale) have nothing to round: the run's sum.
+                    truncated += changed;
+                    // What the packer makes of an unrounded FP32 datum: its high half?
+                    let cut = (0..read.len())
+                        .filter(|&i| u32::from(read[i]) != wide_bits[i] >> 16)
+                        .count();
+                    println!(
+                        "MEASURE {what}: unrounded BF16 pack differs in {changed} of {}, and \
+                         from each datum's high half in {cut}",
+                        read.len()
+                    );
+                    s.free(control).unwrap();
+                    s.free(native).unwrap();
+                    let _ = s.free(DramTensor::from_bf16(composed, Pad::Undefined));
+                }
+            }
+            s.free(wide).unwrap();
+            for t in widened.into_iter().chain(inputs) {
+                s.free(t).unwrap();
+            }
+        }
+        // The control on (i): rounding is not the identity on these results.
+        println!(
+            "MEASURE native bf16 eltwise: {} cases, {rounded} datums changed by rounding",
+            cases.len()
+        );
+        assert!(rounded > 1000, "only {rounded} datums rounded");
+        #[cfg(feature = "silicon")]
+        assert!(
+            truncated > 1000,
+            "control: the unrounded pack changed only {truncated} datums"
+        );
+        let _ = truncated;
     }) {
         panic!("{e}");
     }

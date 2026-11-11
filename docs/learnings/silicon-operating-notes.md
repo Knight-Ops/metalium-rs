@@ -1733,6 +1733,17 @@ and stamp one event naming it (`dm::BATCH_LOG`, `profile_mode::splice_batch_log`
 repeated stamp: a record named twice in one drain is a repeat. The profile mode's existing three-stamp burst after
 a kernel (`ROLE_PUSH`, `ROLE_DRAIN`, `ROLE_WORDS`) is exposed to the same behaviour and has not been checked for it.
 
+## A pack from 32-bit `Dst` to BF16 keeps each datum's high half (2026-11-11, card 0)
+
+The packer configured as `datapath::pack_config` with `Out_data_format=5` (BF16) and `Read_32b_data=1` (what
+`bf16::compress` and a native BF16 SFPU result use) writes each FP32 `Dst` datum's high 16 bits, nothing else:
+over ~100,000 results of 15 element-wise ops on every BF16 class (signed zeros, subnormals, infinities, NaN
+payloads, ties) none differed from `bits >> 16` (`step270_native_bf16`, the `Out::Bf16Unrounded` control,
+`1794407220`). It truncates, NaN payloads and subnormals included: it neither rounds, nor quiets, nor flushes. A
+BF16 result's ties-even rounding is the SFPU quantize's alone (`bf16::quantize_code`), which zeroes the low half
+first, so the pack then moves exact bits. Without it 22-36% of the corpus's results changed (36 of 300 to 2,444
+of 6,700 per op). Not the rounding packer (`Round_10b_mant` and kin), which is unused.
+
 ## Handling silicon runs
 
 Rules that held through the Phase 10 close-out; follow them for any new probe.

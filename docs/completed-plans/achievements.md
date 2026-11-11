@@ -307,6 +307,15 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   Nemotron's fit not re-run). Gate `step270_native_bf16` with its control `tensor::probe_unnamed_slot`; the 1.7B within
   its run-to-run band under both contracts.
 
+- **W1: element-wise ops on BF16 operands, with BF16 results** (2026-11-11, ttsim and card 0, `1794407220`). The SFPU
+  kernel reads each BF16 operand as the expand widens it (`SrcA`, eight `MOVA2D` chunks into its `Dst` rows), runs the
+  F32 op's program, and rounds the result with the compress's own quantize before a BF16 pack
+  (`sfpu::kernel::Formats`): bit for bit `bf16_from_f32(op(bf16_to_f32(x)))` over 15 kinds -- the 1.7B's `silu`,
+  `silu * up` and `add`, unary, scalar, binary, column and block broadcasts, ternary, a comparison, and a decode row --
+  and every BF16 class, with one op instead of three or four and no F32 tensor between them. The looped roles stay one
+  tile long. Measured on the way: the pack from 32-bit `Dst` to BF16 truncates (silicon-operating-notes), which is why
+  the quantize stays. A row broadcast and kinds taking `Bool` or `I32` still widen.
+
 ## Prefill and long context
 
 Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-context.md](../plans/long-context.md).

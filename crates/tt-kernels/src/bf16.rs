@@ -80,8 +80,17 @@ pub(crate) fn transfer(range: DramRange, read: bool, l1: u64, bytes: u32) -> [u3
 /// Exact ties-even BF16 conversion on raw FP32 bits. Quiet NaNs retain their
 /// sign/high payload and cannot become infinity when the payload is discarded.
 fn quantize() -> Vec<Instruction> {
+    quantize_code(0).expand()
+}
+
+/// [`quantize`] of the tile in `Dst` rows `row..row + 64`, in place, as a role's slot holds it:
+/// the rounding every BF16 result takes once, before its pack (`sfpu::kernel::Out::Bf16`; roadmap
+/// W1, native BF16 arithmetic). Built for the rows [`crate::sfpu::with_rows`] names, as the op's
+/// own program before it is.
+pub(crate) fn quantize_code(row: u32) -> crate::code::Code {
     let mut p = Program::new();
-    p.for_each_row_group(64, |p, row| {
+    p.for_each_row_group(64, |p, o| {
+        let row = row + o;
         p.load(LReg::L0, Format::Int32, row);
         p.loadi_bits(LReg::L3, 0x7fffffff);
         p.and(LReg::L0, LReg::L3, LReg::L1);
@@ -113,7 +122,7 @@ fn quantize() -> Vec<Instruction> {
         });
         p.store(LReg::L0, Format::Int32, row);
     });
-    p.finish()
+    p.finish_code()
 }
 
 fn roles(layout: &kernel::Layout, compress: bool) -> [Vec<Instruction>; 3] {

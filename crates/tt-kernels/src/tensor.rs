@@ -3685,12 +3685,10 @@ pub fn broadcast_of(
     use crate::kind;
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::{broadcasts, Broadcast};
-    let name = || format!("element-wise op {:#x}", op.kind);
-    let sig = crate::sfpu::ops::elems(op.kind);
-    a.expect(&name(), sig.inputs[0])?;
-    if let (Some(b), Some(&want)) = (b, sig.inputs.get(1)) {
-        b.expect(&name(), want)?;
-    }
+    eltwise_formats(
+        op.kind,
+        &[Some(a), b].into_iter().flatten().collect::<Vec<_>>(),
+    )?;
     let binary = match crate::sfpu::ops::operands(op.kind) {
         Some(o) => o != Operands::Unary,
         None => {
@@ -3744,6 +3742,80 @@ pub fn block_repeats(a: &DramTensor, b: &DramTensor) -> Option<usize> {
 /// The element type `kind`'s output has.
 pub(crate) fn output_elem(kind: u32) -> Elem {
     crate::sfpu::ops::elems(kind).out
+}
+
+/// How an element-wise op of `kind` holds its operands and its result, given them (roadmap W1,
+/// native BF16 arithmetic; `sfpu::kernel::Formats`): FP32 when each operand is the type `kind`
+/// takes; BF16 when every operand is BF16 and `kind` takes F32 alone, its result then BF16 where
+/// `kind`'s is F32. A BF16 op computes the F32 op on its operands widened (`bf16::expand`) and
+/// rounds its result once as `bf16::compress` does: bit for bit that composition. Refuses a BF16
+/// operand beside another type, and one for a kind that takes another type.
+pub(crate) fn eltwise_formats(
+    kind: u32,
+    operands: &[&DramTensor],
+) -> Result<crate::sfpu::kernel::Formats> {
+    use crate::sfpu::kernel::{Formats, Out};
+    let name = || format!("element-wise op {kind:#x}");
+    let sig = crate::sfpu::ops::elems(kind);
+    if !operands.iter().any(|t| t.elem == Elem::BF16) {
+        for (t, &want) in operands.iter().zip(sig.inputs) {
+            t.expect(&name(), want)?;
+        }
+        return Ok(Formats::FP32);
+    }
+    if let Some(&other) = sig.inputs.iter().find(|&&e| e != Elem::F32) {
+        return Err(TensorError::Elem {
+            op: format!("{} (BF16 operands; it takes {:?})", name(), sig.inputs),
+            got: Elem::BF16,
+            wants: other,
+        });
+    }
+    for t in operands {
+        t.expect(&format!("{} on BF16 operands", name()), Elem::BF16)?;
+    }
+    let out = match sig.out {
+        Elem::F32 => match PROBE_BF16_RESULT.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Out::Bf16AsFp32,
+            2 => Out::Fp32,
+            3 => Out::Bf16Unrounded,
+            _ => Out::Bf16,
+        },
+        _ => Out::Fp32,
+    };
+    Ok(Formats { bf16_in: true, out })
+}
+
+/// The element type of `kind`'s result held as `formats` says.
+pub(crate) fn result_elem(kind: u32, formats: crate::sfpu::kernel::Formats) -> Elem {
+    use crate::sfpu::kernel::Out;
+    match formats.out {
+        Out::Bf16 | Out::Bf16Unrounded => Elem::BF16,
+        Out::Fp32 | Out::Bf16AsFp32 => output_elem(kind),
+    }
+}
+
+/// The element type of `kind`'s result on `operands` ([`eltwise_formats`]).
+pub(crate) fn eltwise_output(kind: u32, operands: &[&DramTensor]) -> Result<Elem> {
+    Ok(result_elem(kind, eltwise_formats(kind, operands)?))
+}
+
+static PROBE_BF16_RESULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What an element-wise op on BF16 operands makes of an F32 kind's result, for gates only
+/// (`step270_native_bf16`): `Bf16` (the default, and the only form outside a gate);
+/// `Bf16AsFp32`, rounded and packed as FP32, the simulator's form since ttsim refuses the BF16
+/// pack (`PACR` mode 0x105); and the negative controls `Fp32` (not rounded) and `Bf16Unrounded`
+/// (packed as BF16 without the quantize, which the packer truncates).
+#[doc(hidden)]
+pub fn probe_bf16_result(out: crate::sfpu::kernel::Out) {
+    use crate::sfpu::kernel::Out;
+    let v = match out {
+        Out::Bf16 => 0,
+        Out::Bf16AsFp32 => 1,
+        Out::Fp32 => 2,
+        Out::Bf16Unrounded => 3,
+    };
+    PROBE_BF16_RESULT.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Element-wise `a (op) b` -- or `a (op) scalar`, or a ternary op's `c` --
@@ -3948,7 +4020,8 @@ fn sfpu_divide(
     let layout = kernel::plan_layout(1, kernel::Operands::Ternary)
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (operands, code) = ops::code2(op.kind, [op.scalar, op.scalar2]).expect("integer division");
-    let (roles, loops) = kernel::roles_code_validated(&layout, operands, &code, true);
+    let (roles, loops) =
+        kernel::roles_code_validated(&layout, operands, &code, true, kernel::Formats::FP32);
     let roles = Arc::new(roles);
     let loops = Arc::new(loops);
     let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, Elem::I32)?;
@@ -4206,6 +4279,7 @@ pub(crate) fn sfpu_group_for_tests(
         bcast,
         operands,
         false,
+        crate::sfpu::kernel::Formats::FP32,
     )
 }
 
@@ -4215,13 +4289,23 @@ pub(crate) fn sfpu_group(
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     half: bool,
+    formats: crate::sfpu::kernel::Formats,
 ) -> usize {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     // Measuring builds the op's role programs twice over: once per op kind,
-    // scalar and broadcast, not once per op.
+    // scalar, broadcast and formats, not once per op.
     // By the arena's end too (`crate::l1::arena`): a group is sized from it.
-    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast, bool, u64), usize>>;
+    type Key = (
+        u32,
+        u32,
+        u32,
+        crate::sfpu::ops::Broadcast,
+        bool,
+        crate::sfpu::kernel::Formats,
+        u64,
+    );
+    type Memo = Mutex<HashMap<Key, usize>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
     let key = (
         op.kind,
@@ -4229,13 +4313,14 @@ pub(crate) fn sfpu_group(
         op.scalar2.to_bits(),
         bcast,
         half,
+        formats,
         crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
     }
-    let g = measure_sfpu_group(op, bcast, operands, half);
+    let g = measure_sfpu_group(op, bcast, operands, half, formats);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, g);
@@ -4247,6 +4332,7 @@ fn measure_sfpu_group(
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     half: bool,
+    formats: crate::sfpu::kernel::Formats,
 ) -> usize {
     const GROUP: usize = 64;
     // The programs' lengths, which do not depend on where the layout sits: measured in the whole of
@@ -4256,9 +4342,15 @@ fn measure_sfpu_group(
             crate::sfpu::kernel::plan_layout_in(n, operands, tt_isa::l1::DATA)
         })
         .expect("two tiles always fit DATA");
-        let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
-            .expect("checked by the caller");
-        crate::sfpu::kernel::roles_code(&layout, operands, &math)
+        let (_, math) = crate::sfpu::ops::code_for_rows_as(
+            op.kind,
+            [op.scalar, op.scalar2],
+            bcast,
+            32,
+            formats.out.quantized(),
+        )
+        .expect("checked by the caller");
+        crate::sfpu::kernel::roles_code_as(&layout, operands, &math, formats)
             .0
             .map(|p| p.len())
     };
@@ -4300,6 +4392,7 @@ pub(crate) fn sfpu_programs(
     half: Option<u8>,
     rows: u32,
     b_once: bool,
+    formats: crate::sfpu::kernel::Formats,
     l1: &crate::l1::Placed,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
@@ -4313,6 +4406,7 @@ pub(crate) fn sfpu_programs(
         Option<u8>,
         u32,
         bool,
+        crate::sfpu::kernel::Formats,
         u64,
     );
     type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
@@ -4327,6 +4421,7 @@ pub(crate) fn sfpu_programs(
         half,
         rows,
         b_once,
+        formats,
         crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
@@ -4338,9 +4433,15 @@ pub(crate) fn sfpu_programs(
         b_once,
         ..crate::sfpu::kernel::Layout::placed(len, operands, l1)
     };
-    let (_, math) = crate::sfpu::ops::code_for_rows(op.kind, [op.scalar, op.scalar2], bcast, rows)
-        .expect("checked by the caller");
-    let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
+    let (_, math) = crate::sfpu::ops::code_for_rows_as(
+        op.kind,
+        [op.scalar, op.scalar2],
+        bcast,
+        rows,
+        formats.out.quantized(),
+    )
+    .expect("checked by the caller");
+    let (roles, loops) = crate::sfpu::kernel::roles_code_as(&layout, operands, &math, formats);
     let p = (layout, Arc::new(roles), Arc::new(loops));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -4791,7 +4892,14 @@ pub fn add_rms_divide(
     let per_tile = if gamma.is_some() { 6 } else { 4 };
     let by_slots =
         ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(3 * pt + 1) / per_tile;
-    let group = sfpu_group(div, Broadcast::Col, Operands::ColBroadcast, false).min(by_slots);
+    let group = sfpu_group(
+        div,
+        Broadcast::Col,
+        Operands::ColBroadcast,
+        false,
+        crate::sfpu::kernel::Formats::FP32,
+    )
+    .min(by_slots);
     if group == 0 {
         return Err(TensorError::Shape(format!(
             "a residual norm's packed rows of {pt} tiles leave no slots"
@@ -5034,7 +5142,14 @@ pub fn rms_divide(
     let per_tile = if gamma.is_some() { 4 } else { 2 };
     let by_slots =
         ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(pt + 1) / per_tile;
-    let group = sfpu_group(div, Broadcast::Col, Operands::ColBroadcast, false).min(by_slots);
+    let group = sfpu_group(
+        div,
+        Broadcast::Col,
+        Operands::ColBroadcast,
+        false,
+        crate::sfpu::kernel::Formats::FP32,
+    )
+    .min(by_slots);
     if group == 0 {
         return Err(TensorError::Shape(format!(
             "an RMS division's packed row of {pt} tiles leaves no slots"
