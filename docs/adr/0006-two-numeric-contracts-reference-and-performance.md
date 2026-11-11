@@ -106,11 +106,15 @@ The inference default. Its per-op rule:
   - no burn-tt op branches on the contract yet.
 
   Its specification model is therefore exact: the F32 model holding the weights' rounded values (`step240`). The model gate is `step269_performance_contract`. BF16 activations, derived fidelity and packer L1 accumulation extend both as their boxes land.
-- **BF16 activations, an option (2026-11-11, roadmap W1):** `WeightOptions::bf16_stream`. Every native BF16 op is bit
-  for bit the widen-compute-narrow composition it replaces, so the option is a model choice, not a contract branch:
-  its specification is Burn's own composition on BF16 (each op rounding once). It is not the default: on the 1.7B it
-  runs behind the FP32 stream and misses `step269`'s top-1 threshold by one position (performance-log, "burn-tt on
-  BF16, and the 1.7B on a BF16 stream").
+- **BF16 activations into the products, the default (2026-11-11, roadmap W1):** under the performance contract
+  `Llama::for_inference` rounds each norm's output and the MLP's `silu(gate) * up` once to BF16 where it is made
+  (`burn_tt::rms_norm_as`, `silu_mul_as`), and the products read them as they lie with F32 results
+  (`burn_tt::matmul_as`); the residual stream, the attention block and every op's arithmetic stay F32. Each op is bit
+  for bit its F32 op then the cast (`step76`, `step270`), so the specification model is the F32 model holding the
+  weights' rounded values with those casts written in. On the 1.7B: decode unchanged, prefill 1.06-1.09x, `step269`
+  the same 228 of 232 (performance-log, "BF16 activations into the products"). `WeightOptions::f32_activations` is the
+  baseline. A BF16 residual stream (every op on BF16, Burn's BF16 compositions) was tried first and deleted: slower
+  and one position under the top-1 threshold (failed-approaches).
 
 ## Consequences
 **Results under the performance contract change** with the contract's version, never with the grid, the card or the schedule.

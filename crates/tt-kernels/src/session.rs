@@ -3564,8 +3564,11 @@ impl<T: Transport> Session<T> {
         &mut self,
         input: &crate::bf16::Bf16Tensor,
     ) -> Result<DramTensor, TensorError> {
-        // The SFPU kernel's runs of tiles (`tile_op::cast`), bit for bit the expand's job a tile.
-        if !tensor::probing_tile_casts() {
+        // The SFPU kernel's runs of tiles (`tile_op::cast`), bit for bit the expand's job a tile,
+        // for an interleaved tensor: a stored weight laid by column names no slots, which only a
+        // `GATHER` reads (the expand's job a tile does).
+        if input.placement.layout() == tensor::Layout::Interleaved && !tensor::probing_tile_casts()
+        {
             let t = DramTensor::from_bf16(input.clone(), tensor::Pad::Undefined);
             let out = self.cast_runs(&t, tensor::Elem::F32)?;
             out.set_pad(tensor::Pad::Undefined);
@@ -7382,6 +7385,21 @@ impl<T: Transport> Session<T> {
         b: Option<&DramTensor>,
         c: Option<&DramTensor>,
     ) -> Result<DramTensor, TensorError> {
+        self.eltwise3_as(op, a, b, c, None)
+    }
+
+    /// [`Session::eltwise3`] with the result's element type asked for
+    /// (`tensor::eltwise_formats_as`): `Elem::BF16` for an op whose result is F32 on F32 operands
+    /// rounds that result once, ties-even, before its BF16 pack -- bit for bit the op then
+    /// [`Session::bf16_from_f32`]'s narrowing, as one op.
+    pub fn eltwise3_as(
+        &mut self,
+        op: tensor::Eltwise,
+        a: &DramTensor,
+        b: Option<&DramTensor>,
+        c: Option<&DramTensor>,
+        out: Option<tensor::Elem>,
+    ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         // The session's math mode picks the program: an Approx twin has a kind
         // of its own, so every memo and cache key below carries the mode.
@@ -7391,21 +7409,23 @@ impl<T: Transport> Session<T> {
         let overlap = self.overlap();
         let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
         let operands: Vec<&DramTensor> = [Some(a), b, c].into_iter().flatten().collect();
-        let twin = self.new_twin(a.rows, a.cols, tensor::eltwise_output(kind, &operands)?)?;
+        let out_elem = tensor::result_elem(kind, tensor::eltwise_formats_as(kind, &operands, out)?);
+        let twin = self.new_twin(a.rows, a.cols, out_elem)?;
         let alloc = &mut self.dram_state()?.alloc;
         // The SFPU's, or refused: the mover only moves data.
-        let work = match tensor::sfpu_eltwise(alloc, op, a, b, c, units, overlap, twin.as_ref()) {
-            Ok(Some(work)) => work,
-            other => {
-                if let Some(twin) = twin {
-                    self.free(twin)?;
+        let work =
+            match tensor::sfpu_eltwise_as(alloc, op, a, b, c, units, overlap, twin.as_ref(), out) {
+                Ok(Some(work)) => work,
+                other => {
+                    if let Some(twin) = twin {
+                        self.free(twin)?;
+                    }
+                    other?;
+                    return Err(TensorError::Shape(format!(
+                        "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
+                    )));
                 }
-                other?;
-                return Err(TensorError::Shape(format!(
-                    "element-wise {kind:#x} with {bcast:?}: no SFPU program computes it"
-                )));
-            }
-        };
+            };
         let out = self.execute_on(work, units, RESET_BUDGET);
         self.keep_twin(&out, twin)?;
         let out = out?;
@@ -7428,6 +7448,19 @@ impl<T: Transport> Session<T> {
         b: Option<tensor::BlockOperand<'_>>,
         c: Option<tensor::BlockOperand<'_>>,
     ) -> Result<DramTensor, TensorError> {
+        self.eltwise_blocks_as(op, a, b, c, None)
+    }
+
+    /// [`Session::eltwise_blocks`] with the result's element type asked for, as
+    /// [`Session::eltwise3_as`] takes it.
+    pub fn eltwise_blocks_as(
+        &mut self,
+        op: tensor::Eltwise,
+        a: tensor::BlockOperand<'_>,
+        b: Option<tensor::BlockOperand<'_>>,
+        c: Option<tensor::BlockOperand<'_>>,
+        out: Option<tensor::Elem>,
+    ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
         let op = op.in_mode(self.math);
         let tiles = |x: &tensor::BlockOperand<'_>| x.dims[0].div_ceil(32) * x.dims[1].div_ceil(32);
@@ -7438,10 +7471,14 @@ impl<T: Transport> Session<T> {
             .flatten()
             .map(|x| x.shape_only())
             .collect();
-        let out_elem = tensor::eltwise_output(op.kind, &shapes.iter().collect::<Vec<_>>())?;
+        let (kind, _) = tensor::broadcast_of(op, &shapes[0], b.is_some().then(|| &shapes[1]))?;
+        let out_elem = tensor::result_elem(
+            kind,
+            tensor::eltwise_formats_as(kind, &shapes.iter().collect::<Vec<_>>(), out)?,
+        );
         let twin = self.new_twin(a.dims[0], a.dims[1], out_elem)?;
         let alloc = &mut self.dram_state()?.alloc;
-        let work = match crate::tile_op::eltwise(op, a, b, c, twin.as_ref())
+        let work = match crate::tile_op::eltwise_as(op, a, b, c, twin.as_ref(), out)
             .and_then(|o| o.map(|mut o| o.build(alloc, units, overlap)).transpose())
         {
             Ok(Some(work)) => work,
@@ -8432,6 +8469,20 @@ impl<T: Transport> Session<T> {
         gamma: Option<&DramTensor>,
         eps: f32,
     ) -> Result<DramTensor, TensorError> {
+        self.rms_norm_as(a, gamma, eps, tensor::Elem::F32)
+    }
+
+    /// [`Session::rms_norm`] with its result as `out`: `Elem::BF16` rounds the F32 norm once,
+    /// ties-even, in `Dst` before a BF16 pack (the norm's last op, the scale's product or the
+    /// division) -- bit for bit the F32 norm then [`Session::bf16_from_f32`], with no F32 result
+    /// written: what a product reads as its BF16 `A`. A decode row's packed twin is BF16 too.
+    pub fn rms_norm_as(
+        &mut self,
+        a: &DramTensor,
+        gamma: Option<&DramTensor>,
+        eps: f32,
+        out: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
         let div = tensor::Eltwise {
             kind: crate::sfpu::ops::kind_sfpu::DIV,
             scalar: 0.0,
@@ -8447,19 +8498,21 @@ impl<T: Transport> Session<T> {
             && div.in_mode(self.math).kind == div.kind;
         if !fused {
             let stat = self.rms(a, eps)?;
-            let out = self.eltwise(div, a, Some(&stat));
+            // The division is the last op without a scale: it then makes `out`.
+            let quotient = if gamma.is_some() { None } else { Some(out) };
+            let normed = self.eltwise3_as(div, a, Some(&stat), None, quotient);
             self.free(stat)?;
             let Some(gamma) = gamma else {
-                return out;
+                return normed;
             };
-            let out = out?;
+            let normed = normed?;
             let mul = tensor::Eltwise {
                 kind: crate::kind::MUL,
                 scalar: 0.0,
                 scalar2: 0.0,
             };
-            let scaled = self.eltwise(mul, &out, Some(gamma));
-            self.free(out)?;
+            let scaled = self.eltwise3_as(mul, &normed, Some(gamma), None, Some(out));
+            self.free(normed)?;
             return scaled;
         }
         let (packed, made) = match self.packed_twin(a).cloned() {
@@ -8477,9 +8530,29 @@ impl<T: Transport> Session<T> {
             .spread_for(tiles_of(a))
             .min(kt.div_ceil(RMS_DIVIDE_TILES))
             .max(1);
-        let twin = self.new_twin(a.rows, a.cols, tensor::Elem::F32)?;
+        // The twin holds the result as it is packed (a gate's `Out::Bf16AsFp32` packs FP32).
+        let packed_elem = match out {
+            tensor::Elem::BF16 => tensor::result_elem(
+                crate::sfpu::ops::kind_sfpu::DIV,
+                crate::sfpu::kernel::Formats {
+                    bf16_in: false,
+                    out: tensor::bf16_result(),
+                },
+            ),
+            other => other,
+        };
+        let twin = self.new_twin(a.rows, a.cols, packed_elem)?;
         let work = self.dram_state().and_then(|d| {
-            tensor::rms_divide(&mut d.alloc, a, &packed, gamma, eps, units, twin.as_ref())
+            tensor::rms_divide(
+                &mut d.alloc,
+                a,
+                &packed,
+                gamma,
+                eps,
+                units,
+                twin.as_ref(),
+                out,
+            )
         });
         let out = match work {
             Ok(work) => self.execute_on(work, units, RESET_BUDGET),

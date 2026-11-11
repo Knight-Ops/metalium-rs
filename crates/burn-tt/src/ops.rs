@@ -69,13 +69,27 @@ pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
 /// widening path) for anything else: a transposed or viewed `b`, `b` with a batch, a host `a`, an
 /// engine without GDDR.
 fn packed_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
+    packed_weight_matmul_as(a, b, a.dtype())
+}
+
+/// [`packed_weight_matmul`] with its result's dtype named: an F32 `a` against a logical F32
+/// weight, F32; a BF16 `a` against a logical BF16 weight, BF16 (each output rounded once); or a
+/// BF16 `a` against a logical F32 weight, F32 -- the product of `a`'s values in F32, which the
+/// card reads as they lie (`a` widened is exact, and a product of BF16 `A` is its widened
+/// product bit for bit). `None` for any other.
+pub(crate) fn packed_weight_matmul_as(a: &TtTensor, b: &TtTensor, out: DType) -> Option<TtTensor> {
     use crate::storage::StorageFormat;
-    // An F32 `a` against a logical F32 weight; or (roadmap W1) a BF16 `a` against a logical BF16
-    // one, stored BFP, with a BF16 result.
-    let bf16 = a.dtype() == DType::BF16 && b.dtype() == DType::BF16;
+    // An F32 `a` against a packed weight, an F32 result; or (roadmap W1) a BF16 `a` against a
+    // logical BF16 one, stored BFP, with a BF16 result; or a BF16 `a` against a logical F32 one
+    // with an F32 result.
+    let bf16 = match (a.dtype(), b.dtype(), out) {
+        (DType::F32, DType::F32 | DType::BF16, DType::F32)
+        | (DType::BF16, DType::F32, DType::F32) => false,
+        (DType::BF16, DType::BF16, DType::BF16) => true,
+        _ => return None,
+    };
     if b.storage_format() == StorageFormat::F32
         || a.storage_format() != StorageFormat::F32
-        || !(a.dtype() == DType::F32 || bf16)
         || b.is_transposed()
         || b.is_view()
         || !crate::server::supports_dram(a.device)
@@ -1564,6 +1578,20 @@ fn device_op_ungated(
     b: Option<&TtTensor>,
     c: Option<&TtTensor>,
 ) -> Option<TtTensor> {
+    device_op_as(op, a, b, c, None)
+}
+
+/// [`device_op_ungated`] with its result's dtype asked for: `None` the op's own; `Some(BF16)` for
+/// an op whose result is F32 on F32 operands rounds it once on the card before its BF16 pack
+/// (`Session::eltwise3_as`), bit for bit the op then `cast_native(.., BF16)`, as one op. `None`
+/// returned where the op does not run so (the caller composes it).
+pub(crate) fn device_op_as(
+    op: tt_kernels::tensor::Eltwise,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+    c: Option<&TtTensor>,
+    out: Option<DType>,
+) -> Option<TtTensor> {
     use tt_kernels::kind as k;
     let kind = op.kind;
     let device = a.device;
@@ -1575,6 +1603,11 @@ fn device_op_ungated(
     // (`Session::eltwise3`), the composition below bit for bit -- else widened and narrowed.
     let operands = || [Some(a), b, c].into_iter().flatten();
     let bf16 = operands().any(|t| t.dtype() == DType::BF16);
+    let rounded = match out {
+        None => false,
+        Some(DType::BF16) if !bf16 && sig.out == Elem::F32 => true,
+        Some(_) => return None,
+    };
     if bf16 {
         let all_f32 = sig.inputs.iter().all(|&e| e == Elem::F32);
         let all_bf16 = operands().all(|t| t.dtype() == DType::BF16);
@@ -1607,7 +1640,7 @@ fn device_op_ungated(
     if !crate::server::supports_dram(device) {
         return None;
     }
-    if let Some(t) = view_op(op, a, b, c) {
+    if let Some(t) = view_op(op, a, b, c, rounded) {
         return Some(t);
     }
     let (sa, sb) = (a.shape().to_vec(), b.map(|b| b.shape().to_vec()));
@@ -1637,24 +1670,27 @@ fn device_op_ungated(
             let shape = broadcast_shape(&sa, s)?;
             if shape != sa {
                 let lhs = expanded(a, burn_backend::Shape::from(shape), "broadcast");
-                return device_op_ungated(op, &lhs, b, c);
+                return device_op_as(op, &lhs, b, c, out);
             }
             let rhs = expanded(b?, a.shape(), "broadcast");
-            return device_op_ungated(op, a, Some(&rhs), c);
+            return device_op_as(op, a, Some(&rhs), c, out);
         }
         _ => return None,
     };
     let (da, db, dc) = (plain_dram(a), b.map(plain_dram), c.map(plain_dram));
-    let (id, dims) = crate::server::eltwise_op(
+    let (id, dims) = crate::server::eltwise_op_as(
         device,
         op,
         da.buffer.id,
         db.as_ref().map(|d| d.buffer.id),
         dc.as_ref().map(|d| d.buffer.id),
+        rounded,
     );
     // The input's own dtype where the element type is kept (a bool's store
     // among them), else the output's.
-    let dtype = if output == input {
+    let dtype = if rounded {
+        DType::BF16
+    } else if output == input {
         a.dtype()
     } else {
         match output {
@@ -1804,6 +1840,7 @@ fn view_op(
     a: &TtTensor,
     b: Option<&TtTensor>,
     c: Option<&TtTensor>,
+    rounded: bool,
 ) -> Option<TtTensor> {
     use crate::server::BlockArg;
     use tt_kernels::kind as k;
@@ -1939,17 +1976,26 @@ fn view_op(
     let _held = (&da.2, db.as_ref().map(|d| &d.2), dc.as_ref().map(|d| &d.2));
     let (da, db, dc) = (da.0, db.as_ref().map(|d| d.0), dc.as_ref().map(|d| d.0));
     let (id, dims) = if all_whole {
-        crate::server::eltwise_op(device, op, da.id, db.map(|d| d.id), dc.map(|d| d.id))
+        crate::server::eltwise_op_as(
+            device,
+            op,
+            da.id,
+            db.map(|d| d.id),
+            dc.map(|d| d.id),
+            rounded,
+        )
     } else if matches!(
         crate::server::elementwise_mode(device),
         crate::ElementwiseMode::Matrix { .. }
     ) {
         return None;
     } else {
-        crate::server::eltwise_blocks(device, op, da, db, dc)
+        crate::server::eltwise_blocks_as(device, op, da, db, dc, rounded)
     };
     let sig = tt_kernels::sfpu::ops::elems(kind);
-    let dtype = if sig.out == sig.inputs[0] {
+    let dtype = if rounded {
+        DType::BF16
+    } else if sig.out == sig.inputs[0] {
         a.dtype()
     } else {
         match sig.out {
@@ -4158,6 +4204,7 @@ pub(crate) mod norm;
 mod pool;
 mod region;
 pub(crate) mod rope;
+pub(crate) mod rounded;
 mod scan;
 mod sort;
 

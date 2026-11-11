@@ -23,6 +23,19 @@ pub fn eltwise(
     c: Option<BlockOperand<'_>>,
     twin: Option<&DramTensor>,
 ) -> Result<Option<TileOp>> {
+    eltwise_as(op, a, b, c, twin, None)
+}
+
+/// [`eltwise`] with its result's element type asked for (`tensor::eltwise_formats_as`): BF16 for
+/// an op whose result is F32 on F32 operands rounds it once before its pack.
+pub fn eltwise_as(
+    op: Eltwise,
+    a: BlockOperand<'_>,
+    b: Option<BlockOperand<'_>>,
+    c: Option<BlockOperand<'_>>,
+    twin: Option<&DramTensor>,
+    out: Option<tensor::Elem>,
+) -> Result<Option<TileOp>> {
     let what = "an element-wise op's block";
     let (ra, rb, rc) = (
         a.tensor_ref(what)?,
@@ -36,9 +49,10 @@ pub fn eltwise(
     );
     let (a, b, c) = (&a, b.as_ref(), c.as_ref());
     let (kind, bcast) = tensor::broadcast_of(op, a, b)?;
-    let formats = tensor::eltwise_formats(
+    let formats = tensor::eltwise_formats_as(
         kind,
         &[Some(a), b, c].into_iter().flatten().collect::<Vec<_>>(),
+        out,
     )?;
     let op = Eltwise { kind, ..op };
     if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {

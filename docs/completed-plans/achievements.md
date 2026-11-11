@@ -342,13 +342,13 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   5 jobs against its 9 at a decode row, 8 against 12 at a block (`step76::bf16_rms_norm_is_the_module_bit_for_bit`).
   `sigmoid` joins the native list, and an element-wise op over blocks reads BF16 buffers.
 
-- **W1: the 1.7B on a BF16 stream, an option** (2026-11-11, cards 0 and 1;
-  [log](../learnings/performance-log.md#w1-burn-tt-on-bf16-and-the-17b-on-a-bf16-stream-an-option-2026-11-11-cards-0-and-1)).
-  `WeightOptions::bf16_stream` (`TT_BF16_STREAM=1` in the bench): BF16 activations between ops, the body's weights
-  logical BF16 stored BFP8, the attention block and the head F32. Decode 9.20 / 9.73 / 10.36 ms, prefill 704 / 2,137 /
-  2,936 tokens/s, behind the FP32 stream's 7.51 ms and 4,004 tokens/s (from 12.60 ms and 346 tokens/s at its first
-  run, the casts of views removed); `step269` top-1 97.84%, one position under its threshold. The default stays the
-  FP32 stream; the profile names what the option lacks (the norm, `silu * up` and the attention block on BF16).
+- **W1: BF16 activations into the products, the performance default** (2026-11-11, cards 0 and 1;
+  [log](../learnings/performance-log.md#w1-bf16-activations-into-the-products-the-performance-default-2026-11-11-cards-0-and-1)).
+  A BF16 residual stream came first (decode 9.20 against 7.51 ms, `step269` one position short) and was deleted. In its
+  place the arithmetic stays F32 and a norm's output and `silu(gate) * up` are rounded once to BF16 where made, each one
+  op (`burn_tt::rms_norm_as`, `silu_mul_as`), and read as they lie by products with F32 results
+  (`burn_tt::matmul_as`), each bit for bit its composition. 1.7B decode 7.52 / 8.01 / 8.64 ms (F32 activations 7.49 /
+  7.99 / 8.67), prefill 1,257 / 3,552 / 4,266 tokens/s (1,190 / 3,258 / 4,007), `step269` 228 of 232 as before.
 
 ## Prefill and long context
 

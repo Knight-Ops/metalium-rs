@@ -611,3 +611,145 @@ fn bf16_mesh_product_uses_resident_ethernet_execution_across_two_cards() {
         assert_eq!(bits(out.into_data()), want);
     });
 }
+
+/// Roadmap W1's BF16 activations: the ops a model's products read their BF16 `A` from, each with
+/// its result's dtype named (`burn_tt::rms_norm_as`, `silu_mul_as`, `matmul_as`), are bit for bit
+/// their compositions -- the F32 norm (`burn_tt::rms_norm`) then the cast, `silu(gate) * up` then
+/// the cast, and the product of a BF16 `x` cast to F32 with an F32 weight stored BFP8 -- on
+/// `TtBackend` and on `Tt` (each a custom operation in the fusion stream), at a decode row and at
+/// 67 rows; on `TtBackend` in fewer jobs than the composition (no cast job). Silicon: a BF16 pack.
+#[cfg(feature = "silicon")]
+#[test]
+fn ops_with_a_named_result_are_their_compositions_bit_for_bit() {
+    use burn::tensor::activation::silu;
+    use burn::tensor::backend::Backend;
+    use burn_tt::storage::{StorageFormat, TensorStorageExt};
+    use burn_tt::TtDevice;
+
+    fn values(len: usize, salt: u32) -> Vec<f32> {
+        (0..len as u32)
+            .map(|i| {
+                let h = (i ^ salt.wrapping_mul(0x9e37_79b9)).wrapping_mul(2_654_435_761);
+                ((h >> 8) % 200_001) as f32 / 100_000.0 - 1.0 + (h & 0xff) as f32 * 1e-9
+            })
+            .collect()
+    }
+    fn f32_bits<const D: usize, B: Backend>(t: Tensor<B, D>) -> Vec<u32> {
+        let data = t.into_data();
+        assert_eq!(data.dtype, DType::F32);
+        data.to_vec::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+    /// The three ops and their compositions on `B`, `(rows, what, jobs named, jobs composed)` for
+    /// each when `count`.
+    fn check<B: burn_tt::storage::StorageBackend<Device = TtDevice>>(
+        d: &TtDevice,
+        count: bool,
+    ) -> Vec<(usize, &'static str, u64, u64)> {
+        let (cols, n) = (2048, 384);
+        let mut jobs = Vec::new();
+        let measured = |f: &mut dyn FnMut()| -> u64 {
+            let ((), report) = burn_tt::with_report(&mut *f);
+            report.0.iter().map(|s| s.jobs).sum()
+        };
+        let gamma = Tensor::<B, 1>::from_data(TensorData::new(values(cols, 9), [cols]), d);
+        let w = Tensor::<B, 2>::from_data(TensorData::new(values(cols * n, 8), [cols, n]), d)
+            .with_storage(StorageFormat::Bfp8);
+        for rows in [1usize, 67] {
+            let f32s = |salt| {
+                Tensor::<B, 3>::from_data(
+                    TensorData::new(values(rows * cols, salt), [1, rows, cols]),
+                    d,
+                )
+            };
+            let (x, gate, up) = (f32s(1), f32s(2), f32s(3));
+
+            let named = burn_tt::rms_norm_as(&x, &gamma, 1e-5, DType::BF16).unwrap();
+            let composed = burn_tt::rms_norm(&x, &gamma, 1e-5)
+                .unwrap()
+                .cast(FloatDType::BF16);
+            assert_eq!(named.dtype(), DType::BF16);
+            assert_eq!(
+                bits(named.clone().into_data()),
+                bits(composed.into_data()),
+                "rms_norm_as, {rows} rows"
+            );
+            if count {
+                let a = measured(&mut || {
+                    burn_tt::rms_norm_as(&x, &gamma, 1e-5, DType::BF16)
+                        .unwrap()
+                        .into_data();
+                });
+                let b = measured(&mut || {
+                    burn_tt::rms_norm(&x, &gamma, 1e-5)
+                        .unwrap()
+                        .cast(FloatDType::BF16)
+                        .into_data();
+                });
+                jobs.push((rows, "rms_norm_as", a, b));
+            }
+
+            let named = burn_tt::silu_mul_as(&gate, &up, DType::BF16).unwrap();
+            let composed = (silu(gate.clone()) * up.clone()).cast(FloatDType::BF16);
+            assert_eq!(named.dtype(), DType::BF16);
+            assert_eq!(
+                bits(named.into_data()),
+                bits(composed.into_data()),
+                "silu_mul_as, {rows} rows"
+            );
+            if count {
+                let a = measured(&mut || {
+                    burn_tt::silu_mul_as(&gate, &up, DType::BF16)
+                        .unwrap()
+                        .into_data();
+                });
+                let b = measured(&mut || {
+                    (silu(gate.clone()) * up.clone())
+                        .cast(FloatDType::BF16)
+                        .into_data();
+                });
+                jobs.push((rows, "silu_mul_as", a, b));
+            }
+
+            let h = burn_tt::rms_norm_as(&x, &gamma, 1e-5, DType::BF16).unwrap();
+            let named = burn_tt::matmul_as(&h, &w, DType::F32).unwrap();
+            let composed = h
+                .clone()
+                .cast(FloatDType::F32)
+                .matmul(w.clone().unsqueeze());
+            assert_eq!(named.dims(), [1, rows, n]);
+            assert_eq!(
+                f32_bits(named),
+                f32_bits(composed),
+                "matmul_as, {rows} rows"
+            );
+            if count {
+                let a = measured(&mut || {
+                    burn_tt::matmul_as(&h, &w, DType::F32).unwrap().into_data();
+                });
+                let b = measured(&mut || {
+                    h.clone()
+                        .cast(FloatDType::F32)
+                        .matmul(w.clone().unsqueeze())
+                        .into_data();
+                });
+                jobs.push((rows, "matmul_as", a, b));
+            }
+        }
+        jobs
+    }
+    with_device(Config::default(), |d| {
+        let jobs = check::<TtBackend>(&d, true);
+        for (rows, what, a, b) in &jobs {
+            println!("MEASURE {what}, {rows} rows: {a} jobs, the composition's {b}");
+            assert!(
+                a < b,
+                "{what}, {rows} rows: {a} jobs against the composition's {b}"
+            );
+        }
+        check::<burn_tt::Tt>(&d, false);
+    });
+}

@@ -262,6 +262,11 @@ not reach. The design below stands for a workload whose consumers do not hide un
   - **The scale is not in it:** its `Reshape` is a block of its own in burn-fusion, and the product joins neither
     (observed). Since 2026-10-27 a model calls `burn_tt::rms_norm(x, gamma, eps)` (a custom operation, as RoPE's), which
     multiplies by the scale inside the norm's job on a decode row (`step195`, `step210`).
+  - **Its result's dtype named** (2026-11-11, roadmap W1's BF16 activations): `burn_tt::rms_norm_as(x, gamma, eps,
+    BF16)` rounds the norm's last op once in `Dst` before a BF16 pack, bit for bit the norm then the cast, one custom
+    operation; likewise `burn_tt::silu_mul_as` (`SILU_MUL` with a BF16 result) and `burn_tt::matmul_as` (a BF16 `A`,
+    an F32 result). Not a chain match: Burn's `cast` after a custom operation, and a product whose weight's `Reshape`
+    is a block of its own, leave a fuser nothing to hold (`step76`, `step270`).
   - **A residual sum and its norm** (2026-10-27, opt-in, `TT_ADD_RMS_NORM=1`): chains `ADD_RMS_NORM` (an `Add`, then the
     composition above) and `ADD_RMS_NORM_SCALED` (an `Add`, then `burn_tt::rms_norm`'s custom operation, matched by the
     chain's `ScaledNorm` step, `eps` from its id). The first chains with **a second output**: a `Pattern`'s `keep` names

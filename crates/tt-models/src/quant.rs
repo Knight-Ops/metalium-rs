@@ -33,17 +33,13 @@ pub enum Format {
     /// a BF16 checkpoint's weights) and computed in F32. burn-tt reads it as a product's `B`
     /// directly, bit for bit the product of the same values held in F32.
     Bf16Stored,
-    /// BFP8 storage of a logical BF16 matrix (roadmap W1, native BF16 arithmetic): a BF16
-    /// stream's weights. Its values are [`Format::Bfp8`]'s, which are BF16 values; a BF16
-    /// activation's product with it is BF16.
-    Bf16Bfp8,
 }
 
 impl Format {
     /// Bits of a block-floating-point datum, `None` for the ordinary floats.
     fn bfp_width(self) -> Option<u32> {
         match self {
-            Format::Bfp8 | Format::Bf16Bfp8 => Some(8),
+            Format::Bfp8 => Some(8),
             Format::Bfp4 => Some(4),
             Format::Bfp2 => Some(2),
             _ => None,
@@ -61,7 +57,7 @@ impl Format {
     /// The storage a matrix in this format is held in (F32 for the half dtypes and F32).
     pub fn storage(self) -> StorageFormat {
         match self {
-            Format::Bfp8 | Format::Bf16Bfp8 => StorageFormat::Bfp8,
+            Format::Bfp8 => StorageFormat::Bfp8,
             Format::Bfp4 => StorageFormat::Bfp4,
             Format::Bfp2 => StorageFormat::Bfp2,
             Format::Bf16Stored => StorageFormat::Bf16,
@@ -78,11 +74,13 @@ pub struct WeightOptions {
     /// tt-metal's acceptance floors (teacher-forced top-1 86.6%, logit PCC 0.93, against 90% and
     /// 0.95; `step269_performance_contract`), to be judged again on the 8B-class model (W5).
     pub mlp_bfp4: bool,
-    /// Under the performance contract, a BF16 activation stream (roadmap W1, native BF16
-    /// arithmetic): every matrix but the embedding table and the output head
-    /// [`Format::Bf16Bfp8`], the head BFP8 of a logical F32 matrix (F32 logits), the table F32
-    /// (each looked-up row narrowed into the stream, `Llama::for_inference`).
-    pub bf16_stream: bool,
+    /// Under the performance contract, F32 activations into the products: the measurement's
+    /// baseline. By default (since 2026-11-11, roadmap W1) the contract's products read BF16
+    /// activations: each norm's output and the MLP's `silu(gate) * up` rounded once to BF16 where
+    /// it is made and read as it lies by the products after it, which give F32; the residual
+    /// stream, the attention block and every op's arithmetic stay F32 (`Llama::for_inference`).
+    /// Not a weight format: the plan is the contract's either way.
+    pub f32_activations: bool,
 }
 
 /// The format of each named tensor: the first rule whose pattern is a substring of the name wins,
@@ -143,16 +141,6 @@ impl Plan {
                     "BFP4 weights are a performance-contract option"
                 );
                 Self::bf16_weights()
-            }
-            burn_tt::Numerics::Performance if options.bf16_stream => {
-                assert!(
-                    !options.mlp_bfp4,
-                    "BFP4 weights are not a BF16 stream's option yet"
-                );
-                Self::new()
-                    .rule("embed_tokens", Format::F32)
-                    .rule("lm_head", Format::Bfp8)
-                    .rule("", Format::Bf16Bfp8)
             }
             burn_tt::Numerics::Performance => {
                 let mut plan = Self::new().rule("embed_tokens", Format::F32);
@@ -242,10 +230,7 @@ pub struct Native;
 
 impl<B: StorageBackend> Quantizer<B> for Native {
     fn matrix(&self, format: Format, t: Tensor<B, 2>) -> Tensor<B, 2> {
-        if format == Format::Bf16Bfp8 {
-            // A logical BF16 tensor stored BFP8 (`burn_tt::storage`).
-            t.cast(DType::BF16).with_storage(format.storage())
-        } else if let Some(dtype) = format.half() {
+        if let Some(dtype) = format.half() {
             t.cast(dtype)
         } else if format.storage() != StorageFormat::F32 {
             // Stored formats take a logical F32 tensor (`StorageBackend`).
@@ -286,10 +271,7 @@ impl Emulated {
 
 impl<B: Backend> Quantizer<B> for Emulated {
     fn matrix(&self, format: Format, t: Tensor<B, 2>) -> Tensor<B, 2> {
-        if format == Format::Bf16Bfp8 {
-            // BFP8's values are BF16 values: exact in a BF16 tensor.
-            Self::round(format, t.cast(DType::F32)).cast(DType::BF16)
-        } else if let Some(dtype) = format.half() {
+        if let Some(dtype) = format.half() {
             t.cast(dtype)
         } else if format.bfp_width().is_some() {
             Self::round(format, t.cast(DType::F32))

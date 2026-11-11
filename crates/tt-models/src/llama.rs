@@ -152,6 +152,23 @@ fn normed<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) -> Ten
     burn_tt::rms_norm(&x, &norm.gamma.val(), norm.epsilon).unwrap_or_else(|| norm.forward(x))
 }
 
+/// [`normed`], rounded once to `operand` where it is given (the dtype the products after it read
+/// their activations in): bit for bit `normed(norm, x).cast(operand)`, on the card one op
+/// (`burn_tt::rms_norm_as`).
+fn normed_as<B: Backend, const D: usize>(
+    norm: &RmsNorm<B>,
+    x: Tensor<B, D>,
+    operand: Option<DType>,
+) -> Tensor<B, D> {
+    match operand {
+        Some(dtype) if dtype != x.dtype() => {
+            burn_tt::rms_norm_as(&x, &norm.gamma.val(), norm.epsilon, dtype)
+                .unwrap_or_else(|| normed(norm, x).cast(dtype))
+        }
+        _ => normed(norm, x),
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct SelfAttn<B: Backend> {
     /// The three projections as loaded; `None` once fused into [`SelfAttn::qkv`].
@@ -203,13 +220,15 @@ fn part<B: Backend>(p: &Option<Linear<B>>) -> &Linear<B> {
         .expect("a projection fused away is read only through its fused matrix")
 }
 
-/// `x @ W` for the fused `whole`, split back into the parts' outputs, `widths` columns each.
+/// `x @ W` for the fused `whole`, split back into the parts' outputs, `widths` columns each, the
+/// product in `stream` ([`project_into`]).
 fn project_split<B: Backend, const N: usize>(
     x: Tensor<B, 3>,
     whole: &Linear<B>,
     widths: [usize; N],
+    stream: DType,
 ) -> [Tensor<B, 3>; N] {
-    split(project(x, whole), widths)
+    split(project_into(x, whole, stream), widths)
 }
 
 /// `y`'s column blocks of `widths`, left to right: views of it.
@@ -274,6 +293,25 @@ fn residual<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor<B, 3> {
     }
 }
 
+/// [`project`] with its result in `stream` where `x` is in another dtype (a BF16 operand of an F32
+/// stream, [`Llama::operand`]): `x`'s values multiplied in the weight's dtype and the result cast
+/// to `stream`, bit for bit; on the card one product reading `x` as it lies
+/// (`burn_tt::matmul_as`).
+fn project_into<B: Backend>(x: Tensor<B, 3>, linear: &Linear<B>, stream: DType) -> Tensor<B, 3> {
+    if x.dtype() == stream {
+        return project(x, linear);
+    }
+    let weight = linear.weight.val();
+    let y = burn_tt::matmul_as(&x, &weight, stream).unwrap_or_else(|| {
+        let dtype = weight.dtype();
+        Tensor::matmul(x.cast(dtype), weight.unsqueeze()).cast(stream)
+    });
+    match &linear.bias {
+        Some(b) => y + b.val().cast(stream).unsqueeze(),
+        None => y,
+    }
+}
+
 /// `x @ W` for a projection, computed in the weight's own dtype: the activation is cast in and the
 /// result cast back to the residual stream's dtype, so matrices held in different formats (F32,
 /// BF16, F16, block floating point) share one stream.
@@ -327,7 +365,8 @@ impl<B: Backend> Layer<B> {
 
     /// The layer's output, and its cache's keys and values (`cache_k`, `cache_v`: `[1, kv_heads,
     /// max_len, head_dim]` for a growing cache, as a [`FixedCache`] stores them for a fixed one)
-    /// with this step's written as `write` says.
+    /// with this step's written as `write` says. `operand`: the dtype the products of the norms'
+    /// and the MLP's outputs read them in, where not the stream's ([`Llama::operand`]).
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -339,6 +378,7 @@ impl<B: Backend> Layer<B> {
         write: &Write<'_, B>,
         index: usize,
         act: Option<&ActFn<B>>,
+        operand: Option<DType>,
     ) -> (Tensor<B, 3>, Tensor<B, 4>, Tensor<B, 4>) {
         let hook = |name: &str, t: Tensor<B, 3>| match act {
             Some(f) => f(&format!("layers.{index}.{name}"), t),
@@ -346,29 +386,18 @@ impl<B: Backend> Layer<B> {
         };
         let (kv_heads, head_dim, groups) = (cfg.kv_heads, cfg.head_dim, cfg.groups());
         let [n, t, _] = x.dims();
-        let h = normed(&self.input_layernorm, x.clone());
+        let stream = x.dtype();
+        let h = normed_as(&self.input_layernorm, x.clone(), operand);
         let a = &self.self_attn;
         let heads =
             |p: Tensor<B, 3>, count: usize| p.reshape([n, t, count, head_dim]).swap_dims(1, 2);
         let (qw, kvw) = (cfg.heads * head_dim, kv_heads * head_dim);
-        // Under a stream of another dtype than the cache's (a BF16 stream, an F32 cache), the
-        // attention block computes in the cache's: its inputs widened here -- a fused product
-        // whole, before it is split, so no view of it is cast -- and its output narrowed after its
-        // heads are laid back along the row.
-        let (stream, kv_dtype) = (x.dtype(), cache_k.dtype());
-        let to_cache = |t: Tensor<B, 3>| {
-            if t.dtype() == kv_dtype {
-                t
-            } else {
-                t.cast(kv_dtype)
-            }
-        };
         let [q, k, v] = match &a.qkv {
-            Some(qkv) => split(to_cache(project(h, qkv)), [qw, kvw, kvw]),
+            Some(qkv) => project_split(h, qkv, [qw, kvw, kvw], stream),
             None => [
-                to_cache(project(h.clone(), part(&a.q_proj))),
-                to_cache(project(h.clone(), part(&a.k_proj))),
-                to_cache(project(h, part(&a.v_proj))),
+                project_into(h.clone(), part(&a.q_proj), stream),
+                project_into(h.clone(), part(&a.k_proj), stream),
+                project_into(h, part(&a.v_proj), stream),
             ],
         };
         let q = rope.apply(heads(q, cfg.heads));
@@ -427,32 +456,39 @@ impl<B: Backend> Layer<B> {
         );
         // Unfolded (a no-op unless the query heads were folded into rows above).
         let out = out.reshape([n, cfg.heads, t, head_dim]);
-        let context = out.swap_dims(1, 2).reshape([n, t, cfg.heads * head_dim]);
-        let context = if context.dtype() == stream {
-            context
-        } else {
-            context.cast(stream)
-        };
-        let context = hook("attn_ctx", context);
-        let x = residual(x, project(context, &a.o_proj));
+        let context = hook(
+            "attn_ctx",
+            out.swap_dims(1, 2).reshape([n, t, cfg.heads * head_dim]),
+        );
+        let x = residual(x, project_into(context, &a.o_proj, stream));
 
-        let h = normed(&self.post_attention_layernorm, x.clone());
+        let h = normed_as(&self.post_attention_layernorm, x.clone(), operand);
         let m = &self.mlp;
         let [gate, up] = match &m.gate_up {
-            Some(gate_up) => project_split(h, gate_up, [cfg.ff, cfg.ff]),
+            Some(gate_up) => project_split(h, gate_up, [cfg.ff, cfg.ff], stream),
             None => [
-                project(h.clone(), part(&m.gate_proj)),
-                project(h, part(&m.up_proj)),
+                project_into(h.clone(), part(&m.gate_proj), stream),
+                project_into(h, part(&m.up_proj), stream),
             ],
         };
         let hidden = if probing_free(2) {
             drop(gate);
             up
         } else {
-            silu(gate) * up
+            match operand {
+                // Rounded once where it is made (`burn_tt::silu_mul_as`): bit for bit the F32
+                // product then the cast.
+                Some(dtype) if dtype != gate.dtype() => burn_tt::silu_mul_as(&gate, &up, dtype)
+                    .unwrap_or_else(|| (silu(gate) * up).cast(dtype)),
+                _ => silu(gate) * up,
+            }
         };
         let hidden = hook("mlp_hidden", hidden);
-        (residual(x, project(hidden, &m.down_proj)), new_k, new_v)
+        (
+            residual(x, project_into(hidden, &m.down_proj, stream)),
+            new_k,
+            new_v,
+        )
     }
 }
 
@@ -554,24 +590,10 @@ pub struct Llama<B: Backend> {
     /// The numeric contract the model was made for ([`Llama::for_inference`]), or `None` for one
     /// put together otherwise. Not a parameter.
     numerics: Option<burn_tt::Numerics>,
-    /// The activations' dtype between ops where it is not the embedding table's (and the cache's):
-    /// BF16 under `WeightOptions::bf16_stream`, each looked-up row narrowed into it, the queries,
-    /// keys and values widened to the cache's after their projections and the attention output
-    /// narrowed back. Not a parameter.
-    stream: Option<DType>,
-}
-
-/// Casts every vector parameter (the norms' scales) to `0`'s dtype.
-struct Vectors(DType);
-
-impl<B: Backend> ModuleMapper<B> for Vectors {
-    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
-        if D != 1 {
-            return param;
-        }
-        let dtype = self.0;
-        param.map(|t| t.cast(dtype))
-    }
+    /// The dtype the products of the norms' and the MLP's outputs read them in where it is not
+    /// the stream's: BF16 under `WeightOptions::bf16_activations`, each such output rounded once
+    /// where it is made, the residual stream and every op's arithmetic F32. Not a parameter.
+    operand: Option<DType>,
 }
 
 /// Widens every float parameter to F32.
@@ -596,7 +618,7 @@ impl<B: Backend> Llama<B> {
             lm_head: (!config.tied_head).then(|| linear(config.hidden, config.vocab, device)),
             config: *config,
             numerics: None,
-            stream: None,
+            operand: None,
         }
     }
 
@@ -767,7 +789,17 @@ impl<B: Backend> Llama<B> {
         let act = cache.act.clone();
         let write = Write::At(start);
         for (index, (layer, c)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
-            let (y, k, v) = layer.forward(cfg, x, &rope, &c.k, &c.v, &write, index, act.as_ref());
+            let (y, k, v) = layer.forward(
+                cfg,
+                x,
+                &rope,
+                &c.k,
+                &c.v,
+                &write,
+                index,
+                act.as_ref(),
+                self.operand,
+            );
             (x, c.k, c.v) = (y, k, v);
         }
         cache.len += t;
@@ -936,7 +968,17 @@ impl<B: Backend> Llama<B> {
         let mut state = Vec::with_capacity(2 * self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             let (k, v) = cache.kv.layer(index);
-            let (y, k, v) = layer.forward(&self.config, x, rope, &k, &v, &write, index, None);
+            let (y, k, v) = layer.forward(
+                &self.config,
+                x,
+                rope,
+                &k,
+                &v,
+                &write,
+                index,
+                None,
+                self.operand,
+            );
             x = y;
             state.extend([k, v]);
         }
@@ -995,8 +1037,7 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         cache: &LlamaCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let x = self.embed(tokens);
-        let stream = self.stream.unwrap_or_else(|| cache.kv.dtype());
-        self.fixed_chunk_within(x, start, last, len, cache, stream)
+        self.fixed_chunk_within(x, start, last, len, cache, cache.kv.dtype())
     }
 
     fn step(
@@ -1007,8 +1048,7 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         cache: &LlamaCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let x = self.embed(token);
-        let stream = self.stream.unwrap_or_else(|| cache.kv.dtype());
-        self.fixed_step_within(x, position, len, cache, stream)
+        self.fixed_step_within(x, position, len, cache, cache.kv.dtype())
     }
 }
 
@@ -1140,11 +1180,11 @@ impl<B: burn_tt::storage::StorageBackend> Llama<B> {
             &crate::quant::Plan::for_numerics(numerics, options),
             &crate::quant::Native,
         );
-        if options.bf16_stream {
-            // The norms' scales in the stream's dtype (exact: a checkpoint's BF16 values). The
-            // table (and so the cache) stays F32 until the BF16 lookup and cache write land.
-            model = model.map(&mut Vectors(DType::BF16));
-            model.stream = Some(DType::BF16);
+        // The performance contract's products read BF16 activations, each rounded once where it
+        // is made ([`crate::quant::WeightOptions::f32_activations`] opts out); the reference
+        // contract's read F32, bit for bit.
+        if numerics == burn_tt::Numerics::Performance && !options.f32_activations {
+            model.operand = Some(DType::BF16);
         }
         model.numerics = Some(numerics);
         model

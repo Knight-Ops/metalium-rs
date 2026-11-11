@@ -3821,6 +3821,34 @@ pub(crate) fn eltwise_formats(
     Ok(Formats { bf16_in: true, out })
 }
 
+/// [`eltwise_formats`] with the result's element type asked for: `None` or the type the op makes
+/// on `operands` take [`eltwise_formats`]' formats; BF16 for an op whose result is F32 on F32
+/// operands rounds that result once, ties-even, in `Dst` before a BF16 pack (`bf16_result`): bit
+/// for bit the F32 op and then `bf16::compress`'s narrowing, with no F32 result written between
+/// (a norm's or an activation's output that a product reads as its BF16 `A`). Refuses any other.
+pub(crate) fn eltwise_formats_as(
+    kind: u32,
+    operands: &[&DramTensor],
+    out: Option<Elem>,
+) -> Result<crate::sfpu::kernel::Formats> {
+    use crate::sfpu::kernel::Formats;
+    let formats = eltwise_formats(kind, operands)?;
+    let natural = result_elem(kind, formats);
+    match out {
+        None => Ok(formats),
+        Some(e) if e == natural => Ok(formats),
+        Some(Elem::BF16) if natural == Elem::F32 && !formats.bf16_in => Ok(Formats {
+            bf16_in: false,
+            out: bf16_result(),
+        }),
+        Some(e) => Err(TensorError::Elem {
+            op: format!("element-wise op {kind:#x} asked for a {e:?} result"),
+            got: e,
+            wants: natural,
+        }),
+    }
+}
+
 /// How a result asked for as BF16 is made: [`Out::Bf16`](crate::sfpu::kernel::Out::Bf16), or
 /// what [`probe_bf16_result`] names for a gate.
 pub(crate) fn bf16_result() -> crate::sfpu::kernel::Out {
@@ -3840,11 +3868,6 @@ pub(crate) fn result_elem(kind: u32, formats: crate::sfpu::kernel::Formats) -> E
         Out::Bf16 | Out::Bf16Unrounded => Elem::BF16,
         Out::Fp32 | Out::Bf16AsFp32 => output_elem(kind),
     }
-}
-
-/// The element type of `kind`'s result on `operands` ([`eltwise_formats`]).
-pub(crate) fn eltwise_output(kind: u32, operands: &[&DramTensor]) -> Result<Elem> {
-    Ok(result_elem(kind, eltwise_formats(kind, operands)?))
 }
 
 static PROBE_BF16_RESULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -3900,16 +3923,38 @@ pub fn sfpu_eltwise(
     overlap: Overlap,
     twin: Option<&DramTensor>,
 ) -> Result<Option<Work>> {
+    sfpu_eltwise_as(alloc, op, a, b, c, units, overlap, twin, None)
+}
+
+/// [`sfpu_eltwise`] with its result's element type asked for ([`eltwise_formats_as`]).
+#[allow(clippy::too_many_arguments)]
+pub fn sfpu_eltwise_as(
+    alloc: &mut DramAlloc,
+    op: Eltwise,
+    a: &DramTensor,
+    b: Option<&DramTensor>,
+    c: Option<&DramTensor>,
+    units: usize,
+    overlap: Overlap,
+    twin: Option<&DramTensor>,
+    out: Option<Elem>,
+) -> Result<Option<Work>> {
     let (kind, bcast) = broadcast_of(op, a, b)?;
     if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
+        if out.is_some_and(|e| e != output_elem(kind)) {
+            return Err(TensorError::Shape(
+                "integer division makes its own type alone".into(),
+            ));
+        }
         return sfpu_divide(alloc, Eltwise { kind, ..op }, a, b, bcast).map(Some);
     }
-    match crate::tile_op::eltwise(
+    match crate::tile_op::eltwise_as(
         op,
         BlockOperand::whole(a),
         b.map(BlockOperand::whole),
         c.map(BlockOperand::whole),
         twin,
+        out,
     )? {
         Some(mut tile_op) => tile_op.build(alloc, units, overlap).map(Some),
         None => Ok(None),
@@ -5164,7 +5209,11 @@ pub fn add_rms_divide(
 /// statistic op and the `DIV` after it, with no barrier between them and no unit waiting on one
 /// that computed the statistic alone. With `gamma` (`[1, K]`), each job then multiplies its tiles
 /// by `gamma`'s (`kind::MUL`, the element-wise op's program): bit for bit the norm, then the
-/// product by its scale. `twin`, if given, receives the result's packed row.
+/// product by its scale. `twin`, if given, receives the result's packed row. `out` is the result's
+/// type: `Elem::BF16` rounds the last kernel's result once in `Dst` and packs it BF16 (its twin
+/// too), bit for bit the F32 norm narrowed (`Session::bf16_from_f32`); every value before it stays
+/// FP32.
+#[allow(clippy::too_many_arguments)]
 pub fn rms_divide(
     alloc: &mut DramAlloc,
     a: &DramTensor,
@@ -5173,11 +5222,34 @@ pub fn rms_divide(
     eps: f32,
     units: usize,
     twin: Option<&DramTensor>,
+    out: Elem,
 ) -> Result<Work> {
-    use crate::sfpu::kernel::{self as sk, Operands};
-    use crate::sfpu::ops::{code_for_rows, kind_sfpu, Broadcast};
+    use crate::sfpu::kernel::{self as sk, Formats, Operands};
+    use crate::sfpu::ops::{code_for_rows_as, kind_sfpu, Broadcast};
     use crate::sfpu::{norm, reduce};
     a.expect("an RMS division", Elem::F32)?;
+    let last = match out {
+        Elem::F32 => Formats::FP32,
+        Elem::BF16 => Formats {
+            bf16_in: false,
+            out: bf16_result(),
+        },
+        other => {
+            return Err(TensorError::Elem {
+                op: "an RMS norm's result".into(),
+                got: other,
+                wants: Elem::F32,
+            })
+        }
+    };
+    if let Some(t) = twin {
+        t.expect(
+            "an RMS norm's packed twin",
+            result_elem(kind_sfpu::DIV, last),
+        )?;
+    }
+    // The quotient's formats: the last kernel's without a scale, else FP32.
+    let quotient = if gamma.is_some() { Formats::FP32 } else { last };
     packed.expect("a packed RMS statistic", Elem::F32)?;
     let cols = a.cols;
     if a.rows != 1 || cols % 32 != 0 || (packed.rows, packed.cols) != (cols / 32, 32) {
@@ -5229,27 +5301,29 @@ pub fn rms_divide(
     let a_at = stat_layout.out_at + TILE_SLOT;
     let (squares, fin) = norm::math_packed(cols, eps);
     let stat_roles = Arc::new(reduce::roles(&stat_layout, &squares, &fin));
-    let (_, code) = code_for_rows(
+    let (_, code) = code_for_rows_as(
         div.kind,
         [0.0, 0.0],
         Broadcast::Col,
         eltwise_rows(div.kind, 1),
+        quotient.out.quantized(),
     )
     .ok_or_else(|| TensorError::Shape("no column-broadcast DIV program".into()))?;
     let scale = match gamma {
         Some(_) => Some(
-            code_for_rows(
+            code_for_rows_as(
                 crate::kind::MUL,
                 [0.0, 0.0],
                 Broadcast::None,
                 eltwise_rows(crate::kind::MUL, 1),
+                last.out.quantized(),
             )
             .ok_or_else(|| TensorError::Shape("no MUL program".into()))?
             .1,
         ),
         None => None,
     };
-    let out = DramTensor::alloc(alloc, 1, cols)?;
+    let out = DramTensor::alloc_elem(alloc, 1, cols, result_elem(kind_sfpu::DIV, last))?;
     let (rp, ra, ro) = (packed.tensor_ref(), a.tensor_ref(), out.tensor_ref());
     let rg = gamma.map(|g| g.tensor_ref());
     let mut jobs = Vec::new();
@@ -5284,7 +5358,7 @@ pub fn rms_divide(
                     sems: planned.sems,
                     init: planned.init,
                 };
-                let (roles, loops) = sk::roles_code(&product, Operands::Binary, mul);
+                let (roles, loops) = sk::roles_code_as(&product, Operands::Binary, mul, last);
                 Some((product, roles, loops))
             }
             None => None,
@@ -5293,7 +5367,7 @@ pub fn rms_divide(
             .as_ref()
             .map_or(layout.out_at, |(product, _, _)| product.out_at);
         crate::l1::note_planned_top(result_at + slots);
-        let (roles, loops) = sk::roles_code(&layout, Operands::ColBroadcast, &code);
+        let (roles, loops) = sk::roles_code_as(&layout, Operands::ColBroadcast, &code, quotient);
         let read = |x: &TensorRef, start: usize, n: usize, at: u64, grid_ct: usize| {
             [
                 [

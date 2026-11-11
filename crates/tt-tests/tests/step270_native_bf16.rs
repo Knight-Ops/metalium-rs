@@ -812,3 +812,223 @@ fn casts_over_runs_are_the_casts_a_tile() {
         panic!("{e}");
     }
 }
+
+/// F32 values of every finite class with low bits set (ties to even among them, 0x8000), and
+/// with `special` the BF16 specials widened (signed zeros, subnormals, infinities, NaNs).
+fn f32_values(n: usize, salt: u32, special: bool) -> Vec<f32> {
+    patterns(n, salt)
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let p = if !special && p & 0x7f80 == 0x7f80 {
+                0x3f80 | (p & 0x8000)
+            } else {
+                p
+            };
+            let low = [0, 0x8000, 0x7fff, 0x1234, 0x18000][i % 5] & 0xffff;
+            f32::from_bits((p as u32) << 16 | low)
+        })
+        .collect()
+}
+
+/// **An F32 op with a BF16 result is its F32 result rounded once**
+/// (`Session::eltwise3_as`, `eltwise_blocks_as`, `rms_norm_as`; roadmap W1's BF16 activations: a
+/// norm's output and `silu(gate) * up` rounded where they are made, for the products after them).
+/// The op's operands stay FP32 in `Dst`; its result is rounded by the compress's quantize before
+/// the pack. For `SILU_MUL` (whole tensors, a decode row, a column block of a fused `gate|up`
+/// product) and RMSNorm (a decode row's one op with and without its scale, and several rows: the
+/// statistic, the division and the scale, only the last rounding): rounded and packed as FP32
+/// (`Out::Bf16AsFp32`, the simulator's form) it is the F32 op's result rounded by the host's
+/// ties-even model; on silicon the BF16 result is `bf16_from_f32` of the F32 op's, bit for bit,
+/// and a product of the norm's BF16 decode row read through its BF16 twin (F32 result, a BFP8
+/// weight) is the product of that composition's row, and of the row widened. The negative
+/// control packs BF16 without the quantize (`Out::Bf16Unrounded`): it must then differ.
+#[test]
+fn an_f32_op_with_a_bf16_result_is_its_result_rounded() {
+    let silu_mul = Eltwise {
+        kind: kind_sfpu::SILU_MUL,
+        scalar: 0.0,
+        scalar2: 0.0,
+    };
+    if let Err(e) = fork_scope(|| {
+        let mut s = open();
+        s.set_packed_twins(true);
+        #[cfg(feature = "silicon")]
+        let mut truncated = 0;
+        let mut rounded = 0;
+        // Each case: what, the F32 op, and the same op with a BF16 result (`Out` per the probe).
+        type Run<'a, T> = Box<dyn Fn(&mut Session<T>, Option<Elem>) -> DramTensor + 'a>;
+        let upload = |s: &mut Session<_>, r: usize, c: usize, salt: u32, special: bool| {
+            s.upload(&f32_values(r * c, salt, special), r, c).unwrap()
+        };
+        let mut held = Vec::new();
+        for (k, &[r, c]) in [[67, 100], [1, 2048]].iter().enumerate() {
+            let (x, y) = (
+                upload(&mut s, r, c, 10 + k as u32, true),
+                upload(&mut s, r, c, 20 + k as u32, true),
+            );
+            held.push((x, y));
+        }
+        let gate_up = upload(&mut s, 1, 4096, 30, true);
+        let gamma = upload(&mut s, 1, 2048, 40, false);
+        let rows = [
+            upload(&mut s, 1, 2048, 41, false),
+            upload(&mut s, 67, 2048, 42, false),
+        ];
+        let mut cases: Vec<(String, Run<'_, _>)> = Vec::new();
+        for (x, y) in &held {
+            cases.push((
+                format!("silu_mul on [{}, {}]", x.rows, x.cols),
+                Box::new(move |s, out| s.eltwise3_as(silu_mul, x, Some(y), None, out).unwrap()),
+            ));
+        }
+        let gu = &gate_up;
+        cases.push((
+            "silu_mul on the column blocks of a [1, 4096] gate|up".into(),
+            Box::new(move |s, out| {
+                let block = |at| tensor::BlockOperand {
+                    tensor: gu,
+                    at: [0, at],
+                    dims: [1, 2048],
+                };
+                s.eltwise_blocks_as(silu_mul, block(0), Some(block(2048)), None, out)
+                    .unwrap()
+            }),
+        ));
+        for x in &rows {
+            for g in [Some(&gamma), None] {
+                cases.push((
+                    format!(
+                        "rms_norm of [{}, {}], scaled {}",
+                        x.rows,
+                        x.cols,
+                        g.is_some()
+                    ),
+                    Box::new(move |s, out| {
+                        s.rms_norm_as(x, g, 1e-5, out.unwrap_or(Elem::F32)).unwrap()
+                    }),
+                ));
+            }
+        }
+        for (what, run) in &cases {
+            let wide = run(&mut s, None);
+            assert_eq!(wide.elem, Elem::F32, "{what}");
+            let wide_bits = s.download_bits(&wide).unwrap();
+            let expect: Vec<u32> = wide_bits.iter().map(|&w| round_bf16(w)).collect();
+
+            tensor::probe_bf16_result(Out::Bf16AsFp32);
+            let as_fp32 = run(&mut s, Some(Elem::BF16));
+            tensor::probe_bf16_result(Out::Bf16);
+            let got = s.download_bits(&as_fp32).unwrap();
+            let differ: Vec<_> = (0..got.len()).filter(|&i| got[i] != expect[i]).collect();
+            assert!(
+                differ.is_empty(),
+                "{what}: rounded, {} of {} differ, first {:?}",
+                differ.len(),
+                got.len(),
+                differ
+                    .iter()
+                    .take(6)
+                    .map(|&i| format!(
+                        "{i}: {:#010x} for {:#010x} (of {:#010x})",
+                        got[i], expect[i], wide_bits[i]
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            rounded += (0..got.len()).filter(|&i| got[i] != wide_bits[i]).count();
+            s.free(as_fp32).unwrap();
+
+            #[cfg(feature = "silicon")]
+            {
+                let native = run(&mut s, Some(Elem::BF16));
+                assert_eq!(native.elem, Elem::BF16, "{what}");
+                let got = s.download_bf16(&native.as_bf16().unwrap()).unwrap();
+                let composed = s.bf16_from_f32(&wide).unwrap();
+                let want = s.download_bf16(&composed).unwrap();
+                let differ: Vec<_> = (0..got.len()).filter(|&i| got[i] != want[i]).collect();
+                assert!(
+                    differ.is_empty(),
+                    "{what}: BF16, {} of {} differ from the composition, first {:?}",
+                    differ.len(),
+                    got.len(),
+                    differ
+                        .iter()
+                        .take(6)
+                        .map(|&i| format!("{i}: {:#06x} for {:#06x}", got[i], want[i]))
+                        .collect::<Vec<_>>()
+                );
+                let host: Vec<u16> = expect.iter().map(|&w| (w >> 16) as u16).collect();
+                assert_eq!(got, host, "{what}: BF16 against the host model");
+
+                // A decode row's norm: its BF16 twin feeds a product.
+                if native.rows == 1 && what.starts_with("rms_norm") {
+                    let twin = s.packed_twin(&native).expect("a norm's row keeps a twin");
+                    assert_eq!(twin.elem, Elem::BF16, "{what}: a BF16 twin");
+                    let weights = f32_values(2048 * 512, 50, false);
+                    let w = s.upload(&weights, 2048, 512).unwrap();
+                    let wb = DramTensor::from_bfp(
+                        s.bfp_from_f32(&w, tt_kernels::bfp::BfpFormat::Bfp8)
+                            .unwrap(),
+                    );
+                    let product = |s: &mut Session<_>, a: &DramTensor| {
+                        let out = s
+                            .matmul_dram(
+                                a,
+                                false,
+                                &wb,
+                                false,
+                                SrcRoute::Tf32FromFp32,
+                                Fidelity::HiFi4,
+                                1 << 40,
+                            )
+                            .unwrap();
+                        assert_eq!(out.elem, Elem::F32);
+                        let bits = s.download_bits(&out).unwrap();
+                        s.free(out).unwrap();
+                        bits
+                    };
+                    let composed = DramTensor::from_bf16(composed, Pad::Undefined);
+                    let widened = s.bf16_to_f32(&composed.as_bf16().unwrap()).unwrap();
+                    let (p, q, r) = (
+                        product(&mut s, &native),
+                        product(&mut s, &composed),
+                        product(&mut s, &widened),
+                    );
+                    assert_eq!(p, q, "{what}: through the twin, the composition's product");
+                    assert_eq!(p, r, "{what}: a BF16 A's product is its widened A's");
+                    for t in [w, wb, widened] {
+                        s.free(t).unwrap();
+                    }
+                    s.free(composed).unwrap();
+                } else {
+                    s.free_bf16(composed).unwrap();
+                }
+                s.free(native).unwrap();
+
+                tensor::probe_bf16_result(Out::Bf16Unrounded);
+                let control = run(&mut s, Some(Elem::BF16));
+                tensor::probe_bf16_result(Out::Bf16);
+                let got = s.download_bf16(&control.as_bf16().unwrap()).unwrap();
+                truncated += (0..got.len()).filter(|&i| got[i] != want[i]).count();
+                s.free(control).unwrap();
+            }
+            s.free(wide).unwrap();
+        }
+        assert!(rounded > 0, "control: rounding changed no datum");
+        #[cfg(feature = "silicon")]
+        assert!(
+            truncated > 0,
+            "control: the unrounded BF16 pack matched the rounded one everywhere"
+        );
+        drop(cases);
+        for (x, y) in held {
+            s.free(x).unwrap();
+            s.free(y).unwrap();
+        }
+        for t in rows.into_iter().chain([gate_up, gamma]) {
+            s.free(t).unwrap();
+        }
+    }) {
+        panic!("{e}");
+    }
+}

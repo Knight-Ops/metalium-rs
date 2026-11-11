@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: BF16 activations into the products, the performance default](#w1-bf16-activations-into-the-products-the-performance-default-2026-11-11-cards-0-and-1) | 2026-11-11 | the BF16 stream replaced: the residual and every op's arithmetic F32, a norm's output and `silu(gate) * up` rounded once to BF16 where made (one op each), products reading them as they lie with F32 results; decode unchanged (7.52 / 8.01 / 8.64 against 7.49 / 7.99 / 8.67 ms), prefill 1.06-1.09x (4,266 against 4,007 tokens/s at 256), `step269` the same 228 of 232: the performance contract's default; the BF16 stream deleted |
 | [W1: burn-tt on BF16, and the 1.7B on a BF16 stream (an option)](#w1-burn-tt-on-bf16-and-the-17b-on-a-bf16-stream-an-option-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's routing phase and a first model run: 21 Burn ops, products, BFP storage of BF16, casts over runs of tiles, RMSNorm on BF16; the 1.7B on a BF16 stream works but runs behind the FP32 stream (decode 9.20 against 7.51 ms at 32 tokens, prefill 2,936 against 4,004 tokens/s at 256) and trips step269's top-1 threshold by one position: the default stays the FP32 stream, the BF16 one an option; what it lacks, measured |
 | [W1: products with a BF16 result, and a BF16 packed twin](#w1-products-with-a-bf16-result-and-a-bf16-packed-twin-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's third phase: each output rounded in `Dst` once its `K` chain is done (the last `K` chunk's run), packed as BF16; every schedule but `K` blocks; the quantize costs 6-9% of a short-`K` chunk product and ~0 of `down` (BF16 x BFP8, card 1), below the BF16 `A`'s gain: not killed |
 | [W1: BF16 tensors in their own slots, named in the tensor reference](#w1-bf16-tensors-in-their-own-slots-named-in-the-tensor-reference-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's first phase: `TensorRef::slot` (word 6); `READ_RUN`/`WRITE_RUN`/`SCATTER` step and size GDDR by it, other records refuse it; `alloc_elem` gives BF16 2,112-byte slots; `dm_b` +364 bytes; the 1.7B within the run-to-run band under both contracts (a first cut that branched per tile in `GATHER` cost 0.3-0.7% and was redone) |
@@ -426,6 +427,55 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: BF16 activations into the products, the performance default (2026-11-11, cards 0 and 1)
+
+Why the BF16 stream below lost, and what replaced it. A batch-1 decode step gains nothing from halving activation
+bytes: its weights are BFP8 either way and a row is 8 KB. The stream lost on jobs: matching Burn's BF16 compositions op
+for op made the norm five jobs and `silu * up` three where the FP32 stream runs one each, every BF16 element-wise op
+paid the chunked widen, and the attention block was cast in and out. A product gains from a BF16 `A` alone (prefill:
+1.13-1.32x on the chunk products, [bound](#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0)).
+So, as Tenstorrent's own stack computes, the arithmetic stays F32 and only the values a product reads are narrowed,
+once, where they are made:
+
+- `burn_tt::rms_norm_as(x, gamma, eps, BF16)`: the F32 norm, its last op rounded in `Dst` before a BF16 pack
+  (`Session::rms_norm_as`; a decode row's one op, `tensor::rms_divide(.., out)`, writes a BF16 twin). Bit for bit
+  `rms_norm(x, gamma).cast(BF16)`.
+- `burn_tt::silu_mul_as(gate, up, BF16)`: `SILU_MUL` on F32 operands, rounded before its pack
+  (`Session::eltwise3_as`, `eltwise_blocks_as`: a column block of the fused `gate|up` product). Bit for bit the
+  composition then the cast.
+- `burn_tt::matmul_as(x, w, F32)`: a BF16 `x` against a logical F32 weight stored BFP8, an F32 result, `x` read as it
+  lies. Bit for bit `x.cast(F32) @ w` (Burn's own `matmul` gives the left operand's dtype).
+
+Each is one custom operation in `Tt`'s fusion stream. The residual stream, the attention block and every op's
+arithmetic stay F32; a product's output is not rounded (no quantize in the products, so no 6-9% on a short-K chunk).
+
+Gates: `step270::an_f32_op_with_a_bf16_result_is_its_result_rounded` (ttsim with `Out::Bf16AsFp32`, card 0
+`1794433576` with the BF16 pack: each result `bf16_from_f32` of the F32 op's and the host model's, a decode norm's
+BF16 twin feeding a BFP8 product equal to the composition's and the widened row's; control: the unrounded pack
+differs); `step76::ops_with_a_named_result_are_their_compositions_bit_for_bit` (card 0 `1794433646`, `TtBackend` and
+`Tt`, 1 and 67 rows; 2 jobs against the compositions' 3-5); conformance (ttsim, 3,025, no unexpected result).
+
+**The 1.7B** (`traced_generation`, card 1, back to back, nothing else on the host):
+
+| run | decode, ms (32 / 128 / 256) | prefill, tokens/s (32 / 128 / 256) |
+|---|--:|--:|
+| BF16 activations (`1794435175`) | 7.520 / 8.006 / 8.641 | 1,257 / 3,552 / 4,266 |
+| F32 activations, the default before (`1794435865`) | 7.487 / 7.993 / 8.668 | 1,190 / 3,258 / 4,007 |
+| ratio | +0.44% / +0.16% / -0.31% | 1.057x / 1.090x / 1.065x |
+
+A first run beside `step269`'s burn-flex reference (every core) and conformance gave 7.65 / 10.63 / 8.60 ms and
+1,268 / 3,379 / 3,106 tokens/s (`1794433889`): host contention, not the change.
+
+**Quality** (`step269`, card 0, all 232 positions, `1794434724`): top-1 98.28% (the same 228 of 232), top-5 100%, PCC
+mean 0.999669 (least 0.999315), against F32 activations' 0.999678 (0.999352); the thresholds hold.
+
+**Decision (the 0.5% rule):** no length is more than 0.5% slower and `step269` passes, so BF16 activations are the
+performance contract's default (`Llama::for_inference`; `WeightOptions::f32_activations` and `TT_F32_ACTIVATIONS=1`
+the baseline). The BF16 stream (`WeightOptions::bf16_stream`, `Format::Bf16Bfp8`, the model's stream code) is deleted,
+with its row in [failed-approaches](failed-approaches.md). The burn-tt BF16 ops below stay: they are Burn's BF16,
+bit for bit. A BF16 KV cache is not part of this: the attention block reads F32, and halving the cache's bytes is a
+long-context lever to bound on its own.
 
 ## W1: burn-tt on BF16, and the 1.7B on a BF16 stream (an option) (2026-11-11, cards 0 and 1)
 

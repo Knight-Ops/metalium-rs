@@ -19,17 +19,18 @@
 //! 1. **The reference contract** (BF16-stored weights, bit for bit the F32 model): its top-1
 //!    equals burn-flex's at every position (the ladder's claim, `step188`), and its agreement is
 //!    the **baseline** the thresholds are derived from.
-//! 2. **The performance contract** (BFP8 weights): top-1 and top-5 at least the baseline's less
-//!    2 points, and mean PCC at least the baseline's less 0.005 (the margin the owner chose,
-//!    2026-11-10). That its logits are those of the F32 model holding the rounded weights, bit for
-//!    bit, is `step240`'s claim (the contract's specification model); this gate is its quality.
+//! 2. **The performance contract** (BFP8 weights; since 2026-11-11 BF16 activations into the
+//!    products, roadmap W1): top-1 and top-5 at least the baseline's less 2 points, and mean PCC
+//!    at least the baseline's less 0.005 (the margin the owner chose, 2026-11-10). That a stored
+//!    weight's product is the F32 product of the values it holds, bit for bit, is `step240`'s
+//!    claim, and that each op making a BF16 activation is its F32 op then the cast, bit for bit,
+//!    is `step76`'s and `step270`'s; this gate is the contract's quality.
 //! 3. **Its named option** (BFP4 `gate|up`): its agreement recorded, not held to a threshold. On
 //!    this model it misses tt-metal's acceptance floors (top-1 90%, PCC 0.95), and the owner kept
 //!    it as a recorded option (2026-11-10), to be judged again on the 8B-class model (W5).
-//! 4. **A BF16 activation stream** (roadmap W1, `WeightOptions::bf16_stream`: the activations
-//!    between ops BF16, the weights logical BF16 stored BFP8, the head and the attention block
-//!    F32): its agreement recorded. It missed the BFP8 run's top-1 threshold by one position on
-//!    2026-11-11 (227 of 232); whether it is held to it is the owner's call.
+//! 4. **F32 activations** (`WeightOptions::f32_activations`, the contract before 2026-11-11): its
+//!    agreement recorded, the baseline of the BF16 activations' rounding; that rounding must show
+//!    in the correlation (a contract that ignored it would agree with this run exactly).
 //!
 //! Negative control: the correlation falls strictly from BF16 to BFP8 to BFP4 weights, so each
 //! run really computed with its contract's formats (a `for_inference` that ignored its contract
@@ -49,6 +50,10 @@
 //! BFP8's top-1 clears its floor by one position (228 of 232); the contract is deterministic, so
 //! the margin moves only with the code (a later W1 box that flips one more near-tie is reviewed).
 //! The smoke run's two prompts (40 positions, `1794287596`): 100% / 100% / 0.999645 for BFP8.
+//!
+//! **BF16 activations** (2026-11-11, card 0, `1794434724`, then the contract's default): top-1
+//! 98.28% (the same 228 of 232), top-5 100%, PCC mean 0.999669 (least 0.999315), against F32
+//! activations' 0.999678 (0.999352). Smoke: 100% / 100% / 0.999639 (`1794433669`).
 //!
 //! Model workload: silicon only (`docs/learnings/test-tiers.md`).
 
@@ -171,7 +176,10 @@ fn run(cases: &[Case]) {
             &d,
         );
         let bfp8 = agreement(cases, &bfp8, &flex);
-        report("performance contract (BFP8 weights)", &bfp8);
+        report(
+            "performance contract (BFP8 weights, BF16 activations)",
+            &bfp8,
+        );
 
         let bfp4 = WeightOptions {
             mlp_bfp4: true,
@@ -195,17 +203,21 @@ fn run(cases: &[Case]) {
             "the correlation does not fall with the weights' bits: {baseline} / {bfp8} / {bfp4}"
         );
 
-        // A BF16 activation stream (roadmap W1, native BF16 arithmetic): recorded, not held to a
-        // threshold. On 2026-11-11 (card 0, `1794418406`) it trips BFP8's top-1 threshold by one
-        // position (227 of 232 against 228; top-5 100%, mean PCC 0.999594): the owner's call,
-        // the thresholds unchanged.
-        let stream = WeightOptions {
-            bf16_stream: true,
+        // F32 activations into the products (the contract before 2026-11-11): recorded. Its
+        // control: the default's BF16 rounding shows in the correlation (a contract that ignored
+        // it would agree with this run exactly).
+        let f32 = WeightOptions {
+            f32_activations: true,
             ..Default::default()
         };
-        let stream = device_logits(&model, Numerics::Performance, stream, cases, &d);
-        let stream = agreement(cases, &stream, &flex);
-        report("performance contract, a BF16 stream", &stream);
+        let f32 = device_logits(&model, Numerics::Performance, f32, cases, &d);
+        let f32 = agreement(cases, &f32, &flex);
+        report("performance contract, F32 activations", &f32);
+        assert!(
+            f32.pcc_mean != bfp8.pcc_mean,
+            "F32 activations agree exactly with the contract's BF16 ones ({f32}): the BF16 \
+             activations did not apply"
+        );
     });
 }
 

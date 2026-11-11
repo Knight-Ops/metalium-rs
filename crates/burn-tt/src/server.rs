@@ -438,6 +438,24 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// [`Engine::rms_norm`], its F32 result rounded once to BF16 where `bf16`
+    /// (`Session::rms_norm_as`). The default runs the composition, the norm then
+    /// [`Engine::cast_float`]: bit for bit the native one.
+    fn rms_norm_as(
+        &mut self,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (out, dims) = self.rms_norm(a, gamma, eps)?;
+        if !bf16 {
+            return Ok((out, dims));
+        }
+        let narrow = self.cast_float(out, true);
+        self.free(out);
+        narrow
+    }
     /// `s = a + b` and `s`'s RMSNorm times `gamma` if given, `(s, norm)`, left on the device
     /// (`tt_kernels::session::Session::add_rms_norm`).
     fn add_rms_norm(
@@ -489,6 +507,42 @@ pub trait Engine {
             return Err(unsupported());
         }
         self.eltwise(op.kind, op.scalar, a, b)
+    }
+    /// [`Engine::eltwise_op`], its F32 result rounded once to BF16 where `bf16`
+    /// (`Session::eltwise3_as`). The default runs the composition, the op then
+    /// [`Engine::cast_float`]: bit for bit the native one.
+    fn eltwise_op_as(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (out, dims) = self.eltwise_op(op, a, b, c)?;
+        if !bf16 {
+            return Ok((out, dims));
+        }
+        let narrow = self.cast_float(out, true);
+        self.free(out);
+        narrow
+    }
+    /// [`Engine::eltwise_blocks`] as [`Engine::eltwise_op_as`] takes it.
+    fn eltwise_blocks_as(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (out, dims) = self.eltwise_blocks(op, a, b, c)?;
+        if !bf16 {
+            return Ok((out, dims));
+        }
+        let narrow = self.cast_float(out, true);
+        self.free(out);
+        narrow
     }
     /// [`Engine::eltwise_op`] over blocks of resident F32 buffers
     /// (`Session::eltwise_blocks`): each operand read where it lies, the
@@ -1806,7 +1860,22 @@ impl DramBuffers {
         b: Option<BufferId>,
         c: Option<BufferId>,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.eltwise_op_as(s, op, a, b, c, None)
+    }
+
+    /// [`DramBuffers::eltwise_op`] with its result's element type asked for
+    /// (`Session::eltwise3_as`): BF16 rounds an F32 result once before its pack.
+    pub fn eltwise_op_as<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+        out: Option<Elem>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if c.is_none()
+            && out.is_none()
             && matches!(
                 op.kind,
                 tt_kernels::kind::ADD
@@ -1830,7 +1899,7 @@ impl DramBuffers {
         let tb = b.map(|b| self.operand(b)).transpose()?;
         let tc = c.map(|c| self.operand(c)).transpose()?;
         let c = s
-            .eltwise3(op, &ta, tb.as_ref(), tc.as_ref())
+            .eltwise3_as(op, &ta, tb.as_ref(), tc.as_ref(), out)
             .map_err(TtError::from)?;
         Ok(self.insert_any(c))
     }
@@ -1842,6 +1911,20 @@ impl DramBuffers {
         a: BlockArg,
         b: Option<BlockArg>,
         c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.eltwise_blocks_as(s, op, a, b, c, None)
+    }
+
+    /// [`DramBuffers::eltwise_blocks`] with its result's element type asked for, as
+    /// [`DramBuffers::eltwise_op_as`] takes it.
+    pub fn eltwise_blocks_as<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+        out: Option<Elem>,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         // BF16 buffers as they lie, as `eltwise_op` reads them (roadmap W1).
         let (ta, tb, tc) = (
@@ -1859,15 +1942,16 @@ impl DramBuffers {
                 dims: x.dims,
             }
         }
-        let out = s
-            .eltwise_blocks(
+        let made = s
+            .eltwise_blocks_as(
                 op,
                 block(&ta, a),
                 tb.as_ref().zip(b).map(|(t, x)| block(t, x)),
                 tc.as_ref().zip(c).map(|(t, x)| block(t, x)),
+                out,
             )
             .map_err(TtError::from)?;
-        Ok(self.insert_any(out))
+        Ok(self.insert_any(made))
     }
 
     pub fn rope_blocks<T: tt_device::Transport>(
@@ -1944,13 +2028,28 @@ impl DramBuffers {
         gamma: Option<BufferId>,
         eps: f32,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.rms_norm_as(s, a, gamma, eps, Elem::F32)
+    }
+
+    /// [`DramBuffers::rms_norm`] with its result as `out` (`Session::rms_norm_as`): BF16 rounds
+    /// the F32 norm once before its pack.
+    pub fn rms_norm_as<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+        out: Elem,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
         let tg = match gamma {
             Some(g) => Some(self.get(g)?.clone()),
             None => None,
         };
-        let c = s.rms_norm(&ta, tg.as_ref(), eps).map_err(TtError::from)?;
-        Ok(self.insert(c))
+        let c = s
+            .rms_norm_as(&ta, tg.as_ref(), eps, out)
+            .map_err(TtError::from)?;
+        Ok(self.insert_any(c))
     }
 
     pub fn add_rms_norm<T: tt_device::Transport>(
@@ -3255,15 +3354,34 @@ pub(crate) fn eltwise_op(
     b: Option<BufferId>,
     c: Option<BufferId>,
 ) -> (BufferId, [usize; 2]) {
+    eltwise_op_as(device, op, a, b, c, false)
+}
+
+/// [`eltwise_op`], its F32 result rounded once to BF16 on the card where `bf16`
+/// (`Engine::eltwise_op_as`), without waiting.
+pub(crate) fn eltwise_op_as(
+    device: TtDevice,
+    op: tt_kernels::tensor::Eltwise,
+    a: BufferId,
+    b: Option<BufferId>,
+    c: Option<BufferId>,
+    bf16: bool,
+) -> (BufferId, [usize; 2]) {
     submit(
         "eltwise",
         device,
         dims_of(a),
-        move || format!("element-wise {:#x}", op.kind),
+        move || match bf16 {
+            false => format!("element-wise {:#x}", op.kind),
+            true => format!("element-wise {:#x}, a BF16 result", op.kind),
+        },
         move |engine, ids| {
             let b = b.map(|b| ids.get(b)).transpose()?;
             let c = c.map(|c| ids.get(c)).transpose()?;
-            engine.eltwise_op(op, ids.get(a)?, b, c)
+            match bf16 {
+                false => engine.eltwise_op(op, ids.get(a)?, b, c),
+                true => engine.eltwise_op_as(op, ids.get(a)?, b, c, true),
+            }
         },
     )
 }
@@ -3279,19 +3397,24 @@ pub struct BlockArg {
 }
 
 /// [`eltwise_op`] over blocks of resident buffers, without waiting: the
-/// result is `a`'s block's dims.
-pub(crate) fn eltwise_blocks(
+/// result is `a`'s block's dims, its F32 result rounded once to BF16 on the card where `bf16`
+/// (`Engine::eltwise_blocks_as`).
+pub(crate) fn eltwise_blocks_as(
     device: TtDevice,
     op: tt_kernels::tensor::Eltwise,
     a: BlockArg,
     b: Option<BlockArg>,
     c: Option<BlockArg>,
+    bf16: bool,
 ) -> (BufferId, [usize; 2]) {
     submit(
         "eltwise",
         device,
         a.dims,
-        move || format!("element-wise {:#x} on blocks", op.kind),
+        move || match bf16 {
+            false => format!("element-wise {:#x} on blocks", op.kind),
+            true => format!("element-wise {:#x} on blocks, a BF16 result", op.kind),
+        },
         move |engine, ids| {
             let get = |x: BlockArg| -> Result<BlockArg, TtError> {
                 Ok(BlockArg {
@@ -3300,7 +3423,10 @@ pub(crate) fn eltwise_blocks(
                 })
             };
             let (b, c) = (b.map(get).transpose()?, c.map(get).transpose()?);
-            engine.eltwise_blocks(op, get(a)?, b, c)
+            match bf16 {
+                false => engine.eltwise_blocks(op, get(a)?, b, c),
+                true => engine.eltwise_blocks_as(op, get(a)?, b, c, true),
+            }
         },
     )
 }
@@ -3420,17 +3546,32 @@ pub(crate) fn rms_norm(
     gamma: Option<BufferId>,
     eps: f32,
 ) -> (BufferId, [usize; 2]) {
+    rms_norm_as(device, a, gamma, eps, false)
+}
+
+/// [`rms_norm`], its F32 result rounded once to BF16 on the card where `bf16`
+/// (`Engine::rms_norm_as`), without waiting.
+pub(crate) fn rms_norm_as(
+    device: TtDevice,
+    a: BufferId,
+    gamma: Option<BufferId>,
+    eps: f32,
+    bf16: bool,
+) -> (BufferId, [usize; 2]) {
     submit(
         "rms_norm",
         device,
         dims_of(a),
-        move || format!("eps {eps:e}, scaled {}", gamma.is_some()),
+        move || format!("eps {eps:e}, scaled {}, BF16 {bf16}", gamma.is_some()),
         move |engine, ids| {
             let gamma = match gamma {
                 Some(g) => Some(ids.get(g)?),
                 None => None,
             };
-            engine.rms_norm(ids.get(a)?, gamma, eps)
+            match bf16 {
+                false => engine.rms_norm(ids.get(a)?, gamma, eps),
+                true => engine.rms_norm_as(ids.get(a)?, gamma, eps, true),
+            }
         },
     )
 }
@@ -4122,6 +4263,28 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise_blocks(&mut self.session, op, a, b, c)
     }
+    fn eltwise_op_as(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise_op_as(&mut self.session, op, a, b, c, bf16.then_some(Elem::BF16))
+    }
+    fn eltwise_blocks_as(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise_blocks_as(&mut self.session, op, a, b, c, bf16.then_some(Elem::BF16))
+    }
     fn rope_blocks(
         &mut self,
         x: BlockArg,
@@ -4171,6 +4334,17 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.rms_norm(&mut self.session, a, gamma, eps)
+    }
+    fn rms_norm_as(
+        &mut self,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        let out = if bf16 { Elem::BF16 } else { Elem::F32 };
+        bufs.rms_norm_as(&mut self.session, a, gamma, eps, out)
     }
     fn add_rms_norm(
         &mut self,

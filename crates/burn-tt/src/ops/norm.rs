@@ -37,29 +37,53 @@ pub fn rms_norm_count() -> u64 {
 /// row. `None` otherwise (more rows gain little: the caller composes the norm's op and the
 /// product).
 pub(crate) fn rms_norm_native(x: &TtTensor, gamma: &TtTensor, eps: f32) -> Option<TtTensor> {
+    rms_norm_native_as(x, gamma, eps, DType::F32)
+}
+
+/// [`rms_norm_native`] with its result as `out`: BF16 rounds the F32 norm once on the card before
+/// its BF16 pack (`Session::rms_norm_as`), bit for bit the norm then `cast_native(.., BF16)`. A
+/// BF16 result takes any number of rows as one call: the norm's last op rounds, whichever runs
+/// (a decode row's one op, or the statistic, the division and the scale).
+pub(crate) fn rms_norm_native_as(
+    x: &TtTensor,
+    gamma: &TtTensor,
+    eps: f32,
+    out: DType,
+) -> Option<TtTensor> {
     let shape = x.shape().to_vec();
     let cols = *shape.last()?;
+    let rows_any = match out {
+        DType::F32 => false,
+        DType::BF16 => true,
+        _ => return None,
+    };
     if gamma.dtype() != DType::F32
         || gamma.storage_format() != crate::storage::StorageFormat::F32
         || gamma.shape().num_elements() != cols
         || x.device != gamma.device
         || !gamma.is_storable()
-        || !norm_takes(x, cols)
+        || !norm_takes_rows(x, cols, rows_any)
     {
         return None;
     }
     let (d, g) = (plain_dram(x), plain_dram(gamma));
-    if [g.buffer.rows, g.buffer.cols] != [1, cols] {
+    if [g.buffer.rows, g.buffer.cols] != [1, cols] || d.buffer.cols != cols || d.transposed {
         return None;
     }
-    let (id, dims) = crate::server::rms_norm(x.device, d.buffer.id, Some(g.buffer.id), eps);
+    let (id, dims) = crate::server::rms_norm_as(
+        x.device,
+        d.buffer.id,
+        Some(g.buffer.id),
+        eps,
+        out == DType::BF16,
+    );
     NATIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Some(device_result_shaped(
         x.device,
         id,
         dims,
         burn_backend::Shape::from(shape),
-        DType::F32,
+        out,
     ))
 }
 
@@ -127,11 +151,16 @@ pub(crate) fn add_rms_norm_native(
 
 /// Whether `x` is a single F32 row of `cols` the norm runs natively on.
 fn norm_takes(x: &TtTensor, cols: usize) -> bool {
+    norm_takes_rows(x, cols, false)
+}
+
+/// [`norm_takes`], any number of rows where `rows_any`.
+fn norm_takes_rows(x: &TtTensor, cols: usize, rows_any: bool) -> bool {
     let shape = x.shape().to_vec();
     x.dtype() == DType::F32
         && x.storage_format() == crate::storage::StorageFormat::F32
         && !shape.contains(&0)
-        && shape.iter().product::<usize>() == cols
+        && (rows_any || shape.iter().product::<usize>() == cols)
         && x.is_storable()
         && crate::server::supports_dram(x.device)
         && !matches!(
@@ -205,6 +234,27 @@ pub(crate) fn rms_norm_tt(x: TtTensor, gamma: TtTensor, eps: f32) -> TtTensor {
     let out = rms_norm_native(&x, &gamma, eps).unwrap_or_else(|| rms_norm_composed(x, gamma, eps));
     crate::report::made(true);
     out
+}
+
+/// [`rms_norm_tt`] with its result as `out`: on F32 `x` and `gamma`, the F32 norm rounded once to
+/// `out` -- one op where [`rms_norm_native_as`] runs it, else the composition then
+/// `cast_native` -- bit for bit `rms_norm_tt(x, gamma).cast(out)` either way. Charged to
+/// `rms_norm`.
+pub(crate) fn rms_norm_tt_as(x: TtTensor, gamma: TtTensor, eps: f32, out: DType) -> TtTensor {
+    if out == x.dtype() {
+        return rms_norm_tt(x, gamma, eps);
+    }
+    let _op = crate::report::enter("rms_norm", true);
+    let made = match (x.dtype(), gamma.dtype()) {
+        (DType::F32, DType::F32) => rms_norm_native_as(&x, &gamma, eps, out),
+        _ => None,
+    };
+    let made = made.unwrap_or_else(|| {
+        let wide = rms_norm_tt(x, gamma, eps);
+        crate::ops::cast_native(wide, out)
+    });
+    crate::report::made(true);
+    made
 }
 
 /// Whether [`rms_norm`] takes the norm (`TT_RMS_NORM_SCALED=0` declines it, so a model runs its

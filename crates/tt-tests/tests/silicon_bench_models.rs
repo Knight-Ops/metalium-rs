@@ -1055,8 +1055,8 @@ fn weight_storage_probe() -> Option<Option<tt_models::quant::Format>> {
 
 /// The numeric contract a model bench runs under (ADR 0006): `TT_NUMERICS` (`reference` or
 /// `performance`), by default `performance`, the inference contract; `TT_MLP_BFP4=1` its named
-/// option, BFP4 for `gate|up`; `TT_BF16_STREAM=1` a BF16 activation stream (roadmap W1,
-/// `WeightOptions::bf16_stream`).
+/// option, BFP4 for `gate|up`; `TT_F32_ACTIVATIONS=1` its products' activations F32, the
+/// baseline of its BF16 ones (roadmap W1, `WeightOptions::f32_activations`).
 fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
     let numerics = burn_tt::Numerics::from_env()
         .unwrap_or(Ok(burn_tt::Numerics::Performance))
@@ -1066,16 +1066,16 @@ fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
         Ok("1") => true,
         Ok(other) => panic!("TT_MLP_BFP4={other}: expected 0 or 1"),
     };
-    let bf16_stream = match std::env::var("TT_BF16_STREAM").as_deref() {
+    let f32_activations = match std::env::var("TT_F32_ACTIVATIONS").as_deref() {
         Err(_) | Ok("0") => false,
         Ok("1") => true,
-        Ok(other) => panic!("TT_BF16_STREAM={other}: expected 0 or 1"),
+        Ok(other) => panic!("TT_F32_ACTIVATIONS={other}: expected 0 or 1"),
     };
     (
         numerics,
         tt_models::quant::WeightOptions {
             mlp_bfp4,
-            bf16_stream,
+            f32_activations,
         },
     )
 }
