@@ -1788,6 +1788,24 @@ pub(crate) fn probing_skip_a_rereads() -> bool {
         && LOWERING_BATCHED.with(std::cell::Cell::get)
 }
 
+/// [`PROBE_SKIP_BATCHED_A`]'s twin for `B`: a batched product's `B` (attention's keys and values)
+/// not read ([`record::GATHER_B_RESIDENT`]), the bound on what a narrower KV cache can save
+/// (`roadmap.md`, "A BF16 KV cache"). **The products are wrong**; only their time means anything.
+static PROBE_SKIP_BATCHED_B: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BATCHED_B`] on or off, process-wide. Dev-facing: a timing bound, never a
+/// result.
+#[doc(hidden)]
+pub fn probe_skip_batched_b_reads(on: bool) {
+    PROBE_SKIP_BATCHED_B.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn probing_skip_batched_b() -> bool {
+    PROBE_SKIP_BATCHED_B.load(std::sync::atomic::Ordering::Relaxed)
+        && LOWERING_BATCHED.with(std::cell::Cell::get)
+}
+
 pub(crate) fn probing_skip_a() -> bool {
     PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
         || (PROBE_SKIP_BATCHED_A.load(std::sync::atomic::Ordering::Relaxed)
@@ -3548,8 +3566,9 @@ pub(crate) fn matmul_dram_batched_limited(
     }
     LOWERING_BATCHED.with(|b| b.set(true));
     let _lowering = Lowering;
-    a.expect("a matmul", Elem::F32)?;
-    b.expect("a matmul", Elem::F32)?;
+    let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
+    a.expect("a matmul", edge(route.packed_a()))?;
+    b.expect("a matmul", edge(route.packed_b()))?;
     let batch = items.len();
     if batch == 0 || m == 0 || k == 0 || n == 0 {
         return Err(TensorError::Shape(format!(
@@ -3605,16 +3624,16 @@ pub(crate) fn matmul_dram_batched_limited(
             for (i, (ra, rb, [ta, tb])) in refs.into_iter().enumerate() {
                 let mut rc = c.tensor_ref();
                 rc.first += (i * mt * nt) as u32;
-                let side = |at, transposed| crate::tile_op::matmul::Side {
+                let side = |at, transposed, elem| crate::tile_op::matmul::Side {
                     at,
                     transposed,
-                    elem: Elem::F32,
+                    elem,
                     // Whole tiles: attention's products are not the decode weights' reads.
                     live_rows: false,
                 };
                 let built = crate::tile_op::matmul(
-                    side(ra, ta),
-                    side(rb, tb),
+                    side(ra, ta, edge(route.packed_a())),
+                    side(rb, tb, edge(route.packed_b())),
                     [m, k, n],
                     route,
                     fidelity,
@@ -5476,7 +5495,9 @@ pub fn rms_divide(
 /// laid out as `x` is (each head's table row), `sin` carrying `rotate_half`'s sign. `rotate(x)`
 /// is each head's halves swapped, read as `x`'s own tiles at the swapped place: no copy. Each job
 /// is two kernels on its run of tiles, `MUL` then `MUL_ADD` (`c + a b`, two roundings): bit for
-/// bit the product, the product and the sum. `head / 2` must be whole tiles.
+/// bit the product, the product and the sum. `head / 2` must be whole tiles. `out` is the result's
+/// type: `Elem::BF16` rounds the sum once in `Dst` and packs it BF16 (a BF16 KV cache's keys),
+/// bit for bit the F32 result narrowed.
 pub fn rope_blocks(
     alloc: &mut DramAlloc,
     x: BlockOperand<'_>,
@@ -5484,9 +5505,24 @@ pub fn rope_blocks(
     sin: BlockOperand<'_>,
     head: usize,
     units: usize,
+    out: Elem,
 ) -> Result<Work> {
-    use crate::sfpu::kernel::{self as sk, Operands};
-    use crate::sfpu::ops::{code_for_rows, kind_sfpu, Broadcast};
+    use crate::sfpu::kernel::{self as sk, Formats, Operands};
+    use crate::sfpu::ops::{code_for_rows, code_for_rows_as, kind_sfpu, Broadcast};
+    let last = match out {
+        Elem::F32 => Formats::FP32,
+        Elem::BF16 => Formats {
+            bf16_in: false,
+            out: bf16_result(),
+        },
+        other => {
+            return Err(TensorError::Elem {
+                op: "RoPE's result".into(),
+                got: other,
+                wants: Elem::F32,
+            })
+        }
+    };
     let [rows, cols] = x.dims;
     if head == 0 || head % 64 != 0 || cols % head != 0 || [cos.dims, sin.dims] != [x.dims; 2] {
         return Err(TensorError::Shape(format!(
@@ -5509,11 +5545,17 @@ pub fn rope_blocks(
     let live = eltwise_rows(kind_sfpu::MUL_ADD, rows);
     let (_, mul) = code_for_rows(crate::kind::MUL, [0.0, 0.0], Broadcast::None, live)
         .ok_or_else(|| TensorError::Shape("no MUL program".into()))?;
-    let (_, mul_add) = code_for_rows(kind_sfpu::MUL_ADD, [0.0, 0.0], Broadcast::None, live)
-        .ok_or_else(|| TensorError::Shape("no MUL_ADD program".into()))?;
+    let (_, mul_add) = code_for_rows_as(
+        kind_sfpu::MUL_ADD,
+        [0.0, 0.0],
+        Broadcast::None,
+        live,
+        last.out.quantized(),
+    )
+    .ok_or_else(|| TensorError::Shape("no MUL_ADD program".into()))?;
     // A run's slots: `x`, `cos`, `rotate(x)`, `sin`, the product and the result.
     let group = (((crate::l1::arena().len() / TILE_SLOT) as usize) / 6).min(64);
-    let out = DramTensor::alloc(alloc, rows, cols)?;
+    let out = DramTensor::alloc_elem(alloc, rows, cols, result_elem(kind_sfpu::MUL_ADD, last))?;
     let ro = out.tensor_ref();
     let mut jobs = Vec::new();
     for run in runs(rt * ct, units, group) {
@@ -5547,7 +5589,7 @@ pub fn rope_blocks(
             init: pt.init,
         };
         let (product_roles, product_loops) = sk::roles_code(&product, Operands::Binary, &mul);
-        let (sum_roles, sum_loops) = sk::roles_code(&sum, Operands::Ternary, &mul_add);
+        let (sum_roles, sum_loops) = sk::roles_code_as(&sum, Operands::Ternary, &mul_add, last);
         let read_run = |r: &TensorRef, at: u64| {
             [
                 [

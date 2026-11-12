@@ -780,8 +780,8 @@ pub struct TracedGenerator<'m, M: FixedShapeDecoder<B>, B: TracedBackend = Tt> {
 
 impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
     /// Capture `model`'s step at each length and a chunk of each size `shapes` names, over one
-    /// cache on `device`. The cache's state must be F32: a packed one would be unpacked by each
-    /// replay's write-back.
+    /// cache on `device`. The cache's state is F32 or BF16 (the performance contract's cache, in
+    /// two-byte slots); a block-float one would be unpacked by each replay's write-back.
     pub fn new(model: &'m M, shapes: &Shapes, device: &TtDevice) -> Result<Self, GenerateError> {
         Self::build(model, shapes, device, false, Sampler::Greedy)
     }
@@ -844,9 +844,13 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             caches.push(model.new_cache(max_len, device));
         }
         for cache in &mut caches {
-            if let Some(t) = cache.state().iter().find(|t| t.dtype() != DType::F32) {
+            if let Some(t) = cache
+                .state()
+                .iter()
+                .find(|t| !matches!(t.dtype(), DType::F32 | DType::BF16))
+            {
                 return Err(GenerateError::Refused(format!(
-                    "a cache in {:?}: traced generation keeps an F32 cache",
+                    "a cache in {:?}: traced generation keeps an F32 or BF16 cache",
                     t.dtype()
                 )));
             }

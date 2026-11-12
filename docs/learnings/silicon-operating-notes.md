@@ -1102,6 +1102,15 @@ From [decode-matmul-bandwidth.md](../completed-plans/decode-matmul-bandwidth.md)
   reads are issued first, so one wait a record). Bit for bit, step171 on card 0 (`1794459860`); dropping the copies
   is caught on ttsim. B's image: +1,772 bytes with the transposed-BF16 `GATHER` arm (safe 38,104 -> 39,876; 10,152
   left in the tightest build).
+- **A 32-byte BF16 face-row is written to a row of either parity** (2026-11-12, ttsim and card 0, roadmap W1's BF16 KV
+  cache). An L1 -> GDDR write needs only 16-byte congruence, and every BF16 face-row sits at 16 or 48 mod 64, so
+  `SCATTER_ROWS_BF16` writes each staged row straight to its destination row, with no aside region (the read side's
+  `SELECT_ROWS_BF16` needs one). Gates `step273` (a cache write at an even and an odd position) and the record's byte
+  model. NC's image: +116 bytes (19,716 -> 19,832; 4,744 left).
+- **A `GATHER` names a resident operand's reference all the same, and it must agree with that operand's slot.**
+  `attention_rows` passed the keys' (or values') reference as the resident `A`'s placeholder; once they were BF16, the
+  record refused it (`RANGE`, `slot_agrees`) though `A` is never read. A resident operand's placeholder is now an FP32
+  reference (the queries').
 - **The B mover pays per entry as much as per byte.** For an `m = 1` product's `A` tiles (one used row in 32):
   - **Two 64-byte face-row reads a tile** (1/32 of the bytes, twice the entries): a 1.7B decode step 1.5 ms faster,
     but the 135M step ~1 ms *slower* (its products are 18 `A` tiles a job).

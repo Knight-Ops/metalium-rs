@@ -59,8 +59,8 @@ pub use numerics::{numerics, with_numerics, Numerics};
 #[doc(hidden)]
 pub use ops::norm::{add_rms_norm_count, rms_norm, rms_norm_count, set_add_rms_norm};
 #[doc(hidden)]
-pub use ops::rope::{rope, rope_count};
-pub use ops::rounded::{matmul_as, matmul_wide, rms_norm_as, silu_mul_as};
+pub use ops::rope::{rope, rope_as, rope_count};
+pub use ops::rounded::{attention_wide, matmul_as, matmul_wide, rms_norm_as, silu_mul_as};
 pub use ops::{
     set_accurate_matmul_slicing, set_argmax_row, set_attention_rows,
     set_exact_matmul_chunk_products, set_softmax_rows, set_softmax_rows_auto,

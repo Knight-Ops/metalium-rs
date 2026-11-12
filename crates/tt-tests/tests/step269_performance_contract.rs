@@ -231,6 +231,21 @@ fn run(cases: &[Case]) {
         let untied = device_logits(&model, Numerics::Performance, untied, cases, &d);
         let untied = agreement(cases, &untied, &flex);
         report("performance contract, untied BFP8 head", &untied);
+
+        // An F32 KV cache (the contract before 2026-11-12): recorded. Its control: the default's
+        // BF16 cache shows in the correlation.
+        let f32_cache = WeightOptions {
+            f32_kv_cache: true,
+            ..Default::default()
+        };
+        let f32_cache = device_logits(&model, Numerics::Performance, f32_cache, cases, &d);
+        let f32_cache = agreement(cases, &f32_cache, &flex);
+        report("performance contract, F32 KV cache", &f32_cache);
+        assert!(
+            f32_cache.pcc_mean != bfp8.pcc_mean,
+            "an F32 KV cache agrees exactly with the contract's BF16 one ({f32_cache}): the BF16 \
+             cache did not apply"
+        );
     });
 }
 

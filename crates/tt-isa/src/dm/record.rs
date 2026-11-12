@@ -450,8 +450,12 @@ pub const POKE_RUN_MAX: usize = 13;
 /// repeated row is still written only from the last of all `count` indices,
 /// so records that split one batch's indices between them write each address
 /// once, from the same index one record would (a row's writer is the record
-/// whose range holds its last index). Bit 0 (16-bit datums) is reserved and,
-/// as any other bit, [`super::error::RANGE`]. As with [`SELECT_ROWS`], the
+/// whose range holds its last index). With [`SCATTER_ROWS_BF16`], `X` and the
+/// staged tiles are BF16 (`X` naming its BF16 slots, the staged ones at their
+/// FP32 stride): two 32-byte face-row writes a tile column, which need no
+/// aside region (a write's addresses need only 16-byte congruence, and every
+/// BF16 face-row sits at 16 or 48 mod 64). Any other bit is
+/// [`super::error::RANGE`]. As with [`SELECT_ROWS`], the
 /// slots are not checked against the data arena here
 /// (`tt_kernels::index::scatter_rows_jobs` places them from its plan); each
 /// write's L1 range is checked as any write's is. The host's [`expand`] reads
@@ -460,6 +464,8 @@ pub const SCATTER_ROWS: u32 = 0x1A;
 /// [`SCATTER_ROWS`]'s indices are a column, `(r, 0)` of the slot: an `[n, 1]`
 /// index tensor, read where it is with no repack.
 pub const SCATTER_ROWS_COLUMN: u32 = 1 << 1;
+/// [`SCATTER_ROWS`]'s flag for a tensor of BF16 slots (a BF16 KV cache): 32-byte face-rows.
+pub const SCATTER_ROWS_BF16: u32 = 1;
 /// The bits of a [`SCATTER_ROWS`] index range ([`scatter_rows_range`]).
 const SCATTER_ROWS_RANGE: u32 = 0x3f << 8 | 0x3f << 16;
 
@@ -1524,8 +1530,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         }
         SCATTER_ROWS if WRITES => {
             let [_, idx_at, count, bound, j0, cols, stage_at, flags] = h;
-            if flags & !(SCATTER_ROWS_COLUMN | SCATTER_ROWS_RANGE) != 0 {
-                // 16-bit datums (bit 0) are not implemented.
+            if flags & !(SCATTER_ROWS_BF16 | SCATTER_ROWS_COLUMN | SCATTER_ROWS_RANGE) != 0 {
                 return Err(super::error::RANGE);
             }
             // The indices written: a range of them, or (none given) all.
@@ -1538,6 +1543,16 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 return Err(super::error::RANGE);
             };
             let (x, cols) = indexed_rows(rec, count, bound, j0, cols)?;
+            // A BF16 tensor names its slots, and only a BF16 one does.
+            let half = flags & SCATTER_ROWS_BF16 != 0;
+            if half != (x.slot != 0) {
+                return Err(super::error::RANGE);
+            }
+            // A face-row's bytes: 64 for FP32, 32 for BF16; a tile's slot in `X` likewise.
+            let (row_bytes, slot) = match half {
+                true => (32, x.slot_bytes()),
+                false => (64, TILE_SLOT),
+            };
             // As `SELECT_ROWS`: every index checked before any write, each
             // read again where it is used, 32-bit arithmetic throughout.
             const DATA: u32 = TILE_DATA as u32;
@@ -1555,7 +1570,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     return Err(super::error::DOMAIN);
                 }
             }
-            let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * 64;
+            let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * row_bytes;
             let mut port = 0;
             for r in first..end.min(count) {
                 let v = index(word(r));
@@ -1569,11 +1584,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 }
                 let mut row = x.cursor(v / 32, j0)?;
                 for j in 0..cols {
-                    let (ch, off) = row.next()?;
+                    let (ch, off) = row.next_with_slot(slot)?;
                     for half in 0..core::hint::black_box(2) {
                         let to = off + face_row(v % 32, half);
                         let from = stage_at + j * TILE_SLOT as u32 + face_row(r, half);
-                        emit([op::WRITE, ch, port, to, from, 64, 0, 0])?;
+                        emit([op::WRITE, ch, port, to, from, row_bytes, 0, 0])?;
                         port = if port + 1 == PORTS { 0 } else { port + 1 };
                     }
                 }
@@ -1624,7 +1639,7 @@ fn indexed_rows(
         return Err(super::error::LENGTH);
     }
     let cols = extent(cols)?;
-    let x = tensor(rec, 1)?;
+    let x = tensor_slotted(rec, 1)?;
     // Every tile number a checked index can name fits a `u32` (the cursor
     // adds without checking: an index comes from L1).
     let tiles = bound
@@ -2761,6 +2776,71 @@ mod tests {
             for e in &got {
                 assert_eq!(e[3] % 64, e[4] % 64);
             }
+        }
+    }
+
+    /// A BF16 tensor's rows (roadmap W1, a BF16 KV cache's write): the expansion's writes, run
+    /// against an L1 and a GDDR of bytes, put every datum of each staged row in its destination
+    /// row, bit for bit, where the face layout (`face_index`) says, independently of `expand`'s
+    /// arithmetic, and write nothing else. Every write is 32 bytes, congruent mod 16 (what a
+    /// write needs); rows of both parities are written straight. A BF16 flag on an FP32 tensor,
+    /// and an FP32 record on a BF16 one, are refused.
+    #[test]
+    fn scatter_rows_writes_bf16_rows_whole() {
+        let mut x = t(3, 5);
+        x.first = 2;
+        x.slot = BF16_TILE_SLOT as u32;
+        let bound = 100;
+        let values = [0u32, 99, 31, 32, 33, 5, 64, 17, 16, 63, 95, 1, 2, 3, 4, 6];
+        let (j0, cols, count) = (1u32, 3u32, values.len() as u32);
+        let rec = scatter(x, bound, count, j0, cols, SCATTER_ROWS_BF16);
+        let mut got = Vec::new();
+        expand_writes(&rec, l1_of(&values), |e| {
+            got.push(e);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got.len() as u32, count * cols * 2);
+        let staged = |at: u32| (at.wrapping_mul(2_654_435_761) >> 11) as u8;
+        let mut gddr = std::collections::HashMap::<(u32, u32), u8>::new();
+        let mut parities = [0; 2];
+        for e in &got {
+            assert_eq!(e[0], op::WRITE);
+            assert_eq!((e[5], e[3] % 16), (32, e[4] % 16), "{e:x?}");
+            parities[usize::from((e[3] ^ e[4]) % 64 != 0)] += 1;
+            for b in 0..32 {
+                assert!(gddr.insert((e[1], e[3] + b), staged(e[4] + b)).is_none());
+            }
+        }
+        assert!(parities[0] > 0 && parities[1] > 0, "{parities:?}");
+        for (r, &v) in values.iter().enumerate() {
+            for j in 0..cols {
+                let (ch, off) = x.tile_in(v / 32, j0 + j, BF16_TILE_SLOT).unwrap();
+                for c in 0..32 {
+                    let to = off
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index((v % 32) as usize, c) as u32;
+                    let from = STAGE
+                        + j * TILE_SLOT as u32
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index(r, c) as u32;
+                    for b in 0..2 {
+                        assert_eq!(gddr[&(ch, to + b)], staged(from + b), "row {v} column {c}");
+                    }
+                }
+            }
+        }
+        // The flag and the tensor's slots agree, or nothing is written.
+        let mut fp32 = x;
+        fp32.slot = 0;
+        for rec in [
+            scatter(fp32, bound, count, j0, cols, SCATTER_ROWS_BF16),
+            scatter(x, bound, count, j0, cols, 0),
+        ] {
+            assert_eq!(
+                expand_writes(&rec, l1_of(&values), |_| Ok(())),
+                Err(crate::dm::error::RANGE)
+            );
         }
     }
 

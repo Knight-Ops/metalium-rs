@@ -279,6 +279,13 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.cast_float(&mut self.session, id, bf16)
         }
+        fn cast_block(
+            &mut self,
+            a: burn_tt::BlockArg,
+            bf16: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.cast_block(&mut self.session, a, bf16)
+        }
         fn cast_f16(
             &mut self,
             id: burn_tt::BufferId,
@@ -430,9 +437,10 @@ fn sim_factory(
             cos: burn_tt::BlockArg,
             sin: burn_tt::BlockArg,
             head: usize,
+            bf16: bool,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers
-                .rope_blocks(&mut self.session, x, cos, sin, head)
+                .rope_blocks(&mut self.session, x, cos, sin, head, bf16)
         }
         fn pow(
             &mut self,

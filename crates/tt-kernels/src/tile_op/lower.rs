@@ -492,6 +492,7 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
     let ct = op.domain[q].tiles();
     let reversed = tensor::probing_reverse_chunks();
     let (skip_all_a, skip_a_rereads) = (tensor::probing_skip_a(), tensor::probing_skip_a_rereads());
+    let skip_b = tensor::probing_skip_batched_b();
     // Per unit, the first operand's tiles (rows, terms) and slot its last run left held.
     type Held = (std::ops::Range<usize>, std::ops::Range<usize>, u64);
     let mut held: Vec<Option<Held>> = vec![None; units];
@@ -606,6 +607,11 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
                 }
                 | if row.is_some() {
                     record::GATHER_STREAM
+                } else {
+                    0
+                }
+                | if skip_b && row.is_none() {
+                    record::GATHER_B_RESIDENT
                 } else {
                     0
                 }

@@ -289,6 +289,12 @@ They run in this order; W1-W4 can overlap.
   once, BF16, by the owner's decision: the 1.7B 7.52 -> 7.68 ms (0.73x tt-metal's 10.55), Qwen3.5-4B 56.93 -> 54.47.
   Still open from W1's prediction: a BF16 KV cache at long context, whose two parts (a transposed BF16 `q k^T`, 2-byte
   rows in B's records) now exist.
+- **A BF16 KV cache, the performance contract's (2026-11-12,** cards 0 and 1;
+  [log](../learnings/performance-log.md#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1)):
+  W1's long-context prediction met: the 1.7B at 2K 19.44 -> 18.89 ms (predicted ~0.9 ms, got 0.55), at 8K 43.44 ->
+  38.67 (predicted ~4.7, got 4.77); short context +1.9% (7.84 ms, 0.74x tt-metal's 10.55), the values' cast a layer;
+  Qwen3.5-4B 54.43 -> 54.71. Half the cache's GDDR, which W3's batch-32 cache needs. The rest of attention's time at 8K
+  (~26 ms) is the scores, not the cache: an attention that keeps them in L1.
 - **First box landed (2026-11-10;** [log](../learnings/performance-log.md#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1)):
   - **The switch:** `burn_tt::Numerics`, recorded in traces.
   - **The default:** tt-models' `for_inference` stores BFP8 weights under the performance contract.

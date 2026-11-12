@@ -276,6 +276,84 @@ fn cast_f16(tensor: &TtTensor, dtype: DType) -> Option<TtTensor> {
     }
 }
 
+/// A cast of a view that covers most of its buffer (a quarter of it or more): the whole buffer
+/// cast, and the same view over the result. Every element converts on its own, so the view's
+/// elements are the ones a cast of the view would give, and its layout is kept: a decode step's
+/// keys after RoPE (heads as column blocks of one row) stay one row, which the cache write reads
+/// where it lies, where materialising the view first laid them a head a row and the write then
+/// repacked them (a BF16 KV cache, roadmap W1). `None` for a plain tensor, a transposed buffer,
+/// a broadcast (a stride of zero over more than one element), or a view of a small part.
+///
+/// A view that is a block of its buffer on tile boundaries (a value head's columns of a fused
+/// projection's row) narrows that block alone (`Session::cast_block`): a third of a fused
+/// `qkv`'s tiles, dealt as the cache write that reads them is, so that write needs no barrier
+/// after the cast (the whole buffer's cast dealt the value tiles to other units).
+fn cast_view_in_place(tensor: &TtTensor, dtype: DType) -> Option<TtTensor> {
+    if !tensor.is_view() {
+        return None;
+    }
+    if tensor.dtype() == DType::F32 && dtype == DType::BF16 {
+        if let Some((w, dims)) = block_view(tensor) {
+            let (id, made) = crate::server::cast_block(
+                tensor.device,
+                crate::server::BlockArg {
+                    id: w.src.buffer.id,
+                    at: w.base,
+                    dims,
+                },
+                true,
+            );
+            let src = device_view(tensor.device, id, made, None, dtype)
+                .to_dram()
+                .clone();
+            return Some(TtTensor::view(
+                crate::views::Strided {
+                    src,
+                    base: [0, 0],
+                    strides: w.strides,
+                },
+                tensor.shape(),
+                dtype,
+                tensor.device,
+            ));
+        }
+    }
+    let v = tensor.as_strided()?;
+    let shape = tensor.shape().to_vec();
+    let count: usize = shape.iter().product();
+    let [rows, cols] = [v.src.buffer.rows, v.src.buffer.cols];
+    let broadcast = shape
+        .iter()
+        .zip(&v.strides)
+        .any(|(&n, s)| n > 1 && *s == [0, 0]);
+    if v.src.transposed
+        || broadcast
+        || 4 * count < rows * cols
+        || v.src.buffer.storage != crate::storage::StorageFormat::F32
+    {
+        return None;
+    }
+    let (id, dims) = crate::server::cast_float(
+        tensor.device,
+        v.src.buffer.id,
+        [rows, cols],
+        dtype == DType::BF16,
+    );
+    let src = device_view(tensor.device, id, dims, None, dtype)
+        .to_dram()
+        .clone();
+    Some(TtTensor::view(
+        crate::views::Strided {
+            src,
+            base: v.base,
+            strides: v.strides,
+        },
+        tensor.shape(),
+        dtype,
+        tensor.device,
+    ))
+}
+
 /// Resident conversion used by explicit casts and BF16 arithmetic dispatch.
 /// BF16 and F16 arithmetic widens to F32 on Tensix, computes using the existing native
 /// contract, then rounds its floating-point result once at the operation boundary.
@@ -302,6 +380,9 @@ pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
         if let Some(widened) = tensor.widened_on_host() {
             return widened;
         }
+    }
+    if let Some(cast) = cast_view_in_place(&tensor, dtype) {
+        return cast;
     }
     let source = tensor.to_dram();
     let (id, dims) = crate::server::cast_float(
@@ -2897,7 +2978,7 @@ pub mod float {
     /// from 1, the last two dimensions of an operand are not a block of its
     /// buffer, or its blocks are neither whole tiles nor whole rows of it
     /// (`Strided::matrix_blocks`).
-    fn batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+    pub(crate) fn batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
         let plan = batched_plan(lhs, rhs)?;
         let (id, dims) =
             crate::server::matmul_dram_batched(lhs.device, plan.a, plan.b, plan.items, plan.mkn);
@@ -2931,7 +3012,12 @@ pub mod float {
         if rank <= 2 || ls.len() < 2 || rs.len() < 2 || !crate::server::supports_dram(device) {
             return None;
         }
-        if !(lhs.is_stored_f32() && rhs.is_stored_f32()) {
+        // A BF16 `B` (a BF16 KV cache's keys or values) is read as it lies, the product over its
+        // exact values with an F32 result: bit for bit the widened `B`'s.
+        let wide_rhs = rhs.dtype() == DType::BF16
+            && rhs.is_storable()
+            && rhs.storage_format() == crate::storage::StorageFormat::F32;
+        if !(lhs.is_stored_f32() && (rhs.is_stored_f32() || wide_rhs)) {
             return None;
         }
         let (m, k, n) = (ls[ls.len() - 2], ls[ls.len() - 1], rs[rs.len() - 1]);
@@ -2974,8 +3060,16 @@ pub mod float {
             t.to_dram();
             t.as_strided()
         })?;
+        // A half operand's blocks are read where they lie, as whole tiles of its buffer: no row
+        // gather moves two-byte rows into padded blocks (`Session::matmul_dram_batched_with`).
+        let whole = |v: &crate::views::Strided, blocks: &[crate::Block]| {
+            !crate::tensor::is_half(t.dtype())
+                || blocks
+                    .iter()
+                    .all(|b| half_block_fits(v, b, &shape[shape.len() - 2..]))
+        };
         if let Some(blocks) = v.matrix_blocks(&shape, batch) {
-            return Some((v.src.buffer.id, blocks));
+            return whole(&v, &blocks).then_some((v.src.buffer.id, blocks));
         }
         if !t.is_view() {
             return None;
@@ -2983,7 +3077,23 @@ pub mod float {
         t.to_dram();
         let v = t.as_strided()?;
         let blocks = v.matrix_blocks(&shape, batch)?;
-        Some((v.src.buffer.id, blocks))
+        whole(&v, &blocks).then_some((v.src.buffer.id, blocks))
+    }
+
+    /// Whether `block` of a `[r, c]` matrix (`dims`) starts on a tile of `v`'s buffer and ends on
+    /// one or at the buffer's edge (`tt_kernels::tensor::block_fits`).
+    fn half_block_fits(v: &crate::views::Strided, block: &crate::Block, dims: &[usize]) -> bool {
+        let [rows, cols] = [v.src.buffer.rows, v.src.buffer.cols];
+        let [er, ec] = if block.transposed {
+            [dims[1], dims[0]]
+        } else {
+            [dims[0], dims[1]]
+        };
+        let [r0, c0] = block.at;
+        let ends = |at: usize, extent: usize, edge: usize| {
+            at + extent <= edge && ((at + extent) % 32 == 0 || at + extent == edge)
+        };
+        r0 % 32 == 0 && c0 % 32 == 0 && ends(r0, er, rows) && ends(c0, ec, cols)
     }
 
     /// `tensor` with dimensions `dim1` and `dim2` swapped, as a view of its
@@ -4329,6 +4439,11 @@ pub mod module {
 
     /// Pinned Burn's attention ordering, with replayable causal geometry.
     /// BF16 inputs widen once; every intermediate remains F32 until the output.
+    ///
+    /// An F32 query over BF16 keys and values (a BF16 KV cache, [`crate::attention_wide`]) is
+    /// computed over the keys' and values' exact values with an F32 result, bit for bit the
+    /// attention of the widened keys and values: the products read them where they lie
+    /// (`SrcRoute::Edges`), and they are widened only where no product does.
     pub fn attention(
         query: TtTensor,
         key: TtTensor,
@@ -4337,7 +4452,13 @@ pub mod module {
         attn_bias: Option<TtTensor>,
         options: burn_backend::ops::AttentionModuleOptions,
     ) -> TtTensor {
-        let dtype = float_compute_dtype(&[&query, &key, &value]);
+        let wide = query.dtype() == DType::F32
+            && key.dtype() == DType::BF16
+            && value.dtype() == DType::BF16;
+        let dtype = match wide {
+            true => DType::F32,
+            false => float_compute_dtype(&[&query, &key, &value]),
+        };
         let qs = query.shape().to_vec();
         let ks = key.shape().to_vec();
         let vs = value.shape().to_vec();
@@ -4361,13 +4482,16 @@ pub mod module {
         // Each stage's jobs are charged to a part of `attention` of its own
         // (`report::part`), so a report says which of them the cost is.
         let part = crate::report::part;
-        let (query, key, value) = {
-            let _part = part("attention/widen");
-            (
-                float_compute_input(query),
-                float_compute_input(key),
-                float_compute_input(value),
-            )
+        let (query, key, value) = match wide {
+            true => (query, key, value),
+            false => {
+                let _part = part("attention/widen");
+                (
+                    float_compute_input(query),
+                    float_compute_input(key),
+                    float_compute_input(value),
+                )
+            }
         };
         if mask.is_none() && attn_bias.is_none() {
             if let Some(out) = padded_attention(&query, &key, &value, &options, scale) {
@@ -4388,7 +4512,7 @@ pub mod module {
         }
         let scores = {
             let _part = part("attention/qk");
-            float::float_matmul(query, float::float_transpose(key))
+            wide_product(query, float::float_transpose(key))
         };
         if let Some(mask) = &mask {
             assert_eq!(device, mask.device, "attention mask device differs");
@@ -4407,7 +4531,7 @@ pub mod module {
             if let Some(probabilities) = probabilities {
                 let out = {
                     let _part = part("attention/pv");
-                    float::float_matmul(probabilities, value)
+                    wide_product(probabilities, value)
                 };
                 let _part = part("attention/narrow");
                 return cast_native(out, dtype);
@@ -4465,10 +4589,27 @@ pub mod module {
         };
         let out = {
             let _part = part("attention/pv");
-            float::float_matmul(probabilities, value)
+            wide_product(probabilities, value)
         };
         let _part = part("attention/narrow");
         cast_native(out, dtype)
+    }
+
+    /// `a @ b` for an F32 `a` and a `b` of F32 or BF16 (attention's keys or values over a BF16
+    /// cache): a BF16 `b` read as it lies by the batched product, else widened once (bit for bit
+    /// the same product).
+    fn wide_product(a: TtTensor, b: TtTensor) -> TtTensor {
+        if b.dtype() != DType::BF16 {
+            return float::float_matmul(a, b);
+        }
+        if let Some(t) = float::batched_matmul(&a, &b) {
+            return t;
+        }
+        let b = {
+            let _part = crate::report::part("attention/widen");
+            cast_native(b, DType::F32)
+        };
+        float::float_matmul(a, b)
     }
 
     /// The bottom-right causal mask of `[b, h, sq, _]` queries over
@@ -4546,8 +4687,16 @@ pub mod module {
         mask: &TtTensor,
         scale: f64,
     ) -> Option<TtTensor> {
-        use tt_kernels::attention::{fits, Item};
+        use tt_kernels::attention::{fits_as, Item};
+        use tt_kernels::tensor::Elem;
         let device = query.device;
+        // F32 keys and values, or BF16 ones (a BF16 KV cache) read as they lie.
+        let kv = match (key.dtype(), value.dtype()) {
+            (DType::F32, DType::F32) => Elem::F32,
+            (DType::BF16, DType::BF16) => Elem::BF16,
+            _ => return None,
+        };
+        let fits = |dims, r0| fits_as(dims, r0, kv);
         if !ATTENTION_ROWS.load(std::sync::atomic::Ordering::Relaxed)
             || crate::matmul_mode::effective(device) != crate::MatmulMode::Fast
             || crate::matmul_mode::fidelity_override().is_some()

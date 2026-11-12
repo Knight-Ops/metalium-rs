@@ -3580,6 +3580,23 @@ impl<T: Transport> Session<T> {
 
     /// `t` converted to `to` (F32 <-> BF16) over runs of tiles on the product's units
     /// (`tile_op::cast`).
+    /// A block of a tensor converted between F32 and BF16 ([`crate::tile_op::cast`]): a new
+    /// tensor of the block's dims, bit for bit [`Session::bf16_from_f32`]'s conversion of those
+    /// elements. Its tiles are dealt as any block op's over the block's own tiles, so a reader
+    /// of the block dealt the same way (a row scatter of a value head's columns into a cache)
+    /// reads each tile on the unit that wrote it, with no barrier between them.
+    pub fn cast_block(
+        &mut self,
+        block: tensor::BlockOperand<'_>,
+        to: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        let units = self.spread_for(block.dims[0].div_ceil(32) * block.dims[1].div_ceil(32));
+        let overlap = self.overlap();
+        let mut op = crate::tile_op::cast(block, to)?;
+        let work = op.build(&mut self.dram_state()?.alloc, units, overlap)?;
+        self.execute_on(work, units, RESET_BUDGET)
+    }
+
     fn cast_runs(&mut self, t: &DramTensor, to: tensor::Elem) -> Result<DramTensor, TensorError> {
         let units = self.spread_for(tiles_of(t));
         let overlap = self.overlap();
@@ -8578,9 +8595,23 @@ impl<T: Transport> Session<T> {
         sin: tensor::BlockOperand<'_>,
         head: usize,
     ) -> Result<DramTensor, TensorError> {
+        self.rope_as(x, cos, sin, head, tensor::Elem::F32)
+    }
+
+    /// [`Session::rope`] with its result `out`: BF16 rounds it once at the pack (a BF16 KV
+    /// cache's keys, written as RoPE leaves them), bit for bit the F32 result narrowed.
+    pub fn rope_as(
+        &mut self,
+        x: tensor::BlockOperand<'_>,
+        cos: tensor::BlockOperand<'_>,
+        sin: tensor::BlockOperand<'_>,
+        head: usize,
+        out: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
         let tiles = x.dims[0].div_ceil(32) * x.dims[1].div_ceil(32);
         let units = self.spread_for(tiles);
-        let work = tensor::rope_blocks(&mut self.dram_state()?.alloc, x, cos, sin, head, units)?;
+        let work =
+            tensor::rope_blocks(&mut self.dram_state()?.alloc, x, cos, sin, head, units, out)?;
         let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)
@@ -9260,8 +9291,44 @@ impl<T: Transport> Session<T> {
         layout: BatchedLayout,
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
-        a.expect("a matmul", tensor::Elem::F32)?;
-        b.expect("a matmul", tensor::Elem::F32)?;
+        use tt_isa::format::TileFormat;
+        // Each operand read in its own edge format, as [`Session::matmul_dram_as`] reads them: a
+        // BF16 `B` (a BF16 KV cache's keys and values) unpacked as BF16, the product of the values
+        // it widens to, bit for bit the widened `B`'s (`SrcRoute::Edges`, gate `step270`).
+        let packed = a.format() != TileFormat::FP32 || b.format() != TileFormat::FP32;
+        let route = match route {
+            SrcRoute::Tf32FromFp32 | SrcRoute::Edges { .. } if packed => {
+                SrcRoute::edges(a.format(), b.format()).ok_or_else(|| {
+                    TensorError::Shape(format!(
+                        "a batched product of {:?} and {:?} operands: no gather reads them",
+                        a.format(),
+                        b.format()
+                    ))
+                })?
+            }
+            _ if packed => {
+                return Err(TensorError::Shape(format!(
+                    "packed operands ({:?}, {:?}) multiply through TF32 only, not {route:?}",
+                    a.format(),
+                    b.format()
+                )))
+            }
+            _ => route,
+        };
+        // Only `B` may be packed here, and a transposed one only where the unpacker transposes it.
+        if a.format() != TileFormat::FP32 {
+            a.expect("a batched matmul's left operand", tensor::Elem::F32)?;
+        }
+        if route.packed_b().is_some()
+            && items.iter().any(|(_, bb)| bb.transposed)
+            && !(self.unpack_transposed_b && route.unpacks_transposed_b())
+        {
+            return Err(TensorError::Shape(
+                "a batched product's packed `B` is read transposed only where the unpacker \
+                 transposes it (BF16)"
+                    .into(),
+            ));
+        }
         // A block that reaches its tensor's ragged edge reads the tensor's padding: as `K`'s
         // when the edge is along `K`, which must then be zero, the fill `matmul_dram` asks
         // for. Along `M` or `N` it reaches only the output's padding (or rows a stacked output
@@ -9342,6 +9409,10 @@ impl<T: Transport> Session<T> {
                 // (a `K` row, an output kept padded) is read: zero.
                 let zero_tails =
                     !(side == 0 && layout.stacked && items.iter().all(|i| !i.0.transposed));
+                // Row gathers move FP32 rows: a packed operand's blocks are read where they lie.
+                if operands[side].format() != TileFormat::FP32 {
+                    continue;
+                }
                 let Some((p, blocks)) = self.rows_padded(
                     t,
                     &items.iter().map(pick).collect::<Vec<_>>(),

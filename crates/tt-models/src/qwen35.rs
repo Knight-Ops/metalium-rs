@@ -487,13 +487,31 @@ impl<B: Backend> GatedAttention<B> {
         let k = k.reshape([n, t, kv_heads, d]);
         let v = v.reshape([n, t, kv_heads, d]);
         let q = Self::rotate(cfg, self.q_norm.forward(q).swap_dims(1, 2), rope);
-        let k = Self::rotate(cfg, self.k_norm.forward(k).swap_dims(1, 2), rope);
-        let v = v.swap_dims(1, 2);
+        // The keys and values in the cache's dtype: rounded once here, after RoPE, where the
+        // cache is narrower than the stream (a BF16 cache, `Qwen35::for_inference`).
+        let kv_dtype = cache_k.dtype();
+        let in_cache = |t: Tensor<B, 4>| match t.dtype() == kv_dtype {
+            true => t,
+            false => t.cast(kv_dtype),
+        };
+        let k = in_cache(Self::rotate(
+            cfg,
+            self.k_norm.forward(k).swap_dims(1, 2),
+            rope,
+        ));
+        let v = in_cache(v.swap_dims(1, 2));
 
         let new_k = write.write(cache_k, k);
         let new_v = write.write(cache_v, v);
         let q = q.reshape([n, kv_heads, groups * t, d]);
         let (keys, values) = (write.attended(new_k.clone()), write.attended(new_v.clone()));
+        // A narrower cache is read as it lies where the backend's attention takes it
+        // (`burn_tt::attention_wide`), else widened.
+        let (keys, values) = if keys.dtype() == q.dtype() || burn_tt::attention_wide::<B>() {
+            (keys, values)
+        } else {
+            (keys.cast(q.dtype()), values.cast(q.dtype()))
+        };
         let out = attention(
             q,
             keys,
@@ -965,6 +983,9 @@ pub struct Qwen35<B: Backend> {
     /// keeps the stream F32 and stores the table BF16): the looked-up rows are widened to it
     /// (exactly), and the cache is made in it. `None`: the table's. Not a parameter.
     stream: Option<DType>,
+    /// The full-attention layers' KV cache dtype where it is not the stream's: BF16 under the
+    /// performance contract ([`Qwen35::for_inference`], as `Llama`'s). Not a parameter.
+    kv: Option<DType>,
 }
 
 /// Widens every float parameter to F32.
@@ -996,6 +1017,7 @@ impl<B: Backend> Qwen35<B> {
             config: *config,
             numerics: None,
             stream: None,
+            kv: None,
         }
     }
 
@@ -1138,6 +1160,12 @@ impl<B: Backend> Qwen35<B> {
             .unwrap_or_else(|| self.embed_tokens.weight.val().dtype())
     }
 
+    /// The full-attention layers' KV cache dtype: [`Qwen35::for_inference`]'s choice, else the
+    /// stream's.
+    pub fn kv_dtype(&self) -> DType {
+        self.kv.unwrap_or_else(|| self.stream_dtype())
+    }
+
     /// An empty state for `max_len` positions of one sequence: keys and values in `dtype`, the
     /// convolutions' inputs in their taps' dtype, the recurrent states in F32.
     pub fn state(&self, max_len: usize, dtype: DType, device: &B::Device) -> State<B> {
@@ -1258,6 +1286,11 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
         );
         model.numerics = Some(numerics);
         model.stream = Some(stream);
+        // The performance contract's KV cache is BF16, as `Llama`'s
+        // ([`crate::quant::WeightOptions::f32_kv_cache`] opts out).
+        if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
+            model.kv = Some(DType::BF16);
+        }
         model
     }
 
@@ -1392,6 +1425,18 @@ impl<B: Backend> Qwen35<B> {
     /// [`CacheLayout::for_heads`] says), the convolutions' inputs in their taps' dtype, the
     /// recurrent states in F32.
     pub fn hybrid_cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> HybridCache<B> {
+        self.hybrid_cache_as(max_len, dtype, dtype, device)
+    }
+
+    /// [`Self::hybrid_cache`] with the keys and values in `kv` and the rotary table in the
+    /// stream's `dtype` (a BF16 cache beside an F32 stream: the performance contract's).
+    pub fn hybrid_cache_as(
+        &self,
+        max_len: usize,
+        dtype: DType,
+        kv: DType,
+        device: &B::Device,
+    ) -> HybridCache<B> {
         let cfg = &self.config;
         let full = (0..cfg.layers).filter(|&i| cfg.is_full(i)).count();
         assert!(max_len >= cfg.conv_kernel, "a cache of {max_len} positions");
@@ -1400,7 +1445,7 @@ impl<B: Backend> Qwen35<B> {
                 full,
                 CacheLayout::for_heads(cfg.kv_heads, cfg.head_dim),
                 max_len,
-                dtype,
+                kv,
                 device,
             )
         });
@@ -1568,9 +1613,10 @@ impl<B: Backend> FixedShapeDecoder<B> for Qwen35<B> {
         self.numerics
     }
 
-    /// A cache whose keys and values are in the stream's dtype.
+    /// A cache whose keys and values are in the contract's dtype ([`Qwen35::kv_dtype`]), its
+    /// rotary table in the stream's.
     fn new_cache(&self, max_len: usize, device: &B::Device) -> HybridCache<B> {
-        self.hybrid_cache(max_len, self.stream_dtype(), device)
+        self.hybrid_cache_as(max_len, self.stream_dtype(), self.kv_dtype(), device)
     }
 
     fn chunk(

@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: a BF16 KV cache, the performance contract's default](#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1) | 2026-11-12 | the 1.7B's decode with a BF16 cache against an F32 one: **18.89 against 19.44 ms at 2K (-2.8%), 38.67 against 43.44 at 8K (-11.0%)**, 7.84 against 7.70 at 32 tokens (+1.9%, a value cast a layer); prefill at 7,992 tokens 5,481 against 5,605 ms; half the cache's GDDR; `step269` 228 of 232, PCC 0.99976; the default (the plan's kill reads "and") |
+| [W1: a BF16 KV cache bounded before building](#w1-a-bf16-kv-cache-bounded-before-building-2026-11-12-card-1) | 2026-11-12 | the 1.7B's decode with the batched products' keys and values not read: 19.54 -> 17.72 ms at 2,000 tokens, 43.48 -> 34.10 at 7,992; a BF16 cache predicted **~0.9 ms (4.7%) at 2K, ~4.7 ms (10.8%) at 8K**, ~0 at short context; built. The other ~26 ms of attention at 8K is not the cache |
 | [W1: the BF16 defects fixed, the BF16 lookup, and one tied table](#w1-the-bf16-defects-fixed-the-bf16-lookup-and-one-tied-table-2026-11-12-cards-0-and-1) | 2026-11-12 | W1's leftovers: a cast widens a host BF16 tensor on the host; a retiling to the same matrix is a view (the BF16 Qwen3.5 holds 4.3 GB of host memory flat, not 40+); `expand` past 2,097,152 rows in chunks; a transposed BF16 `B` transposed by the unpacker; `SELECT_ROWS_BF16`; a tied table stored once, BF16 (owner's call): the 1.7B 7.52 -> 7.68 ms (+2.1%, 312 MB of GDDR less), Qwen3.5-4B 56.93 -> **54.47 ms**; `step167` BF16 229 -> 6.3 s |
 | [W1: BF16 activations into the products, the performance default](#w1-bf16-activations-into-the-products-the-performance-default-2026-11-11-cards-0-and-1) | 2026-11-11 | the BF16 stream replaced: the residual and every op's arithmetic F32, a norm's output and `silu(gate) * up` rounded once to BF16 where made (one op each), products reading them as they lie with F32 results; decode unchanged (7.52 / 8.01 / 8.64 against 7.49 / 7.99 / 8.67 ms), prefill 1.06-1.09x (4,266 against 4,007 tokens/s at 256), `step269` the same 228 of 232: the performance contract's default; the BF16 stream deleted |
 | [W1: burn-tt on BF16, and the 1.7B on a BF16 stream (an option)](#w1-burn-tt-on-bf16-and-the-17b-on-a-bf16-stream-an-option-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's routing phase and a first model run: 21 Burn ops, products, BFP storage of BF16, casts over runs of tiles, RMSNorm on BF16; the 1.7B on a BF16 stream works but runs behind the FP32 stream (decode 9.20 against 7.51 ms at 32 tokens, prefill 2,936 against 4,004 tokens/s at 256) and trips step269's top-1 threshold by one position: the default stays the FP32 stream, the BF16 one an option; what it lacks, measured |
@@ -428,6 +430,92 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: a BF16 KV cache bounded before building (2026-11-12, card 1)
+
+Roadmap W1, "A BF16 KV cache" (the big-bet rule: bound it first). The 1.7B, the performance contract (BFP8 weights,
+BF16 activations into the products, one BF16 tied table), an F32 cache, card 1, at `8d3bc34`:
+`traced_generation_stream_ceiling` with `TT_GEN_MAX_LEN=8192 TT_GEN_CHUNKS=512 TT_GEN_PROMPTS=32,2000,7992
+TT_GEN_NEW=16 TT_GEN_SAMPLES=3`. The bound is the new probe `TT_PROBE_BATCHED_B=1`
+(`tt_kernels::tensor::probe_skip_batched_b_reads`): every batched product's `B` gathered
+`GATHER_B_RESIDENT`, so attention's keys (`q k^T`) and values (`P V`) past `attention_rows`' lengths are not read and
+the products are wrong. It is what a zero-byte cache would save; a BF16 one moves half the bytes.
+
+| ms | decode step, F32 cache (`1794492200`) | keys and values not read (`1794493259`) | their reads | a BF16 cache, predicted |
+|---|--:|--:|--:|--:|
+| 32-token prompt (attends to 64) | 7.80 | 7.68 | (`attention_rows`; not probed) | ~0 |
+| 2,000-token prompt (2,048) | 19.54 | 17.72 | 1.82 (9.3%) | **~0.9 (4.7%)** |
+| 7,992-token prompt (8,192) | 43.48 | 34.10 | 9.38 (21.6%) | **~4.7 (10.8%)** |
+| 7,992-token prefill | 5,602 | 5,250 | 352 (6.3%) | ~175 (3%) |
+
+- **The cache's reads are a fifth of attention's time at 8K.** A position costs 5.9 us at 2K and 4.4 us at 8K above
+  short context; its keys and values (393 KB F32) take 1.1 us of it. The rest is the scores and `P`: one query row a
+  head, each a padded tile row, written by `q k^T`, read three times by the softmax, written, read by `P V`. That is
+  ~26 ms of the 8K step, the larger lever, which only an attention that keeps the scores in L1 removes (a split of
+  `attention_rows` over positions).
+- **`attention_rows` fits 960 positions at head_dim 64** (the 896 KB arena, 7 `nt` + 6 slots); BF16 keys and values
+  at their own stride fit 1,344, so the 1,024-position step moves onto it.
+- **Capacity:** a 2,048-position cache for 32 sequences (W3) is 25.8 GB in F32 and 12.9 in BF16.
+- **Decision:** above the big-bet rule's 3% at 2K and past, and needed for W3's capacity: built. The kill stands:
+  if 2K decode does not improve, or short-context decode slows by more than 0.5%, BF16 stays an option for capacity.
+  (Amended after the results: the approved plan's kill reads "and", not "or": kill if 2K does not improve *and* short
+  context slows by more than 0.5%. This line restated it wrongly. The result is judged against the plan's wording, in
+  the [next section](#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1).)
+- Builds at 8,192 positions: 695 s first, 170 s second (each block choice measured; build time is not a target).
+  The default 900 s silicon timeout cut the first attempt (`1794491283`): such runs take `--timeout-secs 3600`.
+
+## W1: a BF16 KV cache, the performance contract's default (2026-11-12, cards 0 and 1)
+
+Roadmap W1, "A BF16 KV cache", built after its [bound](#w1-a-bf16-kv-cache-bounded-before-building-2026-11-12-card-1).
+The performance contract's cache is BF16 (`Llama::for_inference`, `Qwen35::for_inference`; `WeightOptions::f32_kv_cache`,
+`TT_KV_CACHE=f32` in the benches, keeps it F32); the reference contract's stays F32. Keys and values are rounded once,
+where they are made, and attention reads them as they lie:
+
+- **The cache's dtype is not the stream's** (`LlamaCache`/`hybrid_cache_as`): the stream and the rope table stay F32.
+- **Keys:** RoPE rounds its own result (`burn_tt::rope_as`, `Rope::apply_as`; `rope_blocks` packs BF16), one job, no cast.
+  Qwen3.5's partial rotary still casts after it.
+- **Values:** a column block of the fused `qkv` row narrows that block alone (`Session::cast_block`, from
+  `ops::cast_view_in_place`), dealt as the cache write that reads it. The first build cast the whole `qkv` buffer and
+  dealt the value tiles to other units, so the barrier probe (`TT_PROBE_BARRIERS`) found the write depending on them and
+  the write ran as its own op: 129 us a step (profile `1794505431`).
+- **The cache write:** `SCATTER_ROWS_BF16` (32-byte face-rows, either parity; `record::SCATTER_ROWS`), NC +116 bytes.
+- **Attention without widening:** `attention_rows` with BF16 keys and values at `BF16_TILE_SLOT` (`fits_as`: 1,344
+  positions at head_dim 64 against 960); past it the composition's `q k^T` and `P V` read the BF16 cache as their `B`
+  (`burn_tt::attention_wide`), a transposed BF16 `B` through the unpacker. The resident `A`'s placeholder reference is
+  the query's (a BF16 one failed the record's slot check: code 2, `RANGE`).
+
+Gates: `step273_bf16_kv_cache` (attention over BF16 keys and values bit for bit their widened values' at 64-2,048
+positions, causal and not, on and off `attention_rows`, nothing widened, and unrounded values differing; a cache write
+one job a head's row; a view and RoPE narrowing in one job each), `step187` (a performance-contract Llama generates as
+eagerly), `step185`, `step199`, `step209`, `step189` (ttsim and card 0); `step269` (card 0, `1794506203`, the tree as built): **228 of 232
+top-1, PCC 0.999762** (F32 cache 0.999765). Conformance: ttsim 2,973 passed, 52 expected; the BF16 suites on silicon
+1,115 passed, 72 expected. `step12_mnist` on card 0 and, sharded, both cards.
+
+The 1.7B, card 1, every run at the tree's tip (`8d3bc34+dirty`), the cache's dtype the only difference:
+
+| ms | F32 cache | BF16 cache | |
+|---|--:|--:|--:|
+| decode, 32 / 128 / 256-token prompt (512-position cache) | 7.695 / 8.238 / 8.846 (`1794501712`) | 7.842 / 8.307 / 8.853 (`1794506197`) | +1.9% / +0.8% / +0.1% |
+| prefill, the same, tokens/s | 1,246 / 3,428 / 4,219 | 1,234 / 3,415 / 4,125 | -1.0% / -0.4% / -2.2% |
+| decode, 32 / 2,000 / 7,992-token prompt (8,192 positions) | 7.71 / 19.44 / 43.44 (`1794504384`) | 7.85 / **18.89** / **38.67** (`1794507634`) | +1.8% / **-2.8%** / **-11.0%** |
+| prefill, 7,992 tokens | 5,605 | 5,481 | -2.2% |
+| Qwen3.5-4B decode, 32 / 256-token prompt | 54.43 / 54.83 (`1794503679`) | 54.71 / 55.40 (`1794508679`) | +0.5% / +1.0% |
+
+- **Against the bound:** 2K saved 0.55 ms (predicted ~0.9), 8K 4.77 (predicted ~4.7). 2K saves less than half the
+  probe's reads because the probe also dropped `attention_rows`' reads up to 960 positions and the scores'
+  composition is unchanged.
+- **The short-context cost is the value cast,** one element-wise op a layer inside the rope-and-write run: 31.0 against
+  27.0 us a layer, 7,396 against 7,267 us a step on the card (profiles `1794509472`, `1794509821`). Without it, a
+  BF16 value from `qkv` itself (a product whose result is BF16 in some columns) would remove it; not built. Qwen3.5
+  pays the same, plus its keys' cast (partial rotary), over 8 attention layers.
+- **Decision:** the approved plan kills BF16 as the default only if 2K does not improve *and* short context slows by
+  more than 0.5%. 2K improves 2.8% and 8K 11%, the cache's GDDR halves (a 2,048-position cache for 32 sequences
+  12.9 GB against 25.8), and the owner's tied-table decision put the scaling rule before the 0.5% rule. So BF16 is
+  the performance contract's cache. Short context pays +0.15 ms on the 1.7B (+1.9%), and `TT_KV_CACHE=f32` /
+  `WeightOptions::f32_kv_cache` keeps the F32 cache.
+- Earlier builds on the way: the cast of a view made plain first, then repacked by the write, 11.11 ms at 32 tokens
+  (`1794495735`; four casts a layer, 88 us each, profile `1794497018`); the whole buffer cast in place, 8.07
+  (`1794498272`); with `rope_as`, 7.96 (`1794499363`).
 
 ## W1: the BF16 defects fixed, the BF16 lookup, and one tied table (2026-11-12, cards 0 and 1)
 

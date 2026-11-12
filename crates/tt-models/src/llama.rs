@@ -401,8 +401,15 @@ impl<B: Backend> Layer<B> {
             ],
         };
         let q = rope.apply(heads(q, cfg.heads));
-        let k = rope.apply(heads(k, kv_heads));
-        let v = heads(v, kv_heads);
+        // The keys and values in the cache's dtype: rounded once here, after RoPE, where the
+        // cache is narrower than the stream (a BF16 cache, `Llama::for_inference`).
+        let kv_dtype = cache_k.dtype();
+        let in_cache = |t: Tensor<B, 4>| match t.dtype() == kv_dtype {
+            true => t,
+            false => t.cast(kv_dtype),
+        };
+        let k = rope.apply_as(heads(k, kv_heads), kv_dtype);
+        let v = in_cache(heads(v, kv_heads));
 
         let (q, new_k, new_v, keys, values, mask, is_causal) = match write {
             Write::At(start) => {
@@ -441,6 +448,14 @@ impl<B: Backend> Layer<B> {
                 let (keys, values) = (write.attended(new_k.clone()), write.attended(new_v.clone()));
                 (q, new_k, new_v, keys, values, Some(mask.clone()), false)
             }
+        };
+        // Keys and values narrower than the query (a BF16 cache) are read as they lie where the
+        // backend's attention takes them (`burn_tt::attention_wide`, bit for bit their widened
+        // values'), else widened.
+        let (keys, values) = if keys.dtype() == q.dtype() || burn_tt::attention_wide::<B>() {
+            (keys, values)
+        } else {
+            (keys.cast(q.dtype()), values.cast(q.dtype()))
         };
         let out = attention(
             q,
@@ -598,6 +613,10 @@ pub struct Llama<B: Backend> {
     /// keeps the stream F32 and stores the table BF16): the looked-up rows are widened to it
     /// (exactly), and the cache is made in it. `None`: the table's. Not a parameter.
     stream: Option<DType>,
+    /// The KV cache's dtype where it is not the stream's: BF16 under the performance contract
+    /// ([`Llama::for_inference`]), each step's keys and values rounded once as they are written
+    /// and attention reading them as they lie (`burn_tt::attention_wide`). Not a parameter.
+    kv: Option<DType>,
 }
 
 /// Widens every float parameter to F32.
@@ -624,6 +643,7 @@ impl<B: Backend> Llama<B> {
             numerics: None,
             operand: None,
             stream: None,
+            kv: None,
         }
     }
 
@@ -750,6 +770,11 @@ impl<B: Backend> Llama<B> {
             .unwrap_or_else(|| self.embed_tokens.weight.val().dtype())
     }
 
+    /// The KV cache's dtype: [`Llama::for_inference`]'s choice, else the stream's.
+    pub fn kv_dtype(&self) -> DType {
+        self.kv.unwrap_or_else(|| self.stream_dtype())
+    }
+
     /// An empty cache for `max_len` positions of one sequence.
     pub fn cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> KvCache<B> {
         let shape = [1, self.config.kv_heads, max_len, self.config.head_dim];
@@ -826,9 +851,21 @@ impl<B: Backend> Llama<B> {
     /// An empty [`LlamaCache`] for `max_len` positions, in the layout the heads take
     /// ([`CacheLayout::for_heads`]).
     pub fn fixed_cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> LlamaCache<B> {
+        self.fixed_cache_as(max_len, dtype, dtype, device)
+    }
+
+    /// [`Self::fixed_cache`] with the keys and values in `kv` and the rotary table in the stream's
+    /// `dtype` (a BF16 cache beside an F32 stream: the performance contract's).
+    pub fn fixed_cache_as(
+        &self,
+        max_len: usize,
+        dtype: DType,
+        kv: DType,
+        device: &B::Device,
+    ) -> LlamaCache<B> {
         let cfg = &self.config;
         let layout = CacheLayout::for_heads(cfg.kv_heads, cfg.head_dim);
-        self.fixed_cache_in(max_len, layout, dtype, device)
+        self.fixed_cache_in_as(max_len, layout, dtype, kv, device)
     }
 
     /// An empty [`LlamaCache`] for `max_len` positions, laid out as `layout` says (of the model's
@@ -840,6 +877,18 @@ impl<B: Backend> Llama<B> {
         dtype: DType,
         device: &B::Device,
     ) -> LlamaCache<B> {
+        self.fixed_cache_in_as(max_len, layout, dtype, dtype, device)
+    }
+
+    /// [`Self::fixed_cache_in`] with the keys and values in `kv` ([`Self::fixed_cache_as`]).
+    pub fn fixed_cache_in_as(
+        &self,
+        max_len: usize,
+        layout: CacheLayout,
+        dtype: DType,
+        kv: DType,
+        device: &B::Device,
+    ) -> LlamaCache<B> {
         let cfg = &self.config;
         assert_eq!(
             layout.heads(),
@@ -847,7 +896,7 @@ impl<B: Backend> Llama<B> {
             "a layout of the model's key/value heads"
         );
         LlamaCache {
-            kv: FixedCache::zeros_in(cfg.layers, layout, max_len, dtype, device),
+            kv: FixedCache::zeros_in(cfg.layers, layout, max_len, kv, device),
             rope: Rope::table(max_len, cfg.head_dim, cfg.rope_theta, dtype, device),
         }
     }
@@ -1049,9 +1098,9 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         self.numerics
     }
 
-    /// A cache in the stream's dtype.
+    /// A cache in the contract's dtype ([`Llama::kv_dtype`]), its rotary table in the stream's.
     fn new_cache(&self, max_len: usize, device: &B::Device) -> LlamaCache<B> {
-        self.fixed_cache(max_len, self.stream_dtype(), device)
+        self.fixed_cache_as(max_len, self.stream_dtype(), self.kv_dtype(), device)
     }
 
     fn chunk(
@@ -1063,7 +1112,7 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         cache: &LlamaCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let x = self.embed(tokens);
-        self.fixed_chunk_within(x, start, last, len, cache, cache.kv.dtype())
+        self.fixed_chunk_within(x, start, last, len, cache, self.stream_dtype())
     }
 
     fn step(
@@ -1074,7 +1123,7 @@ impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
         cache: &LlamaCache<B>,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let x = self.embed(token);
-        self.fixed_step_within(x, position, len, cache, cache.kv.dtype())
+        self.fixed_step_within(x, position, len, cache, self.stream_dtype())
     }
 }
 
@@ -1223,6 +1272,11 @@ impl<B: burn_tt::storage::StorageBackend> Llama<B> {
         // contract's read F32, bit for bit.
         if numerics == burn_tt::Numerics::Performance && !options.f32_activations {
             model.operand = Some(DType::BF16);
+        }
+        // The performance contract's KV cache is BF16 ([`crate::quant::WeightOptions::f32_kv_cache`]
+        // opts out); the reference contract's is the stream's, F32.
+        if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
+            model.kv = Some(DType::BF16);
         }
         model.numerics = Some(numerics);
         model

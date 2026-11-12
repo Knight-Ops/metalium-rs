@@ -360,6 +360,13 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   0.5% rule): the 1.7B 7.52 -> 7.68 ms a step and 513 -> 201 MB of table and head, `step269` PCC 0.99967 -> 0.99976
   (top-1 the same 228 of 232); Qwen3.5-4B 56.93 -> 54.47 ms and 1.27 GB less. `WeightOptions::untied_head` keeps the
   two-copy layout as an option.
+- **W1: a BF16 KV cache, the performance contract's default** (2026-11-12, gates ttsim and card 0, benches card 1;
+  [log](../learnings/performance-log.md#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1)). Bounded first (keys and values not read: 9.3% of
+  the 1.7B's step at 2K, 21.6% at 8K), then built: keys rounded by RoPE itself (`burn_tt::rope_as`), values by a
+  cast of their block alone (`Session::cast_block`, dealt as the cache write reads it), the write in 32-byte face-rows
+  (`SCATTER_ROWS_BF16`), and attention reading BF16 keys and values as they lie, bit for bit their widened values'
+  (`step273`). The 1.7B at 2K 19.44 -> 18.89 ms, at 8K 43.44 -> 38.67, at short context 7.70 -> 7.84 (the values'
+  cast); half the cache's GDDR; `attention_rows` to 1,344 positions; `step269` 228 of 232, PCC 0.99976.
 
 ## Prefill and long context
 

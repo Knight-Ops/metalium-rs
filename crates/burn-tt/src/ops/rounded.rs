@@ -325,3 +325,17 @@ pub fn matmul_wide<B: burn_backend::Backend, const D: usize>(
     shape[D - 1] = n;
     dispatch(Kind::MatmulWide, x, w, shape.into(), DType::F32)
 }
+
+/// Whether `B`'s attention takes an F32 query over BF16 keys and values (a BF16 KV cache) with an
+/// F32 result, bit for bit the attention of the widened keys and values, reading them where they
+/// lie (`TtBackend` and `Tt`: `burn_tt::ops::module::attention`). Elsewhere a caller widens them
+/// first: Burn's attention takes operands of one dtype.
+pub fn attention_wide<B: burn_backend::Backend>() -> bool {
+    use std::any::TypeId;
+    let b = TypeId::of::<B>();
+    #[cfg(feature = "fusion")]
+    if b == TypeId::of::<crate::Tt>() {
+        return true;
+    }
+    b == TypeId::of::<crate::TtBackend>()
+}

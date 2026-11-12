@@ -22,8 +22,14 @@ pub fn rope_count() -> u64 {
 
 /// `x cos + rotate(x) sin` for `x` `[n, heads, t, head]` (F32, a view or plain) and tables
 /// `[1, 1, t, head]` (or `x`'s shape), on the device as one op, where `head / 2` is whole tiles
-/// and `x`'s heads are column blocks of its buffer. `None` otherwise: the caller composes it.
-pub(crate) fn rope_native(x: &TtTensor, cos: &TtTensor, sin: &TtTensor) -> Option<TtTensor> {
+/// and `x`'s heads are column blocks of its buffer. `None` otherwise: the caller composes it. The
+/// result is `out`: F32, or BF16 rounded once at the pack (a BF16 KV cache's keys).
+pub(crate) fn rope_native(
+    x: &TtTensor,
+    cos: &TtTensor,
+    sin: &TtTensor,
+    out: DType,
+) -> Option<TtTensor> {
     let sa = x.shape().to_vec();
     if sa.len() != 4 || sa.contains(&0) {
         return None;
@@ -32,6 +38,7 @@ pub(crate) fn rope_native(x: &TtTensor, cos: &TtTensor, sin: &TtTensor) -> Optio
     let device = x.device;
     if head % 64 != 0
         || [x.dtype(), cos.dtype(), sin.dtype()] != [DType::F32; 3]
+        || !matches!(out, DType::F32 | DType::BF16)
         || cos.shape() != sin.shape()
         || cos.device != device
         || sin.device != device
@@ -96,18 +103,17 @@ pub(crate) fn rope_native(x: &TtTensor, cos: &TtTensor, sin: &TtTensor) -> Optio
     let _held = (&v.src, &dc, &ds);
     let _part = crate::report::part("rope/native");
     NATIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let (id, dims) = crate::server::rope_blocks(device, xa, whole(&dc), whole(&ds), head);
-    let out = device_view(device, id, dims, None, DType::F32)
-        .to_dram()
-        .clone();
+    let (id, dims) =
+        crate::server::rope_blocks(device, xa, whole(&dc), whole(&ds), head, out == DType::BF16);
+    let made = device_view(device, id, dims, None, out).to_dram().clone();
     Some(TtTensor::view(
         crate::views::Strided {
-            src: out,
+            src: made,
             base: [0, 0],
             strides: v.strides,
         },
         x.shape(),
-        DType::F32,
+        out,
         device,
     ))
 }
@@ -142,10 +148,18 @@ pub(crate) fn rope_composed(x: TtTensor, cos: TtTensor, sin: TtTensor) -> TtTens
     B::float_add(B::float_mul(x, cos), B::float_mul(swapped, sin))
 }
 
-/// [`rope_native`], else [`rope_composed`]: charged to an op of its own, `rope`, as Burn's ops are.
-pub(crate) fn rope_tt(x: TtTensor, cos: TtTensor, sin: TtTensor) -> TtTensor {
+/// [`rope_native`], else [`rope_composed`] then the cast to `out`: charged to an op of its own,
+/// `rope`, as Burn's ops are.
+pub(crate) fn rope_tt(x: TtTensor, cos: TtTensor, sin: TtTensor, out: DType) -> TtTensor {
     let _op = crate::report::enter("rope", true);
-    let out = rope_native(&x, &cos, &sin).unwrap_or_else(|| rope_composed(x, cos, sin));
+    let out = rope_native(&x, &cos, &sin, out).unwrap_or_else(|| {
+        let y = rope_composed(x, cos, sin);
+        if y.dtype() == out {
+            y
+        } else {
+            cast_native(y, out)
+        }
+    });
     // On the device either way (a view of the op's buffer, or the composition's tensor): never
     // ask the view for its buffer here, which would copy it out.
     crate::report::made(true);
@@ -164,6 +178,7 @@ pub(crate) mod fused {
     #[derive(Debug)]
     struct RopeOp {
         desc: CustomOpIr,
+        out: burn_backend::DType,
     }
 
     impl Operation<TtFusionRuntime> for RopeOp {
@@ -172,7 +187,8 @@ pub(crate) mod fused {
             let x = handles.get_float_tensor::<TtBackend>(x);
             let cos = handles.get_float_tensor::<TtBackend>(cos);
             let sin = handles.get_float_tensor::<TtBackend>(sin);
-            handles.register_float_tensor::<TtBackend>(&out.id, super::rope_tt(x, cos, sin));
+            handles
+                .register_float_tensor::<TtBackend>(&out.id, super::rope_tt(x, cos, sin, self.out));
         }
     }
 
@@ -181,17 +197,24 @@ pub(crate) mod fused {
         x: FusionTensor<TtFusionRuntime>,
         cos: FusionTensor<TtFusionRuntime>,
         sin: FusionTensor<TtFusionRuntime>,
+        dtype: burn_backend::DType,
     ) -> FusionTensor<TtFusionRuntime> {
         let client = x.client.clone();
         let streams = OperationStreams::with_inputs([&x, &cos, &sin]);
-        let out = TensorIr::uninit(client.create_empty_handle(), x.shape.clone(), x.dtype);
-        let desc = CustomOpIr::new(
+        let out = TensorIr::uninit(client.create_empty_handle(), x.shape.clone(), dtype);
+        let mut desc = CustomOpIr::new(
             "tt_rope",
             &[x.into_ir(), cos.into_ir(), sin.into_ir()],
             &[out],
         );
+        // The result's dtype rides in the id (a custom operation's IR holds only tensors).
+        desc.id = format!("tt_rope:{dtype:?}");
         client
-            .register(streams, OperationIr::Custom(desc.clone()), RopeOp { desc })
+            .register(
+                streams,
+                OperationIr::Custom(desc.clone()),
+                RopeOp { desc, out: dtype },
+            )
             .into_iter()
             .next()
             .expect("one output")
@@ -207,6 +230,18 @@ pub fn rope<B: burn_backend::Backend>(
     x: &burn_tensor::Tensor<B, 4>,
     cos: &burn_tensor::Tensor<B, 4>,
     sin: &burn_tensor::Tensor<B, 4>,
+) -> Option<burn_tensor::Tensor<B, 4>> {
+    rope_as(x, cos, sin, x.dtype())
+}
+
+/// [`rope`] with its result in `dtype`: for an F32 `x`, BF16 rounds the result once where it is
+/// made, bit for bit `rope(x, cos, sin).cast(BF16)` (a BF16 KV cache's keys: no cast op after).
+/// `None` on any other backend.
+pub fn rope_as<B: burn_backend::Backend>(
+    x: &burn_tensor::Tensor<B, 4>,
+    cos: &burn_tensor::Tensor<B, 4>,
+    sin: &burn_tensor::Tensor<B, 4>,
+    dtype: DType,
 ) -> Option<burn_tensor::Tensor<B, 4>> {
     use burn_tensor::{Tensor, TensorPrimitive};
     use std::any::{Any, TypeId};
@@ -229,6 +264,7 @@ pub fn rope<B: burn_backend::Backend>(
             float(x.into_primitive())?,
             float(c.into_primitive())?,
             float(s.into_primitive())?,
+            dtype,
         );
         return cast(Tensor::<crate::TtBackend, 4>::from_primitive(
             TensorPrimitive::Float(y),
@@ -242,6 +278,7 @@ pub fn rope<B: burn_backend::Backend>(
             float(x.into_primitive())?,
             float(c.into_primitive())?,
             float(s.into_primitive())?,
+            dtype,
         );
         return cast(Tensor::<crate::Tt, 4>::from_primitive(
             TensorPrimitive::Float(y),

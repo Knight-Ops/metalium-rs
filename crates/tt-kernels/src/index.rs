@@ -457,11 +457,24 @@ pub(crate) fn scatter_rows_jobs(
         .map(|p| p * n / parts..(p + 1) * n / parts)
         .collect();
     let dst_ref = dst.tensor_ref().encode();
-    let flags = if column {
-        record::SCATTER_ROWS_COLUMN
-    } else {
-        0
+    // A BF16 tensor's rows are 32-byte face-rows (a BF16 KV cache); no other packed one is taken.
+    let half = match dst.elem {
+        Elem::BF16 => record::SCATTER_ROWS_BF16,
+        Elem::Packed(_) => {
+            return Err(TensorError::Elem {
+                op: "a resident row scatter".into(),
+                got: dst.elem,
+                wants: Elem::F32,
+            })
+        }
+        _ => 0,
     };
+    let flags = half
+        | if column {
+            record::SCATTER_ROWS_COLUMN
+        } else {
+            0
+        };
     let read = |range: tt_isa::dram::DramRange, at: u64, port: usize| {
         [
             op::READ,

@@ -1078,12 +1078,18 @@ fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
         Ok("1") => true,
         Ok(other) => panic!("TT_UNTIED_HEAD={other}: expected 0 or 1"),
     };
+    let f32_kv_cache = match std::env::var("TT_KV_CACHE").as_deref() {
+        Err(_) | Ok("bf16") => false,
+        Ok("f32") => true,
+        Ok(other) => panic!("TT_KV_CACHE={other}: expected bf16 or f32"),
+    };
     (
         numerics,
         tt_models::quant::WeightOptions {
             mlp_bfp4,
             f32_activations,
             untied_head,
+            f32_kv_cache,
         },
     )
 }
@@ -1119,10 +1125,11 @@ fn bench_model<B: burn_tt::storage::StorageBackend>(m: Llama<B>, fused: bool) ->
     }
     let (numerics, options) = bench_contract();
     println!(
-        "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"untied_head\":{}}}",
+        "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"untied_head\":{},\"f32_kv_cache\":{}}}",
         numerics.name(),
         options.mlp_bfp4,
-        options.untied_head
+        options.untied_head,
+        options.f32_kv_cache
     );
     m.for_inference(numerics, options)
 }
@@ -1589,6 +1596,11 @@ fn traced_generation_stream_ceiling() {
     let batched_a = std::env::var("TT_PROBE_BATCHED_A").unwrap_or_default();
     tt_kernels::tensor::probe_skip_batched_a_reads(batched_a == "1");
     tt_kernels::tensor::probe_skip_batched_a_rereads(batched_a == "rereads");
+    // The bound on a narrower KV cache (`roadmap.md`, "A BF16 KV cache"): `TT_PROBE_BATCHED_B=1`
+    // skips the batched products' `B` reads, attention's keys and values past `attention_rows`'
+    // lengths, the products wrong.
+    let batched_b = std::env::var("TT_PROBE_BATCHED_B").is_ok_and(|v| v == "1");
+    tt_kernels::tensor::probe_skip_batched_b_reads(batched_b);
     probe_background_stream(background);
     // `TT_PROBE_CONTIGUOUS_B=<entry bytes>`: each one-row product's weight stream read from a
     // contiguous scratch in entries of that size, under B's own cap (`TT_IN_FLIGHT_CAP`), its
@@ -1654,6 +1666,10 @@ fn traced_generation_stream_ceiling() {
         "1" => format!("{tag}, batched A skipped"),
         "rereads" => format!("{tag}, batched A re-reads skipped"),
         _ => tag,
+    };
+    let tag = match batched_b {
+        true => format!("{tag}, batched B skipped"),
+        false => tag,
     };
     let tag = match contiguous {
         Some(entry) => format!("{tag}, contiguous B in {entry}-byte reads"),
@@ -1801,6 +1817,7 @@ fn traced_generation_stream_ceiling() {
     probe_skip_weight_reads(false);
     tt_kernels::tensor::probe_skip_batched_a_reads(false);
     tt_kernels::tensor::probe_skip_batched_a_rereads(false);
+    tt_kernels::tensor::probe_skip_batched_b_reads(false);
     probe_background_stream(None);
     probe_space_report(false);
     tt_models::llama::probe_free_consumers(false, false);

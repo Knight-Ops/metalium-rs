@@ -88,6 +88,12 @@ pub struct WeightOptions {
     /// `burn_tt::matmul_wide`) both read. Its cost on SmolLM2-1.7B: the BFP8 head's 113 MB of GDDR
     /// more, for the BF16 head's extra bytes a decode step (`performance-log.md`).
     pub untied_head: bool,
+    /// Under the performance contract, an F32 KV cache: the measurement's baseline. By default
+    /// (since 2026-11-12, roadmap W1) the contract's cache is BF16, each step's keys and values
+    /// rounded once as they are written (after RoPE) and attention reading them as they lie
+    /// (`Llama::for_inference`, `burn_tt::attention_wide`): half the bytes a step attends over and
+    /// half the cache's GDDR. The reference contract's cache is F32 either way.
+    pub f32_kv_cache: bool,
 }
 
 /// The format of each named tensor: the first rule whose pattern is a substring of the name wins,
