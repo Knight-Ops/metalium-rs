@@ -283,6 +283,12 @@ They run in this order; W1-W4 can overlap.
   norm's output, `silu(gate) * up`), the products giving F32. 1.7B decode 7.52 / 8.01 / 8.64 ms (unchanged), prefill
   4,266 tokens/s at 256 (1.065x; 3,552 at 128, 1.09x), `step269` the same 228 of 232. Still open from W1's
   prediction: a BF16 KV cache at long context.
+- **The BF16 defects, the BF16 lookup and one tied table (2026-11-12,** cards 0 and 1;
+  [log](../learnings/performance-log.md#w1-the-bf16-defects-fixed-the-bf16-lookup-and-one-tied-table-2026-11-12-cards-0-and-1)):
+  a transposed BF16 `B` read as it lies (the unpacker transposes it), `SELECT_ROWS_BF16`, and a tied table stored
+  once, BF16, by the owner's decision: the 1.7B 7.52 -> 7.68 ms (0.73x tt-metal's 10.55), Qwen3.5-4B 56.93 -> 54.47.
+  Still open from W1's prediction: a BF16 KV cache at long context, whose two parts (a transposed BF16 `q k^T`, 2-byte
+  rows in B's records) now exist.
 - **First box landed (2026-11-10;** [log](../learnings/performance-log.md#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1)):
   - **The switch:** `burn_tt::Numerics`, recorded in traces.
   - **The default:** tt-models' `for_inference` stores BFP8 weights under the performance contract.

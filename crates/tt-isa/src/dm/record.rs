@@ -51,7 +51,8 @@ pub const GATHER_A_RESIDENT: u32 = 1 << 25;
 /// [`GATHER`]'s flag for a transposed `B` (bit 1) whose tiles the kernel's unpacker transposes:
 /// tile `(kk, j)` of `op(B)` is `B`'s tile `(j, kk)` read as it lies (`op::READ`, not
 /// `op::READ_TRANSPOSED`), so the mover moves whole tiles and transposes nothing. Refused
-/// without bit 1, and with packed BF16.
+/// without bit 1. With a packed `B` only for BF16, each tile read whole from its own slot
+/// (roadmap W1: a tied table's head `last @ table^T`, a BF16 cache's `q k^T`).
 pub const GATHER_B_UNPACK_TRANSPOSE: u32 = 1 << 26;
 /// [`GATHER`]'s flag for a prefetch: RISCV B issues the record's reads on
 /// [`super::TXN_PREFETCH`], not its own ID, so nothing but an [`super::op::WAIT`] with
@@ -70,8 +71,8 @@ pub const GATHER_STREAM: u32 = 1 << 28;
 /// [`crate::format::TileFormat::slot_bytes`], each read whole into an L1 slot of the same size
 /// (`b_at + (kk * cols + j) * slot`: more tiles in a ring than an FP32 `B`'s,
 /// `docs/completed-plans/bf16-weight-storage.md` A5b), where the kernel unpacks it in its own format
-/// (`tt_kernels::matmul::SrcRoute::Tf32WithB`). A packed `B` is untransposed only (not bit 1,
-/// not [`GATHER_B_UNPACK_TRANSPOSE`]); with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
+/// (`tt_kernels::matmul::SrcRoute::Tf32WithB`). A packed `B` is untransposed only (not bit 1),
+/// but for BF16 transposed by the kernel ([`GATHER_B_UNPACK_TRANSPOSE`]); with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
 /// the writer's (zero for a stored weight): nothing is filled.
 pub const GATHER_B_FORMAT_SHIFT: u32 = 29;
 /// [`GATHER`]'s bits that hold `B`'s format code.
@@ -147,6 +148,14 @@ pub const fn gather_b_packed(flags: u32) -> bool {
 /// Whether [`GATHER`]'s `A` is packed (any format but FP32).
 pub const fn gather_a_packed(flags: u32) -> bool {
     flags & GATHER_A_FORMAT_MASK != 0
+}
+/// Whether `flags` name a transposed packed `B` that a [`GATHER`] refuses: one is read only as
+/// BF16, as it lies, for the kernel's unpacker to transpose ([`GATHER_B_UNPACK_TRANSPOSE`]; a BF16
+/// face is moved to `SrcA` as is and transposed there as an FP32 one is, roadmap W1).
+const fn gather_b_transpose_refused(flags: u32) -> bool {
+    gather_b_packed(flags)
+        && flags & 2 != 0
+        && (flags & GATHER_B_UNPACK_TRANSPOSE == 0 || flags & GATHER_B_FORMAT_MASK != GATHER_B_BF16)
 }
 /// [`GATHER`]'s flags for a `B` stored BF16 (a weight in half the bytes) beside an FP32 `A`:
 /// [`gather_b_format`] of BF16, code 1.
@@ -229,7 +238,7 @@ impl PrefetchCursor {
             return Err(super::error::RANGE);
         }
         let slot = gather_b_slot(flags)? as u32;
-        if gather_b_packed(flags) && b_t {
+        if gather_b_transpose_refused(flags) {
             return Err(super::error::RANGE);
         }
         gather_a_slot(flags)?;
@@ -380,14 +389,15 @@ pub const PAD_WRITE: u32 = 0x17;
 /// the index as `u32`, so a negative one is refused too). Rows `count..32` of
 /// each output tile are left as the slot held them.
 ///
-/// `flags` is `0`: 32-bit datums (F32, I32, Bool). **Packed BF16 is not
-/// implemented.** Its face-rows are 32 bytes, congruent to `TILE_DATA` mod 64
-/// only on an even row, so a read must take the pair a row is half of and the
-/// wanted half be moved; that code, in this record, measured 400 bytes more
-/// in RISCV B's image, which then had 172 of its 24 KiB left (a mover image
-/// may not pass `IMAGE_MAX`, now 52,224 bytes since the role images were
-/// repacked; `cargo xtask fw-size` prints the room left). `docs/plans/roadmap.md`, "Gather without staging", has the
-/// options.
+/// `flags` is `0` for 32-bit datums (F32, I32, Bool), or [`SELECT_ROWS_BF16`] with an aside
+/// region for a table of BF16 slots (roadmap W1, the BF16 embedding lookup). A BF16 face-row is 32
+/// bytes, so a source row and its output row are congruent mod 64 (what a GDDR read needs) only
+/// when their face-rows have the same parity, which the index decides: such a row is read where it
+/// goes, and any other into the aside region, at `aside + ((j * count + r) * 2 + h) * 64 +
+/// from % 64`, then moved to its place by one [`op::COPY_HALFWORDS`] of 16 datums once every read
+/// is issued (B waits for the reads before its first copy). The aside region is
+/// `(flags >> SELECT_ROWS_ASIDE_SHIFT) * 64`, `cols x count x 128` bytes of the data arena.
+/// The output tiles are BF16 tiles at the FP32 slots' stride from `stage_at`.
 ///
 /// The slots are not checked against the data arena here (the mover's image has
 /// no room for it; `tt_kernels::index::select_rows_jobs` places them from its
@@ -399,6 +409,12 @@ pub const PAD_WRITE: u32 = 0x17;
 /// [`expand`] has no L1, reads every index as `0` and so checks the record's
 /// geometry (alignment, range) and nothing about the indices.
 pub const SELECT_ROWS: u32 = 0x18;
+/// [`SELECT_ROWS`]'s flag for a table of BF16 slots: 32-byte face-rows, some moved through the
+/// aside region its flags name ([`SELECT_ROWS_ASIDE_SHIFT`]).
+pub const SELECT_ROWS_BF16: u32 = 1;
+/// [`SELECT_ROWS`]'s flags bits from which the aside region's address, in 64-byte units, is held
+/// (with [`SELECT_ROWS_BF16`]; no other bit is defined).
+pub const SELECT_ROWS_ASIDE_SHIFT: u32 = 8;
 /// A run of consecutive words of one role's mailbox: `[POKE_RUN, address,
 /// count, v0, v1, v2, v3, v4]` + `[v5, ..., v12]`, `count` in
 /// `1..=`[`POKE_RUN_MAX`], the values past `count` zero. The same words
@@ -551,8 +567,8 @@ pub struct TensorRef {
     /// slots of their own size (roadmap W1, native BF16 arithmetic). [`READ_RUN`], [`WRITE_RUN`],
     /// [`SCATTER`] and [`GATHER`] step and size their GDDR accesses by it (a BF16 tile is read
     /// whole, its 2,112 bytes, and written as its 2,048 bytes of data); L1 keeps its
-    /// [`TILE_SLOT`] stride, so a kernel's slots do not move. Every other record, and the moves
-    /// that work on FP32 datums ([`op::READ_TRANSPOSED`], [`op::READ_BROADCAST_COL`]), refuse a
+    /// [`TILE_SLOT`] stride, so a kernel's slots do not move. [`SELECT_ROWS`] reads one with
+    /// [`SELECT_ROWS_BF16`]. Every other record, and the moves that work on FP32 datums ([`op::READ_TRANSPOSED`], [`op::READ_BROADCAST_COL`]), refuse a
     /// BF16 slot ([`super::error::RANGE`]).
     pub slot: u32,
 }
@@ -940,6 +956,56 @@ struct ColumnWalk {
     thin: u32,
 }
 
+/// [`SELECT_ROWS`] of a BF16 table, its indices checked: each index's two face-rows of every tile
+/// column read where they go when their parity agrees, else into the aside region, then the aside
+/// ones moved to their places (the record's documentation). Out of line, as its own code: the F32
+/// arm's loop is the hot one.
+#[inline(never)]
+fn select_bf16_rows(
+    table: &TensorRef,
+    index: &mut dyn FnMut(u32) -> u32,
+    [idx_at, count, j0, cols, stage_at, flags]: [u32; 6],
+    emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    const DATA: u32 = TILE_DATA as u32;
+    let aside = (flags >> SELECT_ROWS_ASIDE_SHIFT) * 64;
+    let slot = table.slot_bytes();
+    let word = |r: u32| idx_at + DATA + (r / 16 * 256 + r % 16) * 4;
+    // A BF16 tile's face-row `h` of row `r`: 32 bytes, at 16 or 48 mod 64.
+    let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * 32;
+    // Where row `r`'s face-row `h` of tile column `j` lands (`from` its source), and whether that
+    // is the aside region.
+    let at = |from: u32, r: u32, j: u32, h: u32| {
+        let to = stage_at + j * TILE_SLOT as u32 + face_row(r, h);
+        if (from ^ to) % 64 == 0 {
+            (to, to, false)
+        } else {
+            (aside + ((j * count + r) * 2 + h) * 64 + from % 64, to, true)
+        }
+    };
+    let mut port = 0;
+    for copies in [false, true] {
+        for r in 0..count {
+            let v = index(word(r));
+            let mut row = table.cursor(v / 32, j0)?;
+            for j in 0..cols {
+                let (ch, off) = row.next_with_slot(slot)?;
+                for h in 0..2 {
+                    let from = off + face_row(v % 32, h);
+                    let (got, to, aside) = at(from, r, j, h);
+                    if !copies {
+                        emit([op::READ, ch, port, from, got, 32, 0, 0])?;
+                        port = if port + 1 == PORTS { 0 } else { port + 1 };
+                    } else if aside {
+                        emit([super::op::COPY_HALFWORDS, got, to, 16, 2, 2, 0, 0])?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`ColumnWalk`]'s reads of `x`, in a record [`gather_by_column`] took out of line, as every
 /// by-column path is: [`TensorRef::tile`], [`Cursor`] and the [`GATHER`] arm stay the interleaved
 /// code alone. The mover's per-tile loops are hot for every op, and a by-column branch in them, or
@@ -960,7 +1026,9 @@ fn walk_by_column(
         return Err(super::error::RANGE);
     }
     let down = w.transposed.is_some();
-    let slot = if down { size } else { w.slot };
+    // An operand's own slot, read whole: down a column too, where only an FP32 one or a BF16 `B`
+    // the kernel transposes ([`GATHER_B_UNPACK_TRANSPOSE`]) goes.
+    let slot = w.slot;
     // A tile's slot is `(g * per + r) * slot` on channel `c`: by column, `g` its column group,
     // `per` a column's tiles and `r` its row; interleaved, `g` its slot (`per` 1, `r` 0). Each
     // next tile is a step, the channel carrying into `g`: down a column by column, a row; along
@@ -998,7 +1066,7 @@ fn walk_by_column(
             0
         };
         let (op, data, bytes) = match (w.transposed, thin) {
-            (Some(op), _) => (op, 0, size),
+            (Some(op), _) => (op, 0, w.slot),
             (None, 0) => (op::READ, 0, w.slot),
             (None, thin) => (op::READ, TILE_DATA as u32, 1024 + 64 * thin),
         };
@@ -1163,7 +1231,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 return Err(super::error::RANGE);
             }
             let b_slot = gather_b_slot(flags)?;
-            if gather_b_packed(flags) && b_t {
+            if gather_b_transpose_refused(flags) {
                 return Err(super::error::RANGE);
             }
             let a_slot = gather_a_slot(flags)?;
@@ -1270,8 +1338,12 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                             e
                         }
                         Some(r) => read(r.next()?, kk, j0 + j, to),
-                        // The kernel transposes it: the tile as it lies.
-                        None if b_unpacked => read(b.tile(j0 + j, kk)?, kk, j0 + j, to),
+                        // The kernel transposes it: the tile as it lies, in its own slot.
+                        None if b_unpacked => {
+                            let mut e = read(b.tile_in(j0 + j, kk, b_slot)?, kk, j0 + j, to);
+                            e[5] = b_slot as u32;
+                            e
+                        }
                         None => fetch(&b, b_t, kk, j0 + j, to)?,
                     })?;
                 }
@@ -1385,15 +1457,21 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         }
         SELECT_ROWS => {
             let [_, idx_at, count, bound, j0, cols, stage_at, flags] = h;
-            if flags != 0 {
-                // Packed BF16 is not implemented.
+            // A BF16 table names its slots; an FP32 one, and any other flag, none.
+            let half = flags & SELECT_ROWS_BF16 != 0;
+            if flags & ((1 << SELECT_ROWS_ASIDE_SHIFT) - 1) & !SELECT_ROWS_BF16 != 0
+                || (!half && flags != 0)
+            {
                 return Err(super::error::RANGE);
             }
             if count == 0 || count > 32 || bound == 0 || bound > i32::MAX as u32 {
                 return Err(super::error::LENGTH);
             }
             let cols = extent(cols)?;
-            let table = tensor(rec, 1)?;
+            let table = tensor_slotted(rec, 1)?;
+            if half != (table.slot != 0) {
+                return Err(super::error::RANGE);
+            }
             // Every tile number a checked index can name fits a `u32` (the
             // cursor adds without checking: an index comes from L1).
             let tiles = bound
@@ -1417,6 +1495,14 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 if index(word(r)) >= bound {
                     return Err(super::error::DOMAIN);
                 }
+            }
+            if half {
+                return select_bf16_rows(
+                    &table,
+                    index,
+                    [idx_at, count, j0, cols, stage_at, flags],
+                    &mut emit,
+                );
             }
             // A tile row's face-row `h` of row `r`: two 64-byte reads a row a
             // tile column, each congruent to `TILE_DATA` mod 64 in every slot.
@@ -1935,6 +2021,7 @@ mod tests {
                     GATHER_A_RESIDENT | 2 | GATHER_B_UNPACK_TRANSPOSE,
                     GATHER_A_RESIDENT | GATHER_B_BF16,
                     GATHER_A_RESIDENT | gather_rows(5) | GATHER_B_BF16,
+                    GATHER_A_RESIDENT | GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
                 ] {
                     let head = |f: u32| [GATHER, f | kt << 8, 0x2_0000, 0x6_0000, 0, 1, j0, cols];
                     let rec = |f: u32| {
@@ -1990,7 +2077,10 @@ mod tests {
             (GATHER_A_RESIDENT | GATHER_STREAM, t(2, 4)),
             (GATHER_A_RESIDENT | GATHER_B_BF16 | 2, t(2, 4)),
             (
-                GATHER_A_RESIDENT | GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
+                GATHER_A_RESIDENT
+                    | gather_b_format(crate::tile::L1Format::Bfp8).unwrap()
+                    | 2
+                    | GATHER_B_UNPACK_TRANSPOSE,
                 t(2, 4),
             ),
         ] {
@@ -2173,8 +2263,9 @@ mod tests {
     /// A BF16 `B` ([`GATHER_B_BF16`]) is read from its own slots: each tile's whole
     /// [`super::super::BF16_TILE_SLOT`] from where a BF16 tensor keeps it (slot `t / n` of 2,112
     /// bytes on channel `t % n`), into a 2,112-byte L1 slot of its own (an FP32 `B`'s ring holds
-    /// half the tiles in the same bytes), and `A`'s entries are untouched -- whole, thin, transposed, resident, streamed. A transposed `B` and
-    /// packed BF16 are refused.
+    /// half the tiles in the same bytes), and `A`'s entries are untouched -- whole, thin, transposed, resident, streamed. A transposed BF16
+    /// `B` is read as it lies for the kernel's unpacker to transpose ([`GATHER_B_UNPACK_TRANSPOSE`]);
+    /// read transposed by the mover, or in another packed format, it is refused.
     #[test]
     fn a_bf16_b_reads_its_own_slots_whole() {
         use super::super::BF16_TILE_SLOT;
@@ -2211,6 +2302,10 @@ mod tests {
             GATHER_A_RESIDENT,
             GATHER_STREAM,
             GATHER_A_RESIDENT | GATHER_PREFETCH,
+            // Transposed by the kernel's unpacker: tile `(kk, j)` of `op(B)` is `B`'s `(j, kk)`,
+            // read as it lies in its own slot.
+            2 | GATHER_B_UNPACK_TRANSPOSE,
+            GATHER_A_RESIDENT | GATHER_PREFETCH | 2 | GATHER_B_UNPACK_TRANSPOSE,
         ] {
             let f32_b = gather(flags).unwrap();
             let bf16_b = gather(flags | GATHER_B_BF16).unwrap();
@@ -2223,7 +2318,11 @@ mod tests {
             );
             for (n, (got, was)) in bf16_b[first_b..].iter().zip(&f32_b[first_b..]).enumerate() {
                 let (kk, j) = (n as u32 / cols, n as u32 % cols);
-                let tile = b.first + kk * b.ct + j0 + j;
+                let tile = if flags & 2 != 0 {
+                    b.first + (j0 + j) * b.ct + kk
+                } else {
+                    b.first + kk * b.ct + j0 + j
+                };
                 let (slot, c) = (tile / b.n as u32, (tile % b.n as u32) as usize);
                 let want = [
                     op::READ,
@@ -2245,9 +2344,11 @@ mod tests {
             }
         }
         assert!(cases > 50);
+        let bfp8 = gather_b_format(crate::tile::L1Format::Bfp8).unwrap();
         for bad in [
             GATHER_B_BF16 | 2,
-            GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
+            bfp8 | 2,
+            bfp8 | 2 | GATHER_B_UNPACK_TRANSPOSE,
         ] {
             assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
         }
@@ -2369,6 +2470,124 @@ mod tests {
             assert_eq!(e[3] % 64, e[4] % 64);
         }
         assert_eq!(got.len(), values.len() * cols as usize * 2);
+    }
+
+    /// A BF16 table's rows (roadmap W1, the BF16 lookup): what the expansion's reads and copies
+    /// do, run against a GDDR and an L1 of bytes, puts every datum of each index's row in its
+    /// output row, bit for bit, where the face layout (`face_index`) says, independently of
+    /// `expand`'s arithmetic, and touches no row past `count`. Every read is 32 bytes, congruent
+    /// mod 64 at both ends; a row whose parity differs from its source's goes through the aside
+    /// region, so both kinds occur, and every copy comes after every read.
+    #[test]
+    fn select_rows_moves_bf16_rows_whole_through_the_aside_region() {
+        let mut table = t(3, 5);
+        table.first = 2;
+        table.slot = BF16_TILE_SLOT as u32;
+        let bound = 100;
+        let values = [
+            0u32, 99, 31, 32, 33, 5, 5, 64, 17, 16, 63, 95, 1, 2, 3, 4, 5, 6,
+        ];
+        let (j0, cols, count) = (1u32, 3u32, values.len() as u32);
+        let aside = 0x6_0000u32;
+        let [m0, m1] = table.encode();
+        let flags = SELECT_ROWS_BF16 | (aside / 64) << SELECT_ROWS_ASIDE_SHIFT;
+        let rec = [
+            [SELECT_ROWS, IDX, count, bound, j0, cols, STAGE, flags],
+            m0,
+            m1,
+        ];
+        let mut got = Vec::new();
+        expand_reads(&rec, l1_of(&values), |e| {
+            got.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let gddr =
+            |ch: u32, at: u32| (ch.wrapping_mul(7919) ^ at.wrapping_mul(2_654_435_761) >> 7) as u8;
+        let mut l1 = std::collections::HashMap::<u32, u8>::new();
+        let (mut reads, mut copies, mut moved) = (0, 0, 0);
+        for e in &got {
+            match e[0] {
+                op::READ => {
+                    assert_eq!(copies, 0, "a read after a copy");
+                    assert_eq!((e[5], e[3] % 64), (32, e[4] % 64), "{e:x?}");
+                    for b in 0..32 {
+                        l1.insert(e[4] + b, gddr(e[1], e[3] + b));
+                    }
+                    moved += u32::from(e[4] >= aside);
+                    reads += 1;
+                }
+                crate::dm::op::COPY_HALFWORDS => {
+                    assert_eq!(e[3..6], [16, 2, 2]);
+                    assert!(e[1] >= aside && e[2] < aside, "{e:x?}");
+                    for b in 0..32 {
+                        let v = l1[&(e[1] + b)];
+                        l1.insert(e[2] + b, v);
+                    }
+                    copies += 1;
+                }
+                other => panic!("an entry {other:#x}"),
+            }
+        }
+        assert_eq!(reads, count * cols * 2);
+        assert_eq!(copies, moved);
+        assert!(
+            copies > 0 && copies < reads,
+            "both kinds: {copies} of {reads}"
+        );
+        for (r, &v) in values.iter().enumerate() {
+            for j in 0..cols {
+                let (ch, off) = table.tile_in(v / 32, j0 + j, BF16_TILE_SLOT).unwrap();
+                for c in 0..32 {
+                    let from = off
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index((v % 32) as usize, c) as u32;
+                    let to = STAGE
+                        + j * TILE_SLOT as u32
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index(r, c) as u32;
+                    for b in 0..2 {
+                        assert_eq!(
+                            l1.get(&(to + b)),
+                            Some(&gddr(ch, from + b)),
+                            "row {r} (index {v}), tile column {j}, column {c}"
+                        );
+                    }
+                }
+            }
+        }
+        // Rows past `count` are the slot's as it was.
+        for j in 0..cols {
+            for r in count as usize..32 {
+                for c in 0..32 {
+                    let to = STAGE
+                        + j * TILE_SLOT as u32
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index(r, c) as u32;
+                    assert!(!l1.contains_key(&to), "row {r} written");
+                }
+            }
+        }
+        // A BF16 flag with an FP32 table, an FP32 record of a BF16 table, an undefined flag bit.
+        let fp32 = t(3, 5);
+        let [f0, f1] = fp32.encode();
+        for (flags, refs) in [
+            (SELECT_ROWS_BF16, [f0, f1]),
+            (0, [m0, m1]),
+            (SELECT_ROWS_BF16 | 2, [m0, m1]),
+            (aside << 2, [f0, f1]),
+        ] {
+            let rec = [
+                [SELECT_ROWS, IDX, 1, bound, 0, 1, STAGE, flags],
+                refs[0],
+                refs[1],
+            ];
+            assert_eq!(
+                expand_reads(&rec, l1_of(&[0]), |_| Ok(())),
+                Err(crate::dm::error::RANGE),
+                "{flags:#x}"
+            );
+        }
     }
 
     /// An index at or past `bound`, or a negative one, is `DOMAIN` before a

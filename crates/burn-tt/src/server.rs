@@ -1723,16 +1723,18 @@ impl DramBuffers {
         table: BufferId,
         indices: BufferId,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if self.bf16.contains_key(&table) || self.is_bfp(table) {
+        // A BF16 table's rows through `SELECT_ROWS_BF16` (roadmap W1, the BF16 lookup); a BFP
+        // one's rows are not whole face-rows of their own.
+        if self.is_bfp(table) {
             return Err(TtError::Device(
-                "a row select of a packed (BF16, F16 or BFP) table is not implemented".into(),
+                "a row select of a BFP table is not implemented".into(),
             ));
         }
         let indices = self.get(indices)?.clone();
         let out = s
-            .select_rows(self.get(table)?, &indices)
+            .select_rows(&self.operand(table)?, &indices)
             .map_err(TtError::from)?;
-        Ok(self.insert(out))
+        Ok(self.insert_any(out))
     }
 
     /// `table`'s rows for each tap of the resident `[taps, n]` index tensor

@@ -2349,9 +2349,16 @@ pub(crate) fn matmul_dram_prefetching(
     let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
     a.expect("a matmul", edge(route.packed_a()))?;
     b.expect("a matmul", edge(route.packed_b()))?;
-    if route.packed_b().is_some() && b_transposed {
+    // A transposed packed `B` only where the kernel's unpacker transposes it (BF16): the mover
+    // transposes FP32 datums alone.
+    if route.packed_b().is_some()
+        && b_transposed
+        && !(reads.unpack_b && route.unpacks_transposed_b())
+    {
         return Err(TensorError::Shape(
-            "a packed `B` is read untransposed: store its transpose".into(),
+            "a packed `B` is read untransposed, but a BF16 one the unpacker transposes: store \
+             its transpose"
+                .into(),
         ));
     }
     // A packed `A` is read untransposed and as whole tiles, or -- BF16 only -- as a packed row
@@ -2433,7 +2440,7 @@ pub(crate) fn matmul_dram_prefetching(
                 [m, k, n],
                 route,
                 fidelity,
-                reads.unpack_b && route == SrcRoute::Tf32FromFp32,
+                reads.unpack_b && route.unpacks_transposed_b(),
                 None,
                 crate::tile_op::matmul::Schedule::BlockStream {
                     tiles: layout.tiles,
@@ -2484,7 +2491,7 @@ pub(crate) fn matmul_dram_prefetching(
         },
         resident_a: reads.resident_a && staging == Staging::Slots,
         col_runs,
-        unpack_b: reads.unpack_b && route == SrcRoute::Tf32FromFp32,
+        unpack_b: reads.unpack_b && route.unpacks_transposed_b(),
         packed_a: reads.packed_a,
         // Only where `K` would be blocked: a whole `K` is one batch a column, and each chunk
         // batch's own reload, pack and retire (~3 us a chunk, profile `1792358552`) cost a unit
@@ -3611,7 +3618,7 @@ pub(crate) fn matmul_dram_batched_limited(
                     [m, k, n],
                     route,
                     fidelity,
-                    unpack_b && route == SrcRoute::Tf32FromFp32,
+                    unpack_b && route.unpacks_transposed_b(),
                     None,
                     crate::tile_op::matmul::Schedule::BlockStream {
                         tiles: layout.tiles,
@@ -3648,7 +3655,7 @@ pub(crate) fn matmul_dram_batched_limited(
         thin: 0,
         resident_a: false,
         col_runs: None,
-        unpack_b: unpack_b && route == SrcRoute::Tf32FromFp32,
+        unpack_b: unpack_b && route.unpacks_transposed_b(),
         packed_a: None,
         stream_k: false,
         busy: Vec::new(),

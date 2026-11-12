@@ -231,6 +231,75 @@ fn a_select_over_many_units_is_the_host_s_indexing_with_zero_padding() {
     });
 }
 
+/// A table of BF16 slots (roadmap W1, the BF16 lookup: a tied table stored once, BF16, for its
+/// lookup and its head): each row through `SELECT_ROWS_BF16`, whose 32-byte face-rows go straight
+/// to their output row where the two rows' face-row parity agrees and through an aside region
+/// where it does not (both occur: the indices cross every parity). Bit for bit the host's indexing
+/// of the BF16 bits -- signed zero, subnormals, NaN payloads, infinities -- with zero padding rows,
+/// on one unit and on 16 (a decode step's one row of 2,048 columns, the 1.7B's).
+#[test]
+fn a_bf16_table_selects_its_rows_bit_for_bit() {
+    fn check<T: tt_device::Transport>(s: &mut Session<T>, rows: usize, cols: usize, n: usize) {
+        let bits: Vec<u16> = raw_bits(rows as u64 * 31 + cols as u64, rows * cols)
+            .into_iter()
+            .map(|b| (b >> 16) as u16)
+            .collect();
+        let table = tt_kernels::tensor::DramTensor::from_bf16(
+            s.upload_bf16(&bits, rows, cols).unwrap(),
+            tt_kernels::tensor::Pad::Zero,
+        );
+        let idx = indices(rows, n);
+        let di = s.upload_bits(&idx, 1, n, Elem::I32).unwrap();
+        let out = s.select_rows(&table, &di).unwrap();
+        let what = format!("{n} of the rows of a [{rows}, {cols}] BF16 table");
+        assert_eq!(
+            ([out.rows, out.cols], out.elem),
+            ([n, cols], Elem::BF16),
+            "{what}"
+        );
+        assert_eq!(out.pad(), tt_kernels::tensor::Pad::Zero, "{what}");
+        let got = s.download_bf16(&out.as_bf16().unwrap()).unwrap();
+        let want: Vec<u16> = idx
+            .iter()
+            .flat_map(|&r| {
+                bits[r as usize * cols..(r as usize + 1) * cols]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(got.len(), want.len(), "{what}");
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g,
+                w,
+                "{what}: datum {i} (row {}, column {}): {g:#06x} vs {w:#06x}",
+                i / cols,
+                i % cols
+            );
+        }
+        s.free(out).unwrap();
+        s.free(di).unwrap();
+        assert_eq!(
+            s.download_bf16(&table.as_bf16().unwrap()).unwrap(),
+            bits,
+            "{what}: the table"
+        );
+        s.free(table).unwrap();
+    }
+    with_session(|s| {
+        for (rows, cols) in [(100, 70), (64, 64), (33, 32), (1, 5), (40, 800)] {
+            for n in [1usize, 31, 33, 70] {
+                check(s, rows, cols, n);
+            }
+        }
+    });
+    with_units(16, |s| {
+        for n in [1usize, 9, 33] {
+            check(s, 300, 2048, n);
+        }
+    });
+}
+
 #[test]
 fn integer_and_bool_tables_select_as_raw_words() {
     with_session(|s| {

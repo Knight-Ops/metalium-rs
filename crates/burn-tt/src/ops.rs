@@ -132,6 +132,43 @@ pub(crate) fn packed_weight_matmul_as(a: &TtTensor, b: &TtTensor, out: DType) ->
     ))
 }
 
+/// `a @ b` over both operands' exact values -- each F32 or BF16, in its own slots -- with an F32
+/// result: one product reading `b` where it lies, a transposed view of a BF16 one included (the
+/// kernel's unpacker transposes it, `step272_transposed_bf16_b`): a tied table's head
+/// `last @ table^T` reads the table that its lookup reads (roadmap W1, one tied table). `None` for
+/// packed storage, a strided view, a `b` of another rank or `k`, or an engine without resident
+/// buffers.
+pub(crate) fn wide_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
+    use crate::storage::StorageFormat;
+    let exact = |t: &TtTensor| {
+        matches!(t.dtype(), DType::F32 | DType::BF16)
+            && t.storage_format() == StorageFormat::F32
+            && !t.is_view()
+    };
+    if !exact(a) || !exact(b) || a.device != b.device || !crate::server::supports_dram(a.device) {
+        return None;
+    }
+    let (ls, rs) = (a.shape().to_vec(), b.shape().to_vec());
+    let [k, n] = rs[..] else { return None };
+    if ls.len() < 2 || ls[ls.len() - 1] != k {
+        return None;
+    }
+    let rows: usize = ls[..ls.len() - 1].iter().product();
+    let mut out = ls[..ls.len() - 1].to_vec();
+    out.push(n);
+    let a = float::float_reshape(a.clone(), burn_backend::Shape::new([rows, k]));
+    let (da, db) = (plain_dram(&a), b.to_dram().clone());
+    let (id, dims) =
+        crate::server::matmul_dram(a.device, da.buffer.id, false, db.buffer.id, db.transposed);
+    Some(device_result_shaped(
+        a.device,
+        id,
+        dims,
+        burn_backend::Shape::from(out),
+        DType::F32,
+    ))
+}
+
 pub(crate) fn bfp_compute_result(
     tensor: TtTensor,
     storage: crate::storage::StorageFormat,
@@ -261,6 +298,11 @@ pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
             format_args!("{}, output={dtype:?}", context(&tensor)),
         );
     }
+    if dtype == DType::F32 {
+        if let Some(widened) = tensor.widened_on_host() {
+            return widened;
+        }
+    }
     let source = tensor.to_dram();
     let (id, dims) = crate::server::cast_float(
         tensor.device,
@@ -360,16 +402,22 @@ pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
     if !lhs.is_storable_matrix() || !rhs.is_storable_matrix() {
         return None;
     }
+    // A packed `A` is read untransposed; a transposed BF16 `B` is read as it lies and transposed
+    // by the kernel's unpacker (`step272_transposed_bf16_b`). It was copied plain first, through a
+    // per-element map of 16 bytes an element on the host: 40 GB for Qwen3.5's tied head
+    // `last @ table^T` (roadmap W1, defect 1).
     let a = plain_dram(lhs);
-    let b = plain_dram(rhs);
-    assert_eq!(
-        a.buffer.cols, b.buffer.rows,
-        "BF16 matmul inner dimensions differ"
-    );
+    let b = rhs.to_dram().clone();
+    let inner = if b.transposed {
+        b.buffer.cols
+    } else {
+        b.buffer.rows
+    };
+    assert_eq!(a.buffer.cols, inner, "BF16 matmul inner dimensions differ");
     // A BF16 result: each output rounded once in `Dst` and packed as BF16 (roadmap W1), bit for
     // bit the F32 product narrowed.
     let (id, dims) =
-        crate::server::matmul_dram_bf16(lhs.device, a.buffer.id, false, b.buffer.id, false);
+        crate::server::matmul_dram_bf16(lhs.device, a.buffer.id, false, b.buffer.id, b.transposed);
     Some(device_view(lhs.device, id, dims, None, DType::BF16))
 }
 
@@ -608,9 +656,23 @@ fn pack_axis(tensor: &TtTensor, dim: usize) -> Option<TtTensor> {
 }
 
 /// Retile a matrix's logical sequence into another shape without reading its data.
+/// When `shape` is stored as the matrix the tensor already lies in (`[b, m, k]` and `[b m, k]`), a
+/// view of the same slots, with no job: a BF16 Linear over a rank-3 input once repacked its whole
+/// weight on every call through a 16-byte-a-element host map, and on Qwen3.5 that held host
+/// memory without bound (roadmap W1, defect 2).
 fn repack_shape(tensor: &TtTensor, shape: Vec<usize>) -> TtTensor {
     let dims = crate::tensor::stored_dims(&shape).expect("nonempty output shape");
     let source = plain_dram(tensor);
+    if [source.buffer.rows, source.buffer.cols] == dims
+        && source.buffer.storage == crate::storage::StorageFormat::F32
+    {
+        return TtTensor::on_device(
+            source,
+            burn_backend::Shape::from(shape),
+            tensor.dtype(),
+            tensor.device,
+        );
+    }
     let cols = source.buffer.cols;
     let sources = (0..shape.iter().product())
         .map(|i| [i / cols, i % cols])
@@ -1033,8 +1095,10 @@ fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
 /// BFP storage, indices that are not I32, an empty selection.
 fn select_rows_native(tensor: &TtTensor, indices: &TtTensor) -> Option<TtTensor> {
     let n = indices.shape().num_elements();
+    // A BF16 table in its own slots (roadmap W1): its rows moved as they are, with no staging
+    // (`gather_native`'s per-element repack of the table a token, 229 s for `step167`'s BF16 run).
     if tensor.shape().num_dims() != 2
-        || tensor.elem().is_none()
+        || (tensor.elem().is_none() && tensor.dtype() != DType::BF16)
         || indices.dtype() != DType::I32
         || indices.shape().num_dims() != 1
         || n == 0
@@ -1438,7 +1502,7 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
     // Reported apart from the op that broadcasts: a row list a row of the result, which an
     // operand that is a block of whole tile rows avoids (`block_of`).
     let _part = crate::report::part("broadcast/expand");
-    let indices: Vec<_> = (0..rows)
+    let indices: Vec<(usize, usize)> = (0..rows)
         .map(|mut flat| {
             let mut coords = vec![0; rank - 1];
             for d in (0..rank - 1).rev() {
@@ -1452,10 +1516,10 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
             (0, row)
         })
         .collect();
-    let (id, dims) =
-        crate::server::gather_rows(tensor.device, vec![source.buffer.id], indices, input_cols);
-    let gathered = device_view(tensor.device, id, dims, None, tensor.dtype());
     if input_cols == cols {
+        let (id, dims) =
+            crate::server::gather_rows(tensor.device, vec![source.buffer.id], indices, input_cols);
+        let gathered = device_view(tensor.device, id, dims, None, tensor.dtype());
         return TtTensor::on_device(
             gathered.to_dram().clone(),
             shape,
@@ -1463,24 +1527,61 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
             tensor.device,
         );
     }
-    // [rows, 1] -> [1, rows] -> [cols, rows] -> [rows, cols].
-    let transposed = swapped_view(&gathered, 0, 1).expect("a gathered matrix");
-    let transposed = plain_dram(&transposed);
+    // A trailing axis of one repeated `cols` times: [rows, 1] -> [1, rows] -> [cols, rows] ->
+    // [rows, cols]. The middle two are one tile row `rows / 32` tiles wide, and a record names at
+    // most `MAX_EXTENT` column tiles (`tt_isa::dm::record::TensorRef::decode`): past that the
+    // copy was refused (`RANGE`, a nearest upsampling of `[1, 384, 64, 64]`, roadmap W1's
+    // defect 5). So the rows go in chunks of at most `EXPAND_CHUNK_ROWS`, joined by one gather.
+    let chunks: Vec<_> = indices
+        .chunks(EXPAND_CHUNK_ROWS)
+        .map(|chunk| {
+            let n = chunk.len();
+            let (id, dims) = crate::server::gather_rows(
+                tensor.device,
+                vec![source.buffer.id],
+                chunk.to_vec(),
+                input_cols,
+            );
+            let gathered = device_view(tensor.device, id, dims, None, tensor.dtype());
+            let transposed = swapped_view(&gathered, 0, 1).expect("a gathered matrix");
+            let transposed = plain_dram(&transposed);
+            let (id, dims) = crate::server::gather_rows(
+                tensor.device,
+                vec![transposed.buffer.id],
+                vec![(0, 0); cols],
+                n,
+            );
+            let repeated = device_view(tensor.device, id, dims, None, tensor.dtype());
+            let transposed = swapped_view(&repeated, 0, 1).expect("a gathered matrix");
+            (plain_dram(&transposed), n)
+        })
+        .collect();
+    if let [(whole, _)] = &chunks[..] {
+        return TtTensor::on_device(whole.clone(), shape, tensor.dtype(), tensor.device);
+    }
+    let joined: Vec<(usize, usize)> = chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &(_, n))| (0..n).map(move |r| (i, r)))
+        .collect();
     let (id, dims) = crate::server::gather_rows(
         tensor.device,
-        vec![transposed.buffer.id],
-        vec![(0, 0); cols],
-        rows,
+        chunks.iter().map(|(d, _)| d.buffer.id).collect(),
+        joined,
+        cols,
     );
-    let repeated = device_view(tensor.device, id, dims, None, tensor.dtype());
-    let transposed = swapped_view(&repeated, 0, 1).expect("a gathered matrix");
+    let result = device_view(tensor.device, id, dims, None, tensor.dtype());
     TtTensor::on_device(
-        plain_dram(&transposed),
+        result.to_dram().clone(),
         shape,
         tensor.dtype(),
         tensor.device,
     )
 }
+
+/// The rows [`expanded`] repeats along a trailing axis at once: `[1, rows]` must be at most
+/// `tt_isa::dm::record::MAX_EXTENT` (65,536) tiles wide; a power of two well inside it.
+const EXPAND_CHUNK_ROWS: usize = 1 << 20;
 
 /// A device result that reads `parent`'s slots, keeping it alive: a view of the contents
 /// `parent` names ([`crate::tensor::DramRef::generation`]).

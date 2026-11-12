@@ -31,6 +31,9 @@
 //! 4. **F32 activations** (`WeightOptions::f32_activations`, the contract before 2026-11-11): its
 //!    agreement recorded, the baseline of the BF16 activations' rounding; that rounding must show
 //!    in the correlation (a contract that ignored it would agree with this run exactly).
+//! 5. **An untied head** (`WeightOptions::untied_head`, the default before 2026-11-12): the tied
+//!    head stored BFP8 beside the table, recorded. By default both contracts store the table once,
+//!    BF16, for its lookup and its head (roadmap W1).
 //!
 //! Negative control: the correlation falls strictly from BF16 to BFP8 to BFP4 weights, so each
 //! run really computed with its contract's formats (a `for_inference` that ignored its contract
@@ -218,6 +221,16 @@ fn run(cases: &[Case]) {
             "F32 activations agree exactly with the contract's BF16 ones ({f32}): the BF16 \
              activations did not apply"
         );
+
+        // The two-copy option (`WeightOptions::untied_head`): the tied head stored BFP8 beside
+        // the BF16 table, as the contract stored it before 2026-11-12. Recorded.
+        let untied = WeightOptions {
+            untied_head: true,
+            ..Default::default()
+        };
+        let untied = device_logits(&model, Numerics::Performance, untied, cases, &d);
+        let untied = agreement(cases, &untied, &flex);
+        report("performance contract, untied BFP8 head", &untied);
     });
 }
 

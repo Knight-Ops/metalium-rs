@@ -183,6 +183,26 @@ pub(crate) fn select_taps_jobs(
                 .into(),
         ));
     }
+    // A BF16 table (roadmap W1, the BF16 lookup): its tiles staged at the FP32 slots' stride,
+    // its rows of the other face-row parity read into an aside region first
+    // (`record::SELECT_ROWS_BF16`), one for every record in turn: B finishes a record's copies
+    // before it reads for the next.
+    let half = match table.elem {
+        Elem::BF16 => true,
+        Elem::F32 | Elem::I32 | Elem::Bool => false,
+        other => {
+            return Err(TensorError::Elem {
+                op: "a resident row select's table".into(),
+                got: other,
+                wants: Elem::F32,
+            })
+        }
+    };
+    let aside_bytes = if half {
+        SELECT_TILES as u64 * 32 * 128
+    } else {
+        0
+    };
     let mut req = crate::l1::Requirements::new(1);
     let idx = req.scratch("row select index tiles", 2 * TILE_SLOT, 64, 0..1);
     let slots = req.scratch(
@@ -191,15 +211,18 @@ pub(crate) fn select_taps_jobs(
         64,
         0..1,
     );
+    let aside = half.then(|| req.scratch("row select BF16 aside rows", aside_bytes, 64, 0..1));
     let layout = req
         .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (idx, stage) = (layout.addr(idx), layout.addr(slots));
+    let aside = aside.map_or(0, |a| layout.addr(a));
     // The mover does not check that `SELECT_ROWS`'s slots are in the data
     // arena (`record::SELECT_ROWS`); they come from its plan, and this is the
     // check that says so.
     if !tt_isa::l1::DATA.contains(idx, 2 * TILE_SLOT)
         || !tt_isa::l1::DATA.contains(stage, 2 * SELECT_TILES as u64 * TILE_SLOT)
+        || (half && !tt_isa::l1::DATA.contains(aside, aside_bytes))
     {
         return Err(TensorError::Shape(
             "the row select's slots are outside the data arena".into(),
@@ -249,7 +272,7 @@ pub(crate) fn select_taps_jobs(
                     for k in 0..k1 - k0 {
                         let at = first + k as u64 * TILE_SLOT;
                         read.push([
-                            op::FILL,
+                            if half { op::FILL_HALFWORDS } else { op::FILL },
                             0,
                             fill::param(count as u32, 32),
                             at as u32,
@@ -276,7 +299,12 @@ pub(crate) fn select_taps_jobs(
                         j0 as u32,
                         (j1 - j0) as u32,
                         (first + (k - k0) as u64 * TILE_SLOT) as u32,
-                        0,
+                        if half {
+                            record::SELECT_ROWS_BF16
+                                | ((aside / 64) as u32) << record::SELECT_ROWS_ASIDE_SHIFT
+                        } else {
+                            0
+                        },
                     ]);
                     read.extend(table_ref);
                     k += j1 - j0;
@@ -291,7 +319,7 @@ pub(crate) fn select_taps_jobs(
                             (k - k0) as u32 % tt_isa::dram::PORTS as u32,
                             (to.offset() + TILE_DATA) as u32,
                             (slot + TILE_DATA) as u32,
-                            4096,
+                            if half { 2048 } else { 4096 },
                             0,
                             0,
                         ]

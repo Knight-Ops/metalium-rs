@@ -1056,7 +1056,9 @@ fn weight_storage_probe() -> Option<Option<tt_models::quant::Format>> {
 /// The numeric contract a model bench runs under (ADR 0006): `TT_NUMERICS` (`reference` or
 /// `performance`), by default `performance`, the inference contract; `TT_MLP_BFP4=1` its named
 /// option, BFP4 for `gate|up`; `TT_F32_ACTIVATIONS=1` its products' activations F32, the
-/// baseline of its BF16 ones (roadmap W1, `WeightOptions::f32_activations`).
+/// baseline of its BF16 ones (roadmap W1, `WeightOptions::f32_activations`); `TT_UNTIED_HEAD=1` a
+/// tied model's head stored apart from its table, the two-copy option
+/// (`WeightOptions::untied_head`).
 fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
     let numerics = burn_tt::Numerics::from_env()
         .unwrap_or(Ok(burn_tt::Numerics::Performance))
@@ -1071,11 +1073,17 @@ fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
         Ok("1") => true,
         Ok(other) => panic!("TT_F32_ACTIVATIONS={other}: expected 0 or 1"),
     };
+    let untied_head = match std::env::var("TT_UNTIED_HEAD").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => panic!("TT_UNTIED_HEAD={other}: expected 0 or 1"),
+    };
     (
         numerics,
         tt_models::quant::WeightOptions {
             mlp_bfp4,
             f32_activations,
+            untied_head,
         },
     )
 }
@@ -1111,9 +1119,10 @@ fn bench_model<B: burn_tt::storage::StorageBackend>(m: Llama<B>, fused: bool) ->
     }
     let (numerics, options) = bench_contract();
     println!(
-        "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{}}}",
+        "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"untied_head\":{}}}",
         numerics.name(),
-        options.mlp_bfp4
+        options.mlp_bfp4,
+        options.untied_head
     );
     m.for_inference(numerics, options)
 }
@@ -1185,7 +1194,7 @@ fn qwen_step_bytes<B: burn::tensor::backend::Backend>(
         }
         fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<B, D>>) {
             let format = match (D, self.1.format(&self.0.join("."))) {
-                (2, Format::Bf16Stored) => TileFormat::BF16,
+                (2, Format::Bf16Stored | Format::Bf16) => TileFormat::BF16,
                 (2, Format::Bfp8) => TileFormat::BFP8,
                 (2, Format::Bfp4) => TileFormat::BFP4,
                 (2, Format::Bfp2) => TileFormat::BFP2,
@@ -1849,15 +1858,16 @@ fn qwen35_traced_generation_on<B: tt_models::generate::TracedBackend>(suffix: &s
     with_device(config, |d| {
         conditions(card());
         // The contract's weights (`TT_NUMERICS`, the performance contract by default); the tied
-        // head stays the F32 table under both (`Qwen35::for_inference`).
+        // head is the BF16 table its lookup reads, under both (`Qwen35::for_inference`, since
+        // 2026-11-12; the F32 table before).
         let (numerics, options) = bench_contract();
         println!(
-            "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"head\":\"f32 table\"}}",
+            "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"head\":\"bf16 table\"}}",
             numerics.name(),
             options.mlp_bfp4
         );
         let (m, _) = Qwen35::<B>::qwen3_5_4b(QWEN3_5_4B.layers, Precision::F32, &d).unwrap();
-        // What a step reads at least: every matrix once in its stored format, the tied head's F32
+        // What a step reads at least: every matrix once in its stored format, the tied head's BF16
         // table once.
         let step_bytes =
             qwen_step_bytes(&m, &tt_models::quant::Plan::for_numerics(numerics, options));

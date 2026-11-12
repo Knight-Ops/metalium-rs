@@ -391,6 +391,9 @@ pub const SMOKE: &[&str] = &[
     // BF16 tensors in their own slots; element-wise ops on BF16 operands are their widened op
     // rounded once, bit for bit, and without the quantize differ.
     "step270_native_bf16::",
+    // Roadmap W1, defect 5: `expand` of a trailing axis of one past the 65,536 column tiles a
+    // record names (3.1M rows) goes in chunks, every element its source's.
+    "step271_wide_expand::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     // ADR 0006, roadmap W1: the performance contract's model gate on its first two prompts

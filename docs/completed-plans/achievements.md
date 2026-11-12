@@ -349,6 +349,17 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   op (`burn_tt::rms_norm_as`, `silu_mul_as`), and read as they lie by products with F32 results
   (`burn_tt::matmul_as`), each bit for bit its composition. 1.7B decode 7.52 / 8.01 / 8.64 ms (F32 activations 7.49 /
   7.99 / 8.67), prefill 1,257 / 3,552 / 4,266 tokens/s (1,190 / 3,258 / 4,007), `step269` 228 of 232 as before.
+- **W1: the BF16 defects fixed, the BF16 lookup, and one tied table** (2026-11-12, gates card 0, benches card 1;
+  [log](../learnings/performance-log.md#w1-the-bf16-defects-fixed-the-bf16-lookup-and-one-tied-table-2026-11-12-cards-0-and-1)).
+  The four BF16 defects of `new-architectures.md`: a host-held BF16 tensor's cast widens on the host and uploads once;
+  a retiling to the matrix a tensor lies in is a view (the whole BF16 Qwen3.5 holds 4.3 GB of host memory flat, where
+  it passed 40 GB); a transposed BF16 `B` is read as it lies and transposed by the unpacker, bit for bit (`step272`);
+  `expand` past 2,097,152 rows goes in chunks (`step271`). The BF16 embedding lookup without staging
+  (`SELECT_ROWS_BF16`, `step171`; `step167`'s BF16 run 229 -> 6.3 s). A tied table stored once, BF16, for its lookup
+  and its head (`burn_tt::matmul_wide`), under both contracts, by the owner's decision (the scaling rule over the
+  0.5% rule): the 1.7B 7.52 -> 7.68 ms a step and 513 -> 201 MB of table and head, `step269` PCC 0.99967 -> 0.99976
+  (top-1 the same 228 of 232); Qwen3.5-4B 56.93 -> 54.47 ms and 1.27 GB less. `WeightOptions::untied_head` keeps the
+  two-copy layout as an option.
 
 ## Prefill and long context
 

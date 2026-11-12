@@ -1094,6 +1094,14 @@ From [decode-matmul-bandwidth.md](../completed-plans/decode-matmul-bandwidth.md)
   an L1 slot is congruent for any length, since both slots are 64-byte aligned (`TILE_SLOT` and `BF16_TILE_SLOT` are
   multiples of 64). Records expand on the card through `Descriptor::decode` (never `READ_ENCODED`), so the
   fast-reads encoder plays no part. Gates `step190` (both read modes) and `step77` on card 0.
+- **A 32-byte BF16 face-row moves only to a row of its own parity** (2026-11-12, ttsim and card 0, roadmap W1's BF16
+  lookup). A BF16 face-row starts at 16 or 48 mod 64 within its slot (`TILE_DATA` 16, rows 32 bytes apart), so a
+  source row and the output row it goes to are congruent mod 64 only when their face-row indices share their parity.
+  `SELECT_ROWS_BF16` reads such a row straight to its place and every other one into an aside region at its own
+  offset mod 64, then moves it with `COPY_HALFWORDS` (B waits for the reads before its first copy; all of a record's
+  reads are issued first, so one wait a record). Bit for bit, step171 on card 0 (`1794459860`); dropping the copies
+  is caught on ttsim. B's image: +1,772 bytes with the transposed-BF16 `GATHER` arm (safe 38,104 -> 39,876; 10,152
+  left in the tightest build).
 - **The B mover pays per entry as much as per byte.** For an `m = 1` product's `A` tiles (one used row in 32):
   - **Two 64-byte face-row reads a tile** (1/32 of the bytes, twice the entries): a 1.7B decode step 1.5 ms faster,
     but the 135M step ~1 ms *slower* (its products are 18 `A` tiles a job).
@@ -1309,6 +1317,12 @@ From [decode-attention.md](../completed-plans/decode-attention.md) A0b; gate `st
 - **State:** `Haloize_mode` is persistent. Every later unpack configuration writes the whole `SEC0_REG2` word with it
   clear: `unpack_src_config` by construction, `unpack_config` explicitly. So no other kernel unpacks transposed, and
   none unpacks to `Dst` with it set (undefined behaviour).
+- **A BF16 `B` too (2026-11-12, card 0 and ttsim, roadmap W1;** gate `step272_transposed_bf16_b`): a BF16 tile
+  read whole from its 2,112-byte slot and moved to `SrcA` as is (`SrcRoute::Edges`) is transposed by `Haloize_mode`
+  as an FP32 one is. The products are bit for bit those of the same `B` widened to FP32 and transposed the same
+  way: TF32, HiFi4, BF16's special values, whole, ragged with undefined padding, thin, K-blocked, and with a BF16
+  result. Read untransposed, a square `B` gives another product (the negative control); a mover reading the
+  untransposed tile instead is caught on ttsim. BFP formats are not claimed.
 
 ## A one-row product's compute, `A` reads and weight stream (2026-10-18, cards 0 and 1)
 

@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W1: the BF16 defects fixed, the BF16 lookup, and one tied table](#w1-the-bf16-defects-fixed-the-bf16-lookup-and-one-tied-table-2026-11-12-cards-0-and-1) | 2026-11-12 | W1's leftovers: a cast widens a host BF16 tensor on the host; a retiling to the same matrix is a view (the BF16 Qwen3.5 holds 4.3 GB of host memory flat, not 40+); `expand` past 2,097,152 rows in chunks; a transposed BF16 `B` transposed by the unpacker; `SELECT_ROWS_BF16`; a tied table stored once, BF16 (owner's call): the 1.7B 7.52 -> 7.68 ms (+2.1%, 312 MB of GDDR less), Qwen3.5-4B 56.93 -> **54.47 ms**; `step167` BF16 229 -> 6.3 s |
 | [W1: BF16 activations into the products, the performance default](#w1-bf16-activations-into-the-products-the-performance-default-2026-11-11-cards-0-and-1) | 2026-11-11 | the BF16 stream replaced: the residual and every op's arithmetic F32, a norm's output and `silu(gate) * up` rounded once to BF16 where made (one op each), products reading them as they lie with F32 results; decode unchanged (7.52 / 8.01 / 8.64 against 7.49 / 7.99 / 8.67 ms), prefill 1.06-1.09x (4,266 against 4,007 tokens/s at 256), `step269` the same 228 of 232: the performance contract's default; the BF16 stream deleted |
 | [W1: burn-tt on BF16, and the 1.7B on a BF16 stream (an option)](#w1-burn-tt-on-bf16-and-the-17b-on-a-bf16-stream-an-option-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's routing phase and a first model run: 21 Burn ops, products, BFP storage of BF16, casts over runs of tiles, RMSNorm on BF16; the 1.7B on a BF16 stream works but runs behind the FP32 stream (decode 9.20 against 7.51 ms at 32 tokens, prefill 2,936 against 4,004 tokens/s at 256) and trips step269's top-1 threshold by one position: the default stays the FP32 stream, the BF16 one an option; what it lacks, measured |
 | [W1: products with a BF16 result, and a BF16 packed twin](#w1-products-with-a-bf16-result-and-a-bf16-packed-twin-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's third phase: each output rounded in `Dst` once its `K` chain is done (the last `K` chunk's run), packed as BF16; every schedule but `K` blocks; the quantize costs 6-9% of a short-`K` chunk product and ~0 of `down` (BF16 x BFP8, card 1), below the BF16 `A`'s gain: not killed |
@@ -427,6 +428,61 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W1: the BF16 defects fixed, the BF16 lookup, and one tied table (2026-11-12, cards 0 and 1)
+
+Roadmap W1's leftovers, in the order the plan built them. Gates on card 0, benches on card 1, the performance
+contract unless named.
+
+**The defects** (`new-architectures.md`, items 1, 2, 4, 5):
+
+- *A cast of a host-held BF16 tensor* widens it on the host by its bits and uploads it once, as F32
+  (`TtTensor::widened_on_host`). Gate `step76::a_host_bf16_tensor_cast_to_f32_is_uploaded_once_widened` (ttsim and
+  card 0, all 65,536 patterns): one upload of `4 n` bytes, where the card's cast made two (393,216 against 262,144
+  bytes for `n` = 65,536). Gemma 4 keeps its lazy widening on the data: with a `cast`, every matrix went to the card in
+  F32 at load and `step261_gemma4` was OOM-killed at 40 GB; lazily it passes (316 s).
+- *`Precision::Bf16`'s unbounded host memory* was a BF16 `Linear` over a rank-3 input repacking its whole weight a
+  call (`repack_shape`, a 16-byte host map an element). A retiling to the matrix a tensor lies in is now a view.
+  With the next item, the whole BF16 Qwen3.5 through `forward` holds **4.3 GB flat** (loaded 4.05, prompt 4.28, four
+  decode steps 4.29-4.30; `silicon_probe_qwen35_bf16_memory`, `1794457685`), where it passed 40 GB.
+- *A transposed BF16 `B`*: `GATHER_B_UNPACK_TRANSPOSE` reads a BF16 tile whole from its slot as it lies and the
+  unpacker transposes it (`SrcRoute::unpacks_transposed_b`). Gate `step272_transposed_bf16_b` (ttsim, card 0 in all
+  three read modes; a mover reading the untransposed tile caught on ttsim); `step76::a_bf16_product_reads_a_transposed_b_as_it_lies`
+  (one job, no plain copy). Qwen3.5's `table @ last^T` workaround retired.
+- *`expand` past 2,097,152 rows* goes in chunks of 2^20 (`step271_wide_expand`, 3.1M rows in 10.2 s; one chunk gives
+  the old "descriptor refused before submission (code 2)").
+
+**The BF16 lookup**: `SELECT_ROWS_BF16` (32-byte face-rows; a row of the other parity read into an aside region and
+moved by `COPY_HALFWORDS`, one wait a record). Gates `tt_isa` `select_rows_moves_bf16_rows_whole_through_the_aside_region`
+(a byte model of the entries against `face_index`), `step171::a_bf16_table_selects_its_rows_bit_for_bit` (ttsim, card 0
+`1794459860`; without the copies it fails), `step76::a_bf16_table_s_rows_are_selected_without_staging` (one job).
+`step167`'s BF16 SmolLM2 **229 -> 6.3 s**. B's image +1,772 bytes with the `GATHER` arm (10,152 left, tightest build).
+
+**One tied table** (the owner's decision, 2026-11-12: the scaling rule over the 0.5% rule). Both contracts store the
+embedding table once, BF16 (`Plan::for_numerics`, exact for BF16 checkpoints); its rows are widened to the F32 stream
+(`Llama::stream`, `Qwen35::stream`: the cache's dtype is the stream's, not the table's), and a tied head is
+`last @ table^T` with an F32 result over the exact values (`burn_tt::matmul_wide`, the table read where it lies).
+`WeightOptions::untied_head` (`TT_UNTIED_HEAD=1`) keeps a BFP8 head beside it, the old layout.
+
+| | 1.7B decode, ms (32 / 128 / 256) | 1.7B prefill, tokens/s (32 / 128 / 256) | 1.7B table and head, GDDR |
+|---|--:|--:|--:|
+| one BF16 table, the default (`1794462559`) | 7.677 / 8.209 / 8.850 | 1,261 / 3,471 / 4,219 | 201 MB |
+| untied BFP8 head, the option (`1794463218`) | 7.518 / 8.034 / 8.700 | 1,262 / 3,580 / 4,236 | 314 MB |
+| before: F32 table and BFP8 head (2026-11-11, `1794435175`) | 7.520 / 8.006 / 8.641 | 1,257 / 3,552 / 4,266 | 513 MB |
+
+The one table costs +0.15-0.18 ms a step (+2.1%), the BF16 head's extra 88 MB at ~550 GB/s; predicted +0.2. The
+lookup's change costs nothing (the untied run is the old default's step). The 128-token prefill's -3% is one sample
+each, not explained by the head (0.15 ms of ~37); re-measure before reading it.
+
+Quality (`step269`, all 232 positions, `1794459860`): reference 100% / 100% / PCC 0.999998 as before; performance top-1
+98.28% (the same 228), top-5 100%, PCC mean **0.999765** (least 0.999354), against the untied BFP8 head's 0.999669.
+
+**Qwen3.5-4B** (`qwen35_traced_generation`, card 1, `1794463906`): **54.47 / 54.86 ms** at 32 / 256 tokens, against
+56.93 / 57.29 with the F32 table (`1794293972`): the head reads 1.27 GB, not 2.54, and the card holds 1.27 GB less.
+Its gates on card 0 (`1794457685`): `step260` both, `step263` both (traced equals eager, 1,368 s).
+
+Conformance (ttsim, 3,025): no unexpected result. MNIST (`step12_mnist`), the mover gates in both read modes, and
+`step187`/`step188`/`step240` pass on card 0.
 
 ## W1: BF16 activations into the products, the performance default (2026-11-11, cards 0 and 1)
 

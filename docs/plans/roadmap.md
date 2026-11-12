@@ -19,15 +19,15 @@
   - Burn's own suites on silicon: F32/F16 3,001 of 3,025, BF16 1,098 of 1,187, none listed for a missing op.
 - **Models run on the card,** traced:
   - ResNet-18 in 12.7 ms and ViT-Tiny in 7.7 ms;
-  - SmolLM2-1.7B decodes at ~133 tokens/s (7.52 ms a step) under the performance contract, the inference default since 2026-11-10 (BFP8 weights; top-1 98.28% against HuggingFace, `step269`); 9.81 ms under the reference contract (BF16-stored weights, bit for bit the F32 model);
-  - Qwen3.5-4B decodes in 56.9 ms a step under the performance contract (BFP8 weights; no quality gate yet), 62.5 under the reference (~21 of either a greedy pick, W4);
+  - SmolLM2-1.7B decodes at ~130 tokens/s (7.68 ms a step) under the performance contract, the inference default since 2026-11-10 (BFP8 weights, the tied table stored once, BF16, since 2026-11-12; top-1 98.28% against HuggingFace, `step269`; 7.52 with a BFP8 head beside the table, the option); 9.81 ms under the reference contract (BF16-stored weights, bit for bit the F32 model; not re-measured with the one table);
+  - Qwen3.5-4B decodes in 54.5 ms a step under the performance contract (BFP8 weights, the tied head the BF16 table; no quality gate yet), 62.5 under the reference (~21 of either a greedy pick, W4);
   - a 7,992-token prompt prefills in 5.98 s.
 
-  All of this is single card and batch 1. The 1.7B's 7.52 ms is under the performance contract; everything else is under the bit-exact reference contract.
+  All of this is single card and batch 1. The 1.7B's 7.68 ms and Qwen3.5's 54.5 are under the performance contract; everything else is under the bit-exact reference contract.
 - **Against tt-metal, same card and model (2026-11-09):**
-  - Our batch-1 decode leads: 7.52 (performance) / 9.81 (reference) against 10.55-12.24 ms.
+  - Our batch-1 decode leads: 7.68 (performance) / 9.81 (reference) against 10.55-12.24 ms.
   - tt-metal batches 32 users at 1,289 tokens/s, prefills 2.2-3.1x faster, and runs prefill-shape products 2.4-22x faster (BF16/BFP8, HiFi2/LoFi, 2-D operand multicast).
-  - Qwen3.5-4B: tt-metal 38.0 ms on the card and 44-46 host-timed, with BFP4/BFP8 weights at LoFi and the argmax on the host; ours 56.9 with BFP8 weights (62.5 with BF16), or ~36 without our 21 ms greedy pick.
+  - Qwen3.5-4B: tt-metal 38.0 ms on the card and 44-46 host-timed, with BFP4/BFP8 weights at LoFi and the argmax on the host; ours 54.5 with BFP8 weights (62.5 with BF16), or ~33 without our 21 ms greedy pick.
   - Training, since 2026-11-09 traced on every tile by default (`tt-mnist`), beats burn-flex on the CPU: MNIST 1.31 against 2.3-2.6 ms a step, the small transformer 3.75 against 3.9-4.3.
   - [tt-metal-parity.md](tt-metal-parity.md) §1-§3.
 - **Multi-chip** is a proof of concept: matmul, conv and attention split across two cards; no all-reduce.
@@ -82,7 +82,7 @@ BFP8 weights are the inference default since 2026-11-10, behind the contract swi
 - the one-row path for a BF16 `A`: its decode products at the FP32 `A`'s step (BFP8 `B`, HiFi2: 10.74 -> 6.99 ms of products, FP32 `A` 7.00).
 
 A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmetic (below) is what turns it into a gain on a model. Packer L1 accumulation first needs the owner's decision.
-- [ ] **Packer L1 accumulation: below the 3% rule now; the owner decides whether it moves to failed-approaches.**
+- [ ] **Packer L1 accumulation: below the 3% rule now; kept open (owner, 2026-11-12): judge it again at `m` = 32 (W3) or on the W5 model.**
   - Ceiling with a packed `A` whole in `SrcB` (2026-11-10): at most 2.5% of a product, none on the 1.7B's 512-row chunk (`matmul::probe_skip_reload`; [log](../learnings/performance-log.md#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0)). It was up to 24% only while a packed `A` took faces.
   - Needs a ttsim check of `Pack_L1_Acc` (else an isolated silicon gate and a divergence entry), the partial format stated, and a spec model.
   - Delete `probe_skip_reload` when it lands or is killed.
@@ -91,13 +91,7 @@ A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmet
   - a one-row BF16 result writes its packed twin in BF16 (`Session::set_packed_twins` writes F32 twins only, so a BF16 `A` is packed again at every product today);
   - `float_matmul` and the element-wise wrappers accept BF16 without `cast_native`;
   - BF16 tensors in BF16 GDDR slots.
-- [ ] **Fix the four BF16 defects left from the new architectures** (worked around, never fixed; [new-architectures.md](new-architectures.md)):
-  - a BF16 product with a transposed `B` copies it plain (> 40 GB of host bookkeeping at 248K x 2,560);
-  - `Precision::Bf16` grows host memory without bound on Qwen3.5;
-  - casting a just-loaded tensor uploads the original first;
-  - the block copier refuses element-interleaving moves past ~400K elements.
-- [ ] **The BF16 embedding lookup without staging** (`gather_indexed_bf16` still stages; `step167` BF16 takes 229 s). B now has the room it lacked (10-14 KiB after the firmware diet). It also ends a second copy in today's defaults: a tied Llama (the 1.7B) keeps its table F32 for the lookup and a stored, untied head beside it.
-- [ ] **A BF16 KV cache, and attention reading it without widening** (`attention/widen` widens every call).
+- [ ] **A BF16 KV cache, and attention reading it without widening** (`attention/widen` widens every call). Its parts are in place since 2026-11-12: a transposed BF16 `B` for `q k^T` (`step272`) and 2-byte rows in B's records (`SELECT_ROWS_BF16`; `SCATTER_ROWS` next). Bound it first: the recorded prediction is ~0 at short context and at most ~0.9 ms at 2K on the 1.7B; it halves the cache's GDDR and lifts `attention::fits` ~1.39x (W3, long context). The cache's dtype is no longer the table's (`Llama::stream`).
 - [ ] **A BFP8 KV cache as a named option** (F8).
 - [ ] **The contract switch's reach.** `burn_tt::Numerics` landed (2026-11-10): attachment, thread scope, frozen into traces. Still open:
   - ops that branch on it, as BF16 activations, fidelity and packer L1 accumulation land;
@@ -227,7 +221,6 @@ The full text is in `git show 3e4cefd:docs/plans/roadmap.md`, "Track 3".
 
 - [ ] **Qwen3.5-4B** ([new-architectures.md](new-architectures.md)):
   - The delta-rule step in fewer ops: ~25 non-product ops a DeltaNet layer, 776 at 16.8 ms a step; tt-metal ~10.
-  - The tied head stored BF16 as its only copy, once the BF16 lookup lands (W1). A second copy breaks the scaling rule.
   - Deal evenly only where the uneven deal is not already at the card's read rate: ≤ 0.2 ms; bracket under the 0.5% rule.
   - The trace build: 644-1,487 s, host-bound, cause not found.
   - Chunked (WY) prefill: 3.7 s for 256 tokens today.
@@ -258,7 +251,7 @@ The full text is in `git show 3e4cefd:docs/plans/roadmap.md`, "Track 3".
   - the exact profile's timeouts on silicon.
 - [ ] **Bool scalars under `Fusion<TtBackend>`** (burn-fusion 0.21.0 `ScalarIr::to_relative` `todo!()`): refuse by name until upstream fixes it.
 - [ ] **Gather without staging:**
-  - packed tables (with W1's BF16 lookup);
+  - BFP and F16 tables (BF16 since 2026-11-12, `SELECT_ROWS_BF16`);
   - rank 3+;
   - `select` on other dimensions;
   - per-element `gather`;
