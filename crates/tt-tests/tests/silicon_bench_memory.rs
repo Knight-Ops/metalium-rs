@@ -1,6 +1,7 @@
 //! Memory throughput: what the data mover gets out of GDDR6, device-timed.
 //!
-//! `cargo xtask bench --filter silicon_bench_memory`
+//! `cargo xtask bench --feature profile --filter silicon_bench_memory`: the spans are the mover's
+//! own stamps, which only an image built with the `profile` feature carries.
 //!
 //! Every span is the mover's own `LIST_BEGIN -> LIST_END` (or barrier exit ->
 //! `LIST_END`) on its tile's counter: from its first look at the list to every
@@ -424,6 +425,9 @@ struct Fleet {
     w4: Window,
     dram: Dram,
     movers: Vec<DataMover<Noc0>>,
+    /// Each tile's NC mover, beside `movers` (B's), for the fleets that write
+    /// ([`fleet_on`] with `dm::Mover::NC`); empty otherwise.
+    writers: Vec<DataMover<Noc0>>,
     c: Conditions,
     /// Each tile's counter less tile 0's, in cycles, and the uncertainty of it.
     offset: Vec<i64>,
@@ -437,13 +441,12 @@ fn fleet(d: &mut Dev<'static>) -> Fleet {
     fleet_on(d, dm::Mover::B)
 }
 
-/// Every tile's `mover`, traced: B's, or NC's for the benchmarks of NoC #1
-/// writes (only NC's image has them).
+/// Every tile's B mover, traced; with `mover` NC, each tile's NC mover too
+/// (`Fleet::writers`, untraced), for the benchmarks of writes: NC writes, on
+/// either NoC, but only inside B's transfer packets ([`agg_write_lists`]),
+/// and B's barrier starts them.
 fn fleet_on(d: &mut Dev<'static>, mover: dm::Mover) -> Fleet {
-    let image = match mover.core {
-        tt_isa::tensix::Core::NC => tt_firmware_images::DM_NC.1,
-        _ => tt_firmware_images::DM_B.1,
-    };
+    let writes = mover == dm::Mover::NC;
     let w = d.alloc_window(WindowKind::TwoMib).unwrap();
     let w4 = d.alloc_window(WindowKind::FourGib).unwrap();
     let dram = d.dram_grid(&w).unwrap();
@@ -452,12 +455,28 @@ fn fleet_on(d: &mut Dev<'static>, mover: dm::Mover) -> Fleet {
     let c = Conditions::measure(d, device_index(), tensix_tile());
     c.print();
     let mut movers = Vec::new();
+    let mut writers = Vec::new();
     for t in coords {
         let t = tile(d, t.x(), t.y());
-        match DataMover::start_on(d, &w, t, &dram, mover, image) {
-            Ok(m) => {
-                d.write32(&w, t, mover.at(dm::TRACE), 1).unwrap();
+        let started = DataMover::start(d, &w, t, &dram, tt_firmware_images::DM_B.1).and_then(|m| {
+            if !writes {
+                return Ok((m, None));
+            }
+            let nc =
+                DataMover::start_on(d, &w, t, &dram, dm::Mover::NC, tt_firmware_images::DM_NC.1);
+            match nc {
+                Ok(nc) => Ok((m, Some(nc))),
+                Err(e) => {
+                    m.stop(d, &w).unwrap();
+                    Err(e)
+                }
+            }
+        });
+        match started {
+            Ok((m, nc)) => {
+                d.write32(&w, t, dm::Mover::B.at(dm::TRACE), 1).unwrap();
                 movers.push(m);
+                writers.extend(nc);
             }
             Err(e) => println!(
                 "MEASURE skipping ({},{}): the mover did not start: {e}",
@@ -466,6 +485,12 @@ fn fleet_on(d: &mut Dev<'static>, mover: dm::Mover) -> Fleet {
             ),
         }
     }
+    // Every span here is the mover's own stamps, which only an image built with
+    // the `profile` feature carries: without it a run reads empty traces.
+    assert!(
+        movers.iter().all(|m| m.stamps()),
+        "the mover image cannot stamp: run with `cargo xtask bench --feature profile`"
+    );
     let (offset, skew_bound) = skew(d, &w, &movers, &c);
     let raw = movers
         .iter()
@@ -482,6 +507,7 @@ fn fleet_on(d: &mut Dev<'static>, mover: dm::Mover) -> Fleet {
         w4,
         dram,
         movers,
+        writers,
         c,
         offset,
         skew_bound,
@@ -559,7 +585,39 @@ enum Mix {
     /// two endpoints NoC #0 owns: whether one endpoint, not the channel or the
     /// links, is what holds a channel back under many readers.
     NearestBothPorts,
+    /// tt-metal's `8_dram_adjacent_core_read` (the Blackhole CI gate): eight
+    /// readers, reader `c` on the tile beside channel `c`'s NoC #0 endpoint
+    /// ([`adjacent_tiles`]), each streaming only its own channel from the
+    /// channel's first byte, through the endpoint tt-metal gives NoC #0
+    /// ([`ADJ_PORT`]).
+    Adjacent,
+    /// Reads, `r` tiles a channel ([`banked_tiles`]: the tiles moved to the front channel by
+    /// channel), tile `t` reading only channel `t / r` (its own share of it) through the NoC #0
+    /// endpoint of that channel nearest above it ([`nearest_port`]): F27's bank-local reads at
+    /// more than one reader a channel (`docs/completed-plans/decode-to-bandwidth.md` Phase 10, A1).
+    Banked(u8),
+    /// Today's decode product's weight reads (an `m = 1`, `K`-whole job a unit): tile `t` reads
+    /// `nc` consecutive columns of a weight `n * nc` tiles wide and `entries / nc` tall,
+    /// interleaved over the eight channels as `tt_kernels` places it (tile `kk * ct + j` on
+    /// channel `% 8`, slot `/ 8`), `K` tile by `K` tile, one slot an entry, the port rotating
+    /// `(kk + j) % 3` as `record::GATHER`'s does.
+    Decode {
+        nc: u8,
+    },
+    /// [`Mix::Decode`]'s units, each reading as many bytes, but from a weight laid out for its
+    /// reader at load time (X9 of `docs/learnings/dataflow-compiler.md`, H11): tile `t`'s share is
+    /// contiguous in channel `t % 8`, the tiles sharing a channel stacked by `t / 8`, read front to
+    /// back in entries of the shape's length, the port rotating `i % 3` as `record::GATHER`'s
+    /// does. Whether a decode product's reads, at the same units and bytes, reach the channels'
+    /// long-entry rate (F27's 505-511 at 2+ readers a channel) when its entries are large.
+    DecodeContiguous,
 }
+
+/// The subchannel (our port) tt-metal's `dram_views` give NoC #0 on each
+/// channel (`blackhole_140_arch.yaml`, `worker_endpoint[0]`): 2, 0, 0, 0 on
+/// channels 0-3 and 2 on 4-7. Every one is an endpoint NoC #0 owns here
+/// (`DramChannel::owns`), checked before a list is built.
+const ADJ_PORT: [u8; 8] = [2, 0, 0, 0, 2, 2, 2, 2];
 
 /// Raw NoC #0 Y of each channel's three endpoints, by `channel % 4` and port
 /// (tt-metal `soc_descriptors/blackhole_140_arch.yaml:11-21`, the `dram`
@@ -621,6 +679,116 @@ fn nearest(f: &Fleet, n: usize) -> Vec<(u8, u8)> {
     out
 }
 
+/// The mover (index into the fleet's movers) tt-metal puts beside each
+/// channel's NoC #0 endpoint, by channel (`core_assignment.cpp`,
+/// `get_optimal_dram_to_physical_worker_assignment`, Blackhole): the tile at
+/// the endpoint's row (never above the first Tensix row, 2) in the column
+/// just right of the DRAM column (raw X 0 or 9), moved right while that tile
+/// is not one of ours (a harvested column). The DRAM endpoint's raw X is
+/// 0 on channels 0-3 and [`DRAM_MID_X`] on 4-7.
+fn adjacent_tiles(f: &Fleet) -> Vec<usize> {
+    let picked: Vec<usize> = (0..8u8)
+        .map(|c| {
+            let port = ADJ_PORT[c as usize];
+            assert!(
+                f.dram.channel(c).unwrap().owns(Niu::Noc0, port),
+                "channel {c}: NoC #0 does not own endpoint {port}"
+            );
+            let (dx, dy) = (
+                if c < 4 { 0 } else { DRAM_MID_X },
+                DRAM_RAW_Y[(c % 4) as usize][port as usize],
+            );
+            let y = dy.max(2);
+            let mut x = dx + 1;
+            loop {
+                if let Some(i) = f.raw.iter().position(|&r| r == (x, y)) {
+                    break i;
+                }
+                x += 1;
+                assert!(x <= 16, "channel {c}: no tile of ours right of ({dx},{dy})");
+            }
+        })
+        .collect();
+    let mut sorted = picked.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        8,
+        "two channels share a reader tile: {picked:?}"
+    );
+    picked
+}
+
+/// The NoC #0 endpoint (port) of channel `ch` nearest above tile `t`: the shortest Y leg, as
+/// [`nearest`] chooses.
+fn nearest_port(f: &Fleet, t: usize, ch: u8) -> u8 {
+    let c = f.dram.channel(ch).unwrap();
+    let gap = |row: u8| (f.raw[t].1 as i32 - row as i32).rem_euclid(12);
+    (0..tt_isa::dram::PORTS)
+        .filter(|&p| c.owns(Niu::Noc0, p))
+        .min_by_key(|&p| gap(DRAM_RAW_Y[(ch % 4) as usize][p as usize]))
+        .unwrap()
+}
+
+/// [`Mix::Banked`]'s readers, `r` a channel, channel by channel: of the tiles [`nearest`] deals
+/// to each channel, the `r` nearest it, by the Y leg to their endpoint and then the X leg from
+/// the DRAM column.
+fn banked_tiles(f: &Fleet, r: usize) -> Vec<usize> {
+    let near = nearest(f, f.movers.len());
+    let mut out = Vec::new();
+    for c in 0..8u8 {
+        let dram_x = if c < 4 { 0 } else { DRAM_MID_X };
+        let mut group: Vec<usize> = (0..near.len()).filter(|&t| near[t].0 == c).collect();
+        group.sort_by_key(|&t| {
+            let row = DRAM_RAW_Y[(c % 4) as usize][near[t].1 as usize];
+            (
+                (f.raw[t].1 as i32 - row as i32).rem_euclid(12),
+                f.raw[t].0.abs_diff(dram_x),
+                t,
+            )
+        });
+        assert!(
+            group.len() >= r,
+            "channel {c}: {} tiles near it, {r} asked",
+            group.len()
+        );
+        out.extend(&group[..r]);
+    }
+    out
+}
+
+/// `first` (indices into the fleet's movers) moved to the front, in that
+/// order, with the per-mover tables following, so that `agg_run`'s first `n`
+/// movers are the ones a placement chose.
+fn move_to_front(f: &mut Fleet, first: &[usize]) {
+    let mut order = first.to_vec();
+    order.extend((0..f.movers.len()).filter(|i| !first.contains(i)));
+    let mut movers: Vec<Option<DataMover<Noc0>>> = std::mem::take(&mut f.movers)
+        .into_iter()
+        .map(Some)
+        .collect();
+    f.movers = order.iter().map(|&i| movers[i].take().unwrap()).collect();
+    if !f.writers.is_empty() {
+        let mut writers: Vec<Option<DataMover<Noc0>>> = std::mem::take(&mut f.writers)
+            .into_iter()
+            .map(Some)
+            .collect();
+        f.writers = order.iter().map(|&i| writers[i].take().unwrap()).collect();
+    }
+    f.offset = order.iter().map(|&i| f.offset[i]).collect();
+    f.skew_bound = order.iter().map(|&i| f.skew_bound[i]).collect();
+    f.raw = order.iter().map(|&i| f.raw[i]).collect();
+}
+
+/// Where in L1 a [`Mix::Adjacent`] entry lands: a ring of `len`-byte slots
+/// inside the benchmark's window, whole slots only (an entry of 16,320 bytes
+/// does not divide the window, so a modulo of the byte offset would run past
+/// it).
+fn ring_slot(i: u32, len: u32) -> u32 {
+    L1 + (i % (L1_SPAN / len)) * len
+}
+
 /// Entries per tile per run, of [`AGG_LEN`] each: 3.75 MiB a tile, in
 /// [`MAX_REQUESTS`] packets.
 const AGG_LEN: u32 = 65536;
@@ -662,13 +830,68 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
         0,
     ]];
     let near = matches!(mix, Mix::Nearest | Mix::NearestBothPorts).then(|| nearest(fleet, n)[tile]);
-    if matches!(mix, Mix::Column | Mix::Nearest | Mix::NearestBothPorts) {
+    if matches!(
+        mix,
+        Mix::Column | Mix::Nearest | Mix::NearestBothPorts | Mix::Adjacent
+    ) {
         assert_eq!(nc, 8, "the placements assume all eight channels");
+    }
+    match mix {
+        Mix::Banked(r) => {
+            let (ch, k) = ((tile / r as usize) as u8, (tile % r as usize) as u64);
+            let port = nearest_port(fleet, tile, ch) as u32;
+            for i in 0..entries {
+                let off = BASE + k * (entries * len) as u64 + (i * len) as u64;
+                list.push(entry(op::READ, ch, port, off, ring_slot(i, len), len));
+            }
+            return list;
+        }
+        Mix::Decode { nc } => {
+            let nc = nc as u32;
+            let (kt, ct) = (entries / nc, n as u32 * nc);
+            let mut i = 0;
+            for kk in 0..kt {
+                for j in tile as u32 * nc..(tile as u32 + 1) * nc {
+                    let t = (kk * ct + j) as u64;
+                    let off = BASE + (t / 8) * len as u64;
+                    let port = (kk + j) % 3;
+                    list.push(entry(
+                        op::READ,
+                        (t % 8) as u8,
+                        port,
+                        off,
+                        ring_slot(i, len),
+                        len,
+                    ));
+                    i += 1;
+                }
+            }
+            return list;
+        }
+        Mix::DecodeContiguous => {
+            assert_eq!(nc, 8, "the layout assumes all eight channels");
+            let ch = chans[tile % 8];
+            let share = (entries * len) as u64;
+            let first = BASE + (tile / 8) as u64 * share;
+            for i in 0..entries {
+                list.push(entry(
+                    op::READ,
+                    ch,
+                    i % 3,
+                    first + (i * len) as u64,
+                    ring_slot(i, len),
+                    len,
+                ));
+            }
+            return list;
+        }
+        _ => {}
     }
     for i in 0..entries {
         let (c, k) = match mix {
             Mix::OneChannel | Mix::OneChannelWrite => (0, i),
             Mix::Nearest | Mix::NearestBothPorts => (near.unwrap().0 as u32, i),
+            Mix::Adjacent => (tile as u32, i),
             Mix::Column => {
                 let half = if fleet.raw[tile].0 < DRAM_MID_X { 0 } else { 4 };
                 (half + (i + tile as u32) % 4, i / 4)
@@ -679,13 +902,13 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
             Mix::Write | Mix::OneChannelWrite => op::WRITE,
             _ => op::READ,
         };
-        let per_tile = if matches!(
-            mix,
-            Mix::OneChannel | Mix::OneChannelWrite | Mix::Nearest | Mix::NearestBothPorts
-        ) {
-            (entries * len) as u64
-        } else {
-            1 << 20
+        let per_tile = match mix {
+            // One reader a channel: its stream starts at the channel's base.
+            Mix::Adjacent => 0,
+            Mix::OneChannel | Mix::OneChannelWrite | Mix::Nearest | Mix::NearestBothPorts => {
+                (entries * len) as u64
+            }
+            _ => 1 << 20,
         };
         let off = BASE + tile as u64 * per_tile + (k * len) as u64;
         list.push(entry(
@@ -694,15 +917,95 @@ fn agg_list(fleet: &Fleet, tile: usize, n: usize, mix: Mix, shape: Shape) -> Vec
             match (mix, near) {
                 // NoC #0's two endpoints, 0 and 2, in turn.
                 (Mix::NearestBothPorts, _) => 2 * (i % 2),
+                (Mix::Adjacent, _) => ADJ_PORT[tile] as u32,
                 (_, Some((_, p))) => p as u32,
                 _ => tile as u32 % 3,
             },
             off,
-            L1 + (i * len) % L1_SPAN,
+            if mix == Mix::Adjacent {
+                ring_slot(i, len)
+            } else {
+                L1 + (i * len) % L1_SPAN
+            },
             len,
         ));
     }
     list
+}
+
+impl Mix {
+    /// Whether the mix writes: NC's, inside B's packets ([`agg_write_lists`]).
+    fn writes(self) -> bool {
+        matches!(self, Mix::Write | Mix::OneChannelWrite)
+    }
+}
+
+/// `writes` (WRITE entries) as one transfer packet (`dm::op::PAIR`) for B:
+/// B's reader section only hands NC one credit, and NC's writer section waits
+/// for it, makes the writes and returns it. B finishes the packet once NC's
+/// section is done; a `trailer` (a barrier) then runs on B.
+fn write_packet(writes: &[Entry], trailer: Option<Entry>) -> Vec<Entry> {
+    use tt_isa::dataflow::{Action, Stream};
+    let credit = |action: Action| {
+        [
+            op::CB,
+            Stream::Transfer.word(),
+            action.word(),
+            1,
+            0,
+            0,
+            0,
+            0,
+        ]
+    };
+    let reader = [credit(Action::Reserve), credit(Action::Push)];
+    let mut packet = vec![[
+        op::PAIR,
+        reader.len() as u32,
+        writes.len() as u32 + 2,
+        1,
+        trailer.is_some() as u32,
+        0,
+        0,
+        0,
+    ]];
+    packet.extend(reader);
+    packet.push(credit(Action::Wait));
+    packet.extend_from_slice(writes);
+    packet.push(credit(Action::Pop));
+    packet.extend(trailer);
+    packet
+}
+
+/// [`agg_list`]'s write list (a barrier, then the writes) as B's two lists:
+/// the barrier, then the writes in a packet ([`write_packet`]) -- a barrier is
+/// B's alone, and NC writes only inside B's packets. B's events still time
+/// the run, release to its last `LIST_END`: the reader section's own list
+/// ends as soon as it hands NC the credit, so the packet's trailer, a
+/// wait-only barrier on the same counter (already at its target: one NoC
+/// read), is a last list on B that ends after NC's last write has landed.
+/// NC stays untraced: its events would share the tile's timestamper with B's
+/// (`performance-scoreboard.md`, concurrent B/NC exports).
+fn agg_write_lists(list: &[Entry]) -> (Vec<Entry>, Vec<Entry>) {
+    assert_eq!(list[0][0], op::BARRIER);
+    let mut wait = list[0];
+    wait[4] = 1;
+    let packet = write_packet(&list[1..], Some(wait));
+    // Both sit in B's ring at once: the barrier's one entry and the packet.
+    assert!(
+        packet.len() < dm::LIST_MAX as usize,
+        "a packet of {} entries",
+        packet.len()
+    );
+    (list[..1].to_vec(), packet)
+}
+
+/// Queue a write list's two lists ([`agg_write_lists`]) on a tile's B mover
+/// `m`; [`DataMover::drain`] waits for them.
+fn submit_writes(d: &mut Dev<'_>, w: &Window, m: &mut DataMover<Noc0>, list: &[Entry]) {
+    let (barrier, packet) = agg_write_lists(list);
+    m.enqueue(d, w, &barrier).unwrap();
+    m.enqueue(d, w, &packet).unwrap();
 }
 
 /// One run of `n` tiles' lists at once: per tile, its rate from barrier exit
@@ -714,8 +1017,10 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
     let coord = f.movers[0].tile();
     d.write32(&f.w, coord, dm::BARRIER_COUNTER, 0).unwrap();
     let lists: Vec<_> = (0..n).map(|t| agg_list(f, t, n, mix, shape)).collect();
+    // A write mix's requests wait under NC's cap, not B's.
     let throttle = |d: &mut Dev<'_>, f: &Fleet| {
-        f.movers[..n]
+        let issuers = if mix.writes() { &f.writers } else { &f.movers };
+        issuers[..n]
             .iter()
             .map(|m| m.throttle(d, &f.w).unwrap().stalls as u64)
             .sum::<u64>()
@@ -736,24 +1041,58 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
     }
     // The barrier holds every list until the last is submitted.
     for (m, list) in f.movers[..n].iter_mut().zip(&lists) {
-        m.submit_list(d, &f.w, list).unwrap();
+        if mix.writes() {
+            submit_writes(d, &f.w, m, list);
+        } else {
+            m.submit_list(d, &f.w, list).unwrap();
+        }
     }
     let h0 = Instant::now();
-    for m in &f.movers[..n] {
-        m.wait(d, &f.w).unwrap();
+    for m in &mut f.movers[..n] {
+        if mix.writes() {
+            m.drain(d, &f.w).unwrap();
+        } else {
+            m.wait(d, &f.w).unwrap();
+        }
     }
     let host_us = h0.elapsed().as_secs_f64() * 1e6;
     let bytes = shape.bytes();
     let mut rates = Vec::new();
     let (mut first, mut last) = (i64::MAX, i64::MIN);
     let (mut last_release, mut first_end) = (i64::MIN, i64::MAX);
+    // `AGG_TRACE=full`: every tile's read entries' ends on tile 0's clock, with their bytes.
+    let mut issued: Vec<(i64, u64)> = Vec::new();
     for (i, m) in f.movers[..n].iter().enumerate() {
         let trace = d.read_trace(&f.w, m.tile(), TRACE_BUFFER).unwrap();
+        if trace_mode == dm::trace_mode::FULL {
+            issued.extend(
+                trace
+                    .iter()
+                    .filter(|e| {
+                        let (src, event) = ev::split(e.token);
+                        src == ev::MOVER
+                            && event == ev::ENTRY_END
+                            && matches!(ev::detail(e.token), op::READ | op::READ_ENCODED)
+                    })
+                    .map(|e| (e.cycles as i64 - f.offset[i], shape.len as u64)),
+            );
+        }
         // The barrier is the list's first entry: its end is the release.
         let released = trace
             .iter()
             .find(|e| ev::split(e.token) == (ev::MOVER, ev::ENTRY_END))
-            .expect("no barrier end")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no barrier end: tile {i} ({:?}) traced {} events: {:?}",
+                    m.tile(),
+                    trace.len(),
+                    trace
+                        .iter()
+                        .take(6)
+                        .map(|e| ev::split(e.token))
+                        .collect::<Vec<_>>()
+                )
+            })
             .cycles;
         let end = trace
             .iter()
@@ -768,6 +1107,26 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
     }
     let together = f.c.rate(bytes * n as f64, (last - first) as f64);
     let stalls = throttle(d, f) - stalls_before;
+    // What the card read while every tile was reading, and in tenths of the run.
+    let in_window = |a: i64, b: i64| -> f64 {
+        let moved: u64 = issued
+            .iter()
+            .filter(|&&(t, _)| t > a && t <= b)
+            .map(|&(_, l)| l)
+            .sum();
+        f.c.rate(moved as f64, (b - a).max(1) as f64)
+    };
+    let (all_running, tenths) = if issued.is_empty() {
+        (None, Vec::new())
+    } else {
+        let tenth = (last - first) / 10;
+        (
+            (first_end > last_release).then(|| in_window(last_release, first_end)),
+            (0..10)
+                .map(|k| in_window(first + k * tenth, first + (k + 1) * tenth))
+                .collect(),
+        )
+    };
     AggRun {
         rates,
         together,
@@ -775,6 +1134,8 @@ fn agg_run(d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape) -> 
         stalls,
         release_spread: (last_release - first) as f64,
         end_spread: (last - first_end) as f64,
+        all_running,
+        tenths,
     }
 }
 
@@ -791,6 +1152,11 @@ struct AggRun {
     /// every tile moving at once.
     release_spread: f64,
     end_spread: f64,
+    /// `AGG_TRACE=full` only: the card's rate (bytes per second, by the read entries' ends) from
+    /// the last barrier release to the first list end, while every tile reads.
+    all_running: Option<f64>,
+    /// `AGG_TRACE=full` only: the card's rate in each tenth of the run.
+    tenths: Vec<f64>,
 }
 
 /// [`agg_run`] after a warm-up, [`REPS`] times, reported as `label`: the
@@ -844,6 +1210,29 @@ fn measure(
         "device",
         Stats::of(runs.iter().map(|r| f.c.cycles_to_us(r.end_spread))),
     );
+    let all: Vec<f64> = runs.iter().filter_map(|r| r.all_running).collect();
+    if !all.is_empty() {
+        let s = Stats::of(all.iter().map(|r| r / 1e9));
+        println!(
+            "MEASURE {label}: while every tile reads {:.1} GB/s (p10 {:.1}, p90 {:.1}, n {})",
+            s.median,
+            s.p10,
+            s.p90,
+            all.len()
+        );
+    }
+    if runs.iter().all(|r| r.tenths.len() == 10) {
+        let tenths: Vec<String> = (0..10)
+            .map(|k| {
+                let s = Stats::of(runs.iter().map(|r| r.tenths[k] / 1e9));
+                format!("{:.0}", s.median)
+            })
+            .collect();
+        println!(
+            "MEASURE {label}: GB/s by tenth of the run {}",
+            tenths.join(" ")
+        );
+    }
     report(
         &format!("{label}: requests that waited under the in-flight cap, per run"),
         "requests",
@@ -979,10 +1368,12 @@ fn gddr_aggregate() {
             "MEASURE gddr_aggregate: 'together' spans carry up to {bound} cycles ({:.2} us) of counter-offset uncertainty",
             f.c.cycles_to_us(bound as f64)
         );
-        let Fleet { w, movers, .. } = f;
-        for m in movers {
+        let Fleet {
+            w, movers, writers, ..
+        } = f;
+        for m in writers.into_iter().chain(movers) {
             let t = m.tile();
-            d.write32(&w, t, mover.at(dm::TRACE), 0).unwrap();
+            d.write32(&w, t, m.mover().at(dm::TRACE), 0).unwrap();
             m.stop(d, &w).unwrap();
         }
     });
@@ -1097,13 +1488,416 @@ fn gddr_aggregate_affinity() {
     });
 }
 
+/// tt-metal's Blackhole CI bound on the adjacent-core DRAM read, in GB/s
+/// (`tests/scripts/test_moreh_microbenchmark.py`, `test_dram_read_all_core`:
+/// `490.0 <= throughput <= 512.0`, decimal GB/s from the kernel's device
+/// duration over all the bytes of the buffer).
+const GATE_LOWER: f64 = 490.0;
+const GATE_UPPER: f64 = 512.0;
+
+/// One of the gate's data formats: the packet a reader moves (tt-metal's
+/// `get_max_page_size_and_num_pages`: the most whole tiles in one 16 KiB NoC
+/// burst) and the bytes each of the eight readers streams in the CI's shape
+/// (`test_dram_read_all_core`, Blackhole rows: `k` 524,288, `n` 1,024 or
+/// 2,048, 8 banks; the last is the padded FF1 shape, `k` 2,048, `n` 3,840).
+struct AdjFormat {
+    name: &'static str,
+    page: u32,
+    /// Bytes a bank holds of the buffer, which its reader reads.
+    per_bank: u64,
+}
+
+const ADJ_FORMATS: [AdjFormat; 4] = [
+    // BFP8, 1,088-byte tiles: 15 to a packet.
+    AdjFormat {
+        name: "bfp8",
+        page: 15 * 1088,
+        per_bank: 524_288 * 1088 / 8,
+    },
+    // BF16, 2,048-byte tiles: 8 to a packet.
+    AdjFormat {
+        name: "bf16",
+        page: 8 * 2048,
+        per_bank: 524_288 * 1024 * 2 / 8,
+    },
+    // BFP4, 576-byte tiles: 28 to a packet.
+    AdjFormat {
+        name: "bfp4",
+        page: 28 * 576,
+        per_bank: 524_288 * 2048 * 576 / 1024 / 8,
+    },
+    // BF16, `k` 2,048, `n` 3,840: under 2 MiB a bank.
+    AdjFormat {
+        name: "ff1",
+        page: 8 * 2048,
+        per_bank: 2048 * 3840 * 2 / 8,
+    },
+];
+
+/// A reader's list for `fmt`: `stream` makes each entry as many whole
+/// packets as fit in 128 KiB (the mover splits it into NoC packets as it
+/// does every long entry); otherwise one entry is one tt-metal packet. A list
+/// holds at most `dm::LIST_MAX` entries, so the long formats stream a part of
+/// what the gate reads (a few MiB a bank with packet entries, under 64 MiB
+/// with long ones, against 68-128 MiB): the span is still 0.1-1 ms, and the
+/// ramp is a few microseconds of it.
+fn adj_shape(fmt: &AdjFormat, stream: bool) -> Shape {
+    let len = if stream {
+        fmt.page * (131_072 / fmt.page)
+    } else {
+        fmt.page
+    };
+    Shape {
+        entries: ((fmt.per_bank / len as u64) as u32).clamp(1, dm::LIST_MAX - 2),
+        len,
+    }
+}
+
+/// Each reader's last entries, alone: GDDR holds a pattern of its own at
+/// them, and the L1 slots they land in must hold it. A reader that read the
+/// wrong channel, or a list that ended before its bytes landed, fails here.
+fn adj_check(d: &mut Dev<'_>, f: &mut Fleet, shape: Shape) {
+    let keep = ((L1_SPAN / shape.len) as usize)
+        .min(4)
+        .min(shape.entries as usize);
+    for t in 0..8usize {
+        let list = agg_list(f, t, 8, Mix::Adjacent, shape);
+        let last = &list[list.len() - keep..];
+        let mut want = Vec::new();
+        for (k, e) in last.iter().enumerate() {
+            let ch = f.dram.channel(e[1] as u8).unwrap();
+            let p = pattern(shape.len as usize, (t * 16 + k) as u32 + 7);
+            d.dram_write(&f.w4, ch.range(e[3] as u64, shape.len as u64).unwrap(), &p)
+                .unwrap();
+            want.push(p);
+        }
+        f.movers[t].run_list(d, &f.w, last).unwrap();
+        let mut back = vec![0u8; L1_SPAN as usize];
+        d.l1_read(&f.w, f.movers[t].tile(), L1 as u64, &mut back)
+            .unwrap();
+        for (k, e) in last.iter().enumerate() {
+            let l1 = (e[4] - L1) as usize;
+            assert!(
+                back[l1..l1 + shape.len as usize] == want[k][..],
+                "channel {t}'s read entry {k} did not land"
+            );
+        }
+    }
+}
+
+/// tt-metal's Blackhole DRAM read gate (`8_dram_adjacent_core_read`, run by
+/// CI as `test_dram_read_all_core`), on our mover: eight readers, one a DRAM
+/// channel, each on the tile beside its channel's NoC #0 endpoint
+/// ([`adjacent_tiles`]) and each reading only its own channel from its base,
+/// through the endpoint tt-metal gives NoC #0 ([`ADJ_PORT`]). The metric is
+/// the gate's: every byte over the first start to the last end of the eight
+/// (here on tile 0's clock, each tile's events less its measured offset),
+/// decimal GB/s, against `490 <= x <= 512`.
+///
+/// What differs, so the number is read for what it is:
+/// - tt-metal's reader is a compiled kernel keeping up to two 1 MiB blocks of
+///   packets in flight on three transaction IDs and a static virtual channel
+///   (`bank & 3`); ours is the mover firmware with an in-flight cap
+///   (`AGG_CAP`, `ADJ_CAPS`) and the NoC's own virtual-channel choice.
+/// - A list holds `dm::LIST_MAX` entries ([`adj_shape`]), so each reader
+///   streams 8-64 MiB, not 68-128.
+/// - tt-metal reserves cores for fast dispatch and starts the eight through a
+///   dispatch command; ours start from a barrier released by a counter.
+///
+/// Reports each configuration's `together` (the gate's metric) through
+/// `measure`, then the verdict of each format as shipped (packet entries, the
+/// mover's default cap) and at its best. `ADJ_GATE=1` fails the test below
+/// 490 GB/s at the best; above 512 (by more than 2%) it always fails, since a
+/// list cannot end before its data lands.
+///
+/// `ADJ_FORMATS=bf16,ff1` picks formats, `ADJ_ENTRY=page|stream` one entry
+/// shape (default both), `ADJ_CAPS=8,32,0` the in-flight caps (0 is the
+/// mover's maximum, 128). Run the default build and `--feature fast-reads`:
+/// one safe-mode tile reads 16 KiB packets at ~58 GB/s, under the 61 GB/s a
+/// bank must supply.
+#[test]
+#[ignore = "benchmark"]
+fn gddr_adjacent_banks() {
+    on_card(|d| {
+        let mut f = fleet(d);
+        let adj = adjacent_tiles(&f);
+        move_to_front(&mut f, &adj);
+        for c in 0..8usize {
+            let (x, y) = f.raw[c];
+            let port = ADJ_PORT[c];
+            println!(
+                "MEASURE adjacent: channel {c} through endpoint {port} (raw y {}), read by the tile at raw ({x},{y})",
+                DRAM_RAW_Y[c % 4][port as usize]
+            );
+        }
+        let card = f.c.gddr_card();
+        let list = |var: &str| std::env::var(var).ok();
+        let formats: Vec<&AdjFormat> = match list("ADJ_FORMATS") {
+            Some(s) => s
+                .split(',')
+                .map(|n| {
+                    ADJ_FORMATS
+                        .iter()
+                        .find(|f| f.name == n.trim())
+                        .unwrap_or_else(|| panic!("ADJ_FORMATS: no format `{n}`"))
+                })
+                .collect(),
+            None => ADJ_FORMATS.iter().collect(),
+        };
+        let modes: Vec<bool> = match list("ADJ_ENTRY").as_deref() {
+            Some("page") => vec![false],
+            Some("stream") => vec![true],
+            None => vec![false, true],
+            Some(v) => panic!("ADJ_ENTRY={v}: expected page or stream"),
+        };
+        let caps: Vec<u32> = match list("ADJ_CAPS") {
+            Some(s) => s.split(',').map(|c| c.trim().parse().unwrap()).collect(),
+            None => vec![dm::TILE_IN_FLIGHT_CAP, 32, 0],
+        };
+        let ceiling = card.as_ref().map_or(GATE_UPPER * 1e9, |p| p.bytes_per_sec);
+        let mut results: Vec<(&str, bool, u32, f64)> = Vec::new();
+        for fmt in &formats {
+            for &stream in &modes {
+                let shape = adj_shape(fmt, stream);
+                let entry = if stream { "stream" } else { "page" };
+                println!(
+                    "MEASURE adjacent {}: {} entries x {} B = {:.2} MiB a bank (the gate reads {:.1} MiB)",
+                    fmt.name,
+                    shape.entries,
+                    shape.len,
+                    shape.bytes() / (1 << 20) as f64,
+                    fmt.per_bank as f64 / (1 << 20) as f64
+                );
+                for &cap in &caps {
+                    for m in &f.movers[..8] {
+                        m.set_in_flight_cap(d, &f.w, cap).unwrap();
+                    }
+                    let shown = if cap == 0 { 128 } else { cap };
+                    let label = format!("gddr adjacent {} {entry} cap {shown}", fmt.name);
+                    let runs = measure(d, &mut f, 8, Mix::Adjacent, shape, card.as_ref(), &label);
+                    let gbs = Stats::of(runs.iter().map(|r| r.together / 1e9)).median;
+                    assert!(
+                        gbs * 1e9 <= ceiling * 1.02,
+                        "{label}: {gbs:.1} GB/s is over the card's {:.1}: a list ended before its data landed",
+                        ceiling / 1e9
+                    );
+                    println!(
+                        "MEASURE adjacent gate: {label}: {gbs:.1} GB/s, {} {GATE_LOWER:.0}",
+                        if gbs >= GATE_LOWER { ">=" } else { "<" }
+                    );
+                    results.push((fmt.name, stream, cap, gbs));
+                }
+                adj_check(d, &mut f, shape);
+            }
+        }
+        println!(
+            "MEASURE adjacent gate: tt-metal Blackhole bound {GATE_LOWER:.0} <= GB/s <= {GATE_UPPER:.0}; mover default cap {}",
+            dm::TILE_IN_FLIGHT_CAP
+        );
+        let mut failed = Vec::new();
+        for fmt in &formats {
+            let of = |f: &&(&str, bool, u32, f64)| f.0 == fmt.name;
+            let best = results.iter().filter(of).max_by(|a, b| a.3.total_cmp(&b.3));
+            let shipped = results
+                .iter()
+                .filter(of)
+                .find(|r| !r.1 && r.2 == dm::TILE_IN_FLIGHT_CAP);
+            let verdict = |g: f64| if g >= GATE_LOWER { "PASS" } else { "FAIL" };
+            if let Some(&(_, stream, cap, g)) = best {
+                println!(
+                    "MEASURE adjacent gate: {}: best {g:.1} GB/s ({}, cap {}) {}",
+                    fmt.name,
+                    if stream { "stream" } else { "page" },
+                    if cap == 0 { 128 } else { cap },
+                    verdict(g)
+                );
+                if g < GATE_LOWER {
+                    failed.push(fmt.name);
+                }
+            }
+            if let Some(&(_, _, _, g)) = shipped {
+                println!(
+                    "MEASURE adjacent gate: {}: as shipped (page entries, cap {}) {g:.1} GB/s {}",
+                    fmt.name,
+                    dm::TILE_IN_FLIGHT_CAP,
+                    verdict(g)
+                );
+            }
+        }
+        let Fleet { w, movers, .. } = f;
+        for m in movers {
+            let t = m.tile();
+            m.set_in_flight_cap(d, &w, dm::TILE_IN_FLIGHT_CAP).unwrap();
+            d.write32(&w, t, dm::TRACE, 0).unwrap();
+            m.stop(d, &w).unwrap();
+        }
+        if std::env::var("ADJ_GATE").as_deref() == Ok("1") {
+            assert!(
+                failed.is_empty(),
+                "under {GATE_LOWER} GB/s at best: {failed:?}"
+            );
+        }
+    });
+}
+
+/// F27's first question (`docs/completed-plans/decode-to-bandwidth.md` Phase 10, A1): does a channel still
+/// give its ~64 GB/s when 2, 4 or 8 tiles beside it share it, and at decode's one-tile entries,
+/// and what does today's decode deal ([`Mix::Decode`]) read at on the same card.
+///
+/// - **Decode** first (the fleet in the grid's order, as a session deals units): `DECODE_UNITS`
+///   (default `64,96`) units, `DECODE_NC` columns a unit (default 2, `gate|up`'s), one BF16 tile
+///   slot (2,112 B) an entry.
+/// - **Decode contiguous** (H11's bound, 2026-10-31): the same units and bytes a unit, each unit's
+///   share contiguous in one channel ([`Mix::DecodeContiguous`]), at `DECODE_LENS` (default
+///   `2112,16384,65536`) bytes an entry. Prediction: at 16 KiB and cap 2, ≥ 490 GB/s with list ends
+///   within 10% of the run; kill: < 470 GB/s, or ends spread like the deal's. Result (`1793463838`,
+///   card 1): missed; 64 units 395 -> 499 GB/s at 16 KiB but ends over 28-90 us, and the 96-unit
+///   deal already reads ~499 evenly (`docs/learnings/performance-log.md`, "H11's bound").
+/// - **Banked** (`BANK_READERS=none` skips it): `BANK_READERS` (default `1,2,4,8`) tiles a channel ([`banked_tiles`]), each
+///   streaming its own share of its channel through its nearest NoC #0 endpoint, at
+///   `BANK_LENS` (default `2112,16384,131072`) bytes an entry.
+///
+/// Each at the in-flight caps `BANK_CAPS` (default `3,8`: a BF16 weight stream's and the mover's).
+/// The metric is the adjacent gate's: every byte over the first start to the last end. A rate past
+/// the card's ceiling fails (a list that ended before its data landed).
+///
+/// Decision rule (set before running): A2 if 8 readers a channel reach 465 GB/s at 2,112-byte
+/// entries and the decode deal is at most 430; A3 first if only long entries reach 465.
+#[test]
+#[ignore = "benchmark"]
+fn gddr_readers_by_channel() {
+    on_card(|d| {
+        let mut f = fleet(d);
+        let card = f.c.gddr_card();
+        let ceiling = card.as_ref().map_or(GATE_UPPER * 1e9, |p| p.bytes_per_sec);
+        let list = |var: &str, default: &str| -> Vec<u32> {
+            std::env::var(var)
+                .unwrap_or_else(|_| default.into())
+                .split(',')
+                .map(|v| v.trim().parse().unwrap())
+                .collect()
+        };
+        let caps = list("BANK_CAPS", "3,8");
+        let entries_for = |len: u32| ((8u32 << 20) / len).clamp(1, dm::LIST_MAX - 2);
+        let run = |d: &mut Dev<'_>, f: &mut Fleet, n: usize, mix: Mix, shape: Shape, what: &str| {
+            for &cap in &caps {
+                for m in &f.movers[..n] {
+                    m.set_in_flight_cap(d, &f.w, cap).unwrap();
+                }
+                let label = format!("gddr {what} cap {cap}");
+                let runs = measure(d, f, n, mix, shape, card.as_ref(), &label);
+                let gbs = Stats::of(runs.iter().map(|r| r.together / 1e9)).median;
+                assert!(
+                    gbs * 1e9 <= ceiling * 1.02,
+                    "{label}: {gbs:.1} GB/s is over the card's {:.1}",
+                    ceiling / 1e9
+                );
+                println!("MEASURE by channel: {label}: {gbs:.1} GB/s");
+            }
+        };
+        let nc = list("DECODE_NC", "2")[0];
+        for units in list("DECODE_UNITS", "64,96") {
+            let units = units as usize;
+            assert!(
+                units <= f.movers.len(),
+                "{units} units, {} tiles",
+                f.movers.len()
+            );
+            let len = tt_isa::dm::BF16_TILE_SLOT as u32;
+            let shape = Shape {
+                entries: (dm::LIST_MAX - 2) / nc * nc,
+                len,
+            };
+            let mix = Mix::Decode { nc: nc as u8 };
+            run(
+                d,
+                &mut f,
+                units,
+                mix,
+                shape,
+                &format!("decode {units} units {nc} columns {len} B"),
+            );
+            // H11's bound: the same units and bytes a unit (or `DECODE_BYTES`, comma-separated:
+            // a product's bytes a unit, item 2b's stream time), each unit's share contiguous in
+            // one channel, read in `DECODE_LENS`-byte entries.
+            for bytes in list("DECODE_BYTES", &shape.bytes().to_string()) {
+                for len in list("DECODE_LENS", "2112,16384,65536") {
+                    let shape = Shape {
+                        entries: bytes.div_ceil(len).clamp(1, dm::LIST_MAX - 2),
+                        len,
+                    };
+                    run(
+                        d,
+                        &mut f,
+                        units,
+                        Mix::DecodeContiguous,
+                        shape,
+                        &format!(
+                            "decode contiguous {units} units {len} B, {} B a unit",
+                            shape.bytes()
+                        ),
+                    );
+                }
+            }
+        }
+        if std::env::var("BANK_READERS").is_ok_and(|v| v == "none") {
+            return;
+        }
+        for r in list("BANK_READERS", "1,2,4,8") {
+            let tiles = banked_tiles(&f, r as usize);
+            move_to_front(&mut f, &tiles);
+            for c in 0..8usize {
+                let at: Vec<String> = (0..r as usize)
+                    .map(|k| {
+                        let t = c * r as usize + k;
+                        format!("{:?} port {}", f.raw[t], nearest_port(&f, t, c as u8))
+                    })
+                    .collect();
+                println!(
+                    "MEASURE by channel: {r} a channel: channel {c} read by {}",
+                    at.join(", ")
+                );
+            }
+            // `BANK_BYTES` (comma-separated, bytes a reader): a product's own bytes over `8 r`
+            // readers, against `DECODE_BYTES` over the deal's units (H17 in
+            // `docs/learnings/dataflow-compiler.md`); unset, `entries_for` a list.
+            let bytes = std::env::var("BANK_BYTES")
+                .ok()
+                .map(|_| list("BANK_BYTES", "0"))
+                .unwrap_or_default();
+            for len in list("BANK_LENS", "2112,16384,131072") {
+                let sizes: Vec<u32> = match bytes.is_empty() {
+                    true => vec![entries_for(len)],
+                    false => bytes
+                        .iter()
+                        .map(|&b| b.div_ceil(len).clamp(1, dm::LIST_MAX - 2))
+                        .collect(),
+                };
+                for entries in sizes {
+                    let shape = Shape { entries, len };
+                    let what =
+                        format!("banked {r} a channel {len} B, {} B a reader", shape.bytes());
+                    run(
+                        d,
+                        &mut f,
+                        8 * r as usize,
+                        Mix::Banked(r as u8),
+                        shape,
+                        &what,
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// [`gddr_aggregate`]'s writes, and its reads and writes mixed, with the
 /// writes on each NIU (`tt_isa::dm::WRITE_NOC`; reads are always NoC #0's).
 /// Each GDDR endpoint is one NoC's (`DramChannel::owns`), so the mixes with
 /// writes on NoC #1 put both NoCs on the card at once without sharing an
-/// endpoint -- the SYS-1419 hang needs one endpoint fed by both. Run on NC's
-/// mover, the only one with NoC #1 writes. `AGG_TILES` picks the tile
-/// counts, as there.
+/// endpoint -- the SYS-1419 hang needs one endpoint fed by both. The writes
+/// are NC's, the only mover with NoC #1 writes, in B's packets
+/// ([`agg_write_lists`]). `AGG_TILES` picks the tile counts, as there.
 #[test]
 #[ignore = "benchmark"]
 fn gddr_aggregate_nocs() {
@@ -1123,13 +1917,14 @@ fn gddr_aggregate_nocs() {
         let src = pattern(L1_SPAN as usize, 5);
         // `AGG_CAP`, as in `gddr_aggregate_affinity`.
         let cap = env_cap();
-        for m in &f.movers {
+        // The writes are NC's (in B's packets): its cap and its NoC.
+        for m in &f.writers {
             d.write(&f.w, m.tile(), L1 as u64, &src).unwrap();
             m.set_in_flight_cap(d, &f.w, cap).unwrap();
         }
         println!("MEASURE nocs: in-flight cap {cap}");
         for noc in [WriteNoc::Noc0, WriteNoc::Noc1, WriteNoc::Alternate] {
-            for m in &f.movers {
+            for m in &f.writers {
                 m.set_write_noc(d, &f.w, noc).unwrap();
             }
             let mixes: Vec<Mix> = match std::env::var("AGG_MIXES") {
@@ -1155,10 +1950,12 @@ fn gddr_aggregate_nocs() {
                 }
             }
             // A write through `noc` lands: tile 0's first write entry, run
-            // alone from a known L1 (the mixes' reads overwrote it).
+            // alone (a packet of its own, on B) from a known L1.
             let list = agg_list(&f, 0, have, Mix::Write, shape);
             d.write(&f.w, f.movers[0].tile(), L1 as u64, &src).unwrap();
-            f.movers[0].run_list(d, &f.w, &list[1..2]).unwrap();
+            f.movers[0]
+                .run_list(d, &f.w, &write_packet(&list[1..2], None))
+                .unwrap();
             let ch = f.dram.channel(list[1][1] as u8).unwrap();
             let mut back = vec![0u8; shape.len as usize];
             d.dram_read(
@@ -1172,12 +1969,17 @@ fn gddr_aggregate_nocs() {
                 "{noc:?}: tile 0's write did not land"
             );
         }
-        let Fleet { w, movers, .. } = f;
-        for m in movers {
-            let t = m.tile();
+        let Fleet {
+            w, movers, writers, ..
+        } = f;
+        for m in writers {
             m.set_write_noc(d, &w, Niu::Noc0).unwrap();
             m.set_in_flight_cap(d, &w, dm::TILE_IN_FLIGHT_CAP).unwrap();
-            d.write32(&w, t, dm::Mover::NC.at(dm::TRACE), 0).unwrap();
+            m.stop(d, &w).unwrap();
+        }
+        for m in movers {
+            d.write32(&w, m.tile(), dm::Mover::B.at(dm::TRACE), 0)
+                .unwrap();
             m.stop(d, &w).unwrap();
         }
     });

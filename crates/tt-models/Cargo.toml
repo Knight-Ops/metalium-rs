@@ -1,6 +1,6 @@
 [package]
 name = "tt-models"
-description = "Pretrained models (ResNet-18, ViT-Tiny, SmolLM2-135M) run on burn-tt and checked against burn-flex: the model ladder"
+description = "Pretrained models (ResNet-18, ViT-Tiny, SmolLM2, Qwen3.5, Gemma 4, MOSS-Image) run on burn-tt and checked against burn-flex: the model ladder"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

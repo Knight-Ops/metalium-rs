@@ -20,7 +20,7 @@ C/C++ specification models and simulator FFI are development-only test oracles.
 - `tt-tests`: cross-crate gates, simulator engines and external Flex comparisons.
   `burn-tt-conformance`: Burn's own backend tests against `burn-tt`
   (`cargo xtask conformance`; dev-only). `tt-mnist`: application/model workloads.
-  `tt-models`: pretrained models (ResNet-18, ViT-Tiny, SmolLM2-135M), strict safetensors loading and
+  `tt-models`: pretrained models (ResNet-18, ViT-Tiny, SmolLM2, Qwen3.5-4B, Nemotron/Gemma 4, MOSS-Image), strict safetensors loading and
   mixed-precision plans, checked against Flex (`cargo xtask fetch-weights`; dev-only).
   `xtask`: fetchers, generators and runners.
 
@@ -46,6 +46,8 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | Task                                    | Reference                                                                                                                                |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | What to work on next (open items)       | [roadmap.md](docs/plans/roadmap.md)                                                                                                      |
+| Strategy against tt-metal; the W0-W10 program | [tt-metal-parity.md](docs/plans/tt-metal-parity.md); what was achieved: [achievements.md](docs/completed-plans/achievements.md) |
+| Before trying an optimization           | [failed-approaches.md](docs/learnings/failed-approaches.md): what was already tried, why it failed, when to retry                        |
 | Setup and task options                  | [README.md](README.md), [xtask/README.md](xtask/README.md)                                                                               |
 | New kernel/op; completion criteria      | [new-op-definition-of-done.md](docs/plans/new-op-definition-of-done.md), [burn-op-notes.md](docs/plans/burn-op-notes.md)                  |
 | Fixing a failing Burn conformance test  | [conformance-to-feature.md](docs/plans/conformance-to-feature.md), then the crate [README](crates/burn-tt-conformance/README.md)           |
@@ -53,6 +55,7 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | Scheduler, credits, traces or recovery  | [streaming architecture](docs/learnings/streaming-dataflow-architecture.md), [traced execution](docs/plans/traced-execution.md)          |
 | Hardware access/bring-up                | [silicon operating notes](docs/learnings/silicon-operating-notes.md), [implementation checklist](docs/completed-plans/phases-0-10-checklist.md) |
 | Simulator refusal or numerical mismatch | [ttsim-divergence.md](docs/learnings/ttsim-divergence.md); read refutations as well as original findings                                 |
+| Optimizations below Burn (formats, fusion, multi-core, credits) | [dataflow-compiler.md](docs/learnings/dataflow-compiler.md) (the design reference: principles, ADRs 0003-0006, hypotheses, external research), [dataflow-compiler plan](docs/completed-plans/dataflow-compiler.md) |
 | Performance changes                     | [performance-scoreboard.md](docs/learnings/performance-scoreboard.md) (current), [performance-log.md](docs/learnings/performance-log.md) (history) |
 | Architecture/specification rationale    | [phases-0-10-roadmap.md](docs/completed-plans/phases-0-10-roadmap.md), [tt-metal concepts review](docs/learnings/tt-metal-concepts-review.md)                |
 
@@ -64,7 +67,7 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 | `tt-device` / `tt-kmd`  | `silicon-operating-notes.md`, `ttsim-divergence.md`                                           | `roadmap.md`                                                                                         |
 | `tt-layout`             | `performance-scoreboard.md`                                                              | `roadmap.md`, `new-op-definition-of-done.md`                                                         |
 | `tt-firmware`           | `performance-scoreboard.md`, `streaming-dataflow-architecture.md`, `silicon-operating-notes.md` | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`                                              |
-| `tt-kernels`            | `streaming-dataflow-architecture.md`, `tt-metal-concepts-review.md`                           | `roadmap.md`, `traced-execution.md`, `kernel-fusion.md`, `new-op-definition-of-done.md`              |
+| `tt-kernels`            | `dataflow-compiler.md`, `streaming-dataflow-architecture.md`, `failed-approaches.md`, `tt-metal-concepts-review.md`   | `roadmap.md`, `tt-metal-parity.md`, `traced-execution.md`, `kernel-fusion.md`, `new-op-definition-of-done.md`              |
 | `burn-tt`               | `tt-metal-concepts-review.md`                                                                 | `roadmap.md`, `burn-backend-parity.md`, `burn-native-cutover.md`, `traced-execution.md`, `burn-op-notes.md` |
 | `tt-tests` / `tt-mnist` | `ttsim-divergence.md`, `performance-scoreboard.md`                                       | `roadmap.md`, `new-op-definition-of-done.md`                                                         |
 | `xtask`                 | `silicon-operating-notes.md`                                                                  | `roadmap.md`, `burn-backend-parity.md`                                                               |
@@ -74,8 +77,8 @@ Use documentation in `vendor/tt-isa-documentation/`, `cfg_defines.h`, and `ioctl
 Run from the repository root. Toolchain/targets are in `rust-toolchain.toml`.
 Pinned inputs live in `vendor/`; fetch missing inputs with `cargo xtask fetch-ttsim`,
 `fetch-spec`, `fetch-mnist` (needed by `tt-mnist`), `fetch-burn-tests` (needed by
-`cargo xtask conformance`), `fetch-weights` (needed by the `tt-models` tests and the model-ladder
-gates, which are ignored without `--features weights`), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
+`cargo xtask conformance`), `fetch-weights` (3.8 GB, or `--model <name>`, which alone fetches the larger `on_request` checkpoints; needed by the `tt-models` tests, ignored without `--features tt-models/weights`, and by the
+model-ladder gates, which run on silicon only), or `fetch-kmd` (driver ABI test). `PINS.toml` owns revisions/hashes; do not bypass digest checks.
 
 Choose checks for the changed layer; CI and `prek.toml` define the full set:
 
@@ -98,6 +101,13 @@ cargo clippy --manifest-path crates/tt-firmware/Cargo.toml \
   --target riscv32im-unknown-none-elf --bins --lib --features encoded-guard -- -D warnings
 ```
 
+**Profiling is a mode, and a build feature.** `TT_PROFILE=<dir>` (or `cargo xtask bench|silicon --profile`) records
+every eager op's and every traced op's device time by Burn op, with the host's side, into one directory
+(`burn_tt::profile`, `tt_kernels::profile_mode`). Stamping is compiled into the firmware only with the `profile`
+feature (`tt-tests/profile`, `burn-tt/profile`; `--profile` adds it): without it a run pays nothing for it (0.46 ms a
+SmolLM2-135M decode step when compiled in), and profiling is refused by name. Do not write per-benchmark profiling;
+extend the mode. A firmware change is linted with and without `--features profile`.
+
 The mover has two read modes (`fast-reads`, see below); a change to `mover.rs` or `tt_isa::dm::encoded`
 is run through the encoded-read gate and the differential gate in both: `cargo test -p tt-tests --test
 step172_encoded_reads --test step173_mover_differential` and the same with `--features tt-tests/fast-reads` (and
@@ -105,11 +115,19 @@ step172_encoded_reads --test step173_mover_differential` and the same with `--fe
 (`encoded::Context`); the host's `validate` also runs the independent `guard`; `enqueue_checked` validates every
 `READ_ENCODED`, and only the `#[doc(hidden)] enqueue_raw` sends an entry unchecked (for gates that forge one).
 
-Arithmetic, routing or execution-order changes also need the training regression:
+Arithmetic, routing or execution-order changes also need the training regression, on card 0:
 
 ```bash
-cargo test -p tt-tests --features e2e --test step12_mnist
+cargo xtask silicon --release --device 0 --filter step12_mnist
 ```
+
+**Test tiers** ([test-tiers.md](docs/learnings/test-tiers.md)). ttsim is for validation: encodings,
+single kernels and ops, mover and firmware records, and risky instructions before silicon. Model
+workloads never run on ttsim: MNIST, synthetic or pretrained decoders, training loops, multi-layer
+stacks. Such a gate is `#[cfg_attr(not(feature = "silicon"), ignore = "model workload, ...")]` and
+needs a `SMOKE` entry in `xtask/src/silicon.rs`, which is then its only routine run. burn-flex is
+the CPU oracle for model-scale checks. It runs on every core (rayon); `fork_scope` gives each forked
+child a fresh pool.
 
 Changes to `burn-tt` operations or routing also need Burn's own backend tests, whose result
 must match `crates/burn-tt-conformance/expected-failures.toml` (a fixed test leaves the list):
@@ -174,6 +192,12 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
   descriptors: silicon retains state between programs and processes.
 - Declare padding through `Pad`/`OpPadding`; test ragged producers followed by
   reductions/matmul. Repairing a view must not alter its parent's padding claims.
+- Two numeric contracts ([ADR 0006](docs/adr/0006-two-numeric-contracts-reference-and-performance.md)): the bit-exact
+  *reference* contract is the default for conformance and training gates; a deterministic *performance* contract
+  (BF16 activations, BFP8 weights, HiFi2/LoFi, packer L1 accumulation) is the inference default. Inside each contract a
+  schedule chooses only among bit-equivalent options (ADR 0005); state the contract with every performance number.
+- When a hypothesis is killed or an opt-in knob loses, add its row to
+  [failed-approaches.md](docs/learnings/failed-approaches.md) and delete the knob and its code in the same change.
 - Never guess numerical tolerances. Use specification models/SFPU interpreter
   for exact program results and derive approximation bounds beside the gate.
   Cover signed zeros, subnormals, NaNs, infinities and extremes. Preserve stated
@@ -189,7 +213,8 @@ Wormhole-only documentation does not establish Blackhole behavior or encoding.
   mesh/multi-card ops), native Burn routing,
   residency/padding checks and a smoke entry. Follow
   `docs/plans/new-op-definition-of-done.md`. Re-bless `crates/tt-tests/tests/golden/mnist_reduced.txt` with
-  `TT_BLESS=1` only for an explained, deliberate arithmetic change.
+  `TT_BLESS=1` on card 0 (`--filter step12_mnist::the_mlp_trains_on_a_reduced_dataset`) only for an
+  explained, deliberate arithmetic change.
 
 ## Avoid hardware failures
 
@@ -215,8 +240,17 @@ experiment image (cargo feature `ttinsn-experiment`, off by default, never in a
 shippable build), whose `.ttinsn` words the gate validates word by word, and which can also write
 `.ttinsn` code to L1 at run time and invalidate its own instruction cache
 (`tt_firmware::ttinsn`, which checks every word it emits)
-(`docs/plans/ttinsn-push-experiment.md`); the gate refuses data directives in code
-for every image. Ethernet customer code runs on E1; leave E0
+(`docs/completed-plans/ttinsn-push-experiment.md`); the gate refuses data directives in code
+for every image. **Fused code (on by default, `TT_TTINSN=0` off):** the shipped math
+role (T1) calls `.ttinsn` code the host wrote to the program cache, its length flagged
+`tt_isa::ttinsn::FUSED`, after invalidating its own instruction cache once a run
+(`tt_firmware::fused`). The build-time gate cannot see that code, so
+`tt_isa::ttinsn::validate` is its gate: only `code::Code::fused` makes it (emitted,
+validated, and run on the host against the program's own expansion word for word);
+never write code to the program cache any other way (a replay's B mover restoring a trace's
+programs from GDDR copies those same validated words back: `Session::restore_programs`), never flag `FUSED` for T0 or T2
+(they refuse it), and change the skeleton only with `validate`'s mutation tests
+(`docs/completed-plans/ttinsn-push.md`, gate `step231_ttinsn_push`). Ethernet customer code runs on E1; leave E0
 and firmware-owned L1 intact. Read the operating notes before low-level changes.
 
 ttsim is a non-reentrant process-wide singleton; violations call `_Exit`.

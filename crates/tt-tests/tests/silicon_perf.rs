@@ -878,9 +878,11 @@ fn mover_read_fast_path() {
 /// NOP a cycle) and for one matmul tile at LoFi and HiFi4. A role that pushes
 /// at the NOP rate and retires right after is push-bound, and fewer pushed
 /// words -- `REPLAY`, `MOP` -- make it faster; one that pushes slower than the
-/// NOP rate is held back by its FIFO, the backend's pace (X2b).
+/// NOP rate is held back by its FIFO, the backend's pace (X2b). The firmware stamps only with
+/// `profile` (`cargo xtask bench --profile`).
 #[test]
 #[ignore = "benchmark"]
+#[cfg(feature = "profile")]
 fn role_push_rate() {
     use tt_isa::mailbox::trace as ev;
     use tt_kernels::matmul::{Fidelity, SrcRoute};

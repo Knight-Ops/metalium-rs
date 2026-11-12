@@ -4,8 +4,8 @@
 #![no_std]
 #![no_main]
 
-/// As `icache_b`'s, 256 bytes on.
-const RESULTS: u64 = tt_isa::mailbox::MAILBOX_BASE + 0x3100;
+/// As `icache_b`'s, 256 bytes on (`mailbox::icache_results`).
+const RESULTS: u64 = tt_isa::mailbox::icache_results(1);
 
 /// Each code block's size.
 const BLOCK: u32 = 8192;

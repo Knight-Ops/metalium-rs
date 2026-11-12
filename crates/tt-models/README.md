@@ -10,13 +10,15 @@ Dev-only (`xtask/src/ship.rs`): `burn-flex` is the host reference. Nothing here 
 ## Fetching what it runs on
 
 ```bash
-cargo xtask fetch-weights                 # everything below, 340 MB
+cargo xtask fetch-weights                 # rungs 1-4, 3.8 GB (SmolLM2-1.7B is 3.4 of it)
 cargo xtask fetch-weights --model resnet18
+cargo xtask fetch-weights --model qwen3.5-4b   # rungs 5-7 only by name (on_request): 9.3,
+                                               # 15.9 and 27.2 GB
 ```
 
 Every file is pinned in `PINS.toml` (`[weights]`) by Hugging Face commit, length and SHA-256, and
 verified before it is left under its final name. `vendor/weights/` is not committed. The tests that
-read it are ignored unless `--features weights` (silicon implies it), so a plain
+read it are ignored unless `--features weights` (the `tt-tests` model ladder runs on silicon only), so a plain
 `cargo test --workspace` passes on a checkout that has not fetched them.
 
 | Rung | Model | Source | Ops it exercises |
@@ -24,6 +26,10 @@ read it are ignored unless `--features weights` (silicon implies it), so a plain
 | 1 | ResNet-18 | `timm/resnet18.a1_in1k` | conv2d, batch norm (inference), max pool, adaptive average pool, linear |
 | 2 | ViT-Tiny/16, 224 | `timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k` | patch convolution, layer norm, GELU, `attention`, class token, position embedding |
 | 3 | SmolLM2-135M (Llama architecture) | `HuggingFaceTB/SmolLM2-135M` (BF16) | RMSNorm, SiLU, RoPE (`sin`/`cos` on the device), grouped-query attention, `slice_assign` KV cache, embedding of a 49,152-token vocabulary, tied output head |
+| 4 | SmolLM2-1.7B-Instruct (Llama architecture, 3.4 GB) | `HuggingFaceTB/SmolLM2-1.7B-Instruct` (BF16) | the same at 24 layers of width 2048 and 32 heads: the first model past 1B parameters, and the one performance is measured on |
+| 5 | Qwen3.5-4B (`qwen35`, text) | `Qwen/Qwen3.5-4B` (BF16, two shards) | Gated DeltaNet: a depthwise causal convolution with carried inputs, softplus/exp decay, L2-normed q/k, the delta-rule recurrence a token at a time with an F32 state, a SiLU-gated norm; gated full attention with q/k norms and a partial rotary embedding; zero-centred norms |
+| 6 | Nemotron-3.5-Bolt-E4B (`gemma4`, Gemma 4 E4B text) | `nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16` | per-layer embeddings (a 2.8-billion-entry table), sliding-window and full attention of different head widths, "proportional" rotary embedding, layers sharing keys and values, gelu-tanh, norms around every sub-block, soft-capped logits |
+| 7 | MOSS-Image-Base (`moss_image`, text to image) | `OpenMOSS-Team/MOSS-Image-Base` (encoder and DiT BF16, VAE F32) | a Qwen3.5 text encoder; a diffusion transformer (shared adaLN modulation, four-axis rotary embedding, the situ activation, non-causal attention); a flow-matching Euler schedule with guidance; the FLUX.2 VAE decoder (convolutions, group norm, pixel attention, nearest upsampling as a broadcast) |
 
 The test photographs (`vendor/weights/images/`) are five natural images, so a top-1 comparison is
 between real classes and not near-tied logits of noise.
@@ -56,11 +62,57 @@ under `assert_native_model` (no staged compute, no host arithmetic, no downloade
 * `step167_smollm2`: teacher-forced top-1 agreement at every position (both backends are fed the
   same tokens), and the free-running greedy decode is printed with the position of the first
   divergence. The host model reproduces HuggingFace `transformers` (`tests/llama_host.rs`: the same
-  top-10 next tokens on two prompts, logits to 5e-5).
+  top-10 next tokens on two prompts, logits within 3e-5 as measured, guarded at 1e-3).
+* `step188_smollm2_1_7b`: the same for SmolLM2-1.7B-Instruct (its host reference is
+  `tests/llama_1_7b_host.rs`), plus its traced generation bit for bit against the eager one
+  (silicon only).
 * `step168_smollm2_mixed_precision`: a different number format per matrix. See below.
 * `step170_checkpoint_round_trip`: train, save with Burn's `BinFileRecorder`, load into a fresh
   model, continue, and end bit-identical to an uninterrupted run (and not to a model that was not
   loaded).
+
+## Traced generation (`generate.rs`, `kv_cache.rs`, `rope.rs`)
+
+The generation path is written for decoders in general, not for SmolLM2 (a test vehicle):
+
+- **`FixedShapeDecoder`** is any decoder whose steps have shapes that depend only on how many tokens
+  they take. It has a chunk (`c` prompt tokens from a start position) and a one-token step. Both read
+  a cache and return its new state, and both take positions as tensors.
+- **`FixedCache`** (`kv_cache.rs`) is the architecture-neutral key/value cache those steps use:
+  masked writes at a position or a run, and the attention mask of the later positions. **`Rope`**
+  (`rope.rs`) is a rotary table any RoPE model can select rows from.
+- **`Llama`** implements the trait for every `LlamaConfig`. SmolLM2-135M is the preset
+  `SMOLLM2_135M`, loaded by `Llama::smollm2_135m`; other checkpoints load through
+  `Llama::pretrained(config, weights, ..)`.
+- **`Qwen35`** implements it too, over a `qwen35::HybridCache`: the attention layers' keys and values
+  in a `FixedCache`, and each Gated DeltaNet layer's carried convolution inputs and recurrent state. A
+  padded chunk's rows past the prompt leave that state as it was (decay 1, write strength 0).
+  `step263_qwen35_traced` checks it bit for bit against the eager schedule.
+- **`TracedGenerator`** captures what a `Shapes` names, as traces over one cache on the card
+  (`burn_tt::SharedStateTraces`): a chunk of each size, and a step for each attended length (64,
+  128, 256, ..., then the cache's length). It then serves any prompt: token ids in, logits out, each
+  decode step attending only to the positions in use.
+- **Grouped-query attention reads the cache's own key/value heads** in a fixed step: query head groups
+  are folded into rows instead of repeating the cache (`repeat_kv` stays only in the growing-cache
+  reference).
+- **`generate_fixed`** runs the same schedule eagerly.
+
+`step187_traced_generation` checks it bit for bit against the eager schedule and against the growing
+cache. It runs on Llama shapes SmolLM2 lacks (multi-head attention, GQA 4:1, head widths 32 and 128,
+untied heads, ragged widths) and on a GPT-2-style decoder, with SmolLM2's checkpoint added once
+`cargo xtask fetch-weights` has run. All of it runs on silicon (`cargo xtask silicon`), not ttsim.
+
+## The `transformers` reference (`reference/*.py`)
+
+Device against burn-flex checks the backend: both run this crate's `Llama`. Whether that `Llama` *is* the model is
+checked against HuggingFace `transformers`. `reference/llama_reference.py` is a uv script (dev-only) whose header pins
+`transformers` and torch (CPU). It runs a pinned checkpoint from the verified local file and prints, as Rust, its
+`config.json` as a `LlamaConfig` (to compare with the preset), the token ids and top-10 logits of each prompt (raw or
+chat-templated), and a greedy continuation. `tests/llama_1_7b_host.rs` holds the values it printed and the command.
+`qwen35_reference.py`, `gemma4_reference.py` and `moss_image_reference.py` do the same for rungs 5-7
+(`tests/qwen35_host.rs`, `gemma4_host.rs`, `moss_image_host.rs`); the last runs the checkpoint's own
+`pipeline_moss_image.py` at the pinned revision part by part on synthetic latents and prints each
+tensor's mean, RMS and sixteen samples. See `docs/plans/new-architectures.md`.
 
 ## Mixed precision (`quant.rs`)
 
@@ -77,7 +129,11 @@ quantised values.
 
 ## Where it stands
 
-See the roadmap entry for the numbers. The short version: all three models run natively on card 0 and
-agree with Flex, and the profile is what the performance work needed: one embedding lookup of a real
-vocabulary costs 15 s (`gather_native` stages `32 x rows` host addresses per chunk), a ResNet-18
-forward costs seconds, and a decoded token costs about 3,000 device operations.
+See the roadmap (Track 1, "Model ladder", and Track 2, items 1 to 9) for the numbers. All three models
+run natively and agree with Flex. Since the ladder's first profile:
+
+- an F32 embedding lookup is a row select (260 us, was 15 s);
+- convolution is chunk-free;
+- traced, the three models match or beat burn-flex.
+
+For SmolLM2 traced generation (`TracedGenerator`), see the roadmap's Track 2 item 6.

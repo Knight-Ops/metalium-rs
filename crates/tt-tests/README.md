@@ -8,15 +8,14 @@ depend on both `tt-device` and `tt-ttsim`. Never shipped.
 
 | Feature | Effect |
 |---|---|
-| (none) | `harness::Dev` is `Device<LibTtsim>`: every gate in-process on ttsim, in a fork. End-to-end gates show as ignored. |
-| `e2e` | Turns on the whole-training gates in `tests/step12_mnist.rs`. |
-| `silicon` | `harness::Dev` is `Device<Kmd>`: the same gates against `/dev/tenstorrent/N`. Compiles the `#[cfg(feature = "silicon")]` tests, drops the ttsim-only ones. Implies `e2e`. |
+| (none) | `harness::Dev` is `Device<LibTtsim>`: every validation gate in-process on ttsim, in a fork. Model workloads show as ignored ([test tiers](../../docs/learnings/test-tiers.md)). |
+| `silicon` | `harness::Dev` is `Device<Kmd>`: the same gates against `/dev/tenstorrent/N`, model workloads included. Compiles the `#[cfg(feature = "silicon")]` tests, drops the ttsim-only ones. |
 
 ## Run
 
 ```bash
-cargo test -p tt-tests                                        # validation tier
-cargo test -p tt-tests --features e2e --test step12_mnist     # end to end on ttsim
+cargo test -p tt-tests                                        # validation tier (ttsim)
+cargo xtask silicon --release --filter step12_mnist           # MNIST training against the golden
 cargo xtask silicon --smoke --release                         # burn-tt vs burn-flex on the cards
 cargo xtask silicon --release                                 # every gate on hardware
 ```
@@ -68,12 +67,12 @@ Shared test-only modules live beside the gates as `tests/<name>_support/mod.rs` 
 | `TT_SILICON_DEVICE` | Card for a silicon run (set by `cargo xtask silicon --device`). Default 0. |
 | `TT_TOPOLOGY` | Silicon Burn gates: cards, `"0"` or `"0,1"`. |
 | `TT_TILES` | Silicon Burn gates: tile count or `all`, unless the gate fixes its own. |
-| `TT_BLESS=1` | Rewrite the MNIST golden from the ttsim run of `the_mlp_trains_on_a_reduced_dataset`. |
+| `TT_BLESS=1` | Rewrite the MNIST golden from the single-tile silicon run of `the_mlp_trains_on_a_reduced_dataset` (card 0). |
 
 ## Gotchas
 
-- The golden is written by ttsim and must be reproduced bit for bit on silicon and
-  on any tile count. Re-bless only when the arithmetic changes deliberately.
+- The golden is written by the single-tile silicon run and must be reproduced bit for
+  bit on any tile count and chip count (ttsim agreed with it while MNIST ran there). Re-bless only when the arithmetic changes deliberately.
 - Silicon gates claim tiles through `backend`, which reads the grid from the ARC
   first. Do not hardcode coordinates outside the surviving columns; the gate tile is
   `backend::GATE_TILE` (3, 4).

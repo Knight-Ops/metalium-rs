@@ -70,6 +70,19 @@ pub enum TraceError {
     NotResident,
     /// A capture with nothing in it.
     Empty,
+    /// A planned capture that is not its plan's (`Session::begin_trace_planned`): why. Nothing
+    /// was kept; what its run wrote to the state is the plain trace's to restore.
+    Planned(String),
+    /// Captured op `op` (`label`, `what`) planned L1 up to `top` (0: its layout was not planned
+    /// while captured, so its need is unknown), past the persistent region's base `base`
+    /// (`Session::set_l1_region`).
+    IntoRegion {
+        op: usize,
+        label: &'static str,
+        what: &'static str,
+        top: u64,
+        base: u64,
+    },
 }
 
 impl core::fmt::Display for TraceError {
@@ -98,6 +111,25 @@ impl core::fmt::Display for TraceError {
                  a replay cannot do"
             ),
             TraceError::Empty => write!(f, "the capture ran no device work"),
+            TraceError::Planned(why) => write!(f, "the planned capture is not its plan's: {why}"),
+            TraceError::IntoRegion {
+                op,
+                label,
+                what,
+                top,
+                base,
+            } => match top {
+                0 => write!(
+                    f,
+                    "captured op {op} ({label}, {what}) did not plan its L1 layout while captured, \
+                     so whether it stays below the persistent region at {base:#x} is unknown"
+                ),
+                _ => write!(
+                    f,
+                    "captured op {op} ({label}, {what}) plans L1 up to {top:#x}, into the \
+                     persistent region at {base:#x}"
+                ),
+            },
         }
     }
 }
@@ -106,15 +138,64 @@ impl core::fmt::Display for TraceError {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TraceId(pub(crate) u64);
 
+impl TraceId {
+    /// The number, as the profile mode reports traces by it (`crate::profile_mode`).
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// What one captured op was: the graph a later pass can optimize over.
 #[derive(Clone, Debug)]
 pub struct OpRecord {
     /// Its first list's name (`tensor::stats`).
     pub what: &'static str,
+    /// The caller's name for it when it was queued ([`Session::set_op_label`]);
+    /// empty if none was set.
+    ///
+    /// [`Session::set_op_label`]: crate::session::Session::set_op_label
+    pub label: &'static str,
     /// Per unit, the range of that unit's stream its lists took.
     pub entries: Vec<core::ops::Range<usize>>,
-    /// Whether a barrier followed it on every unit.
+    /// Whether a barrier followed it, on the units it ran on.
     pub barrier: bool,
+    /// The events it could stamp in the profile mode on its busiest unit, at most:
+    /// `[Detail::Ops, Detail::Full, Detail::Pipeline]` (`crate::profile_mode`), indexed by the
+    /// detail. Set when the trace is stored.
+    pub stamps: [u32; 3],
+    /// What it moves through GDDR on all its units. Counted when the trace is stored, in the
+    /// profile mode only; zero otherwise.
+    pub bytes: crate::profile_mode::OpBytes,
+    /// Lists that read its operands ahead of it, (unit, range of that unit's stream): an idle
+    /// unit's `PREFETCH` list, inside `entries`, and a busy unit's `BUSY_PREFETCH` list, moved
+    /// out of them to before the ops it runs under. Their bytes are counted as the op's
+    /// (`OpBytes::ahead`).
+    pub ahead: Vec<(usize, core::ops::Range<usize>)>,
+    /// What `bytes` is made of, unit by unit: (unit, what its entries and its lists read ahead
+    /// move), for each unit that moves anything; they sum to `bytes`. Counted with `bytes`.
+    pub unit_bytes: Vec<(u16, crate::profile_mode::OpBytes)>,
+    /// For each idle unit's `PREFETCH` list in `ahead`, (unit, the barrier target it waits for,
+    /// relative to the capture's first): the product it is anchored at
+    /// (`Session::set_prefetch_anchor`).
+    pub ahead_waits: Vec<(usize, u32)>,
+    /// The highest `DATA` address its L1 plans reached ([`crate::l1::take_planned_top`]): what it
+    /// needs of a unit's arena. Zero where its layout was not planned while it was captured.
+    pub l1_top: u64,
+    /// The lowest arena end at which it is laid out as it is ([`crate::l1::Planned::need`]): what
+    /// a smaller arena must still hold. Below `l1_top` where a plan left room on purpose (a
+    /// product's `B` ring against the arena's end); above it where a choice sized from the arena
+    /// tested more than it runs (a product's block width, probed with `A` unpacked). Zero where
+    /// nothing was planned.
+    pub l1_need: u64,
+    /// A hash of how its lists were laid out before a planned capture rewrote them: each unit's
+    /// steps, their kinds and entry counts. A planned capture's ops must have their plan pass's
+    /// (`crate::residency::Applied`).
+    pub shape: u64,
+    /// How many of the capture's tensors were allocated when it was queued
+    /// (`DramAlloc::logged`): the ones its lists can name. Where a capture reuses its tensors'
+    /// GDDR (`Session::set_capture_reuse`), an address is the latest of these that holds it
+    /// (`crate::residency::Index`).
+    pub allocs: usize,
 }
 
 /// What a stored stream is made of: how many entries it holds, how many of those
@@ -167,6 +248,9 @@ pub struct UnitFootprint {
     pub top_level_entries: u32,
     /// GDDR bytes of the stream and the sections, as allocated (whole slots).
     pub gddr_bytes: u64,
+    /// GDDR bytes of the copy of its programs a replay's B mover restores from, as allocated (whole
+    /// slots; 0 with mover restores off, `Session::set_mover_restore`).
+    pub program_store_bytes: u64,
     /// Distinct programs this trace holds in the unit's program cache, and their bytes.
     pub programs: u32,
     pub program_bytes: u64,
@@ -178,10 +262,19 @@ pub struct UnitFootprint {
 /// One unit's share of a capture in progress.
 #[derive(Default)]
 pub(crate) struct UnitCapture {
-    /// What the sections stored so far are made of, and their GDDR bytes.
+    /// The captured barriers this unit's stream accounts for so far: those it arrived at, and
+    /// those a wait in it stands for (`tt_isa::dm::BARRIER_STANDS_FOR`).
+    pub(crate) barriers_accounted: u32,
+    /// What the sections so far are made of.
     pub(crate) sections_composition: Composition,
-    pub(crate) sections_gddr_bytes: u64,
-    pub(crate) regions: Vec<Placement>,
+    /// Each packet's reader and writer sections, laid out for streaming
+    /// ([`chunked`]), kept on the host until the capture ends: they are stored
+    /// with the unit's stream, in one region (`Session::store_stream`).
+    pub(crate) pending_sections: Vec<Vec<[u32; 8]>>,
+    /// Where each `PAIR_CALL` sits in `stream`, in order: the `i`th names
+    /// `pending_sections[2 i]` and `[2 i + 1]`, its offsets filled in when they
+    /// are stored.
+    pub(crate) pair_calls: Vec<usize>,
     /// The unit's entries, in order, generations and barrier targets relative.
     pub(crate) stream: Vec<[u32; 8]>,
     /// The resident's last generation when the capture began: the stream's
@@ -196,6 +289,12 @@ pub(crate) struct UnitCapture {
     /// Entries in each reader and writer section stored for the stream's
     /// `PAIR_CALL`s, chunk padding included: reader, then writer, per packet.
     pub(crate) sections: Vec<u32>,
+    /// The entries a development probe put at the front of `stream`
+    /// (`Session`'s `ProbeBackground`); 0 without one.
+    pub(crate) probe_entries: usize,
+    /// Each program-cache hold's address and the op that took it (`OpRecord::label` and
+    /// `what`), for the space report (`Session`'s `probe_space_report`).
+    pub(crate) program_owners: Vec<(u64, &'static str, &'static str)>,
 }
 
 impl UnitCapture {
@@ -256,21 +355,203 @@ pub(crate) struct Capture {
     pub(crate) epoch: u64,
     /// The session's barrier count when it began.
     pub(crate) barriers_base: u32,
-    /// Barriers captured.
+    /// Arrivals at the barriers captured: each barrier's units, the ones its op ran on.
     pub(crate) barriers: u32,
+    /// The barriers captured, one an op that ended in one.
+    pub(crate) barrier_ops: u32,
     pub(crate) units: Vec<UnitCapture>,
     /// Frees during the capture, deferred to the trace's release.
     pub(crate) freed: Vec<Placement>,
     pub(crate) ops: Vec<OpRecord>,
     /// An op failed part-way through being captured.
     pub(crate) failed: bool,
+    /// The last weight-streaming product's barrier target (relative, as every captured target
+    /// is) and each unit's stream length after it: a unit whose stream has not grown since ran
+    /// nothing after it, so a list appended to it runs as soon as the product is done
+    /// (`Session::matmul_dram`'s weight prefetch).
+    pub(crate) weight_anchor: Option<(u32, Vec<usize>)>,
+    /// The units that product ran on: the rest are where the next one's weights stream.
+    pub(crate) weight_units: usize,
+    /// Each unit's own anchor (`Session::set_prefetch_anchor`): the barrier target (relative)
+    /// of the last weight-streaming product the unit took part in -- its stream grew in it --
+    /// and its stream length after it, or after the first such product for a unit that has
+    /// taken part in none. Indexed by unit; empty before the first.
+    pub(crate) unit_anchors: Vec<Option<(u32, usize)>>,
+    /// Tensors the capture wrote in place (`Session::drop_twin`'s writers): a product whose `B`
+    /// is one of them, or was allocated in the capture, reads no `B` ahead of its own op.
+    pub(crate) written: Vec<crate::tensor::Placement>,
+    /// Where the persistent region begins, if the capture keeps one (`Session::set_l1_region`):
+    /// every op it holds planned below it ([`crate::l1::arena`]).
+    pub(crate) region_base: Option<u64>,
+    /// The residency plan it applies (`Session::begin_trace_planned`), while it does.
+    pub(crate) applied: Option<std::sync::Arc<crate::residency::Applied>>,
+    /// Why the plan stopped applying, if it did: the capture is then refused.
+    pub(crate) plan_mismatch: Option<String>,
+    /// Whether it began planned: it ends verified against its plan, or refused.
+    pub(crate) planned: bool,
+    /// Whether it is a residency plan pass (`Session::begin_trace_plan_pass`): it ends by planning
+    /// the next planned capture.
+    pub(crate) plan_pass: bool,
+    /// The key its plan is cached under (`Session::begin_trace_planned_as`,
+    /// `Session::begin_trace_cached`): kept there if the capture is its plan's, forgotten if not.
+    pub(crate) plan_key: Option<u64>,
+    /// While it applies a plan: its tensors' GDDR slots so far, grown as it allocates.
+    pub(crate) index: crate::residency::Index,
+    /// Whether its own tensors' freed slots go to later allocations of it
+    /// (`Session::set_capture_reuse`, `docs/plans/long-context.md` 1.G).
+    pub(crate) reuse: bool,
+    /// The tensors it freed into its pool, in order: its own, never given back by the trace (their
+    /// slots are in `pool`, or another of its tensors').
+    pub(crate) pooled: Vec<Placement>,
+    /// What its pool held free when it ended (`DramAlloc::take_pool`): the trace's to give back.
+    pub(crate) pool: Vec<(usize, u64, u64)>,
+}
+
+impl Capture {
+    /// Move unit `u`'s entries `block` of its stream to start at `to`, earlier (`to <=
+    /// block.start`: the entries from `to` move up behind it) or later (`to >= block.end`, `to`
+    /// counted before the move: the block ends where `to` was, the entries between move down).
+    /// Every op's range on `u` and every `PAIR_CALL`'s position follow their entries; a range
+    /// that held the block keeps the rest of its entries, which are contiguous again. The block
+    /// is no op's own afterwards: a prefetch moved to before the ops it runs under, or the
+    /// probe's background moved after them. The one place inside an op a block may move to is
+    /// just before the op's last entry, `u`'s arrival at its barrier
+    /// (`Session::set_read_ahead_early`): that op's range then holds the block.
+    pub(crate) fn move_block(&mut self, u: usize, block: std::ops::Range<usize>, to: usize) {
+        let len = block.len();
+        assert!(
+            to <= block.start || to >= block.end,
+            "a block moves out of its own place"
+        );
+        if len == 0 || to == block.start || to == block.end {
+            return;
+        }
+        let stream = &self.units[u].stream;
+        debug_assert!(
+            self.ops.iter().all(|rec| {
+                let r = &rec.entries[u];
+                !(r.start < to && to < r.end)
+                    || (to < block.start && to + 1 == r.end && stream[to][0] == op::BARRIER)
+            }),
+            "a block moves to the middle of an op"
+        );
+        let earlier = to < block.start;
+        // Where the entry at `i` goes.
+        let at = |i: usize| -> usize {
+            if block.contains(&i) {
+                i - block.start + if earlier { to } else { to - len }
+            } else if earlier && (to..block.start).contains(&i) {
+                i + len
+            } else if !earlier && (block.end..to).contains(&i) {
+                i - len
+            } else {
+                i
+            }
+        };
+        let uc = &mut self.units[u];
+        for p in uc.pair_calls.iter_mut() {
+            *p = at(*p);
+        }
+        if earlier {
+            uc.stream[to..block.end].rotate_right(len);
+        } else {
+            uc.stream[block.start..to].rotate_left(len);
+        }
+        for op in &mut self.ops {
+            let r = &mut op.entries[u];
+            if r.start >= r.end {
+                continue;
+            }
+            // Moved to before the op's arrival: it holds the block now.
+            if earlier && r.start < to && to < r.end {
+                *r = r.start..r.end + len;
+                continue;
+            }
+            let holds = r.start <= block.start && r.end >= block.end;
+            debug_assert!(
+                holds || r.end <= block.start || r.start >= block.end,
+                "an op's range cuts the block"
+            );
+            // The range's own entries, the block's left out where it held them.
+            let (first, last) = match holds {
+                true if r.start == block.start && r.end == block.end => {
+                    *r = 0..0;
+                    continue;
+                }
+                true if r.start == block.start => (block.end, r.end - 1),
+                true if r.end == block.end => (r.start, block.start - 1),
+                _ => (r.start, r.end - 1),
+            };
+            let (a, b) = (at(first), at(last));
+            debug_assert!(b >= a && b - a + 1 == (r.len() - if holds { len } else { 0 }));
+            *r = a..b + 1;
+        }
+        // Lists read ahead follow their entries; none holds a block that moves.
+        for (v, r) in self.ops.iter_mut().flat_map(|op| op.ahead.iter_mut()) {
+            if *v != u || r.start >= r.end {
+                continue;
+            }
+            let (a, b) = (at(r.start), at(r.end - 1));
+            debug_assert!(
+                b >= a && b - a + 1 == r.len(),
+                "a block moves out of a list read ahead"
+            );
+            *r = a..b + 1;
+        }
+    }
+}
+
+impl Capture {
+    /// Insert `entries` into unit `u`'s stream at `at`, held by op `owner`: inside its range on `u`
+    /// (`at` from its start to its end), which grows by them. Every other range, `PAIR_CALL`
+    /// position and list read ahead at or past `at` follows its entries; a range around `at` grows.
+    /// For the edge credits ([`crate::barriers::credit`]): a producer's credits just before its
+    /// arrival, a consumer's wait at its op's start.
+    pub(crate) fn insert_entries(
+        &mut self,
+        u: usize,
+        at: usize,
+        owner: usize,
+        entries: &[[u32; 8]],
+    ) {
+        let n = entries.len();
+        let held = &self.ops[owner].entries[u];
+        assert!(
+            held.start <= at && at <= held.end,
+            "an insertion outside its op's range"
+        );
+        if n == 0 {
+            return;
+        }
+        let uc = &mut self.units[u];
+        uc.stream.splice(at..at, entries.iter().copied());
+        for p in uc.pair_calls.iter_mut() {
+            if *p >= at {
+                *p += n;
+            }
+        }
+        for (k, op) in self.ops.iter_mut().enumerate() {
+            let r = &mut op.entries[u];
+            if k == owner {
+                r.end += n;
+            } else if r.start > at || (r.start == at && r.start < r.end) {
+                *r = r.start + n..r.end + n;
+            } else if r.end > at {
+                r.end += n;
+            }
+        }
+        for (v, r) in self.ops.iter_mut().flat_map(|op| op.ahead.iter_mut()) {
+            if *v == u && r.start >= at {
+                *r = r.start + n..r.end + n;
+            }
+        }
+    }
 }
 
 /// One unit's share of a finished trace.
 pub(crate) struct UnitTrace {
-    pub(crate) regions: Vec<Placement>,
-    /// Its stream in GDDR, and where that is: the chip's channel index, the
-    /// offset, the entry count.
+    /// Its stream in GDDR, its sections after it in the same region, and where
+    /// the stream is: the chip's channel index, the offset, the entry count.
     pub(crate) stream: Placement,
     pub(crate) channel: u32,
     pub(crate) offset: u32,
@@ -279,26 +560,46 @@ pub(crate) struct UnitTrace {
     pub(crate) generations: u32,
     /// As [`UnitCapture::held_programs`].
     pub(crate) held_programs: Vec<(u64, u64)>,
+    /// Every program the stream names, once each: its address and words, which a replay puts
+    /// back where another trace's took the room (`ProgramCache::restore`), and their hash.
+    pub(crate) programs: Vec<(u64, std::sync::Arc<[u32]>, u64)>,
+    /// The programs' words in GDDR, each once, at an offset whose 64-byte residue is its L1
+    /// address's (a `READ` keeps the two equal), and for each of [`UnitTrace::programs`] the `READ`
+    /// with which the B mover puts it back (`Session::restore_programs`). `None` and empty with
+    /// mover restores off (`TT_MOVER_RESTORE=0`): the host writes them back instead.
+    pub(crate) program_store: Option<Placement>,
+    pub(crate) restore_reads: Vec<[u32; 8]>,
+    /// The program cache's generation and change count when the programs were last known
+    /// resident, so a replay that finds them unchanged restores nothing.
+    pub(crate) restored: Option<(u64, u64)>,
     /// As [`UnitCapture::sections`].
     pub(crate) sections: Vec<u32>,
     /// What the unit's stream and its sections are made of, and their GDDR bytes.
     pub(crate) composition: Composition,
     pub(crate) top_level_entries: u32,
     pub(crate) gddr_bytes: u64,
+    /// Its stream's `BARRIER` entries: `[arrivals, wait-only, the barriers both stand for]`.
+    pub(crate) barriers: [u32; 3],
 }
 
 /// A finished trace: see the module documentation.
 pub(crate) struct Trace {
     pub(crate) epoch: u64,
     pub(crate) units: Vec<Option<UnitTrace>>,
-    /// Barriers a replay takes.
+    /// Arrivals a replay adds to the barrier counter ([`Capture::barriers`]).
     pub(crate) barriers: u32,
     /// GDDR's free space when the capture ended: whatever was not free, the
     /// trace holds.
     pub(crate) free_at_end: FreeSnapshot,
     /// Frees of what it holds, deferred to its release.
     pub(crate) freed: Vec<Placement>,
+    /// Slots its capture's own tensors gave back and no tensor took again (`Capture::pool`): its
+    /// replays write them, and its release gives them back.
+    pub(crate) pool: Vec<(usize, u64, u64)>,
     pub(crate) ops: Vec<OpRecord>,
+    /// Per unit, its barriers in stream order, for the profile mode's per-unit times; empty
+    /// unless the trace was stored in the profile mode.
+    pub(crate) unit_barriers: Vec<Vec<crate::profile_mode::UnitBarrier>>,
 }
 
 impl Trace {
@@ -332,6 +633,160 @@ pub(crate) fn chunked(entries: &[[u32; 8]]) -> Vec<[u32; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capture of one unit whose entries are numbered (word 1), with `PAIR_CALL`s at `calls`
+    /// and one op a range of `ranges`.
+    fn numbered(n: usize, calls: &[usize], ranges: &[std::ops::Range<usize>]) -> Capture {
+        let stream = (0..n)
+            .map(|i| {
+                let op = if calls.contains(&i) {
+                    op::PAIR_CALL
+                } else {
+                    op::WAIT
+                };
+                [op, i as u32, 0, 0, 0, 0, 0, 0]
+            })
+            .collect();
+        let uc = UnitCapture {
+            stream,
+            pair_calls: calls.to_vec(),
+            ..Default::default()
+        };
+        Capture {
+            epoch: 0,
+            barriers_base: 0,
+            barriers: 0,
+            barrier_ops: 0,
+            units: vec![uc],
+            freed: Vec::new(),
+            ops: ranges
+                .iter()
+                .map(|r| OpRecord {
+                    what: "",
+                    label: "",
+                    entries: vec![r.clone()],
+                    barrier: true,
+                    stamps: [0; 3],
+                    bytes: Default::default(),
+                    unit_bytes: Vec::new(),
+                    ahead: Vec::new(),
+                    ahead_waits: Vec::new(),
+                    l1_top: 0,
+                    l1_need: 0,
+                    shape: 0,
+                    allocs: 0,
+                })
+                .collect(),
+            failed: false,
+            weight_anchor: None,
+            weight_units: 0,
+            unit_anchors: Vec::new(),
+            written: Vec::new(),
+            region_base: None,
+            applied: None,
+            plan_mismatch: None,
+            planned: false,
+            plan_pass: false,
+            plan_key: None,
+            index: Default::default(),
+            reuse: false,
+            pooled: Vec::new(),
+            pool: Vec::new(),
+        }
+    }
+
+    /// Each op's entries (by number) and the numbers at the `PAIR_CALL` positions.
+    fn contents(c: &Capture) -> (Vec<Vec<u32>>, Vec<u32>) {
+        let s = &c.units[0].stream;
+        let ops = c
+            .ops
+            .iter()
+            .map(|o| s[o.entries[0].clone()].iter().map(|e| e[1]).collect())
+            .collect();
+        let calls = c.units[0]
+            .pair_calls
+            .iter()
+            .map(|&p| {
+                assert_eq!(
+                    s[p][0],
+                    op::PAIR_CALL,
+                    "a PAIR_CALL position follows its entry"
+                );
+                s[p][1]
+            })
+            .collect();
+        (ops, calls)
+    }
+
+    #[test]
+    fn a_moved_block_leaves_every_op_its_own_entries() {
+        // Ops 0..4, 4..10 (a PAIR_CALL at 6), 10..20 (the last holds a block 12..15 with a
+        // PAIR_CALL at 13): the block moves back to 4, before the second op.
+        let mut c = numbered(20, &[6, 13], &[0..4, 4..10, 10..20]);
+        c.move_block(0, 12..15, 4);
+        let (ops, calls) = contents(&c);
+        assert_eq!(ops[0], (0..4).collect::<Vec<_>>());
+        assert_eq!(ops[1], (4..10).collect::<Vec<_>>());
+        assert_eq!(ops[2], [10, 11, 15, 16, 17, 18, 19]);
+        assert_eq!(calls, [6, 13]);
+        let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
+        assert_eq!(&order[..10], [0, 1, 2, 3, 12, 13, 14, 4, 5, 6]);
+        // A block at the front of the stream (the probe's background) moved after the ops.
+        let mut c = numbered(12, &[5], &[3..6, 6..9, 9..12]);
+        c.move_block(0, 0..3, 9);
+        let (ops, calls) = contents(&c);
+        assert_eq!(ops[0], [3, 4, 5]);
+        assert_eq!(ops[1], [6, 7, 8]);
+        assert_eq!(ops[2], [9, 10, 11]);
+        assert_eq!(calls, [5]);
+        let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
+        assert_eq!(order, [3, 4, 5, 6, 7, 8, 0, 1, 2, 9, 10, 11]);
+        // A block that starts an op's range, moved back past another op.
+        let mut c = numbered(10, &[], &[0..5, 5..10]);
+        c.move_block(0, 5..7, 0);
+        let (ops, _) = contents(&c);
+        assert_eq!(ops[0], [0, 1, 2, 3, 4]);
+        assert_eq!(ops[1], [7, 8, 9]);
+        let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
+        assert_eq!(&order[..2], [5, 6]);
+        // Back past several ops, one of them with no entries on the unit (a product it sat out,
+        // `Session::set_prefetch_anchor`), a PAIR_CALL and an earlier op's list read ahead: the
+        // block 16..18 of the last op moves to 3, after the first op.
+        let mut c = numbered(20, &[7], &[0..3, 3..8, 8..8, 8..12, 12..20]);
+        c.ops[3].ahead.push((0, 9..11));
+        c.move_block(0, 16..18, 3);
+        let (ops, calls) = contents(&c);
+        assert_eq!(ops[0], [0, 1, 2]);
+        assert_eq!(ops[1], [3, 4, 5, 6, 7]);
+        assert!(ops[2].is_empty(), "the op it sat out holds nothing");
+        assert_eq!(ops[3], [8, 9, 10, 11]);
+        assert_eq!(ops[4], [12, 13, 14, 15, 18, 19]);
+        assert_eq!(calls, [7]);
+        let r = c.ops[3].ahead[0].1.clone();
+        let read: Vec<u32> = c.units[0].stream[r].iter().map(|e| e[1]).collect();
+        assert_eq!(read, [9, 10], "the list read ahead follows its entries");
+        let order: Vec<u32> = c.units[0].stream.iter().map(|e| e[1]).collect();
+        assert_eq!(&order[..6], [0, 1, 2, 16, 17, 3]);
+    }
+
+    #[test]
+    fn a_block_moved_before_an_arrival_is_held_by_that_op() {
+        // Ops 0..5, whose last entry is the unit's arrival at its barrier, and 5..12, holding a
+        // block 9..11 with a PAIR_CALL at 10: the block moves to 4, before the arrival
+        // (`Session::set_read_ahead_early`), and the first op's range holds it.
+        let mut c = numbered(12, &[10], &[0..5, 5..12]);
+        c.units[0].stream[4][0] = op::BARRIER;
+        c.move_block(0, 9..11, 4);
+        let (ops, calls) = contents(&c);
+        assert_eq!(ops[0], [0, 1, 2, 3, 9, 10, 4]);
+        assert_eq!(ops[1], [5, 6, 7, 8, 11]);
+        assert_eq!(calls, [10]);
+        assert_eq!(
+            c.units[0].stream[6][0],
+            op::BARRIER,
+            "the arrival still ends it"
+        );
+    }
 
     #[test]
     fn no_record_crosses_a_chunk() {

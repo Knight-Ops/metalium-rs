@@ -346,8 +346,23 @@ fn bf16_changed_input_traces_and_packed_matmul() {
             let a = s.upload_bf16(&vec![0x4000; 33 * 17], 33, 17).unwrap();
             let b = s.upload_bf16(&vec![0x3f80; 17 * 32], 17, 32).unwrap();
             let copy = s.copy_bf16_xmov(&a).unwrap();
+            // The copy's padding is what the copy left: repaired by the product if need be.
             let mm = s
-                .matmul_bf16(&copy, &b, tt_kernels::matmul::Fidelity::HiFi4, 4_000_000)
+                .matmul_dram(
+                    &tt_kernels::tensor::DramTensor::from_bf16(
+                        copy.clone(),
+                        tt_kernels::tensor::Pad::Undefined,
+                    ),
+                    false,
+                    &tt_kernels::tensor::DramTensor::from_bf16(
+                        b.clone(),
+                        tt_kernels::tensor::Pad::Zero,
+                    ),
+                    false,
+                    tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+                    tt_kernels::matmul::Fidelity::HiFi4,
+                    4_000_000,
+                )
                 .unwrap();
             assert_eq!(s.download(&mm).unwrap(), vec![34.0; 33 * 32]);
             s.free(mm).unwrap();

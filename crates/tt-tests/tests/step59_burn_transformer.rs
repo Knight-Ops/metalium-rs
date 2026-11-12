@@ -43,6 +43,10 @@ fn baseline() -> std::collections::BTreeSet<String> {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step59_burn_transformer"
+)]
 fn a_transformer_trains_and_the_report_only_shrinks() {
     let weights = init(59);
     let host = train::<Autodiff<Flex>>(&weights, STEPS, &FlexDevice).losses;

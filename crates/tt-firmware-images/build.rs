@@ -22,6 +22,9 @@ const BINARIES: &[&str] = &[
     "role_t0",
     "role_t1",
     "role_t2",
+    "guarded_t0",
+    "guarded_t1",
+    "guarded_t2",
     "eth_e1",
     "dm_b",
     "nc_probe",
@@ -73,6 +76,10 @@ fn main() {
     }
     if std::env::var_os("CARGO_FEATURE_ENCODED_GUARD").is_some() {
         features.push("encoded-guard");
+    }
+    // Stamping is compiled in only for profiling (`tt-firmware`'s `profile`).
+    if std::env::var_os("CARGO_FEATURE_PROFILE").is_some() {
+        features.push("profile");
     }
     if !features.is_empty() {
         cmd.args(["--features", &features.join(",")]);

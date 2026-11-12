@@ -28,6 +28,7 @@ use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::dm::record::{self, TensorRef};
 use tt_isa::dm::{TILE_DATA, TILE_SLOT};
 use tt_isa::dram::{Dram, DramChannel, DramRange, CHANNEL_BYTES};
+use tt_isa::format::TileFormat;
 use tt_isa::isa::Instruction;
 
 use crate::dm::DmError;
@@ -40,9 +41,12 @@ pub enum TensorError {
     Transport(TransportError),
     Mover(DmError),
     Run(RunError),
-    /// No channel has room for the tensor's share of slots.
+    /// No channel has room for the tensor's share of slots: the channel that refused it had
+    /// `free` bytes, the largest run of them `largest` (less than the share's, or it would fit).
     OutOfMemory {
         slots: u64,
+        free: u64,
+        largest: u64,
     },
     /// Shapes that do not compose, or an op this path does not support.
     Shape(String),
@@ -86,9 +90,15 @@ impl std::fmt::Display for TensorError {
             TensorError::Transport(e) => write!(f, "{e}"),
             TensorError::Mover(e) => write!(f, "{e}"),
             TensorError::Run(e) => write!(f, "{e}"),
-            TensorError::OutOfMemory { slots } => {
-                write!(f, "no room in GDDR for {slots} tile slots per channel")
-            }
+            TensorError::OutOfMemory {
+                slots,
+                free,
+                largest,
+            } => write!(
+                f,
+                "no room in GDDR for {slots} tile slots per channel: the channel that refused \
+                 them has {free} bytes free, the largest run {largest}"
+            ),
             TensorError::Shape(s) => write!(f, "{s}"),
             TensorError::Trace(e) => write!(f, "{e}"),
             TensorError::Elem { op, got, wants } => write!(
@@ -104,6 +114,40 @@ impl std::error::Error for TensorError {}
 
 pub type Result<T> = std::result::Result<T, TensorError>;
 
+/// How a tensor's tiles are dealt to its channels' regions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Layout {
+    /// Tile `t` (row-major) on channel `t % n` at slot `t / n`: every tensor's, by default.
+    #[default]
+    Interleaved,
+    /// A weight laid by column (`docs/plans/decode-bytes-in-flight.md` Phase C1,
+    /// [`tt_isa::dm::record::REF_BY_COLUMN`]): column `c`'s tiles consecutive on channel `c % n`,
+    /// from slot `(c / n) * rows` there. A decode product reads each of its columns in large
+    /// pieces; a block reads it a tile at a time, as it reads an interleaved one. Only a
+    /// [`tt_isa::dm::record::GATHER`] reads it on the card; host paths address it by
+    /// [`Placement::slot`].
+    ByColumn,
+}
+
+impl Layout {
+    /// How a weight of `[rows, cols]` tiles over `n` channels is laid when `wanted`: by column
+    /// only where that takes no more slots a channel than interleaved. Every channel's region is
+    /// `cols.div_ceil(n)` columns, so a column count that is not a multiple of `n` leaves up to a
+    /// column a channel empty (a weight's bytes held once, plus that, which grows with the
+    /// model: the 135M's 18-column weights took 38 MB more); such a weight stays interleaved.
+    pub fn for_weight(wanted: Layout, [rows, cols]: [usize; 2], n: usize) -> Layout {
+        let fits = || {
+            let by_column = cols.div_ceil(n).checked_mul(rows)?;
+            let tiles = rows.checked_mul(cols)?;
+            Some(tiles > 0 && by_column <= tiles.div_ceil(n))
+        };
+        match wanted {
+            Layout::ByColumn if n > 0 && fits() == Some(true) => Layout::ByColumn,
+            _ => Layout::Interleaved,
+        }
+    }
+}
+
 /// Where one tensor's tiles are: a region of `slots` slots at `base[i]` on
 /// each of `channels[i]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,22 +159,71 @@ pub struct Placement {
     tiles: usize,
     /// A view's first tile within the allocation it borrows from.
     first: usize,
+    /// Laid by column ([`Layout::ByColumn`]): the grid's `[rows, columns]` in tiles; `None`
+    /// interleaved.
+    by_column: Option<[usize; 2]>,
     /// Did this placement allocate its slots? A view ([`DramTensor::rows_view`])
     /// did not, and freeing it gives nothing back.
     owned: bool,
+    /// When its slots were allocated, in the allocator's order (a view's are its parent's):
+    /// what a [`FreeSnapshot`] tells apart from its own moment.
+    serial: u64,
 }
 
 impl Placement {
+    /// The bytes it takes on each of its channels.
+    pub(crate) fn channel_bytes(&self) -> u64 {
+        self.slots * self.slot_bytes
+    }
+
+    /// How its tiles are dealt ([`Layout`]).
+    pub fn layout(&self) -> Layout {
+        match self.by_column {
+            Some(_) => Layout::ByColumn,
+            None => Layout::Interleaved,
+        }
+    }
+
     pub(crate) fn tensor_ref(&self, ct: usize) -> TensorRef {
+        let col_tiles = match self.by_column {
+            Some([rows, cols]) => {
+                assert_eq!(
+                    ct, cols,
+                    "a tensor laid by column is named with its own grid"
+                );
+                rows as u32
+            }
+            None => 0,
+        };
+        // An interleaved tensor of BF16 slots names them, so a record that steps by its slots
+        // (`READ_RUN`, `WRITE_RUN`, `SCATTER`) steps by 2,112 bytes and every other record refuses
+        // it. A packed tensor laid by column, or of BFP slots, names none: only a `GATHER` reads
+        // those, by its format flags.
+        let slot = if col_tiles == 0
+            && self.slot_bytes == tt_isa::dm::BF16_TILE_SLOT
+            && PROBE_UNNAMED_SLOT.load(std::sync::atomic::Ordering::Relaxed) != self.serial + 1
+        {
+            tt_isa::dm::BF16_TILE_SLOT as u32
+        } else {
+            0
+        };
         let mut r = TensorRef {
             n: self.channels.len() as u8,
             first: self.first as u32,
             ct: ct as u32,
+            col_tiles,
+            slot,
             ..TensorRef::default()
         };
         for (i, (c, b)) in self.channels.iter().zip(&self.base).enumerate() {
             r.channels[i] = c.index();
             r.base[i] = *b as u32;
+        }
+        // The control: the card reads by the reference's layout, so a rotated one misreads.
+        if col_tiles != 0 && PROBE_COLUMN_SHIFT.load(std::sync::atomic::Ordering::Relaxed) {
+            let n = self.channels.len();
+            r.channels[..n].rotate_left(1);
+            r.base[..n].rotate_left(1);
         }
         r
     }
@@ -152,7 +245,13 @@ impl Placement {
         assert!(t < self.tiles, "tile {t} of {}", self.tiles);
         let t = t + self.first;
         let n = self.channels.len();
-        let (c, i) = (t % n, (t / n) as u64);
+        let (c, i) = match self.by_column {
+            Some([rows, cols]) => {
+                let (r, col) = (t / cols, t % cols);
+                (col % n, ((col / n) * rows + r) as u64)
+            }
+            None => (t % n, (t / n) as u64),
+        };
         self.channels[c]
             .range(self.base[c] + i * self.slot_bytes, self.slot_bytes)
             .expect("the allocator placed every slot inside its channel")
@@ -160,6 +259,34 @@ impl Placement {
 
     pub fn tiles(&self) -> usize {
         self.tiles
+    }
+
+    /// Each channel's share of the slots, in the order tiles are dealt to them: `(the chip's
+    /// channel index, offset, bytes)`. A view's are its allocation's.
+    pub(crate) fn extents(&self) -> impl Iterator<Item = (u8, u64, u64)> + '_ {
+        let bytes = self.slots * self.slot_bytes;
+        self.channels
+            .iter()
+            .zip(&self.base)
+            .map(move |(c, &b)| (c.index(), b, bytes))
+    }
+
+    /// Bytes a tile's slot takes.
+    pub(crate) fn slot_bytes(&self) -> u64 {
+        self.slot_bytes
+    }
+
+    /// Do `self` and `other` name slots of one allocation (a view and what it borrows, or the
+    /// same tensor twice)?
+    pub(crate) fn same_allocation(&self, other: &Placement) -> bool {
+        self.channels == other.channels && self.base == other.base
+    }
+
+    /// Are `self` and `other` one allocation by when it was made, not where: where a capture
+    /// reuses its own tensors' GDDR (`DramAlloc::start_pool`), a later tensor can take an earlier
+    /// one's slots, base for base.
+    pub(crate) fn same_serial(&self, other: &Placement) -> bool {
+        self.serial == other.serial
     }
 
     /// The whole of a one-channel placement's slots ([`DramAlloc::alloc_on`]).
@@ -177,12 +304,22 @@ impl Placement {
 pub(crate) struct FreeSnapshot {
     channels: Vec<DramChannel>,
     free: Vec<BTreeMap<u64, u64>>,
+    /// The serial the allocator's next placement takes.
+    serial: u64,
 }
 
 impl FreeSnapshot {
     /// Were all of `p`'s slots free then -- so allocated since, and nothing
-    /// captured then can name them?
+    /// captured then can name them? A placement allocated after the snapshot was: what then
+    /// occupied its slots was freed since, and a trace that named that had its free deferred
+    /// until the trace's release, so it was not, or its slots would not have come back. Without
+    /// that, a slot in use at a trace's end and freed and reused since would be the trace's for
+    /// good, and every eager op beside live traces would leak its buffers into them
+    /// (`docs/plans/long-context.md`: an eager 32K prefill beside 13 traces filled 31 GB).
     pub(crate) fn was_free(&self, p: &Placement) -> bool {
+        if p.serial >= self.serial {
+            return true;
+        }
         p.channels.iter().zip(&p.base).all(|(c, &at)| {
             let len = p.slots * p.slot_bytes;
             let Some(i) = self.channels.iter().position(|k| k == c) else {
@@ -205,6 +342,38 @@ pub struct DramAlloc {
     channels: Vec<DramChannel>,
     /// Per channel: free regions as `offset -> bytes`, coalesced on free.
     free: Vec<BTreeMap<u64, u64>>,
+    /// The tensors allocated since [`DramAlloc::start_log`], in order, while one is kept: a
+    /// capture's own tensors (`crate::residency`).
+    log: Option<Vec<Placement>>,
+    /// The next placement's [`Placement::serial`].
+    serial: u64,
+    /// A capture's own freed slots, while it reuses them ([`DramAlloc::start_pool`]).
+    pool: Option<Pool>,
+}
+
+/// A paused capture's log and pool ([`DramAlloc::suspend`]).
+#[derive(Debug)]
+pub(crate) struct Suspended {
+    log: Option<Vec<Placement>>,
+    pool: Option<Pool>,
+}
+
+/// The slots a capture's own tensors gave back during it (`docs/plans/long-context.md` 1.G):
+/// later allocations of the capture take them first, and the trace keeps what is left of them
+/// when it ends ([`DramAlloc::take_pool`]). Kept apart from the free lists, so nothing allocated
+/// outside the capture (or after it, while the trace lives) lands in slots a replay writes.
+#[derive(Debug)]
+struct Pool {
+    /// The capture's first placement's serial: only a tensor from it on is the capture's own.
+    from: u64,
+    /// Per channel, as `DramAlloc::free`.
+    free: Vec<BTreeMap<u64, u64>>,
+    /// Placements written by the host during the capture (an upload, a constant): a replay does
+    /// not write them again, so their slots are never another tensor's.
+    uploads: std::collections::HashSet<u64>,
+    /// Set while an upload allocates: it never takes the pool's slots, since the host writes it
+    /// at once, ahead of the queued ops that may still read them.
+    bypass: bool,
 }
 
 impl DramAlloc {
@@ -216,7 +385,117 @@ impl DramAlloc {
             .iter()
             .map(|_| BTreeMap::from([(0, usable)]))
             .collect();
-        DramAlloc { channels, free }
+        DramAlloc {
+            channels,
+            free,
+            log: None,
+            serial: 0,
+            pool: None,
+        }
+    }
+
+    /// Keep the slots of the capture's own tensors freed from now on for its later allocations
+    /// ([`DramAlloc::give_to_pool`]), until [`DramAlloc::take_pool`].
+    pub(crate) fn start_pool(&mut self) {
+        self.pool = Some(Pool {
+            from: self.serial,
+            free: vec![BTreeMap::new(); self.channels.len()],
+            uploads: Default::default(),
+            bypass: false,
+        });
+    }
+
+    /// `f`'s allocations are uploads, written by the host: never from the pool, and never given
+    /// back to it.
+    pub(crate) fn uploading<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let Some(pool) = self.pool.as_mut() else {
+            return f(self);
+        };
+        pool.bypass = true;
+        let first = self.serial;
+        let out = f(self);
+        let pool = self.pool.as_mut().expect("kept above");
+        pool.bypass = false;
+        pool.uploads.extend(first..self.serial);
+        out
+    }
+
+    /// The host wrote `p` during the capture: as an upload, its slots are never given to the pool.
+    pub(crate) fn note_host_written(&mut self, p: &Placement) {
+        if let Some(pool) = self.pool.as_mut() {
+            pool.uploads.insert(p.serial);
+        }
+    }
+
+    /// Give `p`'s slots to the capture's pool if they are its own to reuse: allocated during the
+    /// capture, not by an upload. `false` (nothing done) otherwise, or with no pool.
+    pub(crate) fn give_to_pool(&mut self, p: &Placement) -> bool {
+        let Some(pool) = self.pool.as_mut() else {
+            return false;
+        };
+        if !p.owned || p.serial < pool.from || pool.uploads.contains(&p.serial) {
+            return false;
+        }
+        for (c, &b) in p.channels.iter().zip(&p.base) {
+            let i = self
+                .channels
+                .iter()
+                .position(|k| k == c)
+                .expect("a placement's channel is the allocator's");
+            release(&mut pool.free[i], b, p.slots * p.slot_bytes);
+        }
+        true
+    }
+
+    /// Stop pooling: the slots the pool still holds, `(channel index, offset, bytes)`, which the
+    /// trace keeps until it is released ([`DramAlloc::free_ranges`]).
+    pub(crate) fn take_pool(&mut self) -> Vec<(usize, u64, u64)> {
+        let Some(pool) = self.pool.take() else {
+            return Vec::new();
+        };
+        pool.free
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, f)| f.into_iter().map(move |(at, len)| (i, at, len)))
+            .collect()
+    }
+
+    /// Give back ranges [`DramAlloc::take_pool`] returned.
+    pub(crate) fn free_ranges(&mut self, ranges: &[(usize, u64, u64)]) {
+        for &(i, at, len) in ranges {
+            release(&mut self.free[i], at, len);
+        }
+    }
+
+    /// Keep every tensor allocated from now on ([`DramAlloc::alloc`]) until
+    /// [`DramAlloc::take_log`].
+    pub(crate) fn start_log(&mut self) {
+        self.log = Some(Vec::new());
+    }
+
+    /// Stop keeping the log and the pool for a while, returning them to [`DramAlloc::resume`]:
+    /// what a paused capture keeps (`Session::paused`), while what runs meanwhile is none of its.
+    pub(crate) fn suspend(&mut self) -> Suspended {
+        Suspended {
+            log: self.log.take(),
+            pool: self.pool.take(),
+        }
+    }
+
+    /// Keep again what [`DramAlloc::suspend`] returned.
+    pub(crate) fn resume(&mut self, s: Suspended) {
+        self.log = s.log;
+        self.pool = s.pool;
+    }
+
+    /// What was allocated since [`DramAlloc::start_log`], so far.
+    pub(crate) fn logged(&self) -> &[Placement] {
+        self.log.as_deref().unwrap_or(&[])
+    }
+
+    /// What was allocated since [`DramAlloc::start_log`], and stop keeping it.
+    pub(crate) fn take_log(&mut self) -> Vec<Placement> {
+        self.log.take().unwrap_or_default()
     }
 
     /// `bytes` contiguous on channel `channel` (an index into the chip's
@@ -237,6 +516,7 @@ impl DramAlloc {
         if free > len {
             self.free[channel].insert(at + len, free - len);
         }
+        self.serial += 1;
         Ok(Placement {
             channels: vec![self.channels[channel]],
             base: vec![at],
@@ -244,8 +524,42 @@ impl DramAlloc {
             slot_bytes: TILE_SLOT,
             tiles: 1,
             first: 0,
+            by_column: None,
             owned: true,
+            serial: self.serial - 1,
         })
+    }
+
+    /// Room for a `[rows, cols]`-tile grid in slots of `slot_bytes`, laid as `layout` says. By
+    /// column, each channel holds whole columns (`cols.div_ceil(n) * rows` slots): the same
+    /// regions as interleaved but for at most one column a channel's rounding.
+    pub(crate) fn alloc_laid(
+        &mut self,
+        [rows, cols]: [usize; 2],
+        slot_bytes: u64,
+        layout: Layout,
+    ) -> Result<Placement> {
+        let tiles = rows
+            .checked_mul(cols)
+            .ok_or_else(|| TensorError::Shape("tile count overflow".into()))?;
+        match layout {
+            Layout::Interleaved => self.alloc_slots(tiles, slot_bytes),
+            Layout::ByColumn => {
+                if tiles == 0 {
+                    return Err(TensorError::Shape("an empty grid laid by column".into()));
+                }
+                let n = self.channels.len();
+                let mut p = self.alloc_slots(cols.div_ceil(n) * n * rows, slot_bytes)?;
+                debug_assert_eq!(p.slots, (cols.div_ceil(n) * rows) as u64);
+                (p.tiles, p.by_column) = (tiles, Some([rows, cols]));
+                if let Some(log) = &mut self.log {
+                    if let Some(last) = log.last_mut().filter(|l| l.serial == p.serial) {
+                        *last = p.clone();
+                    }
+                }
+                Ok(p)
+            }
+        }
     }
 
     /// Room for `tiles` tile slots, interleaved.
@@ -262,14 +576,39 @@ impl DramAlloc {
         let n = self.channels.len();
         let slots = (tiles.max(1)).div_ceil(n) as u64;
         let bytes = slots * slot_bytes;
+        // A capture's freed slots first, where every channel has the room (no placement takes
+        // some channels from the pool and some from the free lists).
+        if let Some(pool) = self.pool.as_mut().filter(|p| !p.bypass) {
+            let found: Vec<Option<u64>> = pool
+                .free
+                .iter()
+                .map(|f| f.iter().find(|(_, &len)| len >= bytes).map(|(&at, _)| at))
+                .collect();
+            if found.iter().all(Option::is_some) {
+                let base: Vec<u64> = found.into_iter().flatten().collect();
+                for (f, &at) in pool.free.iter_mut().zip(&base) {
+                    let len = f.remove(&at).expect("found above");
+                    if len > bytes {
+                        f.insert(at + bytes, len - bytes);
+                    }
+                }
+                return Ok(self.placed(base, slots, slot_bytes, tiles));
+            }
+        }
         let mut base = Vec::with_capacity(n);
         for i in 0..n {
             let Some((&at, &len)) = self.free[i].iter().find(|(_, &len)| len >= bytes) else {
+                let free = self.free[i].values().sum();
+                let largest = self.free[i].values().copied().max().unwrap_or(0);
                 // Give back what this call already took.
                 for (j, &b) in base.iter().enumerate() {
                     release(&mut self.free[j], b, bytes);
                 }
-                return Err(TensorError::OutOfMemory { slots });
+                return Err(TensorError::OutOfMemory {
+                    slots,
+                    free,
+                    largest,
+                });
             };
             self.free[i].remove(&at);
             if len > bytes {
@@ -277,15 +616,27 @@ impl DramAlloc {
             }
             base.push(at);
         }
-        Ok(Placement {
+        Ok(self.placed(base, slots, slot_bytes, tiles))
+    }
+
+    /// The placement [`DramAlloc::alloc_slots`] made at `base`, given its serial and logged.
+    fn placed(&mut self, base: Vec<u64>, slots: u64, slot_bytes: u64, tiles: usize) -> Placement {
+        self.serial += 1;
+        let p = Placement {
             channels: self.channels.clone(),
             base,
             slots,
             slot_bytes,
             tiles,
             first: 0,
+            by_column: None,
             owned: true,
-        })
+            serial: self.serial - 1,
+        };
+        if let Some(log) = &mut self.log {
+            log.push(p.clone());
+        }
+        p
     }
 
     /// Give `p`'s slots back; nothing, for a view.
@@ -309,12 +660,18 @@ impl DramAlloc {
         FreeSnapshot {
             channels: self.channels.clone(),
             free: self.free.clone(),
+            serial: self.serial,
         }
     }
 
     /// The chip's usable channels, in the allocator's order.
     pub(crate) fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Free bytes on every channel together.
+    pub fn free_bytes_total(&self) -> u64 {
+        self.free.iter().flat_map(|f| f.values()).sum()
     }
 
     /// Free bytes on the fullest channel.
@@ -385,11 +742,22 @@ pub trait OpPadding {
 ///   so the raw bits are the useful form -- and `i32::MIN` has one.
 /// - `Bool` is `0` or `1` as an `I32` (never `1.0`: an FP32 op sees `1` as a
 ///   denormal and would flush it).
+///
+/// `Packed` is the exception: a weight stored in fewer bytes than FP32, tiles of its
+/// [`TileFormat`] in slots of that format's size (BF16, `docs/completed-plans/bf16-weight-storage.md`; or
+/// BFP8/4/2), which only a product reads, as its `B` ([`SrcRoute::Tf32WithB`]); every other op
+/// refuses it by its elem. The format is the edge's (`docs/learnings/dataflow-compiler.md` §4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
     F32,
     I32,
     Bool,
+    Packed(TileFormat),
+}
+
+impl Elem {
+    /// A weight stored BF16.
+    pub const BF16: Elem = Elem::Packed(TileFormat::BF16);
 }
 
 /// A `[rows, cols]` matrix of 32-bit datums in GDDR, tiled, FP32 unless
@@ -440,19 +808,86 @@ impl DramTensor {
         self.placement.slot(i * ct + j)
     }
 
+    /// The format of this tensor's tiles: FP32 for every elem but a packed weight's.
+    pub fn format(&self) -> TileFormat {
+        match self.elem {
+            Elem::Packed(format) => format,
+            Elem::F32 | Elem::I32 | Elem::Bool => TileFormat::FP32,
+        }
+    }
+
+    /// A BFP tensor's slots as a stored BFP weight ([`Elem::Packed`]): a product's `B`
+    /// ([`SrcRoute::Tf32WithB`]). A BFP tensor's padding is zero.
+    pub fn from_bfp(t: crate::bfp::BfpTensor) -> Self {
+        let d = DramTensor {
+            rows: t.rows(),
+            cols: t.cols(),
+            elem: Elem::Packed(TileFormat::new(t.format().l1_format())),
+            placement: t.placement,
+            pad: std::cell::Cell::new(Pad::Undefined),
+        };
+        d.set_pad(Pad::Zero);
+        d
+    }
+
+    /// A BF16 tensor's slots as a stored BF16 weight ([`Elem::BF16`]): a product's `B`
+    /// ([`SrcRoute::Tf32WithB`]), whose padding is `pad`.
+    pub fn from_bf16(t: crate::bf16::Bf16Tensor, pad: Pad) -> Self {
+        let d = DramTensor {
+            rows: t.rows,
+            cols: t.cols,
+            elem: Elem::BF16,
+            placement: t.placement,
+            pad: std::cell::Cell::new(Pad::Undefined),
+        };
+        d.set_pad(pad);
+        d
+    }
+
+    /// A stored BFP weight's slots as a [`crate::bfp::BfpTensor`] (the same allocation, for the
+    /// BFP ops: widening, downloading, copying); `None` for any other elem.
+    pub fn as_bfp(&self) -> Option<crate::bfp::BfpTensor> {
+        let Elem::Packed(format) = self.elem else {
+            return None;
+        };
+        let format = crate::bfp::BfpFormat::of(format)?;
+        Some(crate::bfp::BfpTensor::from_parts(
+            self.rows,
+            self.cols,
+            format,
+            self.placement.clone(),
+        ))
+    }
+
+    /// A stored BF16 weight's slots as a [`crate::bf16::Bf16Tensor`] (the same allocation,
+    /// for the BF16 ops: widening, downloading); `None` for any other elem.
+    pub fn as_bf16(&self) -> Option<crate::bf16::Bf16Tensor> {
+        (self.elem == Elem::BF16).then(|| crate::bf16::Bf16Tensor {
+            rows: self.rows,
+            cols: self.cols,
+            placement: self.placement.clone(),
+        })
+    }
+
     /// Allocate a `[rows, cols]` FP32 tensor, contents undefined.
     pub fn alloc(alloc: &mut DramAlloc, rows: usize, cols: usize) -> Result<Self> {
         Self::alloc_elem(alloc, rows, cols, Elem::F32)
     }
 
-    /// Allocate a `[rows, cols]` tensor of `elem`, contents undefined.
+    /// Allocate a `[rows, cols]` tensor of `elem`, contents undefined. A BF16 tensor takes BF16
+    /// slots (2,112 bytes a tile, half an FP32 tile's), which its reference names
+    /// ([`tt_isa::dm::record::TensorRef::slot`]); every other elem an FP32 tile's.
     pub fn alloc_elem(alloc: &mut DramAlloc, rows: usize, cols: usize, elem: Elem) -> Result<Self> {
         let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
+        let slot = match elem {
+            Elem::BF16 => tt_isa::dm::BF16_TILE_SLOT,
+            _ => TILE_SLOT,
+        };
         let t = DramTensor {
             rows,
             cols,
             elem,
-            placement: alloc.alloc(tiles)?,
+            placement: alloc.alloc_slots(tiles, slot)?,
             pad: std::cell::Cell::new(Pad::Undefined),
         };
         t.set_pad(Pad::Undefined);
@@ -494,6 +929,19 @@ impl DramTensor {
         let t = Self::alloc_elem(alloc, rows, cols, elem)?;
         t.write_bits(dev, w, values)?;
         Ok(t)
+    }
+
+    /// Refuse a tensor whose slots are not an FP32 tile's (BF16 or BFP tiles: a BF16 tensor's
+    /// datums go through `Session::upload_bf16` / `download_bf16`, a BFP one's through its
+    /// [`DramTensor::as_bfp`]) where `what` moves 4-byte datums a 4,096-byte tile.
+    pub(crate) fn expect_fp32_slots(&self, what: &str) -> Result<()> {
+        if self.placement.slot_bytes == TILE_SLOT {
+            return Ok(());
+        }
+        Err(TensorError::Shape(format!(
+            "a {:?} tensor in {}-byte slots is not {what}: use its own format's transfer",
+            self.elem, self.placement.slot_bytes
+        )))
     }
 
     /// Refuse anything but `want`, naming `op`.
@@ -558,6 +1006,7 @@ impl DramTensor {
     /// The checks every write makes: `len` datums for this tensor, its own
     /// slots (not a view's), and a `Bool` tensor's `bits` only `0` and `1`.
     pub fn check_write(&self, len: usize, bits: Option<&[u32]>) -> Result<()> {
+        self.expect_fp32_slots("written as 32-bit datums")?;
         if let (Elem::Bool, Some(values)) = (self.elem, bits) {
             if let Some(i) = values.iter().position(|&v| v > 1) {
                 return Err(TensorError::Shape(format!(
@@ -590,6 +1039,19 @@ impl DramTensor {
     ) -> Result<()> {
         let t = self;
         let img = matmul::TILE_IMAGE_BYTES;
+        // Laid by column: each tile to its own slot (a weight's, written once).
+        if t.placement.by_column.is_some() {
+            for (tile, image) in images.chunks_exact(img).enumerate() {
+                let s = t.placement.slot(tile);
+                let r = s
+                    .channel()
+                    .range(s.offset(), img as u64)
+                    .expect("inside its slot");
+                dev.dram_write(w, r, image)?;
+            }
+            t.set_pad(Pad::Zero);
+            return Ok(());
+        }
         let per = t.placement.channels.len();
         let mut regions = vec![vec![0u8; (t.placement.slots * TILE_SLOT) as usize]; per];
         for (tile, image) in images.chunks_exact(img).enumerate() {
@@ -679,10 +1141,14 @@ impl DramTensor {
     }
 
     fn download_any<T: Transport>(&self, dev: &mut Device<T>, w: &Window) -> Result<Vec<f32>> {
+        self.expect_fp32_slots("read as 32-bit datums")?;
         // A small tensor, or a view: tile by tile, and of each tile only the
         // faces and face rows its data reaches -- a `[1, n]` row is 64 bytes
         // from each of two faces, not 4 KiB per tile.
-        if self.placement.first != 0 || self.placement.tiles < 2 * self.placement.channels.len() {
+        if self.placement.first != 0
+            || self.placement.tiles < 2 * self.placement.channels.len()
+            || self.placement.by_column.is_some()
+        {
             let [rt, ct] = self.grid();
             let mut packed = vec![0u8; self.placement.tiles * 4096];
             for i in 0..rt {
@@ -1172,12 +1638,16 @@ pub fn pipelining_pays(
     units: usize,
 ) -> bool {
     let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    // What each staging's plan needs of the arena: noted below only where both answers decide.
+    let floors = std::cell::Cell::new(0);
     // Tiles gathered over the whole op, and blocks, for a staging.
     let gathered = |st: Staging| -> Option<(usize, usize)> {
-        let s = matmul::plan_in([m, k, n], route, fidelity, st)?;
+        let (s, floor) = matmul::plan_floor([m, k, n], route, fidelity, st);
+        let s = s?;
         if s.tiles[1] < kt {
             return None;
         }
+        floors.set(floors.get().max(floor));
         let [mc, nc] = blocks([mt, nt], [s.tiles[0], s.tiles[2]], units);
         let (mut tiles, mut count) = (0, 0);
         for i0 in (0..mt).step_by(mc) {
@@ -1191,8 +1661,16 @@ pub fn pipelining_pays(
     let (Some((full, _)), Some((half, count))) =
         (gathered(Staging::Slots), gathered(Staging::SlotsHalf))
     else {
+        // A staging that cannot hold `K` whole cannot in a smaller arena either: no smaller arena
+        // changes the answer.
         return false;
     };
+    // Both plans decide; a smaller arena that narrowed either could change the answer
+    // (`docs/completed-plans/planned-l1-residency.md` 2h).
+    crate::l1::note_planned(crate::l1::Planned {
+        top: 0,
+        need: floors.get(),
+    });
     count >= 2 * units.max(1) && half <= 2 * full
 }
 
@@ -1230,9 +1708,568 @@ pub fn matmul_dram(
         allow_mop,
         pipeline,
         None,
+        Reads {
+            thin: true,
+            resident_a: false,
+            unpack_b: false,
+            packed_a: None,
+            stream_k: false,
+            stream_prefetch: false,
+            prefetch_units: [usize::MAX; 2],
+            block_stream: BlockStream::Off,
+            reuse: Reuse::Off,
+            out: crate::matmul::Out::Fp32,
+        },
     )
 }
 
+/// A development probe (`docs/completed-plans/decode-to-bandwidth.md` Phase 4, the bound on reading `A` once a
+/// product): every GDDR matmul block is gathered [`record::GATHER_A_RESIDENT`], reading only `B`.
+/// **The products are wrong** (`A`'s slots hold whatever they held); only their time means anything.
+static PROBE_SKIP_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_A`] on or off, process-wide. Dev-facing: a timing bound, never a result.
+#[doc(hidden)]
+pub fn probe_skip_a_reads(on: bool) {
+    PROBE_SKIP_A.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A development probe (`docs/plans/prefill-operand-reuse.md` P4, `silicon_probe_pair_cost`): a
+/// blocked product's chunks gather nothing (a `WAIT` stands in), so its kernels compute on whatever
+/// the slots hold. What is left is the kernels and their handshakes. **The products are wrong**;
+/// only their time means anything.
+static PROBE_SKIP_BLOCK_GATHERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BLOCK_GATHERS`] on or off, process-wide. Dev-facing: a timing bound, never a
+/// result.
+#[doc(hidden)]
+pub fn probe_skip_block_gathers(on: bool) {
+    PROBE_SKIP_BLOCK_GATHERS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn probing_skip_block_gathers() -> bool {
+    PROBE_SKIP_BLOCK_GATHERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`PROBE_SKIP_A`] for the products of [`matmul_dram_batched`] alone (attention's `Q K^T` and
+/// `P V`): the bound on sharing a batched product's `A` reads (`roadmap.md`, "F4b's leftovers").
+/// **The products are wrong**; only their time means anything.
+static PROBE_SKIP_BATCHED_A: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BATCHED_A`] on or off, process-wide. Dev-facing: a timing bound, never a
+/// result.
+#[doc(hidden)]
+pub fn probe_skip_batched_a_reads(on: bool) {
+    PROBE_SKIP_BATCHED_A.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+thread_local! {
+    /// Whether this thread is lowering a batched product's jobs ([`matmul_dram_batched_limited`]).
+    static LOWERING_BATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`PROBE_SKIP_BATCHED_A`] for a batched product's re-reads alone: `A` gathered by the first
+/// column block of each row strip, skipped by the rest. What a pull of `A` could save at best (its
+/// copies made free); the products are wrong.
+static PROBE_SKIP_BATCHED_A_REREADS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BATCHED_A_REREADS`] on or off, process-wide. Dev-facing: a timing bound,
+/// never a result.
+#[doc(hidden)]
+pub fn probe_skip_batched_a_rereads(on: bool) {
+    PROBE_SKIP_BATCHED_A_REREADS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn probing_skip_a_rereads() -> bool {
+    PROBE_SKIP_BATCHED_A_REREADS.load(std::sync::atomic::Ordering::Relaxed)
+        && LOWERING_BATCHED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn probing_skip_a() -> bool {
+    PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
+        || (PROBE_SKIP_BATCHED_A.load(std::sync::atomic::Ordering::Relaxed)
+            && LOWERING_BATCHED.with(std::cell::Cell::get))
+}
+
+/// A development probe (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, the stream fully ahead of the
+/// products): a product with a packed `A` gathers nothing, so it reads no `B` (its `GATHER` reads
+/// only `B`, [`record::GATHER_A_RESIDENT`]), and the session prefetches nothing. What is left of a
+/// step is its products' compute, control and barriers and the small ops: the step with its weight
+/// stream made free. **The products are wrong**; only their time means anything.
+static PROBE_SKIP_WEIGHTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_WEIGHTS`] on or off, process-wide. Dev-facing: a timing bound, never a result.
+#[doc(hidden)]
+pub fn probe_skip_weight_reads(on: bool) {
+    PROBE_SKIP_WEIGHTS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn probing_skip_weights() -> bool {
+    PROBE_SKIP_WEIGHTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A gather list with its `B`-only `GATHER` left out under [`PROBE_SKIP_WEIGHTS`] (only where `A`
+/// is packed, so the record reads nothing else); a `WAIT` stands in where nothing is left.
+pub(crate) fn probe_gather(
+    mut gather: Vec<[u32; 8]>,
+    record: [[u32; 8]; 5],
+    packed_a: bool,
+) -> Vec<[u32; 8]> {
+    if packed_a && probing_skip_weights() {
+        if gather.is_empty() {
+            gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
+        }
+    } else {
+        gather.extend(record);
+    }
+    gather
+}
+
+/// A development probe (`docs/plans/decode-bytes-in-flight.md`, roadmap Track 2 follow-ups item
+/// 2b, H11's "then" step): each one-row product's weight stream (a `GATHER` with
+/// [`record::GATHER_STREAM`] and `A` resident, so it reads only `B`) reads its bytes from a scratch
+/// region of their size, contiguous in one channel (unit `u`'s in channel `u % 8`, X9's layout),
+/// in plain `READ`s of this many bytes, landing in the same slots. A read ahead
+/// ([`record::GATHER_PREFETCH`]) is left as it is. The scratch holds whatever GDDR held: **the
+/// products are wrong**; only their time means anything. The reads run under B's own cap
+/// (`TT_IN_FLIGHT_CAP`), not the stream's. 0 is off.
+static PROBE_CONTIGUOUS_B: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// [`PROBE_CONTIGUOUS_B`]'s bytes moved to plain reads, and left read ahead, since it was set.
+static PROBE_CONTIGUOUS_BYTES: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Turn [`PROBE_CONTIGUOUS_B`] on with entries of `entry_bytes` (a positive multiple of 64), or
+/// off, process-wide; zeroes its byte counts. Dev-facing: a timing bound, never a result.
+#[doc(hidden)]
+pub fn probe_contiguous_b(entry_bytes: Option<u32>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let entry = entry_bytes.unwrap_or(0);
+    assert!(
+        entry % tt_isa::dram::ALIGN as u32 == 0,
+        "a contiguous read's entry is whole 64-byte units: {entry}"
+    );
+    PROBE_CONTIGUOUS_B.store(entry, SeqCst);
+    for c in &PROBE_CONTIGUOUS_BYTES {
+        c.store(0, SeqCst);
+    }
+}
+
+/// [`PROBE_CONTIGUOUS_B`]'s bytes since it was set: `[moved to contiguous reads, left read ahead]`,
+/// counted as ops are queued (an op queued twice, as a capture's run and its trace's, counts once
+/// each time).
+#[doc(hidden)]
+pub fn probe_contiguous_b_bytes() -> [u64; 2] {
+    PROBE_CONTIGUOUS_BYTES
+        .each_ref()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub(crate) fn probing_contiguous_b() -> Option<u32> {
+    match PROBE_CONTIGUOUS_B.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// What [`PROBE_CONTIGUOUS_B`] does with a `GATHER` record's header: `Some((B's bytes, its first
+/// slot in L1))` for a weight stream it moves, `None` for any other gather (it counts a read
+/// ahead's bytes as left).
+pub(crate) fn contiguous_b_bytes(header: &[u32; 8]) -> Result<Option<(u64, u32)>> {
+    let flags = header[1];
+    let refuse = |code| TensorError::Shape(format!("a gather's flags ({flags:#x}): {code}"));
+    let bytes = || -> Result<u64> {
+        let slot = record::gather_b_tile_format(flags)
+            .map_err(refuse)?
+            .slot_bytes();
+        Ok(record::gather_kt(flags) as u64 * header[7] as u64 * slot)
+    };
+    if flags & record::GATHER_PREFETCH != 0 {
+        PROBE_CONTIGUOUS_BYTES[1].fetch_add(bytes()?, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+    if flags & record::GATHER_STREAM == 0 {
+        return Ok(None);
+    }
+    if flags & record::GATHER_A_RESIDENT == 0 || flags & 2 != 0 {
+        return Err(TensorError::Shape(format!(
+            "a weight stream that reads more than an untransposed `B` ({flags:#x})"
+        )));
+    }
+    Ok(Some((bytes()?, header[3])))
+}
+
+/// A weight stream's `B`, `bytes` from L1 `b_at` on, as plain `READ`s of `entry` bytes from
+/// `(channel, off)` on: contiguous in GDDR and in L1 (the record lands tile `(kk, j)` at
+/// `b_at + (kk * cols + j) * slot`, one span), the last read shorter, the port rotating as
+/// `GATHER`'s does. Each read stays inside [`tt_isa::l1::LISTED`] and keeps the NoC's 64-byte
+/// congruence.
+pub(crate) fn contiguous_b_reads(
+    b_at: u32,
+    bytes: u64,
+    (channel, off): (u32, u64),
+    entry: u32,
+) -> Result<Vec<[u32; 8]>> {
+    let align = tt_isa::dram::ALIGN;
+    let listed = tt_isa::l1::LISTED;
+    let end = b_at as u64 + bytes;
+    if entry == 0 || entry as u64 % align != 0 {
+        return Err(TensorError::Shape(format!(
+            "a contiguous read of {entry} bytes"
+        )));
+    }
+    if (b_at as u64) < listed.base || end > listed.end {
+        return Err(TensorError::Shape(format!(
+            "a weight stream's slots {b_at:#x}..{end:#x} leave the listed L1"
+        )));
+    }
+    if off % align != b_at as u64 % align {
+        return Err(TensorError::Shape(format!(
+            "GDDR {off:#x} and L1 {b_at:#x} differ mod {align}"
+        )));
+    }
+    if off + bytes > u32::MAX as u64 + 1 {
+        return Err(TensorError::Shape(format!(
+            "a scratch region past a 32-bit offset ({off:#x} + {bytes})"
+        )));
+    }
+    let mut reads = Vec::new();
+    let mut at = 0u64;
+    while at < bytes {
+        let len = (bytes - at).min(entry as u64);
+        reads.push([
+            tt_isa::dm::op::READ,
+            channel,
+            (reads.len() % 3) as u32,
+            (off + at) as u32,
+            (b_at as u64 + at) as u32,
+            len as u32,
+            0,
+            0,
+        ]);
+        at += len;
+    }
+    PROBE_CONTIGUOUS_BYTES[0].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    Ok(reads)
+}
+
+/// Phase C1's negative control (`step268_column_weights`): a weight laid by column named with its
+/// channels rotated by one, so each column is read from the next column's channel. Host paths
+/// (writes, downloads) still address it by [`Placement::slot`].
+static PROBE_COLUMN_SHIFT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_COLUMN_SHIFT`] on or off (a gate's control, never a result).
+#[doc(hidden)]
+pub fn probe_column_shift(on: bool) {
+    PROBE_COLUMN_SHIFT.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Native BF16's negative control (`step270_native_bf16`): one tensor of BF16 slots (its
+/// allocation's serial plus one; 0 for none) named with no slot, as every reference was before
+/// slots were named, so a run steps it at FP32 slots and reads other tiles' bytes. Host paths
+/// (writes, downloads) still address it by [`Placement::slot`].
+static PROBE_UNNAMED_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Name `t`'s BF16 slots as none ([`PROBE_UNNAMED_SLOT`]), or stop (`None`): a gate's control,
+/// never a result.
+#[doc(hidden)]
+pub fn probe_unnamed_slot(t: Option<&DramTensor>) {
+    let v = t.map_or(0, |t| t.placement.serial + 1);
+    PROBE_UNNAMED_SLOT.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How a GDDR matmul reads `A` ([`matmul_dram_limited`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Reads {
+    /// `A`'s last tile row is read as only its [`thin_rows`] (off, whole tiles: the output's
+    /// padding rows are then what `A`'s held).
+    pub thin: bool,
+    /// A unit's later blocks of the same `A` rows do not read it again
+    /// ([`record::GATHER_A_RESIDENT`]): with `K` whole under [`Staging::Slots`], `A` is at the
+    /// same slots for every block.
+    pub resident_a: bool,
+    /// A transposed `B` is transposed by the kernel's unpacker (`tile_op::matmul::Plan::unpack_b`).
+    pub unpack_b: bool,
+    /// `A` (one row) as [`pack_row`] laid it out, `[K / 32, 32]`: each block reads its
+    /// `K / 1024` tiles instead of a thin read a `K` tile (`tile_op::matmul::Plan::packed_a`).
+    pub packed_a: Option<TensorRef>,
+    /// With `packed_a`, each output column's `K` in chunks the mover reads while the kernel
+    /// computes the chunk before (`tile_op::matmul::Schedule::Stream`).
+    pub stream_k: bool,
+    /// A streamed product's columns may be prefetched too ([`matmul_dram_prefetching`]).
+    pub stream_prefetch: bool,
+    /// The most prefetching units a product takes, its `K` whole and streamed: a streamed
+    /// column reads only its first chunks ahead, so the two kinds want different counts.
+    pub prefetch_units: [usize; 2],
+    /// Whether a product of several tile rows runs as 2-D blocks with `K` streamed
+    /// ([`BlockStream`]).
+    pub block_stream: BlockStream,
+    /// Whether a blocked product's units share their reads of `A`, and of `B` ([`Reuse`]).
+    pub reuse: Reuse,
+    /// How the result is packed (`tile_op::matmul()`): FP32, or a BF16 result (roadmap W1).
+    pub out: crate::matmul::Out,
+}
+
+/// Whether the units of a product of 2-D blocks with `K` streamed ([`BlockStream`]) that read
+/// the same strip of `A`, or of `B`, share its reads (X4, H1; `crate::tile_op::reuse`). Bit for
+/// bit the unshared product: the copies only move bytes into the slots a read would fill.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Reuse {
+    /// Each unit reads its own strips.
+    #[default]
+    Off,
+    /// At most `holders` units of a group read a strip of `A` from GDDR, and the others copy it
+    /// from one of them (`op::READ_L1`, credited both ways). With `b_holders`, `B`'s strips too:
+    /// at most that many units of a column group read one, the groups are one size, and the
+    /// units past them run nothing (`crate::tile_op::distribute::Shared`).
+    Pull {
+        holders: usize,
+        b_holders: Option<usize>,
+    },
+    /// Where a measurement chose it ([`BlockStream::Measured`]); unmeasured, nothing is shared
+    /// (`crate::tile_op::reuse::share`).
+    Auto,
+}
+
+impl Reuse {
+    /// `TT_OPERAND_REUSE`: `off`, `auto`, or `pull`, `pull:<holders>` (one by default) or
+    /// `pull:<holders>,<b_holders>` (`B` shared too); [`Reuse::Auto`] when unset, the session's
+    /// default since F4b.2 (a measured choice pulls `A` where it gains; nothing else shares).
+    pub fn from_env() -> Self {
+        match std::env::var("TT_OPERAND_REUSE") {
+            Err(_) => Reuse::Auto,
+            Ok(v) => v
+                .parse()
+                .unwrap_or_else(|e| panic!("TT_OPERAND_REUSE={v}: {e}")),
+        }
+    }
+}
+
+impl std::str::FromStr for Reuse {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.split_once(':') {
+            None if s == "off" || s == "0" => Ok(Reuse::Off),
+            None if s == "auto" => Ok(Reuse::Auto),
+            None if s == "pull" => Ok(Reuse::Pull {
+                holders: 1,
+                b_holders: None,
+            }),
+            Some(("pull", h)) => {
+                let count = |c: &str| match c.trim().parse::<usize>() {
+                    Ok(n) if n > 0 => Ok(n),
+                    _ => Err(format!("`pull:{h}`: expected positive holder counts")),
+                };
+                match h.split_once(',') {
+                    None => Ok(Reuse::Pull {
+                        holders: count(h)?,
+                        b_holders: None,
+                    }),
+                    Some((a, b)) => Ok(Reuse::Pull {
+                        holders: count(a)?,
+                        b_holders: Some(count(b)?),
+                    }),
+                }
+            }
+            _ => Err(format!(
+                "expected `off`, `auto`, `pull`, `pull:<holders>` or `pull:<holders>,<b_holders>`, \
+                 not `{s}`"
+            )),
+        }
+    }
+}
+
+/// Whether a GDDR product of at least two tile rows runs as `[mb, nb]` blocks of output tiles,
+/// each job streaming `K` in chunks of at most `kq` tiles and reading its `A` and `B` strips once
+/// (`tile_op::matmul::Schedule::BlockStream`, `docs/plans/prefill-operand-reuse.md`). Bit for bit the
+/// other paths: each output tile's `K` chain is the same, in the same order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BlockStream {
+    /// Never.
+    Off,
+    /// Where [`block_stream_plan`] finds a shape whose modelled time beats the other paths'.
+    #[default]
+    Auto,
+    /// Always where the product allows one, with this `[mb, kq, nb]` (each clamped to the
+    /// product): a gate's or a sweep's.
+    Fixed([usize; 3]),
+    /// In a trace, where [`BlockStream::Auto`] blocks a product: the block and the operand reuse
+    /// timed fastest on the card the first time a capture plans the product's question
+    /// ([`BlockQuestion`], `Session::matmul_dram`, the capture paused for it), from
+    /// [`block_stream_candidates`] and a climb ([`block_stream_neighbours`]). An eager product,
+    /// and one nothing was measured for, runs [`BlockStream::Auto`]'s: what is timed is a product
+    /// inside a trace, and an eager one also pays its planning every call. Bit for bit
+    /// [`BlockStream::Auto`]'s product: every candidate is.
+    Measured,
+}
+
+impl BlockStream {
+    /// `TT_MATMUL_BLOCK`: `off`, `auto`, `measured` or `mb,kq,nb`; [`BlockStream::Measured`] when
+    /// unset, the session's default since F4b.2 (on ttsim and in eager products, `Auto`'s block).
+    pub fn from_env() -> Self {
+        match std::env::var("TT_MATMUL_BLOCK") {
+            Err(_) => BlockStream::Measured,
+            Ok(v) => v
+                .parse()
+                .unwrap_or_else(|e| panic!("TT_MATMUL_BLOCK={v}: {e}")),
+        }
+    }
+}
+
+impl std::str::FromStr for BlockStream {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "off" | "0" => Ok(BlockStream::Off),
+            "auto" | "1" => Ok(BlockStream::Auto),
+            "measured" => Ok(BlockStream::Measured),
+            _ => {
+                let parts: Vec<usize> = s
+                    .split(',')
+                    .map(|p| p.trim().parse::<usize>())
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| {
+                        format!("expected `off`, `auto`, `measured` or `mb,kq,nb`: {e}")
+                    })?;
+                match parts[..] {
+                    [mb, kq, nb] if mb > 0 && kq > 0 && nb > 0 => {
+                        Ok(BlockStream::Fixed([mb, kq, nb]))
+                    }
+                    _ => Err(
+                        "expected `off`, `auto`, `measured` or three positive `mb,kq,nb`".into(),
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// The rows of `op(A)`'s last tile row a matmul reads when it reads only what
+/// it uses ([`record::gather_rows`]): `m % 32` when that is 1..=16 and `A` is
+/// not transposed, otherwise 0 (whole tiles). An `m = 1` decode product reads
+/// one row of each `A` tile instead of 32.
+pub fn thin_rows(m: usize, a_transposed: bool) -> u32 {
+    match m % 32 {
+        r @ 1..=16 if !a_transposed => r as u32,
+        _ => 0,
+    }
+}
+
+/// Bytes of one face row (16 datums) of a packed row's tiles ([`pack_row`]): 64 in FP32, 32 in
+/// BF16. A packed `A`'s pairs start `K` tile `kk`'s unpack this many bytes a row into its packed
+/// face ([`crate::matmul::packed_a_pairs`]). Only FP32 and BF16 rows are packed.
+pub const fn packed_row_bytes(format: TileFormat) -> u64 {
+    match format.l1() {
+        tt_isa::tile::L1Format::Bf16 => 32,
+        _ => 64,
+    }
+}
+
+/// One row of `K` values (`t`, `[1, K]`, `K` a multiple of 32) laid out `[K / 32, 32]`: row
+/// `kk` is `t`'s columns `32 kk..32 kk + 32`, the row of `t`'s tile `kk` that holds data. A
+/// product's packed `A` ([`Reads::packed_a`]): it reads `K / 1024` tiles, where a thin read
+/// reads `K / 32`, an entry each. Spread over `units`: each reads its tiles' rows (one entry a
+/// tile) and writes each row's two face rows into place (two `WRITE`s), B reading and NC
+/// writing ([`Step::Transfer`]), no kernel. Data movement only, so bit for bit; the last tile's
+/// rows past `K / 32` are not written (padding, `Undefined`).
+///
+/// FP32 or BF16 (a BF16 activation, roadmap W1): the packed row keeps `t`'s format, its face
+/// rows [`packed_row_bytes`] long. A BFP row is refused: its exponents are shared along 16
+/// datums of a face row, which one row's move cannot carry alone.
+/// The tensor a packed row of `kt` tiles of `elem` (F32 or BF16) is laid in ([`pack_row`], a
+/// packed twin): `[kt, 32]` in FP32-sized slots whatever the format, which a product reads with
+/// `READ_RUN` a `TILE_SLOT` a tile; its padding undefined.
+pub(crate) fn packed_row_tensor(
+    alloc: &mut DramAlloc,
+    kt: usize,
+    elem: Elem,
+) -> Result<DramTensor> {
+    Ok(DramTensor {
+        rows: kt,
+        cols: 32,
+        elem,
+        placement: alloc.alloc_slots(kt.div_ceil(32), TILE_SLOT)?,
+        pad: std::cell::Cell::new(Pad::Undefined),
+    })
+}
+
+pub fn pack_row(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work> {
+    use tt_isa::dm::op;
+    let row_bytes = match t.elem {
+        Elem::F32 | Elem::BF16 => packed_row_bytes(t.format()),
+        other => {
+            return Err(TensorError::Elem {
+                op: "a packed row".into(),
+                got: other,
+                wants: Elem::F32,
+            })
+        }
+    };
+    if t.rows != 1 || t.cols % 32 != 0 {
+        return Err(TensorError::Shape(format!(
+            "a packed row is [1, K] with K whole tiles, not [{}, {}]",
+            t.rows, t.cols
+        )));
+    }
+    // Two writes a tile: a batch's side stays within `TRANSFER_SIDE_MAX`.
+    const GROUP: usize = 64;
+    // A face is 16 face rows.
+    let face = 16 * row_bytes;
+    let kt = t.cols / 32;
+    let stage = staging("packed row slots", GROUP.min(kt))?;
+    let out = packed_row_tensor(alloc, kt, t.elem)?;
+    let jobs = runs(kt, units, GROUP)
+        .into_iter()
+        .map(|run| {
+            let (mut read, mut write) = (Vec::new(), Vec::new());
+            for (q, kk) in run.enumerate() {
+                let (src, slot) = (t.tile(0, kk), stage + q as u64 * TILE_SLOT);
+                // Row 0 of faces 0 and 1: face 0 whole, then face 1's first row.
+                read.push([
+                    op::READ,
+                    src.channel().index() as u32,
+                    (kk % tt_isa::dram::PORTS as usize) as u32,
+                    (src.offset() + TILE_DATA) as u32,
+                    (slot + TILE_DATA) as u32,
+                    (face + row_bytes) as u32,
+                    0,
+                    0,
+                ]);
+                let (dst, r) = (out.tile(kk / 32, 0), (kk % 32) as u64);
+                for half in 0..2u64 {
+                    let f = 2 * (r / 16) + half;
+                    write.push([
+                        op::WRITE,
+                        dst.channel().index() as u32,
+                        0,
+                        (dst.offset() + TILE_DATA + f * face + (r % 16) * row_bytes) as u32,
+                        (slot + TILE_DATA + half * face) as u32,
+                        row_bytes as u32,
+                        0,
+                        0,
+                    ]);
+                }
+            }
+            vec![Step::Transfer {
+                what: "packed row",
+                depth: 1,
+                batches: vec![TransferBatch { read, write }],
+            }]
+        })
+        .collect();
+    out.set_pad(Pad::Undefined);
+    Ok(Work { out, jobs })
+}
+
+/// [`matmul_dram`] with `K` blocked to at most `max_k_tiles`, reading `A` as `reads` says.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_dram_limited(
     alloc: &mut DramAlloc,
@@ -1246,9 +2283,93 @@ pub(crate) fn matmul_dram_limited(
     allow_mop: bool,
     pipeline: bool,
     max_k_tiles: Option<std::num::NonZeroUsize>,
+    reads: Reads,
 ) -> Result<Work> {
-    a.expect("a matmul", Elem::F32)?;
-    b.expect("a matmul", Elem::F32)?;
+    matmul_dram_prefetching(
+        alloc,
+        a,
+        a_transposed,
+        b,
+        b_transposed,
+        route,
+        fidelity,
+        units,
+        allow_mop,
+        pipeline,
+        max_k_tiles,
+        reads,
+        &[],
+        units,
+        &[],
+        &[],
+        None,
+    )
+    .map(|(work, ..)| work)
+}
+
+/// What a list that reads a product's `B` ahead of it is called: the session puts it in a unit's
+/// trace stream ahead of the wait that orders the unit after the ops before the product
+/// (`tile_op::matmul::Plan::push_prefetched_jobs`).
+pub const PREFETCH: &str = "weight prefetch";
+
+/// What a list that reads a product's `B` ahead on a unit that runs the ops before the product
+/// is called (`docs/completed-plans/decode-to-bandwidth.md` Phase 8): its `GATHER` carries
+/// [`record::GATHER_PREFETCH`], so the ops' own drains leave its reads in flight, and the job's
+/// gather list ends with the `WAIT` that drains them. The capture moves it back in the unit's
+/// stream to just after the last weight-streaming product, or towards the last one the unit took
+/// part in (`Session::set_prefetch_anchor`); the capture's own run, and any run that is not
+/// captured, read it where the job is.
+pub const BUSY_PREFETCH: &str = "busy weight prefetch";
+
+/// [`matmul_dram_limited`], with `prefetch` (units at or past `units`, below `spread`) each
+/// taking one job of the product whose `B` its own list reads ahead ([`PREFETCH`],
+/// `tile_op::matmul::Plan::push_prefetched_jobs`) -- where the product is one row with a packed `A` and
+/// its `K` whole or streamed (a prefetching unit's one job is in the first half when pipelined). Returns the work, `Some(spread)` when its jobs are dealt over
+/// `spread` units (job `j` to unit `j % spread`), else `None` (over `units`, `prefetch` unused).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_dram_prefetching(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    a_transposed: bool,
+    b: &DramTensor,
+    b_transposed: bool,
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    allow_mop: bool,
+    pipeline: bool,
+    max_k_tiles: Option<std::num::NonZeroUsize>,
+    reads: Reads,
+    prefetch: &[usize],
+    spread: usize,
+    busy: &[Option<u64>],
+    tiles: &[(u8, u8)],
+    deal: Option<&[u32]>,
+) -> Result<(Work, Option<usize>)> {
+    let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
+    a.expect("a matmul", edge(route.packed_a()))?;
+    b.expect("a matmul", edge(route.packed_b()))?;
+    if route.packed_b().is_some() && b_transposed {
+        return Err(TensorError::Shape(
+            "a packed `B` is read untransposed: store its transpose".into(),
+        ));
+    }
+    // A packed `A` is read untransposed and as whole tiles, or -- BF16 only -- as a packed row
+    // ([`pack_row`]).
+    let packed_row_ok = route.packed_a() == Some(TileFormat::BF16);
+    if route.packed_a().is_some()
+        && (a_transposed || reads.thin || (reads.packed_a.is_some() && !packed_row_ok))
+    {
+        return Err(TensorError::Shape(format!(
+            "a packed `A` ({:?}) is read untransposed and as whole tiles{}",
+            route.packed_a(),
+            if packed_row_ok {
+                ""
+            } else {
+                ", or as a packed row in BF16 only"
+            }
+        )));
+    }
     let (m, ka) = if a_transposed {
         (a.cols, a.rows)
     } else {
@@ -1266,31 +2387,89 @@ pub(crate) fn matmul_dram_limited(
     }
     let k = ka;
     let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
-    // Pipelined (checklist 9.15): each block in half the arena, consecutive
-    // blocks of a unit alternating halves, so the session can move the next
-    // block in and the last one out while one computes -- if `K` still fits
-    // whole in half the arena.
-    let staging = if pipeline && pipelining_pays([m, k, n], route, fidelity, units) {
-        Staging::SlotsHalf
-    } else {
-        Staging::Slots
+    let (staging, floor, [mc, kc, nc]) =
+        chunk_plan([m, k, n], route, fidelity, units, pipeline, max_k_tiles)?;
+    // A packed `A` takes a few slots, not `K`'s: its K blocks are as few as fit.
+    let kc = match reads.packed_a {
+        Some(_) if kc < kt => packed_k_block(kt, max_k_tiles, route, fidelity)?,
+        _ => kc,
     };
-    let shape = matmul::plan_in([m, k, n], route, fidelity, staging)
-        .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
-    let [mc, kc, nc] = shape.tiles;
-    let kc = max_k_tiles.map_or(kc, |limit| kc.min(limit.get()));
-    let kc = if kc < kt {
-        k_block_size(kc, route, fidelity)?
-    } else {
-        kc
-    };
+    // Several tile rows: 2-D blocks with `K` streamed, where the mode asks for them and the
+    // modelled time beats this plan's.
+    if reads.packed_a.is_none() && max_k_tiles.is_none() {
+        let question = block_question(
+            [mt, kt, nt],
+            [mc, kc, nc],
+            [a_transposed, b_transposed],
+            units,
+            route,
+            fidelity,
+        );
+        // A measured product runs its winner where it fits; one not measured yet, `Auto`'s.
+        let (mode, reuse) = match (reads.block_stream, measured_choice(&question)) {
+            (BlockStream::Measured, Some(Some(c))) if measured_fits(&question, c.block) => {
+                (BlockStream::Fixed(c.block), c.reuse)
+            }
+            (BlockStream::Measured, Some(None)) => (BlockStream::Off, reads.reuse),
+            (mode, _) => (mode, reads.reuse),
+        };
+        if let Some((_, layout)) = block_stream_plan(
+            mode,
+            [mt, kt, nt],
+            units,
+            question.other_us(),
+            route,
+            fidelity,
+        ) {
+            let side = |t: &DramTensor, transposed| crate::tile_op::matmul::Side {
+                at: t.tensor_ref(),
+                transposed,
+                elem: t.elem,
+                live_rows: reads.thin,
+            };
+            let mut op = crate::tile_op::matmul(
+                side(a, a_transposed),
+                side(b, b_transposed),
+                [m, k, n],
+                route,
+                fidelity,
+                reads.unpack_b && route == SrcRoute::Tf32FromFp32,
+                None,
+                crate::tile_op::matmul::Schedule::BlockStream {
+                    tiles: layout.tiles,
+                },
+                reads.out,
+            )?;
+            op.share = crate::tile_op::reuse::share(reuse, tiles);
+            let work = op.build(alloc, units, Overlap::Off)?;
+            return Ok((work, None));
+        }
+    }
+    // The plan's block is what runs, so the arena must keep it (`matmul::plan_floor`) -- except
+    // where a packed `A`'s `K` is blocked: its blocks are `packed_k_block`'s, noted where they are
+    // placed (`tile_op::allocate`), and its jobs a column each, whatever the plan's width; and a smaller arena keeps `K`
+    // blocked (`docs/completed-plans/planned-l1-residency.md` 2h-i: `down` at 8192, 8960 and 14,336 laid
+    // out and timed alike past the plan's floor).
+    if !(reads.packed_a.is_some() && kc < kt) {
+        crate::l1::note_planned(crate::l1::Planned {
+            top: 0,
+            need: floor,
+        });
+    }
+    let col_runs = thin_runs([mt, kt, nt], [kc, nc], staging, units);
     let [mc, nc] = blocks([mt, nt], [mc, nc], units);
     let (ra, rb) = (a.tensor_ref(), b.tensor_ref());
-    let c = DramTensor::alloc(alloc, m, n)?;
+    let c = DramTensor::alloc_elem(alloc, m, n, crate::tile_op::matmul::result_elem(reads.out))?;
     let rc = c.tensor_ref();
     let mut jobs = Vec::new();
-    let plan = BlockPlan {
+    if reads.packed_a.is_some() && (m != 1 || a_transposed) {
+        return Err(TensorError::Shape(format!(
+            "a packed `A` is one row read as it is, not [{m}, {k}] transposed {a_transposed}"
+        )));
+    }
+    let plan = crate::tile_op::matmul::Plan {
         tiles: [mt, kt, nt],
+        m,
         block: [mc, nc],
         k_block: kc,
         staging,
@@ -1298,153 +2477,313 @@ pub(crate) fn matmul_dram_limited(
         route,
         fidelity,
         allow_mop,
+        thin: if reads.thin {
+            thin_rows(m, a_transposed)
+        } else {
+            0
+        },
+        resident_a: reads.resident_a && staging == Staging::Slots,
+        col_runs,
+        unpack_b: reads.unpack_b && route == SrcRoute::Tf32FromFp32,
+        packed_a: reads.packed_a,
+        // Only where `K` would be blocked: a whole `K` is one batch a column, and each chunk
+        // batch's own reload, pack and retire (~3 us a chunk, profile `1792358552`) cost a unit
+        // of several columns more than the compute they hide.
+        stream_k: reads.stream_k
+            && reads.packed_a.is_some()
+            && mt == 1
+            && staging == Staging::Slots
+            && kc < kt,
+        busy: busy.to_vec(),
+        deal: deal.map(<[u32]>::to_vec),
+        out: reads.out,
     };
-    if let Err(e) = plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed]) {
+    let prefetch = &prefetch[..prefetch
+        .len()
+        .min(reads.prefetch_units[usize::from(plan.stream_k)])];
+    let prefetching = !prefetch.is_empty()
+        && plan.packed_a.is_some()
+        && mt == 1
+        && if plan.stream_k {
+            reads.stream_prefetch
+        } else {
+            kc >= kt
+        }
+        && prefetch.iter().all(|&u| (units..spread).contains(&u));
+    let pushed = if prefetching {
+        plan.push_prefetched_jobs(
+            &mut jobs,
+            [ra, rb, rc],
+            [a_transposed, b_transposed],
+            prefetch,
+            spread,
+        )
+    } else {
+        plan.push_jobs(&mut jobs, [ra, rb, rc], [a_transposed, b_transposed])
+    };
+    if let Err(e) = pushed {
         alloc.free(&c.placement);
         return Err(e);
     }
-    Ok(Work { out: c, jobs })
+    Ok((Work { out: c, jobs }, prefetching.then_some(spread)))
 }
 
-/// How one `[m, k, n]` product is cut into jobs: what [`matmul_dram`] and
-/// [`matmul_dram_batched`] share.
-struct BlockPlan {
-    tiles: [usize; 3],
-    block: [usize; 2],
-    k_block: usize,
+/// A one-tile-row product's output columns, one run a job, in the order a
+/// session deals them (job `j` to unit `j % units`): whole rounds of the plan's
+/// width `nc`, then what is left as even runs over as many units as it covers.
+/// [`blocks`] cuts every job `nc` wide, so the last round's few jobs leave most
+/// units idle while some do a whole block more (`[1, 2048] @ [2048, 8192]`, `nc`
+/// 2 on 120 units: 8 units run two jobs of 2, 4 columns; spread, 16 run 2 + 1,
+/// and no unit more than the 3 that 256 columns over 120 units need). For
+/// `K` whole and unpipelined only (`None` otherwise, and with no columns past
+/// one per unit to deal). Each output tile's accumulation is unchanged: only
+/// which job holds it moves.
+pub fn thin_runs(
+    [mt, kt, nt]: [usize; 3],
+    [kc, nc]: [usize; 2],
     staging: Staging,
     units: usize,
-    route: SrcRoute,
-    fidelity: Fidelity,
-    allow_mop: bool,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if mt != 1 || kc < kt || staging != Staging::Slots || nt <= units || nc == 0 {
+        return None;
+    }
+    let full = nt / (units * nc) * units * nc;
+    let mut out: Vec<_> = (0..full).step_by(nc).map(|j| j..j + nc).collect();
+    out.extend(
+        runs(nt - full, units, nc)
+            .into_iter()
+            .map(|r| full + r.start..full + r.end),
+    );
+    Some(out)
 }
 
-impl BlockPlan {
-    /// One job per `[mc, nc]` output block of `op(A) @ op(B)`, the operands
-    /// and the output named by `refs` (`[A, B, C]`, each a tensor or a
-    /// tile-aligned block of one: the records read `K` and the output from
-    /// the ref's first tile on, at the ref's row stride).
-    fn push_jobs(
-        &self,
-        jobs: &mut Vec<Job>,
-        [ra, rb, rc]: [TensorRef; 3],
-        [a_transposed, b_transposed]: [bool; 2],
-    ) -> Result<()> {
-        let [mt, kt, nt] = self.tiles;
-        if self.k_block < kt {
-            return self.push_k_jobs(jobs, [ra, rb, rc], [a_transposed, b_transposed]);
+/// X10's probe (`docs/plans/decode-bytes-in-flight.md`, "X10: evenness"): a one-row product with
+/// prefetching units and `K` whole deals its in-span columns over its own units **and** its
+/// prefetching ones ([`dealt_runs`]), each unit's share by its weight (indexed by unit, a missing
+/// weight 1; none: even). Set, it takes precedence over the session's even deal
+/// (`Session::set_even_deal`, on by default); off (`None`), the session's choice stands. Bit for
+/// bit either way: only which unit holds a column moves. Dev-facing: position weights were bounded
+/// and killed (a unit's rate follows the load its deal gives it).
+static PROBE_DEAL: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(None);
+
+/// Turn [`PROBE_DEAL`] on with these per-unit weights (empty: even), or off, process-wide.
+#[doc(hidden)]
+pub fn probe_deal(weights: Option<Vec<u32>>) {
+    *PROBE_DEAL.lock().unwrap_or_else(|e| e.into_inner()) = weights;
+}
+
+pub(crate) fn probing_deal() -> Option<Vec<u32>> {
+    PROBE_DEAL.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// `total` cut in proportion to `weights` (all zero counts as all one), in whole parts summing
+/// to `total`: each its floor, then one more to the largest remainders, ties to the later.
+pub fn weighted_counts(total: usize, weights: &[u32]) -> Vec<usize> {
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    let ones = weights.iter().all(|&w| w == 0);
+    let w = |i: usize| if ones { 1 } else { u128::from(weights[i]) };
+    let sum: u128 = (0..weights.len()).map(w).sum();
+    let mut out: Vec<usize> = (0..weights.len())
+        .map(|i| (total as u128 * w(i) / sum) as usize)
+        .collect();
+    let mut left = total - out.iter().sum::<usize>();
+    // The remainders, as numerators over `sum`, largest first, the later first among equals.
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by_key(|&i| {
+        (
+            std::cmp::Reverse(total as u128 * w(i) % sum),
+            std::cmp::Reverse(i),
+        )
+    });
+    for i in order {
+        if left == 0 {
+            break;
         }
-        let [mc, nc] = self.block;
-        let (units, staging) = (self.units, self.staging);
-        let (in_fmt, out_fmt) = self.route.formats();
-        for i0 in (0..mt).step_by(mc) {
-            let rows = mc.min(mt - i0);
-            for j0 in (0..nt).step_by(nc) {
-                let cols = nc.min(nt - j0);
-                let tiles = [rows, kt, cols];
-                // A session deals job `j` to unit `j % units`, so a unit's blocks
-                // are every `units`-th: they alternate halves by `j / units`.
-                let half = (staging == Staging::SlotsHalf)
-                    .then(|| ((jobs.len() / units.max(1)) % 2) as u8);
-                let layout = match matmul::plan_layout_in(tiles, in_fmt, staging) {
-                    Ok(l) if half == Some(1) => l.shifted(matmul::HALF),
-                    Ok(l) => l,
-                    Err(e) => return Err(e.into()),
-                };
-                let matmul::Layout {
-                    a_at,
-                    b_at,
-                    outputs,
-                    sems,
-                    init,
-                } = layout;
-                let flags =
-                    u32::from(a_transposed) | u32::from(b_transposed) << 1 | (kt as u32) << 8;
-                let gather = [
-                    [
-                        record::GATHER,
-                        flags,
-                        a_at as u32,
-                        b_at as u32,
-                        i0 as u32,
-                        rows as u32,
-                        j0 as u32,
-                        cols as u32,
-                    ],
-                    ra.encode()[0],
-                    ra.encode()[1],
-                    rb.encode()[0],
-                    rb.encode()[1],
-                ];
-                // The cache tells the stagings and halves apart: their programs
-                // name different addresses.
-                let variant = half.map_or(0, |h| 1 + h);
-                let (fidelity, allow_mop) = (self.fidelity, self.allow_mop);
-                let (roles, mop) = matmul::kernel_programs(
-                    tiles,
-                    variant,
-                    self.route,
-                    fidelity,
-                    sems,
-                    allow_mop,
-                    || matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop),
-                );
-                // Only the datums go back: the packer writes nothing else, and the
-                // unpacker skips the header whatever it holds (`step18_dram_matmul`).
-                // The outputs sit one slot apart from the first (`plan_layout_in`).
-                let out_at = outputs[0].out;
-                debug_assert!(outputs
-                    .iter()
-                    .enumerate()
-                    .all(|(k, o)| o.out == out_at + k as u64 * TILE_SLOT));
-                let scatter = [
-                    [
-                        record::SCATTER,
-                        out_at as u32,
-                        TILE_SLOT as u32,
-                        i0 as u32,
-                        rows as u32,
-                        j0 as u32,
-                        cols as u32,
-                        0,
-                    ],
-                    rc.encode()[0],
-                    rc.encode()[1],
-                ];
-                jobs.push(vec![
-                    Step::List {
-                        what: "matmul gather",
-                        entries: gather.to_vec(),
-                    },
-                    Step::Kernel {
-                        roles,
-                        init,
-                        mop: Box::new(mop),
-                        loops: Default::default(),
-                        half,
-                    },
-                    Step::List {
-                        what: "matmul scatter",
-                        entries: scatter.to_vec(),
-                    },
-                ]);
+        out[i] += 1;
+        left -= 1;
+    }
+    out
+}
+
+/// [`PROBE_DEAL`]'s deal of columns `cols` at most `nc` a run: per unit of `deal` (a product's own
+/// units `0..units` first, then its prefetching units), its runs in order. Round 0 gives each own
+/// unit `nc` columns (its first job, which it reads ahead where it is busy); every unit of `deal`
+/// then takes its weighted share ([`weighted_counts`], `weights` by unit, a missing weight 1) of
+/// the rest, in rounds of at most `nc` each, the columns of a round in `deal`'s order -- so
+/// neighbours start on neighbouring channels, as [`thin_runs`]' rounds do. `None` where the own
+/// units' first round would not fit.
+pub fn dealt_runs(
+    cols: std::ops::Range<usize>,
+    nc: usize,
+    units: usize,
+    deal: &[usize],
+    weights: &[u32],
+) -> Option<Vec<Vec<std::ops::Range<usize>>>> {
+    if nc == 0 || units == 0 || deal.len() < units || cols.len() < units * nc {
+        return None;
+    }
+    let rest = cols.len() - units * nc;
+    let w: Vec<u32> = deal
+        .iter()
+        .map(|&u| weights.get(u).copied().unwrap_or(1))
+        .collect();
+    let share = weighted_counts(rest, &w);
+    let mut out: Vec<Vec<std::ops::Range<usize>>> = vec![Vec::new(); deal.len()];
+    let mut j = cols.start;
+    for runs in out.iter_mut().take(units) {
+        runs.push(j..j + nc);
+        j += nc;
+    }
+    let mut taken = vec![0usize; deal.len()];
+    while j < cols.end {
+        for (d, runs) in out.iter_mut().enumerate() {
+            let t = nc.min(share[d] - taken[d]);
+            if t > 0 {
+                runs.push(j..j + t);
+                taken[d] += t;
+                j += t;
             }
         }
-        Ok(())
     }
+    Some(out)
+}
+
+/// `A` slots a K block of `count` tiles takes with `A` packed: the packed tiles its `K` range
+/// may span.
+pub(crate) fn packed_a_slots(count: usize) -> usize {
+    count.div_ceil(32) + 1
+}
+
+/// The K block of a product with a packed `A` ([`Reads::packed_a`]): `kt` cut into the fewest
+/// blocks of equal size (at most `limit`) whose layout ([`matmul::k_block_layout_with`]) and
+/// programs fit. `down` (`K` = 8192) takes two of 128 where a thin `A`'s 64 slots a block left
+/// four of 64: half the blocks' compute between reads, and half the partials through GDDR.
+fn packed_k_block(
+    kt: usize,
+    limit: Option<std::num::NonZeroUsize>,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> Result<usize> {
+    let limit = limit.map_or(kt, |l| l.get());
+    for blocks in 2..=kt {
+        let kc = kt.div_ceil(blocks);
+        if kc > limit {
+            continue;
+        }
+        // A measurement: the block chosen is noted where it is placed (`tile_op::allocate`).
+        let Ok((layout, reload)) = crate::l1::unnoted(|| {
+            matmul::k_block_layout_with(kc, packed_a_slots(kc), route.packed_row_slots())
+        }) else {
+            continue;
+        };
+        let layout = matmul::Layout {
+            outputs: matmul::packed_a_pairs(
+                &layout.outputs,
+                layout.a_at,
+                0,
+                route.packed_row_bytes(),
+            ),
+            ..layout
+        };
+        let fits = [None, Some(reload)].into_iter().all(|r| {
+            matmul::k_block_kernel(
+                &layout,
+                r,
+                route,
+                fidelity,
+                false,
+                matmul::LiveRows::All,
+                matmul::Out::Fp32,
+            )
+            .iter()
+            .all(|p| {
+                p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                    && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+            })
+        });
+        if fits {
+            return Ok(kc);
+        }
+    }
+    Err(TensorError::Shape(
+        "no K-block matmul of a packed A fits".into(),
+    ))
+}
+
+/// Fewest chunks a streamed column's `K` is cut into (`tile_op::matmul::Schedule::Stream`): the
+/// mover reads one while the kernel computes the one before, so the last's compute is what is
+/// left after the reads.
+const MIN_STREAM_CHUNKS: usize = 4;
+
+/// The chunk size of a `kt`-tile `K` streamed with a packed `A` (`tile_op::matmul::Schedule::Stream`),
+/// and its layout: an even number of chunks (a column's first in half 0, so a unit's columns
+/// alternate halves throughout), at least [`MIN_STREAM_CHUNKS`], each at most `limit` tiles (the
+/// K block the product would otherwise take), the fewest whose layout and programs fit.
+pub(crate) fn stream_chunks(
+    kt: usize,
+    limit: usize,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> Result<(usize, matmul::StreamLayout)> {
+    let a_slots = packed_a_slots(kt);
+    for chunks in (MIN_STREAM_CHUNKS..=kt.max(MIN_STREAM_CHUNKS)).step_by(2) {
+        let kq = kt.div_ceil(chunks);
+        if kt.div_ceil(kq) % 2 != 0 || kq > limit {
+            continue;
+        }
+        // A measurement: the chunks chosen are noted where they are placed (`tile_op::allocate`).
+        let Ok(layout) =
+            crate::l1::unnoted(|| matmul::k_stream_layout(kq, a_slots, route.b_slot()))
+        else {
+            continue;
+        };
+        let fits = (0..2).all(|c| {
+            let (l, r) = layout.chunk(c, c * kq, kq, route.packed_row_bytes());
+            matmul::k_block_kernel(
+                &l,
+                r,
+                route,
+                fidelity,
+                false,
+                matmul::LiveRows::All,
+                matmul::Out::Fp32,
+            )
+            .iter()
+            .all(|p| {
+                p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                    && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+            })
+        });
+        if fits {
+            return Ok((kq, layout));
+        }
+    }
+    Err(TensorError::Shape(format!(
+        "no K-streamed matmul of {kt} K tiles fits"
+    )))
 }
 
 /// Size both first and continuation programs against the resident-cache limit.
 pub(crate) fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -> Result<usize> {
     loop {
-        if let Ok((layout, reload)) = matmul::k_block_layout(kc) {
+        if let Ok((layout, reload)) = crate::l1::unnoted(|| matmul::k_block_layout(kc)) {
             let fits = [None, Some(reload)].into_iter().all(|r| {
-                matmul::k_block_kernel(&layout, r, route, fidelity)
-                    .iter()
-                    .all(|p| {
-                        p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
-                            && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
-                    })
+                matmul::k_block_kernel(
+                    &layout,
+                    r,
+                    route,
+                    fidelity,
+                    false,
+                    matmul::LiveRows::All,
+                    matmul::Out::Fp32,
+                )
+                .iter()
+                .all(|p| {
+                    p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                        && p.len() * 4 <= tt_isa::l1::PROGRAM_CACHE.len() as usize / 2
+                })
             });
             if fits {
                 return Ok(kc);
@@ -1457,127 +2796,602 @@ pub(crate) fn k_block_size(mut kc: usize, route: SrcRoute, fidelity: Fidelity) -
     }
 }
 
-impl BlockPlan {
-    fn push_k_jobs(
-        &self,
-        jobs: &mut Vec<Job>,
-        [ra, rb, rc]: [TensorRef; 3],
-        transposed: [bool; 2],
-    ) -> Result<()> {
-        let [mt, kt, nt] = self.tiles;
-        // One output tile per job keeps its prior accumulator and every K
-        // continuation on the same unit; outputs remain independent.
-        for i in 0..mt {
-            for j in 0..nt {
-                let mut steps = Vec::new();
-                for k0 in (0..kt).step_by(self.k_block) {
-                    let count = self.k_block.min(kt - k0);
-                    let (layout, reload) = matmul::k_block_layout(count)?;
-                    let mut ar = ra;
-                    let mut br = rb;
-                    ar.first += if transposed[0] {
-                        (k0 * ar.ct as usize) as u32
-                    } else {
-                        k0 as u32
-                    };
-                    br.first += if transposed[1] {
-                        k0 as u32
-                    } else {
-                        (k0 * br.ct as usize) as u32
-                    };
-                    let flags = u32::from(transposed[0])
-                        | u32::from(transposed[1]) << 1
-                        | (count as u32) << 8;
-                    let mut gather = vec![
-                        [
-                            record::GATHER,
-                            flags,
-                            layout.a_at as u32,
-                            layout.b_at as u32,
-                            i as u32,
-                            1,
-                            j as u32,
-                            1,
-                        ],
-                        ar.encode()[0],
-                        ar.encode()[1],
-                        br.encode()[0],
-                        br.encode()[1],
-                    ];
-                    if k0 > 0 {
-                        // A WAIT marks this dependent gather's footprint as
-                        // conservative: the scheduler waits for NC release,
-                        // not merely pack retirement, before reading GDDR.
-                        gather.insert(0, [tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
-                        gather.extend([
-                            [
-                                record::READ_RUN,
-                                (i * nt + j) as u32,
-                                1,
-                                reload.prior as u32,
-                                0,
-                                0,
-                                0,
-                                0,
-                            ],
-                            rc.encode()[0],
-                            rc.encode()[1],
-                        ]);
-                    }
-                    let variant = if k0 > 0 { 0x81 } else { 0x80 };
-                    let (roles, _) = matmul::kernel_programs(
-                        [1, count, 1],
-                        variant,
-                        self.route,
-                        self.fidelity,
-                        layout.sems,
-                        false,
-                        || {
-                            (
-                                matmul::k_block_kernel(
-                                    &layout,
-                                    (k0 > 0).then_some(reload),
-                                    self.route,
-                                    self.fidelity,
-                                ),
-                                [None; 3],
-                            )
-                        },
-                    );
-                    steps.push(Step::List {
-                        what: "K-block matmul gather",
-                        entries: gather,
-                    });
-                    steps.push(Step::Kernel {
-                        roles,
-                        init: layout.init,
-                        mop: Box::new([None; 3]),
-                        loops: Default::default(),
-                        half: None,
-                    });
-                    steps.push(Step::List {
-                        what: "K-block matmul scatter",
-                        entries: vec![
-                            [
-                                record::SCATTER,
-                                layout.outputs[0].out as u32,
-                                TILE_SLOT as u32,
-                                i as u32,
-                                1,
-                                j as u32,
-                                1,
-                                0,
-                            ],
-                            rc.encode()[0],
-                            rc.encode()[1],
-                        ],
-                    });
-                }
-                jobs.push(steps);
+/// What [`block_stream_plan`]'s model takes a unit to spend on a K-tile pair, on an output tile's
+/// reload and pack a chunk, and on a chunk's batch (its launch, credits and retire), in us; and
+/// GDDR's read rates, a card's and one unit's, in bytes a us. From card 0's sweeps
+/// (`docs/plans/prefill-operand-reuse.md`, "Measured": a `kq` sweep of a `4 x 6` block of `down`,
+/// `1792857249`-`1792857286`, ~3-5 us a chunk of 24 outputs; blocks of 24-64 outputs, 0.4-0.6 us a
+/// pair at HiFi4). The card's rate is what a product reading under its compute reached: shapes
+/// that asked ~400 GB/s ran slower than their compute, none of the fast ones read more than ~315.
+/// The pair re-fitted for the tiles order (`matmul::PairOrder::Tiles`, P4, card 1): its kernel alone,
+/// gathers left out, runs a pair in ~0.14-0.23 us at HiFi4 (`silicon_probe_pair_cost::without_gathers`,
+/// `1793037314`); at 0.4 the model kept blocks that read more than they need (`down` at 1,024 rows:
+/// `[4, 4, 6]` 18.5 TFLOPS with a BF16 `B`, the re-fitted model's `[6, 4, 6]` 22.2, `1793039350`-`1793039358`).
+const BLOCK_PAIR_US: f64 = 0.2;
+const BLOCK_OUTPUT_US: f64 = 0.15;
+const BLOCK_BATCH_US: f64 = 2.0;
+const CARD_READ_BYTES_PER_US: f64 = 320_000.0;
+const UNIT_READ_BYTES_PER_US: f64 = 7_000.0;
+const TILE_BYTES: f64 = 4096.0;
+
+/// The longest side of a block [`block_stream_plan`] considers: the kernel's programs are
+/// unrolled an output tile (P1b loops them).
+pub const BLOCK_SIDE_MAX: usize = 16;
+
+/// The programs [`block_stream_plan`] builds to check a candidate's fit, at most, before it gives
+/// up on a product.
+const BLOCK_FIT_TRIES: usize = 8;
+
+/// A K-streamed blocked product's shape ([`BlockStream`]): `[mb, kq, nb]`, its chunks a job, and
+/// what [`block_stream_plan`]'s model makes of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockStreamShape {
+    pub tiles: [usize; 3],
+    pub chunks: usize,
+    /// Modelled time, us.
+    pub us: f64,
+    /// GDDR bytes read.
+    pub bytes: f64,
+}
+
+/// [`BlockStreamShape`] of `[mt, kt, nt]` tiles in `[mb, kq, nb]` blocks over `units` units: `None`
+/// where the chunks a job are odd (a unit's chunks must alternate halves from job to job) or the
+/// block is wider than the product.
+pub fn block_stream_model(
+    [mt, kt, nt]: [usize; 3],
+    [mb, kq, nb]: [usize; 3],
+    units: usize,
+) -> Option<BlockStreamShape> {
+    if mb == 0 || kq == 0 || nb == 0 || mb > mt || nb > nt || kq > kt {
+        return None;
+    }
+    let chunks = kt.div_ceil(kq);
+    if chunks % 2 != 0 {
+        return None;
+    }
+    let (row_blocks, col_blocks) = (mt.div_ceil(mb), nt.div_ceil(nb));
+    let jobs = row_blocks * col_blocks;
+    let rounds = jobs.div_ceil(units.max(1)) as f64;
+    // Every block reads its rows' `A` and its columns' `B` once, over the whole of `K`.
+    let bytes = (col_blocks * mt + row_blocks * nt) as f64 * kt as f64 * TILE_BYTES;
+    let compute = chunks as f64 * BLOCK_BATCH_US
+        + (mb * nb) as f64 * (kt as f64 * BLOCK_PAIR_US + chunks as f64 * BLOCK_OUTPUT_US);
+    let read = (mb + nb) as f64 * kt as f64 * TILE_BYTES / UNIT_READ_BYTES_PER_US;
+    // A chunk's reads run under the chunk before's compute.
+    let us = (bytes / CARD_READ_BYTES_PER_US).max(rounds * compute.max(read));
+    Some(BlockStreamShape {
+        tiles: [mb, kq, nb],
+        chunks,
+        us,
+        bytes,
+    })
+}
+
+/// The same model of the product's other paths: `[mc, kc, nc]` as `matmul_dram_prefetching`
+/// runs it (after [`blocks`]), `K` whole (its reads and compute one after another under
+/// [`Staging::Slots`]) or in K blocks of one output tile, the partial through GDDR.
+pub fn blocked_paths_model(
+    [mt, kt, nt]: [usize; 3],
+    [mc, kc, nc]: [usize; 3],
+    units: usize,
+) -> f64 {
+    let units = units.max(1);
+    if kc >= kt {
+        let (row_blocks, col_blocks) = (mt.div_ceil(mc), nt.div_ceil(nc));
+        let rounds = (row_blocks * col_blocks).div_ceil(units) as f64;
+        let bytes = (col_blocks * mt + row_blocks * nt) as f64 * kt as f64 * TILE_BYTES;
+        let job = BLOCK_BATCH_US
+            + (mc * nc) as f64 * (kt as f64 * BLOCK_PAIR_US + BLOCK_OUTPUT_US)
+            + (mc + nc) as f64 * kt as f64 * TILE_BYTES / UNIT_READ_BYTES_PER_US;
+        (bytes / CARD_READ_BYTES_PER_US).max(rounds * job)
+    } else {
+        let blocks = kt.div_ceil(kc) as f64;
+        let rounds = (mt * nt).div_ceil(units) as f64;
+        let tiles = 2.0 * kt as f64 + 2.0 * (blocks - 1.0);
+        let bytes = (mt * nt) as f64 * tiles * TILE_BYTES;
+        let job = blocks * (BLOCK_BATCH_US + BLOCK_OUTPUT_US)
+            + kt as f64 * BLOCK_PAIR_US
+            + tiles * TILE_BYTES / UNIT_READ_BYTES_PER_US;
+        (bytes / CARD_READ_BYTES_PER_US).max(rounds * job)
+    }
+}
+
+/// A GDDR product's chunk plan before a packed `A`'s `K` blocks, as
+/// [`matmul_dram_prefetching`] makes it: its staging, the arena's floor for it
+/// ([`matmul::plan_floor`]) and its `[mc, kc, nc]` tiles.
+fn chunk_plan(
+    [m, k, n]: [usize; 3],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    pipeline: bool,
+    max_k_tiles: Option<std::num::NonZeroUsize>,
+) -> Result<(Staging, u64, [usize; 3])> {
+    let kt = k.div_ceil(32);
+    // Pipelined (checklist 9.15): each block in half the arena, consecutive
+    // blocks of a unit alternating halves, so the session can move the next
+    // block in and the last one out while one computes -- if `K` still fits
+    // whole in half the arena.
+    let staging = if pipeline && pipelining_pays([m, k, n], route, fidelity, units) {
+        Staging::SlotsHalf
+    } else {
+        Staging::Slots
+    };
+    let (shape, floor) = matmul::plan_floor([m, k, n], route, fidelity, staging);
+    let shape = shape
+        .ok_or_else(|| TensorError::Shape(format!("[{m}, {k}] @ [{k}, {n}] fits no chunk")))?;
+    let [mc, kc, nc] = shape.tiles;
+    let kc = max_k_tiles.map_or(kc, |limit| kc.min(limit.get()));
+    let kc = if kc < kt {
+        k_block_size(kc, route, fidelity)?
+    } else {
+        kc
+    };
+    Ok((staging, floor, [mc, kc, nc]))
+}
+
+/// What a blocked product's block depends on ([`block_stream_plan`]): its tiles, which operands
+/// are read transposed, units, route (its operands' formats) and fidelity, and the other paths'
+/// modelled time.
+/// [`BlockStream::Measured`] times each question once a process. Not the arena: a residency
+/// plan pass plans in the whole arena and its planned capture below its region, which is placed
+/// above what every op of the pass needed, so a block chosen in the pass is the capture's too;
+/// one that does not fit where it is asked runs `Auto`'s ([`measured_fits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlockQuestion {
+    pub tiles: [usize; 3],
+    /// `A` and `B` read transposed: a gradient's product of the same tiles is another question.
+    pub transposed: [bool; 2],
+    pub units: usize,
+    pub route: SrcRoute,
+    pub fidelity: Fidelity,
+    other_bits: u64,
+}
+
+impl BlockQuestion {
+    /// The other paths' modelled time, us ([`blocked_paths_model`]).
+    pub fn other_us(&self) -> f64 {
+        f64::from_bits(self.other_bits)
+    }
+}
+
+/// What [`BlockStream::Measured`] runs a question's product as: the block, and how its units
+/// share their reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlockChoice {
+    pub block: [usize; 3],
+    pub reuse: Reuse,
+}
+
+/// A question's choice, and the times it was chosen by: `Auto`'s block (unpulled) and the
+/// choice's, us. No times where it was not timed (a measurement that failed keeps `Auto`'s).
+type Measurements =
+    std::collections::HashMap<BlockQuestion, (Option<BlockChoice>, Option<[f64; 2]>)>;
+
+fn measurements() -> std::sync::MutexGuard<'static, Measurements> {
+    static MEASURED: std::sync::OnceLock<std::sync::Mutex<Measurements>> =
+        std::sync::OnceLock::new();
+    MEASURED.get_or_init(Default::default).lock().unwrap()
+}
+
+/// What was measured for `q` in this process: `Some(None)` where nothing blocks it (the other
+/// paths run), `None` where it was not measured yet.
+pub fn measured_choice(q: &BlockQuestion) -> Option<Option<BlockChoice>> {
+    measurements().get(q).map(|m| m.0)
+}
+
+/// Keep `choice` as `q`'s for the rest of the process, with `times`, `[Auto's, the choice's]`
+/// in us, if it was timed.
+pub(crate) fn note_measured(
+    q: BlockQuestion,
+    choice: Option<BlockChoice>,
+    times: Option<[f64; 2]>,
+) {
+    measurements().insert(q, (choice, times));
+}
+
+/// Every question measured in this process, its choice, and `[Auto's, the choice's]` times, us.
+pub fn measured() -> Vec<(BlockQuestion, Option<BlockChoice>, Option<[f64; 2]>)> {
+    measurements()
+        .iter()
+        .map(|(q, (c, t))| (*q, *c, *t))
+        .collect()
+}
+
+/// Forget every measurement: a gate's, to measure again.
+pub fn forget_measured() {
+    measurements().clear();
+}
+
+/// The question of a `[mt, kt, nt]`-tile product whose other paths are `[mc, kc, nc]` chunks
+/// on `units` units, in the current arena.
+fn block_question(
+    [mt, kt, nt]: [usize; 3],
+    [mc, kc, nc]: [usize; 3],
+    transposed: [bool; 2],
+    units: usize,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> BlockQuestion {
+    let [bmc, bnc] = blocks([mt, nt], [mc, nc], units);
+    BlockQuestion {
+        tiles: [mt, kt, nt],
+        transposed,
+        units,
+        route,
+        fidelity,
+        other_bits: blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], units).to_bits(),
+    }
+}
+
+/// Whether `q`'s product can run as `block` here: inside the product, its chunks a job even, its
+/// layout and programs fitting the current arena ([`measured_fits`]). A sweep's filter.
+pub fn block_stream_fits(q: &BlockQuestion, block: [usize; 3]) -> bool {
+    let ([mt, kt, nt], [mb, kq, nb]) = (q.tiles, block);
+    (1..=mt).contains(&mb)
+        && (1..=nt).contains(&nb)
+        && (1..=kt).contains(&kq)
+        && mb.max(nb) <= 63
+        && kt.div_ceil(kq) % 2 == 0
+        && measured_fits(q, block)
+}
+
+/// Whether `q`'s product fits `block` in the current arena, its layout and programs as
+/// [`block_stream_plan`] checks them.
+fn measured_fits(q: &BlockQuestion, block: [usize; 3]) -> bool {
+    let arena = crate::l1::arena();
+    matmul::block_stream_bytes(block, q.route.slots()) + 256 <= arena.len()
+        && crate::l1::unnoted(|| {
+            matmul::block_stream_layout(block, q.route.slots())
+                .is_ok_and(|layout| block_stream_programs_fit(&layout, q.route, q.fidelity))
+        })
+}
+
+/// The question [`matmul_dram_prefetching`] asks of `op(A) @ op(B)`, `[m, k, n]`, `transposed`
+/// saying which operands are, on `units` units, where it may run as 2-D blocks: `None` for one
+/// tile row or one `K` tile.
+pub fn product_question(
+    [m, k, n]: [usize; 3],
+    transposed: [bool; 2],
+    route: SrcRoute,
+    fidelity: Fidelity,
+    units: usize,
+    pipeline: bool,
+) -> Result<Option<BlockQuestion>> {
+    let tiles = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+    if tiles[0] < 2 || tiles[1] < 2 {
+        return Ok(None);
+    }
+    let (_, _, chunks) = chunk_plan([m, k, n], route, fidelity, units, pipeline, None)?;
+    Ok(Some(block_question(
+        tiles, chunks, transposed, units, route, fidelity,
+    )))
+}
+
+/// The blocks [`BlockStream::Measured`] times first, `[mb, kq, nb]` and whether `A` is pulled:
+/// re-swept for the subblocked kernel (`docs/completed-plans/dataflow-compiler.md` F5, B2;
+/// `silicon_probe_block_sweep`, card 0, 2026-10-30, `1793346207`-`1793351145`) over the four F4b
+/// shapes with an FP32, BF16 and BFP8 `B` and three model shapes (the MOSS-Image DiT's qkv and
+/// down projections at 1,024 tokens, Qwen3.5's gate at 512) with an FP32 and BF16 `B`: the fewest
+/// blocks that, with `Auto`'s own, come within 4% of each sweep's best (greedy, every case 96% or
+/// more); the list before reached 79-92% at four of the 18. Two kept from it: the packed formats'
+/// `[6, 4, 12]` (BFP4 and BFP2 were not re-swept) and a 512-row prefill's `[4, 4, 18]`. The
+/// analytical models rank none of these near their top, and the peaks are narrow.
+pub const MEASURED_BLOCKS: [([usize; 3], bool); 12] = [
+    ([8, 4, 6], true),
+    ([8, 2, 9], true),
+    ([7, 4, 4], true),
+    ([4, 8, 5], true),
+    ([4, 4, 10], true),
+    ([4, 4, 8], true),
+    ([7, 4, 9], true),
+    ([5, 8, 8], true),
+    ([5, 3, 16], true),
+    ([8, 1, 10], true),
+    ([6, 4, 12], true),
+    // A 512-row prefill's: few block rows over many units.
+    ([4, 4, 18], false),
+];
+
+/// Products of at most this many tile rows also time [`SHORT_MEASURED_BLOCKS`]: a short prefill
+/// chunk's (64-256 rows).
+pub const SHORT_ROWS: usize = 8;
+
+/// The blocks [`BlockStream::Measured`] times first for a product of at most [`SHORT_ROWS`] tile
+/// rows, after [`MEASURED_BLOCKS`] (H14, `docs/learnings/dataflow-compiler.md` §13): swept with a
+/// BF16 `B` (`silicon_probe_block_sweep`, card 1, 2026-10-31, `1793473918`, `1793474596`,
+/// `1793475537`, `1793475578`, `1793475681`) over the SmolLM2-1.7B's four products at 64, 128 and
+/// 256 rows and Qwen3.5-4B's `gate|up` and `down` at 64 and 128: the fewest blocks that, with
+/// `Auto`'s own, come within 4% of each sweep's best (greedy; every case within 1.4%). Every block
+/// of [`MEASURED_BLOCKS`] is four rows or more, so at 64 rows none fitted and only
+/// `Auto`'s block and a climb from it were timed: the climb stops at `K` chunks of 4-5 where these
+/// stream 8-16, and a 1.7B layer's four 64-row products ran 835 us against these blocks' 691.
+pub const SHORT_MEASURED_BLOCKS: [([usize; 3], bool); 11] = [
+    ([2, 8, 9], false),
+    ([2, 16, 3], false),
+    ([1, 16, 2], false),
+    ([2, 8, 4], false),
+    ([2, 8, 3], false),
+    ([2, 8, 2], false),
+    ([2, 16, 5], false),
+    ([2, 16, 2], false),
+    ([4, 8, 4], false),
+    ([4, 4, 10], false),
+    ([4, 4, 9], true),
+];
+
+/// The sides and `K` chunks a measured climb steps between ([`block_stream_neighbours`]).
+const MEASURE_SIDES: [usize; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 24];
+const MEASURE_KQS: [usize; 9] = [1, 2, 3, 4, 5, 6, 8, 12, 16];
+
+/// `c` with `A` pulled as `pull` says, or not.
+fn choice(block: [usize; 3], pulled: bool, pull: Option<Reuse>) -> Option<BlockChoice> {
+    match (pulled, pull) {
+        (false, _) => Some(BlockChoice {
+            block,
+            reuse: Reuse::Off,
+        }),
+        (true, Some(reuse)) => Some(BlockChoice { block, reuse }),
+        (true, None) => None,
+    }
+}
+
+/// What [`BlockStream::Measured`] times first for `q`: [`BlockStream::Auto`]'s block, unpulled
+/// and pulled, then [`MEASURED_BLOCKS`] (and [`SHORT_MEASURED_BLOCKS`] for a short chunk's),
+/// each `kq` the longest at most its own whose chunks a job are even here, those that fit ([`block_stream_fits`]). A pulled one runs with `pull`
+/// (`None`: the session shares nothing, and none is pulled). Empty where `Auto` blocks nothing:
+/// the other paths run, measured or not.
+pub fn block_stream_candidates(q: &BlockQuestion, pull: Option<Reuse>) -> Vec<BlockChoice> {
+    let Some((first, _)) = block_stream_plan(
+        BlockStream::Auto,
+        q.tiles,
+        q.units,
+        q.other_us(),
+        q.route,
+        q.fidelity,
+    ) else {
+        return Vec::new();
+    };
+    let kt = q.tiles[1];
+    let short: &[([usize; 3], bool)] = if q.tiles[0] <= SHORT_ROWS {
+        &SHORT_MEASURED_BLOCKS
+    } else {
+        &[]
+    };
+    let listed = MEASURED_BLOCKS
+        .iter()
+        .chain(short)
+        .filter_map(|&([mb, kq, nb], pulled)| {
+            even_chunks(kt, kq)
+                .filter(|&k| k <= kq)
+                .map(|k| ([mb, k, nb], pulled))
+        });
+    let mut out: Vec<BlockChoice> = Vec::new();
+    for (block, pulled) in [(first.tiles, false), (first.tiles, true)]
+        .into_iter()
+        .chain(listed)
+    {
+        if let Some(c) = choice(block, pulled, pull) {
+            if !out.contains(&c) && block_stream_fits(q, block) {
+                out.push(c);
             }
         }
-        Ok(())
     }
+    out
+}
+
+/// The blocks one step from `c` that fit `q`: the next side or chunk below and above each of
+/// `mb`, `kq` and `nb` ([`MEASURE_SIDES`], [`MEASURE_KQS`]), and `c` with `A` pulled or not.
+pub fn block_stream_neighbours(
+    q: &BlockQuestion,
+    c: BlockChoice,
+    pull: Option<Reuse>,
+) -> Vec<BlockChoice> {
+    let steps = |v: usize, grid: &[usize]| {
+        [
+            grid.iter().rev().find(|&&g| g < v).copied(),
+            grid.iter().find(|&&g| g > v).copied(),
+        ]
+    };
+    let [mb, kq, nb] = c.block;
+    let pulled = c.reuse != Reuse::Off;
+    let mut blocks: Vec<([usize; 3], bool)> = vec![(c.block, !pulled)];
+    for m in steps(mb, &MEASURE_SIDES).into_iter().flatten() {
+        blocks.push(([m, kq, nb], pulled));
+    }
+    for k in steps(kq, &MEASURE_KQS).into_iter().flatten() {
+        blocks.push(([mb, k, nb], pulled));
+    }
+    for n in steps(nb, &MEASURE_SIDES).into_iter().flatten() {
+        blocks.push(([mb, kq, n], pulled));
+    }
+    blocks
+        .into_iter()
+        .filter_map(|(block, pulled)| choice(block, pulled, pull))
+        .filter(|n| block_stream_fits(q, n.block))
+        .collect()
+}
+
+/// Every block of `[mt, kt, nt]` tiles on `units` units that fits the arena with `route`'s
+/// slots, by [`block_stream_model`]'s time, then its bytes; sides up to [`BLOCK_SIDE_MAX`].
+fn model_shapes([mt, kt, nt]: [usize; 3], units: usize, route: SrcRoute) -> Vec<BlockStreamShape> {
+    let arena = crate::l1::arena();
+    let fits_arena = |tiles: [usize; 3]| {
+        // Two semaphores pairs' worth of slack past the slots.
+        matmul::block_stream_bytes(tiles, route.slots()) + 256 <= arena.len()
+    };
+    let mut kqs: Vec<usize> = (1..=kt).filter(|&kq| kt.div_ceil(kq) % 2 == 0).collect();
+    // Of the `kq`s with the same chunks a job, the shortest: the same work and reloads
+    // in fewer slots.
+    kqs.dedup_by_key(|kq| kt.div_ceil(*kq));
+    let mut all = Vec::new();
+    for mb in 1..=mt.min(BLOCK_SIDE_MAX) {
+        for nb in 1..=nt.min(BLOCK_SIDE_MAX) {
+            for &kq in &kqs {
+                if fits_arena([mb, kq, nb]) {
+                    all.extend(block_stream_model([mt, kt, nt], [mb, kq, nb], units));
+                }
+            }
+        }
+    }
+    all.sort_by(|a, b| a.us.total_cmp(&b.us).then(a.bytes.total_cmp(&b.bytes)));
+    all
+}
+
+/// The largest `kq <= limit` whose chunks a job are even, or the smallest above it.
+fn even_chunks(kt: usize, limit: usize) -> Option<usize> {
+    let even = |kq: usize| kt.div_ceil(kq) % 2 == 0;
+    (1..=limit.min(kt))
+        .rev()
+        .find(|&kq| even(kq))
+        .or_else(|| (limit + 1..=kt).find(|&kq| even(kq)))
+}
+
+/// Whether a block's first and continuing chunks' programs, as they run
+/// ([`matmul::block_stream_programs`]), fit a role's program slot and half the program cache, as
+/// [`k_block_size`] asks of a K block's.
+fn block_stream_programs_fit(
+    layout: &matmul::BlockStreamLayout,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> bool {
+    let dst = matmul::dst_row_plan(layout.tiles[2]);
+    (0..2).all(|c| {
+        let (roles, loops, _) = matmul::block_stream_programs(
+            layout,
+            c,
+            layout.tiles,
+            route,
+            fidelity,
+            false,
+            matmul::LiveRows::All,
+            dst.as_ref(),
+            crate::matmul::Out::Fp32,
+        );
+        roles.iter().zip(loops.iter()).all(|(p, l)| {
+            let code = crate::code::Code {
+                ins: p.clone(),
+                loops: l.clone(),
+            };
+            code.stored().is_ok_and(|(words, _)| {
+                words.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                    && crate::program_cache::admitted(words.len())
+            })
+        })
+    })
+}
+
+/// The shape and layout a `[mt, kt, nt]`-tile product runs in under `mode` ([`BlockStream`]) on
+/// `units` units, in the current arena; `None` where it runs another way: [`BlockStream::Off`], a
+/// product of one tile row or one `K` tile, no shape that fits, or under [`BlockStream::Auto`] none
+/// whose modelled time beats `other_us` (the other paths', [`blocked_paths_model`]) by a tenth.
+/// Planned once a process for each question.
+pub(crate) fn block_stream_plan(
+    mode: BlockStream,
+    [mt, kt, nt]: [usize; 3],
+    units: usize,
+    other_us: f64,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> Option<(BlockStreamShape, matmul::BlockStreamLayout)> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // What is measured is chosen before ([`measured_choice`]); before it is, `Auto`'s.
+    let mode = match mode {
+        BlockStream::Measured => BlockStream::Auto,
+        m => m,
+    };
+    if mode == BlockStream::Off || mt < 2 || kt < 2 {
+        return None;
+    }
+    type Key = (BlockStream, [usize; 3], usize, u64, SrcRoute, Fidelity, u64);
+    type Value = Option<(BlockStreamShape, matmul::BlockStreamLayout)>;
+    static CACHE: OnceLock<Mutex<HashMap<Key, Value>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let arena = crate::l1::arena();
+    let key = (
+        mode,
+        [mt, kt, nt],
+        units,
+        other_us.to_bits(),
+        route,
+        fidelity,
+        arena.end,
+    );
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return v.clone();
+    }
+    let fits_arena = |tiles: [usize; 3]| {
+        // Two semaphores pairs' worth of slack past the slots.
+        matmul::block_stream_bytes(tiles, route.slots()) + 256 <= arena.len()
+    };
+    let mut candidates: Vec<BlockStreamShape> = match mode {
+        BlockStream::Off | BlockStream::Measured => Vec::new(),
+        BlockStream::Fixed([mb, kq, nb]) => {
+            // The program cache's variant holds six bits a side (`tile_op::matmul::Schedule::BlockStream`).
+            let (mb, nb) = (mb.min(mt).min(63), nb.min(nt).min(63));
+            even_chunks(kt, kq)
+                .and_then(|kq| block_stream_model([mt, kt, nt], [mb, kq, nb], units))
+                .into_iter()
+                .collect()
+        }
+        BlockStream::Auto => model_shapes([mt, kt, nt], units, route),
+    };
+    candidates.sort_by(|a, b| a.us.total_cmp(&b.us).then(a.bytes.total_cmp(&b.bytes)));
+    // The candidates' layouts are measurements: the chosen one is noted where it is placed
+    // (`tile_op::allocate`).
+    let value = crate::l1::unnoted(|| {
+        candidates
+            .into_iter()
+            .filter(|s| mode != BlockStream::Auto || s.us < 0.9 * other_us)
+            .filter(|s| fits_arena(s.tiles))
+            .take(BLOCK_FIT_TRIES)
+            .find_map(|s| {
+                matmul::block_stream_layout(s.tiles, route.slots())
+                    .ok()
+                    .filter(|layout| block_stream_programs_fit(layout, route, fidelity))
+                    .map(|layout| (s, layout))
+            })
+    });
+    if let (BlockStream::Fixed(asked), None) = (mode, &value) {
+        // Once a question (the cache keeps the answer): a sweep must not time the other paths
+        // as if they were the blocked one.
+        eprintln!(
+            "TT_MATMUL_BLOCK={asked:?}: no such blocked product of {mt} x {kt} x {nt} tiles \
+             fits (L1 or a role's program); it runs the other paths"
+        );
+    }
+    cache.lock().unwrap().insert(key, value.clone());
+    value
+}
+
+/// The shape [`block_stream_plan`] chooses, without its layout: what a gate or a benchmark reports.
+pub fn block_stream_choice(
+    mode: BlockStream,
+    tiles: [usize; 3],
+    units: usize,
+    other_us: f64,
+    route: SrcRoute,
+    fidelity: Fidelity,
+) -> Option<BlockStreamShape> {
+    crate::l1::unnoted(|| block_stream_plan(mode, tiles, units, other_us, route, fidelity))
+        .map(|(s, _)| s)
+}
+
+/// A gate's negative control (`step229_block_stream_product`): a blocked product's chunks take
+/// their `K` ranges last first, so each output tile's chain is accumulated out of order. **The
+/// products are wrong** wherever the order matters.
+static PROBE_REVERSE_CHUNKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_REVERSE_CHUNKS`] on or off, process-wide. A gate's control, never a result.
+#[doc(hidden)]
+pub fn probe_reverse_chunks(on: bool) {
+    PROBE_REVERSE_CHUNKS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn probing_reverse_chunks() -> bool {
+    PROBE_REVERSE_CHUNKS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// One operand of a [`matmul_dram_batched`] product: the block of a tensor
@@ -1632,7 +3446,12 @@ fn padded_block_ref(
 /// kept. Refused unless the block starts on a tile and, where it does not end
 /// on one, ends at the tensor's own edge -- a ragged edge inside the tensor
 /// would read its neighbour's elements as padding.
-fn block_ref(t: &DramTensor, at: [usize; 2], extent: [usize; 2], what: &str) -> Result<TensorRef> {
+pub(crate) fn block_ref(
+    t: &DramTensor,
+    at: [usize; 2],
+    extent: [usize; 2],
+    what: &str,
+) -> Result<TensorRef> {
     let ([r0, c0], [r, c]) = (at, extent);
     if !block_fits(t, at, extent) {
         return Err(TensorError::Shape(format!(
@@ -1684,6 +3503,8 @@ pub fn matmul_dram_batched(
         pipeline,
         None,
         [false; 2],
+        false,
+        BlockStream::Off,
     )
 }
 
@@ -1708,7 +3529,18 @@ pub(crate) fn matmul_dram_batched_limited(
     pipeline: bool,
     max_k_tiles: Option<std::num::NonZeroUsize>,
     padded: [bool; 2],
+    unpack_b: bool,
+    block_stream: BlockStream,
 ) -> Result<Work> {
+    // [`PROBE_SKIP_BATCHED_A`] applies to what is lowered here, and only here.
+    struct Lowering;
+    impl Drop for Lowering {
+        fn drop(&mut self) {
+            LOWERING_BATCHED.with(|b| b.set(false));
+        }
+    }
+    LOWERING_BATCHED.with(|b| b.set(true));
+    let _lowering = Lowering;
     a.expect("a matmul", Elem::F32)?;
     b.expect("a matmul", Elem::F32)?;
     let batch = items.len();
@@ -1750,8 +3582,60 @@ pub(crate) fn matmul_dram_batched_limited(
             [ba.transposed, bb.transposed],
         ));
     }
-    let plan = BlockPlan {
+    // Each product as 2-D blocks with `K` streamed (`docs/plans/prefill-operand-reuse.md`), where
+    // the mode asks for them and the model beats this plan's on the units each product gets:
+    // attention's `P V` over a long prefix otherwise reads `P` once an output column and `V` once
+    // an output row, with every partial through GDDR (one output tile a job, `Schedule::KBlocks`).
+    if max_k_tiles.is_none() {
+        let [bmc, bnc] = blocks([mt, nt], [mc, nc], per_item);
+        let other = blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], per_item);
+        if let Some((_, layout)) =
+            block_stream_plan(block_stream, [mt, kt, nt], per_item, other, route, fidelity)
+        {
+            let rows = if batch == 1 { m } else { batch * mt * 32 };
+            let c = DramTensor::alloc(alloc, rows, n)?;
+            let mut jobs = Vec::new();
+            for (i, (ra, rb, [ta, tb])) in refs.into_iter().enumerate() {
+                let mut rc = c.tensor_ref();
+                rc.first += (i * mt * nt) as u32;
+                let side = |at, transposed| crate::tile_op::matmul::Side {
+                    at,
+                    transposed,
+                    elem: Elem::F32,
+                    // Whole tiles: attention's products are not the decode weights' reads.
+                    live_rows: false,
+                };
+                let built = crate::tile_op::matmul(
+                    side(ra, ta),
+                    side(rb, tb),
+                    [m, k, n],
+                    route,
+                    fidelity,
+                    unpack_b && route == SrcRoute::Tf32FromFp32,
+                    None,
+                    crate::tile_op::matmul::Schedule::BlockStream {
+                        tiles: layout.tiles,
+                    },
+                    crate::matmul::Out::Fp32,
+                )
+                .and_then(|mut op| {
+                    op.results[0].layout = crate::tile_op::Layout::Tiles(rc);
+                    op.jobs(per_item, Overlap::Off)
+                });
+                match built {
+                    Ok(j) => jobs.extend(j),
+                    Err(e) => {
+                        alloc.free(&c.placement);
+                        return Err(e);
+                    }
+                }
+            }
+            return Ok(Work { out: c, jobs });
+        }
+    }
+    let plan = crate::tile_op::matmul::Plan {
         tiles: [mt, kt, nt],
+        m,
         block: blocks([mt, nt], [mc, nc], per_item),
         k_block: kc,
         staging,
@@ -1759,6 +3643,17 @@ pub(crate) fn matmul_dram_batched_limited(
         route,
         fidelity,
         allow_mop,
+        // Whole tiles: attention's products are not the decode weights' reads
+        // (decode-matmul-bandwidth P1), and their padding claims stay as they were.
+        thin: 0,
+        resident_a: false,
+        col_runs: None,
+        unpack_b: unpack_b && route == SrcRoute::Tf32FromFp32,
+        packed_a: None,
+        stream_k: false,
+        busy: Vec::new(),
+        deal: None,
+        out: crate::matmul::Out::Fp32,
     };
     let rows = if batch == 1 { m } else { batch * mt * 32 };
     let c = DramTensor::alloc(alloc, rows, n)?;
@@ -1774,116 +3669,34 @@ pub(crate) fn matmul_dram_batched_limited(
     Ok(Work { out: c, jobs })
 }
 
-/// Fewest tiles a pipelined element-wise or reduce run may hold. Each run
-/// is a launch and a gather and scatter record of its own: card 0 lost
-/// 5-50% splitting ops into runs of 1-4 tiles.
-pub const MIN_PIPELINED_RUN: usize = 12;
+/// Held by a host test while it changes or depends on a process-wide switch
+/// (`tile_op::distribute::set_col_once`, the pair order, ...): tests run side by side in one
+/// process.
+#[cfg(test)]
+pub(crate) static SWITCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// How the runs of an element-wise or reduce op may overlap: the movers moving
-/// one run while the roles compute another. More runs cost the host a list
-/// each, which a captured op pays once and a replay never, so a trace may
-/// overlap where a fresh op may not.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Overlap {
-    /// One run a unit, serialized (`Session::set_pipeline(false)`).
-    Off,
-    /// An op queued now: the host pays for every run.
-    Fresh,
-    /// An op being captured into a trace.
-    Captured,
-}
-
-/// Fewest tiles a unit's share of a fresh pipelined op may hold on one unit.
-/// Card 0 (`streaming_performance_sweep`, `sfpu_pipeline_sweep`; host end to
-/// end, run 1791079325 and after): on one tile every element-wise op or
-/// reduction from 49 tiles gained (0.63-0.89), and small ones forced to
-/// overlap still did (a max over rows of 64 tiles 0.88).
-pub const PIPELINE_SHARE: usize = 48;
-
-/// What each further unit adds to [`PIPELINE_SHARE`], in tiles a unit. The host
-/// queues the units' lists one after another (~6 us a unit an op), so with many
-/// units a fresh op is the host's, and the extra runs overlap makes cost more
-/// than it saves until each unit has a great deal to move. Adds on 8 tiles
-/// lost 1.07-1.20 up to 1152 tiles a unit and gained from 1568 (0.97 there,
-/// 0.87 at 2048 a unit); on 32 tiles they lost 1.37-1.44 at every size to 1152
-/// a unit; reductions on 8 and 32 tiles lost up to 1.28 or broke even.
-pub const PIPELINE_SHARE_PER_UNIT: usize = 180;
-
-/// Fewest tiles a unit's share of a captured pipelined op may hold, per unit.
-/// A replay pays no host time for its runs. Adds on 8 tiles gained 0.90 at 32
-/// tiles a unit and 0.77 at 128; on 32 tiles 0.95 at 32 and 0.93 at 128, and
-/// lost 1.016 at 8 a unit, where [`MIN_PIPELINED_RUN`] leaves one run anyway.
-pub const CAPTURED_PIPELINE_SHARE: usize = 32;
-
-/// Tiles a unit's share must hold for `overlap` on `units` units, scaled by
-/// [`set_pipeline_share_percent`].
-pub fn pipeline_share(overlap: Overlap, units: usize) -> usize {
-    let share = match overlap {
-        Overlap::Off => usize::MAX,
-        Overlap::Fresh => PIPELINE_SHARE + PIPELINE_SHARE_PER_UNIT * (units.max(1) - 1),
-        Overlap::Captured => CAPTURED_PIPELINE_SHARE,
-    };
-    if share == usize::MAX {
-        return share;
-    }
-    share * PIPELINE_SHARE_PERCENT.load(std::sync::atomic::Ordering::Relaxed) / 100
-}
-
-/// Percent of [`pipeline_share`] that [`pipelined_runs`] asks for; 100 is the
-/// constants as they stand. A benchmark lowers it to see what overlap does
-/// where the constants say no (`sfpu_pipeline_sweep`,
-/// `streaming_performance_sweep`); nothing else sets it.
-static PIPELINE_SHARE_PERCENT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(100);
-
-/// Set [`PIPELINE_SHARE_PERCENT`]; returns what it was.
-pub fn set_pipeline_share_percent(percent: usize) -> usize {
-    PIPELINE_SHARE_PERCENT.swap(percent, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The runs of a pipelined element-wise or reduce op over `len` items of
-/// `weight` tiles each, at most `half_max` items a run (half the arena's
-/// worth): at least two a unit, so every unit has a run moving while one
-/// computes, and the same number on every unit -- the op takes as long as its
-/// busiest unit, and one extra run on a few units cost card 0 up to 25%
-/// (`exp` over 1024 tiles on 8: 18 runs, two units doing three). `None` where
-/// `overlap` is off, that would leave a run under [`MIN_PIPELINED_RUN`] tiles,
-/// a unit's share under [`pipeline_share`] tiles, or `half_max` is zero.
-pub fn pipelined_runs(
-    len: usize,
-    weight: usize,
-    units: usize,
-    half_max: usize,
-    overlap: Overlap,
-) -> Option<Vec<std::ops::Range<usize>>> {
-    let units = units.max(1);
-    let share = pipeline_share(overlap, units);
-    if half_max == 0 || overlap == Overlap::Off || len * weight < share.saturating_mul(units) {
-        return None;
-    }
-    let parts = len.div_ceil(half_max).div_ceil(units).max(2) * units;
-    // Contiguous, as even as integer division allows.
-    let r: Vec<_> = (0..parts)
-        .map(|p| p * len / parts..(p + 1) * len / parts)
-        .collect();
-    let shortest = r.iter().map(|r| r.len()).min()?;
-    (shortest * weight >= MIN_PIPELINED_RUN).then_some(r)
-}
-
-/// Which half of the arena run `j` of a pipelined op is staged in: a unit
-/// takes runs `j`, `j + units`, ... in turn, and alternates halves.
-fn half_of(j: usize, units: usize) -> u8 {
-    ((j / units.max(1)) % 2) as u8
-}
+/// Distribution (X3), the dealing of an op's items over units, is the pass's
+/// (`tile_op::distribute`); its tunables keep their paths here.
+pub use crate::tile_op::distribute::{
+    pipeline_share, pipelined_runs, row_runs, set_col_once, set_pipeline_share_percent, Overlap,
+    CAPTURED_PIPELINE_SHARE, MIN_PIPELINED_RUN, PIPELINE_SHARE, PIPELINE_SHARE_PER_UNIT,
+};
 
 /// `slots` tile slots of scratch for the mover's own use, planned in the data
 /// arena (`crate::l1`): where an element-wise run or a column sum stages its
 /// tiles.
+/// `want` staging slots, or as many as the arena holds ([`crate::l1::arena`]) where fewer: an even
+/// number, at least two, so batches can alternate halves.
+fn arena_group(want: usize) -> usize {
+    let slots = (crate::l1::arena().len() / TILE_SLOT) as usize;
+    want.min(slots / 2 * 2).max(2)
+}
+
 fn staging(name: &'static str, slots: usize) -> Result<u64> {
     let mut req = crate::l1::Requirements::new(1);
     let b = req.scratch(name, slots as u64 * TILE_SLOT, tt_isa::dram::ALIGN, 0..1);
     let plan = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     Ok(plan.addr(b))
 }
@@ -1901,9 +3714,10 @@ pub struct Eltwise {
 
 /// What an element-wise op is once its operands' shapes are read: its kind
 /// (`ADD_ROW` is `ADD` with a row broadcast) and how `b` meets `a` -- the same
-/// shape, one row (`[1, cols]`) or one column (`[rows, 1]`), the last two only
-/// for the kinds that take one (`sfpu::ops::broadcasts`). Refuses anything
-/// else.
+/// shape, one row (`[1, cols]`), one column (`[rows, 1]`) or a block of whole
+/// tile rows repeated down `a`'s (`[R, cols]`, `R` a multiple of 32 dividing
+/// `a`'s rows), the last three only for the kinds that take one
+/// (`sfpu::ops::broadcasts`). Refuses anything else.
 pub fn broadcast_of(
     op: Eltwise,
     a: &DramTensor,
@@ -1912,12 +3726,10 @@ pub fn broadcast_of(
     use crate::kind;
     use crate::sfpu::kernel::Operands;
     use crate::sfpu::ops::{broadcasts, Broadcast};
-    let name = || format!("element-wise op {:#x}", op.kind);
-    let sig = crate::sfpu::ops::elems(op.kind);
-    a.expect(&name(), sig.inputs[0])?;
-    if let (Some(b), Some(&want)) = (b, sig.inputs.get(1)) {
-        b.expect(&name(), want)?;
-    }
+    eltwise_formats(
+        op.kind,
+        &[Some(a), b].into_iter().flatten().collect::<Vec<_>>(),
+    )?;
     let binary = match crate::sfpu::ops::operands(op.kind) {
         Some(o) => o != Operands::Unary,
         None => {
@@ -1948,16 +3760,147 @@ pub fn broadcast_of(
         (true, Some(b)) if broadcasts(op.kind) && shape(b) == (a.rows, 1) => {
             Ok((op.kind, Broadcast::Col))
         }
+        (true, Some(b)) if broadcasts(op.kind) && block_repeats(a, b).is_some() => {
+            Ok((op.kind, Broadcast::Block))
+        }
         (true, Some(b)) => Err(TensorError::Shape(format!(
-            "[{}, {}] and [{}, {}]: neither the same shape nor a row or column to broadcast",
+            "[{}, {}] and [{}, {}]: neither the same shape nor a row, a column or a block of whole \
+             tile rows to broadcast",
             a.rows, a.cols, b.rows, b.cols
         ))),
     }
 }
 
+/// How many times `b`'s rows repeat down `a`'s, if `b` is a [`Broadcast::Block`] of `a`: as
+/// wide, at least two repeats, and its rows whole tiles (so a repeat never splits one).
+///
+/// [`Broadcast::Block`]: crate::sfpu::ops::Broadcast::Block
+pub fn block_repeats(a: &DramTensor, b: &DramTensor) -> Option<usize> {
+    (b.cols == a.cols && b.rows % 32 == 0 && b.rows > 0 && b.rows < a.rows && a.rows % b.rows == 0)
+        .then(|| a.rows / b.rows)
+}
+
 /// The element type `kind`'s output has.
-fn output_elem(kind: u32) -> Elem {
+pub(crate) fn output_elem(kind: u32) -> Elem {
     crate::sfpu::ops::elems(kind).out
+}
+
+/// How an element-wise op of `kind` holds its operands and its result, given them (roadmap W1,
+/// native BF16 arithmetic; `sfpu::kernel::Formats`): FP32 when each operand is the type `kind`
+/// takes; BF16 when every operand is BF16 and `kind` takes F32 alone, its result then BF16 where
+/// `kind`'s is F32. A BF16 op computes the F32 op on its operands widened (`bf16::expand`) and
+/// rounds its result once as `bf16::compress` does: bit for bit that composition. Refuses a BF16
+/// operand beside another type, and one for a kind that takes another type.
+pub(crate) fn eltwise_formats(
+    kind: u32,
+    operands: &[&DramTensor],
+) -> Result<crate::sfpu::kernel::Formats> {
+    use crate::sfpu::kernel::{Formats, Out};
+    let name = || format!("element-wise op {kind:#x}");
+    let sig = crate::sfpu::ops::elems(kind);
+    if !operands.iter().any(|t| t.elem == Elem::BF16) {
+        for (t, &want) in operands.iter().zip(sig.inputs) {
+            t.expect(&name(), want)?;
+        }
+        return Ok(Formats::FP32);
+    }
+    if let Some(&other) = sig.inputs.iter().find(|&&e| e != Elem::F32) {
+        return Err(TensorError::Elem {
+            op: format!("{} (BF16 operands; it takes {:?})", name(), sig.inputs),
+            got: Elem::BF16,
+            wants: other,
+        });
+    }
+    for t in operands {
+        t.expect(&format!("{} on BF16 operands", name()), Elem::BF16)?;
+    }
+    let out = match sig.out {
+        Elem::F32 => bf16_result(),
+        _ => Out::Fp32,
+    };
+    Ok(Formats { bf16_in: true, out })
+}
+
+/// [`eltwise_formats`] with the result's element type asked for: `None` or the type the op makes
+/// on `operands` take [`eltwise_formats`]' formats; BF16 for an op whose result is F32 on F32
+/// operands rounds that result once, ties-even, in `Dst` before a BF16 pack (`bf16_result`): bit
+/// for bit the F32 op and then `bf16::compress`'s narrowing, with no F32 result written between
+/// (a norm's or an activation's output that a product reads as its BF16 `A`). Refuses any other.
+pub(crate) fn eltwise_formats_as(
+    kind: u32,
+    operands: &[&DramTensor],
+    out: Option<Elem>,
+) -> Result<crate::sfpu::kernel::Formats> {
+    use crate::sfpu::kernel::Formats;
+    let formats = eltwise_formats(kind, operands)?;
+    let natural = result_elem(kind, formats);
+    match out {
+        None => Ok(formats),
+        Some(e) if e == natural => Ok(formats),
+        Some(Elem::BF16) if natural == Elem::F32 && !formats.bf16_in => Ok(Formats {
+            bf16_in: false,
+            out: bf16_result(),
+        }),
+        Some(e) => Err(TensorError::Elem {
+            op: format!("element-wise op {kind:#x} asked for a {e:?} result"),
+            got: e,
+            wants: natural,
+        }),
+    }
+}
+
+/// How a result asked for as BF16 is made: [`Out::Bf16`](crate::sfpu::kernel::Out::Bf16), or
+/// what [`probe_bf16_result`] names for a gate.
+pub(crate) fn bf16_result() -> crate::sfpu::kernel::Out {
+    use crate::sfpu::kernel::Out;
+    match PROBE_BF16_RESULT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Out::Bf16AsFp32,
+        2 => Out::Fp32,
+        3 => Out::Bf16Unrounded,
+        _ => Out::Bf16,
+    }
+}
+
+/// The element type of `kind`'s result held as `formats` says.
+pub(crate) fn result_elem(kind: u32, formats: crate::sfpu::kernel::Formats) -> Elem {
+    use crate::sfpu::kernel::Out;
+    match formats.out {
+        Out::Bf16 | Out::Bf16Unrounded => Elem::BF16,
+        Out::Fp32 | Out::Bf16AsFp32 => output_elem(kind),
+    }
+}
+
+static PROBE_BF16_RESULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+static PROBE_TILE_CASTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The F32 <-> BF16 conversions a job a tile (`bf16::expand`, `bf16::compress`) instead of the
+/// SFPU kernel's runs (`tile_op::cast`): the oracle `step270_native_bf16` holds the runs to.
+/// Gates only.
+#[doc(hidden)]
+pub fn probe_tile_casts(on: bool) {
+    PROBE_TILE_CASTS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn probing_tile_casts() -> bool {
+    PROBE_TILE_CASTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What an element-wise op on BF16 operands makes of an F32 kind's result, and a product asked
+/// for a BF16 result (`Session::matmul_dram_as`), for gates only (`step270_native_bf16`): `Bf16` (the default, and the only form outside a gate);
+/// `Bf16AsFp32`, rounded and packed as FP32, the simulator's form since ttsim refuses the BF16
+/// pack (`PACR` mode 0x105); and the negative controls `Fp32` (not rounded) and `Bf16Unrounded`
+/// (packed as BF16 without the quantize, which the packer truncates).
+#[doc(hidden)]
+pub fn probe_bf16_result(out: crate::sfpu::kernel::Out) {
+    use crate::sfpu::kernel::Out;
+    let v = match out {
+        Out::Bf16 => 0,
+        Out::Bf16AsFp32 => 1,
+        Out::Fp32 => 2,
+        Out::Bf16Unrounded => 3,
+    };
+    PROBE_BF16_RESULT.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Element-wise `a (op) b` -- or `a (op) scalar`, or a ternary op's `c` --
@@ -1969,6 +3912,7 @@ fn output_elem(kind: u32) -> Elem {
 ///
 /// The roles' programs are memoised by op, scalar and run length, so a
 /// model's repeated ops reuse them, and so does the program cache.
+#[allow(clippy::too_many_arguments)]
 pub fn sfpu_eltwise(
     alloc: &mut DramAlloc,
     op: Eltwise,
@@ -1977,131 +3921,188 @@ pub fn sfpu_eltwise(
     c: Option<&DramTensor>,
     units: usize,
     overlap: Overlap,
+    twin: Option<&DramTensor>,
 ) -> Result<Option<Work>> {
-    use crate::sfpu::kernel::Operands;
-    use crate::sfpu::ops::Broadcast;
+    sfpu_eltwise_as(alloc, op, a, b, c, units, overlap, twin, None)
+}
+
+/// [`sfpu_eltwise`] with its result's element type asked for ([`eltwise_formats_as`]).
+#[allow(clippy::too_many_arguments)]
+pub fn sfpu_eltwise_as(
+    alloc: &mut DramAlloc,
+    op: Eltwise,
+    a: &DramTensor,
+    b: Option<&DramTensor>,
+    c: Option<&DramTensor>,
+    units: usize,
+    overlap: Overlap,
+    twin: Option<&DramTensor>,
+    out: Option<Elem>,
+) -> Result<Option<Work>> {
     let (kind, bcast) = broadcast_of(op, a, b)?;
-    let op = Eltwise { kind, ..op };
     if crate::sfpu::integer::operation(kind).is_some_and(|(op, _)| op == 15 || op == 16) {
-        return sfpu_divide(alloc, op, a, b, bcast).map(Some);
-    }
-    let Some((operands, _)) = crate::sfpu::ops::program_for(kind, [op.scalar, op.scalar2], bcast)
-    else {
-        return Ok(None);
-    };
-    // A ternary op's third operand: `A`'s shape, of the kind's type.
-    let rc = match (operands, c) {
-        (Operands::Ternary, Some(c)) => {
-            if (c.rows, c.cols) != (a.rows, a.cols) {
-                return Err(TensorError::Shape(format!(
-                    "a ternary op's third operand [{}, {}] for [{}, {}]",
-                    c.rows, c.cols, a.rows, a.cols
-                )));
-            }
-            if let Some(&want) = crate::sfpu::ops::elems(kind).inputs.get(2) {
-                c.expect(&format!("element-wise op {kind:#x}"), want)?;
-            }
-            Some(c.tensor_ref())
-        }
-        (Operands::Ternary, None) => {
+        if out.is_some_and(|e| e != output_elem(kind)) {
             return Err(TensorError::Shape(
-                "a ternary op needs three operands".into(),
-            ))
+                "integer division makes its own type alone".into(),
+            ));
         }
-        (_, Some(_)) => {
-            return Err(TensorError::Shape(format!(
-                "{kind:#x} takes no third operand"
-            )))
-        }
-        _ => None,
-    };
-    let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, output_elem(op.kind))?;
-    let [rt, ct] = a.grid();
-    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
-    let rb = b.map(DramTensor::tensor_ref);
-    // Pipelined (checklist 9.15): runs in alternating halves of the arena,
-    // so a unit's mover moves one run while the roles compute another.
-    let piped = pipelined_runs(
-        rt * ct,
-        1,
-        units,
-        sfpu_group(op, bcast, operands, true),
-        overlap,
-    );
-    let pipelined = piped.is_some();
-    let all = piped.unwrap_or_else(|| runs(rt * ct, units, sfpu_group(op, bcast, operands, false)));
-    let mut jobs = Vec::new();
-    for (j, run) in all.into_iter().enumerate() {
-        let len = run.len();
-        let half = pipelined.then(|| half_of(j, units));
-        let (layout, roles, loops) = match sfpu_programs(op, bcast, operands, len, half) {
-            Ok(p) => p,
-            Err(e) => {
-                alloc.free(&out.placement);
-                return Err(e);
-            }
-        };
-        let read = |x: &TensorRef, at: u64, flags: u32| {
-            [
-                [
-                    record::READ_RUN,
-                    run.start as u32,
-                    len as u32,
-                    at as u32,
-                    flags,
-                    ct as u32,
-                    0,
-                    0,
-                ],
-                x.encode()[0],
-                x.encode()[1],
-            ]
-        };
-        let mut gather = read(&ra, layout.a_at, 0).to_vec();
-        if let (Some(rb), Some(b_at)) = (&rb, layout.b_at) {
-            let flags = match bcast {
-                Broadcast::None => 0,
-                Broadcast::Row => 1,
-                Broadcast::Col => 2,
-            };
-            gather.extend(read(rb, b_at, flags));
-        }
-        if let (Some(rc), Some(c_at)) = (&rc, layout.c_at) {
-            gather.extend(read(rc, c_at, 0));
-        }
-        let scatter = [
-            [
-                record::WRITE_RUN,
-                run.start as u32,
-                len as u32,
-                layout.out_at as u32,
-                0,
-                0,
-                0,
-                0,
-            ],
-            ro.encode()[0],
-            ro.encode()[1],
-        ];
-        jobs.push(vec![
-            Step::List {
-                what: "sfpu gather",
-                entries: gather,
-            },
-            Step::Kernel {
-                roles,
-                init: layout.init.clone(),
-                mop: Box::new([None; 3]),
-                loops,
-                half,
-            },
-            Step::List {
-                what: "sfpu scatter",
-                entries: scatter.to_vec(),
-            },
-        ]);
+        return sfpu_divide(alloc, Eltwise { kind, ..op }, a, b, bcast).map(Some);
     }
-    Ok(Some(Work { out, jobs }))
+    match crate::tile_op::eltwise_as(
+        op,
+        BlockOperand::whole(a),
+        b.map(BlockOperand::whole),
+        c.map(BlockOperand::whole),
+        twin,
+        out,
+    )? {
+        Some(mut tile_op) => tile_op.build(alloc, units, overlap).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// A product's jobs (`c` one tile row, `[1, n]`) also writing `c`'s packed twin
+/// ([`packed_twin_writes`]): after each list's [`record::SCATTER`] of `c`'s one tile row from
+/// slots a tile apart, the writes of those tiles' data rows, on the same writer from the same
+/// slots. Only if those scatters cover every one of `c`'s tile columns; `false`, and the jobs
+/// untouched, otherwise (the twin is then not `c`'s).
+pub(crate) fn twin_one_row_scatters(jobs: &mut [Job], c: &DramTensor, twin: &DramTensor) -> bool {
+    let enc = c.tensor_ref().encode();
+    let nt = c.grid()[1];
+    // `c`'s one-row scatters in `entries`: (index, slot of the first tile, first column, columns).
+    let scatters = |entries: &[[u32; 8]]| -> Vec<(usize, u64, usize, usize)> {
+        (0..entries.len())
+            .filter(|&i| {
+                entries[i][0] == record::SCATTER
+                    && entries.get(i + 1) == Some(&enc[0])
+                    && entries.get(i + 2) == Some(&enc[1])
+            })
+            .filter_map(|i| {
+                let [_, at, stride, i0, rows, j0, cols, _] = entries[i].map(|w| w as usize);
+                (i0 == 0
+                    && rows == 1
+                    && stride as u64 == TILE_SLOT
+                    && at as u64 >= TILE_DATA
+                    && j0 + cols <= nt)
+                    .then_some((i, at as u64, j0, cols))
+            })
+            .collect()
+    };
+    let mut covered = vec![false; nt];
+    for job in jobs.iter() {
+        for step in job {
+            if let Step::List { entries, .. } = step {
+                for (_, _, j0, cols) in scatters(entries) {
+                    covered[j0..j0 + cols].iter_mut().for_each(|c| *c = true);
+                }
+            }
+        }
+    }
+    if !covered.iter().all(|&c| c) {
+        return false;
+    }
+    for job in jobs.iter_mut() {
+        for step in job.iter_mut() {
+            let Step::List { entries, .. } = step else {
+                continue;
+            };
+            // From the last, so the earlier indices stay put.
+            // A product's `out_at` is its first output's datums, a slot's `TILE_DATA` in.
+            for (i, at, j0, cols) in scatters(entries).into_iter().rev() {
+                let writes = packed_twin_writes(twin, j0, cols, at - TILE_DATA);
+                entries.splice(i + 3..i + 3, writes);
+            }
+        }
+    }
+    true
+}
+
+/// The writes that put one-row tiles' data rows, packed, into `twin` (`[K / 32, 32]`, as
+/// [`pack_row`] lays them out): output tiles `first..first + count`, each in the slot after the
+/// last from `at` with its data in row 0, two face-row writes a tile on the writer -- 64 bytes
+/// for an FP32 twin, 32 for a BF16 one (a BF16 result's tiles are packed as BF16, their faces
+/// 512 bytes apart; roadmap W1).
+pub fn packed_twin_writes(twin: &DramTensor, first: usize, count: usize, at: u64) -> Vec<[u32; 8]> {
+    use tt_isa::dm::op;
+    let row = packed_row_bytes(twin.format());
+    let face = 16 * row;
+    (0..count)
+        .flat_map(|n| {
+            let (kk, slot) = (first + n, at + n as u64 * TILE_SLOT);
+            let (dst, r) = (twin.tile(kk / 32, 0), (kk % 32) as u64);
+            (0..2u64).map(move |half| {
+                [
+                    op::WRITE,
+                    dst.channel().index() as u32,
+                    0,
+                    (dst.offset() + TILE_DATA + (2 * (r / 16) + half) * face + (r % 16) * row)
+                        as u32,
+                    (slot + TILE_DATA + half * face) as u32,
+                    row as u32,
+                    0,
+                    0,
+                ]
+            })
+        })
+        .collect()
+}
+
+/// One operand of [`sfpu_eltwise_blocks`]: the `dims` block of `tensor` whose
+/// top-left element is `at`, read where it lies ([`block_fits`]: on tile
+/// boundaries, ragged only at the tensor's own edge) -- a gate's columns of a
+/// fused projection, a head's columns of `q`.
+#[derive(Copy, Clone, Debug)]
+pub struct BlockOperand<'a> {
+    pub tensor: &'a DramTensor,
+    pub at: [usize; 2],
+    pub dims: [usize; 2],
+}
+
+impl<'a> BlockOperand<'a> {
+    /// All of `t`.
+    pub fn whole(t: &'a DramTensor) -> Self {
+        BlockOperand {
+            tensor: t,
+            at: [0, 0],
+            dims: [t.rows, t.cols],
+        }
+    }
+
+    /// The block as a tensor of its own for what reads only its shape, type
+    /// and padding (`broadcast_of`, `OpPadding::produces`): never for its
+    /// slots, whose row stride is the parent's. Its padding is the parent's
+    /// where the block is ragged (only ever at the parent's edge), and none
+    /// where it is whole tiles.
+    pub fn shape_only(&self) -> DramTensor {
+        let t = DramTensor {
+            rows: self.dims[0],
+            cols: self.dims[1],
+            elem: self.tensor.elem,
+            placement: Placement {
+                owned: false,
+                ..self.tensor.placement.clone()
+            },
+            pad: std::cell::Cell::new(self.tensor.pad()),
+        };
+        t.set_pad(self.tensor.pad());
+        t
+    }
+
+    pub(crate) fn tensor_ref(&self, what: &str) -> Result<TensorRef> {
+        block_ref(self.tensor, self.at, self.dims, what)
+    }
+}
+
+/// The rows of each tile an element-wise op on a tensor of `rows` rows computes
+/// ([`crate::sfpu::ops::code_for_rows`]): a single tile row's own rows (a decode step's `[1, W]`
+/// activation is one of 32) for a [`crate::sfpu::ops::row_limited`] kind, else 32. Below 32 the
+/// output's padding rows are whatever `Dst` held: `Pad::Undefined`.
+pub fn eltwise_rows(kind: u32, rows: usize) -> u32 {
+    if rows < 32 && crate::sfpu::ops::row_limited(kind) {
+        rows as u32
+    } else {
+        32
+    }
 }
 
 /// Checked full-width integer division. The packer publishes canonical
@@ -2118,12 +4119,19 @@ fn sfpu_divide(
         ops::{self, Broadcast},
     };
     use tt_isa::dm::op as mover;
+    if bcast == Broadcast::Block {
+        return Err(TensorError::Shape(format!(
+            "integer division {:#x} by a block of rows repeated: not implemented",
+            op.kind
+        )));
+    }
     // Reserve C as an independent status buffer through Requirements. The
     // actual unary/binary role signature never gathers or unpacks a C input.
     let layout = kernel::plan_layout(1, kernel::Operands::Ternary)
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (operands, code) = ops::code2(op.kind, [op.scalar, op.scalar2]).expect("integer division");
-    let (roles, loops) = kernel::roles_code_validated(&layout, operands, &code, true);
+    let (roles, loops) =
+        kernel::roles_code_validated(&layout, operands, &code, true, kernel::Formats::FP32);
     let roles = Arc::new(roles);
     let loops = Arc::new(loops);
     let out = DramTensor::alloc_elem(alloc, a.rows, a.cols, Elem::I32)?;
@@ -2154,7 +4162,7 @@ fn sfpu_divide(
         let mut gather = read(layout.a_at, 0, ra);
         if let Some(rb) = rb {
             let flags = match bcast {
-                Broadcast::None => 0,
+                Broadcast::None | Broadcast::Block => 0,
                 Broadcast::Row => 1,
                 Broadcast::Col => 2,
             };
@@ -2223,7 +4231,7 @@ fn sfpu_divide(
     Ok(Work { out, jobs })
 }
 
-type SfpuPrograms = (
+pub(crate) type SfpuPrograms = (
     crate::sfpu::kernel::Layout,
     Arc<[Vec<Instruction>; 3]>,
     Arc<[Vec<crate::code::Loop>; 3]>,
@@ -2247,7 +4255,7 @@ pub(crate) fn metadata(
     let dst = req.scratch("metadata destination", TILE_SLOT, 64, 0..1);
     let constant = req.scratch("metadata immediate", TILE_SLOT, 64, 0..1);
     let plan = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (dst, constant) = (plan.addr(dst), plan.addr(constant));
     let out = DramTensor::alloc_elem(alloc, rows, cols, elem)?;
@@ -2381,21 +4389,33 @@ pub(crate) fn sfpu_group_for_tests(
         bcast,
         operands,
         false,
+        crate::sfpu::kernel::Formats::FP32,
     )
 }
 
 /// `half`: in half the arena, for a pipelined run.
-fn sfpu_group(
+pub(crate) fn sfpu_group(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     half: bool,
+    formats: crate::sfpu::kernel::Formats,
 ) -> usize {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     // Measuring builds the op's role programs twice over: once per op kind,
-    // scalar and broadcast, not once per op.
-    type Memo = Mutex<HashMap<(u32, u32, u32, crate::sfpu::ops::Broadcast, bool), usize>>;
+    // scalar, broadcast and formats, not once per op.
+    // By the arena's end too (`crate::l1::arena`): a group is sized from it.
+    type Key = (
+        u32,
+        u32,
+        u32,
+        crate::sfpu::ops::Broadcast,
+        bool,
+        crate::sfpu::kernel::Formats,
+        u64,
+    );
+    type Memo = Mutex<HashMap<Key, usize>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
     let key = (
         op.kind,
@@ -2403,12 +4423,14 @@ fn sfpu_group(
         op.scalar2.to_bits(),
         bcast,
         half,
+        formats,
+        crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
     }
-    let g = measure_sfpu_group(op, bcast, operands, half);
+    let g = measure_sfpu_group(op, bcast, operands, half, formats);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, g);
@@ -2420,30 +4442,46 @@ fn measure_sfpu_group(
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     half: bool,
+    formats: crate::sfpu::kernel::Formats,
 ) -> usize {
     const GROUP: usize = 64;
+    // The programs' lengths, which do not depend on where the layout sits: measured in the whole of
+    // `DATA`, whatever the arena, and not noted as the op's.
     let lens = |n: usize| -> [usize; 3] {
-        let layout = crate::sfpu::kernel::plan_layout(n, operands).expect("two tiles always fit");
-        let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
-            .expect("checked by the caller");
-        crate::sfpu::kernel::roles_code(&layout, operands, &math)
+        let layout = crate::l1::unnoted(|| {
+            crate::sfpu::kernel::plan_layout_in(n, operands, tt_isa::l1::DATA)
+        })
+        .expect("two tiles always fit DATA");
+        let (_, math) = crate::sfpu::ops::code_for_rows_as(
+            op.kind,
+            [op.scalar, op.scalar2],
+            bcast,
+            32,
+            formats.out.quantized(),
+        )
+        .expect("checked by the caller");
+        crate::sfpu::kernel::roles_code_as(&layout, operands, &math, formats)
             .0
             .map(|p| p.len())
     };
-    let (one, two) = (lens(1), lens(2));
+    // Two tiles and three: a run of two or more repeats one tile's block
+    // (`sfpu::kernel::roles_looped`), so nothing grows a tile, and the bound is
+    // only the arena's; a role that did grow is bounded by its slot.
+    let (two, three) = (lens(2), lens(3));
     let max = tt_isa::mailbox::PROGRAM_MAX as usize;
     let by_program = (0..3)
         .map(|r| {
-            let per = two[r] - one[r];
-            let fixed = one[r] - per;
-            (max - fixed) / per.max(1)
+            let per = three[r].saturating_sub(two[r]);
+            let fixed = two[r].saturating_sub(2 * per);
+            assert!(fixed < max, "a run's fixed program exceeds its slot");
+            (max - fixed).checked_div(per).unwrap_or(usize::MAX)
         })
         .min()
         .unwrap();
     let arena = if half {
-        crate::matmul::HALF
+        crate::matmul::half()
     } else {
-        tt_isa::l1::DATA.len()
+        crate::l1::arena().len()
     };
     GROUP
         .min(crate::sfpu::kernel::max_tiles_in(operands, arena))
@@ -2451,15 +4489,21 @@ fn measure_sfpu_group(
         .max(1)
 }
 
-/// One run's layout and role programs, memoised by op, scalar, length and
-/// `half` (the half of the arena a pipelined run is staged in; `None` for the
-/// whole arena).
-fn sfpu_programs(
+/// One run's layout and role programs over the L1 it was given (`l1`, `tile_op::allocate`),
+/// memoised by op, scalar, length and `half` (the half of the arena a pipelined run is staged in;
+/// `None` for the whole arena), which with the arena's end fix where it was placed; `b_once`: a
+/// column's one tile of `B` held for the whole run ([`row_runs`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sfpu_programs(
     op: Eltwise,
     bcast: crate::sfpu::ops::Broadcast,
     operands: crate::sfpu::kernel::Operands,
     len: usize,
     half: Option<u8>,
+    rows: u32,
+    b_once: bool,
+    formats: crate::sfpu::kernel::Formats,
+    l1: &crate::l1::Placed,
 ) -> Result<SfpuPrograms> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -2470,9 +4514,14 @@ fn sfpu_programs(
         crate::sfpu::ops::Broadcast,
         usize,
         Option<u8>,
+        u32,
+        bool,
+        crate::sfpu::kernel::Formats,
+        u64,
     );
     type Memo = Mutex<HashMap<Key, SfpuPrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
+    // The programs name the layout's addresses, planned in the arena (`crate::l1::arena`).
     let key = (
         op.kind,
         op.scalar.to_bits(),
@@ -2480,20 +4529,29 @@ fn sfpu_programs(
         bcast,
         len,
         half,
+        rows,
+        b_once,
+        formats,
+        crate::l1::arena().end,
     );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
-    let layout = match half {
-        None => crate::sfpu::kernel::plan_layout(len, operands),
-        Some(h) => crate::sfpu::kernel::plan_layout_in(len, operands, crate::matmul::half_arena())
-            .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
-    }
-    .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (_, math) = crate::sfpu::ops::code_for(op.kind, [op.scalar, op.scalar2], bcast)
-        .expect("checked by the caller");
-    let (roles, loops) = crate::sfpu::kernel::roles_code(&layout, operands, &math);
+    // `B` held once uses the first of its slots.
+    let layout = crate::sfpu::kernel::Layout {
+        b_once,
+        ..crate::sfpu::kernel::Layout::placed(len, operands, l1)
+    };
+    let (_, math) = crate::sfpu::ops::code_for_rows_as(
+        op.kind,
+        [op.scalar, op.scalar2],
+        bcast,
+        rows,
+        formats.out.quantized(),
+    )
+    .expect("checked by the caller");
+    let (roles, loops) = crate::sfpu::kernel::roles_code_as(&layout, operands, &math, formats);
     let p = (layout, Arc::new(roles), Arc::new(loops));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2514,84 +4572,1114 @@ pub fn sfpu_reduce(
     units: usize,
     overlap: Overlap,
 ) -> Result<Work> {
-    a.expect("a reduction", op.elem())?;
-    use crate::sfpu::reduce::Axis;
-    let per = match axis {
-        Axis::Cols => a.grid()[1],
-        Axis::Rows => a.grid()[0],
-    };
-    let valid = match axis {
-        Axis::Cols => a.cols,
-        Axis::Rows => a.rows,
-    } % 32;
-    if reduce_group(
-        op,
-        axis,
-        per,
-        if valid == 0 { 32 } else { valid as u32 },
-        false,
-    )
-    .is_none()
-    {
-        return reduce_chunked(alloc, a, op, axis, units);
+    sfpu_reduce_then(alloc, a, op, axis, units, overlap, None)
+}
+
+/// [`sfpu_reduce`] with `then`'s exact unary kind applied to the result before the pack
+/// ([`ReduceThen`]): bit for bit the kind run on the stored result. A softmax's
+/// `clamp_min(max(x))` and `clamp_min(sum(e))` are each one op so. Refused for a reduction too
+/// long for one tile's programs (the chunked form has no finish to add to).
+pub fn sfpu_reduce_then(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    units: usize,
+    overlap: Overlap,
+    then: ReduceThen,
+) -> Result<Work> {
+    crate::tile_op::reduce(a, op, axis, then)?.build(alloc, units, overlap)
+}
+
+/// Each row's `sqrt(mean(a a) + eps)` over its columns, `[rows, 1]`, on the SFPU
+/// (`crate::sfpu::norm`): bit for bit `MUL(a, a)`, the sum over columns, `MUL_SCALAR(1/cols)`,
+/// `ADD_SCALAR(eps)` and `SQRT`, with no tensor between them. A reduction's kernel, one job a
+/// tile row: the mover reads the row, the kernel sums its squares and takes the statistic, the
+/// mover writes the column. A row longer than one job takes (`sfpu::norm::fits`) is refused.
+pub fn sfpu_rms(alloc: &mut DramAlloc, a: &DramTensor, eps: f32) -> Result<Work> {
+    use crate::sfpu::{norm, reduce};
+    a.expect("an RMS statistic", Elem::F32)?;
+    if !norm::fits(a.cols) {
+        return Err(TensorError::Shape(format!(
+            "a row of {} columns does not fit one RMS statistic job",
+            a.cols
+        )));
     }
-    let [rt, ct] = a.grid();
-    let (outs, per, valid, out) = match axis {
-        Axis::Cols => (
-            rt,
-            ct,
-            a.cols % 32,
-            DramTensor::alloc_elem(alloc, a.rows, 1, op.elem())?,
-        ),
-        Axis::Rows => (
-            ct,
-            rt,
-            a.rows % 32,
-            DramTensor::alloc_elem(alloc, 1, a.cols, op.elem())?,
-        ),
+    let [rt, per] = a.grid();
+    let valid = match a.cols % 32 {
+        0 => 32,
+        v => v as u32,
     };
-    let valid = if valid == 0 { 32 } else { valid as u32 };
-    let group = match reduce_group(op, axis, per, valid, false) {
-        Some(g) => g,
-        None => {
-            alloc.free(&out.placement);
-            return Err(TensorError::Shape(format!(
-                "a reduction over {per} tiles does not fit one tile's L1 and program slots"
-            )));
+    let layout = reduce::plan_layout(1, per).map_err(|e| TensorError::Shape(e.to_string()))?;
+    // A tile row's programs run over the row groups its rows occupy: a ragged last tile row (a
+    // decode step's one row) has its own.
+    let roles_for = |rows: usize| {
+        let (squares, fin) = norm::math(per, valid, eps, rows as u32);
+        Arc::new(reduce::roles(&layout, &squares, &fin))
+    };
+    let whole = (a.rows >= 32).then(|| roles_for(32));
+    // Unrolled over the row groups a ragged tile row occupies, its programs can outgrow a
+    // program slot (2048 columns at 18 to 31 rows; the mover refuses the kernel with
+    // `PROGRAM`): there the whole tile row's, which compute each row the same way.
+    let fits = |roles: &[Vec<_>; 3]| {
+        roles
+            .iter()
+            .all(|p| p.len() <= tt_isa::mailbox::PROGRAM_MAX as usize)
+    };
+    let last = match a.rows % 32 {
+        0 => whole.clone().expect("a whole tile row"),
+        r => {
+            let limited = roles_for(r);
+            if fits(&limited) {
+                limited
+            } else {
+                whole.clone().unwrap_or_else(|| roles_for(32))
+            }
         }
     };
+    let out = DramTensor::alloc_elem(alloc, a.rows, 1, Elem::F32)?;
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
-    // Pipelined as element-wise runs are ([`sfpu_eltwise`]).
-    let piped = {
-        let half = reduce_group(op, axis, per, valid, true).unwrap_or(0);
-        pipelined_runs(outs, per, units, half, overlap)
+    let jobs = (0..rt)
+        .map(|k| {
+            // As a reduction over columns gathers and scatters a run of one output. Whole
+            // tiles even for a decode row: reading only its rows (`1024 + 64 r` bytes a tile)
+            // measured slower, 21.0 us a 2048-wide row against 19.2 (decode-small-ops.md S3).
+            let gather = [
+                [
+                    record::READ_RUN,
+                    (k * per) as u32,
+                    per as u32,
+                    layout.in_at as u32,
+                    0,
+                    per as u32,
+                    0,
+                    0,
+                ],
+                ra.encode()[0],
+                ra.encode()[1],
+            ];
+            let scatter = [
+                [
+                    record::WRITE_RUN,
+                    k as u32,
+                    1,
+                    layout.out_at as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                ro.encode()[0],
+                ro.encode()[1],
+            ];
+            vec![
+                Step::List {
+                    what: "rms gather",
+                    entries: gather.to_vec(),
+                },
+                Step::Kernel {
+                    roles: match &whole {
+                        Some(w) if k + 1 < rt => w.clone(),
+                        _ => last.clone(),
+                    },
+                    init: layout.init.clone(),
+                    mop: Box::new([None; 3]),
+                    loops: Default::default(),
+                    half: None,
+                },
+                Step::List {
+                    what: "rms scatter",
+                    entries: scatter.to_vec(),
+                },
+            ]
+        })
+        .collect();
+    Ok(Work { out, jobs })
+}
+
+/// [`sfpu_rms`] of one row of `cols` columns (whole tiles) from its packed layout (`packed`,
+/// `[cols / 32, 32]`, [`pack_row`]): one job, `cols / 1024` tiles read where the row is
+/// `cols / 32` entries. The same sums in the same order (`sfpu::norm::math_packed`), so bit for
+/// bit [`sfpu_rms`]'s `[1, 1]`.
+pub fn sfpu_rms_packed(
+    alloc: &mut DramAlloc,
+    packed: &DramTensor,
+    cols: usize,
+    eps: f32,
+) -> Result<Work> {
+    use crate::sfpu::{norm, reduce};
+    packed.expect("a packed RMS statistic", Elem::F32)?;
+    if cols % 32 != 0 || (packed.rows, packed.cols) != (cols / 32, 32) {
+        return Err(TensorError::Shape(format!(
+            "[{}, {}] is not a packed row of {cols} columns",
+            packed.rows, packed.cols
+        )));
+    }
+    let [pt, _] = packed.grid();
+    let layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (squares, fin) = norm::math_packed(cols, eps);
+    let roles = Arc::new(reduce::roles(&layout, &squares, &fin));
+    let out = DramTensor::alloc_elem(alloc, 1, 1, Elem::F32)?;
+    let (rp, ro) = (packed.tensor_ref(), out.tensor_ref());
+    let gather = [
+        [
+            record::READ_RUN,
+            0,
+            pt as u32,
+            layout.in_at as u32,
+            0,
+            1,
+            0,
+            0,
+        ],
+        rp.encode()[0],
+        rp.encode()[1],
+    ];
+    let scatter = [
+        [record::WRITE_RUN, 0, 1, layout.out_at as u32, 0, 0, 0, 0],
+        ro.encode()[0],
+        ro.encode()[1],
+    ];
+    let jobs = vec![vec![
+        Step::List {
+            what: "rms gather",
+            entries: gather.to_vec(),
+        },
+        Step::Kernel {
+            roles,
+            init: layout.init.clone(),
+            mop: Box::new([None; 3]),
+            loops: Default::default(),
+            half: None,
+        },
+        Step::List {
+            what: "rms scatter",
+            entries: scatter.to_vec(),
+        },
+    ]];
+    Ok(Work { out, jobs })
+}
+
+/// One semaphore initialisation for every kernel of `job`, where their plans agree on each
+/// semaphore's starting value (the matmul's, SFPU's and reduction's do: theirs number from zero in
+/// the same order). A kernel leaves every semaphore as it found it, those it never takes
+/// included, so the union is each one's own. Consecutive blocks join one ownership region only
+/// with equal initialisations: one region a job, not one a kernel (~3.5 us each). Where two
+/// disagree, `job` is left as it is.
+pub(crate) fn share_semaphore_init(job: &mut Job) {
+    let mut all: Vec<crate::runtime::SemaphoreInit> = Vec::new();
+    for step in job.iter() {
+        if let Step::Kernel { init, .. } = step {
+            for &(sem, value, max) in init {
+                match all.iter().find(|(s, _, _)| *s == sem) {
+                    Some(&(_, v, m)) if (v, m) != (value, max) => return,
+                    Some(_) => {}
+                    None => all.push((sem, value, max)),
+                }
+            }
+        }
+    }
+    all.sort_by_key(|(s, _, _)| s.index());
+    for step in job.iter_mut() {
+        if let Step::Kernel { init, .. } = step {
+            *init = all.clone();
+        }
+    }
+}
+
+/// `out`'s rows plus `values`' rows at the rows `indices` name, in index order, written over
+/// `out` in place: Burn's `select_add` along rows (an embedding's gradient), the indices resident
+/// (`[n, 1]` I32) and never read by the host. One job a group of `out`'s tile columns (no two
+/// jobs touch one byte), and in it one block an index: the index's tile read, `SELECT_ROWS` of
+/// `out`'s row `indices[j]` and of `values`' row `j` (`positions`, `[n, 1]` I32, holds `j`), an
+/// `ADD` of the two (`kind::ADD`, the row's tiles), and `SCATTER_ROWS` of the sum back to row
+/// `indices[j]`. Both records' slots are unknown to the region's footprint check, so each
+/// block's gather waits for the block before to be written out and released
+/// (`RELEASED`, `Release::Written`) and a row repeated reads the sum the last one wrote: each row's
+/// additions are made in index order, bit for bit Flex's loop. An index outside `out`'s rows is
+/// the select's `DOMAIN`.
+pub(crate) fn select_add_rows_jobs(
+    out: &DramTensor,
+    indices: &DramTensor,
+    positions: &DramTensor,
+    values: &DramTensor,
+    units: usize,
+) -> Result<Vec<Job>> {
+    use crate::sfpu::kernel::{self as sk, Operands};
+    use crate::sfpu::ops::{code_for_rows, Broadcast};
+    use tt_isa::dm::op;
+    let n = indices.rows;
+    out.expect("a select-add's table", Elem::F32)?;
+    values.expect("a select-add's values", Elem::F32)?;
+    indices.expect("a select-add's indices", Elem::I32)?;
+    positions.expect("a select-add's positions", Elem::I32)?;
+    if n == 0
+        || indices.cols != 1
+        || (positions.rows, positions.cols) != (n, 1)
+        || (values.rows, values.cols) != (n, out.cols)
+        || out.rows == 0
+        || out.rows > i32::MAX as usize
+        || !out.placement.owned()
+    {
+        return Err(TensorError::Shape(format!(
+            "a select-add of [{n}, {}] indices and [{}, {}] values into an owned [{}, {}] table",
+            indices.cols, values.rows, values.cols, out.rows, out.cols
+        )));
+    }
+    let ct = out.grid()[1];
+    // A block's slots: the index and position tiles, then a group's columns of `out`'s row,
+    // `values`' row and their sum.
+    let room = ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(2) / 3;
+    let width = ct
+        .div_ceil(units.max(1))
+        .clamp(1, room.min(SELECT_ADD_TILES));
+    let base = tt_isa::l1::DATA.base;
+    let (idx_at, pos_at) = (base, base + TILE_SLOT);
+    let slots = width as u64 * TILE_SLOT;
+    let [a_at, b_at, o_at] = [0, 1, 2].map(|k| base + 2 * TILE_SLOT + k * slots);
+    if !tt_isa::l1::DATA.contains(base, 2 * TILE_SLOT + 3 * slots) {
+        return Err(TensorError::Shape(
+            "a select-add's slots are outside the data arena".into(),
+        ));
+    }
+    crate::l1::note_planned_top(o_at + slots);
+    let (_, add) = code_for_rows(
+        crate::kind::ADD,
+        [0.0, 0.0],
+        Broadcast::None,
+        eltwise_rows(crate::kind::ADD, 1),
+    )
+    .ok_or_else(|| TensorError::Shape("no ADD program".into()))?;
+    let (out_ref, values_ref) = (out.tensor_ref().encode(), values.tensor_ref().encode());
+    let read_tile = |range: tt_isa::dram::DramRange, at: u64, port: u32| {
+        [
+            op::READ,
+            range.channel().index() as u32,
+            port % tt_isa::dram::PORTS as u32,
+            range.offset() as u32,
+            at as u32,
+            range.len() as u32,
+            0,
+            0,
+        ]
     };
-    let pipelined = piped.is_some();
-    let all = piped.unwrap_or_else(|| runs(outs, units, group));
     let mut jobs = Vec::new();
+    for g in 0..ct.div_ceil(width) {
+        let (j0, j1) = (g * width, ((g + 1) * width).min(ct));
+        let cols = j1 - j0;
+        let planned = sk::plan_layout(cols, Operands::Binary)
+            .map_err(|e| TensorError::Shape(e.to_string()))?;
+        let layout = sk::Layout {
+            tiles: cols,
+            a_at,
+            b_at: Some(b_at),
+            b_once: false,
+            c_at: None,
+            out_at: o_at,
+            sems: planned.sems,
+            init: planned.init,
+        };
+        let (roles, loops) = sk::roles_code(&layout, Operands::Binary, &add);
+        let (roles, loops) = (Arc::new(roles), Arc::new(loops));
+        let mut job = Vec::new();
+        for j in 0..n {
+            // Index `j` is row `q` of its tile: the records read it at `(0, 0)` of the slot that
+            // row starts.
+            let q = (j % 32) as u64;
+            let row = (q / 16 * 512 + q % 16 * 16) * 4;
+            let mut gather = vec![
+                read_tile(indices.tile(j / 32, 0), idx_at, 0),
+                read_tile(positions.tile(j / 32, 0), pos_at, 1),
+                [
+                    record::SELECT_ROWS,
+                    (idx_at + row) as u32,
+                    1,
+                    out.rows as u32,
+                    j0 as u32,
+                    cols as u32,
+                    a_at as u32,
+                    0,
+                ],
+            ];
+            gather.extend(out_ref);
+            gather.push([
+                record::SELECT_ROWS,
+                (pos_at + row) as u32,
+                1,
+                n as u32,
+                j0 as u32,
+                cols as u32,
+                b_at as u32,
+                0,
+            ]);
+            gather.extend(values_ref);
+            let mut scatter = vec![[
+                record::SCATTER_ROWS,
+                (idx_at + row) as u32,
+                1,
+                out.rows as u32,
+                j0 as u32,
+                cols as u32,
+                o_at as u32,
+                0,
+            ]];
+            scatter.extend(out_ref);
+            job.extend([
+                Step::List {
+                    what: "select-add gather",
+                    entries: gather,
+                },
+                Step::Kernel {
+                    roles: roles.clone(),
+                    init: layout.init.clone(),
+                    mop: Box::new([None; 3]),
+                    loops: loops.clone(),
+                    half: None,
+                },
+                Step::List {
+                    what: "select-add scatter",
+                    entries: scatter,
+                },
+            ]);
+        }
+        jobs.push(job);
+    }
+    Ok(jobs)
+}
+
+/// The most tile columns one [`select_add_rows_jobs`] job takes: as a row select's group.
+const SELECT_ADD_TILES: usize = 24;
+
+/// `s = a + b` and `s / sqrt(mean(s s) + eps)` (times `gamma`, `[1, K]`, if given) for decode
+/// rows `a` and `b` (`[1, K]`) whose packed rows are `pa` and `pb` ([`pack_row`]): a residual
+/// sum and the norm after it, as one op. Each job adds the packed rows (the sum's packed row,
+/// `kind::ADD` over the same datums), takes the statistic from it ([`sfpu_rms_packed`]'s
+/// kernel), then adds its run of `a`'s and `b`'s tiles, divides them by the statistic and scales
+/// them: bit for bit the `ADD`, then [`rms_divide`]. Returns the norm (`Work::out`) and the sum;
+/// `twins`, if given, receive their packed rows (the sum's first).
+#[allow(clippy::too_many_arguments)]
+pub fn add_rms_divide(
+    alloc: &mut DramAlloc,
+    [a, b]: [&DramTensor; 2],
+    [pa, pb]: [&DramTensor; 2],
+    gamma: Option<&DramTensor>,
+    eps: f32,
+    units: usize,
+    twins: [Option<&DramTensor>; 2],
+) -> Result<(Work, DramTensor)> {
+    use crate::sfpu::kernel::{self as sk, Operands};
+    use crate::sfpu::ops::{code_for_rows, kind_sfpu, Broadcast};
+    use crate::sfpu::{norm, reduce};
+    let cols = a.cols;
+    for (x, p) in [(a, pa), (b, pb)] {
+        x.expect("a residual sum's operand", Elem::F32)?;
+        p.expect("a residual sum's packed operand", Elem::F32)?;
+        if x.rows != 1 || x.cols != cols || cols % 32 != 0 || (p.rows, p.cols) != (cols / 32, 32) {
+            return Err(TensorError::Shape(format!(
+                "a residual norm of [{}, {}] packed as [{}, {}], with a row of {cols}",
+                x.rows, x.cols, p.rows, p.cols
+            )));
+        }
+    }
+    if let Some(g) = gamma {
+        g.expect("an RMS norm's scale", Elem::F32)?;
+        if (g.rows, g.cols) != (1, cols) {
+            return Err(TensorError::Shape(format!(
+                "an RMS norm of [1, {cols}] scaled by [{}, {}]",
+                g.rows, g.cols
+            )));
+        }
+    }
+    let [pt, _] = pa.grid();
+    let ct = a.grid()[1];
+    let div = Eltwise {
+        kind: kind_sfpu::DIV,
+        scalar: 0.0,
+        scalar2: 0.0,
+    };
+    // A job's slots: the packed `a`, `b` and sum, the statistic; then a run's tiles of `a`, `b`,
+    // the sum and the quotient, and with a scale of `gamma` and the product.
+    let per_tile = if gamma.is_some() { 6 } else { 4 };
+    let by_slots =
+        ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(3 * pt + 1) / per_tile;
+    let group = sfpu_group(
+        div,
+        Broadcast::Col,
+        Operands::ColBroadcast,
+        false,
+        crate::sfpu::kernel::Formats::FP32,
+    )
+    .min(by_slots);
+    if group == 0 {
+        return Err(TensorError::Shape(format!(
+            "a residual norm's packed rows of {pt} tiles leave no slots"
+        )));
+    }
+    let base = tt_isa::l1::DATA.base;
+    let packed_slots = pt as u64 * TILE_SLOT;
+    let [pa_at, pb_at, ps_at] = [0, 1, 2].map(|k| base + k * packed_slots);
+    let stat_layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let stat_layout = reduce::Layout {
+        in_at: ps_at,
+        out_at: ps_at + packed_slots,
+        ..stat_layout
+    };
+    let a_at = stat_layout.out_at + TILE_SLOT;
+    let (squares, fin) = norm::math_packed(cols, eps);
+    let stat_roles = Arc::new(reduce::roles(&stat_layout, &squares, &fin));
+    let program = |kind: u32, bcast: Broadcast, rows: u32| {
+        code_for_rows(kind, [0.0, 0.0], bcast, rows)
+            .map(|(_, code)| code)
+            .ok_or_else(|| TensorError::Shape(format!("no program for kind {kind:#x}")))
+    };
+    // The packed rows' sum over every row they hold; a run's over its tiles' one row, as the
+    // element-wise `ADD` of two decode rows runs.
+    let add_packed = program(crate::kind::ADD, Broadcast::None, 32)?;
+    let add = program(
+        crate::kind::ADD,
+        Broadcast::None,
+        eltwise_rows(crate::kind::ADD, 1),
+    )?;
+    let divide = program(div.kind, Broadcast::Col, eltwise_rows(div.kind, 1))?;
+    let scale = match gamma {
+        Some(_) => Some(program(
+            crate::kind::MUL,
+            Broadcast::None,
+            eltwise_rows(crate::kind::MUL, 1),
+        )?),
+        None => None,
+    };
+    let binary = |tiles: usize, a_at: u64, b_at: u64, out_at: u64| -> Result<sk::Layout> {
+        let planned = sk::plan_layout(tiles, Operands::Binary)
+            .map_err(|e| TensorError::Shape(e.to_string()))?;
+        Ok(sk::Layout {
+            tiles,
+            a_at,
+            b_at: Some(b_at),
+            b_once: false,
+            c_at: None,
+            out_at,
+            sems: planned.sems,
+            init: planned.init,
+        })
+    };
+    let kernel = |layout: &sk::Layout, operands: Operands, code: &crate::code::Code| {
+        let (roles, loops) = sk::roles_code(layout, operands, code);
+        Step::Kernel {
+            roles: Arc::new(roles),
+            init: layout.init.clone(),
+            mop: Box::new([None; 3]),
+            loops: Arc::new(loops),
+            half: None,
+        }
+    };
+    let packed_sum = kernel(
+        &binary(pt, pa_at, pb_at, ps_at)?,
+        Operands::Binary,
+        &add_packed,
+    );
+    let out = DramTensor::alloc(alloc, 1, cols)?;
+    let sum = match DramTensor::alloc(alloc, 1, cols) {
+        Ok(sum) => sum,
+        Err(e) => {
+            alloc.free(&out.placement);
+            return Err(e);
+        }
+    };
+    let refs = [pa, pb, a, b].map(|x| x.tensor_ref());
+    let (rs, ro, rg) = (
+        sum.tensor_ref(),
+        out.tensor_ref(),
+        gamma.map(|g| g.tensor_ref()),
+    );
+    let read = |x: &TensorRef, start: usize, n: usize, at: u64, grid_ct: usize| {
+        [
+            [
+                record::READ_RUN,
+                start as u32,
+                n as u32,
+                at as u32,
+                0,
+                grid_ct as u32,
+                0,
+                0,
+            ],
+            x.encode()[0],
+            x.encode()[1],
+        ]
+    };
+    let write = |x: &TensorRef, start: usize, n: usize, at: u64| {
+        [
+            [
+                record::WRITE_RUN,
+                start as u32,
+                n as u32,
+                at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            x.encode()[0],
+            x.encode()[1],
+        ]
+    };
+    let empty = |what: &'static str| Step::List {
+        what,
+        entries: Vec::new(),
+    };
+    let mut jobs = Vec::new();
+    for run in runs(ct, units, group) {
+        let len = run.len();
+        let slots = len as u64 * TILE_SLOT;
+        let [b_at, s_at, q_at, g_at, p_at] = [1, 2, 3, 4, 5].map(|k| a_at + k * slots);
+        let run_sum = binary(len, a_at, b_at, s_at)?;
+        let planned = sk::plan_layout(len, Operands::ColBroadcast)
+            .map_err(|e| TensorError::Shape(e.to_string()))?;
+        let quotient = sk::Layout {
+            tiles: len,
+            a_at: s_at,
+            b_at: Some(stat_layout.out_at),
+            b_once: true,
+            c_at: None,
+            out_at: q_at,
+            sems: planned.sems,
+            init: planned.init,
+        };
+        let result_at = if scale.is_some() { p_at } else { q_at };
+        crate::l1::note_planned_top(result_at + slots);
+        let mut gather = read(&refs[0], 0, pt, pa_at, 1).to_vec();
+        gather.extend(read(&refs[1], 0, pt, pb_at, 1));
+        gather.extend(read(&refs[2], run.start, len, a_at, ct));
+        gather.extend(read(&refs[3], run.start, len, b_at, ct));
+        if let Some(rg) = &rg {
+            gather.extend(read(rg, run.start, len, g_at, ct));
+        }
+        let mut scatter = write(&rs, run.start, len, s_at).to_vec();
+        if let Some(twin) = twins[0] {
+            scatter.extend(packed_twin_writes(twin, run.start, len, s_at));
+        }
+        scatter.extend(write(&ro, run.start, len, result_at));
+        if let Some(twin) = twins[1] {
+            scatter.extend(packed_twin_writes(twin, run.start, len, result_at));
+        }
+        let mut job = vec![
+            Step::List {
+                what: "residual norm gather",
+                entries: gather,
+            },
+            packed_sum.clone(),
+            empty("residual norm packed sum"),
+            empty("residual norm statistic in"),
+            Step::Kernel {
+                roles: stat_roles.clone(),
+                init: stat_layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Default::default(),
+                half: None,
+            },
+            empty("residual norm statistic"),
+            empty("residual norm sum in"),
+            kernel(&run_sum, Operands::Binary, &add),
+            empty("residual norm sum"),
+            empty("residual norm divide in"),
+            kernel(&quotient, Operands::ColBroadcast, &divide),
+        ];
+        if let Some(mul) = &scale {
+            job.extend([
+                empty("residual norm quotient"),
+                empty("residual norm scale in"),
+                kernel(&binary(len, q_at, g_at, p_at)?, Operands::Binary, mul),
+            ]);
+        }
+        job.push(Step::List {
+            what: "residual norm scatter",
+            entries: scatter,
+        });
+        jobs.push(job);
+        share_semaphore_init(jobs.last_mut().expect("just pushed"));
+    }
+    Ok((Work { out, jobs }, sum))
+}
+
+/// `a / sqrt(mean(a a) + eps)` for a decode row `a` (`[1, K]`) whose packed row (`[K / 32, 32]`,
+/// [`pack_row`]) is `packed`: RMSNorm up to its scale, as one op. Each job takes a run of `a`'s
+/// tiles and computes the statistic itself from `packed` ([`sfpu_rms_packed`]'s kernel), then
+/// divides its tiles by it (`kind_sfpu::DIV`, the column broadcast, one row): bit for bit the
+/// statistic op and the `DIV` after it, with no barrier between them and no unit waiting on one
+/// that computed the statistic alone. With `gamma` (`[1, K]`), each job then multiplies its tiles
+/// by `gamma`'s (`kind::MUL`, the element-wise op's program): bit for bit the norm, then the
+/// product by its scale. `twin`, if given, receives the result's packed row. `out` is the result's
+/// type: `Elem::BF16` rounds the last kernel's result once in `Dst` and packs it BF16 (its twin
+/// too), bit for bit the F32 norm narrowed (`Session::bf16_from_f32`); every value before it stays
+/// FP32.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_divide(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    packed: &DramTensor,
+    gamma: Option<&DramTensor>,
+    eps: f32,
+    units: usize,
+    twin: Option<&DramTensor>,
+    out: Elem,
+) -> Result<Work> {
+    use crate::sfpu::kernel::{self as sk, Formats, Operands};
+    use crate::sfpu::ops::{code_for_rows_as, kind_sfpu, Broadcast};
+    use crate::sfpu::{norm, reduce};
+    a.expect("an RMS division", Elem::F32)?;
+    let last = match out {
+        Elem::F32 => Formats::FP32,
+        Elem::BF16 => Formats {
+            bf16_in: false,
+            out: bf16_result(),
+        },
+        other => {
+            return Err(TensorError::Elem {
+                op: "an RMS norm's result".into(),
+                got: other,
+                wants: Elem::F32,
+            })
+        }
+    };
+    if let Some(t) = twin {
+        t.expect(
+            "an RMS norm's packed twin",
+            result_elem(kind_sfpu::DIV, last),
+        )?;
+    }
+    // The quotient's formats: the last kernel's without a scale, else FP32.
+    let quotient = if gamma.is_some() { Formats::FP32 } else { last };
+    packed.expect("a packed RMS statistic", Elem::F32)?;
+    let cols = a.cols;
+    if a.rows != 1 || cols % 32 != 0 || (packed.rows, packed.cols) != (cols / 32, 32) {
+        return Err(TensorError::Shape(format!(
+            "an RMS division of [{}, {cols}] by the packed row [{}, {}]",
+            a.rows, packed.rows, packed.cols
+        )));
+    }
+    if let Some(g) = gamma {
+        g.expect("an RMS norm's scale", Elem::F32)?;
+        if (g.rows, g.cols) != (1, cols) {
+            return Err(TensorError::Shape(format!(
+                "an RMS norm of [1, {cols}] scaled by [{}, {}]",
+                g.rows, g.cols
+            )));
+        }
+    }
+    let [pt, _] = packed.grid();
+    let ct = a.grid()[1];
+    let div = Eltwise {
+        kind: kind_sfpu::DIV,
+        scalar: 0.0,
+        scalar2: 0.0,
+    };
+    // A run's slots: the packed row, the statistic, its tiles of `a` and of the quotient, and
+    // with a scale its tiles of `gamma` and of the product.
+    let per_tile = if gamma.is_some() { 4 } else { 2 };
+    let by_slots =
+        ((crate::l1::arena().len() / TILE_SLOT) as usize).saturating_sub(pt + 1) / per_tile;
+    let group = sfpu_group(
+        div,
+        Broadcast::Col,
+        Operands::ColBroadcast,
+        false,
+        crate::sfpu::kernel::Formats::FP32,
+    )
+    .min(by_slots);
+    if group == 0 {
+        return Err(TensorError::Shape(format!(
+            "an RMS division's packed row of {pt} tiles leaves no slots"
+        )));
+    }
+    let stat_layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let stat_layout = reduce::Layout {
+        in_at: tt_isa::l1::DATA.base,
+        out_at: tt_isa::l1::DATA.base + pt as u64 * TILE_SLOT,
+        ..stat_layout
+    };
+    let a_at = stat_layout.out_at + TILE_SLOT;
+    let (squares, fin) = norm::math_packed(cols, eps);
+    let stat_roles = Arc::new(reduce::roles(&stat_layout, &squares, &fin));
+    let (_, code) = code_for_rows_as(
+        div.kind,
+        [0.0, 0.0],
+        Broadcast::Col,
+        eltwise_rows(div.kind, 1),
+        quotient.out.quantized(),
+    )
+    .ok_or_else(|| TensorError::Shape("no column-broadcast DIV program".into()))?;
+    let scale = match gamma {
+        Some(_) => Some(
+            code_for_rows_as(
+                crate::kind::MUL,
+                [0.0, 0.0],
+                Broadcast::None,
+                eltwise_rows(crate::kind::MUL, 1),
+                last.out.quantized(),
+            )
+            .ok_or_else(|| TensorError::Shape("no MUL program".into()))?
+            .1,
+        ),
+        None => None,
+    };
+    let out = DramTensor::alloc_elem(alloc, 1, cols, result_elem(kind_sfpu::DIV, last))?;
+    let (rp, ra, ro) = (packed.tensor_ref(), a.tensor_ref(), out.tensor_ref());
+    let rg = gamma.map(|g| g.tensor_ref());
+    let mut jobs = Vec::new();
+    for run in runs(ct, units, group) {
+        let len = run.len();
+        let planned = sk::plan_layout(len, Operands::ColBroadcast)
+            .map_err(|e| TensorError::Shape(e.to_string()))?;
+        let layout = sk::Layout {
+            tiles: len,
+            a_at,
+            b_at: Some(stat_layout.out_at),
+            b_once: true,
+            c_at: None,
+            out_at: a_at + len as u64 * TILE_SLOT,
+            sems: planned.sems,
+            init: planned.init,
+        };
+        // The product by the scale: `gamma`'s tiles after the quotient's, the product's after
+        // those.
+        let slots = len as u64 * TILE_SLOT;
+        let scaled = match &scale {
+            Some(mul) => {
+                let planned = sk::plan_layout(len, Operands::Binary)
+                    .map_err(|e| TensorError::Shape(e.to_string()))?;
+                let product = sk::Layout {
+                    tiles: len,
+                    a_at: layout.out_at,
+                    b_at: Some(layout.out_at + slots),
+                    b_once: false,
+                    c_at: None,
+                    out_at: layout.out_at + 2 * slots,
+                    sems: planned.sems,
+                    init: planned.init,
+                };
+                let (roles, loops) = sk::roles_code_as(&product, Operands::Binary, mul, last);
+                Some((product, roles, loops))
+            }
+            None => None,
+        };
+        let result_at = scaled
+            .as_ref()
+            .map_or(layout.out_at, |(product, _, _)| product.out_at);
+        crate::l1::note_planned_top(result_at + slots);
+        let (roles, loops) = sk::roles_code_as(&layout, Operands::ColBroadcast, &code, quotient);
+        let read = |x: &TensorRef, start: usize, n: usize, at: u64, grid_ct: usize| {
+            [
+                [
+                    record::READ_RUN,
+                    start as u32,
+                    n as u32,
+                    at as u32,
+                    0,
+                    grid_ct as u32,
+                    0,
+                    0,
+                ],
+                x.encode()[0],
+                x.encode()[1],
+            ]
+        };
+        let mut gather = read(&rp, 0, pt, stat_layout.in_at, 1).to_vec();
+        gather.extend(read(&ra, run.start, len, a_at, ct));
+        if let (Some(rg), Some((product, _, _))) = (&rg, &scaled) {
+            let g_at = product.b_at.expect("a binary layout");
+            gather.extend(read(rg, run.start, len, g_at, ct));
+        }
+        let mut scatter = vec![
+            [
+                record::WRITE_RUN,
+                run.start as u32,
+                len as u32,
+                result_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        if let Some(twin) = twin {
+            scatter.extend(packed_twin_writes(twin, run.start, len, result_at));
+        }
+        let mut job = vec![
+            Step::List {
+                what: "rms divide gather",
+                entries: gather,
+            },
+            Step::Kernel {
+                roles: stat_roles.clone(),
+                init: stat_layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Default::default(),
+                half: None,
+            },
+            Step::List {
+                what: "rms divide statistic",
+                entries: Vec::new(),
+            },
+            Step::List {
+                what: "rms divide",
+                entries: Vec::new(),
+            },
+            Step::Kernel {
+                roles: Arc::new(roles),
+                init: layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops: Arc::new(loops),
+                half: None,
+            },
+        ];
+        if let Some((product, roles, loops)) = scaled {
+            job.extend([
+                Step::List {
+                    what: "rms divide quotient",
+                    entries: Vec::new(),
+                },
+                Step::List {
+                    what: "rms divide scale",
+                    entries: Vec::new(),
+                },
+                Step::Kernel {
+                    roles: Arc::new(roles),
+                    init: product.init,
+                    mop: Box::new([None; 3]),
+                    loops: Arc::new(loops),
+                    half: None,
+                },
+            ]);
+        }
+        job.push(Step::List {
+            what: "rms divide scatter",
+            entries: scatter,
+        });
+        jobs.push(job);
+        share_semaphore_init(jobs.last_mut().expect("just pushed"));
+    }
+    Ok(Work { out, jobs })
+}
+
+/// Rotary position embedding in the rotate-half layout, as one op: `x cos + rotate(x) sin` over
+/// the `[rows, cols]` block `x`, whose columns are heads of `head` columns each, `cos` and `sin`
+/// laid out as `x` is (each head's table row), `sin` carrying `rotate_half`'s sign. `rotate(x)`
+/// is each head's halves swapped, read as `x`'s own tiles at the swapped place: no copy. Each job
+/// is two kernels on its run of tiles, `MUL` then `MUL_ADD` (`c + a b`, two roundings): bit for
+/// bit the product, the product and the sum. `head / 2` must be whole tiles.
+pub fn rope_blocks(
+    alloc: &mut DramAlloc,
+    x: BlockOperand<'_>,
+    cos: BlockOperand<'_>,
+    sin: BlockOperand<'_>,
+    head: usize,
+    units: usize,
+) -> Result<Work> {
+    use crate::sfpu::kernel::{self as sk, Operands};
+    use crate::sfpu::ops::{code_for_rows, kind_sfpu, Broadcast};
+    let [rows, cols] = x.dims;
+    if head == 0 || head % 64 != 0 || cols % head != 0 || [cos.dims, sin.dims] != [x.dims; 2] {
+        return Err(TensorError::Shape(format!(
+            "RoPE over [{rows}, {cols}] in heads of {head}: halves of whole tiles, tables of x's \
+             shape"
+        )));
+    }
+    for t in [x.tensor, cos.tensor, sin.tensor] {
+        t.expect("RoPE", Elem::F32)?;
+    }
+    let what = "a RoPE operand";
+    let (rx, rc, rs) = (
+        x.tensor_ref(what)?,
+        cos.tensor_ref(what)?,
+        sin.tensor_ref(what)?,
+    );
+    let shape = x.shape_only();
+    let [rt, ct] = shape.grid();
+    let (dt, half) = (head / 32, head / 64);
+    let live = eltwise_rows(kind_sfpu::MUL_ADD, rows);
+    let (_, mul) = code_for_rows(crate::kind::MUL, [0.0, 0.0], Broadcast::None, live)
+        .ok_or_else(|| TensorError::Shape("no MUL program".into()))?;
+    let (_, mul_add) = code_for_rows(kind_sfpu::MUL_ADD, [0.0, 0.0], Broadcast::None, live)
+        .ok_or_else(|| TensorError::Shape("no MUL_ADD program".into()))?;
+    // A run's slots: `x`, `cos`, `rotate(x)`, `sin`, the product and the result.
+    let group = (((crate::l1::arena().len() / TILE_SLOT) as usize) / 6).min(64);
+    let out = DramTensor::alloc(alloc, rows, cols)?;
+    let ro = out.tensor_ref();
+    let mut jobs = Vec::new();
+    for run in runs(rt * ct, units, group) {
+        let len = run.len();
+        let slots = len as u64 * TILE_SLOT;
+        let base = tt_isa::l1::DATA.base;
+        let [x_at, c_at, r_at, s_at, p_at, o_at] = std::array::from_fn(|k| base + k as u64 * slots);
+        crate::l1::note_planned_top(o_at + slots);
+        let planned = |operands| {
+            sk::plan_layout(len, operands).map_err(|e| TensorError::Shape(e.to_string()))
+        };
+        let (pb, pt) = (planned(Operands::Binary)?, planned(Operands::Ternary)?);
+        let product = sk::Layout {
+            tiles: len,
+            a_at: x_at,
+            b_at: Some(c_at),
+            b_once: false,
+            c_at: None,
+            out_at: p_at,
+            sems: pb.sems,
+            init: pb.init,
+        };
+        let sum = sk::Layout {
+            tiles: len,
+            a_at: r_at,
+            b_at: Some(s_at),
+            b_once: false,
+            c_at: Some(p_at),
+            out_at: o_at,
+            sems: pt.sems,
+            init: pt.init,
+        };
+        let (product_roles, product_loops) = sk::roles_code(&product, Operands::Binary, &mul);
+        let (sum_roles, sum_loops) = sk::roles_code(&sum, Operands::Ternary, &mul_add);
+        let read_run = |r: &TensorRef, at: u64| {
+            [
+                [
+                    record::READ_RUN,
+                    run.start as u32,
+                    len as u32,
+                    at as u32,
+                    0,
+                    ct as u32,
+                    0,
+                    0,
+                ],
+                r.encode()[0],
+                r.encode()[1],
+            ]
+        };
+        let mut gather = read_run(&rx, x_at).to_vec();
+        gather.extend(read_run(&rc, c_at));
+        gather.extend(read_run(&rs, s_at));
+        // `rotate(x)`'s tile `n` is `x`'s tile across the head's halves.
+        for n in 0..len {
+            let t = run.start + n;
+            let (i, j) = (t / ct, t % ct);
+            let (h, k) = (j / dt, j % dt);
+            let src = x
+                .tensor
+                .tile(x.at[0] / 32 + i, x.at[1] / 32 + h * dt + (k + half) % dt);
+            gather.push([
+                tt_isa::dm::op::READ,
+                src.channel().index() as u32,
+                (n % tt_isa::dram::PORTS as usize) as u32,
+                src.offset() as u32,
+                (r_at + n as u64 * TILE_SLOT) as u32,
+                TILE_SLOT as u32,
+                0,
+                0,
+            ]);
+        }
+        let scatter = [
+            [
+                record::WRITE_RUN,
+                run.start as u32,
+                len as u32,
+                o_at as u32,
+                0,
+                0,
+                0,
+                0,
+            ],
+            ro.encode()[0],
+            ro.encode()[1],
+        ];
+        let kernel = |roles, loops, init| Step::Kernel {
+            roles: Arc::new(roles),
+            init,
+            mop: Box::new([None; 3]),
+            loops: Arc::new(loops),
+            half: None,
+        };
+        let mut job = vec![
+            Step::List {
+                what: "rope gather",
+                entries: gather,
+            },
+            kernel(product_roles, product_loops, product.init),
+            Step::List {
+                what: "rope product",
+                entries: Vec::new(),
+            },
+            Step::List {
+                what: "rope sum",
+                entries: Vec::new(),
+            },
+            kernel(sum_roles, sum_loops, sum.init),
+            Step::List {
+                what: "rope scatter",
+                entries: scatter.to_vec(),
+            },
+        ];
+        share_semaphore_init(&mut job);
+        jobs.push(job);
+    }
+    Ok(Work { out, jobs })
+}
+
+/// Most tiles of a row one partial of [`argmax_partials`] reads: its programs are a tile's each.
+pub const ARGMAX_RUN_MAX: usize = 32;
+
+/// Phase 1 of a row's argmax ([`crate::sfpu::select`]): the `[1, cols]` F32 row `a` dealt in runs
+/// of tiles over `units`, each run's best key and index in a tile of the `[1, 32 runs]` result.
+/// Also each run's first column, which [`argmax_choose`] adds to its index.
+pub fn argmax_partials(
+    alloc: &mut DramAlloc,
+    a: &DramTensor,
+    units: usize,
+) -> Result<(Work, Vec<usize>)> {
+    use crate::sfpu::{reduce, select};
+    a.expect("an argmax", Elem::F32)?;
+    if a.rows != 1 || a.cols == 0 {
+        return Err(TensorError::Shape(format!(
+            "an argmax of [{}, {}]: one row",
+            a.rows, a.cols
+        )));
+    }
+    let ct = a.grid()[1];
+    let all = runs(ct, units, ARGMAX_RUN_MAX);
+    let out = DramTensor::alloc(alloc, 1, 32 * all.len())?;
+    let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
+    let mut jobs = Vec::with_capacity(all.len());
+    let mut starts = Vec::with_capacity(all.len());
+    let body = select::accumulate(a.cols - 1);
+    let fold = select::fold();
     for (j, run) in all.into_iter().enumerate() {
         let len = run.len();
-        let half = pipelined.then(|| half_of(j, units));
-        let (layout, roles) = match reduce_programs(op, axis, len, per, valid, half) {
-            Ok(p) => p,
+        let layout = match reduce::plan_layout(1, len) {
+            Ok(l) => l,
             Err(e) => {
                 alloc.free(&out.placement);
-                return Err(e);
+                return Err(TensorError::Shape(e.to_string()));
             }
         };
-        let (flags, grid_rt) = match axis {
-            Axis::Cols => (0, 0),
-            Axis::Rows => (4, rt as u32),
-        };
+        let (roles, loops) = select::roles(
+            &layout,
+            len,
+            &select::prologue(32 * run.start),
+            &body,
+            &fold,
+        );
+        let (roles, loops) = (Arc::new(roles), Arc::new(loops));
+        starts.push(32 * run.start);
         let gather = [
             [
                 record::READ_RUN,
-                (run.start * per) as u32,
-                (len * per) as u32,
+                run.start as u32,
+                len as u32,
                 layout.in_at as u32,
-                flags,
+                0,
                 ct as u32,
-                grid_rt,
+                0,
                 0,
             ],
             ra.encode()[0],
@@ -2600,8 +5688,8 @@ pub fn sfpu_reduce(
         let scatter = [
             [
                 record::WRITE_RUN,
-                run.start as u32,
-                len as u32,
+                j as u32,
+                1,
                 layout.out_at as u32,
                 0,
                 0,
@@ -2613,23 +5701,90 @@ pub fn sfpu_reduce(
         ];
         jobs.push(vec![
             Step::List {
-                what: "reduce gather",
+                what: "argmax gather",
                 entries: gather.to_vec(),
             },
             Step::Kernel {
                 roles,
                 init: layout.init.clone(),
                 mop: Box::new([None; 3]),
-                loops: Default::default(),
-                half,
+                loops,
+                half: None,
             },
             Step::List {
-                what: "reduce scatter",
+                what: "argmax scatter",
                 entries: scatter.to_vec(),
             },
         ]);
     }
-    Ok(Work { out, jobs })
+    Ok((Work { out, jobs }, starts))
+}
+
+/// Phase 2 of a row's argmax: one job over [`argmax_partials`]' tiles, in order, each index moved
+/// by its run's first column (`starts`); the chosen index as an I32 `[1, 1]`.
+pub fn argmax_choose(
+    alloc: &mut DramAlloc,
+    partials: &DramTensor,
+    starts: &[usize],
+) -> Result<Work> {
+    use crate::sfpu::{reduce, select};
+    let pt = partials.grid()[1];
+    if pt != starts.len() || partials.rows != 1 {
+        return Err(TensorError::Shape(format!(
+            "an argmax's {pt} partials for {} runs",
+            starts.len()
+        )));
+    }
+    let layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (roles, loops) = select::roles(
+        &layout,
+        pt,
+        &select::choice_prologue(),
+        &select::combine(),
+        &select::index_out(),
+    );
+    let (roles, loops) = (Arc::new(roles), Arc::new(loops));
+    let out = DramTensor::alloc_elem(alloc, 1, 1, Elem::I32)?;
+    let (rp, ro) = (partials.tensor_ref(), out.tensor_ref());
+    let gather = [
+        [
+            record::READ_RUN,
+            0,
+            pt as u32,
+            layout.in_at as u32,
+            0,
+            pt as u32,
+            0,
+            0,
+        ],
+        rp.encode()[0],
+        rp.encode()[1],
+    ];
+    let scatter = [
+        [record::WRITE_RUN, 0, 1, layout.out_at as u32, 0, 0, 0, 0],
+        ro.encode()[0],
+        ro.encode()[1],
+    ];
+    Ok(Work {
+        out,
+        jobs: vec![vec![
+            Step::List {
+                what: "argmax choice gather",
+                entries: gather.to_vec(),
+            },
+            Step::Kernel {
+                roles,
+                init: layout.init.clone(),
+                mop: Box::new([None; 3]),
+                loops,
+                half: None,
+            },
+            Step::List {
+                what: "argmax choice scatter",
+                entries: scatter.to_vec(),
+            },
+        ]],
+    })
 }
 
 /// Inclusive scan down matrix rows. Each column tile is a job, so its
@@ -2714,133 +5869,75 @@ pub fn sfpu_scan(
     Ok(Work { out, jobs })
 }
 
-/// Long reductions carry the full, unfolded accumulator tile in GDDR.
-/// Each output group stays on one unit and reloads only after NC releases
-/// the preceding batch. Folding occurs once, in the final chunk.
-fn reduce_chunked(
-    alloc: &mut DramAlloc,
-    a: &DramTensor,
-    op: crate::sfpu::reduce::ReduceOp,
-    axis: crate::sfpu::reduce::Axis,
-    units: usize,
-) -> Result<Work> {
-    use crate::sfpu::reduce::{continuation_roles, plan_chunk_layout, Axis, ROW_CHUNK};
-    let [rt, ct] = a.grid();
-    let (outs, per, valid, dims) = match axis {
-        Axis::Cols => (rt, ct, a.cols % 32, [a.rows, 1]),
-        Axis::Rows => (ct, rt, a.rows % 32, [1, a.cols]),
-    };
-    let valid = if valid == 0 { 32 } else { valid as u32 };
-    let c = plan_chunk_layout(1).map_err(|e| TensorError::Shape(e.to_string()))?;
-    let out = DramTensor::alloc_elem(alloc, dims[0], dims[1], op.elem())?;
-    let mut jobs = Vec::new();
-    // One output tile per job bounds the largest continuation program.
-    // All chunks of that output remain on the same unit.
-    let _ = units;
-    for output in 0..outs {
-        let mut steps = Vec::new();
-        for first in (0..per).step_by(ROW_CHUNK) {
-            let count = ROW_CHUNK.min(per - first);
-            let last = first + count == per;
-            let mut gather = Vec::new();
-            if first > 0 {
-                // Reload depends on the preceding GDDR write, even though
-                // its L1 destination is separate from the packer's output.
-                gather.push([tt_isa::dm::op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
-                gather.extend([
-                    [
-                        record::READ_RUN,
-                        output as u32,
-                        1,
-                        c.prior_at as u32,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
-                    out.tensor_ref().encode()[0],
-                    out.tensor_ref().encode()[1],
-                ]);
-            }
-            gather.extend([
-                [
-                    record::READ_RUN,
-                    (output * per + first) as u32,
-                    count as u32,
-                    c.layout.in_at as u32,
-                    if axis == Axis::Rows { 4 } else { 0 },
-                    ct as u32,
-                    if axis == Axis::Rows { rt as u32 } else { 0 },
-                    0,
-                ],
-                a.tensor_ref().encode()[0],
-                a.tensor_ref().encode()[1],
-            ]);
-            steps.push(Step::List {
-                what: "reduce continuation gather",
-                entries: gather,
-            });
-            steps.push(Step::Kernel {
-                roles: Arc::new(continuation_roles(
-                    &c,
-                    op,
-                    axis,
-                    first > 0,
-                    count,
-                    if last { valid } else { 32 },
-                    last,
-                )),
-                init: c.layout.init.clone(),
-                mop: Box::new([None; 3]),
-                loops: Default::default(),
-                half: None,
-            });
-            steps.push(Step::List {
-                what: "reduce continuation scatter",
-                entries: vec![
-                    [
-                        record::WRITE_RUN,
-                        output as u32,
-                        1,
-                        c.layout.out_at as u32,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ],
-                    out.tensor_ref().encode()[0],
-                    out.tensor_ref().encode()[1],
-                ],
-            });
-        }
-        jobs.push(steps);
-    }
-    Ok(Work { out, jobs })
-}
-
-type ReducePrograms = (crate::sfpu::reduce::Layout, Arc<[Vec<Instruction>; 3]>);
+pub(crate) type ReducePrograms = (
+    crate::sfpu::reduce::Layout,
+    Arc<[Vec<Instruction>; 3]>,
+    Arc<[Vec<crate::code::Loop>; 3]>,
+);
 
 /// Most output tiles one reduce run may take, from the slots the data arena
 /// (half of it, if `half`) holds and the role programs' length per output
 /// tile; `None` if not even one fits.
-fn reduce_group(
+/// An exact unary kind and its scalar's bits, applied to a reduction's result before its pack
+/// ([`sfpu_reduce_then`]).
+pub type ReduceThen = Option<(u32, u32)>;
+
+/// A reduction's finishing program: the fold, then `then`'s kind in place on the result
+/// (`sfpu::ops::exact_in_place`). `None` if `then` names no exact unary kind.
+fn finishing(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    then: ReduceThen,
+) -> Option<Vec<tt_isa::isa::Instruction>> {
+    let mut fin = crate::sfpu::reduce::finish(op, axis);
+    if let Some((kind, s)) = then {
+        fin.extend(crate::sfpu::ops::exact_in_place(
+            kind,
+            [f32::from_bits(s), 0.0],
+            crate::sfpu::kernel::OUT_ROW,
+        )?);
+    }
+    Some(fin)
+}
+
+/// Whether a reduction of a `[rows, cols]` tensor over `axis` with `then` runs as one tile's
+/// programs a run ([`sfpu_reduce_then`] takes it), not chunked.
+pub fn reduce_then_fits(
+    op: crate::sfpu::reduce::ReduceOp,
+    axis: crate::sfpu::reduce::Axis,
+    [rows, cols]: [usize; 2],
+    then: ReduceThen,
+) -> bool {
+    use crate::sfpu::reduce::Axis;
+    let (per, valid) = match axis {
+        Axis::Cols => (cols.div_ceil(32), cols % 32),
+        Axis::Rows => (rows.div_ceil(32), rows % 32),
+    };
+    let valid = if valid == 0 { 32 } else { valid as u32 };
+    reduce_group(op, axis, per, valid, false, then).is_some()
+}
+
+pub(crate) fn reduce_group(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     per: usize,
     valid: u32,
     half: bool,
+    then: ReduceThen,
 ) -> Option<usize> {
     use crate::sfpu::reduce::{Axis, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Memo = Mutex<HashMap<(ReduceOp, Axis, usize, u32, bool), Option<usize>>>;
+    // By the arena's end too (`crate::l1::arena`): a group is sized from it.
+    type Key = (ReduceOp, Axis, usize, u32, bool, ReduceThen, u64);
+    type Memo = Mutex<HashMap<Key, Option<usize>>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, per, valid, half);
+    let key = (op, axis, per, valid, half, then, crate::l1::arena().end);
     let memo = MEMO.get_or_init(Default::default);
     if let Some(&g) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return g;
     }
-    let g = measure_reduce_group(op, axis, per, valid, half);
+    let g = measure_reduce_group(op, axis, per, valid, half, then);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, g);
@@ -2853,23 +5950,29 @@ fn measure_reduce_group(
     per: usize,
     valid: u32,
     half: bool,
+    then: ReduceThen,
 ) -> Option<usize> {
-    use crate::sfpu::reduce::{math_programs, plan_layout, roles};
+    use crate::sfpu::reduce::{math_programs, plan_layout, roles_code};
     const GROUP: usize = 64;
     let arena = if half {
-        crate::matmul::HALF
+        crate::matmul::half()
     } else {
-        tt_isa::l1::DATA.len()
+        crate::l1::arena().len()
     };
     let slots = (arena / TILE_SLOT) as usize;
     let by_slots = slots / (per + 1);
     if by_slots == 0 {
         return None;
     }
-    let (inputs, fin) = math_programs(op, axis, per, valid);
+    let (inputs, _) = math_programs(op, axis, per, valid);
+    let fin = finishing(op, axis, then)?;
+    // Measured, not the op's: not noted (`crate::l1::unnoted`), as an SFPU group's are.
     let lens = |n: usize| -> Option<[usize; 3]> {
-        let layout = plan_layout(n, per).ok()?;
-        Some(roles(&layout, &inputs, &fin).map(|p| p.len()))
+        let layout = crate::l1::unnoted(|| plan_layout(n, per)).ok()?;
+        // As stored: a repeated block once, with its loop table
+        // (`sfpu::reduce::roles_code`).
+        let (code, loops) = roles_code(&layout, &inputs, &fin);
+        Some(std::array::from_fn(|t| code[t].len() + loops[t].len() + 1))
     };
     let max = tt_isa::mailbox::PROGRAM_MAX as usize;
     let one = lens(1)?;
@@ -2879,45 +5982,75 @@ fn measure_reduce_group(
     if by_slots == 1 {
         return Some(1);
     }
+    // Two outputs and three: looped, a further output costs nothing.
     let two = lens(2)?;
+    if two.iter().any(|&l| l > max) {
+        return Some(1);
+    }
+    if by_slots == 2 {
+        return Some(2);
+    }
+    let three = lens(3)?;
     let by_program = (0..3)
         .map(|r| {
-            let per_out = (two[r] - one[r]).max(1);
-            (max - (one[r] - per_out)) / per_out
+            let per_out = three[r].saturating_sub(two[r]);
+            let fixed = two[r].saturating_sub(2 * per_out);
+            (max - fixed).checked_div(per_out).unwrap_or(usize::MAX)
         })
         .min()
         .unwrap();
     Some(GROUP.min(by_slots).min(by_program).max(1))
 }
 
-/// One run's layout and role programs; `half` as for [`sfpu_programs`].
-fn reduce_programs(
+/// One run's layout and role programs over the L1 it was given; `half` and `l1` as for
+/// [`sfpu_programs`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reduce_programs(
     op: crate::sfpu::reduce::ReduceOp,
     axis: crate::sfpu::reduce::Axis,
     len: usize,
     per: usize,
     valid: u32,
     half: Option<u8>,
+    then: ReduceThen,
+    l1: &crate::l1::Placed,
 ) -> Result<ReducePrograms> {
-    use crate::sfpu::reduce::{math_programs, plan_layout, plan_layout_in, roles, Axis, ReduceOp};
+    use crate::sfpu::reduce::{math_programs, roles_code, Axis, Layout, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (ReduceOp, Axis, usize, usize, u32, Option<u8>);
+    type Key = (
+        ReduceOp,
+        Axis,
+        usize,
+        usize,
+        u32,
+        Option<u8>,
+        ReduceThen,
+        u64,
+    );
+    // By the arena's end too, which with `half` fixes where the layout was placed.
     type Memo = Mutex<HashMap<Key, ReducePrograms>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (op, axis, len, per, valid, half);
+    let key = (
+        op,
+        axis,
+        len,
+        per,
+        valid,
+        half,
+        then,
+        crate::l1::arena().end,
+    );
     let memo = MEMO.get_or_init(Default::default);
     if let Some(p) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(p.clone());
     }
-    let layout = match half {
-        None => plan_layout(len, per),
-        Some(h) => plan_layout_in(len, per, crate::matmul::half_arena())
-            .map(|l| l.shifted(h as u64 * crate::matmul::HALF)),
-    }
-    .map_err(|e| TensorError::Shape(e.to_string()))?;
-    let (inputs, fin) = math_programs(op, axis, per, valid);
-    let p = (layout.clone(), Arc::new(roles(&layout, &inputs, &fin)));
+    let layout = Layout::placed(len, per, l1);
+    let (inputs, _) = math_programs(op, axis, per, valid);
+    let fin = finishing(op, axis, then)
+        .ok_or_else(|| TensorError::Shape("a reduction's finishing kind is no exact one".into()))?;
+    let (roles, loops) = roles_code(&layout, &inputs, &fin);
+    let p = (layout.clone(), Arc::new(roles), Arc::new(loops));
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(key, p.clone());
@@ -2944,7 +6077,7 @@ pub fn sum_rows(
         0 => 32,
         v => v,
     };
-    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid, false).is_some() {
+    if reduce_group(ReduceOp::Sum, Axis::Rows, rt, valid, false, None).is_some() {
         return sfpu_reduce(alloc, a, ReduceOp::Sum, Axis::Rows, units, overlap);
     }
     // Longer columns stay plain: each chunk gathers the sums the chunk before
@@ -3044,9 +6177,19 @@ pub fn sum_rows(
 /// role programs' length; `None` if not even one fits.
 fn chunk_group() -> Option<usize> {
     use crate::sfpu::reduce::{chunk_roles, plan_chunk_layout, ROW_CHUNK};
-    static MEMO: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *MEMO.get_or_init(|| {
-        let slots = (tt_isa::l1::DATA.len() / TILE_SLOT) as usize;
+    // By the arena's end (`crate::l1::arena`).
+    static MEMO: std::sync::Mutex<std::collections::BTreeMap<u64, Option<usize>>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let arena = crate::l1::arena();
+    if let Some(&g) = MEMO
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&arena.end)
+    {
+        return g;
+    }
+    let g = (|| {
+        let slots = (arena.len() / TILE_SLOT) as usize;
         let by_slots = slots / (ROW_CHUNK + 2);
         let lens = |n: usize| -> Option<[usize; 3]> {
             let c = plan_chunk_layout(n).ok()?;
@@ -3066,7 +6209,11 @@ fn chunk_group() -> Option<usize> {
             .min()
             .unwrap();
         Some(64.min(by_slots).min(by_program).max(1))
-    })
+    })();
+    MEMO.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(arena.end, g);
+    g
 }
 
 /// [`sum_rows`]'s padding rules. It reads only a ragged tensor's valid rows
@@ -3100,6 +6247,33 @@ impl OpPadding for MatmulPadding {
     fn produces(&self, _: &[&DramTensor]) -> Pad {
         Pad::Zero
     }
+}
+
+/// For `op(A) @ op(B)`, per operand: is its `K` whole tiles while it has padding
+/// elsewhere? Then its padding is all off `K` -- `op(A)`'s past `M`, `op(B)`'s past
+/// `N` -- where it reaches only the output's padding rows (columns), never a real
+/// datum, so the operand needs no refill whatever it holds there; the output's
+/// padding is then undefined unless the operand's was zero. `false` for an
+/// operand with no padding at all, or with padding along `K`, which the matmul
+/// needs zero ([`MatmulPadding`]).
+pub fn matmul_padding_off_k(
+    a: &DramTensor,
+    a_transposed: bool,
+    b: &DramTensor,
+    b_transposed: bool,
+) -> [bool; 2] {
+    // `(K, the other)` of each operand as stored.
+    let (ak, am) = if a_transposed {
+        (a.rows, a.cols)
+    } else {
+        (a.cols, a.rows)
+    };
+    let (bk, bn) = if b_transposed {
+        (b.cols, b.rows)
+    } else {
+        (b.rows, b.cols)
+    };
+    [ak % 32 == 0 && am % 32 != 0, bk % 32 == 0 && bn % 32 != 0]
 }
 
 impl Eltwise {
@@ -3138,6 +6312,9 @@ impl Eltwise {
             POW_S => s > 0.0,
             // `g (1/2)` and `g 0 1`: zero with the gradient's padding.
             GELU_BACKWARD | SIGMOID_BACKWARD | LOG_SIGMOID_BACKWARD => b_zero,
+            // `0 * 0.5`, then times `y`.
+            SILU => true,
+            SILU_MUL => b_zero,
             // `atan2(+0, +0) = +0`.
             ATAN2 => b_zero,
             // `((0 % s) + s) % s` is a zero (the sign of `s`) for a
@@ -3228,12 +6405,12 @@ impl OpPadding for Eltwise {
 /// Its padding is the source tiles' -- the parent's data, for a view -- so
 /// undefined unless `t`'s is zero.
 pub fn copy(alloc: &mut DramAlloc, t: &DramTensor, units: usize) -> Result<Work> {
-    const GROUP: usize = 128;
-    let stage = staging("copy slots", GROUP)?;
+    let group = arena_group(128);
+    let stage = staging("copy slots", group)?;
     let out = DramTensor::alloc_elem(alloc, t.rows, t.cols, t.elem)?;
     let [rt, ct] = t.grid();
     let (rs, ro) = (t.tensor_ref(), out.tensor_ref());
-    let jobs = runs(rt * ct, units, GROUP)
+    let jobs = runs(rt * ct, units, group)
         .into_iter()
         .map(|run| {
             let (first, count) = (run.start as u32, run.len() as u32);
@@ -3278,11 +6455,11 @@ pub fn copy_into(src: &DramTensor, dst: &DramTensor, units: usize) -> Result<Wor
             src.rows, src.cols, src.elem, dst.rows, dst.cols, dst.elem
         )));
     }
-    const GROUP: usize = 128;
-    let stage = staging("copy slots", GROUP)?;
+    let group = arena_group(128);
+    let stage = staging("copy slots", group)?;
     let [rt, ct] = src.grid();
     let (rs, ro) = (src.tensor_ref(), dst.tensor_ref());
-    let jobs = runs(rt * ct, units, GROUP)
+    let jobs = runs(rt * ct, units, group)
         .into_iter()
         .map(|run| {
             let (first, count) = (run.start as u32, run.len() as u32);
@@ -3347,7 +6524,7 @@ pub fn copy_blocks(
     [rows, cols]: [usize; 2],
     units: usize,
 ) -> Result<Work> {
-    const GROUP: usize = 128;
+    let group = arena_group(128);
     let out = DramTensor::alloc_elem(alloc, rows, cols, t.elem)?;
     let checked = (|| {
         let [ort, oct] = out.grid();
@@ -3389,13 +6566,13 @@ pub fn copy_blocks(
             return Err(e);
         }
     };
-    let stage = staging("copy slots", GROUP)?;
+    let stage = staging("copy slots", group)?;
     let per = units.div_ceil(moves.len().max(1)).max(1);
     let mut jobs = Vec::new();
     for (rs, ro, [r, c], transposed) in refs {
         let ct = c.div_ceil(32);
         let flags = if transposed { 8 } else { 0 };
-        for run in runs(r.div_ceil(32) * ct, per, GROUP) {
+        for run in runs(r.div_ceil(32) * ct, per, group) {
             let (first, count) = (run.start as u32, run.len() as u32);
             jobs.push(vec![Step::Transfer {
                 what: "block copy list",
@@ -3451,6 +6628,10 @@ pub fn repack(
     repack_many(alloc, &[t], &mapping, [rows, cols])
 }
 
+/// The source tiles a [`repack_many`] batch reads before it copies: their reads are in flight
+/// together.
+const REPACK_SLOTS: usize = 32;
+
 /// Assemble raw datums from multiple resident tensors using static geometry.
 pub fn repack_many(
     alloc: &mut DramAlloc,
@@ -3473,10 +6654,15 @@ pub fn repack_many(
         return Err(TensorError::Shape("invalid native repack mapping".into()));
     }
     let mut req = crate::l1::Requirements::new(1);
-    let input = req.scratch("repack source tile", TILE_SLOT, 64, 0..1);
+    let input = req.scratch(
+        "repack source tiles",
+        REPACK_SLOTS as u64 * TILE_SLOT,
+        64,
+        0..1,
+    );
     let output = req.scratch("repack destination tile", TILE_SLOT, 64, 0..1);
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (input, output) = (layout.addr(input), layout.addr(output));
     let out = DramTensor::alloc_elem(alloc, rows, cols, t.elem)?;
@@ -3506,76 +6692,104 @@ pub fn repack_many(
                 0,
                 0,
             ];
+            let write = vec![
+                [
+                    record::WRITE_RUN,
+                    (i * ct + j) as u32,
+                    1,
+                    output as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                out.tensor_ref().encode()[0],
+                out.tensor_ref().encode()[1],
+            ];
+            // A batch reads its source tiles into slots of their own, all of them before any copy
+            // (B waits for the preceding reads before a `COPY_WORDS`, so the reads are in flight
+            // together), then copies their words in the order one slot would have.
             let mut batches = Vec::new();
-            let mut read = Vec::new();
-            let flush = |read: &mut Vec<[u32; 8]>, batches: &mut Vec<TransferBatch>| {
-                if read.is_empty() {
+            let (mut reads, mut copies) = (Vec::new(), Vec::<[u32; 8]>::new());
+            let flush = |reads: &mut Vec<[u32; 8]>,
+                         copies: &mut Vec<[u32; 8]>,
+                         batches: &mut Vec<TransferBatch>| {
+                if reads.is_empty() {
                     return;
                 }
+                let mut read = std::mem::take(reads);
+                read.append(copies);
                 batches.push(TransferBatch {
-                    read: std::mem::take(read),
-                    write: vec![
-                        [
-                            record::WRITE_RUN,
-                            (i * ct + j) as u32,
-                            1,
-                            output as u32,
-                            0,
-                            0,
-                            0,
-                            0,
-                        ],
-                        out.tensor_ref().encode()[0],
-                        out.tensor_ref().encode()[1],
-                    ],
+                    read,
+                    write: write.clone(),
                 });
             };
             for ((source, tile), mut words) in tiles {
                 let t = inputs[source];
                 words.sort_unstable();
                 let src = t.tile(tile / t.grid()[1], tile % t.grid()[1]);
-                let read_src = [
-                    op::READ,
-                    src.channel().index() as u32,
-                    0,
-                    src.offset() as u32,
-                    input as u32,
-                    TILE_SLOT as u32,
-                    0,
-                    0,
-                ];
+                // Consecutive words commonly cover a face-row. Merge
+                // them without assuming a tile-coherent logical view.
+                let mut merged = Vec::new();
                 let mut n = 0;
                 while n < words.len() {
-                    if read.len() >= 240 {
-                        flush(&mut read, &mut batches);
-                        read.push(read_prior);
+                    let (sr, dst) = words[n];
+                    let mut count = 1;
+                    while n + count < words.len() && words[n + count] == (sr + count, dst + count) {
+                        count += 1;
                     }
-                    read.push(read_src);
-                    // Consecutive words commonly cover a face-row. Merge
-                    // them without assuming a tile-coherent logical view.
-                    while n < words.len() && read.len() < 240 {
-                        let (sr, dst) = words[n];
-                        let mut count = 1;
-                        while n + count < words.len()
-                            && words[n + count] == (sr + count, dst + count)
-                        {
-                            count += 1;
-                        }
-                        read.push([
+                    merged.push((sr, dst, count));
+                    n += count;
+                }
+                // A tile whose copies do not fit one batch is read again for each part.
+                for part in merged.chunks(TRANSFER_SIDE_MAX - 2) {
+                    if reads.len() == REPACK_SLOTS
+                        || 1 + reads.len() + 1 + copies.len() + part.len() > TRANSFER_SIDE_MAX
+                    {
+                        flush(&mut reads, &mut copies, &mut batches);
+                    }
+                    if reads.is_empty() && !batches.is_empty() {
+                        reads.push(read_prior);
+                    }
+                    let slot = input + (reads.len() as u64) * TILE_SLOT;
+                    // Only the 64-byte span of the slot that holds the part's words (a decode row's
+                    // two face rows are 1,152 bytes of 4,160): a unit's reads are bound by its own
+                    // stream (~7 GB/s), not by their count. Slot offsets on both sides, so the read
+                    // keeps the C64 congruence.
+                    let (lo, hi) = part
+                        .iter()
+                        .fold((u64::MAX, 0), |(lo, hi), &(sr, _, count)| {
+                            (
+                                lo.min(TILE_DATA + 4 * sr as u64),
+                                hi.max(TILE_DATA + 4 * (sr + count) as u64),
+                            )
+                        });
+                    let (lo, hi) = (lo / 64 * 64, hi.next_multiple_of(64).min(TILE_SLOT));
+                    reads.push([
+                        op::READ,
+                        src.channel().index() as u32,
+                        0,
+                        (src.offset() + lo) as u32,
+                        (slot + lo) as u32,
+                        (hi - lo) as u32,
+                        0,
+                        0,
+                    ]);
+                    copies.extend(part.iter().map(|&(sr, dst, count)| {
+                        [
                             op::COPY_WORDS,
-                            (input + TILE_DATA + sr as u64 * 4) as u32,
+                            (slot + TILE_DATA + sr as u64 * 4) as u32,
                             (output + TILE_DATA + dst as u64 * 4) as u32,
                             count as u32,
                             4,
                             4,
                             0,
                             0,
-                        ]);
-                        n += count;
-                    }
+                        ]
+                    }));
                 }
             }
-            flush(&mut read, &mut batches);
+            flush(&mut reads, &mut copies, &mut batches);
             jobs.push(vec![Step::Transfer {
                 what: "native repack",
                 depth: 1,
@@ -3585,6 +6799,13 @@ pub fn repack_many(
     }
     Ok(Work { out, jobs })
 }
+
+/// [`gather_rows`]'s source for a row it leaves as its slot held it (nothing read).
+pub const GATHER_HOLE: usize = usize::MAX;
+
+/// The fewest rows a unit takes when [`gather_rows`] deals rows, not tiles: each unit in an op
+/// costs it a barrier arrival.
+pub const GATHER_DEAL_ROWS: usize = 4;
 
 /// A new `[rows.len(), cols]` tensor whose row `i` is row `rows[i].1` of
 /// `sources[rows[i].0]`, bit for bit: an embedding's lookup, and the rows a
@@ -3598,7 +6819,10 @@ pub fn repack_many(
 /// are built in staging slots (64-aligned) by B, then written out by NC, a few
 /// tiles to a batch ([`Step::Transfer`]). Two read entries a row a tile
 /// column, ~316 cycles each on the mover. Rows past the last in the last tile row are left as the
-/// slot held them: the output's padding is undefined there.
+/// slot held them: the output's padding is undefined there. So is a row whose source is
+/// [`GATHER_HOLE`]: nothing is read for it. With fewer output tiles than `units`, rows are dealt
+/// instead (at least [`GATHER_DEAL_ROWS`] a unit), and only the rows gathered are written: the
+/// others keep what GDDR held, as undefined.
 pub fn gather_rows(
     alloc: &mut DramAlloc,
     sources: &[&DramTensor],
@@ -3626,7 +6850,7 @@ pub fn gather_rows(
     if let Some((i, &(k, r))) = rows
         .iter()
         .enumerate()
-        .find(|(_, &(k, r))| k >= sources.len() || r >= sources[k].rows)
+        .find(|(_, &(k, r))| k != GATHER_HOLE && (k >= sources.len() || r >= sources[k].rows))
     {
         return Err(TensorError::Shape(format!(
             "a row gather's row {i} names row {r} of source {k}, which has none"
@@ -3642,6 +6866,60 @@ pub fn gather_rows(
     let [ort, oct] = out.grid();
     let face_row =
         |r: usize, h: usize| TILE_DATA + (((r / 16) * 2 + h) * 1024 + (r % 16) * 64) as u64;
+    if ort * oct < units {
+        // Fewer output tiles than units (a stacked product's `[heads, n]`): a tile's 32 rows on
+        // one unit would cost it 64 entries. Dealt by rows instead, each a read of its two face
+        // rows (1,024 bytes apart in any tile, so one 1,088-byte read lands both where the
+        // output row's go) into a slot of its own, and two 64-byte writes into place.
+        let items: Vec<(usize, usize, usize, usize)> = (0..oct)
+            .flat_map(|oj| {
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, &(k, _))| k != GATHER_HOLE)
+                    .map(move |(i, &(k, sr))| (i, oj, k, sr))
+            })
+            .collect();
+        let per = items.len().div_ceil(units).clamp(GATHER_DEAL_ROWS, GROUP);
+        let jobs = items
+            .chunks(per)
+            .map(|chunk| {
+                let (mut read, mut write) = (Vec::new(), Vec::new());
+                for (q, &(i, oj, k, sr)) in chunk.iter().enumerate() {
+                    let (from, slot) = (sources[k].tile(sr / 32, oj), stage + q as u64 * TILE_SLOT);
+                    let r = i % 32;
+                    read.push([
+                        op::READ,
+                        from.channel().index() as u32,
+                        (q % tt_isa::dram::PORTS as usize) as u32,
+                        (from.offset() + face_row(sr % 32, 0)) as u32,
+                        (slot + face_row(r, 0)) as u32,
+                        1024 + 64,
+                        0,
+                        0,
+                    ]);
+                    let to = out.tile(i / 32, oj);
+                    for h in 0..2 {
+                        write.push([
+                            op::WRITE,
+                            to.channel().index() as u32,
+                            0,
+                            (to.offset() + face_row(r, h)) as u32,
+                            (slot + face_row(r, h)) as u32,
+                            64,
+                            0,
+                            0,
+                        ]);
+                    }
+                }
+                vec![Step::Transfer {
+                    what: "row gather list",
+                    depth: 1,
+                    batches: vec![TransferBatch { read, write }],
+                }]
+            })
+            .collect();
+        return Ok(Work { out, jobs });
+    }
     // Output tiles go in batches of `PER_BATCH`: its 64 face-row reads a tile
     // must fit a packet's side, and two batches alternate halves of the
     // staging so NC writes one out while B reads the next.
@@ -3663,6 +6941,9 @@ pub fn gather_rows(
                     let slot = first_slot + k as u64 * TILE_SLOT;
                     for r in 0..32.min(rows.len() - oi * 32) {
                         let (src, sr) = rows[oi * 32 + r];
+                        if src == GATHER_HOLE {
+                            continue;
+                        }
                         let from = sources[src].tile(sr / 32, oj);
                         for h in 0..2 {
                             read.push([
@@ -3811,7 +7092,7 @@ pub fn write_rows(
 /// tiles only, dealt out in runs to `units` tiles. Nothing at all when `t`
 /// has no ragged edge.
 pub fn fill_pad(t: &DramTensor, value: f32, units: usize) -> Result<Vec<Job>> {
-    const GROUP: usize = 192;
+    let group = arena_group(192);
     let [rt, ct] = t.grid();
     let (rows, cols) = (t.rows % 32, t.cols % 32);
     let edges = if rows != 0 { ct } else { 0 }
@@ -3823,11 +7104,11 @@ pub fn fill_pad(t: &DramTensor, value: f32, units: usize) -> Result<Vec<Job>> {
     if edges == 0 {
         return Ok(Vec::new());
     }
-    let stage = staging("fill-pad slots", GROUP)?;
+    let stage = staging("fill-pad slots", group)?;
     let r = t.tensor_ref();
     // B reads each edge tile and fills its padding; NC writes it back. Batches
     // of half the staging alternate, so NC writes one while B fills the next.
-    const PER_BATCH: usize = GROUP / 2;
+    let per_batch = group / 2;
     let head = |op: u32, first: usize, count: usize, stage: u64| {
         [
             op,
@@ -3840,15 +7121,15 @@ pub fn fill_pad(t: &DramTensor, value: f32, units: usize) -> Result<Vec<Job>> {
             rt as u32,
         ]
     };
-    Ok(runs(edges, units, GROUP)
+    Ok(runs(edges, units, group)
         .into_iter()
         .map(|run| {
             let batches = (run.start..run.end)
-                .step_by(PER_BATCH)
+                .step_by(per_batch)
                 .enumerate()
                 .map(|(b, first)| {
-                    let count = PER_BATCH.min(run.end - first);
-                    let at = stage + (b % 2 * PER_BATCH) as u64 * TILE_SLOT;
+                    let count = per_batch.min(run.end - first);
+                    let at = stage + (b % 2 * per_batch) as u64 * TILE_SLOT;
                     let side =
                         |op: u32| vec![head(op, first, count, at), r.encode()[0], r.encode()[1]];
                     TransferBatch {
@@ -3899,10 +7180,29 @@ pub mod stats {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocks, metadata, reference, runs, DramAlloc, DramTensor, Elem, Eltwise, Job,
-        MatmulPadding, OpPadding, Pad, PadNeed, Step, SumRows, TransferBatch, TRANSFER_SIDE_MAX,
+        block_repeats, blocks, broadcast_of, metadata, pipelined_runs, reference, row_runs, runs,
+        set_col_once, sfpu_eltwise, DramAlloc, DramTensor, Elem, Eltwise, Job, MatmulPadding,
+        OpPadding, Overlap, Pad, PadNeed, Step, SumRows, TransferBatch, TILE_SLOT,
+        TRANSFER_SIDE_MAX,
     };
     use crate::kind;
+
+    /// A placement allocated after a snapshot was free then, though its slots were in use at the
+    /// snapshot: what held them was freed and reused since. Before that rule, a slot in use at a
+    /// trace's end was the trace's for good, and an eager op's buffer landing on it could not be
+    /// freed while the trace lived.
+    #[test]
+    fn a_placement_allocated_after_a_snapshot_was_free_then() {
+        let mut alloc = DramAlloc::new(&tt_isa::dram::Dram::FULL);
+        let a = alloc.alloc(64).unwrap();
+        let snapshot = alloc.snapshot();
+        assert!(!snapshot.was_free(&a), "in use then");
+        alloc.free(&a);
+        let b = alloc.alloc(64).unwrap();
+        assert_eq!(b.base, a.base, "on the same slots");
+        assert!(snapshot.was_free(&b));
+        assert!(!snapshot.was_free(&a), "what was in use then still was");
+    }
     use tt_isa::dm::TILE_DATA;
     use tt_isa::dm::{fill, op, record};
     use tt_isa::dram::Dram;
@@ -3970,6 +7270,9 @@ mod tests {
                     Some(Elem::F32) | None => floats.to_vec(),
                     Some(Elem::Bool) => vec![f32::from_bits(1)],
                     Some(Elem::I32) => [1, u32::MAX, 0x8000_0000].map(f32::from_bits).to_vec(),
+                    Some(Elem::Packed(_)) => {
+                        unreachable!("no element-wise kind takes a packed weight")
+                    }
                 }
             };
             for s in scalars {
@@ -4006,6 +7309,246 @@ mod tests {
             }
         }
         assert!(checked > 100, "{checked}");
+    }
+
+    /// [`row_runs`] cover every tile once, in order, each run inside one tile row and at most
+    /// `max` tiles, two a unit where pipelined; never spread over fewer units than the runs they
+    /// replace when those were one a unit; and give way where a row is shorter than a pipelined
+    /// run or the runs could not give every unit two.
+    /// What a column broadcast's runs move a tile, as `tile_op::distribute` counts them: `A`
+    /// and `B` in and the result out, `A` in and the result out with `B` held, and `B` once.
+    const COL_BROADCAST: [usize; 3] = [3, 2, 1];
+
+    #[test]
+    fn row_runs_keep_to_tile_rows() {
+        let piped = |rt: usize, ct: usize, units: usize, max: usize| {
+            pipelined_runs(rt * ct, 1, units, max, Overlap::Captured).unwrap()
+        };
+        for (rt, ct, units, max, pipelined) in [
+            (64, 256, 120, 36, true),
+            (512, 256, 120, 36, true),
+            (64, 256, 120, 64, false),
+            (3, 80, 5, 20, true),
+            (1, 300, 1, 64, false),
+            (1, 256, 120, 64, false),
+            (7, 41, 3, 14, true),
+        ] {
+            let old = if pipelined {
+                piped(rt, ct, units, max)
+            } else {
+                runs(rt * ct, units, max)
+            };
+            let r = row_runs(rt, ct, units, max, pipelined, &old, COL_BROADCAST)
+                .unwrap_or_else(|| panic!("[{rt}, {ct}] on {units}: no row runs"));
+            let mut next = 0;
+            for run in &r {
+                assert_eq!(run.start, next, "[{rt}, {ct}]: contiguous");
+                assert!(!run.is_empty() && run.len() <= max, "[{rt}, {ct}]: {run:?}");
+                assert_eq!(
+                    run.start / ct,
+                    (run.end - 1) / ct,
+                    "[{rt}, {ct}]: {run:?} in one row"
+                );
+                next = run.end;
+            }
+            assert_eq!(next, rt * ct);
+            if pipelined {
+                assert!(
+                    r.len() >= 2 * units,
+                    "[{rt}, {ct}]: {} runs on {units}",
+                    r.len()
+                );
+            }
+            assert!(
+                r.len() >= old.len().min(units),
+                "[{rt}, {ct}]: {} runs where {} were",
+                r.len(),
+                old.len()
+            );
+        }
+        // A chunk's RMSNorm division (`[64, 2048]` by `[64, 1]`): cut by rows at the fewest runs,
+        // four units took 32 tiles each where 120 took one or two (the first rule; the 1.7B's
+        // prefill at 1,000 tokens 8% slower). Costed, it keeps every unit.
+        let r = row_runs(2, 64, 120, 64, false, &runs(128, 120, 64), COL_BROADCAST).unwrap();
+        assert!(r.len() >= 120, "{} runs", r.len());
+        assert_eq!(
+            row_runs(
+                512,
+                8,
+                120,
+                36,
+                true,
+                &piped(512, 8, 120, 36),
+                COL_BROADCAST
+            ),
+            None,
+            "a row shorter than a pipelined run"
+        );
+        assert_eq!(
+            row_runs(2, 256, 120, 36, true, &runs(512, 120, 12), COL_BROADCAST),
+            None,
+            "too few runs for every unit"
+        );
+    }
+
+    /// A column broadcast (`B` `[rows, 1]`) whose rows hold a run each reads, a run, `A`'s tiles
+    /// inside one tile row and that row's one tile of `B`, once, into one slot; switched off
+    /// ([`set_col_once`]), `B`'s tile beside every tile of `A` as before.
+    #[test]
+    fn a_column_broadcast_reads_its_row_s_tile_once_a_run() {
+        let op = Eltwise {
+            kind: crate::sfpu::ops::kind_sfpu::DIV,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let (rows, cols) = (96, 32 * 80);
+        let a = DramTensor::alloc_elem(&mut alloc, rows, cols, Elem::F32).unwrap();
+        let b = DramTensor::alloc_elem(&mut alloc, rows, 1, Elem::F32).unwrap();
+        let ct = a.grid()[1];
+        let b_ref = b.tensor_ref().encode();
+        let tile_of = |e: &[[u32; 8]]| {
+            let mut out = Vec::new();
+            expanded(e, &mut out);
+            out.into_iter().map(|e| e.unwrap()).collect::<Vec<_>>()
+        };
+        for (units, overlap) in [
+            (1, Overlap::Off),
+            (5, Overlap::Captured),
+            (4, Overlap::Fresh),
+        ] {
+            let work = sfpu_eltwise(&mut alloc, op, &a, Some(&b), None, units, overlap, None)
+                .unwrap()
+                .unwrap();
+            for job in &work.jobs {
+                let Step::List { entries, .. } = &job[0] else {
+                    panic!("a job begins with its gather")
+                };
+                let (first, count) = (entries[0][1] as usize, entries[0][2] as usize);
+                assert_eq!(first / ct, (first + count - 1) / ct, "a run inside one row");
+                assert_eq!(entries[3][2], 1, "one tile of B a run");
+                let reads = tile_of(&entries[3..6]);
+                assert_eq!(reads.len(), 1);
+                let want = tile_of(&[
+                    [record::READ_RUN, (first / ct) as u32, 1, 0, 0, 1, 0, 0],
+                    b_ref[0],
+                    b_ref[1],
+                ]);
+                assert_eq!(
+                    (reads[0][1], reads[0][3]),
+                    (want[0][1], want[0][3]),
+                    "row {}'s tile",
+                    first / ct
+                );
+            }
+            alloc.free(&work.out.placement);
+        }
+        let _held = super::SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
+        let was = set_col_once(false);
+        let work = sfpu_eltwise(
+            &mut alloc,
+            op,
+            &a,
+            Some(&b),
+            None,
+            5,
+            Overlap::Captured,
+            None,
+        );
+        set_col_once(was);
+        let work = work.unwrap().unwrap();
+        for job in &work.jobs {
+            let Step::List { entries, .. } = &job[0] else {
+                panic!("a job begins with its gather")
+            };
+            assert_eq!(
+                entries[3][2], entries[0][2],
+                "off: B's tile beside every tile of A"
+            );
+        }
+        alloc.free(&work.out.placement);
+    }
+
+    /// A [`Broadcast::Block`] op reads, beside each of `A`'s tiles `(i, j)`, `B`'s tile
+    /// `(i % B's tile rows, j)`: what a gather expanding `B` to `A`'s shape would have put in the
+    /// slot, over runs that start anywhere in a repeat and span several (one unit, several units,
+    /// both overlaps), with nothing else of `B` read.
+    ///
+    /// [`Broadcast::Block`]: crate::sfpu::ops::Broadcast::Block
+    #[test]
+    fn a_block_broadcast_reads_b_s_tile_rows_again_down_a() {
+        use crate::sfpu::ops::Broadcast;
+        let op = Eltwise {
+            kind: crate::kind::ADD,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let mut checked = 0;
+        for (b_rows, repeats, cols) in [(32, 2, 32), (64, 4, 96), (64, 3, 40), (96, 2, 300)] {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc_elem(&mut alloc, b_rows * repeats, cols, Elem::F32).unwrap();
+            let b = DramTensor::alloc_elem(&mut alloc, b_rows, cols, Elem::F32).unwrap();
+            assert_eq!(broadcast_of(op, &a, Some(&b)).unwrap().1, Broadcast::Block);
+            assert_eq!(block_repeats(&a, &b), Some(repeats));
+            let ([_, ct], [brt, _]) = (a.grid(), b.grid());
+            // What `B`'s tile `t` is read from, by a one-tile plain run.
+            let b_ref = b.tensor_ref().encode();
+            let source = |t: usize| {
+                let mut out = Vec::new();
+                expanded(
+                    &[
+                        [record::READ_RUN, t as u32, 1, 0, 0, ct as u32, 0, 0],
+                        b_ref[0],
+                        b_ref[1],
+                    ],
+                    &mut out,
+                );
+                let e = out[0].clone().unwrap();
+                (e[1], e[3])
+            };
+            for (units, overlap) in [
+                (1, Overlap::Off),
+                (3, Overlap::Fresh),
+                (5, Overlap::Captured),
+            ] {
+                let work = sfpu_eltwise(&mut alloc, op, &a, Some(&b), None, units, overlap, None)
+                    .unwrap()
+                    .unwrap();
+                for job in &work.jobs {
+                    let Step::List { entries, .. } = &job[0] else {
+                        panic!("a job begins with its gather")
+                    };
+                    // `A`'s run first, then `B`'s records.
+                    let (first, count) = (entries[0][1] as usize, entries[0][2] as usize);
+                    let b_at = entries[3][3];
+                    let mut reads = Vec::new();
+                    expanded(&entries[3..], &mut reads);
+                    let reads: Vec<[u32; 8]> = reads.into_iter().map(Result::unwrap).collect();
+                    assert_eq!(reads.len(), count, "a tile of B beside each tile of A");
+                    for (n, e) in reads.iter().enumerate() {
+                        let t = first + n;
+                        let (i, j) = (t / ct, t % ct);
+                        assert_eq!(e[4], b_at + (n as u64 * TILE_SLOT) as u32, "slot {n}");
+                        assert_eq!(
+                            (e[1], e[3]),
+                            source((i % brt) * ct + j),
+                            "A's tile ({i}, {j}) reads B's ({}, {j})",
+                            i % brt
+                        );
+                        checked += 1;
+                    }
+                }
+                alloc.free(&work.out.placement);
+            }
+        }
+        assert!(checked > 100, "{checked}");
+        // Not a block: a `B` whose rows are not whole tiles, or do not divide `A`'s.
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let a = DramTensor::alloc_elem(&mut alloc, 128, 64, Elem::F32).unwrap();
+        for rows in [16, 48, 96] {
+            let b = DramTensor::alloc_elem(&mut alloc, rows, 64, Elem::F32).unwrap();
+            assert!(broadcast_of(op, &a, Some(&b)).is_err(), "[{rows}, 64]");
+        }
     }
 
     /// `entries` with each record expanded, appended to `out`.
@@ -4278,6 +7821,854 @@ mod tests {
             }
         }
     }
+
+    /// A thin product's columns are dealt so that the busiest unit holds the
+    /// fewest a balanced deal can give it, `ceil(nt / units)`, in jobs no wider
+    /// than the plan's block, covering every column once and in order -- and
+    /// never more than [`blocks`]' deal gave it. Not for `K` blocked, a
+    /// pipelined staging, more than one tile row, or no more columns than units.
+    /// [`weighted_counts`] sums to its total, in proportion, the remainder to the larger remainders
+    /// and then the later parts.
+    #[test]
+    fn weighted_counts_cut_a_total_in_proportion() {
+        use super::weighted_counts;
+        assert_eq!(weighted_counts(10, &[1, 1, 1]), [3, 3, 4]);
+        assert_eq!(
+            weighted_counts(10, &[0, 0, 0]),
+            [3, 3, 4],
+            "all zero is even"
+        );
+        assert_eq!(weighted_counts(6, &[1, 2, 3]), [1, 2, 3]);
+        assert_eq!(weighted_counts(7, &[1, 2, 3]), [1, 2, 4]);
+        assert_eq!(weighted_counts(5, &[3, 1]), [4, 1]);
+        assert_eq!(weighted_counts(0, &[5, 1]), [0, 0]);
+        assert_eq!(weighted_counts(4, &[]), Vec::<usize>::new());
+        for total in [0, 1, 17, 272, 1000] {
+            for w in [&[1u32, 7, 3, 0, 2][..], &[9; 120][..]] {
+                assert_eq!(weighted_counts(total, w).iter().sum::<usize>(), total);
+            }
+        }
+    }
+
+    /// [`dealt_runs`] covers every column once, in order of rounds, at most `nc` a run: each own
+    /// unit's first run `nc` wide, then each unit's share by weight; a deal whose first round would
+    /// not fit is `None`.
+    #[test]
+    fn dealt_runs_cover_every_column_once_by_weight() {
+        use super::dealt_runs;
+        // The 1.7B's `gate|up`: 512 columns, 48 read ahead by 24 prefetching units (96..120), the
+        // rest over 96 own units at `nc` 2.
+        let deal: Vec<usize> = (0..120).collect();
+        let runs = dealt_runs(48..512, 2, 96, &deal, &[]).unwrap();
+        let mut cover: Vec<usize> = runs.iter().flatten().flat_map(|r| r.clone()).collect();
+        cover.sort_unstable();
+        assert_eq!(cover, (48..512).collect::<Vec<_>>());
+        assert!(runs.iter().flatten().all(|r| !r.is_empty() && r.len() <= 2));
+        // Own units: their first job of 2, then 272 in-span columns over 120: 2 each, 32 left to
+        // the last 32 (units 88..120), so 88 own units read 2 in span and 8 own units 3.
+        let held = |d: usize| runs[d].iter().map(|r| r.len()).sum::<usize>();
+        assert!(runs[..96].iter().all(|r| r[0].len() == 2));
+        assert_eq!((held(0), held(87), held(88), held(95)), (4, 4, 5, 5));
+        assert_eq!((held(96), held(119)), (3, 3));
+        // Round 0 in order, then rounds over every unit: the first in-span run is unit 0's.
+        assert_eq!(runs[0][0], 48..50);
+        assert_eq!(runs[95][0], 238..240);
+        assert_eq!(runs[0][1], 240..242);
+        assert_eq!(runs[96][0], 242 + 2 * 95..242 + 2 * 95 + 2);
+        // Weights by unit: a unit of weight 0 takes nothing past its first job.
+        let mut w = vec![1u32; 120];
+        w[30] = 0;
+        let weighted = dealt_runs(48..512, 2, 96, &deal, &w).unwrap();
+        assert_eq!((weighted[30].len(), weighted[30][0].clone()), (1, 108..110));
+        // A deal over other units' indices reads their weights.
+        let other: Vec<usize> = (0..96).chain(100..124).collect();
+        let mut w = vec![1u32; 124];
+        w[123] = 0;
+        let r = dealt_runs(48..512, 2, 96, &other, &w).unwrap();
+        assert!(r[119].is_empty());
+        // No room for the first round.
+        assert_eq!(dealt_runs(0..191, 2, 96, &deal, &[]), None);
+        assert_eq!(dealt_runs(0..512, 0, 96, &deal, &[]), None);
+        assert_eq!(dealt_runs(0..512, 2, 96, &deal[..90], &[]), None);
+    }
+
+    /// X10's probe on the 1.7B's `gate|up` (`[1, 2048] @ [2048, 16384]`, 96 own units, 24
+    /// prefetching): the in-span columns go over all 120, every output column is written once, as
+    /// off, each prefetching unit's job read ahead stays its first, and each busy own unit's first
+    /// job still reads ahead.
+    #[test]
+    fn the_probe_deals_the_in_span_columns_over_the_prefetching_units_too() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let (units, spread, k, n) = (96, 120, 2048, 16384);
+        let prefetch: Vec<usize> = (units..spread).collect();
+        let busy = vec![Some(tt_isa::l1::DATA.base); units];
+        let built = |deal: Option<&[u32]>| {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+            let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+            let (work, dealt) = super::matmul_dram_prefetching(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                None,
+                super::Reads {
+                    thin: true,
+                    resident_a: true,
+                    unpack_b: false,
+                    packed_a: Some(p.tensor_ref()),
+                    stream_k: false,
+                    stream_prefetch: false,
+                    prefetch_units: [usize::MAX; 2],
+                    block_stream: super::BlockStream::Off,
+                    reuse: super::Reuse::Off,
+                    out: crate::matmul::Out::Fp32,
+                },
+                &prefetch,
+                spread,
+                &busy,
+                &[],
+                deal,
+            )
+            .unwrap();
+            assert_eq!(dealt, Some(spread));
+            work.jobs
+        };
+        let first = |job: &Job| match job.first() {
+            Some(Step::List { what, .. }) => Some(*what),
+            _ => None,
+        };
+        // Per unit: its output columns, its jobs, and what its first job starts with.
+        let per_unit = |jobs: &[Job]| {
+            let mut cols = vec![Vec::new(); spread];
+            let mut count = vec![0usize; spread];
+            let mut starts = vec![None; spread];
+            for (j, job) in jobs.iter().enumerate().filter(|(_, j)| !j.is_empty()) {
+                let u = j % spread;
+                if count[u] == 0 {
+                    starts[u] = first(job);
+                }
+                count[u] += 1;
+                for step in job {
+                    let Step::List { entries, .. } = step else {
+                        continue;
+                    };
+                    for e in entries.iter().filter(|e| e[0] == record::SCATTER) {
+                        cols[u].extend(e[5] as usize..(e[5] + e[6]) as usize);
+                    }
+                }
+            }
+            (cols, count, starts)
+        };
+        let (off_cols, off_count, off_starts) = per_unit(&built(None));
+        let (on_cols, on_count, on_starts) = per_unit(&built(Some(&[])));
+        let all = |cols: &[Vec<usize>]| {
+            let mut v: Vec<usize> = cols.iter().flatten().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(all(&off_cols), (0..n / 32).collect::<Vec<_>>());
+        assert_eq!(all(&on_cols), all(&off_cols), "every column once, as off");
+        // Off: the prefetching units run their one job; on, past it, the in-span columns.
+        assert!(off_count[units..].iter().all(|&c| c == 1));
+        assert!(on_count[units..].iter().all(|&c| c > 1));
+        let in_span = |c: &[Vec<usize>], u: usize| c[u].len() - 2;
+        let most = (0..spread).map(|u| in_span(&on_cols, u)).max().unwrap();
+        let least = (0..spread).map(|u| in_span(&on_cols, u)).min().unwrap();
+        assert_eq!((least, most), (2, 3), "272 in-span columns over 120");
+        assert_eq!(
+            (0..spread).map(|u| in_span(&off_cols, u)).max().unwrap(),
+            3,
+            "off, 80 own units read 3 in span"
+        );
+        for u in 0..spread {
+            let want = match u < units {
+                true => Some(super::BUSY_PREFETCH),
+                false => Some(super::PREFETCH),
+            };
+            assert_eq!(on_starts[u], want, "unit {u}");
+            assert_eq!(off_starts[u], want, "unit {u}, off");
+        }
+        // Weights move columns: unit 30 at weight 0 keeps only its first job.
+        let mut w = vec![1u32; spread];
+        w[30] = 0;
+        let (w_cols, ..) = per_unit(&built(Some(&w)));
+        assert_eq!(w_cols[30].len(), 2);
+        assert_eq!(all(&w_cols), all(&off_cols));
+    }
+
+    #[test]
+    fn thin_runs_give_no_unit_more_than_its_share() {
+        use super::thin_runs;
+        use crate::matmul::Staging;
+        let load = |cols: &mut dyn Iterator<Item = usize>, units: usize| {
+            let mut load = vec![0; units];
+            for (j, c) in cols.enumerate() {
+                load[j % units] += c;
+            }
+            load.into_iter().max().unwrap()
+        };
+        for units in [1, 7, 64, 120] {
+            for nc in [1, 2, 3] {
+                for nt in [
+                    units + 1,
+                    units * nc,
+                    units * nc + 1,
+                    2 * units * nc + units / 2 + 1,
+                    1536,
+                ] {
+                    let runs = thin_runs([1, 4, nt], [4, nc], Staging::Slots, units);
+                    if nt <= units {
+                        assert_eq!(runs, None);
+                        continue;
+                    }
+                    let runs = runs.unwrap();
+                    let mut next = 0;
+                    for r in &runs {
+                        assert_eq!(r.start, next);
+                        assert!(!r.is_empty() && r.len() <= nc, "{r:?} wider than {nc}");
+                        next = r.end;
+                    }
+                    assert_eq!(next, nt);
+                    let thin = load(&mut runs.iter().map(|r| r.len()), units);
+                    assert_eq!(thin, nt.div_ceil(units), "nt {nt} units {units} nc {nc}");
+                    let [_, bn] = blocks([1, nt], [1, nc], units);
+                    let whole = load(&mut (0..nt).step_by(bn).map(|j| bn.min(nt - j)), units);
+                    assert!(whole >= thin);
+                }
+            }
+        }
+        assert_eq!(thin_runs([1, 64, 256], [2, 2], Staging::Slots, 120), None);
+        assert_eq!(
+            thin_runs([1, 64, 256], [64, 2], Staging::SlotsHalf, 120),
+            None
+        );
+        assert_eq!(thin_runs([2, 64, 256], [64, 2], Staging::Slots, 120), None);
+        assert_eq!(thin_runs([1, 64, 120], [64, 2], Staging::Slots, 120), None);
+    }
+
+    /// What a decode step's `m = 1` products ask of GDDR, from the jobs
+    /// `matmul_dram` builds (decode-matmul-bandwidth P0): jobs, the rounds the
+    /// busiest unit runs, and the bytes its gathers read of `A` and of `B`.
+    /// `cargo test -p tt-kernels decode_products -- --nocapture` prints the table.
+    #[test]
+    fn resident_a_is_read_once_a_unit() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let units = 120;
+        let count = |k: usize, n: usize, resident_a: bool| {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+            let reads = super::Reads {
+                thin: true,
+                resident_a,
+                unpack_b: false,
+                packed_a: None,
+                stream_k: false,
+                stream_prefetch: false,
+                prefetch_units: [usize::MAX; 2],
+                block_stream: super::BlockStream::Off,
+                reuse: super::Reuse::Off,
+                out: crate::matmul::Out::Fp32,
+            };
+            let work = super::matmul_dram_limited(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                None,
+                reads,
+            )
+            .unwrap();
+            let mut per_unit = vec![crate::profile_mode::OpBytes::default(); units];
+            for (j, job) in work.jobs.iter().enumerate() {
+                for step in job {
+                    if let Step::List { entries, .. } = step {
+                        per_unit[j % units].count(entries);
+                    }
+                }
+            }
+            (work.jobs, per_unit)
+        };
+        // `gate|up` (three rounds on some units), `q` (one), `down` (K-blocked: never resident).
+        for [k, n] in [[2048, 16384], [2048, 2048], [8192, 2048]] {
+            let (jobs, off) = count(k, n, false);
+            let (resident_jobs, on) = count(k, n, true);
+            assert_eq!(jobs.len(), resident_jobs.len());
+            // The thin `A` of `K` whole: one `1024 + 64`-byte read a tile.
+            let a_once = (k as u64 / 32) * (1024 + 64);
+            for u in 0..units {
+                let (off, on) = (off[u], on[u]);
+                assert_eq!(on.b, off.b, "[{k}, {n}] unit {u}: B unchanged");
+                if k == 8192 || off.a == 0 {
+                    assert_eq!(on, off, "[{k}, {n}] unit {u}");
+                } else {
+                    assert_eq!(on.a, a_once, "[{k}, {n}] unit {u}: A once");
+                    assert_eq!(off.reads - on.reads, (off.a - a_once) / 1088, "unit {u}");
+                }
+            }
+        }
+    }
+
+    /// A packed `A` ([`super::pack_row`]) is read as its `K / 1024` packed tiles on a unit's first
+    /// block, and not at all on its later ones; `B` is read as before. Without it, each block
+    /// reads `K / 32` thin `A` tiles (once a unit with `resident_a`).
+    #[test]
+    fn a_packed_a_is_read_in_k_over_1024_tiles() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let units = 64;
+        for (k, n, limit) in [
+            (2048, 6144, None),
+            (2048, 16384, None),
+            (8192, 2048, Some(64)),
+            (8192, 2048, None),
+        ] {
+            let reads_per_unit = |packed: bool| {
+                let mut alloc = DramAlloc::new(&Dram::FULL);
+                let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+                let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+                let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+                let work = super::matmul_dram_limited(
+                    &mut alloc,
+                    &a,
+                    false,
+                    &b,
+                    false,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    units,
+                    false,
+                    false,
+                    limit.and_then(std::num::NonZeroUsize::new),
+                    super::Reads {
+                        thin: true,
+                        resident_a: true,
+                        unpack_b: false,
+                        packed_a: packed.then(|| p.tensor_ref()),
+                        stream_k: false,
+                        stream_prefetch: false,
+                        prefetch_units: [usize::MAX; 2],
+                        block_stream: super::BlockStream::Off,
+                        reuse: super::Reuse::Off,
+                        out: crate::matmul::Out::Fp32,
+                    },
+                )
+                .unwrap();
+                let mut per_unit = vec![crate::profile_mode::OpBytes::default(); units];
+                for (j, job) in work.jobs.iter().enumerate() {
+                    for step in job {
+                        if let Step::List { entries, .. } = step {
+                            per_unit[j % units].count(entries);
+                        }
+                    }
+                }
+                per_unit
+            };
+            let (off, on) = (reads_per_unit(false), reads_per_unit(true));
+            if k == 8192 && limit.is_none() {
+                // Packed, `down` fits two K blocks of 128, not four of 64: its partial written
+                // once and read back once, not three times.
+                let kc = super::packed_k_block(256, None, SrcRoute::Tf32FromFp32, Fidelity::HiFi4);
+                assert_eq!(kc.unwrap(), 128);
+            }
+            let kt = k as u64 / 32;
+            for u in 0..units {
+                let (off, on) = (off[u], on[u]);
+                assert_eq!(on.b, off.b, "[{k}, {n}] unit {u}: B unchanged");
+                // Thin `A`, `K` tiles (once a unit with `K` whole), against the packed tiles; and
+                // each K block after the first reads its partial back (`down` unlimited: four
+                // thin blocks of 64, two packed of 128).
+                let (thin_blocks, packed_blocks) = match (k, limit) {
+                    (8192, Some(_)) => (4, 4),
+                    (8192, None) => (4, 2),
+                    _ => (1, 1),
+                };
+                let packed_tiles = if k == 8192 { kt / 32 } else { kt.div_ceil(32) };
+                assert_eq!(
+                    off.reads - on.reads,
+                    kt - packed_tiles + (thin_blocks - packed_blocks),
+                    "[{k}, {n}] unit {u}"
+                );
+            }
+        }
+    }
+
+    /// A BF16 `A` packed ([`super::pack_row`], roadmap W1) is read as its `K / 1024` packed tiles,
+    /// a [`TILE_SLOT`] each (`READ_RUN`), where unpacked it reads `K / 32` whole BF16 tiles; `B`
+    /// is read as before. `down`'s K blocks are the FP32 row's: the packed ring is FP32 slots
+    /// whatever `A`'s format.
+    #[test]
+    fn a_packed_bf16_a_is_read_in_k_over_1024_tiles() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        use tt_isa::dm::BF16_TILE_SLOT;
+        use tt_isa::format::TileFormat;
+        let units = 64;
+        let route = SrcRoute::edges(TileFormat::BF16, TileFormat::FP32).unwrap();
+        assert_eq!(route.packed_row_bytes(), 32);
+        assert_eq!(route.packed_row_slots().a, TILE_SLOT);
+        let fp32 = super::packed_k_block(256, None, SrcRoute::Tf32FromFp32, Fidelity::HiFi4);
+        let bf16 = super::packed_k_block(256, None, route, Fidelity::HiFi4);
+        assert_eq!(bf16.unwrap(), fp32.unwrap());
+        for (k, n, limit) in [
+            (2048, 6144, None),
+            (2048, 16384, None),
+            (8192, 2048, Some(64)),
+            (8192, 2048, None),
+        ] {
+            let reads_per_unit = |packed: bool| {
+                let mut alloc = DramAlloc::new(&Dram::FULL);
+                let a = DramTensor::alloc_elem(&mut alloc, 1, k, Elem::BF16).unwrap();
+                let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+                let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+                let work = super::matmul_dram_limited(
+                    &mut alloc,
+                    &a,
+                    false,
+                    &b,
+                    false,
+                    route,
+                    Fidelity::HiFi4,
+                    units,
+                    false,
+                    false,
+                    limit.and_then(std::num::NonZeroUsize::new),
+                    super::Reads {
+                        thin: false,
+                        resident_a: true,
+                        unpack_b: false,
+                        packed_a: packed.then(|| p.tensor_ref()),
+                        stream_k: false,
+                        stream_prefetch: false,
+                        prefetch_units: [usize::MAX; 2],
+                        block_stream: super::BlockStream::Off,
+                        reuse: super::Reuse::Off,
+                        out: crate::matmul::Out::Fp32,
+                    },
+                )
+                .unwrap();
+                let mut per_unit = vec![crate::profile_mode::OpBytes::default(); units];
+                for (j, job) in work.jobs.iter().enumerate() {
+                    for step in job {
+                        if let Step::List { entries, .. } = step {
+                            per_unit[j % units].count(entries);
+                        }
+                    }
+                }
+                per_unit
+            };
+            let (off, on) = (reads_per_unit(false), reads_per_unit(true));
+            // `K` whole: the packed tiles once a unit, against the whole BF16 tiles.
+            if k == 8192 {
+                continue;
+            }
+            let packed_tiles = (k as u64 / 32).div_ceil(32);
+            for u in 0..units {
+                let (off, on) = (off[u], on[u]);
+                assert_eq!(on.b, off.b, "[{k}, {n}] unit {u}: B unchanged");
+                assert_eq!(
+                    on.a, 0,
+                    "[{k}, {n}] unit {u}: the gather leaves A to the packed row"
+                );
+                if off.b == 0 {
+                    continue;
+                }
+                assert_eq!(off.a % BF16_TILE_SLOT, 0, "[{k}, {n}] unit {u}");
+                assert_eq!(
+                    on.read,
+                    on.b + packed_tiles * TILE_SLOT,
+                    "[{k}, {n}] unit {u}"
+                );
+                assert_eq!(
+                    off.reads - on.reads,
+                    off.a / BF16_TILE_SLOT - packed_tiles,
+                    "[{k}, {n}] unit {u}"
+                );
+            }
+        }
+    }
+
+    /// A streamed one-row product: a job a column, each its `K` in an even number of chunks
+    /// (at least [`super::MIN_STREAM_CHUNKS`]) in alternating halves, every chunk's gather reading
+    /// only `B` (its `K` range: each `B` tile once) but a unit's first, which reads the packed
+    /// `A`; and only each column's last chunk writes.
+    #[test]
+    fn a_units_first_job_reads_its_b_ahead_where_the_ops_before_plan_below_it() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        use tt_isa::dm::{op, TILE_SLOT, WAIT_PREFETCH};
+        let units = 8;
+        let (k, n) = (2048, 1024);
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+        let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+        let bt = DramTensor::alloc(&mut alloc, n, k).unwrap();
+        let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+        let mut jobs = |busy: &[Option<u64>], b_transposed: bool| {
+            super::matmul_dram_prefetching(
+                &mut alloc,
+                &a,
+                false,
+                if b_transposed { &bt } else { &b },
+                b_transposed,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                None,
+                super::Reads {
+                    thin: true,
+                    resident_a: true,
+                    unpack_b: false,
+                    packed_a: Some(p.tensor_ref()),
+                    stream_k: false,
+                    stream_prefetch: false,
+                    prefetch_units: [usize::MAX; 2],
+                    block_stream: super::BlockStream::Off,
+                    reuse: super::Reuse::Off,
+                    out: crate::matmul::Out::Fp32,
+                },
+                &[],
+                units,
+                busy,
+                &[],
+                None,
+            )
+            .unwrap()
+            .0
+            .jobs
+        };
+        let ahead =
+            |job: &Job| matches!(&job[0], Step::List { what, .. } if *what == super::BUSY_PREFETCH);
+        let data = tt_isa::l1::DATA;
+        // Every unit free below the arena's top: each unit's first job, and only it, reads ahead.
+        let all = jobs(&vec![Some(data.base); units], false);
+        assert!(all.len() > units, "more than a job a unit");
+        for (j, job) in all.iter().enumerate() {
+            assert_eq!(ahead(job), j < units, "job {j}");
+            if j >= units {
+                continue;
+            }
+            let (
+                Step::List { entries: early, .. },
+                Step::List {
+                    entries: gather, ..
+                },
+            ) = (&job[0], &job[1])
+            else {
+                unreachable!("two lists first")
+            };
+            assert_eq!(early.len(), 5, "the GATHER and its operands");
+            assert_eq!(early[0][0], record::GATHER);
+            assert_ne!(early[0][1] & record::GATHER_PREFETCH, 0, "flagged");
+            assert_eq!(gather.last().unwrap()[..2], [op::WAIT, WAIT_PREFETCH]);
+            assert!(gather.iter().all(|e| e[0] != record::GATHER));
+            // `B`'s ring ends at the arena's end.
+            let [kt, cols] = [k as u64 / 32, early[0][7] as u64];
+            assert_eq!(early[0][3] as u64 + kt * cols * TILE_SLOT, data.end);
+        }
+        // Where an op before planned up into `B`'s ring, or is not known, or `B` is read
+        // transposed by the mover: no unit reads ahead.
+        let mut some = vec![Some(data.end); units];
+        some[3] = Some(data.base);
+        some[5] = None;
+        let mixed = jobs(&some, false);
+        for (j, job) in mixed.iter().enumerate() {
+            assert_eq!(ahead(job), j == 3, "job {j}");
+        }
+        assert!(jobs(&vec![Some(data.base); units], true)
+            .iter()
+            .all(|j| !ahead(j)));
+        assert!(jobs(&[], false).iter().all(|j| !ahead(j)));
+    }
+
+    #[test]
+    fn a_streamed_column_reads_its_k_in_chunks() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let units = 64;
+        // `down`'s `K` (blocked anyway), and shorter ones under a block limit.
+        for (k, n, limit) in [
+            (8192, 2048, None),
+            (2048, 6144, Some(16)),
+            (1056, 200, Some(9)),
+        ] {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+            let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+            let work = super::matmul_dram_limited(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                false,
+                limit.and_then(std::num::NonZeroUsize::new),
+                super::Reads {
+                    thin: true,
+                    resident_a: true,
+                    unpack_b: false,
+                    packed_a: Some(p.tensor_ref()),
+                    stream_k: true,
+                    stream_prefetch: false,
+                    prefetch_units: [usize::MAX; 2],
+                    block_stream: super::BlockStream::Off,
+                    reuse: super::Reuse::Off,
+                    out: crate::matmul::Out::Fp32,
+                },
+            )
+            .unwrap();
+            let (kt, nt) = (k / 32, n.div_ceil(32));
+            assert_eq!(work.jobs.len(), nt, "[{k}, {n}]: a job a column");
+            let mut first_on_unit = vec![true; units];
+            let mut b_tiles = 0;
+            for (j, job) in work.jobs.iter().enumerate() {
+                let chunks = job.len() / 3;
+                assert!(
+                    chunks >= super::MIN_STREAM_CHUNKS && chunks % 2 == 0,
+                    "{chunks} chunks"
+                );
+                for (c, step) in job.chunks(3).enumerate() {
+                    let [Step::List {
+                        entries: gather, ..
+                    }, Step::Kernel { half, .. }, Step::List {
+                        entries: scatter, ..
+                    }] = step
+                    else {
+                        panic!("a chunk is a gather, a kernel and a scatter");
+                    };
+                    assert_eq!(
+                        *half,
+                        Some((c % 2) as u8),
+                        "[{k}, {n}] column {j} chunk {c}"
+                    );
+                    assert_eq!(scatter.is_empty(), c + 1 < chunks, "only the last writes");
+                    let reads_a = gather[0][0] == record::READ_RUN;
+                    assert_eq!(reads_a, std::mem::take(&mut first_on_unit[j % units]));
+                    let mut counted = crate::profile_mode::OpBytes::default();
+                    counted.count(gather);
+                    assert_eq!(counted.a, 0);
+                    b_tiles += counted.b / tt_isa::dm::TILE_SLOT;
+                }
+            }
+            assert_eq!(b_tiles, (kt * nt) as u64, "[{k}, {n}]: every B tile once");
+        }
+    }
+
+    #[test]
+    fn a_streamed_product_s_idle_units_read_their_columns_first_two_chunks_ahead() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        let (units, spread) = (64, 120);
+        let prefetch: Vec<usize> = (units..spread).collect();
+        let tiles = |entries: &[[u32; 8]]| {
+            let mut counted = crate::profile_mode::OpBytes::default();
+            counted.count(entries);
+            counted.b / tt_isa::dm::TILE_SLOT
+        };
+        // `down` (1.7B), and a short `K` under a block limit with fewer columns than idle units;
+        // a streamed product takes at most its own count (40) of the 56.
+        for (k, n, limit) in [(8192, 2048, None), (1056, 200, Some(9))] {
+            for on in [true, false] {
+                let mut alloc = DramAlloc::new(&Dram::FULL);
+                let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+                let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+                let p = DramTensor::alloc(&mut alloc, k / 32, 32).unwrap();
+                let (work, dealt) = super::matmul_dram_prefetching(
+                    &mut alloc,
+                    &a,
+                    false,
+                    &b,
+                    false,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    units,
+                    false,
+                    false,
+                    limit.and_then(std::num::NonZeroUsize::new),
+                    super::Reads {
+                        thin: true,
+                        resident_a: true,
+                        unpack_b: false,
+                        packed_a: Some(p.tensor_ref()),
+                        stream_k: true,
+                        stream_prefetch: on,
+                        prefetch_units: [usize::MAX, 40],
+                        block_stream: super::BlockStream::Off,
+                        reuse: super::Reuse::Off,
+                        out: crate::matmul::Out::Fp32,
+                    },
+                    &prefetch,
+                    spread,
+                    &[],
+                    &[],
+                    None,
+                )
+                .unwrap();
+                let (kt, nt) = ((k / 32) as u64, n.div_ceil(32));
+                let mut columns = 0;
+                let mut ahead = Vec::new();
+                for (slot, job) in work.jobs.iter().enumerate().filter(|(_, j)| !j.is_empty()) {
+                    let (pre, rest) = match job.first() {
+                        Some(Step::List {
+                            what: super::PREFETCH,
+                            entries,
+                        }) => (Some(tiles(entries)), &job[1..]),
+                        _ => (None, &job[..]),
+                    };
+                    let mut read = pre.unwrap_or(0);
+                    let mut first_two = 0;
+                    for (c, step) in rest.chunks(3).enumerate() {
+                        let [Step::List {
+                            entries: gather, ..
+                        }, Step::Kernel { half, .. }, Step::List { .. }] = step
+                        else {
+                            panic!("a chunk is a gather, a kernel and a scatter");
+                        };
+                        assert_eq!(*half, Some((c % 2) as u8), "slot {slot} chunk {c}");
+                        if c < 2 {
+                            first_two += tiles(gather);
+                        }
+                        read += tiles(gather);
+                    }
+                    assert_eq!(read, kt, "[{k}, {n}] slot {slot}: its column's B once");
+                    if let Some(pre) = pre {
+                        assert_eq!(first_two, 0, "[{k}, {n}] slot {slot}: chunks 0-1 ahead");
+                        assert!(
+                            pre < kt,
+                            "[{k}, {n}] slot {slot}: only the ring's two halves"
+                        );
+                        ahead.push(slot);
+                    }
+                    columns += 1;
+                }
+                assert_eq!(columns, nt, "[{k}, {n}]: a job a column");
+                if on {
+                    assert_eq!(dealt, Some(spread));
+                    let want: Vec<usize> = prefetch.iter().copied().take(nt.min(40)).collect();
+                    assert_eq!(ahead, want, "[{k}, {n}]: the idle units' columns");
+                } else {
+                    assert_eq!(dealt, None);
+                    assert!(ahead.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_products_jobs_rounds_and_bytes() {
+        use crate::matmul::{Fidelity, SrcRoute};
+        use tt_isa::dm::TILE_SLOT;
+        let units = 120;
+        // name, [k, n], B transposed (the tied head reads the table transposed)
+        let shapes = [
+            ("q/k/v/o", [2048, 2048], false),
+            ("gate/up", [2048, 8192], false),
+            ("down", [8192, 2048], false),
+            ("head", [2048, 49152], true),
+            // `Llama::fused`'s products (1.7B): `q|k|v` and `gate|up` as one each.
+            ("qkv", [2048, 6144], false),
+            ("gate|up", [2048, 16384], false),
+        ];
+        let mut rows = Vec::new();
+        for (name, [k, n], bt) in shapes {
+            let mut alloc = DramAlloc::new(&Dram::FULL);
+            let a = DramTensor::alloc(&mut alloc, 1, k).unwrap();
+            let b = match bt {
+                true => DramTensor::alloc(&mut alloc, n, k),
+                false => DramTensor::alloc(&mut alloc, k, n),
+            }
+            .unwrap();
+            let work = super::matmul_dram(
+                &mut alloc,
+                &a,
+                false,
+                &b,
+                bt,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                units,
+                false,
+                true,
+            )
+            .unwrap();
+            let (mut a_bytes, mut b_bytes, mut gathers) = (0u64, 0u64, 0usize);
+            let (mut a_whole, mut gather_reads) = (0u64, 0u64);
+            // The profile mode's count of the same lists, records expanded.
+            let mut counted = crate::profile_mode::OpBytes::default();
+            let mut per_unit = vec![0usize; units];
+            for (j, job) in work.jobs.iter().enumerate() {
+                per_unit[j % units] += 1;
+                for step in job {
+                    let Step::List { entries, .. } = step else {
+                        continue;
+                    };
+                    counted.count(entries);
+                    for e in entries.iter().filter(|e| e[0] == record::GATHER) {
+                        let kt = u64::from(record::gather_kt(e[1]));
+                        let [rows, cols] = [u64::from(e[5]), u64::from(e[7])];
+                        // A thin last tile row reads through row `r` of face 1.
+                        let r = u64::from(e[1] >> record::GATHER_ROWS_SHIFT & 0x1f);
+                        let last = if r == 0 { TILE_SLOT } else { 1024 + 64 * r };
+                        a_bytes += ((rows - 1) * TILE_SLOT + last) * kt;
+                        a_whole += rows * TILE_SLOT * kt;
+                        b_bytes += kt * cols * TILE_SLOT;
+                        gather_reads += (rows + cols) * kt;
+                        gathers += 1;
+                    }
+                }
+            }
+            // The counter agrees with the headers, operand by operand; the control is `A` read as
+            // whole tiles, which a thin product's count must not match.
+            assert_eq!((counted.a, counted.b), (a_bytes, b_bytes), "{name}");
+            assert_ne!(
+                counted.a, a_whole,
+                "{name}: thin reads counted as whole tiles"
+            );
+            assert!(counted.reads >= gather_reads, "{name}");
+            assert!(counted.read >= a_bytes + b_bytes, "{name}");
+            let plan = crate::matmul::plan_in(
+                [1, k, n],
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                crate::matmul::Staging::Slots,
+            )
+            .unwrap()
+            .tiles;
+            let busy = per_unit.iter().filter(|&&n| n > 0).count();
+            let rounds = *per_unit.iter().max().unwrap();
+            let two = per_unit.iter().filter(|&&n| n > 1).count();
+            rows.push(format!(
+                "{name:8} plan {plan:?} jobs {:4} gathers {gathers:4} busy {busy:3} rounds {rounds} \
+                 (units with >1 job: {two:3}) A {:6.1} MB  B {:6.1} MB  A share {:4.1}%  \
+                 reads {:6} written {:5.2} MB",
+                work.jobs.len(),
+                a_bytes as f64 / 1e6,
+                b_bytes as f64 / 1e6,
+                100.0 * a_bytes as f64 / (a_bytes + b_bytes) as f64,
+                counted.reads,
+                counted.write as f64 / 1e6,
+            ));
+            // `B`'s whole tiles are read once: blocks never share a column.
+            assert_eq!(b_bytes, (k as u64 / 32) * (n as u64 / 32) * TILE_SLOT);
+        }
+        println!("{}", rows.join("\n"));
+    }
 }
 
 #[cfg(test)]
@@ -4379,9 +8770,14 @@ mod reference {
                         list.push(fetch(b, b_transposed, kk, j0 + j, to));
                     }
                 }
+                // A job of the last tile row alone computes only its rows.
+                let live = matmul::LiveRows::for_job(m, i0, rows);
                 let roles =
-                    matmul::programs((tiles, Staging::Slots), route, fidelity, sems, || {
-                        matmul::matmul_roles(&outputs, sems, in_fmt, out_fmt, fidelity)
+                    matmul::programs((tiles, Staging::Slots), route, fidelity, sems, live, || {
+                        let (words, _) = matmul::matmul_kernel(
+                            &outputs, sems, in_fmt, out_fmt, fidelity, false, false, live,
+                        );
+                        words
                     });
 
                 // Only the datums go back: the packer writes nothing else, and the
@@ -4482,5 +8878,518 @@ mod overlap_tests {
         assert!(runs(1024, 32, Overlap::Captured));
         // A capture never asks less than a fresh op's one-unit share.
         assert!(pipeline_share(Overlap::Fresh, 1) > pipeline_share(Overlap::Captured, 1));
+    }
+}
+
+#[cfg(test)]
+mod block_stream_tests {
+    use super::*;
+
+    fn reads(mode: BlockStream) -> Reads {
+        Reads {
+            thin: true,
+            resident_a: true,
+            unpack_b: true,
+            packed_a: None,
+            stream_k: false,
+            stream_prefetch: false,
+            prefetch_units: [usize::MAX; 2],
+            block_stream: mode,
+            reuse: Reuse::Off,
+            out: crate::matmul::Out::Fp32,
+        }
+    }
+
+    fn work(mkn: [usize; 3], units: usize, mode: BlockStream) -> Work {
+        let [m, k, n] = mkn;
+        let mut alloc = DramAlloc::new(&Dram::FULL);
+        let a = DramTensor::alloc(&mut alloc, m, k).unwrap();
+        let b = DramTensor::alloc(&mut alloc, k, n).unwrap();
+        matmul_dram_limited(
+            &mut alloc,
+            &a,
+            false,
+            &b,
+            false,
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            units,
+            false,
+            true,
+            None,
+            reads(mode),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_blocked_job_reads_its_strips_once_and_writes_its_block_once() {
+        // 8 x 16 x 13 tiles, ragged along `N` against 3 x 5 blocks.
+        let [mt, kt, nt] = [8, 16, 13];
+        let [mb, kq, nb] = [3, 4, 5];
+        let work = work(
+            [mt * 32, kt * 32, nt * 32],
+            7,
+            BlockStream::Fixed([mb, kq, nb]),
+        );
+        let (row_blocks, col_blocks) = (mt.div_ceil(mb), nt.div_ceil(nb));
+        assert_eq!(work.jobs.len(), row_blocks * col_blocks);
+        let mut read_tiles = 0;
+        let mut written = 0;
+        for job in &work.jobs {
+            let halves: Vec<u8> = job
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Kernel { half, .. } => *half,
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(halves.len(), kt / kq, "a kernel a chunk");
+            assert_eq!(
+                halves.len() % 2,
+                0,
+                "chunks even, so units alternate halves"
+            );
+            assert!(halves.iter().enumerate().all(|(c, &h)| h as usize == c % 2));
+            let (mut k_read, mut scatters, mut block) = (0, 0, None);
+            for (index, step) in job.iter().enumerate() {
+                let Step::List { entries, .. } = step else {
+                    continue;
+                };
+                for e in entries {
+                    match e[0] {
+                        record::GATHER => {
+                            let count = record::gather_kt(e[1]) as usize;
+                            let [rows, cols] = [e[5] as usize, e[7] as usize];
+                            assert!(block.is_none_or(|b| b == [rows, cols]));
+                            block = Some([rows, cols]);
+                            read_tiles += (rows + cols) * count;
+                            k_read += count;
+                        }
+                        record::SCATTER => {
+                            assert_eq!(index, job.len() - 1, "only the last chunk writes");
+                            written += (e[4] * e[6]) as usize;
+                            scatters += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(k_read, kt, "the job reads its strips over `K` once");
+            assert_eq!(scatters, 1);
+        }
+        assert_eq!(written, mt * nt);
+        assert_eq!(read_tiles, (col_blocks * mt + row_blocks * nt) * kt);
+    }
+
+    #[test]
+    fn off_and_a_single_row_take_the_other_paths() {
+        for (mkn, mode) in [
+            ([256, 512, 512], BlockStream::Off),
+            ([1, 512, 512], BlockStream::Fixed([4, 4, 4])),
+            ([256, 32, 512], BlockStream::Fixed([4, 4, 4])),
+        ] {
+            let work = work(mkn, 8, mode);
+            assert!(work.jobs.iter().flatten().all(|s| !matches!(
+                s,
+                Step::List { what, .. } if what.starts_with("blocked")
+            )));
+        }
+    }
+
+    /// A looped block's programs are one output's block a role, whatever the block
+    /// (`docs/plans/prefill-operand-reuse.md` P1b); unrolled, the unpack role grows ~130 words an
+    /// output.
+    #[test]
+    fn looped_block_programs_do_not_grow_with_the_block() {
+        let stored = |tiles: [usize; 3], c: usize| -> [usize; 3] {
+            let layout = matmul::block_stream_layout(tiles, matmul::Slots::FP32).unwrap();
+            let (code, loops) = matmul::block_stream_kernel_looped(
+                &layout,
+                c,
+                tiles,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                false,
+                matmul::LiveRows::All,
+                crate::matmul::Out::Fp32,
+            )
+            .expect("the loops fit");
+            std::array::from_fn(|t| {
+                crate::code::Code {
+                    ins: code[t].clone(),
+                    loops: loops[t].clone(),
+                }
+                .stored()
+                .unwrap()
+                .0
+                .len()
+            })
+        };
+        for c in 0..2 {
+            let small = stored([2, 2, 2], c);
+            let large = stored([8, 2, 8], c);
+            assert_eq!(small, large, "chunk {c}: the same words, more repeats");
+            assert!(small.iter().all(|&w| w < 400), "chunk {c}: {small:?} words");
+        }
+    }
+
+    /// The model's choices for SmolLM2-1.7B's prefill products on 120 units, against its model of
+    /// the other paths. Printed for the plan's record; the bound is the model's, not a measurement.
+    #[test]
+    fn the_17b_prefill_products_plan_blocks_that_read_less() {
+        let units = 120;
+        let cases = [
+            ("gate|up", [2048, 16384]),
+            ("down", [8192, 2048]),
+            ("qkv", [2048, 3072]),
+            ("o", [2048, 2048]),
+        ];
+        for m in [64, 512, 2048] {
+            for (name, [k, n]) in cases {
+                let tiles = [m / 32, k / 32, n / 32];
+                let (shape, _) = matmul::plan_floor(
+                    [m, k, n],
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                    Staging::Slots,
+                );
+                let [mc, kc, nc] = shape.unwrap().tiles;
+                let kc = if kc < tiles[1] {
+                    k_block_size(kc, SrcRoute::Tf32FromFp32, Fidelity::HiFi4).unwrap()
+                } else {
+                    kc
+                };
+                let [mc, nc] = blocks([tiles[0], tiles[2]], [mc, nc], units);
+                let other = blocked_paths_model(tiles, [mc, kc, nc], units);
+                let choice = block_stream_choice(
+                    BlockStream::Auto,
+                    tiles,
+                    units,
+                    other,
+                    SrcRoute::Tf32FromFp32,
+                    Fidelity::HiFi4,
+                );
+                println!(
+                    "m {m} {name}: other [{mc}, {kc}, {nc}] {other:.0} us; blocked {choice:?}"
+                );
+                if m >= 512 {
+                    let s = choice.expect("a long prefill's products block");
+                    assert!(s.us < other);
+                }
+            }
+        }
+    }
+}
+
+/// The bound's host side (`roadmap.md`, "F4b's leftovers"): what each batched attention product
+/// of a prefill chunk runs as, and whether its units could share `A` at all.
+#[cfg(test)]
+mod batched_questions {
+    use super::*;
+
+    /// `cargo test -p tt-kernels batched_attention_questions -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a table for the bound, not a claim"]
+    fn batched_attention_questions() {
+        let route = SrcRoute::Tf32FromFp32;
+        let fidelity = Fidelity::HiFi4;
+        // (what, items, [m, k, n])
+        let mut cases: Vec<(&str, usize, [usize; 3])> = Vec::new();
+        for prefix in [512, 1024, 4096, 8192] {
+            // SmolLM2-1.7B: 32 heads of 64, chunks of 512 attending to `prefix`.
+            cases.push(("1.7B qk", 32, [512, 64, prefix]));
+            cases.push(("1.7B pv", 32, [512, prefix, 64]));
+            // Qwen3.5-4B's attention layers, grouped-query folded: 4 key/value heads of 256, 4
+            // query heads a group, chunks of 16 (the bench's) and 512.
+            for chunk in [16, 512] {
+                cases.push(("Qwen3.5 qk", 4, [4 * chunk, 256, prefix]));
+                cases.push(("Qwen3.5 pv", 4, [4 * chunk, prefix, 256]));
+            }
+        }
+        println!(
+            "| product | items | [m, k, n] | units | per item | path | block [mb, kq, nb] | A read x | \
+             shared at per item | per item, floor | shared at floor |"
+        );
+        for units in [120usize, 64] {
+            for &(what, batch, [m, k, n]) in &cases {
+                let [mt, kt, nt] = [m.div_ceil(32), k.div_ceil(32), n.div_ceil(32)];
+                let per_item = units.div_ceil(batch).max(1);
+                let floor = (units / batch).max(1);
+                let staging = if pipelining_pays([m, k, n], route, fidelity, per_item) {
+                    Staging::SlotsHalf
+                } else {
+                    Staging::Slots
+                };
+                let Some(shape) = matmul::plan_in([m, k, n], route, fidelity, staging) else {
+                    println!(
+                        "| {what} | {batch} | {:?} | {units} | fits no chunk |",
+                        [m, k, n]
+                    );
+                    continue;
+                };
+                let [mc, kc, nc] = shape.tiles;
+                let kc = if kc < kt {
+                    k_block_size(kc, route, fidelity).unwrap_or(kc)
+                } else {
+                    kc
+                };
+                let [bmc, bnc] = blocks([mt, nt], [mc, nc], per_item);
+                let other = blocked_paths_model([mt, kt, nt], [bmc, kc, bnc], per_item);
+                let plan = block_stream_plan(
+                    BlockStream::Auto,
+                    [mt, kt, nt],
+                    per_item,
+                    other,
+                    route,
+                    fidelity,
+                );
+                let share = |u: usize, [mb, nb]: [usize; 2]| {
+                    crate::tile_op::distribute::shared(
+                        mt.div_ceil(mb),
+                        nt.div_ceil(nb),
+                        u,
+                        crate::tile_op::reuse::AUTO_HOLDERS,
+                        None,
+                    )
+                    .is_some()
+                };
+                let (path, block, reads, at_item, at_floor) = match plan {
+                    Some((s, _)) => {
+                        let [mb, kq, nb] = s.tiles;
+                        (
+                            "block stream",
+                            format!("[{mb}, {kq}, {nb}]"),
+                            nt.div_ceil(nb),
+                            share(per_item, [mb, nb]),
+                            share(floor, [mb, nb]),
+                        )
+                    }
+                    None => (
+                        "blocks",
+                        format!("[{bmc}, {kc}, {bnc}]"),
+                        nt.div_ceil(bnc),
+                        false,
+                        false,
+                    ),
+                };
+                println!(
+                    "| {what} | {batch} | {:?} | {units} | {per_item} | {path} | {block} | {reads} \
+                     | {at_item} | {floor} | {at_floor} |",
+                    [m, k, n]
+                );
+            }
+        }
+    }
+}
+
+/// The contiguous-weight probe's rewrite (`docs/plans/decode-bytes-in-flight.md`).
+#[cfg(test)]
+mod contiguous_b {
+    /// [`super::contiguous_b_reads`]: a weight stream's span moved to plain reads covers its slots
+    /// exactly, front to back, in one channel, each read congruent mod 64, the last shorter; and
+    /// what would leave the listed L1, break the congruence or misname an entry is refused.
+    #[test]
+    fn a_contiguous_weight_stream_tiles_its_slots_exactly() {
+        use super::contiguous_b_reads;
+        use tt_isa::dm::op;
+        let (b_at, slot) = (0x2_0000u32, 2112u64);
+        for (kt, cols, entry) in [
+            (64u64, 2u64, 16_384u32),
+            (64, 1, 2112),
+            (13, 3, 65_536),
+            (1, 1, 64),
+        ] {
+            let bytes = kt * cols * slot;
+            let (ch, off) = (5u32, 0x40_0000u64);
+            let reads = contiguous_b_reads(b_at, bytes, (ch, off), entry).unwrap();
+            let what = format!("{kt} x {cols} slots in {entry}-byte reads");
+            assert_eq!(reads.len() as u64, bytes.div_ceil(entry as u64), "{what}");
+            let mut at = 0u64;
+            for (i, r) in reads.iter().enumerate() {
+                assert_eq!(
+                    [r[0], r[1], r[2]],
+                    [op::READ, ch, (i % 3) as u32],
+                    "{what}: read {i}"
+                );
+                assert_eq!(r[3] as u64, off + at, "{what}: read {i}'s GDDR offset");
+                assert_eq!(r[4] as u64, b_at as u64 + at, "{what}: read {i}'s slot");
+                assert_eq!(
+                    r[3] as u64 % 64,
+                    r[4] as u64 % 64,
+                    "{what}: read {i} congruent"
+                );
+                assert!(r[5] > 0 && r[5] <= entry, "{what}: read {i}'s length");
+                assert_eq!([r[6], r[7]], [0, 0]);
+                at += r[5] as u64;
+            }
+            assert_eq!(at, bytes, "{what}: the span covered exactly");
+        }
+        let ok = |b_at, bytes, off, entry| contiguous_b_reads(b_at, bytes, (0, off), entry).is_ok();
+        assert!(ok(b_at, 4224, 0, 2112), "the control");
+        assert!(!ok(b_at, 4224, 32, 2112), "GDDR and L1 differ mod 64");
+        assert!(
+            !ok(b_at, 4224, 0, 100),
+            "an entry not of whole 64-byte units"
+        );
+        assert!(!ok(b_at, 4224, 0, 0), "an empty entry");
+        let listed = tt_isa::l1::LISTED;
+        assert!(
+            !ok(listed.base as u32 - 64, 4224, 0, 2112),
+            "below the listed L1"
+        );
+        assert!(
+            !ok((listed.end - 4160) as u32, 4224, 0, 2112),
+            "past the listed L1"
+        );
+    }
+
+    /// [`super::contiguous_b_bytes`] moves a weight stream (`B` only) and nothing else: a read
+    /// ahead and a plain gather stay, and a stream that would also read `A` is refused.
+    #[test]
+    fn only_a_weight_stream_is_moved_to_contiguous_reads() {
+        use super::contiguous_b_bytes;
+        use tt_isa::dm::record;
+        let bf16 = record::gather_b_format(tt_isa::tile::L1Format::Bf16).unwrap();
+        let header = |flags: u32| {
+            [
+                record::GATHER,
+                flags | 64 << 8,
+                0x3_0000,
+                0x2_0000,
+                0,
+                1,
+                4,
+                3,
+            ]
+        };
+        let stream = record::GATHER_STREAM | record::GATHER_A_RESIDENT;
+        assert_eq!(
+            contiguous_b_bytes(&header(stream | bf16)).unwrap(),
+            Some((64 * 3 * 2112, 0x2_0000)),
+            "BF16: 64 terms of 3 columns"
+        );
+        assert_eq!(
+            contiguous_b_bytes(&header(stream)).unwrap(),
+            Some((64 * 3 * super::TILE_SLOT, 0x2_0000)),
+            "FP32"
+        );
+        let ahead = record::GATHER_PREFETCH | record::GATHER_A_RESIDENT | bf16;
+        assert_eq!(
+            contiguous_b_bytes(&header(ahead)).unwrap(),
+            None,
+            "a read ahead"
+        );
+        assert_eq!(
+            contiguous_b_bytes(&header(bf16)).unwrap(),
+            None,
+            "a plain gather"
+        );
+        assert!(
+            contiguous_b_bytes(&header(record::GATHER_STREAM | bf16)).is_err(),
+            "a stream that reads `A` too"
+        );
+        assert!(
+            contiguous_b_bytes(&header(stream | 2)).is_err(),
+            "a transposed `B`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod by_column_tests {
+    use super::*;
+    use tt_isa::dram::Dram;
+
+    /// Phase C1's placement (`docs/plans/decode-bytes-in-flight.md`): a grid laid by column puts
+    /// tile `(r, c)` on channel `c % n` at slot `(c / n) * rows + r` of the region there (the
+    /// layout's definition, the oracle here), every tile in a slot of its own inside the regions,
+    /// which are each `cols.div_ceil(n) * rows` slots: the bytes of the interleaved grid but for
+    /// at most one column a channel. A row view names the same slots; its reference carries the
+    /// layout; a grid laid by column is refused a reference under another width.
+    /// A weight is laid by column only where that takes no more slots a channel than
+    /// interleaved: the 1.7B's and Qwen3.5-4B's weights (columns a multiple of 8), not the 135M's
+    /// 18 columns, nor any column count on a 7-channel chip that leaves a channel's region short.
+    #[test]
+    fn a_weight_is_laid_by_column_only_where_it_takes_no_more_gddr() {
+        let (by, flat) = (Layout::ByColumn, Layout::Interleaved);
+        for (grid, n, want) in [
+            ([64, 192], 8, by),  // the 1.7B's `qkv`
+            ([256, 64], 8, by),  // its `down`
+            ([80, 288], 8, by),  // Qwen3.5-4B's
+            ([18, 18], 8, flat), // the 135M's `q`: 3 columns a channel, 2 on six of them
+            ([18, 48], 8, by),   // its `gate`
+            ([64, 64], 7, flat), // 10 columns a channel against 586 slots
+            ([64, 70], 7, by),   // whole columns on every channel
+            ([1, 5], 8, by),     // one row: as many slots as interleaved
+            ([0, 8], 8, flat),   // nothing to hold (`alloc_laid` refuses it by column)
+            ([4, 8], 0, flat),   // no channels
+            ([usize::MAX, 9], 8, flat),
+        ] {
+            assert_eq!(Layout::for_weight(by, grid, n), want, "{grid:?} over {n}");
+            assert_eq!(
+                Layout::for_weight(flat, grid, n),
+                flat,
+                "{grid:?} over {n}, not asked"
+            );
+            if want == by && n > 0 {
+                let [rows, cols] = grid;
+                assert!(cols.div_ceil(n) * rows <= (rows * cols).div_ceil(n));
+            }
+        }
+    }
+
+    #[test]
+    fn a_grid_laid_by_column_holds_each_tile_once_where_the_layout_puts_it() {
+        for mask in [0xFFu8, 0b1011_0110] {
+            let dram = Dram::from_usable_mask(mask);
+            let mut a = DramAlloc::new(&dram);
+            let n = a.channel_count();
+            for (rows, cols, slot) in [
+                (64usize, 64usize, 2112u64),
+                (7, 13, TILE_SLOT),
+                (3, 1, 1088),
+            ] {
+                let what = format!("mask {mask:#x}, [{rows}, {cols}] tiles, slot {slot}");
+                let p = a.alloc_laid([rows, cols], slot, Layout::ByColumn).unwrap();
+                let flat = a
+                    .alloc_laid([rows, cols], slot, Layout::Interleaved)
+                    .unwrap();
+                assert_eq!(p.layout(), Layout::ByColumn);
+                assert_eq!(p.tiles(), rows * cols, "{what}");
+                assert_eq!(p.slots, (cols.div_ceil(n) * rows) as u64, "{what}");
+                assert!(
+                    p.slots - flat.slots <= rows as u64,
+                    "{what}: at most a column a channel more than interleaved"
+                );
+                let mut seen = std::collections::HashSet::new();
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let s = p.slot(r * cols + c);
+                        let k = c % n;
+                        let want = p.base[k] + ((c / n) * rows + r) as u64 * slot;
+                        assert_eq!(s.channel(), p.channels[k], "{what}: ({r}, {c}) channel");
+                        assert_eq!(s.offset(), want, "{what}: ({r}, {c}) offset");
+                        assert!(want + slot <= p.base[k] + p.slots * slot, "{what}: inside");
+                        assert!(seen.insert((k, want)), "{what}: ({r}, {c}) shares a slot");
+                    }
+                }
+                let x = p.tensor_ref(cols);
+                assert_eq!(x.col_tiles, rows as u32, "{what}");
+                assert_eq!(TensorRef::decode(x.encode()), Ok(x), "{what}");
+                // A view of rows from the second on: the same slots, its reference offset.
+                if rows > 1 {
+                    let v = p.borrowed_tiles(cols, (rows - 1) * cols);
+                    for t in 0..(rows - 1) * cols {
+                        assert_eq!(v.slot(t), p.slot(t + cols), "{what}: view tile {t}");
+                    }
+                    assert_eq!(v.tensor_ref(cols).first, cols as u32);
+                }
+                let wrong = std::panic::catch_unwind(|| p.tensor_ref(cols + 1));
+                assert!(wrong.is_err(), "{what}: another width misnames it");
+                a.free(&p);
+                a.free(&flat);
+            }
+        }
     }
 }

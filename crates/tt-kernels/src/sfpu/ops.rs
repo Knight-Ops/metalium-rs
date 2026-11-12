@@ -230,6 +230,25 @@ pub mod kind_sfpu {
     pub const INT_LE_S: u32 = 0x18d;
     /// `relu(a + b)`: compound fused addition and ReLU in one SFPU pass.
     pub const ADD_RELU: u32 = 0x1f0;
+    /// `x * sigmoid(x)`: Burn's `silu`, as `SIGMOID` then `MUL(x, s)` compute it, in one pass
+    /// (the same instructions, the sigmoid kept in a register: bit for bit the two ops).
+    pub const SILU: u32 = 0x1f1;
+    /// `silu(x) * y`: `SILU` then `MUL(t, y)`, in one pass, bit for bit the three ops.
+    pub const SILU_MUL: u32 = 0x1f2;
+    /// `exp(x - y)`: `SUB` then `EXP` in one pass, the difference kept in a register -- bit for
+    /// bit the two ops (every `SFPMAD` result is flushed, so the difference is never a
+    /// denormal the FP32 store would keep). A softmax's numerator, `y` its row's maximum as a
+    /// column broadcast.
+    pub const SUB_EXP: u32 = 0x1f3;
+    /// `c + a * b`: `MUL` then `ADD(c, product)`, in one pass, two roundings -- bit for bit the
+    /// two ops (the product is an `SFPMAD` result, flushed, so its FP32 store would keep no
+    /// denormal). RoPE's `x cos + rotate(x) sin`, `c` the first product.
+    pub const MUL_ADD: u32 = 0x1f4;
+    /// `mask ? fill : a * scale`, the scalars `[scale, fill]`: `MUL_SCALAR` then `MASK_FILL`, in one
+    /// pass -- bit for bit the two ops (the product is stored as `MUL_SCALAR` stores it, and the
+    /// fill as an FP32 store keeps it: a zero, a normal number or an infinity; [`code_for`]
+    /// refuses any other). An attention's scaled, masked scores, `mask` (as `MASK_FILL`'s) a row.
+    pub const SCALE_MASK_FILL: u32 = 0x1f5;
     /// End of the original contiguous activation range. Additional kinds
     /// occupy the documented integer, rounding and index ranges below.
     pub const LAST: u32 = BOOL_TO_I32;
@@ -303,8 +322,9 @@ pub fn elems(kind: u32) -> Sig {
         kind_sfpu::BOOL_AND | kind_sfpu::BOOL_OR | kind_sfpu::BOOL_XOR => sig(&[Bool, Bool], Bool),
         kind_sfpu::EQ..=kind_sfpu::LE => sig(&[F32, F32], Bool),
         kind_sfpu::EQ_S..=kind_sfpu::IS_INF => sig(&[F32], Bool),
-        kind_sfpu::MASK_FILL => sig(&[F32, Bool], F32),
+        kind_sfpu::MASK_FILL | kind_sfpu::SCALE_MASK_FILL => sig(&[F32, Bool], F32),
         kind_sfpu::MASK_WHERE => sig(&[F32, Bool, F32], F32),
+        kind_sfpu::MUL_ADD => sig(&[F32, F32, F32], F32),
         kind_sfpu::INT_MASK_FILL => sig(&[Elem::I32, Bool], Elem::I32),
         kind_sfpu::INT_MASK_WHERE => sig(&[Elem::I32, Bool, Elem::I32], Elem::I32),
         kind_sfpu::BOOL_MASK_FILL => sig(&[Bool, Bool], Bool),
@@ -347,6 +367,9 @@ pub fn accuracy(kind: u32) -> Accuracy {
         | kind_sfpu::SQRT..=kind_sfpu::POW_I
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
+        | kind_sfpu::SILU
+        | kind_sfpu::SILU_MUL
+        | kind_sfpu::SUB_EXP
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
@@ -376,20 +399,42 @@ pub fn accuracy(kind: u32) -> Accuracy {
 /// Outside `[-87.34, 88.72]` the result is `+0`
 /// (it would be denormal, which flushes) or `+inf`; a NaN stays one.
 pub fn exp_program(p: &mut Program, x: LReg, d: LReg) {
+    let [k, magic, t, nf, r, c] = exp_registers(x, d);
+    exp_reduce(p, x, [k, magic, t, nf, r]);
+    exp_poly(p, d, [magic, t, r, c]);
+    exp_range(p, x, d, [k, t]);
+}
+
+/// The scratch registers [`exp_program`] takes for `x` and `d`, in its order: `k`, `magic`, `t`,
+/// `nf`, `r`, `c`.
+fn exp_registers(x: LReg, d: LReg) -> [LReg; 6] {
     use LReg as R;
     let regs: Vec<LReg> = [R::L0, R::L1, R::L2, R::L3, R::L4, R::L5, R::L6, R::L7]
         .into_iter()
         .filter(|r| *r != x && *r != d)
         .collect();
-    let (k, magic, t, nf, r, c) = (regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);
+    [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]]
+}
+
+/// The magic number [`exp_program`] rounds `x log2 e` with: `1.5 * 2^23`.
+const EXP_MAGIC: u32 = 0x4b40_0000;
+
+/// [`exp_program`]'s first stage: `t = x log2 e + magic` and `r = x - n ln 2`; `magic` holds
+/// [`EXP_MAGIC`] after it.
+fn exp_reduce(p: &mut Program, x: LReg, [k, magic, t, nf, r]: [LReg; 5]) {
     p.loadi(k, std::f32::consts::LOG2_E);
-    p.loadi_bits(magic, 0x4b40_0000);
+    p.loadi_bits(magic, EXP_MAGIC);
     p.mad(x, k, magic, t);
     p.sub(t, magic, nf);
     p.loadi_bits(k, 0x3f31_8000); // ln2_hi = 0.693359375
     p.nmad(nf, k, x, r);
     p.loadi_bits(k, 0xb95e_8083); // ln2_lo = -2.12194440e-4
     p.nmad(nf, k, r, r);
+}
+
+/// [`exp_program`]'s second stage: `d = e^r 2^n` from `r` and `t`, `magic` holding
+/// [`EXP_MAGIC`].
+fn exp_poly(p: &mut Program, d: LReg, [magic, t, r, c]: [LReg; 4]) {
     // e^r = 1 + r(1 + r(1/2 + r(1/6 + r(1/24 + r(1/120 + r(1/720 + r/5040))))))
     p.loadi(d, 1.0 / 5040.0);
     for coeff in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5] {
@@ -402,6 +447,10 @@ pub fn exp_program(p: &mut Program, x: LReg, d: LReg) {
     p.isub_from(t, magic);
     p.shl(magic, 23, magic);
     p.iadd(magic, d);
+}
+
+/// [`exp_program`]'s last stage: `d` where `x` is out of range or a NaN.
+fn exp_range(p: &mut Program, x: LReg, d: LReg, [k, t]: [LReg; 2]) {
     // The range: below `ln 2^-126` a zero, above `ln f32::MAX` infinity
     // (which a positive NaN also passes), and a NaN restored.
     p.loadi_bits(k, 0xc2ae_ac50); // -87.336544
@@ -2348,6 +2397,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
     Some(match kind {
         kind::ADD
         | kind_sfpu::ADD_RELU
+        | kind_sfpu::SUB_EXP
         | kind::SUB
         | kind::MUL
         | kind::RELU_BACKWARD
@@ -2357,6 +2407,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::BOOL_XOR
         | kind_sfpu::EQ..=kind_sfpu::LE
         | kind_sfpu::MASK_FILL
+        | kind_sfpu::SCALE_MASK_FILL
         | kind_sfpu::INT_MASK_FILL
         | kind_sfpu::BOOL_MASK_FILL
         | kind_sfpu::PRELU
@@ -2365,10 +2416,12 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::SIGMOID_BACKWARD
         | kind_sfpu::GELU_BACKWARD
         | kind_sfpu::LOG_SIGMOID_BACKWARD
+        | kind_sfpu::SILU_MUL
         | kind_sfpu::ATAN2 => Operands::Binary,
-        kind_sfpu::MASK_WHERE | kind_sfpu::INT_MASK_WHERE | kind_sfpu::BOOL_MASK_WHERE => {
-            Operands::Ternary
-        }
+        kind_sfpu::MASK_WHERE
+        | kind_sfpu::INT_MASK_WHERE
+        | kind_sfpu::BOOL_MASK_WHERE
+        | kind_sfpu::MUL_ADD => Operands::Ternary,
         kind_sfpu::REM => Operands::Binary,
         kind_sfpu::REM_S => Operands::Unary,
         kind::MUL_SCALAR
@@ -2390,6 +2443,7 @@ pub fn operands(kind: u32) -> Option<Operands> {
         | kind_sfpu::INT_ABS
         | kind_sfpu::EXPM1
         | kind_sfpu::SIGMOID
+        | kind_sfpu::SILU
         | kind_sfpu::TANH
         | kind_sfpu::ERF
         | kind_sfpu::GELU
@@ -2445,6 +2499,11 @@ pub enum Broadcast {
     Row,
     /// `[rows, 1]`: its one column to every column.
     Col,
+    /// `[R, cols]`, `R` a multiple of 32 that divides `A`'s rows: its rows repeated down `A`'s (a
+    /// grouped-query mask over each key/value head's scores). The program is the same-shape one:
+    /// only which of `B`'s tiles is read beside each of `A`'s changes
+    /// (`tensor::sfpu_eltwise_blocks`).
+    Block,
 }
 
 /// The kinds that take a broadcast second operand.
@@ -2456,6 +2515,7 @@ pub fn broadcasts(kind: u32) -> bool {
         kind,
         kind::ADD
             | kind_sfpu::ADD_RELU
+            | kind_sfpu::SUB_EXP
             | kind::SUB
             | kind::MUL
             | kind_sfpu::DIV
@@ -2465,6 +2525,7 @@ pub fn broadcasts(kind: u32) -> bool {
             | kind_sfpu::EQ
             ..=kind_sfpu::LE
                 | kind_sfpu::MASK_FILL
+                | kind_sfpu::SCALE_MASK_FILL
                 | kind_sfpu::INT_MASK_FILL
                 | kind_sfpu::BOOL_MASK_FILL
                 | kind_sfpu::PRELU
@@ -2480,9 +2541,23 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
     // The exact ops of S2 move raw bits too: an FP32 store would flush a
     // denormal Flex keeps.
     let fmt = match kind {
-        kind::ADD | kind_sfpu::ADD_RELU | kind::SUB | kind::MUL | kind_sfpu::DIV => Format::Fp32,
+        kind::ADD
+        | kind_sfpu::ADD_RELU
+        | kind_sfpu::SUB_EXP
+        | kind::SUB
+        | kind::MUL
+        | kind_sfpu::DIV => Format::Fp32,
         _ => Format::Int32,
     };
+    if kind == kind_sfpu::SCALE_MASK_FILL {
+        // `MUL_SCALAR`'s load and product, then `MASK_FILL`'s select on the raw mask.
+        p.load(LReg::L0, Format::Fp32, a_at);
+        p.load(LReg::L1, Format::Int32, b_at);
+        p.mul(LReg::L0, LReg::L4, LReg::L2);
+        p.if_(Cond::Ne0(LReg::L1), |p| p.mov(LReg::L3, LReg::L2));
+        p.store(LReg::L2, Format::Fp32, out_at);
+        return;
+    }
     p.load(LReg::L0, fmt, a_at);
     p.load(LReg::L1, fmt, b_at);
     if let Some((op, _)) = super::integer::operation(kind) {
@@ -2544,6 +2619,12 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
             p.sub(LReg::L0, LReg::L1, LReg::L2);
             LReg::L2
         }
+        // `SUB`'s difference, then `EXP`'s program on it where `EXP` would load it.
+        kind_sfpu::SUB_EXP => {
+            p.sub(LReg::L0, LReg::L1, LReg::L2);
+            exp_program(p, LReg::L2, LReg::L7);
+            LReg::L7
+        }
         kind::MUL => {
             p.mul(LReg::L0, LReg::L1, LReg::L2);
             LReg::L2
@@ -2568,6 +2649,127 @@ fn binary_body(p: &mut Program, kind: u32, a_at: u32, b_at: u32, out_at: u32) {
     p.store(out, fmt, out_at);
 }
 
+/// `kind`'s constants and then its body for one row group, `a` at `a_at` and `b` at `b_at` in
+/// `Dst`, the result stored at `out_at`: one link of a chain of kinds in one program
+/// (`super::softmax`), each link the instructions the kind's own program runs on that row group.
+pub(crate) fn chain_link(
+    p: &mut Program,
+    kind: u32,
+    scalars: [f32; 2],
+    a_at: u32,
+    b_at: u32,
+    out_at: u32,
+) {
+    binary_constants(p, kind, scalars);
+    binary_body(p, kind, a_at, b_at, out_at);
+}
+
+/// The `Dst` rows a [`staged`] program hands its registers on through, a row group's at each
+/// offset: free in a binary kernel, whose operands are at `A_ROW` and `B_ROW` and its result at
+/// `OUT_ROW` (`super::kernel`).
+const STAGE_ROWS: [u32; 3] = [
+    super::kernel::C_ROW,
+    super::kernel::SPILL_ROW,
+    super::kernel::SPILL_ROW + 64,
+];
+
+/// `kind`'s whole-tile program as row loops short enough to replay, where its body is not
+/// (`SUB_EXP`'s is 57 words, `DIV`'s 62, past the 32-entry replay buffer, so the role runner
+/// pushed every word of every row group: ~2,000 words and ~10 us a tile on silicon). Each stage
+/// is a row loop over the whole tile running a part of [`binary_body`]'s instructions, in their
+/// order, on the registers it uses; what a later stage reads it stores raw (`Format::Int32`) at
+/// [`STAGE_ROWS`] and loads raw, so every register holds the bits it held in one loop and the
+/// result is [`binary_body`]'s bit for bit (`staged_programs_are_the_body_bit_for_bit`). A
+/// constant a stage needs that an earlier one loaded is loaded again, the same value. `None` for
+/// a kind with no staged form, and under a row limit ([`super::with_rows`]), where every row loop is
+/// unrolled anyway and stages would only add their loads and stores.
+/// Whether `kind`'s whole-tile program is [`staged`] into replayed row loops.
+pub fn is_staged(kind: u32) -> bool {
+    staged(kind).is_some()
+}
+
+fn staged(kind: u32) -> Option<crate::code::Code> {
+    staged_at(kind, [A_ROW, B_ROW, OUT_ROW], STAGE_ROWS)
+}
+
+/// [`staged`] with its operands at `a_at` and `b_at`, its result stored at `out_at`, and its
+/// registers handed on through `stages` (each a row group's 64 rows, clear of the other three):
+/// a link of a streamed chain (`super::softmax`), where the default rows hold its statistics.
+pub(crate) fn staged_at(
+    kind: u32,
+    [a_at, b_at, out_at]: [u32; 3],
+    stages: [u32; 3],
+) -> Option<crate::code::Code> {
+    if super::row_limit() < 32 {
+        return None;
+    }
+    let (rx, ry, rz) = (stages[0], stages[1], stages[2]);
+    let (i32_, f32_) = (Format::Int32, Format::Fp32);
+    use LReg as R;
+    let mut p = Program::new();
+    match kind {
+        // `SUB`, then `exp_program(L2 -> L7)`: `k, magic, t, nf, r, c` are `L0, L1, L3, L4, L5, L6`.
+        kind_sfpu::SUB_EXP => {
+            let [k, magic, t, nf, r, c] = exp_registers(R::L2, R::L7);
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L0, f32_, a_at + o);
+                p.load(R::L1, f32_, b_at + o);
+                p.sub(R::L0, R::L1, R::L2);
+                exp_reduce(p, R::L2, [k, magic, t, nf, r]);
+                p.store(R::L2, i32_, rx + o);
+                p.store(t, i32_, ry + o);
+                p.store(r, i32_, rz + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(t, i32_, ry + o);
+                p.load(r, i32_, rz + o);
+                p.loadi_bits(magic, EXP_MAGIC);
+                exp_poly(p, R::L7, [magic, t, r, c]);
+                p.store(R::L7, i32_, rz + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L2, i32_, rx + o);
+                p.load(R::L7, i32_, rz + o);
+                exp_range(p, R::L2, R::L7, [k, t]);
+                p.store(R::L7, f32_, out_at + o);
+            });
+        }
+        // `scale_large_divisor`, `recip`'s steps, its specials, then `divide`, as
+        // [`binary_body`]'s registers: `a, b, y, t, c, q` in `L0..L5`, `f32::MAX` in `L6` and
+        // `+inf` in `L7` throughout ([`binary_constants`]).
+        kind_sfpu::DIV => {
+            binary_constants(&mut p, kind, [0.0; 2]);
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L0, f32_, a_at + o);
+                p.load(R::L1, f32_, b_at + o);
+                scale_large_divisor(p, R::L0, R::L1, R::L3, R::L4);
+                p.store(R::L0, i32_, rx + o);
+                p.store(R::L1, i32_, ry + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L1, i32_, ry + o);
+                p.recip_steps(R::L1, R::L2, R::L3, R::L4, R::L6);
+                p.store(R::L2, i32_, rz + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L1, i32_, ry + o);
+                p.load(R::L2, i32_, rz + o);
+                p.recip_specials(R::L1, R::L2, R::L3, R::L4, R::L6);
+                p.store(R::L2, i32_, rz + o);
+            });
+            p.for_each_row_group(64, |p, o| {
+                p.load(R::L0, i32_, rx + o);
+                p.load(R::L1, i32_, ry + o);
+                p.load(R::L2, i32_, rz + o);
+                divide(p, R::L0, R::L1, R::L2, R::L5, R::L3, R::L4, R::L7);
+                p.store(R::L5, f32_, out_at + o);
+            });
+        }
+        _ => return None,
+    }
+    Some(p.finish_code())
+}
+
 /// The constants [`binary_body`] needs for `kind`, loaded once.
 fn binary_constants(p: &mut Program, kind: u32, scalars: [f32; 2]) {
     if kind == kind_sfpu::ADD_RELU {
@@ -2585,6 +2787,11 @@ fn binary_constants(p: &mut Program, kind: u32, scalars: [f32; 2]) {
         kind_sfpu::MASK_FILL | kind_sfpu::INT_MASK_FILL | kind_sfpu::BOOL_MASK_FILL
     ) {
         p.loadi_bits(LReg::L3, scalars[0].to_bits());
+    }
+    // The scale as `MUL_SCALAR` loads its scalar.
+    if kind == kind_sfpu::SCALE_MASK_FILL {
+        p.loadi(LReg::L4, scalars[0]);
+        p.loadi_bits(LReg::L3, scalars[1].to_bits());
     }
 }
 
@@ -2647,13 +2854,35 @@ fn canonical(bits: u32) -> u32 {
 
 /// The program for an exact S2 op (10.2c) over a tile, or `None` for a kind
 /// that is not one -- or a `CLAMP` whose bounds `f32::clamp` would refuse.
-fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operands> {
+fn exact_program(p: &mut Program, kind: u32, scalars: [f32; 2]) -> Option<Operands> {
+    exact_program_at(p, kind, scalars, A_ROW, OUT_ROW)
+}
+
+/// The exact (raw-bit) program of an exact unary kind (a clamp, `NEG`, `ABS`, ...), in place on
+/// the tile at `Dst` row `row`: what a reduction appends to its finish to apply the kind to its
+/// result before the pack, bit for bit the kind run on the stored result (it moves raw bits, so
+/// no store or load between them changes one). `None` for a kind with no exact unary program.
+pub fn exact_in_place(kind: u32, scalars: [f32; 2], row: u32) -> Option<Vec<Instruction>> {
+    let mut p = Program::new();
+    match exact_program_at(&mut p, kind, scalars, row, row)? {
+        Operands::Unary => Some(p.finish()),
+        _ => None,
+    }
+}
+
+fn exact_program_at(
+    p: &mut Program,
+    kind: u32,
+    [s, s2]: [f32; 2],
+    in_row: u32,
+    out_row: u32,
+) -> Option<Operands> {
     use kind_sfpu::*;
     let (x, out, ax) = (LReg::L0, LReg::L2, LReg::L3);
     let (mask, inf) = (LReg::L4, LReg::L5);
     let (load, store) = (
-        move |p: &mut Program, o: u32| p.load(x, Format::Int32, A_ROW + o),
-        move |p: &mut Program, o: u32| p.store(out, Format::Int32, OUT_ROW + o),
+        move |p: &mut Program, o: u32| p.load(x, Format::Int32, in_row + o),
+        move |p: &mut Program, o: u32| p.store(out, Format::Int32, out_row + o),
     );
     match kind {
         // Two's complement `|x|`: negate the negative lanes, wrapping, so
@@ -2789,7 +3018,7 @@ fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operan
             p.loadi_bits(LReg::L7, s2.to_bits());
             p.loadi(LReg::L1, 1.0);
             p.for_each_row_group(64, |p, o| {
-                p.load(x, Format::Fp32, A_ROW + o);
+                p.load(x, Format::Fp32, in_row + o);
                 p.mul(LReg::L6, x, out);
                 p.add(out, LReg::L7, out);
                 // `.clamp(0, 1)`: a NaN stays, `-0` stays.
@@ -2860,12 +3089,75 @@ fn exact_program(p: &mut Program, kind: u32, [s, s2]: [f32; 2]) -> Option<Operan
     Some(Operands::Unary)
 }
 
+/// Whether `kind`'s program computes each `Dst` row group from the same group of its operands
+/// alone, so it may be built for tiles of fewer rows ([`code_for_rows`]): the element-wise
+/// kinds a decode step's `[1, W]` activations run, each checked against its whole-tile program
+/// (`row_limited_programs_keep_the_computed_rows`).
+pub fn row_limited(kind: u32) -> bool {
+    matches!(
+        kind,
+        kind::ADD
+            | kind::SUB
+            | kind::MUL
+            | kind::MUL_SCALAR
+            | kind::ADD_SCALAR
+            | kind_sfpu::DIV
+            | kind_sfpu::SIGMOID
+            | kind_sfpu::SILU_MUL
+            | kind_sfpu::MUL_ADD
+            | kind_sfpu::SCALE_MASK_FILL
+            | kind_sfpu::SUB_EXP
+    )
+}
+
+/// [`code_for`] for tiles of which only the first `rows` tensor rows are computed
+/// (`super::with_rows`): the other rows of the output tile are left as `Dst` held them. 32, or a
+/// kind not [`row_limited`], is [`code_for`].
+pub fn code_for_rows(
+    kind: u32,
+    scalars: [f32; 2],
+    bcast: Broadcast,
+    rows: u32,
+) -> Option<(Operands, crate::code::Code)> {
+    if rows >= 32 || !row_limited(kind) {
+        return code_for(kind, scalars, bcast);
+    }
+    super::with_rows(rows, || code_for(kind, scalars, bcast))
+}
+
+/// [`code_for_rows`], its result then rounded to BF16 in place where `quantized`
+/// (`bf16::quantize_code` over `OUT_ROW`'s tile, for the same rows): a BF16 run's math
+/// (`sfpu::kernel::Formats`; roadmap W1, native BF16 arithmetic).
+pub fn code_for_rows_as(
+    kind: u32,
+    scalars: [f32; 2],
+    bcast: Broadcast,
+    rows: u32,
+    quantized: bool,
+) -> Option<(Operands, crate::code::Code)> {
+    let build = || {
+        code_for(kind, scalars, bcast).map(|(o, c)| {
+            if quantized {
+                (o, c.then(crate::bf16::quantize_code(OUT_ROW)))
+            } else {
+                (o, c)
+            }
+        })
+    };
+    if rows >= 32 || !row_limited(kind) {
+        build()
+    } else {
+        super::with_rows(rows, build)
+    }
+}
+
 /// The program for `kind` with its second operand broadcast as `bcast`, and
 /// what operands it takes; `None` where there is none. A row broadcast reads
 /// the row's two faces from where the kernel lays them, which depends on the
-/// row group, so its loop is unrolled; a column broadcast reads a whole tile
-/// the mover has made of the column (`READ_BROADCAST_COL`), so its program is
-/// the plain binary one.
+/// row group, so its loop is unrolled; a column broadcast first copies column 0
+/// of `B`'s tile, as it was read, into every column ([`Program::broadcast_col0`],
+/// the tile `READ_BROADCAST_COL` would have made), then runs the plain binary
+/// program.
 pub fn program_for(
     kind: u32,
     scalars: [f32; 2],
@@ -2881,10 +3173,19 @@ pub fn code_for(
     scalars: [f32; 2],
     bcast: Broadcast,
 ) -> Option<(Operands, crate::code::Code)> {
+    if !fill_kept(kind, scalars) {
+        return None;
+    }
     match bcast {
         Broadcast::None => code2(kind, scalars),
         _ if !broadcasts(kind) => None,
-        Broadcast::Col => code2(kind, scalars).map(|(_, p)| (Operands::ColBroadcast, p)),
+        Broadcast::Block => code2(kind, scalars),
+        Broadcast::Col => {
+            let (_, math) = code2(kind, scalars)?;
+            let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
+            p.broadcast_col0(B_ROW);
+            Some((Operands::ColBroadcast, p.finish_code().then(math)))
+        }
         Broadcast::Row => {
             let mut p = Program::with_policy(super::LoopPolicy::Unrolled);
             binary_constants(&mut p, kind, scalars);
@@ -2894,6 +3195,13 @@ pub fn code_for(
             Some((Operands::RowBroadcast, p.finish_code()))
         }
     }
+}
+
+/// Whether `kind`'s fill is one its program stores as `MASK_FILL` does: `SCALE_MASK_FILL` stores
+/// its result in FP32, which would change a denormal or a NaN's payload that `MASK_FILL` moves as
+/// raw bits.
+fn fill_kept(kind: u32, [_, fill]: [f32; 2]) -> bool {
+    kind != kind_sfpu::SCALE_MASK_FILL || fill == 0.0 || fill.is_normal() || fill.is_infinite()
 }
 
 /// The program for `kind` (with its scalar), and what operands it takes, or
@@ -2911,6 +3219,9 @@ pub fn program2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, Vec<Instructi
 
 /// [`program2`] as a role's slot holds it ([`code_for`]).
 pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Code)> {
+    if !fill_kept(kind, scalars) {
+        return None;
+    }
     // The Approx twin of a transcendental (`approx.rs`).
     if let Some(code) = super::approx::code(kind) {
         return Some((Operands::Unary, code));
@@ -3005,6 +3316,9 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
             p.finish_code(),
         ));
     }
+    if let Some(code) = staged(kind) {
+        return Some((Operands::Binary, code));
+    }
     let scalar = scalars[0];
     let mut p = Program::new();
     if let Some(o) = exact_program(&mut p, kind, scalars) {
@@ -3014,6 +3328,7 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
     let operands = match kind {
         kind::ADD
         | kind_sfpu::ADD_RELU
+        | kind_sfpu::SUB_EXP
         | kind::SUB
         | kind::MUL
         | kind_sfpu::DIV
@@ -3022,6 +3337,7 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
         | kind_sfpu::BOOL_XOR
         | kind_sfpu::EQ..=kind_sfpu::LE
         | kind_sfpu::MASK_FILL
+        | kind_sfpu::SCALE_MASK_FILL
         | kind_sfpu::INT_MASK_FILL
         | kind_sfpu::BOOL_MASK_FILL
         | kind_sfpu::PRELU => {
@@ -3189,6 +3505,43 @@ pub fn code2(kind: u32, scalars: [f32; 2]) -> Option<(Operands, crate::code::Cod
                 p.store(LReg::L7, Format::Fp32, OUT_ROW + o);
             });
             Operands::Unary
+        }
+        // `SIGMOID`'s program, then `MUL`'s `x * s` (`SFPMAD(x, s, -0)`, the
+        // operands in `MUL`'s order), and for `SILU_MUL` `MUL`'s `t * y`. The
+        // sigmoid and the product stay in registers where the separate ops
+        // store and reload them as FP32: neither is ever a denormal (every
+        // `SFPMAD` result is flushed, and sigmoid's other results are 0.5 or a
+        // NaN), so the store would change no bit.
+        // `MUL`'s product, then `ADD`'s sum with `c` as its left operand, as the separate ops
+        // compute `c + a * b`.
+        kind_sfpu::MUL_ADD => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                p.load(LReg::L1, Format::Fp32, B_ROW + o);
+                p.mul(LReg::L0, LReg::L1, LReg::L2);
+                p.load(LReg::L0, Format::Fp32, super::kernel::C_ROW + o);
+                p.add(LReg::L0, LReg::L2, LReg::L2);
+                p.store(LReg::L2, Format::Fp32, OUT_ROW + o);
+            });
+            Operands::Ternary
+        }
+        kind_sfpu::SILU | kind_sfpu::SILU_MUL => {
+            p.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                sigmoid_program(p, super::kernel::SPILL_ROW + o);
+                p.load(LReg::L0, Format::Fp32, A_ROW + o);
+                p.mul(LReg::L0, LReg::L7, LReg::L2);
+                if kind == kind_sfpu::SILU_MUL {
+                    p.load(LReg::L1, Format::Fp32, B_ROW + o);
+                    p.mul(LReg::L2, LReg::L1, LReg::L2);
+                }
+                p.store(LReg::L2, Format::Fp32, OUT_ROW + o);
+            });
+            if kind == kind_sfpu::SILU {
+                Operands::Unary
+            } else {
+                Operands::Binary
+            }
         }
         // Flex's `g * s * (1 - s)`, left to right: three roundings, as here.
         kind_sfpu::SIGMOID_BACKWARD => {
@@ -3457,15 +3810,12 @@ pub fn reference_op(
                     }
                 }
                 (Operands::ColBroadcast, Some(b)) => {
-                    // As `READ_BROADCAST_COL` makes it: row `r`'s value in
-                    // every column.
-                    let mut t = vec![0u32; 1024];
+                    // As the mover reads it: row `r`'s value in column 0, the
+                    // other columns whatever the slot held (NaN here).
+                    let mut t = vec![0x7fc0_beefu32; 1024];
                     for r in 0..32 {
                         let gr = 32 * i + r;
-                        let v = if gr < rows { b[gr].to_bits() } else { 0 };
-                        for c in 0..32 {
-                            t[face_index(r, c)] = v;
-                        }
+                        t[face_index(r, 0)] = if gr < rows { b[gr].to_bits() } else { 0 };
                     }
                     v.put_tile(B_ROW as usize, &t);
                 }
@@ -3624,6 +3974,9 @@ mod fit {
         for k in [
             kind::ADD,
             kind_sfpu::ADD_RELU,
+            kind_sfpu::SUB_EXP,
+            kind_sfpu::SILU,
+            kind_sfpu::SILU_MUL,
             kind::SUB,
             kind::MUL,
             kind::MUL_SCALAR,
@@ -5306,6 +5659,574 @@ mod intbool {
                         "kind {kind:#x}, scalar {scalar:#010x}, lane {i}"
                     );
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod silu {
+    use super::*;
+
+    /// A tile of every special value (signed zeros, subnormals, infinities, NaN payloads,
+    /// `±f32::MAX`, sigmoid's saturation edges) among ordinary values in `[-24, 24)`.
+    fn tile(seed: u32) -> Vec<f32> {
+        const SPECIAL: [u32; 16] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x807f_ffff,
+            0x0080_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_0000,
+            0x7fc1_2345,
+            0xffc0_0001,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+            0x42b0_0000,
+            0xc2b0_0000,
+            0x42c8_0000,
+            0xc2c8_0000,
+        ];
+        let mut s = seed | 1;
+        (0..1024)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if i % 7 == 0 {
+                    f32::from_bits(SPECIAL[(s >> 8) as usize % SPECIAL.len()])
+                } else {
+                    (s >> 8) as f32 / (1u32 << 24) as f32 * 48.0 - 24.0
+                }
+            })
+            .collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// `SILU` and `SILU_MUL` are `SIGMOID`, `MUL(x, s)` and `MUL(t, y)` run one by one, bit for
+    /// bit, as the programs run on the specification's functional model.
+    #[test]
+    fn the_fused_programs_are_the_separate_ops_bit_for_bit() {
+        let one = |kind: u32, a: &[f32], b: Option<&[f32]>| reference(kind, 0.0, a, b, 32, 32);
+        for seed in [1, 2, 3] {
+            let (x, y) = (tile(seed), tile(seed + 100));
+            let s = one(kind_sfpu::SIGMOID, &x, None);
+            let t = one(kind::MUL, &x, Some(&s));
+            let want = one(kind::MUL, &t, Some(&y));
+            assert_eq!(
+                bits(&one(kind_sfpu::SILU, &x, None)),
+                bits(&t),
+                "silu, seed {seed}"
+            );
+            assert_eq!(
+                bits(&one(kind_sfpu::SILU_MUL, &x, Some(&y))),
+                bits(&want),
+                "silu_mul, seed {seed}"
+            );
+            // Control: the comparison sees a product's rounding. `(x y) s`, the same three
+            // factors associated otherwise, differs somewhere.
+            let other = one(kind::MUL, &one(kind::MUL, &x, Some(&y)), Some(&s));
+            let differ = bits(&other)
+                .iter()
+                .zip(bits(&want))
+                .filter(|(a, b)| **a != *b)
+                .count();
+            assert!(
+                differ > 0,
+                "control, seed {seed}: (x y) s is s x y everywhere"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_limited_tests {
+    use super::super::interp::Vector;
+    use super::*;
+    use tt_isa::dm::face_index;
+
+    /// Ordinary values of several magnitudes with every special value among them.
+    fn tile(seed: u32) -> Vec<u32> {
+        const SPECIAL: [u32; 10] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x807f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc1_2345,
+            0x7f7f_ffff,
+            0x1f80_0000,
+            0x6080_0000,
+        ];
+        let mut s = seed | 1;
+        (0..1024)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if i % 13 == 5 {
+                    return SPECIAL[(s >> 8) as usize % SPECIAL.len()];
+                }
+                let scale = [1.0e-3f32, 1.0, 37.0, 1.0e4][i % 4];
+                (((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * scale).to_bits()
+            })
+            .collect()
+    }
+
+    /// `math` run over `Dst` holding the operands `operands` takes (a broadcast's as its
+    /// kernel lays them) and NaN wherever the output goes: the output tile.
+    fn run(math: &[Instruction], operands: Operands) -> Vec<u32> {
+        let mut v = Vector::new();
+        v.put_tile(OUT_ROW as usize, &vec![0x7fc0_dead; 1024]);
+        v.put_tile(A_ROW as usize, &tile(1));
+        match operands {
+            Operands::Unary => {}
+            Operands::Binary | Operands::ColBroadcast => v.put_tile(B_ROW as usize, &tile(2)),
+            Operands::RowBroadcast => {
+                let t = tile(3);
+                for r in 0..4 {
+                    v.dst[(B_ROW + r) as usize] = std::array::from_fn(|c| t[c]);
+                    v.dst[(B_ROW + 4 + r) as usize] = std::array::from_fn(|c| t[256 + c]);
+                }
+            }
+            Operands::Ternary => {
+                v.put_tile(B_ROW as usize, &tile(2));
+                v.put_tile(super::super::kernel::C_ROW as usize, &tile(4));
+            }
+        }
+        v.run(math).unwrap();
+        v.tile(OUT_ROW as usize)
+    }
+
+    /// Each row-limited kind's program, built for tiles of `rows` rows, computes those rows (and
+    /// the rest of their row groups of four) bit for bit as its whole-tile program does and
+    /// leaves the others as `Dst` held them, at
+    /// every row count across the faces' and row groups' boundaries, with every broadcast
+    /// the kind takes. Control: the row after the last is not computed.
+    #[test]
+    fn row_limited_programs_keep_the_computed_rows() {
+        let kinds = [
+            kind::ADD,
+            kind::SUB,
+            kind::MUL,
+            kind::MUL_SCALAR,
+            kind::ADD_SCALAR,
+            kind_sfpu::DIV,
+            kind_sfpu::SIGMOID,
+            kind_sfpu::SILU_MUL,
+            kind_sfpu::MUL_ADD,
+            kind_sfpu::SCALE_MASK_FILL,
+            kind_sfpu::SUB_EXP,
+        ];
+        for kind in kinds {
+            assert!(row_limited(kind), "{kind:#x}");
+            let mut checked = 0;
+            for bcast in [Broadcast::None, Broadcast::Row, Broadcast::Col] {
+                let scalars = [0.75, 0.0];
+                let Some((operands, full)) = code_for(kind, scalars, bcast) else {
+                    continue;
+                };
+                let full = run(&full.expand(), operands);
+                checked += 1;
+                for rows in [1u32, 2, 3, 4, 5, 8, 15, 16, 17, 20, 31] {
+                    let (o, limited) = code_for_rows(kind, scalars, bcast, rows).unwrap();
+                    assert_eq!(o, operands);
+                    let limited = limited.expand();
+                    let got = run(&limited, operands);
+                    for r in 0..32 {
+                        for c in 0..32 {
+                            let i = face_index(r, c);
+                            // A row group (four rows) is computed whole.
+                            let computed = ((r - r % 4) as u32) < rows;
+                            let want = if computed { full[i] } else { 0x7fc0_dead };
+                            assert_eq!(
+                                got[i], want,
+                                "{kind:#x} {bcast:?}, {rows} rows: datum ({r}, {c})"
+                            );
+                        }
+                    }
+                    // The first row of the next group is not computed.
+                    let next = rows.div_ceil(4) as usize * 4;
+                    if next < 32 {
+                        let i = face_index(next, 0);
+                        assert_ne!(got[i], full[i], "{kind:#x} {bcast:?}: row {next} computed");
+                    }
+                }
+            }
+            assert!(checked > 0, "{kind:#x}: no program checked");
+        }
+    }
+
+    /// A kind not on the list, and 32 rows, are the whole-tile program.
+    #[test]
+    fn other_kinds_and_whole_tiles_are_unchanged() {
+        let whole = code_for(kind::ADD, [0.0; 2], Broadcast::None)
+            .unwrap()
+            .1
+            .expand();
+        let at32 = code_for_rows(kind::ADD, [0.0; 2], Broadcast::None, 32)
+            .unwrap()
+            .1
+            .expand();
+        assert_eq!(whole.len(), at32.len());
+        let exp = code_for(kind_sfpu::EXP, [0.0; 2], Broadcast::None)
+            .unwrap()
+            .1
+            .expand();
+        let exp1 = code_for_rows(kind_sfpu::EXP, [0.0; 2], Broadcast::None, 1)
+            .unwrap()
+            .1
+            .expand();
+        assert_eq!(exp.len(), exp1.len());
+        let add1 = code_for_rows(kind::ADD, [0.0; 2], Broadcast::None, 1)
+            .unwrap()
+            .1
+            .expand();
+        assert!(
+            add1.len() < whole.len(),
+            "{} against {}",
+            add1.len(),
+            whole.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod col_broadcast_tests {
+    use super::super::interp::Vector;
+    use super::*;
+    use tt_isa::dm::face_index;
+
+    /// Ordinary values and every special value, from `seed`.
+    fn tile(seed: u32) -> Vec<u32> {
+        const SPECIAL: [u32; 9] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x807f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc1_2345,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+        ];
+        let mut s = seed | 1;
+        (0..1024)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if i % 7 == 3 {
+                    return SPECIAL[(s >> 8) as usize % SPECIAL.len()];
+                }
+                (((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 9.0).to_bits()
+            })
+            .collect()
+    }
+
+    /// `math` over `A` and the tile `b` at `B_ROW`, the output primed with NaN.
+    fn run(math: &[Instruction], a: &[u32], b: &[u32]) -> Vec<u32> {
+        let mut v = Vector::new();
+        v.put_tile(OUT_ROW as usize, &vec![0x7fc0_dead; 1024]);
+        v.put_tile(A_ROW as usize, a);
+        v.put_tile(B_ROW as usize, b);
+        v.run(math).unwrap();
+        v.tile(OUT_ROW as usize)
+    }
+
+    /// The tile `READ_BROADCAST_COL` makes of `b`: `(r, c)` from `(r, 0)`.
+    fn mover_broadcast(b: &[u32]) -> Vec<u32> {
+        let mut t = vec![0u32; 1024];
+        for r in 0..32 {
+            for c in 0..32 {
+                t[face_index(r, c)] = b[face_index(r, 0)];
+            }
+        }
+        t
+    }
+
+    /// `b`'s column 0 as the mover reads it plainly, the other columns NaN (whatever the
+    /// slot held).
+    fn as_read(b: &[u32]) -> Vec<u32> {
+        let mut t = vec![0x7fc0_beef; 1024];
+        for r in 0..32 {
+            t[face_index(r, 0)] = b[face_index(r, 0)];
+        }
+        t
+    }
+
+    /// The broadcast alone makes the mover's tile, bit for bit (signed zeros, denormals,
+    /// NaN payloads), in the row groups a program for `rows` rows computes, and leaves the
+    /// rest of `Dst` as it was.
+    #[test]
+    fn the_broadcast_is_the_mover_s_tile() {
+        for seed in 1..4 {
+            let b = tile(seed);
+            for rows in [1u32, 3, 4, 5, 15, 16, 17, 31, 32] {
+                let prologue = super::super::with_rows(rows, || {
+                    let mut p = Program::with_policy(super::super::LoopPolicy::Unrolled);
+                    p.broadcast_col0(B_ROW);
+                    p.finish()
+                });
+                let mut v = Vector::new();
+                v.put_tile(A_ROW as usize, &vec![0x7fc0_aaaa; 1024]);
+                v.put_tile(B_ROW as usize, &as_read(&b));
+                v.run(&prologue).unwrap();
+                assert_eq!(v.tile(A_ROW as usize), vec![0x7fc0_aaaa; 1024]);
+                let (got, want, read) = (v.tile(B_ROW as usize), mover_broadcast(&b), as_read(&b));
+                for r in 0..32 {
+                    for c in 0..32 {
+                        let i = face_index(r, c);
+                        let computed = ((r - r % 4) as u32) < rows;
+                        let want = if computed { want[i] } else { read[i] };
+                        assert_eq!(got[i], want, "seed {seed}, {rows} rows: ({r}, {c})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every kind that takes a column: its program over `B` as read is the plain program
+    /// over the mover's broadcast tile, bit for bit, whole and row-limited. Control: the
+    /// plain program over `B` as read differs (it reads the NaN columns).
+    #[test]
+    fn a_column_program_is_the_plain_one_over_the_mover_s_tile() {
+        let kinds: Vec<u32> = (0..=crate::kind::LAST)
+            .chain(0x100..=kind_sfpu::LAST)
+            .filter(|&k| broadcasts(k))
+            .collect();
+        let mut checked = 0;
+        for &kind in &kinds {
+            for scalars in [[0.75f32, 0.0], [0.5, -2.5]] {
+                let Some((operands, _)) = code_for(kind, scalars, Broadcast::Col) else {
+                    continue;
+                };
+                assert_eq!(operands, Operands::ColBroadcast, "{kind:#x}");
+                for (seed, rows) in [(5u32, 32u32), (6, 1), (7, 17)] {
+                    let (a, b) = (tile(seed), tile(seed + 100));
+                    let (_, col) = code_for_rows(kind, scalars, Broadcast::Col, rows).unwrap();
+                    let (_, plain) = code_for_rows(kind, scalars, Broadcast::None, rows).unwrap();
+                    let got = run(&col.expand(), &a, &as_read(&b));
+                    let want = run(&plain.expand(), &a, &mover_broadcast(&b));
+                    assert_eq!(got, want, "{kind:#x} {scalars:?}, {rows} rows");
+                    if rows == 32 {
+                        let unbroadcast = run(&plain.expand(), &a, &as_read(&b));
+                        assert_ne!(unbroadcast, want, "control, {kind:#x}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 3 * 20, "{checked} programs checked");
+    }
+}
+
+#[cfg(test)]
+mod sub_exp_tests {
+    use super::*;
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Ordinary values, every special value, and pairs whose difference is a denormal.
+    fn values(seed: u32, n: usize) -> Vec<f32> {
+        const SPECIAL: [u32; 10] = [
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0001,
+            0x807f_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc1_2345,
+            0x7f7f_ffff,
+            0x0080_0000,
+            0xc2b0_0000,
+        ];
+        let mut s = seed | 1;
+        (0..n)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                match i % 11 {
+                    3 => f32::from_bits(SPECIAL[(s >> 8) as usize % SPECIAL.len()]),
+                    // Near the smallest normal: a difference with its neighbour is a denormal.
+                    7 => f32::from_bits(0x0080_0000 + (s >> 28)),
+                    _ => ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * [0.1f32, 4.0, 90.0][i % 3],
+                }
+            })
+            .collect()
+    }
+
+    /// `MUL_ADD` is `MUL` then `ADD(c, product)`, bit for bit, on special values and products
+    /// that are denormals.
+    #[test]
+    fn mul_add_is_mul_then_add_bit_for_bit() {
+        for (rows, cols) in [(32, 64), (33, 70), (1, 2048)] {
+            let n = rows * cols;
+            let (a, b, c) = (values(1, n), values(2, n), values(3, n));
+            let none = Broadcast::None;
+            let t = reference_op(kind::MUL, [0.0; 2], none, &[&a, &b], rows, cols);
+            let want = reference_op(kind::ADD, [0.0; 2], none, &[&c, &t], rows, cols);
+            let got = reference_op(
+                kind_sfpu::MUL_ADD,
+                [0.0; 2],
+                none,
+                &[&a, &b, &c],
+                rows,
+                cols,
+            );
+            assert_eq!(bits(&got), bits(&want), "[{rows}, {cols}]");
+        }
+    }
+
+    /// `SCALE_MASK_FILL` is `MUL_SCALAR` then `MASK_FILL`, bit for bit, plain and with the mask a
+    /// row or a column broadcast, for scales whose products flush, overflow or are exact, and
+    /// every fill it takes; a fill it would store changed is refused.
+    #[test]
+    fn scale_mask_fill_is_mul_scalar_then_mask_fill_bit_for_bit() {
+        let flag = |i: usize| f32::from_bits(u32::from(i % 3 == 1 || i % 7 == 0));
+        for (rows, cols) in [(32, 64), (33, 70), (9, 512), (1, 40)] {
+            let x = values((rows * 100 + cols) as u32, rows * cols);
+            for (bcast, n) in [
+                (Broadcast::None, rows * cols),
+                (Broadcast::Col, rows),
+                (Broadcast::Row, cols),
+            ] {
+                if bcast != Broadcast::None && (rows == 1 || cols == 1) {
+                    continue;
+                }
+                let mask: Vec<f32> = (0..n).map(flag).collect();
+                for scale in [0.125f32, 1.0 / 8f32.sqrt(), -3.0, 1.0e30, 1.0e-30] {
+                    for fill in [f32::NEG_INFINITY, f32::INFINITY, -0.0, 0.0, -1.5, f32::MAX] {
+                        let t = reference_for(
+                            kind::MUL_SCALAR,
+                            scale,
+                            Broadcast::None,
+                            &x,
+                            None,
+                            rows,
+                            cols,
+                        );
+                        let want = reference_op(
+                            kind_sfpu::MASK_FILL,
+                            [fill, 0.0],
+                            bcast,
+                            &[&t, &mask],
+                            rows,
+                            cols,
+                        );
+                        let got = reference_op(
+                            kind_sfpu::SCALE_MASK_FILL,
+                            [scale, fill],
+                            bcast,
+                            &[&x, &mask],
+                            rows,
+                            cols,
+                        );
+                        assert_eq!(
+                            bits(&got),
+                            bits(&want),
+                            "[{rows}, {cols}] {bcast:?} scale {scale} fill {fill}"
+                        );
+                    }
+                }
+            }
+        }
+        for fill in [f32::NAN, f32::from_bits(1), -f32::from_bits(0x007f_ffff)] {
+            for bcast in [Broadcast::None, Broadcast::Row, Broadcast::Col] {
+                assert!(code_for(kind_sfpu::SCALE_MASK_FILL, [0.5, fill], bcast).is_none());
+            }
+        }
+    }
+
+    /// `SUB_EXP` is `SUB` then `EXP`, bit for bit, plain and with its second operand a row or a
+    /// column broadcast (a softmax's row maximum).
+    #[test]
+    fn sub_exp_is_sub_then_exp_bit_for_bit() {
+        for (rows, cols) in [(32, 64), (33, 70), (3, 512), (1, 40)] {
+            let x = values((rows * 100 + cols) as u32, rows * cols);
+            for (bcast, n) in [
+                (Broadcast::None, rows * cols),
+                (Broadcast::Col, rows),
+                (Broadcast::Row, cols),
+            ] {
+                if bcast != Broadcast::None && (rows == 1 || cols == 1) {
+                    continue;
+                }
+                let y = values(7 + n as u32, n);
+                let d = reference_for(kind::SUB, 0.0, bcast, &x, Some(&y), rows, cols);
+                let want =
+                    reference_for(kind_sfpu::EXP, 0.0, Broadcast::None, &d, None, rows, cols);
+                let got = reference_for(kind_sfpu::SUB_EXP, 0.0, bcast, &x, Some(&y), rows, cols);
+                assert_eq!(bits(&got), bits(&want), "[{rows}, {cols}] {bcast:?}");
+            }
+        }
+    }
+
+    /// `SUB_EXP` and `DIV` as staged row loops ([`staged`]) are [`binary_body`] in one loop, bit
+    /// for bit, over the specials both meet (zeros, denormals, infinities, NaNs of both signs,
+    /// `f32::MAX`, divisors past `2^100`, exponents past the range), plain and with a column
+    /// broadcast; and every stage replays (no row loop is pushed word by word).
+    #[test]
+    fn staged_programs_are_the_body_bit_for_bit() {
+        use super::super::interp::Vector;
+        let specials = [
+            0.0f32,
+            -0.0,
+            1.0e-40,
+            -3.0e-39,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            -f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0xffc0_1234),
+            f32::from_bits(0x42b1_7218), // `exp_range`'s bounds
+            f32::from_bits(0xc2ae_ac50),
+            300.0,
+            -300.0,
+            2.0e30,
+            -7.0e31,
+            1.5,
+        ];
+        for kind in [kind_sfpu::SUB_EXP, kind_sfpu::DIV] {
+            let (_, staged) = code2(kind, [0.0; 2]).unwrap();
+            assert!(
+                staged.loops.is_empty(),
+                "{kind:#x}: a stage did not fit the replay buffer: {:?}",
+                staged.loops
+            );
+            let staged = staged.expand();
+            let mut one = Program::new();
+            binary_constants(&mut one, kind, [0.0; 2]);
+            one.for_each_row_group(64, |p, o| {
+                binary_body(p, kind, A_ROW + o, B_ROW + o, OUT_ROW + o)
+            });
+            let one = one.finish();
+            for seed in 0..24u32 {
+                let tile = |salt: u32| -> Vec<u32> {
+                    let v = values(seed * 31 + salt, 1024);
+                    (0..1024)
+                        .map(|i| {
+                            if (i as u32 + seed + salt) % 5 == 0 {
+                                specials[(i * 7 + (seed + salt) as usize) % specials.len()]
+                                    .to_bits()
+                            } else {
+                                (v[i] * [1.0, 40.0, 1.0e-20, 1.0e25][(i / 7) % 4]).to_bits()
+                            }
+                        })
+                        .collect()
+                };
+                let (a, b) = (tile(1), tile(2));
+                let run = |program: &[tt_isa::isa::Instruction]| {
+                    let mut v = Vector::new();
+                    v.put_tile(A_ROW as usize, &a);
+                    v.put_tile(B_ROW as usize, &b);
+                    v.run(program).unwrap();
+                    v.tile(OUT_ROW as usize)
+                };
+                assert_eq!(run(&staged), run(&one), "{kind:#x}, seed {seed}");
             }
         }
     }

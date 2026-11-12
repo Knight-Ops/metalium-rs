@@ -710,3 +710,260 @@ fn norm_forward_baselines() {
 fn norm_backward_baselines() {
     norm_bench::run(false);
 }
+
+// ---------------------------------------------------------------------------
+// The Matrix Unit's rate at a prefill's product shapes, traced.
+// ---------------------------------------------------------------------------
+
+/// `matmul/throughput/[m,k]@[k,n]`: one product's rate on every tile at a prefill's shapes
+/// (SmolLM2-1.7B: `K` = 2048, `N` = 2048 and 8192, `m` a chunk's tokens), TF32 Src, F32 storage,
+/// HiFi4: what a prefill's products reach against the Matrix Unit's peak
+/// (`docs/learnings/performance-scoreboard.md`, "Roofline").
+///
+/// The product is captured as a trace (`TracedInference`) with `A` its input, so a replay's time is
+/// the card's: the input's write and the output's read are timed apart and left out. Reported: the
+/// eager product (host dispatch through sync), the replay, and `2 m k n` over each replay in
+/// TFLOPS. The capture counts what the product moves through GDDR (`set_count_trace_bytes`, host
+/// work at store time only): its read bytes (`A`'s and `B`'s apart) and read entries, the units it
+/// ran on, and the read rate over the replay, which say whether the mover or the Matrix Unit binds.
+///
+/// Validated outside the timing: the eager product's elements on a grid equal exact integer
+/// arithmetic, and every replay equals the eager product bit for bit. The operands are integers in
+/// [-3, 3], so every term of a group of eight is a multiple of its quantum
+/// (`silicon-operating-notes.md`, "Matmul accumulation") and every sum (at most 6 x 2048) is exact
+/// in F32. `TT_MATMUL_SHAPES` (`m,k,n;...`) measures other shapes.
+#[test]
+#[ignore = "benchmark"]
+fn matmul_throughput() {
+    use burn::tensor::{backend::Backend, TensorPrimitive};
+    use burn_tt::{InputPayload, OutputPayload, TracedInference};
+    with_device(
+        Config {
+            tiles: Some(burn_tt::TileChoice::All),
+            ..Config::default()
+        },
+        |d| {
+            println!("BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"tiles\":\"all\",\"warmups\":2,\"samples\":7,\"route\":\"Tf32FromFp32\",\"fidelity\":\"HiFi4\",\"inputs\":\"resident GDDR tensors\",\"timing\":\"eager: host dispatch through sync; replay: the card's side of a trace replay, input write and output read excluded; validation outside timing\"}}", tt_tests::bench::git_sha(), !cfg!(debug_assertions));
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            burn_tt::set_count_trace_bytes(d, true).unwrap();
+            // `TT_MATMUL_SHAPES` (`m,k,n;m,k,n;...`) replaces the default shapes: a prefill chunk's
+            // own products, say.
+            let shapes: Vec<(usize, usize, usize)> = std::env::var("TT_MATMUL_SHAPES").map_or(
+                vec![
+                    (256, 2048, 2048),
+                    (256, 2048, 8192),
+                    (1024, 2048, 2048),
+                    (1024, 2048, 8192),
+                ],
+                |v| {
+                    v.split(';')
+                        .map(|s| {
+                            let d: Vec<usize> =
+                                s.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                            (d[0], d[1], d[2])
+                        })
+                        .collect()
+                },
+            );
+            for (m, k, n) in shapes {
+                let av: Vec<f32> = (0..m * k)
+                    .map(|i| ((i / k * 7 + i % k * 3) % 5) as f32 - 2.0)
+                    .collect();
+                let bv: Vec<f32> = (0..k * n)
+                    .map(|i| ((i / n * 5 + i % n * 11) % 7) as f32 - 3.0)
+                    .collect();
+                let a = Tensor::<TtBackend, 2>::from_data(TensorData::new(av.clone(), [m, k]), &d);
+                let b = Tensor::<TtBackend, 2>::from_data(TensorData::new(bv.clone(), [k, n]), &d);
+                let key = format!("matmul/throughput/[{m},{k}]@[{k},{n}]");
+                let flops = (2 * m * k * n) as f64;
+                // Eager, and the reference every replay is held to.
+                let mut want = Vec::new();
+                let mut eager = Vec::new();
+                for repetition in 0..9 {
+                    let start = Instant::now();
+                    let c = a.clone().matmul(b.clone());
+                    TtBackend::sync(&d).unwrap();
+                    let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                    let got = c.into_data().to_vec::<f32>().unwrap();
+                    if repetition == 0 {
+                        want = got;
+                    } else {
+                        assert_eq!(bits(&got), bits(&want), "{key}: eager run {repetition}");
+                    }
+                    if repetition >= 2 {
+                        eager.push(elapsed);
+                    }
+                }
+                for i in (0..m).step_by(37).chain([m - 1]) {
+                    for j in (0..n).step_by(61).chain([n - 1]) {
+                        let exact: i64 = (0..k)
+                            .map(|kk| av[i * k + kk] as i64 * bv[kk * n + j] as i64)
+                            .sum();
+                        assert_eq!(want[i * n + j], exact as f32, "{key}: element ({i}, {j})");
+                    }
+                }
+                report(&format!("{key}/eager"), "us", "host", Stats::of(eager));
+                // The eager product timed again, 7 samples after 2 warmups, each checked.
+                // The session's host stages over the timed runs, ms an op (a diagnosis's split).
+                let stages = || burn_tt::host_stage_times(d).unwrap();
+                let eager_again = |label: String| {
+                    let mut times = Vec::new();
+                    let mut before = Vec::new();
+                    for repetition in 0..9 {
+                        if repetition == 2 {
+                            before = stages();
+                        }
+                        let start = Instant::now();
+                        let c = a.clone().matmul(b.clone());
+                        TtBackend::sync(&d).unwrap();
+                        let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                        let got = c.into_data().to_vec::<f32>().unwrap();
+                        assert_eq!(bits(&got), bits(&want), "{key}: {label}, {repetition}");
+                        if repetition >= 2 {
+                            times.push(elapsed);
+                        }
+                    }
+                    let split: Vec<String> = stages()
+                        .iter()
+                        .zip(&before)
+                        .filter(|(after, before)| after.2 > before.2)
+                        .map(|(after, before)| {
+                            format!(
+                                "{} {:.3} ms x{} w{}",
+                                after.0,
+                                (after.1 - before.1) / 7.0,
+                                (after.2 - before.2) / 7,
+                                (after.3 - before.3) / 7
+                            )
+                        })
+                        .collect();
+                    // The process's resident memory, a footprint the capture may leave.
+                    let rss = std::fs::read_to_string("/proc/self/status")
+                        .ok()
+                        .and_then(|st| {
+                            st.lines()
+                                .find(|l| l.starts_with("VmRSS:"))
+                                .map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string())
+                        })
+                        .unwrap_or_default();
+                    eprintln!("STAGES {key}/{label}: RSS {rss} kB, {}", split.join(", "));
+                    report(&format!("{key}/{label}"), "us", "host", Stats::of(times));
+                };
+                // The control of the rounds after the capture (below): as many rounds before it.
+                let rounds: usize = std::env::var("TT_MATMUL_EAGER_AFTER")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                for round in 0..rounds {
+                    eager_again(format!("eager before capture, round {round}"));
+                }
+                // Traced: `A` is the input, `B` stays resident.
+                let TensorPrimitive::Float(ap) = a.clone().into_primitive() else {
+                    unreachable!()
+                };
+                ap.ensure_resident();
+                let (trace, first) = TracedInference::capture(&[&ap], || {
+                    let TensorPrimitive::Float(c) = a.clone().matmul(b.clone()).into_primitive()
+                    else {
+                        unreachable!()
+                    };
+                    vec![c]
+                })
+                .unwrap_or_else(|e| panic!("{key}: capture: {e}"));
+                let out = |o: &[OutputPayload]| match &o[0] {
+                    OutputPayload::F32(v) => v.clone(),
+                    other => panic!("{key}: output as {other:?}"),
+                };
+                assert_eq!(bits(&out(&first)), bits(&want), "{key}: the capture's run");
+                let mut replay = Vec::new();
+                for repetition in 0..9 {
+                    let run = trace
+                        .run_timed(vec![InputPayload::F32(av.clone())])
+                        .unwrap();
+                    assert_eq!(
+                        bits(&out(&run.outputs)),
+                        bits(&want),
+                        "{key}: replay {repetition}"
+                    );
+                    if repetition >= 2 {
+                        replay.push(run.replay.as_secs_f64() * 1e6);
+                    }
+                }
+                report(
+                    &format!("{key}/replay"),
+                    "us",
+                    "host",
+                    Stats::of(replay.clone()),
+                );
+                report(
+                    &format!("{key}/replay TFLOPS"),
+                    "TFLOPS",
+                    "host",
+                    Stats::of(replay.iter().map(|us| flops / us / 1e6)),
+                );
+                let ops = trace.ops().unwrap();
+                let mut moved = tt_kernels::profile_mode::OpBytes::default();
+                for op in &ops {
+                    moved.add(&op.bytes);
+                }
+                let units = (0..ops.first().map_or(0, |op| op.entries.len()))
+                    .filter(|&u| ops.iter().any(|op| !op.entries[u].is_empty()))
+                    .count();
+                eprintln!(
+                    "MEASURE {key}: {} ops on {units} units; GDDR read {:.1} MB (A {:.1}, B {:.1}) \
+                     in {} entries, written {:.1} MB",
+                    ops.len(),
+                    moved.read as f64 / 1e6,
+                    moved.a as f64 / 1e6,
+                    moved.b as f64 / 1e6,
+                    moved.reads,
+                    moved.write as f64 / 1e6,
+                );
+                report(
+                    &format!("{key}/replay GDDR read"),
+                    "GB/s",
+                    "host",
+                    Stats::of(replay.iter().map(|us| moved.read as f64 / us / 1e3)),
+                );
+                report(
+                    &format!("{key}/read entries"),
+                    "entries",
+                    "count",
+                    Stats::of([moved.reads as f64]),
+                );
+                // The eager product again after its own shape's capture, `TT_MATMUL_EAGER_AFTER`
+                // rounds of it, each round capturing once more after it (roadmap, "F4b's
+                // leftovers": 3-10% more host time once a measured, pulled capture ran).
+                // `TT_MATMUL_DROP_TRACE=1`: the first capture freed before the rounds, a toggle
+                // of the diagnosis.
+                let trace =
+                    (std::env::var("TT_MATMUL_DROP_TRACE").as_deref() != Ok("1")).then_some(trace);
+                // `TT_MATMUL_TRIM=1`: the heap the capture freed handed back to the system first
+                // (glibc's `malloc_trim`), a toggle of the diagnosis: freed memory against live.
+                if std::env::var("TT_MATMUL_TRIM").as_deref() == Ok("1") {
+                    extern "C" {
+                        fn malloc_trim(pad: usize) -> i32;
+                    }
+                    // SAFETY: glibc's `malloc_trim` takes a byte count and touches only free
+                    // heap.
+                    unsafe { malloc_trim(0) };
+                }
+                for round in 0..rounds {
+                    eager_again(format!("eager after capture, round {round}"));
+                    let (again, first) = TracedInference::capture(&[&ap], || {
+                        let TensorPrimitive::Float(c) =
+                            a.clone().matmul(b.clone()).into_primitive()
+                        else {
+                            unreachable!()
+                        };
+                        vec![c]
+                    })
+                    .unwrap_or_else(|e| panic!("{key}: capture again: {e}"));
+                    assert_eq!(bits(&out(&first)), bits(&want), "{key}: capture {round}");
+                    drop(again);
+                }
+                drop(trace);
+            }
+        },
+    );
+}

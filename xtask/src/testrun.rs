@@ -9,7 +9,10 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Mutex;
+use std::time::Duration;
 
 /// A test binary `cargo test --no-run` produced.
 #[derive(Clone)]
@@ -85,6 +88,33 @@ pub fn list(exe: &Path, include_ignored: bool) -> Result<Vec<String>, String> {
     Ok(all)
 }
 
+/// [`list`] for every binary, several at a time (each is two process starts, and a
+/// selection is a few hundred binaries); the result is in `bins`' order.
+pub fn list_all(bins: &[Built], include_ignored: bool) -> Result<Vec<Vec<String>>, String> {
+    let next = AtomicUsize::new(0);
+    type Listed = Option<Result<Vec<String>, String>>;
+    let lists: Mutex<Vec<Listed>> = Mutex::new(bins.iter().map(|_| None).collect());
+    let jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(bins.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(b) = bins.get(i) else {
+                    return;
+                };
+                let l = list(&b.exe, include_ignored);
+                lists.lock().unwrap()[i] = Some(l);
+            });
+        }
+    });
+    lists
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|l| l.expect("every binary was listed"))
+        .collect()
+}
+
 fn run_list(exe: &Path, ignored_only: bool) -> Result<Vec<String>, String> {
     let mut cmd = Command::new(exe);
     cmd.args(["--list", "--format", "terse"]);
@@ -149,24 +179,34 @@ pub fn run_one(
         .stderr(err)
         .spawn()
         .map_err(|e| format!("{}: {e}", exe.display()))?;
-    let deadline = Instant::now() + timeout;
-    let verdict = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break if status.success() {
+    // Waited for on another thread, so the verdict comes the moment the test exits
+    // rather than at the next poll.
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    let verdict = match rx.recv_timeout(timeout) {
+        Ok(status) => {
+            if status.map_err(|e| e.to_string())?.success() {
                 Verdict::Pass
             } else {
                 Verdict::Fail
-            };
+            }
         }
-        if Instant::now() >= deadline {
+        Err(RecvTimeoutError::Timeout) => {
             // A process blocked in an MMIO read against a hung NoC may not die;
             // the verdict is recorded either way, and the log already says START.
-            kill_group(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-            break Verdict::Timeout;
+            // The test leads its own group, so this kills it too.
+            kill_group(pid);
+            let _ = rx.recv();
+            // The leader's exit is not the group's: a forked child still tearing down its
+            // mappings holds the card, and the next gate's attach found it "in use"
+            // (`1793550655`).
+            wait_group_gone(pid, Duration::from_secs(30));
+            Verdict::Timeout
         }
-        std::thread::sleep(Duration::from_millis(50));
+        Err(RecvTimeoutError::Disconnected) => return Err("the test's waiter thread died".into()),
     };
     if let Ok(f) = File::open(out_path) {
         let _ = f.sync_all();
@@ -180,6 +220,23 @@ fn kill_group(pgid: u32) {
         .args(["-KILL", "--"])
         .arg(format!("-{pgid}"))
         .status();
+}
+
+/// Wait until no process of group `pgid` is left (`kill -0` on the group fails), or `most`.
+fn wait_group_gone(pgid: u32, most: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < most {
+        let alive = Command::new("kill")
+            .args(["-0", "--"])
+            .arg(format!("-{pgid}"))
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]
@@ -224,8 +281,8 @@ mod tests {
             .parse()
             .unwrap();
         // `kill -0` succeeds only for a live process (a reaped one has no entry; a zombie of ours
-        // would, but the child's parent was the script, which is gone, so init reaps it).
-        std::thread::sleep(Duration::from_millis(300));
+        // would, but the child's parent was the script, which is gone, so init reaps it). No
+        // grace period: `run_one` returns only once the group is gone.
         let alive = Command::new("kill")
             .args(["-0", &child.to_string()])
             .stderr(Stdio::null())

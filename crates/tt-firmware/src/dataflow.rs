@@ -153,6 +153,39 @@ pub fn released(target: u16, which: Release) -> Result<(), u32> {
     }
 }
 
+/// Wait until the credit word at `address` has reached `target`, signed modulo 2^32
+/// (`dm::op::WAIT_CREDIT`): a cross-core channel's count, which a peer's NoC atomic raises. Every
+/// poll fences, so the NoC's write is seen, and reads the abort word, so a wait that will never end
+/// is cancelled.
+#[inline(never)]
+pub fn credit(address: u64, target: u32, actor: u32) -> Result<(), u32> {
+    credit_with(address, target, actor, || {})
+}
+
+/// [`credit`], calling `turn` once each poll that finds the word short: RISCV B issues its queued
+/// prefetch's reads there, as in a barrier's wait (an edge credit stands where a barrier was,
+/// `docs/completed-plans/dataflow-compiler.md` F4a.1).
+#[inline(always)]
+pub fn credit_with(
+    address: u64,
+    target: u32,
+    actor: u32,
+    mut turn: impl FnMut(),
+) -> Result<(), u32> {
+    let reason = dataflow::WAIT_REASON + actor as u64 * 4;
+    write(reason, dataflow::CREDIT_WAIT);
+    let mut poll = Poll::new();
+    loop {
+        poll.tick()?;
+        if (read(address).wrapping_sub(target) as i32) >= 0 {
+            write(reason, 0);
+            publish();
+            return Ok(());
+        }
+        turn();
+    }
+}
+
 /// Record that `role` has retired `batch`, without waiting for its peers: the
 /// region's last batch, which the mover's `KERNEL_WAIT` joins instead.
 pub fn record_batch(role: u32, batch: u32) {

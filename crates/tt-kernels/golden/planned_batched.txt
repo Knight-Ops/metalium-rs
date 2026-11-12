@@ -1,0 +1,116 @@
+case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 1 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x50c00 need 0x62000
+case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 1 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x48a00 need 0x62000
+case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 1 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x50c00 need 0x50c00
+case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 1 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x48a00 need 0x48a00
+case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x3c700 need 0x62000
+case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 8 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x38600 need 0x62000
+case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 8 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x3c700 need 0x40800
+case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 8 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x38600 need 0x40800
+case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 120 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x25140 need 0x62000
+case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 120 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x62000
+case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 120 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x25140 need 0x40800
+case [512, 128] [128, 256] [128, 128, 64] items [[0, 0]/[0, 0] [128, 0]/[0, 64] [256, 0]/[0, 128] [384, 0]/[0, 192]] units 120 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x40800
+case [128, 256] [128, 256] [128, 64, 128] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T [0, 192]/[0, 192]^T] units 8 pipeline true k None padded [false, false] unpack_b false block Auto
+  planned top 0x3c700 need 0x62000
+case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 1 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x28200 need 0x32000
+case [192, 35] [35, 96] [35, 35, 32] items [[0, 0]/[0, 0] [64, 0]/[0, 32] [128, 0]/[0, 64]] units 1 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x32000
+case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 1 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x28200 need 0x28200
+case [192, 35] [35, 96] [35, 35, 32] items [[0, 0]/[0, 0] [64, 0]/[0, 32] [128, 0]/[0, 64]] units 1 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x2a280
+case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x230c0 need 0x32000
+case [192, 35] [35, 96] [35, 35, 32] items [[0, 0]/[0, 0] [64, 0]/[0, 32] [128, 0]/[0, 64]] units 8 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x25140 need 0x32000
+case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 8 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x230c0 need 0x28200
+case [192, 35] [35, 96] [35, 35, 32] items [[0, 0]/[0, 0] [64, 0]/[0, 32] [128, 0]/[0, 64]] units 8 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x25140 need 0x28200
+case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 120 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x230c0 need 0x32000
+case [192, 35] [35, 96] [35, 35, 32] items [[0, 0]/[0, 0] [64, 0]/[0, 32] [128, 0]/[0, 64]] units 120 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x25140 need 0x32000
+case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 120 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x230c0 need 0x28200
+case [192, 35] [35, 96] [35, 35, 32] items [[0, 0]/[0, 0] [64, 0]/[0, 32] [128, 0]/[0, 64]] units 120 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x25140 need 0x28200
+case [35, 96] [35, 96] [35, 32, 35] items [[0, 0]/[0, 0]^T [0, 32]/[0, 32]^T [0, 64]/[0, 64]^T] units 8 pipeline true k None padded [false, false] unpack_b false block Auto
+  planned top 0x230c0 need 0x32000
+case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 1 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x38600 need 0x42000
+case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 1 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x36580 need 0x42000
+case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 1 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x38600 need 0x38600
+case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 1 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x36580 need 0x36580
+case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x42000
+case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 8 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x42000
+case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 8 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x30400
+case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 8 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x30400
+case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 120 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x42000
+case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 120 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x25140 need 0x42000
+case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 120 pipeline false k None padded [false, false] unpack_b true block Auto
+  planned top 0x2a280 need 0x30400
+case [128, 64] [64, 192] [64, 64, 96] items [[0, 0]/[0, 0] [64, 0]/[0, 96]] units 120 pipeline false k None padded [true, false] unpack_b true block Auto
+  planned top 0x25140 need 0x30400
+case [64, 192] [64, 192] [64, 96, 64] items [[0, 0]/[0, 0]^T [0, 96]/[0, 96]^T] units 8 pipeline true k None padded [false, false] unpack_b false block Auto
+  planned top 0x2a280 need 0x42000
+case [1, 192] [64, 192] [1, 64, 64] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x25140 need 0x32000
+case [96, 64] [64, 192] [1, 64, 64] items [[0, 0]/[0, 0] [32, 0]/[0, 64] [64, 0]/[0, 128]] units 8 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x25140 need 0x32000
+case [1, 192] [64, 192] [1, 64, 64] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T] units 64 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x25140 need 0x32000
+case [96, 64] [64, 192] [1, 64, 64] items [[0, 0]/[0, 0] [32, 0]/[0, 64] [64, 0]/[0, 128]] units 64 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x25140 need 0x32000
+case [1, 192] [300, 192] [1, 64, 300] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x2e380 need 0x62000
+case [96, 300] [300, 192] [1, 300, 64] items [[0, 0]/[0, 0] [32, 0]/[0, 64] [64, 0]/[0, 128]] units 8 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x35540 need 0x62000
+case [1, 192] [300, 192] [1, 64, 300] items [[0, 0]/[0, 0]^T [0, 64]/[0, 64]^T [0, 128]/[0, 128]^T] units 64 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x25140 need 0x62000
+case [96, 300] [300, 192] [1, 300, 64] items [[0, 0]/[0, 0] [32, 0]/[0, 64] [64, 0]/[0, 128]] units 64 pipeline true k None padded [true, false] unpack_b true block Auto
+  planned top 0x35540 need 0x62000
+case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x48a00 need 0xe5080
+case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 120 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x2e380 need 0xe5080
+case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 8 pipeline true k None padded [false, false] unpack_b true block Fixed([4, 8, 2])
+  planned top 0x91c00 need 0xe5080
+case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 120 pipeline true k None padded [false, false] unpack_b true block Fixed([4, 8, 2])
+  planned top 0x91c00 need 0xe5080
+case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 8 pipeline true k None padded [false, false] unpack_b true block Off
+  planned top 0xe5080 need 0xe5080
+case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 120 pipeline true k None padded [false, false] unpack_b true block Off
+  planned top 0xa3040 need 0xe5080
+case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 8 pipeline true k Some(16) padded [false, false] unpack_b true block Auto
+  planned top 0x42880 need 0xe5080
+case [1024, 2048] [2048, 128] [512, 2048, 64] items [[0, 0]/[0, 0] [512, 0]/[0, 64]] units 120 pipeline true k Some(16) padded [false, false] unpack_b true block Auto
+  planned top 0x42880 need 0xe5080
+case [96, 320] [320, 288] [96, 320, 288] items [[0, 0]/[0, 0]] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x4aa80 need 0xfc000
+case [64, 64] [64, 64] [64, 64, 64] items [[0, 32]/[0, 0]] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x0 need 0x3a000
+case [64, 64] [64, 64] [64, 64, 64] items [] units 8 pipeline true k None padded [false, false] unpack_b true block Auto
+  planned top 0x0 need 0x0

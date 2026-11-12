@@ -8,7 +8,7 @@ holds and deferred frees retain physical slot sizes and exponent groups.
 Replay input buffers still require ordinary F32 physical storage; perform
 explicit BFP casts inside the captured computation. Decoded output readback
 widens on device. Training keeps gradients, masters and optimizer state F32.
-See [the current storage contract](mixed-bfp-storage.md); the motivation and
+See [the current storage contract](../completed-plans/mixed-bfp-storage.md); the motivation and
 original limitations below describe the earlier trace design.
 
 Status (2026-10-10): sections 3, 4 and 6 describe what `crates/burn-tt/src/trace.rs` and
@@ -115,6 +115,46 @@ Bool), never as tensors, because the output buffer is rewritten by every replay.
    - Write new input payloads into fixed GDDR input slots using `write` (F32) or `write_bits` (I32/Bool/BF16).
    - Enqueue a single `CALL` entry per tile (`Session::replay`).
    - Download the $M$ output buffers back to host memory.
+
+### Several traces over one state (`SharedStateTraces`, 2026-10-15)
+
+A decoder needs more than one trace over the same key/value cache: its one-token step, and prefill
+chunks of a few sizes. `SharedStateTraces<K>` (`crates/burn-tt/src/trace.rs`) holds them, keyed by
+the caller's `K`. Each capture works like this:
+
+- it receives the same state tensors;
+- it returns the new state, one tensor for each state tensor, of the same shape and dtype;
+- `capture_with_state` records the on-card `copy_into(new → state)`.
+
+So whichever trace replays, the next reads what it left. The rules:
+
+- **The step is functional.** It reads the state it was given and returns the new state. It must not
+  read a tensor that an earlier capture produced, because that tensor is the earlier trace's
+  scratch: its own replays rewrite it, and no other trace's do. A model whose step mutated its cache
+  object in place would capture the second trace over the first one's scratch. Under this rule, the
+  order of capture does not matter.
+- **A capture runs its step once, so it writes the state.** Nothing may rely on what the state held
+  before a capture. A cache read only at positions the generation itself has written meets this
+  rule.
+- **Several traces fit only together, or fail.** They share the program cache (240 KiB of L1 a unit;
+  programs are refcounted, so a program shared by two traces is held once). A capture that does not
+  fit fails the attachment for good (the error is sticky), so reattach before retrying with fewer
+  traces. `SharedStateTraces::footprint` and `TracedInference::footprint` (`Session::trace_footprint`)
+  report what each unit holds.
+
+The model side is `tt_models::generate`:
+
+- `FixedShapeDecoder` is a decoder's chunk and step over a cache, both functional.
+- `TracedGenerator` captures one chunk per size and one step per attended length (`Shapes`). It feeds
+  a prompt with the smallest chunk that covers it (chunks of the largest past that), then replays a
+  token at a time the step attending to the fewest positions that include it. Token ids go in, and the
+  lookup runs inside the trace.
+- **Storage:** a trace's streams are one GDDR region a unit: the stream, then each `PAIR_CALL` section from
+  a 64-byte boundary (`Session::store_stream`; see [decode-length-cost.md](../completed-plans/decode-length-cost.md)).
+- `generate_fixed` is the same schedule run eagerly.
+
+The gate is `step187_traced_generation`, run on Llama shapes SmolLM2 does not have and on a GPT-2-style
+decoder: bit for bit against the eager schedule and the growing cache.
 
 ---
 
@@ -249,12 +289,17 @@ frontiers must be addressed:
 ### 8.1. Trace Cache Segmentation & Instruction Streaming
 
 #### Physical Constraint: 240 KB L1 Program Cache
-Each Tensix tile provides 1.5 MiB of local L1 SRAM (`tt_isa::tensix::L1_SIZE`), of which **240 KiB** is left for the firmware program cache (`tt_isa::l1::PROGRAM_CACHE`: L1 after the program slots and the 16 KiB trace buffer).
+Each Tensix tile provides 1.5 MiB of local L1 SRAM (`tt_isa::tensix::L1_SIZE`), of which **240 KiB** is left for the firmware program cache (`tt_isa::l1::PROGRAM_CACHE`: L1 after the program slots, the mailboxes and the 16 KiB trace buffer).
 When capturing a large enough network's entire training step (forward pass, loss, backward pass, optimizer updates, and parameter writebacks) on a single tile, the unrolled kernel instruction stream can exceed 240 KiB. `Session` then refuses with:
 ```text
 a list's programs do not fit an empty program cache
 ```
 The MNIST and `TinyTransformer` traces captured today fit; deeper training graphs would need program cache management.
+
+**Since 2026-10-23** ([long-context.md](long-context.md) 1.A, 1.E): element-wise and reduce programs no longer grow
+with their tile count (one tile's block, repeated), and the traces of a set need not fit the cache together: a trace
+keeps its programs' words and a replay puts back what another trace's took the room of. One trace's programs must
+still fit a unit's cache alone.
 
 #### Architectural Solution:
 1. **Instruction Segment Chunking**:

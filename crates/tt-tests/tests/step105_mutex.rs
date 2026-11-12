@@ -290,7 +290,14 @@ fn contended(
         stage: &[],
     };
     let tile = harness::tensix_tile();
-    let launch = atomics::start(dev, tile, &tt_tests::firmware::ROLES, &run, budget()).unwrap();
+    let launch = atomics::start(
+        dev,
+        tile,
+        &tt_tests::firmware::GUARDED_ROLES,
+        &run,
+        budget(),
+    )
+    .unwrap();
     let outcome = (|| -> Result<[usize; 2], String> {
         // Everyone is parked: the holder at its `go` wait, each waiter behind
         // the held mutex. A role reports BLOCKED only because its deadline
@@ -531,7 +538,7 @@ fn uncontended_on(
         let launch = atomics::start(
             dev,
             harness::tensix_tile(),
-            &tt_tests::firmware::ROLES,
+            &tt_tests::firmware::GUARDED_ROLES,
             &Spec {
                 roles,
                 semaphores: &init,
@@ -607,7 +614,7 @@ fn guard_breadcrumbs_reach_drained_on_the_simulator() {
             let launch = atomics::start(
                 dev,
                 harness::tensix_tile(),
-                &tt_tests::firmware::ROLES,
+                &tt_tests::firmware::GUARDED_ROLES,
                 &Spec {
                     roles: [
                         RoleProgram::Guarded(&p),
@@ -669,7 +676,7 @@ fn calibrate(mode: PollMode) {
         let launch = atomics::start(
             dev,
             harness::tensix_tile(),
-            &tt_tests::firmware::ROLES,
+            &tt_tests::firmware::GUARDED_ROLES,
             &Spec {
                 roles: [
                     RoleProgram::Guarded(&p),
@@ -819,7 +826,7 @@ fn deadline_reports_blocked_and_the_host_release_completes_the_role() {
         let launch = atomics::start(
             dev,
             harness::tensix_tile(),
-            &tt_tests::firmware::ROLES,
+            &tt_tests::firmware::GUARDED_ROLES,
             &run,
             budget(),
         )
@@ -870,7 +877,7 @@ fn an_unreleased_role_gives_up_after_the_grace_period() {
         let launch = atomics::start(
             dev,
             harness::tensix_tile(),
-            &tt_tests::firmware::ROLES,
+            &tt_tests::firmware::GUARDED_ROLES,
             &run,
             budget(),
         )
@@ -912,7 +919,7 @@ fn arming_is_consumed_by_the_run_it_guards() {
         let launch = atomics::start(
             dev,
             harness::tensix_tile(),
-            &tt_tests::firmware::ROLES,
+            &tt_tests::firmware::GUARDED_ROLES,
             &run,
             budget(),
         )
@@ -946,7 +953,7 @@ fn a_poke_stores_a_word_from_the_runner_core() {
         let launch = atomics::start(
             dev,
             harness::tensix_tile(),
-            &tt_tests::firmware::ROLES,
+            &tt_tests::firmware::GUARDED_ROLES,
             &Spec {
                 roles: [
                     RoleProgram::Idle,
@@ -977,6 +984,42 @@ fn a_poke_stores_a_word_from_the_runner_core() {
     });
 }
 
+/// The production role images (`firmware::ROLES`) leave guarded runs out to keep
+/// their slots small, so a guarded program given to them is refused by the host
+/// before anything is loaded, by name; the guarded images take it.
+#[cfg(not(feature = "silicon"))]
+#[test]
+fn a_guarded_program_on_the_production_role_images_is_refused() {
+    harness::in_device(|dev| {
+        let l = Layout::new();
+        let body = sync::take(l.go, Before::EVERYTHING).to_vec();
+        let p = GuardedProgram::new(1, &body, guard_spec(), l.done[1]).unwrap();
+        let init = l.plan.semaphore_init();
+        let spec = Spec {
+            roles: [
+                RoleProgram::Idle,
+                RoleProgram::Guarded(&p),
+                RoleProgram::Idle,
+            ],
+            semaphores: &init,
+            stage: &[],
+        };
+        match atomics::start(
+            dev,
+            harness::tensix_tile(),
+            &tt_tests::firmware::ROLES,
+            &spec,
+            budget(),
+        ) {
+            Err(atomics::AtomicsError::Refused(why)) => {
+                assert!(why.contains("GUARDED_ROLES"), "{why}")
+            }
+            Err(e) => panic!("expected a refusal by name, got {e}"),
+            Ok(_) => panic!("a guarded program ran on the production role images"),
+        }
+    });
+}
+
 /// The runner checks a poke itself: an address outside the data arena (written
 /// past the host's check) panics it with `guard::REFUSED` rather than writing
 /// a mailbox. Simulator only: the role's parked thread would stay parked on
@@ -992,7 +1035,7 @@ fn the_runner_refuses_a_poke_outside_the_data_arena() {
         let launch = atomics::start(
             dev,
             harness::tensix_tile(),
-            &tt_tests::firmware::ROLES,
+            &tt_tests::firmware::GUARDED_ROLES,
             &Spec {
                 roles: [
                     RoleProgram::Idle,

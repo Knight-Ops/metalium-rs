@@ -56,6 +56,12 @@ SECTIONS
     __bss_end = .;
   } > L1
 
+  /* The image's span in its L1 region, for `cargo xtask fw-size`: absolute
+   * symbols only, so no byte of the image moves. `__bss_end` is the end of the
+   * last section placed in L1. */
+  __image_base = ORIGIN(L1);
+  __image_limit = ORIGIN(L1) + LENGTH(L1);
+
   /* Per-core state the firmware keeps for itself (`#[link_section = ".local"]`),
    * at the bottom of local data RAM: 2-cycle access, and the stack grows down
    * from the top. NOLOAD -- nothing can be staged there (the NoC cannot reach

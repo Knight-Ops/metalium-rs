@@ -47,6 +47,29 @@ pub const ROLES: [Image; 3] = [
     ),
 ];
 
+/// The role runner with guarded runs (`tt_firmware::corpus::run_guarded_role`) on
+/// T0, T1 and T2, each at its core's default reset PC: what `tt_kernels::atomics`
+/// loads for a guarded program (`tt_isa::mailbox::guard`). [`ROLES`] leaves the
+/// guard machinery out (about 1.9 KB an image), so their slots stay small and the
+/// room goes to B's mover. Never loaded beside the mover.
+pub const GUARDED_ROLES: [Image; 3] = [
+    (
+        Core::T0,
+        include_bytes!(env!("FIRMWARE_GUARDED_T0")),
+        Core::T0.default_reset_pc() as u64,
+    ),
+    (
+        Core::T1,
+        include_bytes!(env!("FIRMWARE_GUARDED_T1")),
+        Core::T1.default_reset_pc() as u64,
+    ),
+    (
+        Core::T2,
+        include_bytes!(env!("FIRMWARE_GUARDED_T2")),
+        Core::T2.default_reset_pc() as u64,
+    ),
+];
+
 /// The step 3 heartbeat: increments a counter in L1 forever.
 pub const HEARTBEAT: &[u8] = include_bytes!(env!("FIRMWARE_HEARTBEAT"));
 
@@ -150,7 +173,7 @@ pub const ICACHE_T: [Image; 3] = [
 ];
 
 /// The `.ttinsn` push-fusion experiment's T1 image
-/// (`docs/plans/ttinsn-push-experiment.md`): [`ROLES`]'s math image with two hooks,
+/// (`docs/completed-plans/ttinsn-push-experiment.md`): [`ROLES`]'s math image with two hooks,
 /// built with fused `.ttinsn` words for a few programs. Only with the
 /// `ttinsn-experiment` feature, which no shippable build turns on.
 #[cfg(feature = "ttinsn-experiment")]
@@ -161,7 +184,7 @@ pub const TTINSN_T1: Image = (
 );
 
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 20] = [
+const ENTRIES: [(&str, &str); 23] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("prng_seed", env!("FIRMWARE_PRNG_SEED_ENTRY")),
@@ -170,6 +193,9 @@ const ENTRIES: [(&str, &str); 20] = [
     ("role_t0", env!("FIRMWARE_ROLE_T0_ENTRY")),
     ("role_t1", env!("FIRMWARE_ROLE_T1_ENTRY")),
     ("role_t2", env!("FIRMWARE_ROLE_T2_ENTRY")),
+    ("guarded_t0", env!("FIRMWARE_GUARDED_T0_ENTRY")),
+    ("guarded_t1", env!("FIRMWARE_GUARDED_T1_ENTRY")),
+    ("guarded_t2", env!("FIRMWARE_GUARDED_T2_ENTRY")),
     ("eth_e1", env!("FIRMWARE_ETH_E1_ENTRY")),
     ("dm_b", env!("FIRMWARE_DM_B_ENTRY")),
     ("nc_probe", env!("FIRMWARE_NC_PROBE_ENTRY")),
@@ -233,6 +259,21 @@ mod tests {
             Some(TTINSN_T1.2),
             "ttinsn_t1 is linked away from T1's slot"
         );
+    }
+
+    /// The guarded role runners sit at their cores' default reset PCs, each
+    /// within the 16 KiB that leaves it.
+    #[test]
+    fn the_guarded_role_images_are_linked_at_their_default_reset_pcs() {
+        for ((core, image, at), name) in
+            GUARDED_ROLES
+                .iter()
+                .zip(["guarded_t0", "guarded_t1", "guarded_t2"])
+        {
+            assert_eq!(*at, core.default_reset_pc() as u64, "{name}");
+            assert_eq!(entry(name).map(u64::from), Some(*at), "{name}");
+            assert!(!image.is_empty() && image.len() <= 0x4000, "{name}");
+        }
     }
 
     #[test]

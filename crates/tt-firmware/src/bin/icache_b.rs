@@ -4,8 +4,8 @@
 #![no_main]
 
 /// Where the timings go: `[size, straight-line cycles, jump-chain cycles]`
-/// per size, in the mailbox region's free stretch (below RISCV NC's ring).
-const RESULTS: u64 = tt_isa::mailbox::MAILBOX_BASE + 0x3000;
+/// per size, in the probes' own L1 (`mailbox::PROBE_SCRATCH`).
+const RESULTS: u64 = tt_isa::mailbox::icache_results(0);
 
 /// Each code block's size.
 const BLOCK: u32 = 8192;

@@ -1,5 +1,10 @@
 //! Per-tensor physical storage, separate from the logical F32 dtype.
 //!
+//! [`StorageFormat::Bf16`] is a weight in half the bytes: a product reads it as its `B` directly
+//! (bit for bit the product of its values in F32, `tt_kernels::matmul::SrcRoute::TF32_WITH_BF16_B`),
+//! and every other op widens it first. Storing rounds ties-even, so it is exact for BF16-valued
+//! data (a BF16 checkpoint widened to F32).
+//!
 //! Casts return a fresh resident allocation and use identity backward (a
 //! straight-through approximation). Arithmetic widens on device. Unary/scalar
 //! results keep storage; binary results use the higher input precision;
@@ -22,13 +27,14 @@ pub enum StorageFormat {
     Bfp2,
     Bfp4,
     Bfp8,
+    Bf16,
     #[default]
     F32,
 }
 impl StorageFormat {
     fn packed(self) -> Option<BfpFormat> {
         match self {
-            Self::F32 => None,
+            Self::F32 | Self::Bf16 => None,
             Self::Bfp8 => Some(BfpFormat::Bfp8),
             Self::Bfp4 => Some(BfpFormat::Bfp4),
             Self::Bfp2 => Some(BfpFormat::Bfp2),
@@ -39,10 +45,13 @@ impl TtTensor {
     pub fn storage_format(&self) -> StorageFormat {
         self.physical_storage()
     }
-    /// Convert logical F32 to explicit single-card physical storage. BF16 must
-    /// first be converted to logical F32. No source host cache is retained.
+    /// Convert logical F32 to explicit single-card physical storage, or a logical BF16 tensor to
+    /// BFP and back ([`TtTensor::bf16_with_storage`]). No source host cache is retained.
     pub fn with_storage(self, format: StorageFormat) -> Self {
         let _op = crate::report::enter("with_storage", true);
+        if self.dtype() == DType::BF16 {
+            return self.bf16_with_storage(format);
+        }
         assert_eq!(self.dtype(), DType::F32, "BFP storage requires logical F32");
 
         assert!(
@@ -56,15 +65,31 @@ impl TtTensor {
         };
         let src = input.to_dram();
         let dims = [src.buffer.rows, src.buffer.cols];
-        let (id, [rows, cols]) =
-            if input.storage_format() == StorageFormat::F32 && format == StorageFormat::F32 {
-                let sources = (0..dims[0] * dims[1])
-                    .map(|i| [i / dims[1], i % dims[1]])
-                    .collect();
-                crate::server::repack(input.device, src.buffer.id, sources, dims)
-            } else {
-                crate::server::cast_bfp(input.device, src.buffer.id, dims, format.packed())
-            };
+        let from = input.storage_format();
+        // A transposed view stored in a packed format is its transpose made plain first: a product
+        // reads a stored weight as it lies (the tied output head, `x @ table^T`), and a transposed
+        // packed weight would be widened at every call.
+        let plain = (format != StorageFormat::F32 && src.transposed)
+            .then(|| crate::ops::plain_dram(&input));
+        let (src, dims) = match &plain {
+            Some(p) => (p, [p.buffer.rows, p.buffer.cols]),
+            None => (src, dims),
+        };
+        let (id, [rows, cols]) = if from == StorageFormat::F32 && format == StorageFormat::F32 {
+            let sources = (0..dims[0] * dims[1])
+                .map(|i| [i / dims[1], i % dims[1]])
+                .collect();
+            crate::server::repack(input.device, src.buffer.id, sources, dims)
+        } else if format == StorageFormat::Bf16 || from == StorageFormat::Bf16 {
+            crate::server::cast_bf16_storage(
+                input.device,
+                src.buffer.id,
+                dims,
+                format == StorageFormat::Bf16,
+            )
+        } else {
+            crate::server::cast_bfp(input.device, src.buffer.id, dims, format.packed())
+        };
         let dram = DramRef {
             buffer: Arc::new(Buffer {
                 id,
@@ -73,10 +98,46 @@ impl TtTensor {
                 cols,
                 parent: None,
                 storage: format,
+                plain: Default::default(),
             }),
-            transposed: src.transposed,
+            transposed: src.transposed && plain.is_none(),
+            generation: 0,
         };
         Self::on_device(dram, input.shape(), DType::F32, input.device)
+    }
+}
+
+impl TtTensor {
+    /// A logical BF16 tensor stored as `format` (roadmap W1, native BF16 arithmetic): BFP8/4/2 --
+    /// a BF16 stream's weights, which a product reads as its `B` against a BF16 activation, with a
+    /// BF16 result -- or [`StorageFormat::F32`], which for a BF16 tensor is its own BF16 slots. The
+    /// BFP block is `Session::store_bfp`'s of the widened values; every value a BFP block decodes
+    /// to is a BF16 value (at most 7 significant bits under an 8-bit exponent), so decoding it back
+    /// to the tensor's own slots is exact. [`StorageFormat::Bf16`] is refused: a BF16 tensor
+    /// already is.
+    fn bf16_with_storage(self, format: StorageFormat) -> Self {
+        let (from, shape, device) = (self.storage_format(), self.shape(), self.device);
+        assert!(
+            format != StorageFormat::Bf16 && from != StorageFormat::Bf16,
+            "a BF16 tensor's storage is BFP or its own"
+        );
+        if from == format {
+            return self;
+        }
+        // The same buffer, read as the logical F32 tensor it stores.
+        let as_f32 =
+            |t: &TtTensor| Self::on_device(t.to_dram().clone(), t.shape(), DType::F32, t.device);
+        if from == StorageFormat::F32 {
+            let stored = crate::ops::float_compute_input(self).with_storage(format);
+            return Self::on_device(stored.to_dram().clone(), shape, DType::BF16, device);
+        }
+        let decoded = as_f32(&self).with_storage(StorageFormat::F32);
+        let own = crate::ops::cast_native(decoded, DType::BF16);
+        if format == StorageFormat::F32 {
+            own
+        } else {
+            own.bf16_with_storage(format)
+        }
     }
 }
 

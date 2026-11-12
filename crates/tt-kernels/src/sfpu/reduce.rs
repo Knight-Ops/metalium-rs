@@ -97,7 +97,7 @@ impl ReduceOp {
         }
     }
 
-    fn format(self) -> Format {
+    pub(crate) fn format(self) -> Format {
         match self {
             Self::Max
             | Self::All
@@ -122,7 +122,7 @@ pub enum Axis {
 }
 
 /// `into = op(other, into)`, lanewise.
-fn combine(p: &mut Program, op: ReduceOp, other: LReg, into: LReg) {
+pub(crate) fn combine(p: &mut Program, op: ReduceOp, other: LReg, into: LReg) {
     match op {
         ReduceOp::Sum => p.add(other, into, into),
         ReduceOp::Max => p.if_(Cond::Less(into, other), |p| p.mov(other, into)),
@@ -179,9 +179,47 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
         return accumulate_in_order(first, valid.unwrap_or(32));
     }
+    accumulate_with(op, axis, first, valid, false, 32)
+}
+
+/// [`accumulate`] of each datum's square (`x * x` as `MUL`'s program forms it, `SFPMAD(x, x,
+/// -0)`) for a sum over columns: what accumulating `MUL(x, x)`'s output tile does, bit for bit,
+/// since a product is never a denormal and so its FP32 store and reload change nothing. The sum
+/// of squares of `sfpu::norm`, over the tile's first `rows` rows only ([`row_offsets`]).
+pub fn accumulate_squares(first: bool, valid: Option<u32>, rows: u32) -> Vec<Instruction> {
+    accumulate_with(ReduceOp::Sum, Axis::Cols, first, valid, true, rows)
+}
+
+/// The `Dst` offsets, from a tile's first row and as `for_each_row_group(64, ..)` hands them,
+/// of the row groups that hold the tile's first `rows` (1..=32) tensor rows. Tensor rows 0..16
+/// are faces 0 (offsets 0..16) and 1 (16..32), rows 16..32 faces 2 and 3; each face is four
+/// groups of four rows, a group's even columns at `4g` and its odd at `4g | 2`. A load holds
+/// four rows of eight columns, and a reduction over columns never moves a value between rows
+/// (its fold rotates within a lane row), so the groups past `rows` -- padding -- need not run:
+/// a decode row (`rows == 1`) is 4 of the 32.
+pub fn row_offsets(rows: u32) -> Vec<u32> {
+    assert!((1..=32).contains(&rows), "{rows} rows of a tile");
+    (0..64)
+        .step_by(2)
+        .filter(|o| o / 32 * 16 + o % 16 / 4 * 4 < rows)
+        .collect()
+}
+
+fn accumulate_with(
+    op: ReduceOp,
+    axis: Axis,
+    first: bool,
+    valid: Option<u32>,
+    square: bool,
+    rows: u32,
+) -> Vec<Instruction> {
+    assert!(
+        rows == 32 || axis == Axis::Cols,
+        "rows limit a sum over columns"
+    );
     let fmt = op.format();
     let masked = valid.is_some_and(|v| v < 32);
-    let mut p = Program::with_policy(if masked {
+    let mut p = Program::with_policy(if masked || rows < 32 {
         LoopPolicy::Unrolled
     } else {
         LoopPolicy::Replay
@@ -206,11 +244,14 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
         mask_setup(&mut p);
     }
     let v = valid.unwrap_or(32) as i32;
-    p.for_each_row_group(64, |p, o| {
+    let body = |p: &mut Program, o: u32| {
         if masked && matches!(op, ReduceOp::ProdI32 | ReduceOp::MinI32 | ReduceOp::MaxI32) {
             mask_setup(p);
         }
         p.load(LReg::L0, fmt, A_ROW + o);
+        if square {
+            p.mul(LReg::L0, LReg::L0, LReg::L0);
+        }
         if masked {
             let g = o / 4;
             // What the lane index in `L6` must stay below for the lane to
@@ -237,7 +278,14 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
             combine(p, op, LReg::L0, LReg::L1);
             p.store(LReg::L1, fmt, OUT_ROW + o);
         }
-    });
+    };
+    if rows == 32 {
+        p.for_each_row_group(64, body);
+    } else {
+        for o in row_offsets(rows) {
+            body(&mut p, o);
+        }
+    }
     p.finish()
 }
 
@@ -246,6 +294,20 @@ pub fn accumulate(op: ReduceOp, axis: Axis, first: bool, valid: Option<u32>) -> 
 /// `first` tile, which also zeroes the accumulator's other rows (as the
 /// result's padding). Flex's `sum` over `dim = 0`, bit for bit.
 pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
+    in_order(first, valid, false)
+}
+
+/// The column sums of squares of one input tile's first `valid` rows, in order, into row 0 of
+/// the accumulator tile: what [`accumulate_squares`] adds a lane at a time over a row's tiles,
+/// for that row laid out one of its tiles' data rows per row (`tensor::pack_row`: row `kk` is
+/// the row's tile `kk`). Column `c` then takes the same squares in the same order as lane `c`
+/// of the row's sum -- the first as it is (not added to `+0.0`), each later one added as
+/// `square + sum` -- and [`finish_rows`]`(.., 1)` folds row 0 as it folds the row's.
+pub fn accumulate_squares_in_order(first: bool, valid: u32) -> Vec<Instruction> {
+    in_order(first, valid, true)
+}
+
+fn in_order(first: bool, valid: u32, square: bool) -> Vec<Instruction> {
     let mut p = Program::with_policy(LoopPolicy::Unrolled);
     let acc = |r: u32| OUT_ROW + r;
     if first {
@@ -261,6 +323,8 @@ pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
             } else {
                 p.load(LReg::L4, Format::Fp32, acc(top + half));
             }
+            // The first square is the sum, as `accumulate_squares` stores the first tile's.
+            let mut fresh = first && square;
             for g in 0..8u32 {
                 let rows = valid.saturating_sub(4 * g).min(4);
                 if rows == 0 {
@@ -272,15 +336,23 @@ pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
                     bottom + 4 * (g - 4)
                 };
                 p.load(LReg::L0, Format::Fp32, A_ROW + r + half);
+                if square {
+                    p.mul(LReg::L0, LReg::L0, LReg::L0);
+                }
                 // Row `i` of the four into row 0 of `L[i]`; row 0 of `L4`
                 // stays where it is.
                 p.transpose4();
                 for i in 0..rows {
-                    p.add(
-                        LReg::L4,
-                        [LReg::L0, LReg::L1, LReg::L2, LReg::L3][i as usize],
-                        LReg::L4,
-                    );
+                    let row = [LReg::L0, LReg::L1, LReg::L2, LReg::L3][i as usize];
+                    if fresh {
+                        p.mov(row, LReg::L4);
+                        fresh = false;
+                    } else if square {
+                        // `combine`'s order: the new value, then the sum.
+                        p.add(row, LReg::L4, LReg::L4);
+                    } else {
+                        p.add(LReg::L4, row, LReg::L4);
+                    }
                 }
             }
             // Row 0 the sums, rows 1..4 zero: `L5..L8` cleared and transposed
@@ -298,6 +370,16 @@ pub fn accumulate_in_order(first: bool, valid: u32) -> Vec<Instruction> {
 /// The finishing program: the accumulator folded within the tile (see the
 /// module documentation). Nothing for a sum over rows, already in row 0.
 pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
+    finish_rows(op, axis, 32)
+}
+
+/// [`finish`] of a sum over columns folding only the row groups of the tile's first `rows`
+/// rows ([`row_offsets`]); the others are left as they were, padding.
+pub fn finish_rows(op: ReduceOp, axis: Axis, rows: u32) -> Vec<Instruction> {
+    assert!(
+        rows == 32 || axis == Axis::Cols,
+        "rows limit a sum over columns"
+    );
     let fmt = op.format();
     let mut p = Program::with_policy(LoopPolicy::Unrolled);
     if (op, axis) == (ReduceOp::Sum, Axis::Rows) {
@@ -310,6 +392,9 @@ pub fn finish(op: ReduceOp, axis: Axis) -> Vec<Instruction> {
             // faces 2 and 3; a group of four rows in each.
             for lower in [0, 32] {
                 for g in 0..4 {
+                    if lower / 2 + 4 * g >= rows {
+                        continue;
+                    }
                     let (left, right) = (lower + 4 * g, lower + 16 + 4 * g);
                     let at = [left, left | 2, right, right | 2];
                     p.load(LReg::L0, fmt, acc(at[0]));
@@ -396,7 +481,7 @@ impl Layout {
 }
 
 pub fn plan_layout(outputs: usize, per: usize) -> Result<Layout, PlanError> {
-    plan_layout_in(outputs, per, tt_isa::l1::DATA)
+    plan_layout_in(outputs, per, crate::l1::arena())
 }
 
 /// [`plan_layout`] in `arena`: half the data arena, for a run double-buffered
@@ -406,33 +491,56 @@ pub fn plan_layout_in(
     per: usize,
     arena: tt_isa::l1::Region,
 ) -> Result<Layout, PlanError> {
+    let req = std::sync::Arc::new(requirements(outputs, per));
+    let plan = req.plan(arena)?;
+    Ok(Layout::placed(
+        outputs,
+        per,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// What a run of `outputs` output tiles, each from `per` input tiles, needs: the inputs' and the
+/// outputs' slots, and the four semaphores ([`Layout::placed`] reads them back).
+pub fn requirements(outputs: usize, per: usize) -> Requirements {
     let mut req = Requirements::new(1);
     let align = tt_isa::dram::ALIGN;
-    let input = req.scratch(
+    req.scratch(
         "reduce inputs",
         (outputs * per) as u64 * TILE_SLOT,
         align,
         0..1,
     );
-    let out = req.scratch("reduce outputs", outputs as u64 * TILE_SLOT, align, 0..1);
-    let unpacked = req.semaphore("reduce unpacked", 0, 0..1);
-    let consumed = req.semaphore("reduce consumed", 1, 0..1);
-    let computed = req.semaphore("reduce computed", 0, 0..1);
-    let packed = req.semaphore("reduce packed", 1, 0..1);
-    let plan = req.plan(arena)?;
-    Ok(Layout {
-        outputs,
-        per,
-        in_at: plan.addr(input),
-        out_at: plan.addr(out),
-        sems: ReduceSemaphores {
-            unpacked: plan.semaphore(unpacked),
-            consumed: plan.semaphore(consumed),
-            computed: plan.semaphore(computed),
-            packed: plan.semaphore(packed),
-        },
-        init: plan.semaphore_init(),
-    })
+    req.scratch("reduce outputs", outputs as u64 * TILE_SLOT, align, 0..1);
+    declare_semaphores(&mut req);
+    req
+}
+
+fn declare_semaphores(req: &mut Requirements) {
+    req.semaphore("reduce unpacked", 0, 0..1);
+    req.semaphore("reduce consumed", 1, 0..1);
+    req.semaphore("reduce computed", 0, 0..1);
+    req.semaphore("reduce packed", 1, 0..1);
+}
+
+impl Layout {
+    /// A run of `outputs` output tiles, each from `per` input tiles, where its [`requirements`]
+    /// (or a chunk's, [`chunk_requirements`]) were placed.
+    pub fn placed(outputs: usize, per: usize, l1: &crate::l1::Placed) -> Layout {
+        Layout {
+            outputs,
+            per,
+            in_at: l1.addr("reduce inputs"),
+            out_at: l1.addr("reduce outputs"),
+            sems: ReduceSemaphores {
+                unpacked: l1.semaphore("reduce unpacked"),
+                consumed: l1.semaphore("reduce consumed"),
+                computed: l1.semaphore("reduce computed"),
+                packed: l1.semaphore("reduce packed"),
+            },
+            init: l1.semaphore_init(),
+        }
+    }
 }
 
 /// The math programs of one output tile: per input, in order, then the
@@ -450,6 +558,25 @@ pub fn math_programs(
         })
         .collect();
     (inputs, finish(op, axis))
+}
+
+/// [`math_programs`] of a reduction over columns computing only the row groups of each tile's
+/// first `rows` rows ([`row_offsets`]): a decode head's score row is 4 of the 32. A reduction
+/// over columns never moves a value between rows, so those rows keep their bits; the others
+/// are left as they were, padding.
+pub fn math_programs_rows(
+    op: ReduceOp,
+    per: usize,
+    last_valid: u32,
+    rows: u32,
+) -> (Vec<Vec<Instruction>>, Vec<Instruction>) {
+    let inputs = (0..per)
+        .map(|n| {
+            let valid = (n + 1 == per && last_valid < 32).then_some(last_valid);
+            accumulate_with(op, Axis::Cols, n == 0, valid, false, rows)
+        })
+        .collect();
+    (inputs, finish_rows(op, Axis::Cols, rows))
 }
 
 /// The three role programs of a run over `layout`.
@@ -508,6 +635,221 @@ pub fn roles_at(
     [unpack, math, pack]
 }
 
+/// [`roles`] as the role slots hold them, with each role's block repeats
+/// ([`roles_code_at`]).
+pub fn roles_code(
+    layout: &Layout,
+    inputs: &[Vec<Instruction>],
+    finish: &[Instruction],
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
+    assert_eq!(inputs.len(), layout.per);
+    roles_code_at(layout, inputs, finish, |k, n| {
+        layout.in_at + (k * layout.per + n) as u64 * TILE_SLOT
+    })
+}
+
+/// [`roles_at`], with an output's middle inputs -- the same math program,
+/// read from consecutive slots -- one block repeated, and the outputs one
+/// block repeated around it, their addresses stepped in GPRs
+/// (`docs/plans/long-context.md` 1.A): a program's size does not grow with
+/// the inputs an output reduces, or the outputs. The unpacker and packer see
+/// the same addresses, in the same order, as [`roles_at`] gives them, and the
+/// math runs the same programs. [`roles_at`]'s programs where the inputs do not
+/// have that shape.
+pub fn roles_code_at(
+    layout: &Layout,
+    inputs: &[Vec<Instruction>],
+    finish: &[Instruction],
+    input: impl Fn(usize, usize) -> u64,
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
+    roles_looped(layout, inputs, finish, &input)
+        .unwrap_or_else(|| (roles_at(layout, inputs, finish, input), Default::default()))
+}
+
+/// GPRs [`roles_looped`] keeps its addresses in: clear of the ones
+/// `sfpu::kernel`'s notes name, as its own are.
+const FIRST_GPR: u32 = 32;
+const FIRST_STRIDE_GPR: u32 = 33;
+const MID_GPR: u32 = 34;
+const GAP_GPR: u32 = 35;
+const SLOT_GPR: u32 = 36;
+const OUT_GPR: u32 = 37;
+const PACK_SLOT_GPR: u32 = 39;
+
+fn roles_looped(
+    layout: &Layout,
+    inputs: &[Vec<Instruction>],
+    finish: &[Instruction],
+    input: &impl Fn(usize, usize) -> u64,
+) -> Option<crate::code::LoopedRoles> {
+    use crate::code::Loop;
+    use crate::datapath::{
+        pack_dest_units, pack_tile_from_dst_gpr, tile_base_units, unpack_datums_to_dst_gpr,
+        TILE_DATUMS,
+    };
+    use tt_isa::backend::set_gpr;
+    use tt_isa::isa::generated::encode;
+    let (outputs, per) = (layout.outputs, inputs.len());
+    // A first input, a middle of at least one, a last.
+    if per < 3 || inputs[1..per - 1].iter().any(|p| *p != inputs[1]) {
+        return None;
+    }
+    // Each output's inputs after its first are consecutive slots; its first, and its
+    // middle's start, a fixed distance on from the last output's.
+    let aligned = |a: u64| a % 16 == 0;
+    let consecutive = (0..outputs).all(|k| {
+        (1..per - 1).all(|n| input(k, n + 1) == input(k, n) + TILE_SLOT)
+            && (0..per).all(|n| aligned(input(k, n)))
+    });
+    let distance = |f: &dyn Fn(usize) -> u64| -> Option<u64> {
+        let d = f(1).checked_sub(f(0))?;
+        (1..outputs.saturating_sub(1))
+            .all(|k| f(k + 1).checked_sub(f(k)) == Some(d))
+            .then_some(d)
+    };
+    let (first_stride, gap) = if outputs > 1 {
+        (
+            distance(&|k| input(k, 0))?,
+            // From the last input read to the next output's first middle one, a slot back.
+            distance(&|k| input(k, 1))?.checked_sub(per as u64 * TILE_SLOT - TILE_SLOT)?,
+        )
+    } else {
+        (0, 0)
+    };
+    if !consecutive {
+        return None;
+    }
+    let units = |a: u64| tile_base_units(a);
+    let slot = units(TILE_SLOT);
+    let set = |p: &mut Vec<Instruction>, gpr: u32, v: u32| p.extend(set_gpr(gpr, v).unwrap());
+    let add = |gpr: u32, by: u32| encode::adddmareg(gpr, by, gpr).unwrap();
+    let s = layout.sems;
+
+    let mut unpack = thread_config();
+    unpack.extend(clear_unpacker0_adcs());
+    let mut words = ConfigWords::new();
+    tile_unpack_config(&mut words, layout.in_at);
+    unpack.extend(config_program(&words));
+    set(&mut unpack, SLOT_GPR, slot);
+    set(&mut unpack, FIRST_GPR, units(input(0, 0)));
+    set(&mut unpack, FIRST_STRIDE_GPR, units(first_stride));
+    // The middle steps before it reads: a slot back.
+    set(&mut unpack, MID_GPR, units(input(0, 1)) - slot);
+    set(&mut unpack, GAP_GPR, units(gap));
+    let mut unpack_loops = Vec::new();
+    let output_block = unpack.len() as u32;
+    let read = |p: &mut Vec<Instruction>, gpr: u32, step: Option<u32>| {
+        p.extend(sync::take(s.consumed, Before::UNPACKER));
+        p.extend(unpack_datums_to_dst_gpr(gpr, step, TILE_DATUMS, A_ROW));
+        p.extend(sync::post_after(Unit::Unpacker0, s.unpacked));
+    };
+    read(&mut unpack, FIRST_GPR, None);
+    for count in middle_counts(per) {
+        let middle = unpack.len() as u32;
+        read(&mut unpack, MID_GPR, Some(SLOT_GPR));
+        unpack_loops.push(Loop {
+            start: middle,
+            len: unpack.len() as u32 - middle,
+            count,
+        });
+    }
+    read(&mut unpack, MID_GPR, Some(SLOT_GPR));
+    // On to the next output: written, so stepped after.
+    unpack.push(add(FIRST_GPR, FIRST_STRIDE_GPR));
+    unpack.push(add(MID_GPR, GAP_GPR));
+    if outputs > 1 {
+        unpack_loops.insert(
+            0,
+            Loop {
+                start: output_block,
+                len: unpack.len() as u32 - output_block,
+                count: outputs as u32,
+            },
+        );
+    }
+    unpack.push(backend::wait_for_unpacker0(Before::EVERYTHING).unwrap());
+
+    let mut math = vec![state_id()];
+    let mut math_loops = Vec::new();
+    let output_block = math.len() as u32;
+    let compute = |m: &mut Vec<Instruction>, n: usize| {
+        m.extend(sync::take(s.unpacked, Before::SFPU));
+        if n == 0 {
+            m.extend(sync::take(s.packed, Before::SFPU));
+        }
+        m.extend_from_slice(&inputs[n]);
+        m.extend(sync::post_after(Unit::Sfpu, s.consumed));
+    };
+    compute(&mut math, 0);
+    for count in middle_counts(per) {
+        let middle = math.len() as u32;
+        compute(&mut math, 1);
+        math_loops.push(Loop {
+            start: middle,
+            len: math.len() as u32 - middle,
+            count,
+        });
+    }
+    compute(&mut math, per - 1);
+    math.extend_from_slice(finish);
+    math.extend(sync::post_after(Unit::Sfpu, s.computed));
+    if outputs > 1 {
+        math_loops.insert(
+            0,
+            Loop {
+                start: output_block,
+                len: math.len() as u32 - output_block,
+                count: outputs as u32,
+            },
+        );
+    }
+
+    let mut pack = vec![state_id()];
+    set(&mut pack, PACK_SLOT_GPR, slot);
+    set(
+        &mut pack,
+        OUT_GPR,
+        pack_dest_units(layout.out_at + tt_isa::dm::TILE_DATA) - slot,
+    );
+    let output_block = pack.len() as u32;
+    pack.extend(sync::take(s.computed, Before::PACKER));
+    pack.extend(pack_tile_from_dst_gpr(
+        OUT_GPR,
+        Some(PACK_SLOT_GPR),
+        OUT_ROW,
+    ));
+    pack.extend(sync::post_after(Unit::Packer, s.packed));
+    let pack_loops = if outputs > 1 {
+        vec![Loop {
+            start: output_block,
+            len: pack.len() as u32 - output_block,
+            count: outputs as u32,
+        }]
+    } else {
+        Vec::new()
+    };
+    pack.push(backend::wait_for_packer(Before::EVERYTHING).unwrap());
+
+    let code = [unpack, math, pack];
+    let loops = [unpack_loops, math_loops, pack_loops];
+    let fits = (0..3).all(|t| crate::code::check(&loops[t], code[t].len() as u32).is_ok());
+    fits.then_some((code, loops))
+}
+
+/// The middle inputs of [`roles_looped`]'s output, `per - 2`, as the counts of
+/// sibling loops each within what one loop counts (`mailbox::loops`).
+fn middle_counts(per: usize) -> Vec<u32> {
+    let most = 1 << tt_isa::mailbox::loops::COUNT_BITS;
+    let mut left = per as u32 - 2;
+    let mut counts = Vec::new();
+    while left > 0 {
+        let n = left.min(most);
+        counts.push(n);
+        left -= n;
+    }
+    counts
+}
+
 /// A sum over rows too long for one run, in chunks of [`ROW_CHUNK`] row
 /// tiles: each chunk after the first starts from the last chunk's sums, read
 /// back as an input of one valid row ahead of its own tiles. Exactly Flex's
@@ -525,37 +867,39 @@ pub struct ChunkLayout {
 }
 
 pub fn plan_chunk_layout(outputs: usize) -> Result<ChunkLayout, PlanError> {
+    let req = std::sync::Arc::new(chunk_requirements(outputs));
+    let plan = req.plan(crate::l1::arena())?;
+    Ok(ChunkLayout::placed(
+        outputs,
+        &crate::l1::Placed::new(req, plan, 0),
+    ))
+}
+
+/// What a chunk of `outputs` output tiles needs: their priors, a chunk's inputs, the outputs and
+/// the four semaphores ([`ChunkLayout::placed`] reads them back).
+pub fn chunk_requirements(outputs: usize) -> Requirements {
     let mut req = Requirements::new(1);
     let align = tt_isa::dram::ALIGN;
-    let prior = req.scratch("sum prior", outputs as u64 * TILE_SLOT, align, 0..1);
-    let input = req.scratch(
-        "sum inputs",
+    req.scratch("sum prior", outputs as u64 * TILE_SLOT, align, 0..1);
+    req.scratch(
+        "reduce inputs",
         (outputs * ROW_CHUNK) as u64 * TILE_SLOT,
         align,
         0..1,
     );
-    let out = req.scratch("sum outputs", outputs as u64 * TILE_SLOT, align, 0..1);
-    let unpacked = req.semaphore("reduce unpacked", 0, 0..1);
-    let consumed = req.semaphore("reduce consumed", 1, 0..1);
-    let computed = req.semaphore("reduce computed", 0, 0..1);
-    let packed = req.semaphore("reduce packed", 1, 0..1);
-    let plan = req.plan(tt_isa::l1::DATA)?;
-    Ok(ChunkLayout {
-        layout: Layout {
-            outputs,
-            per: ROW_CHUNK,
-            in_at: plan.addr(input),
-            out_at: plan.addr(out),
-            sems: ReduceSemaphores {
-                unpacked: plan.semaphore(unpacked),
-                consumed: plan.semaphore(consumed),
-                computed: plan.semaphore(computed),
-                packed: plan.semaphore(packed),
-            },
-            init: plan.semaphore_init(),
-        },
-        prior_at: plan.addr(prior),
-    })
+    req.scratch("reduce outputs", outputs as u64 * TILE_SLOT, align, 0..1);
+    declare_semaphores(&mut req);
+    req
+}
+
+impl ChunkLayout {
+    /// A chunk of `outputs` output tiles where its [`chunk_requirements`] were placed.
+    pub fn placed(outputs: usize, l1: &crate::l1::Placed) -> ChunkLayout {
+        ChunkLayout {
+            layout: Layout::placed(outputs, ROW_CHUNK, l1),
+            prior_at: l1.addr("sum prior"),
+        }
+    }
 }
 
 /// The role programs of one chunk of a long sum over rows: `tiles` input
@@ -595,7 +939,7 @@ pub fn continuation_roles(
     tiles: usize,
     valid: u32,
     last: bool,
-) -> [Vec<Instruction>; 3] {
+) -> ([Vec<Instruction>; 3], [Vec<crate::code::Loop>; 3]) {
     let mut inputs = Vec::new();
     if prior {
         let mut p = Program::new();
@@ -614,7 +958,7 @@ pub fn continuation_roles(
         ));
     }
     let fin = if last { finish(op, axis) } else { Vec::new() };
-    roles_at(&c.layout, &inputs, &fin, |k, n| match (prior, n) {
+    roles_code_at(&c.layout, &inputs, &fin, |k, n| match (prior, n) {
         (true, 0) => c.prior_at + k as u64 * TILE_SLOT,
         (true, n) => c.layout.in_at + (k * ROW_CHUNK + n - 1) as u64 * TILE_SLOT,
         (false, n) => c.layout.in_at + (k * ROW_CHUNK + n) as u64 * TILE_SLOT,
@@ -682,6 +1026,132 @@ pub fn reference(op: ReduceOp, axis: Axis, a: &[f32], rows: usize, cols: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The looped reduce roles present every unpack and pack the configuration
+    /// [`roles_at`]'s do, and are otherwise the same stream: whole runs, and a
+    /// continuation's chunks after a prior; and their size does not grow with
+    /// the inputs an output reduces.
+    #[test]
+    fn looped_reduce_roles_unpack_and_pack_what_the_unrolled_ones_do() {
+        let expand = |code: &[Instruction], loops: &[crate::code::Loop]| {
+            crate::code::Code {
+                ins: code.to_vec(),
+                loops: loops.to_vec(),
+            }
+            .expand()
+        };
+        let compare = |what: &str,
+                       layout: &Layout,
+                       inputs: &[Vec<Instruction>],
+                       fin: &[Instruction],
+                       input: &dyn Fn(usize, usize) -> u64|
+         -> [usize; 3] {
+            let (looped, loops) = roles_looped(layout, inputs, fin, &input)
+                .unwrap_or_else(|| panic!("{what}: looped"));
+            let unrolled = roles_at(layout, inputs, fin, input);
+            for t in 0..3 {
+                let a = crate::code::transfers(&expand(&looped[t], &loops[t]));
+                let b = crate::code::transfers(&unrolled[t]);
+                assert_eq!(a.0.len(), b.0.len(), "{what}, role {t}: transfers");
+                for (n, (x, y)) in a.0.iter().zip(&b.0).enumerate() {
+                    for (addr, v) in y {
+                        assert_eq!(
+                            x.get(addr),
+                            Some(v),
+                            "{what}, role {t}: transfer {n}, word {addr}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    a.1, b.1,
+                    "{what}, role {t}: the stream outside the addresses"
+                );
+            }
+            std::array::from_fn(|t| {
+                crate::code::Code {
+                    ins: looped[t].clone(),
+                    loops: loops[t].clone(),
+                }
+                .stored()
+                .unwrap()
+                .0
+                .len()
+            })
+        };
+        for (op, axis) in [
+            (ReduceOp::Sum, Axis::Cols),
+            (ReduceOp::Max, Axis::Cols),
+            (ReduceOp::Sum, Axis::Rows),
+        ] {
+            for outputs in [1, 2, 5] {
+                let mut sizes = Vec::new();
+                for per in [3, 4, 17, 130, 131, 200] {
+                    let Ok(layout) = plan_layout(outputs, per) else {
+                        continue;
+                    };
+                    let (inputs, fin) = math_programs(op, axis, per, 7);
+                    let what = format!("{op:?} {axis:?}, {outputs} outputs of {per}");
+                    let input =
+                        |k: usize, n: usize| layout.in_at + (k * per + n) as u64 * TILE_SLOT;
+                    sizes.push(compare(&what, &layout, &inputs, &fin, &input));
+                }
+                // One loop counts 128; past it the middle is two sibling loops.
+                let (short, long): (Vec<_>, Vec<_>) =
+                    sizes.iter().enumerate().partition(|&(i, _)| i < 4);
+                for set in [short, long] {
+                    assert!(
+                        set.windows(2).all(|w| w[0].1 == w[1].1),
+                        "{op:?} {axis:?} {outputs}: stored words {sizes:?}"
+                    );
+                }
+            }
+        }
+        // A continuation's chunk: the prior's copy first, then its tiles, outputs
+        // `ROW_CHUNK` slots apart.
+        let c = plan_chunk_layout(3).unwrap();
+        for tiles in [2, 5, ROW_CHUNK] {
+            let mut copy = Program::new();
+            copy.for_each_row_group(64, |p, o| {
+                p.load(LReg::L0, Format::Int32, A_ROW + o);
+                p.store(LReg::L0, Format::Int32, OUT_ROW + o);
+            });
+            let mut inputs = vec![copy.finish()];
+            for n in 0..tiles {
+                inputs.push(accumulate(
+                    ReduceOp::Max,
+                    Axis::Cols,
+                    false,
+                    (n + 1 == tiles).then_some(9),
+                ));
+            }
+            let fin = finish(ReduceOp::Max, Axis::Cols);
+            let input = |k: usize, n: usize| match n {
+                0 => c.prior_at + k as u64 * TILE_SLOT,
+                n => c.layout.in_at + (k * ROW_CHUNK + n - 1) as u64 * TILE_SLOT,
+            };
+            compare(
+                &format!("continuation of {tiles}"),
+                &c.layout,
+                &inputs,
+                &fin,
+                &input,
+            );
+        }
+    }
+
+    /// Where the middle inputs' programs differ, or their slots are not
+    /// consecutive, there is nothing to repeat.
+    #[test]
+    fn roles_that_do_not_repeat_are_not_looped() {
+        let layout = plan_layout(1, 4).unwrap();
+        let (mut inputs, fin) = math_programs(ReduceOp::Sum, Axis::Cols, 4, 32);
+        let input = |_: usize, n: usize| layout.in_at + n as u64 * TILE_SLOT;
+        assert!(roles_looped(&layout, &inputs, &fin, &input).is_some());
+        let backwards = |_: usize, n: usize| layout.in_at + (3 - n) as u64 * TILE_SLOT;
+        assert!(roles_looped(&layout, &inputs, &fin, &backwards).is_none());
+        inputs[2].push(tt_isa::sfpu::nop());
+        assert!(roles_looped(&layout, &inputs, &fin, &input).is_none());
+    }
 
     fn data(rows: usize, cols: usize) -> Vec<f32> {
         (0..rows * cols)
@@ -757,5 +1227,29 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod row_limited_lengths {
+    use super::*;
+
+    /// A row-limited reduction over up to 32 tiles (what `attention::fits` lets a decode head's
+    /// scores reach) fits a program slot at every row count: unrolled over row groups, its
+    /// programs outgrow one past that (64 tiles at 17 to 31 rows, which `tensor::sfpu_rms` runs
+    /// as whole tile rows instead).
+    #[test]
+    fn row_limited_reductions_over_32_tiles_fit_a_program_slot() {
+        let over = |nt: usize, rows: u32| {
+            let layout = plan_layout(1, nt).unwrap();
+            let (inputs, fin) = math_programs_rows(ReduceOp::Max, nt, 32, rows);
+            roles(&layout, &inputs, &fin)
+                .iter()
+                .any(|p| p.len() > tt_isa::mailbox::PROGRAM_MAX as usize)
+        };
+        for rows in 1..=32 {
+            assert!(!over(32, rows), "32 tiles at {rows} rows");
+        }
+        assert!(over(64, 24), "the control: 64 tiles at 24 rows");
     }
 }

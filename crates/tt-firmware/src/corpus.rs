@@ -20,7 +20,7 @@ use tt_isa::sfpu::dst32_address;
 use tt_isa::tensix::{PushesTo, TensixThread};
 
 /// The hooks the `.ttinsn` experiment image (`bin/ttinsn_t1.rs`) installs
-/// (`docs/plans/ttinsn-push-experiment.md`). Single-threaded: one core runs
+/// (`docs/completed-plans/ttinsn-push-experiment.md`). Single-threaded: one core runs
 /// this, and the image sets them before the runner starts.
 #[cfg(feature = "ttinsn-experiment")]
 pub mod experiment {
@@ -62,17 +62,34 @@ where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    run_in::<Riscv, Thread>(Mailbox::single_core())
+    // The single-core probe images (`corpus`, `corpus_t0`) have no slot to
+    // fit, so they keep guarded runs (`step105_mutex`'s refusals arm one).
+    run_in::<Riscv, Thread, true>(Mailbox::single_core())
 }
 
 /// The same runner, reporting through a role mailbox: one of three cores each
-/// running its own part of a kernel (`tt_isa::mailbox::role`).
+/// running its own part of a kernel (`tt_isa::mailbox::role`). The production
+/// role images: no guarded runs, whose machinery (`guard_wait` and its helpers,
+/// about 1.9 KB an image) is compiled out, so the role slots stay small and their
+/// room goes to B's mover (`tt_isa::l1::roles`).
 pub fn run_role<Riscv, Thread>() -> !
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
 {
-    run_in::<Riscv, Thread>(Mailbox::of(Thread::INDEX))
+    run_in::<Riscv, Thread, false>(Mailbox::of(Thread::INDEX))
+}
+
+/// The role runner with **guarded runs** (`tt_isa::mailbox::guard`): the probe
+/// images `guarded_t0..2`, at their cores' default reset PCs, which
+/// `tt_kernels::atomics` loads for the Sync Unit and L1 atomics gates. Never
+/// loaded beside the mover.
+pub fn run_guarded_role<Riscv, Thread>() -> !
+where
+    Thread: TensixThread,
+    Riscv: PushesTo<Thread>,
+{
+    run_in::<Riscv, Thread, true>(Mailbox::of(Thread::INDEX))
 }
 
 /// Stop, having said why in `mb` as well as in the single-core mailbox the
@@ -94,7 +111,8 @@ fn fail_in(mb: Mailbox, code: u32) -> ! {
 /// whether ttsim models the timestamper is a question with its own probe, and
 /// a register it does not model is fatal there.
 fn trace(on: bool, thread: u32, event: u32) {
-    if on {
+    // Compiled out without the `profile` feature (`tt_isa::dm::caps::STAMPS`).
+    if cfg!(feature = "profile") && on {
         // SAFETY: a documented, aligned timestamper register; a store has no
         // effect beyond appending the event.
         unsafe {
@@ -408,7 +426,7 @@ fn guard_wait(mb: Mailbox, run: &GuardRun) {
     crumb(g, stage::DRAINED);
 }
 
-fn run_in<Riscv, Thread>(mb: Mailbox) -> !
+fn run_in<Riscv, Thread, const GUARDED: bool>(mb: Mailbox) -> !
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
@@ -429,7 +447,7 @@ where
     // SAFETY: as above; written by the host before this core left reset.
     let mut generation = unsafe { l1_read32(mb.generation()) };
     loop {
-        let program_len = run_once::<Riscv, Thread>(mb);
+        let program_len = run_once::<Riscv, Thread, GUARDED>(mb);
         if generation == 0 {
             // The dump is what carries the result; this only says it is complete.
             if mb == Mailbox::single_core() {
@@ -446,7 +464,10 @@ where
         // generation, and the poll goes through a fence, since nothing the NoC
         // writes invalidates the L0 data cache (`MemoryOrdering.md:59`).
         // SAFETY: fixed aligned mailbox locations inside L1.
-        let tracing = || unsafe { l1_read32(mb.trace()) } != 0;
+        let tracing = || {
+            cfg!(feature = "profile")
+                && unsafe { l1_read32(mb.trace()) } & mailbox::trace_word::RUNS != 0
+        };
         trace(tracing(), Thread::INDEX, mailbox::trace::ACKED);
         // SAFETY: fixed aligned mailbox locations inside L1.
         unsafe {
@@ -472,7 +493,7 @@ where
 
 /// One run of the staged program: read the descriptor, push the program, wait
 /// for it to retire, dump `Dst`. Returns the program's length.
-fn run_once<Riscv, Thread>(mb: Mailbox) -> u32
+fn run_once<Riscv, Thread, const GUARDED: bool>(mb: Mailbox) -> u32
 where
     Thread: TensixThread,
     Riscv: PushesTo<Thread>,
@@ -486,10 +507,19 @@ where
     let program_len_word = unsafe { l1_read32(mb.program_len()) };
     let streamed = program_len_word & tt_isa::dataflow::STREAMED != 0;
     let looped = program_len_word & mailbox::loops::LOOPED != 0;
+    // Fused `.ttinsn` code (`crate::fused`): the math role's only, its loops in the code.
+    let fused_code = program_len_word & tt_isa::ttinsn::FUSED != 0;
     let program_len = program_len_word & tt_isa::dataflow::LENGTH_MASK;
     let dump_first = unsafe { l1_read32(mb.dump_row_first()) };
     let dump_rows = unsafe { l1_read32(mb.dump_row_count()) };
-    let tracing = unsafe { l1_read32(mb.trace()) } != 0;
+    let trace_word = if cfg!(feature = "profile") {
+        unsafe { l1_read32(mb.trace()) }
+    } else {
+        0
+    };
+    let tracing = trace_word & mailbox::trace_word::RUNS != 0;
+    let mut totals = Totals::new(trace_word & mailbox::trace_word::PUSH != 0);
+    let batches = Batches::new(mb, trace_word & mailbox::trace_word::BATCHES != 0, Thread::INDEX);
     let mut push_window = unsafe { l1_read32(mb.push_window()) };
     let program_addr = unsafe { l1_read32(mb.program_addr()) } as u64;
     // SAFETY: as above.
@@ -501,7 +531,9 @@ where
     // cannot fill a blocked thread's FIFO, is neither streamed, looped nor
     // dumping, and carries its own bounds. Checked before anything is pushed;
     // the window drain is off because it is a coprocessor-drain load too.
-    let guarded = guard_armed(mb);
+    // Only an image built with them (`run_guarded_role`) looks at the guard
+    // block at all; a production role never arms, and never reads it.
+    let guarded = GUARDED && guard_armed(mb);
     let guard_run = if guarded {
         push_window = 0;
         Some(guard_begin(mb, streamed, looped, dump_rows, program_len))
@@ -518,6 +550,7 @@ where
     if thread != Thread::INDEX
         || program_len > mailbox::PROGRAM_MAX
         || dump_rows > mailbox::DUMP_MAX_ROWS
+        || fused_code && (looped || streamed || guarded || Thread::INDEX != 1)
     {
         fail_in(mb, panic_code::EXPLICIT);
     }
@@ -573,11 +606,19 @@ where
             fail_in(mb, panic_code::EXPLICIT);
         }
         trace(tracing, Thread::INDEX, mailbox::trace::START);
-        if let Err(code) = run_stream::<Riscv, Thread>(program, program_len, push_window, tracing) {
+        if let Err(code) = run_stream::<Riscv, Thread>(
+            program,
+            program_len,
+            push_window,
+            tracing,
+            &mut totals,
+            &batches,
+        ) {
             crate::dataflow::abort_with(code);
             fail_in(mb, code);
         }
         trace(tracing, Thread::INDEX, mailbox::trace::RETIRED);
+        totals.publish(mb);
         return program_len;
     }
 
@@ -635,18 +676,30 @@ where
     // program it was built with instead of reading it from L1
     // (`experiment::try_push`). Without the feature this is the line it was.
     #[cfg(feature = "ttinsn-experiment")]
-    let fused = experiment::try_push(code, code_len, &loops[..n]);
+    let baked = experiment::try_push(code, code_len, &loops[..n]);
     #[cfg(not(feature = "ttinsn-experiment"))]
-    let fused = false;
-    if !fused {
+    let baked = false;
+    let since = totals.now();
+    if fused_code {
+        // SAFETY: the host validated the code and ran it against the program's expansion
+        // (`tt_isa::ttinsn`); it lies in the program region or cache, checked above, ending in
+        // a return; this core's cache is invalidated after the host's writes.
+        unsafe {
+            crate::fused::invalidate_icache(code, 1 << (1 + Thread::INDEX));
+            crate::fused::call(code);
+        }
+    } else if !baked {
         let mut push = Pusher::<Riscv, Thread> {
             program: code,
             push_window,
             until_drain: push_window,
+            pushed: 0,
             _p: core::marker::PhantomData,
         };
         push.span(push.start(code_len), code_len, &loops[..n]);
+        totals.words = totals.words.wrapping_add(push.pushed);
     }
+    let since = totals.pushed(since);
 
     trace(tracing, Thread::INDEX, mailbox::trace::PUSHED);
 
@@ -658,7 +711,9 @@ where
     } else {
         wait_for_coprocessor();
     }
+    totals.drained(since);
     trace(tracing, Thread::INDEX, mailbox::trace::RETIRED);
+    totals.publish(mb);
     #[cfg(feature = "ttinsn-experiment")]
     experiment::after_retire();
 
@@ -685,6 +740,7 @@ fn push_body<Riscv, Thread>(
     length: u32,
     push_window: u32,
     last_traced: bool,
+    totals: &mut Totals,
 ) -> Result<(), u32>
 where
     Thread: TensixThread,
@@ -697,6 +753,22 @@ where
     }
     if !dataflow::program(address, length) {
         return Err(dm::error::PROGRAM);
+    }
+    if length & tt_isa::ttinsn::FUSED != 0 {
+        // Fused `.ttinsn` code (`crate::fused`), the math role's only; the run invalidated this
+        // core's instruction cache before its first batch (`run_stream`).
+        if Thread::INDEX != 1 {
+            return Err(dm::error::PROGRAM);
+        }
+        let since = totals.now();
+        // SAFETY: the host validated the code and ran it against the program's expansion
+        // (`tt_isa::ttinsn`); `dataflow::program` checked it lies in the program cache, aligned.
+        unsafe { crate::fused::call(address as u64) };
+        let since = totals.pushed(since);
+        trace(last_traced, Thread::INDEX, mailbox::trace::PUSHED);
+        wait_for_coprocessor();
+        totals.drained(since);
+        return Ok(());
     }
     let words = length & !mailbox::loops::LOOPED;
     let read = |offset| unsafe { l1_read32(address as u64 + offset * 4) };
@@ -749,15 +821,20 @@ where
             return Err(dm::error::PROGRAM);
         }
     }
+    let since = totals.now();
     let mut push = Pusher::<Riscv, Thread> {
         program: address as u64 + prefix as u64 * 4,
         push_window,
         until_drain: push_window,
+        pushed: 0,
         _p: core::marker::PhantomData,
     };
     push.span(push.start(code_len), code_len, &loops[..count as usize]);
+    totals.words = totals.words.wrapping_add(push.pushed);
+    let since = totals.pushed(since);
     trace(last_traced, Thread::INDEX, mailbox::trace::PUSHED);
     wait_for_coprocessor();
+    totals.drained(since);
     Ok(())
 }
 
@@ -766,6 +843,8 @@ fn run_stream<Riscv, Thread>(
     words: u32,
     push_window: u32,
     tracing: bool,
+    totals: &mut Totals,
+    batches: &Batches,
 ) -> Result<(), u32>
 where
     Thread: TensixThread,
@@ -787,6 +866,7 @@ where
     {
         return Err(dm::error::PROGRAM);
     }
+    let mut fused = 0;
     for index in 0..count {
         let offset = 4 + index as u64 * dataflow::STEP_WORDS as u64;
         let (address, length) = (read(offset), read(offset + 1));
@@ -796,22 +876,37 @@ where
         {
             return Err(dm::error::PROGRAM);
         }
+        if length & tt_isa::ttinsn::FUSED != 0 {
+            fused = address;
+        }
+    }
+    if fused != 0 {
+        if Thread::INDEX != 1 {
+            return Err(dm::error::PROGRAM);
+        }
+        // Once a run, before any of its fused code: the host wrote it before the run's
+        // generation, and nothing writes the program cache while a run uses it.
+        // SAFETY: an aligned word of a checked program in the cache; this core's own bit.
+        unsafe { crate::fused::invalidate_icache(fused as u64, 1 << (1 + Thread::INDEX)) };
     }
     let capacity = capacity as u16;
     for index in 0..count {
         crate::dataflow::check()?;
+        batches.record(index, 0);
         if Thread::INDEX == 0 {
             crate::dataflow::buffer(Stream::Input, Action::Wait, capacity, Endpoint::Unpack, 1)?;
         }
         if Thread::INDEX == 2 {
             crate::dataflow::buffer(Stream::Output, Action::Reserve, capacity, Endpoint::Pack, 3)?;
         }
+        batches.record(index, 1);
         let offset = 4 + index as u64 * dataflow::STEP_WORDS as u64;
         push_body::<Riscv, Thread>(
             read(offset),
             read(offset + 1),
             push_window,
             tracing && index + 1 == count,
+            totals,
         )?;
         if Thread::INDEX == 0 {
             crate::dataflow::buffer(Stream::Input, Action::Pop, capacity, Endpoint::Unpack, 1)?;
@@ -819,6 +914,7 @@ where
         if Thread::INDEX == 2 {
             crate::dataflow::buffer(Stream::Output, Action::Push, capacity, Endpoint::Pack, 3)?;
         }
+        batches.record(index, 2);
         // The roles share configuration and semaphores, so each batch starts
         // only once all three have retired the one before. After the last,
         // nothing follows in this region: the mover's `KERNEL_WAIT` joins.
@@ -828,7 +924,111 @@ where
             crate::dataflow::record_batch(Thread::INDEX, count);
         }
     }
+    batches.publish(count);
     Ok(())
+}
+
+/// A run's pushing and its waits for the coprocessor after pushing, in wall-clock
+/// cycles (`mailbox::trace_word::PUSH`): compiled out without the `profile`
+/// feature, and nothing read when the run does not ask for them.
+struct Totals {
+    on: bool,
+    push: u32,
+    drain: u32,
+    words: u32,
+}
+
+impl Totals {
+    fn new(on: bool) -> Self {
+        Self {
+            on: cfg!(feature = "profile") && on,
+            push: 0,
+            drain: 0,
+            words: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn now(&self) -> u32 {
+        if self.on {
+            // SAFETY: the timestamper's counter, a documented aligned
+            // register; ttsim models it (divergence row 54).
+            unsafe { l1_read32(tt_isa::tensix::timestamper::WALL_CLOCK_L) }
+        } else {
+            0
+        }
+    }
+
+    /// Charge the time since `since` to pushing; returns now.
+    #[inline(always)]
+    fn pushed(&mut self, since: u32) -> u32 {
+        let now = self.now();
+        self.push = self.push.wrapping_add(now.wrapping_sub(since));
+        now
+    }
+
+    /// Charge the time since `since` to waiting for the coprocessor.
+    #[inline(always)]
+    fn drained(&mut self, since: u32) {
+        let now = self.now();
+        self.drain = self.drain.wrapping_add(now.wrapping_sub(since));
+    }
+
+    /// Leave the totals where the data mover reads them, before the run is
+    /// acknowledged: zero when not measured, so a stale total is never read.
+    fn publish(&self, mb: Mailbox) {
+        if cfg!(feature = "profile") {
+            // SAFETY: fixed aligned mailbox words this runner owns.
+            unsafe {
+                l1_write32(mb.push_cycles(), self.push);
+                l1_write32(mb.drain_cycles(), self.drain);
+                l1_write32(mb.push_words(), self.words);
+            }
+        }
+    }
+}
+
+/// A streamed run's batch table (`mailbox::BATCH_TIMES`), in a `profile` image whose T0 or T2
+/// runner was asked for it (`mailbox::trace_word::BATCHES`); a no-op otherwise, and compiled out
+/// without the feature. The count is cleared at the run's start, so a run that is not streamed
+/// leaves none for the data mover to stamp.
+struct Batches {
+    table: Option<Mailbox>,
+}
+
+impl Batches {
+    fn new(mb: Mailbox, asked: bool, thread: u32) -> Self {
+        let table = (cfg!(feature = "profile") && asked && thread != 1).then_some(mb);
+        if let Some(mb) = table {
+            // SAFETY: this runner's own aligned mailbox word, which only it and the data mover
+            // (after this run's acknowledgement) touch.
+            unsafe { l1_write32(mb.batch_count(), 0) };
+        }
+        Self { table }
+    }
+
+    /// Batch `index`'s clock read `k`, if the table holds it.
+    #[inline(always)]
+    fn record(&self, index: u32, k: u32) {
+        if let Some(mb) = self.table {
+            if index < mailbox::BATCH_TIMES_MAX {
+                // SAFETY: the timestamper's counter, a documented aligned register (ttsim models
+                // it, divergence row 54); a word of this runner's own table.
+                unsafe {
+                    let now = l1_read32(tt_isa::tensix::timestamper::WALL_CLOCK_L);
+                    l1_write32(mb.batch_time(index, k), now);
+                }
+            }
+        }
+    }
+
+    /// The run's batch count, written last, before the run is acknowledged.
+    fn publish(&self, count: u32) {
+        if let Some(mb) = self.table {
+            // SAFETY: as in `new`.
+            unsafe { l1_write32(mb.batch_count(), count) };
+        }
+    }
 }
 
 /// Pushes ranges of a staged program, its block repeats expanded.
@@ -838,6 +1038,8 @@ struct Pusher<Riscv, Thread> {
     /// A countdown rather than `i % push_window`: T2 has no remainder
     /// instruction, and the instruction-set gate refuses one.
     until_drain: u32,
+    /// Words pushed, in a `profile` image (`Totals`); 0 otherwise.
+    pushed: u32,
     _p: core::marker::PhantomData<(Riscv, Thread)>,
 }
 
@@ -908,6 +1110,9 @@ where
 
     /// Words `[lo, hi)` as they are.
     fn linear(&mut self, lo: u32, hi: u32) {
+        if cfg!(feature = "profile") {
+            self.pushed = self.pushed.wrapping_add(hi.saturating_sub(lo));
+        }
         let mut i = lo;
         // Silicon (no push window): sixteen words read, then sixteen pushed, so
         // the loads overlap rather than each push waiting on its own load. One

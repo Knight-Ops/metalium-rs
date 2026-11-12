@@ -1,0 +1,37 @@
+{"kind": "note", "key": "conditions", "card": 0, "git": "3e4cefd81b12", "warmup": 3, "samples": 15, "batch": 16, "torch": "2.11.0+cpu"}
+{"kind": "note", "key": "ttnn add f32 64x64 check", "bit_exact": true, "max_abs_err": 0.0, "max_rel_err_of_max": 0.0}
+{"kind": "result", "key": "ttnn add f32 64x64 eager_sync", "unit": "us", "timed": "host", "median": 109.43296365439892, "p10": 106.2159426510334, "p90": 118.75806376338005, "n": 15}
+{"kind": "result", "key": "ttnn add f32 64x64 eager_batch", "unit": "us", "timed": "host", "median": 61.948070651851594, "p10": 60.63812179490924, "p90": 64.68188075814396, "n": 15}
+{"kind": "note", "key": "ttnn add f32 64x64 trace check", "bit_exact": true, "max_abs_err": 0.0, "max_rel_err_of_max": 0.0}
+{"kind": "result", "key": "ttnn add f32 64x64 trace", "unit": "us", "timed": "host", "median": 33.82307477295399, "p10": 33.261021599173546, "p90": 40.42498767375946, "n": 15}
+{"kind": "note", "key": "ttnn add f32 2048x2048 check", "bit_exact": true, "max_abs_err": 0.0, "max_rel_err_of_max": 0.0}
+{"kind": "result", "key": "ttnn add f32 2048x2048 eager_sync", "unit": "us", "timed": "host", "median": 207.62300118803978, "p10": 205.7100646197796, "p90": 218.64310838282108, "n": 15}
+{"kind": "result", "key": "ttnn add f32 2048x2048 eager_batch", "unit": "us", "timed": "host", "median": 120.74224650859833, "p10": 120.51431986037642, "p90": 121.21681356802583, "n": 15}
+{"kind": "note", "key": "ttnn add f32 2048x2048 trace check", "bit_exact": true, "max_abs_err": 0.0, "max_rel_err_of_max": 0.0}
+{"kind": "result", "key": "ttnn add f32 2048x2048 trace", "unit": "us", "timed": "host", "median": 145.23882418870926, "p10": 142.9240219295025, "p90": 149.71592463552952, "n": 15}
+{"kind": "note", "key": "ttnn matmul f32 256x256x256 check", "bit_exact": false, "max_abs_err": 0.08329271072315692, "max_rel_err_of_max": 0.0011373347539615885}
+{"kind": "result", "key": "ttnn matmul f32 256x256x256 eager_sync", "unit": "us", "timed": "host", "median": 82.16104470193386, "p10": 79.69606667757034, "p90": 90.80814197659492, "n": 15}
+{"kind": "result", "key": "ttnn matmul f32 256x256x256 eager_batch", "unit": "us", "timed": "host", "median": 38.25000021606684, "p10": 36.42475348897278, "p90": 40.229817386716604, "n": 15}
+{"kind": "note", "key": "ttnn matmul f32 256x256x256 trace check", "bit_exact": false, "max_abs_err": 0.08329271072315692, "max_rel_err_of_max": 0.0011373347539615885}
+{"kind": "result", "key": "ttnn matmul f32 256x256x256 trace", "unit": "us", "timed": "host", "median": 34.97488796710968, "p10": 34.67407077550888, "p90": 41.01591184735298, "n": 15}
+{"kind": "note", "key": "ttnn matmul bf16 256x256x256 check", "bit_exact": false, "max_abs_err": 0.7256735563278198, "max_rel_err_of_max": 0.009259866609531582}
+{"kind": "result", "key": "ttnn matmul bf16 256x256x256 eager_sync", "unit": "us", "timed": "host", "median": 68.215886130929, "p10": 59.28915925323963, "p90": 72.50392809510231, "n": 15}
+{"kind": "result", "key": "ttnn matmul bf16 256x256x256 eager_batch", "unit": "us", "timed": "host", "median": 38.31637150142342, "p10": 36.17118636611849, "p90": 40.47650145366788, "n": 15}
+{"kind": "note", "key": "ttnn matmul bf16 256x256x256 trace check", "bit_exact": false, "max_abs_err": 0.7256735563278198, "max_rel_err_of_max": 0.009259866609531582}
+{"kind": "result", "key": "ttnn matmul bf16 256x256x256 trace", "unit": "us", "timed": "host", "median": 38.25104795396328, "p10": 37.75907680392265, "p90": 43.20917651057243, "n": 15}
+{"kind": "note", "key": "ttnn matmul f32 1024x1024x1024 check", "bit_exact": false, "max_abs_err": 0.18421620450038745, "max_rel_err_of_max": 0.001137899180869615}
+{"kind": "result", "key": "ttnn matmul f32 1024x1024x1024 eager_sync", "unit": "us", "timed": "host", "median": 154.34599481523037, "p10": 152.8619322925806, "p90": 168.99220645427704, "n": 15}
+{"kind": "result", "key": "ttnn matmul f32 1024x1024x1024 eager_batch", "unit": "us", "timed": "host", "median": 91.49950346909463, "p10": 91.3548719836399, "p90": 91.67550888378173, "n": 15}
+{"kind": "note", "key": "ttnn matmul f32 1024x1024x1024 trace check", "bit_exact": false, "max_abs_err": 0.18421620450038745, "max_rel_err_of_max": 0.001137899180869615}
+{"kind": "result", "key": "ttnn matmul f32 1024x1024x1024 trace", "unit": "us", "timed": "host", "median": 119.15084905922413, "p10": 117.3769123852253, "p90": 120.72385288774967, "n": 15}
+{"kind": "note", "key": "ttnn matmul bf16 1024x1024x1024 check", "bit_exact": false, "max_abs_err": 2.684718821197748, "max_rel_err_of_max": 0.017008666442024693}
+{"kind": "result", "key": "ttnn matmul bf16 1024x1024x1024 eager_sync", "unit": "us", "timed": "host", "median": 96.74881584942341, "p10": 93.17207150161266, "p90": 105.16401380300522, "n": 15}
+{"kind": "result", "key": "ttnn matmul bf16 1024x1024x1024 eager_batch", "unit": "us", "timed": "host", "median": 45.91530887410045, "p10": 45.66932329908013, "p90": 46.98106204159558, "n": 15}
+{"kind": "note", "key": "ttnn matmul bf16 1024x1024x1024 trace check", "bit_exact": false, "max_abs_err": 2.684718821197748, "max_rel_err_of_max": 0.017008666442024693}
+{"kind": "result", "key": "ttnn matmul bf16 1024x1024x1024 trace", "unit": "us", "timed": "host", "median": 72.64502346515656, "p10": 71.8629453331232, "p90": 75.29905997216702, "n": 15}
+{"kind": "note", "key": "ttnn embedding 49152x576 1 token f32", "skipped": "TT_FATAL @ /home/carl/projects/tt-metal-v077/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp:36: weights.dtype() == DataType::BFLOAT16"}
+{"kind": "note", "key": "ttnn embedding 49152x576 1 token bf16 check", "bit_exact": true, "max_abs_err": 0.0, "max_rel_err_of_max": 0.0}
+{"kind": "result", "key": "ttnn embedding 49152x576 1 token bf16 eager_sync", "unit": "us", "timed": "host", "median": 82.24090561270714, "p10": 80.39898239076138, "p90": 97.47990407049656, "n": 15}
+{"kind": "result", "key": "ttnn embedding 49152x576 1 token bf16 eager_batch", "unit": "us", "timed": "host", "median": 36.404686397872865, "p10": 34.89380469545722, "p90": 39.1378125641495, "n": 15}
+{"kind": "note", "key": "ttnn embedding 49152x576 1 token bf16 trace check", "bit_exact": true, "max_abs_err": 0.0, "max_rel_err_of_max": 0.0}
+{"kind": "result", "key": "ttnn embedding 49152x576 1 token bf16 trace", "unit": "us", "timed": "host", "median": 33.37208181619644, "p10": 32.69989974796772, "p90": 39.40192982554436, "n": 15}

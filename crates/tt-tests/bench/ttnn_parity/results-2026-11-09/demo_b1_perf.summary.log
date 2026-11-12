@@ -1,0 +1,40 @@
+2026-11-09 04:10:09.339 | INFO     | models.tt_transformers.tt.generator:warmup_model_prefill:253 - Warming up prefill for sequence length: 128 for batch size: 1 with sampling params: SamplingParams(temperature=[1.0], top_k=[10], top_p=[0.9], presence_penalty=None, frequency_penalty=None, repetition_penalty=None, seed=None, enable_log_probs=[False], num_logprobs=0)
+2026-11-09 04:10:09.339 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:779 - Prefilling User 1 up to 128 tokens
+2026-11-09 04:10:09.339 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:820 - Prefill seq len: 128, max_prefill_chunk_size: 4096, trace: True
+2026-11-09 04:10:09.367 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:1130 - Finished prefill for all users up to 128 tokens, Starting decode...
+2026-11-09 04:10:09.367 | INFO     | models.tt_transformers.tt.generator:warmup_model_prefill:253 - Warming up prefill for sequence length: 128 for batch size: 1 with sampling params: SamplingParams(temperature=[0.0], top_k=[1], top_p=[1.0], presence_penalty=0.0, frequency_penalty=0.0, repetition_penalty=1.0, seed=None, enable_log_probs=False, num_logprobs=0)
+2026-11-09 04:10:09.367 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:779 - Prefilling User 1 up to 128 tokens
+2026-11-09 04:10:09.367 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:820 - Prefill seq len: 128, max_prefill_chunk_size: 4096, trace: True
+2026-11-09 04:10:10.859 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:1130 - Finished prefill for all users up to 128 tokens, Starting decode...
+2026-11-09 04:10:10.860 | INFO     | models.tt_transformers.tt.generator:warmup_model_prefill:253 - Warming up prefill for sequence length: 128 for batch size: 1 with sampling params: None
+2026-11-09 04:10:10.860 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:779 - Prefilling User 1 up to 128 tokens
+2026-11-09 04:10:10.860 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:820 - Prefill seq len: 128, max_prefill_chunk_size: 4096, trace: True
+2026-11-09 04:10:10.878 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:1130 - Finished prefill for all users up to 128 tokens, Starting decode...
+2026-11-09 04:10:10.879 | INFO     | models.tt_transformers.tt.generator:warmup_model_prefill:253 - Warming up prefill for sequence length: 1024 for batch size: 1 with sampling params: None
+2026-11-09 04:10:10.879 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:779 - Prefilling User 1 up to 1024 tokens
+2026-11-09 04:10:10.879 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:820 - Prefill seq len: 1024, max_prefill_chunk_size: 4096, trace: True
+2026-11-09 04:10:18.898 | INFO     | models.tt_transformers.tt.generator:_capture_trace_prefill:384 - Done Compiling Model
+2026-11-09 04:10:18.923 | INFO     | models.tt_transformers.tt.generator:_capture_trace_prefill:400 - Done Capturing Prefill Trace
+2026-11-09 04:10:18.967 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:1130 - Finished prefill for all users up to 1024 tokens, Starting decode...
+2026-11-09 04:10:18.967 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:779 - Prefilling User 1 up to 114 tokens
+2026-11-09 04:10:18.967 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:820 - Prefill seq len: 128, max_prefill_chunk_size: 4096, trace: True
+2026-11-09 04:10:18.986 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:1130 - Finished prefill for all users up to 114 tokens, Starting decode...
+2026-11-09 04:10:18.986 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1224 - Finished prefill warmup
+2026-11-09 04:10:18.986 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1226 - Starting prefill...
+2026-11-09 04:10:18.986 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:779 - Prefilling User 1 up to 114 tokens
+2026-11-09 04:10:18.986 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:820 - Prefill seq len: 128, max_prefill_chunk_size: 4096, trace: True
+2026-11-09 04:10:19.004 | INFO     | models.tt_transformers.tt.generator:prefill_forward_text:1130 - Finished prefill for all users up to 114 tokens, Starting decode...
+2026-11-09 04:10:19.004 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1243 - Prefill finished
+2026-11-09 04:10:19.004 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1272 - Starting decode loop...
+2026-11-09 04:10:37.283 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1371 - Finished decoding, printing the final outputs...
+2026-11-09 04:10:37.283 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1388 -
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1501 -
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1502 - === Performance metrics ===
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1504 - 1st token decode time: 10.42ms [96.02 t/s/u, 96.02 t/s]
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1521 - ==
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1522 - Prefill compile time: 51.9s
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1523 - Decode compile time: 17.5s
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1524 -
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1525 - Average Time to First Token (TTFT): 18.31ms
+2026-11-09 04:10:37.284 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1526 - Average speed: 10.55ms @ 94.81 tok/s/user (94.81 tok/s throughput)
+2026-11-09 04:10:37.348 | INFO     | models.tt_transformers.demo.simple_text_demo:test_demo_text:1540 - Model SmolLM2-1.7B does not have centralized performance targets set for device P150, batch_size=1, seq_len=1024

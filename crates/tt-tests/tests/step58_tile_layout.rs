@@ -148,7 +148,16 @@ fn the_mover_tilizes_and_untilizes_a_ragged_band() {
 fn tilizing_on_the_card_or_the_host_gives_the_same_tensors() {
     use tt_kernels::session::{Session, TileChoice, Tilize};
     fn check<T: tt_device::Transport>(s: &mut Session<T>, units: usize) {
-        for [r, c] in [[1usize, 1usize], [64, 10], [70, 50], [64, 784], [128, 3100]] {
+        // `[1, 1]` and `[2, 3100]` are mostly padding: downloaded untilized by the card in
+        // either setting.
+        for [r, c] in [
+            [1usize, 1usize],
+            [2, 3100],
+            [64, 10],
+            [70, 50],
+            [64, 784],
+            [128, 3100],
+        ] {
             let v: Vec<f32> = (0..r * c).map(|i| (i as f32).sin() * 1e3).collect();
             for up in [Tilize::Host, Tilize::Card] {
                 s.set_tilize(up);

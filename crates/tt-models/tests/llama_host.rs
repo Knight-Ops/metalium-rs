@@ -9,7 +9,7 @@
 
 use burn::tensor::{DType, Int, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
-use tt_models::llama::{Llama, Precision, FULL_LAYERS, VOCAB};
+use tt_models::llama::{Llama, Precision, SMOLLM2_135M};
 
 /// "The capital of France is"
 const PROMPT: [i32; 5] = [504, 3575, 282, 4649, 314];
@@ -30,7 +30,8 @@ fn argmax(v: &[f32]) -> usize {
     ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-models/weights"
 )]
 fn the_pretrained_model_loads_completely() {
-    let (_, loaded) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+    let (_, loaded) =
+        Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
     // 30 layers of 9 tensors, the embedding table and the final norm; the output head is tied.
     assert_eq!(loaded.applied, 272, "{loaded:?}");
     assert!(loaded.ignored.is_empty(), "{:?}", loaded.ignored);
@@ -68,9 +69,10 @@ fn run(model: &Llama<Flex>, ids: &[i32]) -> Vec<f32> {
     ignore = "needs the weights: cargo xtask fetch-weights, then --features tt-models/weights"
 )]
 fn the_host_model_reproduces_the_reference_implementation() {
-    let (model, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+    let (model, _) =
+        Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
     let logits = run(&model, &PROMPT);
-    assert_eq!(logits.len(), VOCAB);
+    assert_eq!(logits.len(), SMOLLM2_135M.vocab);
     let top = top10(&logits);
     assert_eq!(top, FRANCE_TOP10, "the ten most likely next tokens");
     // Greedy decoding says " the" (260), with " Paris" (7042) second: a base model this small.
@@ -101,7 +103,7 @@ fn a_cached_decode_equals_a_full_prefill() {
     // The same six tokens, once as one prompt and once as five plus one through the cache.
     // Both are the same arithmetic in a different order of work, so they agree on the host
     // to the last bits that attention's summation order can move.
-    let (model, _) = Llama::<Flex>::pretrained(4, Precision::F32, &FlexDevice).unwrap();
+    let (model, _) = Llama::<Flex>::smollm2_135m(4, Precision::F32, &FlexDevice).unwrap();
     let ids = [504, 3575, 282, 4649, 314, 7042];
     let mut full = model.cache(16, DType::F32, &FlexDevice);
     let whole = model

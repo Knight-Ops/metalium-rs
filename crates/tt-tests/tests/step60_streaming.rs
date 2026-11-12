@@ -30,6 +30,9 @@ fn with_tiles(count: usize, test: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_
         session
             .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' gate: products of several tile rows would otherwise run blocked
+        // (`docs/plans/prefill-operand-reuse.md`; `step229` gates those).
+        session.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         session.set_pipeline(true);
         test(&mut session);
     })
@@ -48,6 +51,9 @@ fn with_tiles(count: usize, test: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
         session
             .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' gate: products of several tile rows would otherwise run blocked
+        // (`docs/plans/prefill-operand-reuse.md`; `step229` gates those).
+        session.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         session.set_pipeline(true);
         test(&mut session);
     })
@@ -144,11 +150,17 @@ fn default_ownership_covers_every_sfpu_kind() {
                         Elem::F32 => &floats,
                         Elem::Bool => &booleans,
                         Elem::I32 => &integers,
+                        Elem::Packed(_) => {
+                            unreachable!("no element-wise kind takes a packed weight")
+                        }
                     };
                     let host = |index: usize| match signature.inputs[index] {
                         Elem::F32 => &data[..],
                         Elem::Bool => &host_bool[..],
                         Elem::I32 => &host_int[..],
+                        Elem::Packed(_) => {
+                            unreachable!("no element-wise kind takes a packed weight")
+                        }
                     };
                     let second = match operands {
                         Operands::Unary => None,
@@ -459,6 +471,9 @@ fn firmware_configuration_is_fixed_and_rejected_during_capture() {
         session
             .enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
             .unwrap();
+        // The other paths' gate: products of several tile rows would otherwise run blocked
+        // (`docs/plans/prefill-operand-reuse.md`; `step229` gates those).
+        session.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         session.set_pipeline(true);
     });
 }
@@ -768,7 +783,9 @@ fn a_sixteen_page_ring_runs_without_sync_unit_counters() {
 #[test]
 fn a_streaming_trace_holds_its_bodies_under_cache_pressure() {
     with_tiles(1, |session| {
-        session.limit_program_cache(24 * 1024).unwrap();
+        // Under half of what the ops below upload (about 20 KB since the programs shrank, when
+        // 24 KiB stopped evicting anything): the pressure the assertion below needs.
+        session.limit_program_cache(8 * 1024).unwrap();
         session.set_pipeline(true);
         let input = session.upload(&values(128 * 128, 37), 128, 128).unwrap();
         session.begin_trace().unwrap();
@@ -840,7 +857,9 @@ fn a_failed_stream_role_invalidates_traces_and_recovers() {
 fn releasing_a_stale_trace_leaves_a_newer_traces_programs_held() {
     use tt_device::tlb::WindowKind;
     with_tiles(1, |session| {
-        session.limit_program_cache(24 * 1024).unwrap();
+        // Under half of what the ops below upload (about 20 KB since the programs shrank, when
+        // 24 KiB stopped evicting anything): the pressure the assertion below needs.
+        session.limit_program_cache(8 * 1024).unwrap();
         session.set_pipeline(true);
         let first_data = values(128 * 128, 41);
         let first_input = session.upload(&first_data, 128, 128).unwrap();
@@ -1052,7 +1071,7 @@ fn streaming_gddr_throughput() {
     }
 }
 
-#[cfg(feature = "silicon")]
+#[cfg(all(feature = "silicon", feature = "profile"))]
 #[test]
 fn streaming_collects_profile_events_without_affecting_results() {
     for roles in [false, true] {

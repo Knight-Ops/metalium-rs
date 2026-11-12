@@ -495,7 +495,7 @@ fn compact_jobs(staged: &Placement, output: &Placement) -> Result<Vec<Job>> {
     let src = req.scratch("FP16 staged words", tt_isa::dm::TILE_SLOT, 64, 0..1);
     let dst = req.scratch("FP16 compacted", TILE_SLOT, 64, 0..1);
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (src, dst) = (layout.addr(src), layout.addr(dst));
     Ok((0..staged.tiles())

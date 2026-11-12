@@ -37,26 +37,99 @@ pub(crate) fn bfp_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
     if crate::matmul_mode::effective(a.device) != crate::MatmulMode::Fast {
         return None;
     }
-    if a.storage_format() != b.storage_format()
-        || a.storage_format() == crate::storage::StorageFormat::F32
-        || a.shape().num_dims() != 2
+    if let Some(t) = packed_weight_matmul(a, b) {
+        return Some(t);
+    }
+    // Any other pair of storage formats (BFP or BF16 on either side, one format or two): one
+    // product of the values each decodes to, its result stored as the wider input
+    // ([`bfp_result_storage`]).
+    if a.shape().num_dims() != 2
         || b.shape().num_dims() != 2
         || a.is_transposed()
         || b.is_transposed()
         || a.is_view()
         || b.is_view()
+        || !crate::server::supports_dram(a.device)
     {
         return None;
     }
-    assert_eq!(a.device, b.device, "BFP matmul devices differ");
+    assert_eq!(a.device, b.device, "packed matmul devices differ");
     let (aa, bb) = (a.to_dram(), b.to_dram());
-    let (id, dims) = crate::server::matmul_bfp(
+    let (id, dims) = crate::server::matmul_dram(a.device, aa.buffer.id, false, bb.buffer.id, false);
+    Some(bfp_compute_result(
+        device_result(a.device, id, dims),
+        bfp_result_storage("float_matmul", &[a, b]),
+    ))
+}
+
+/// `a @ b` for an F32 `a` and a weight `b` stored in any packed format (BF16, BFP8, BFP4, BFP2:
+/// [`crate::storage::StorageFormat`]), read where it lies: `a`'s leading dimensions folded into
+/// rows, one product on the card, bit for bit the product of the values `b` decodes to, in F32
+/// (`Session::matmul_dram`, `SrcRoute::Tf32WithB`: the format is `b`'s edge). `None` (the
+/// widening path) for anything else: a transposed or viewed `b`, `b` with a batch, a host `a`, an
+/// engine without GDDR.
+fn packed_weight_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
+    packed_weight_matmul_as(a, b, a.dtype())
+}
+
+/// [`packed_weight_matmul`] with its result's dtype named: an F32 `a` against a logical F32
+/// weight, F32; a BF16 `a` against a logical BF16 weight, BF16 (each output rounded once); or a
+/// BF16 `a` against a logical F32 weight, F32 -- the product of `a`'s values in F32, which the
+/// card reads as they lie (`a` widened is exact, and a product of BF16 `A` is its widened
+/// product bit for bit). `None` for any other.
+pub(crate) fn packed_weight_matmul_as(a: &TtTensor, b: &TtTensor, out: DType) -> Option<TtTensor> {
+    use crate::storage::StorageFormat;
+    // An F32 `a` against a packed weight, an F32 result; or (roadmap W1) a BF16 `a` against a
+    // logical BF16 one, stored BFP, with a BF16 result; or a BF16 `a` against a logical F32 one
+    // with an F32 result.
+    let bf16 = match (a.dtype(), b.dtype(), out) {
+        (DType::F32, DType::F32 | DType::BF16, DType::F32)
+        | (DType::BF16, DType::F32, DType::F32) => false,
+        (DType::BF16, DType::BF16, DType::BF16) => true,
+        _ => return None,
+    };
+    if b.storage_format() == StorageFormat::F32
+        || a.storage_format() != StorageFormat::F32
+        || b.is_transposed()
+        || b.is_view()
+        || !crate::server::supports_dram(a.device)
+    {
+        return None;
+    }
+    let (ls, rs) = (a.shape().to_vec(), b.shape().to_vec());
+    if ls.len() < 2 || rs.len() < 2 || rs[..rs.len() - 2].iter().any(|&d| d != 1) {
+        return None;
+    }
+    let (k, n) = (rs[rs.len() - 2], rs[rs.len() - 1]);
+    if ls[ls.len() - 1] != k {
+        return None;
+    }
+    assert_eq!(a.device, b.device, "packed weight matmul devices differ");
+    let rows: usize = ls[..ls.len() - 1].iter().product();
+    let mut out = vec![1; rs.len().saturating_sub(ls.len())];
+    out.extend_from_slice(&ls[..ls.len() - 1]);
+    out.push(n);
+    let a = float::float_reshape(a.clone(), burn_backend::Shape::new([rows, k]));
+    let (da, db) = (a.to_dram().clone(), b.to_dram().clone());
+    let (id, dims) = match bf16 {
+        true => crate::server::matmul_dram_bf16(
+            a.device,
+            da.buffer.id,
+            da.transposed,
+            db.buffer.id,
+            false,
+        ),
+        false => {
+            crate::server::matmul_dram(a.device, da.buffer.id, da.transposed, db.buffer.id, false)
+        }
+    };
+    Some(device_result_shaped(
         a.device,
-        aa.buffer.id,
-        bb.buffer.id,
-        [aa.buffer.rows, bb.buffer.cols],
-    );
-    Some(device_result(a.device, id, dims).with_storage(a.storage_format()))
+        id,
+        dims,
+        burn_backend::Shape::from(out),
+        if bf16 { DType::BF16 } else { DType::F32 },
+    ))
 }
 
 pub(crate) fn bfp_compute_result(
@@ -293,16 +366,11 @@ pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
         a.buffer.cols, b.buffer.rows,
         "BF16 matmul inner dimensions differ"
     );
-    let (id, dims) = crate::server::matmul_bf16(
-        lhs.device,
-        a.buffer.id,
-        b.buffer.id,
-        [a.buffer.rows, b.buffer.cols],
-    );
-    Some(cast_native(
-        device_result(lhs.device, id, dims),
-        DType::BF16,
-    ))
+    // A BF16 result: each output rounded once in `Dst` and packed as BF16 (roadmap W1), bit for
+    // bit the F32 product narrowed.
+    let (id, dims) =
+        crate::server::matmul_dram_bf16(lhs.device, a.buffer.id, false, b.buffer.id, false);
+    Some(device_view(lhs.device, id, dims, None, DType::BF16))
 }
 
 /// Materialized matrix products for each logical batch, including ragged,
@@ -379,17 +447,14 @@ fn materialized_batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTenso
         };
         let a = pack(lhs, &va, &ls, &la, [m, k]);
         let b = pack(rhs, &vb, &rs, &lb, [k, n]);
-        let (id, dims) = if dtype == DType::BF16 {
-            crate::server::matmul_bf16(device, a.to_dram().buffer.id, b.to_dram().buffer.id, [m, n])
-        } else {
-            crate::server::matmul_dram(
-                device,
-                a.to_dram().buffer.id,
-                false,
-                b.to_dram().buffer.id,
-                false,
-            )
-        };
+        // F32 or BF16 operands alike: one product of their values (F1d).
+        let (id, dims) = crate::server::matmul_dram(
+            device,
+            a.to_dram().buffer.id,
+            false,
+            b.to_dram().buffer.id,
+            false,
+        );
         outputs.push(device_result(device, id, dims));
     }
     let ids = outputs.iter().map(|t| t.to_dram().buffer.id).collect();
@@ -448,7 +513,7 @@ fn device_result_shaped(
 }
 
 /// Materialize a matrix transpose with the native block copier, preserving bits.
-fn plain_dram(tensor: &TtTensor) -> crate::tensor::DramRef {
+pub(crate) fn plain_dram(tensor: &TtTensor) -> crate::tensor::DramRef {
     let d = tensor.to_dram();
     if !d.transposed {
         return d.clone();
@@ -785,7 +850,118 @@ fn mask_fill_native(op: &str, kind: u32, bits: u32, tensor: TtTensor, mask: TtTe
 
 /// General raw resident gather. Static staging covers every legal source;
 /// B reads bounded I32 indices and rejects the domain before indexed copying.
+/// `tensor`'s element at `indices` along its last dimension, one index a row (`indices` is
+/// `tensor`'s shape with a last dimension of 1): every row's pick in one op on the card
+/// (`Session::pick_columns`), raw datums, the indices resident; an index outside the row is the
+/// mover's `DOMAIN`. Cross-entropy's pick of each row's target. `None` for what it does not take
+/// (another dimension or index shape, packed storage): the caller stages the gather.
+fn pick_columns_native(tensor: &TtTensor, indices: &TtTensor) -> Option<TtTensor> {
+    let shape = tensor.shape().to_vec();
+    let (&cols, lead) = shape.split_last()?;
+    let rows: usize = lead.iter().product();
+    let mut picked = shape.clone();
+    *picked.last_mut()? = 1;
+    if indices.shape().to_vec() != picked
+        || indices.dtype() != DType::I32
+        || tensor.elem().is_none()
+        || tensor.device != indices.device
+        || rows == 0
+        || cols == 0
+        || !tensor.is_storable()
+        || !crate::server::supports_dram(tensor.device)
+    {
+        return None;
+    }
+    let (table, index) = (plain_dram(tensor), plain_dram(indices));
+    let words = |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
+    if !words(&table)
+        || !words(&index)
+        || [table.buffer.rows, table.buffer.cols] != [rows, cols]
+        || [index.buffer.rows, index.buffer.cols] != [rows, 1]
+    {
+        return None;
+    }
+    let (id, dims) = crate::server::pick_columns(tensor.device, table.buffer.id, index.buffer.id);
+    Some(device_result_shaped(
+        tensor.device,
+        id,
+        dims,
+        picked.into(),
+        tensor.dtype(),
+    ))
+}
+
+/// `tensor` with `value` added at `indices` along its last dimension, one index a row (`indices`
+/// and `value` are `tensor`'s shape with a last dimension of 1): F32, a few ops whatever the rows
+/// -- `where(column == index, tensor + value, tensor)` over the row's column numbers (geometry
+/// kept for the attachment) -- after the indices' pick, whose `DOMAIN` refuses one outside the
+/// row. Bit for bit Flex's loop: one addition at the indexed element, every other datum moved
+/// as it was. Cross-entropy's gradient. `None` for what it does not take: the caller loops.
+fn scatter_add_columns_native(
+    tensor: &TtTensor,
+    indices: &TtTensor,
+    value: &TtTensor,
+) -> Option<TtTensor> {
+    let shape = tensor.shape().to_vec();
+    let (&cols, lead) = shape.split_last()?;
+    let rows: usize = lead.iter().product();
+    if tensor.dtype() != DType::F32
+        || value.dtype() != DType::F32
+        || value.shape() != indices.shape()
+        || tensor.storage_format() != crate::storage::StorageFormat::F32
+        || value.storage_format() != crate::storage::StorageFormat::F32
+        || matches!(
+            crate::server::elementwise_mode(tensor.device),
+            crate::ElementwiseMode::Matrix { .. }
+        )
+    {
+        return None;
+    }
+    // The indices checked against the row: the pick's `DOMAIN` (its result is not needed).
+    pick_columns_native(tensor, indices)?;
+    let device = tensor.device;
+    let columns = nhwc::cached_metadata(
+        device,
+        "scatter-add columns",
+        vec![rows, cols],
+        [rows, cols],
+        burn_backend::Shape::new([rows, cols]),
+        DType::I32,
+        || (0..rows * cols).map(|i| (i % cols) as u32).collect(),
+    );
+    // `[rows, c]` as it is, or reshaped by the backend's own op (a view's too).
+    let flat = |t: &TtTensor, c: usize| {
+        if t.shape().to_vec() == [rows, c] {
+            t.clone()
+        } else {
+            <TtBackend as burn_backend::ops::FloatTensorOps<TtBackend>>::float_reshape(
+                t.clone(),
+                vec![rows, c].into(),
+            )
+        }
+    };
+    let (t, index, v) = (flat(tensor, cols), flat(indices, 1), flat(value, 1));
+    let mask =
+        device_eltwise_ungated(kind_sfpu::INT_EQ, 0.0, &columns, Some(&index)).or_else(|| {
+            let index = expanded(&index, [rows, cols].into(), "scatter-add indices");
+            device_eltwise_ungated(kind_sfpu::INT_EQ, 0.0, &columns, Some(&index))
+        })?;
+    let sum = float::float_add(t.clone(), v);
+    let out = float::float_mask_where(t, mask, sum);
+    if out.shape().to_vec() == shape {
+        return Some(out);
+    }
+    Some(<TtBackend as burn_backend::ops::FloatTensorOps<
+        TtBackend,
+    >>::float_reshape(out, shape.into()))
+}
+
 fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
+    if dim + 1 == tensor.shape().num_dims() {
+        if let Some(picked) = pick_columns_native(&tensor, &indices) {
+            return picked;
+        }
+    }
     let shape = tensor.shape().to_vec();
     let output = indices.shape().to_vec();
     assert!(
@@ -911,6 +1087,11 @@ fn scatter_add_native(
     value: TtTensor,
 ) -> TtTensor {
     assert_eq!(tensor.dtype(), value.dtype());
+    if dim + 1 == tensor.shape().num_dims() {
+        if let Some(sum) = scatter_add_columns_native(&tensor, &indices, &value) {
+            return sum;
+        }
+    }
     let dtype = tensor.dtype();
     let stored = matches!(dtype, DType::I32 | DType::Bool(_));
     if !stored {
@@ -1006,8 +1187,68 @@ fn scatter_add_native(
     cast_native(mapped_native(&[&current], sources, shape), dtype)
 }
 
+/// `tensor` with `value`'s rows added to the rows `indices` name, in order, the indices resident
+/// (`Session::select_add_rows`: three ops an index, where the mask loop of
+/// [`scatter_add_native`] takes about twenty): an embedding's gradient. `None` for what it does
+/// not take (the caller runs the loop): other than a rank-2 F32 table along dim 0 with 1-D I32
+/// indices, packed storage, the matrix element-wise mode.
+fn select_add_rows_native(
+    tensor: &TtTensor,
+    indices: &TtTensor,
+    value: &TtTensor,
+) -> Option<TtTensor> {
+    let n = indices.shape().num_elements();
+    if tensor.shape().num_dims() != 2
+        || tensor.dtype() != DType::F32
+        || value.dtype() != DType::F32
+        || indices.dtype() != DType::I32
+        || indices.shape().num_dims() != 1
+        || value.shape().to_vec() != [n, tensor.shape()[1]]
+        || tensor.device != indices.device
+        || tensor.device != value.device
+        || !crate::server::supports_dram(tensor.device)
+        || matches!(
+            crate::server::elementwise_mode(tensor.device),
+            crate::ElementwiseMode::Matrix { .. }
+        )
+    {
+        return None;
+    }
+    let [rows, cols] = tensor.stored()?;
+    let (table, index, rows_in) = (plain_dram(tensor), plain_dram(indices), plain_dram(value));
+    let f32_storage =
+        |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
+    if !f32_storage(&table)
+        || !f32_storage(&index)
+        || !f32_storage(&rows_in)
+        || [table.buffer.rows, table.buffer.cols] != [rows, cols]
+        || [index.buffer.rows, index.buffer.cols] != [1, n]
+        || [rows_in.buffer.rows, rows_in.buffer.cols] != [n, cols]
+    {
+        return None;
+    }
+    let (id, dims) = crate::server::select_add_rows(
+        tensor.device,
+        table.buffer.id,
+        index.buffer.id,
+        rows_in.buffer.id,
+    );
+    Some(device_result_shaped(
+        tensor.device,
+        id,
+        dims,
+        vec![rows, cols].into(),
+        DType::F32,
+    ))
+}
+
 fn select_add_native(tensor: TtTensor, dim: usize, indices: TtTensor, value: TtTensor) -> TtTensor {
     assert!(indices.shape().num_dims() == 1 && dim < value.shape().num_dims());
+    if dim == 0 {
+        if let Some(sum) = select_add_rows_native(&tensor, &indices, &value) {
+            return sum;
+        }
+    }
     let shape = value.shape().to_vec();
     assert_eq!(shape[dim], indices.shape().num_elements());
     let mut index_shape = vec![1; shape.len()];
@@ -1194,6 +1435,9 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
     let cols = to[rank - 1];
     let input_cols = padded[rank - 1];
     let source = plain_dram(tensor);
+    // Reported apart from the op that broadcasts: a row list a row of the result, which an
+    // operand that is a block of whole tile rows avoids (`block_of`).
+    let _part = crate::report::part("broadcast/expand");
     let indices: Vec<_> = (0..rows)
         .map(|mut flat| {
             let mut coords = vec![0; rank - 1];
@@ -1238,12 +1482,13 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
     )
 }
 
-/// A device result that reads `parent`'s slots, keeping it alive.
+/// A device result that reads `parent`'s slots, keeping it alive: a view of the contents
+/// `parent` names ([`crate::tensor::DramRef::generation`]).
 fn device_view(
     device: TtDevice,
     id: crate::server::BufferId,
     [m, n]: [usize; 2],
-    parent: Option<std::sync::Arc<crate::tensor::Buffer>>,
+    parent: Option<&crate::tensor::DramRef>,
     dtype: DType,
 ) -> TtTensor {
     let buffer = std::sync::Arc::new(crate::tensor::Buffer {
@@ -1251,16 +1496,12 @@ fn device_view(
         device,
         rows: m,
         cols: n,
-        storage: parent
-            .as_ref()
-            .map_or(crate::storage::StorageFormat::F32, |p| p.storage),
-        parent,
+        storage: parent.map_or(crate::storage::StorageFormat::F32, |p| p.buffer.storage),
+        plain: Default::default(),
+        parent: parent.map(|p| p.buffer.clone()),
     });
     TtTensor::on_device(
-        crate::tensor::DramRef {
-            buffer,
-            transposed: false,
-        },
+        crate::tensor::DramRef::of(buffer, false, parent.map_or(0, |p| p.generation)),
         burn_backend::Shape::from(vec![m, n]),
         dtype,
         device,
@@ -1337,14 +1578,57 @@ fn device_op_ungated(
     b: Option<&TtTensor>,
     c: Option<&TtTensor>,
 ) -> Option<TtTensor> {
+    device_op_as(op, a, b, c, None)
+}
+
+/// [`device_op_ungated`] with its result's dtype asked for: `None` the op's own; `Some(BF16)` for
+/// an op whose result is F32 on F32 operands rounds it once on the card before its BF16 pack
+/// (`Session::eltwise3_as`), bit for bit the op then `cast_native(.., BF16)`, as one op. `None`
+/// returned where the op does not run so (the caller composes it).
+pub(crate) fn device_op_as(
+    op: tt_kernels::tensor::Eltwise,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+    c: Option<&TtTensor>,
+    out: Option<DType>,
+) -> Option<TtTensor> {
     use tt_kernels::kind as k;
     let kind = op.kind;
     let device = a.device;
     // Any rank: each operand as the matrix it is stored as
     // (`crate::tensor::stored_dims`), of the element type the kind computes on.
     let sig = tt_kernels::sfpu::ops::elems(kind);
+    // BF16 operands (roadmap W1, native BF16 arithmetic): read as they lie where the kind takes
+    // F32 alone and every operand is BF16 -- the op is then its widened op rounded once
+    // (`Session::eltwise3`), the composition below bit for bit -- else widened and narrowed.
+    let operands = || [Some(a), b, c].into_iter().flatten();
+    let bf16 = operands().any(|t| t.dtype() == DType::BF16);
+    let rounded = match out {
+        None => false,
+        Some(DType::BF16) if !bf16 && sig.out == Elem::F32 => true,
+        Some(_) => return None,
+    };
+    if bf16 {
+        let all_f32 = sig.inputs.iter().all(|&e| e == Elem::F32);
+        let all_bf16 = operands().all(|t| t.dtype() == DType::BF16);
+        // A row broadcast has no BF16 form in the kernel (`sfpu::kernel::widened_rows`).
+        let row = |x: &TtTensor, y: &TtTensor| {
+            matches!(
+                (x.stored(), y.stored()),
+                (Some([xr, _]), Some([1, _])) if xr != 1
+            ) && x.shape() != y.shape()
+        };
+        let rows = b.is_some_and(|b| row(a, b) || row(b, a));
+        if !(all_f32 && all_bf16 && !rows) || kind == k::ADD_ROW {
+            return bf16_widened(op, a, b, c);
+        }
+    }
     let fits = |t: &TtTensor, i: usize| {
-        t.is_storable() && t.elem() == sig.inputs.get(i).copied() && t.device == device
+        let elem = match t.dtype() {
+            DType::BF16 => Some(Elem::F32),
+            _ => t.elem(),
+        };
+        t.is_storable() && elem == sig.inputs.get(i).copied() && t.device == device
     };
     if !fits(a, 0) || b.is_some_and(|b| !fits(b, 1)) || c.is_some_and(|c| !fits(c, 2)) {
         return None;
@@ -1356,7 +1640,7 @@ fn device_op_ungated(
     if !crate::server::supports_dram(device) {
         return None;
     }
-    if let Some(t) = view_op(op, a, b, c) {
+    if let Some(t) = view_op(op, a, b, c, rounded) {
         return Some(t);
     }
     let (sa, sb) = (a.shape().to_vec(), b.map(|b| b.shape().to_vec()));
@@ -1374,7 +1658,7 @@ fn device_op_ungated(
             crate::tensor::stored_dims(x).expect("checked"),
             crate::tensor::stored_dims(y).expect("checked"),
         );
-        ((yr == 1 && yc == xc) || (yc == 1 && yr == xr))
+        ((yr == 1 && yc == xc) || (yc == 1 && yr == xr) || block_of(x, y))
             && broadcast_shape(x, y).is_some_and(|s| s == x)
     };
     let (a, b) = match &sb {
@@ -1386,142 +1670,296 @@ fn device_op_ungated(
             let shape = broadcast_shape(&sa, s)?;
             if shape != sa {
                 let lhs = expanded(a, burn_backend::Shape::from(shape), "broadcast");
-                return device_op_ungated(op, &lhs, b, c);
+                return device_op_as(op, &lhs, b, c, out);
             }
             let rhs = expanded(b?, a.shape(), "broadcast");
-            return device_op_ungated(op, a, Some(&rhs), c);
+            return device_op_as(op, a, Some(&rhs), c, out);
         }
         _ => return None,
     };
     let (da, db, dc) = (plain_dram(a), b.map(plain_dram), c.map(plain_dram));
-    let (id, dims) = crate::server::eltwise_op(
+    let (id, dims) = crate::server::eltwise_op_as(
         device,
         op,
         da.buffer.id,
         db.as_ref().map(|d| d.buffer.id),
         dc.as_ref().map(|d| d.buffer.id),
+        rounded,
     );
     // The input's own dtype where the element type is kept (a bool's store
     // among them), else the output's.
-    let dtype = if output == input {
+    let dtype = if rounded {
+        DType::BF16
+    } else if output == input {
         a.dtype()
     } else {
         match output {
             Elem::F32 => DType::F32,
             Elem::I32 => DType::I32,
             Elem::Bool => DType::Bool(burn_backend::BoolStore::Native),
+            Elem::Packed(_) => unreachable!("no element-wise op makes a stored packed weight"),
         }
     };
     Some(device_result_shaped(device, id, dims, a.shape(), dtype))
 }
 
-/// `t`'s view if it is one that covers its buffer one to one (`base` at the
-/// origin, each element a different buffer element, every one of them
-/// named): an element-wise op on it is the op on the buffer, whatever order
-/// the view reads it in. A convolution's NHWC output viewed as NCHW is one.
-fn covering_view(t: &TtTensor) -> Option<crate::views::Strided> {
-    if !t.is_view() {
-        return None;
-    }
-    let v = t.as_strided()?;
-    (!v.src.transposed
-        && v.src.buffer.storage == crate::storage::StorageFormat::F32
-        && v.covers_source(&t.shape().to_vec()))
-    .then_some(v)
-}
-
-/// An element-wise op on a covering view ([`covering_view`]) run on its
-/// buffer, the result a view of the output buffer with the same strides: no
-/// datum moves to put the view in row-major order first. Every other operand
-/// is a view of the same layout (the same strides on each dimension longer
-/// than one, a buffer of the same dimensions), or broadcasts as one row or
-/// one column of the buffer: its dimensions longer than one are exactly
-/// those the view lays along the buffer's columns (or rows), in the order the
-/// view lays them -- a BatchNorm's `[1, C, 1, 1]` against an NHWC activation
-/// is a row of `C`. `None` for anything else (the caller materialises the
-/// view).
-fn view_op(
+/// [`device_op_ungated`] on BF16 operands it does not read natively: each widened, the op in F32,
+/// an F32 result narrowed once -- the composition burn-tt runs for any BF16 op it has no native
+/// form of.
+fn bf16_widened(
     op: tt_kernels::tensor::Eltwise,
     a: &TtTensor,
     b: Option<&TtTensor>,
     c: Option<&TtTensor>,
 ) -> Option<TtTensor> {
+    let wide = |t: &TtTensor| float_compute_input(t.clone());
+    let (wa, wb, wc) = (wide(a), b.map(wide), c.map(wide));
+    let out = device_op_ungated(op, &wa, wb.as_ref(), wc.as_ref())?;
+    // The result's dtype is `a`'s where the kind keeps its element type, as the native op's is.
+    Some(match (out.dtype(), a.dtype()) {
+        (DType::F32, DType::BF16) => cast_native(out, DType::BF16),
+        _ => out,
+    })
+}
+
+/// Whether `y` broadcasts to `x` as a block of whole tile rows repeated down `x`'s matrix
+/// (`tt_kernels::sfpu::ops::Broadcast::Block`): `y` is 1 on a run of `x`'s leading dimensions and
+/// equal to `x` on the rest (`[1, 1, R, C]` against `[1, kv_heads, R, C]`, a grouped-query mask
+/// over each key/value head's scores), so `y`'s matrix is `x`'s first block of rows, and its rows
+/// are whole tiles. Not a dimension of 1 between others: `[kv_heads, 1, C]` against `[kv_heads,
+/// R, C]` repeats each row, not the block.
+fn block_of(x: &[usize], y: &[usize]) -> bool {
+    if y.len() > x.len() || x.len() < 2 {
+        return false;
+    }
+    let mut padded = vec![1; x.len() - y.len()];
+    padded.extend_from_slice(y);
+    let Some(lead) = padded.iter().position(|&d| d != 1) else {
+        return false;
+    };
+    let rows: usize = x[lead..x.len() - 1].iter().product();
+    lead > 0
+        && padded[lead..] == x[lead..]
+        && x[..lead].iter().product::<usize>() > 1
+        && rows % 32 == 0
+}
+
+/// `t`'s view and the block of its buffer it is, if it is one the card reads
+/// where it lies (`Strided::as_block`: each element a different element of
+/// a block on tile boundaries, every one of them named): an element-wise op
+/// on it is the op on that block, whatever order the view reads it in. A
+/// convolution's NHWC output viewed as NCHW is one (the whole buffer), and so
+/// is a gate's columns of a fused projection, or the heads of `q` along its
+/// row.
+fn block_view(t: &TtTensor) -> Option<(crate::views::Strided, [usize; 2])> {
+    if !t.is_view() {
+        return None;
+    }
+    let v = t.as_strided()?;
+    if v.src.transposed || v.src.buffer.storage != crate::storage::StorageFormat::F32 {
+        return None;
+    }
+    let dims = v.as_block(&t.shape().to_vec())?;
+    Some((v, dims))
+}
+
+/// `x` broadcast to `shape` and laid out as `strides` lay a tensor of
+/// `shape` out (a view's layout, filling a block one to one): a view of a new
+/// buffer, built by whole-tile copies of `x` (`Strided::layout_moves`), and
+/// kept beside `x` ([`TtTensor::derived`]) for every op that meets it in the
+/// same layout. RoPE's `[1, 1, t, d]` table against heads laid along a
+/// projection's columns is `h` copies of each of its tiles. `None` where the
+/// tiles do not line up (a dimension of 16 columns) or `x` is not F32.
+fn relaid(x: &TtTensor, shape: &[usize], strides: &[[usize; 2]]) -> Option<TtTensor> {
+    let sx = x.shape().to_vec();
+    if sx.len() > shape.len() || x.dtype() != DType::F32 {
+        return None;
+    }
+    let src = match x.as_strided() {
+        Some(v) => v,
+        None => crate::views::Strided::of(&plain_dram(x), &sx),
+    };
+    if src.src.transposed || src.src.buffer.storage != crate::storage::StorageFormat::F32 {
+        return None;
+    }
+    let lead = shape.len() - sx.len();
+    let expanded = crate::views::Strided {
+        strides: (0..shape.len())
+            .map(|k| {
+                if k < lead || sx[k - lead] == 1 {
+                    [0, 0]
+                } else {
+                    src.strides[k - lead]
+                }
+            })
+            .collect(),
+        ..src.clone()
+    };
+    let (dims, moves) =
+        crate::views::Strided::layout_moves(&[(&expanded, shape)], 0, shape, strides)?;
+    let key = format!("laid out as {shape:?} {strides:?}");
+    let (device, shape, strides) = (
+        x.device,
+        burn_backend::Shape::from(shape.to_vec()),
+        strides.to_vec(),
+    );
+    Some(x.derived(key, move |_| {
+        let (id, dims) = crate::server::copy_blocks(device, src.src.buffer.id, moves, dims);
+        let out = device_view(device, id, dims, None, DType::F32)
+            .to_dram()
+            .clone();
+        TtTensor::view(
+            crate::views::Strided {
+                src: out,
+                base: [0, 0],
+                strides,
+            },
+            shape,
+            DType::F32,
+            device,
+        )
+    }))
+}
+
+/// An element-wise op on a block view ([`block_view`]) run on that block of
+/// its buffer, the result a view of the output buffer with the same strides:
+/// no datum moves to put the view in row-major order first. Every other
+/// operand of the same shape is laid out alike -- a block view, or a plain
+/// tensor, of the same block dimensions and the same strides on each
+/// dimension longer than one (a gate's columns times the plain
+/// `sigmoid` of them) -- or broadcasts as one row or one column of the block:
+/// its dimensions longer than one are exactly those the view lays along the
+/// block's columns (or rows), in the order the view lays them -- a
+/// BatchNorm's `[1, C, 1, 1]` against an NHWC activation is a row of `C`.
+/// Operands that are whole buffers run as any element-wise op does; a block
+/// inside a buffer is read where it lies (`server::eltwise_blocks`), except
+/// in the matrix element-wise mode, which reads whole buffers. `None` for
+/// anything else (the caller materialises the view).
+fn view_op(
+    op: tt_kernels::tensor::Eltwise,
+    a: &TtTensor,
+    b: Option<&TtTensor>,
+    c: Option<&TtTensor>,
+    rounded: bool,
+) -> Option<TtTensor> {
+    use crate::server::BlockArg;
     use tt_kernels::kind as k;
     let kind = op.kind;
-    let (a, b) = match (covering_view(a), b) {
-        (Some(_), _) => (a, b),
-        // A commuting op with the view on the right.
-        (None, Some(rhs)) if c.is_none() && matches!(kind, k::ADD | k::MUL) => {
-            covering_view(rhs)?;
-            (rhs, Some(a))
+    let (a, b, (v, [rows, cols])) = if let Some(l) = block_view(a) {
+        (a, b, l)
+    } else {
+        let rhs = b?;
+        let l = block_view(rhs)?;
+        if rhs.shape() == a.shape() {
+            (a, b, l)
+        } else if c.is_none() && matches!(kind, k::ADD | k::MUL) {
+            // A commuting op with the view on the right.
+            (rhs, Some(a), l)
+        } else {
+            return None;
         }
-        _ => return None,
     };
-    let v = covering_view(a)?;
     let sa = a.shape().to_vec();
-    let [rows, cols] = [v.src.buffer.rows, v.src.buffer.cols];
     let broadcasts = tt_kernels::sfpu::ops::broadcasts(kind);
-    let operand = |x: &TtTensor, broadcast: bool| -> Option<crate::tensor::DramRef> {
-        if x.device != a.device {
-            return None;
-        }
-        let sx = x.shape().to_vec();
-        if sx == sa {
-            let w = covering_view(x)?;
-            let same = [w.src.buffer.rows, w.src.buffer.cols] == [rows, cols]
-                && sa
-                    .iter()
-                    .zip(v.strides.iter().zip(&w.strides))
-                    .all(|(&n, (s, t))| n == 1 || s == t);
-            return same.then_some(w.src);
-        }
-        if !broadcast || sx.len() > sa.len() {
-            return None;
-        }
-        // `x`'s dimensions right-aligned to `a`'s: the ones longer than one
-        // must be `a`'s, and all of `a`'s along one axis of the buffer.
-        let lead = sa.len() - sx.len();
-        let long: Vec<usize> = (0..sa.len())
-            .filter(|&d| d >= lead && sx[d - lead] != 1)
-            .collect();
-        if long.iter().any(|&d| sx[d - lead] != sa[d]) {
-            return None;
-        }
-        for axis in 0..2 {
-            let along = |d: usize| v.strides[d][axis] > 0 && v.strides[d][1 - axis] == 0;
-            let spans: Vec<usize> = (0..sa.len()).filter(|&d| sa[d] > 1 && along(d)).collect();
-            if spans.is_empty() || spans != long {
-                continue;
-            }
-            // In `x`'s row-major order: the last dimension stride 1.
-            let mut stride = 1;
-            for &d in long.iter().rev() {
-                if v.strides[d][axis] != stride {
-                    return None;
-                }
-                stride *= sa[d];
-            }
-            if stride != [rows, cols][axis] {
+    // Each operand's block, whether it is its whole buffer, and the buffer,
+    // kept alive until the op is queued (a broadcast row made here has no
+    // other owner).
+    let whole = |d: crate::tensor::DramRef| {
+        let arg = BlockArg {
+            id: d.buffer.id,
+            at: [0, 0],
+            dims: [d.buffer.rows, d.buffer.cols],
+        };
+        (arg, true, d)
+    };
+    let operand =
+        |x: &TtTensor, broadcast: bool| -> Option<(BlockArg, bool, crate::tensor::DramRef)> {
+            if x.device != a.device {
                 return None;
             }
-            let dims = if axis == 1 { [1, cols] } else { [rows, 1] };
-            // Already that row (or column) of a buffer, read in order: a
-            // parameter `[C]` viewed as `[1, C, 1, 1]`.
-            if let Some(w) = x.as_strided() {
-                let n = dims[0] * dims[1];
-                if w.base == [0, 0]
-                    && !w.src.transposed
-                    && [w.src.buffer.rows, w.src.buffer.cols] == dims
-                    && (0..n).all(|f| w.at(&sx, f) == if axis == 1 { [0, f] } else { [f, 0] })
-                {
-                    return Some(w.src);
-                }
+            let sx = x.shape().to_vec();
+            if sx == sa {
+                let (w, dims) = if x.is_view() {
+                    block_view(x)?
+                } else {
+                    let d = plain_dram(x);
+                    if d.buffer.storage != crate::storage::StorageFormat::F32 {
+                        return None;
+                    }
+                    let dims = [d.buffer.rows, d.buffer.cols];
+                    (crate::views::Strided::of(&d, &sx), dims)
+                };
+                let same = dims == [rows, cols]
+                    && sa
+                        .iter()
+                        .zip(v.strides.iter().zip(&w.strides))
+                        .all(|(&n, (s, t))| n == 1 || s == t);
+                let entire = w.base == [0, 0] && dims == [w.src.buffer.rows, w.src.buffer.cols];
+                let arg = BlockArg {
+                    id: w.src.buffer.id,
+                    at: w.base,
+                    dims,
+                };
+                return same.then_some((arg, entire, w.src));
             }
-            let flat = reshaped(x.clone(), burn_backend::Shape::new(dims));
-            return Some(plain_dram(&flat));
-        }
-        None
-    };
+            if !broadcast || sx.len() > sa.len() {
+                return None;
+            }
+            // `x`'s dimensions right-aligned to `a`'s: the ones longer than one
+            // must be `a`'s, and all of `a`'s along one axis of the block.
+            let lead = sa.len() - sx.len();
+            let long: Vec<usize> = (0..sa.len())
+                .filter(|&d| d >= lead && sx[d - lead] != 1)
+                .collect();
+            if long.iter().any(|&d| sx[d - lead] != sa[d]) {
+                return None;
+            }
+            for axis in 0..2 {
+                let along = |d: usize| v.strides[d][axis] > 0 && v.strides[d][1 - axis] == 0;
+                let spans: Vec<usize> = (0..sa.len()).filter(|&d| sa[d] > 1 && along(d)).collect();
+                if spans.is_empty() || spans != long {
+                    continue;
+                }
+                // In `x`'s row-major order: the last dimension stride 1.
+                let mut stride = 1;
+                for &d in long.iter().rev() {
+                    if v.strides[d][axis] != stride {
+                        stride = 0;
+                        break;
+                    }
+                    stride *= sa[d];
+                }
+                if stride != [rows, cols][axis] {
+                    continue;
+                }
+                let dims = if axis == 1 { [1, cols] } else { [rows, 1] };
+                // Already that row (or column) of a buffer, read in order: a
+                // parameter `[C]` viewed as `[1, C, 1, 1]`.
+                if let Some(w) = x.as_strided() {
+                    let n = dims[0] * dims[1];
+                    if w.base == [0, 0]
+                        && !w.src.transposed
+                        && [w.src.buffer.rows, w.src.buffer.cols] == dims
+                        && (0..n).all(|f| w.at(&sx, f) == if axis == 1 { [0, f] } else { [f, 0] })
+                    {
+                        return Some(whole(w.src));
+                    }
+                }
+                let flat = reshaped(x.clone(), burn_backend::Shape::new(dims));
+                return Some(whole(plain_dram(&flat)));
+            }
+            // Neither: `x` laid out in the view's own layout by tile copies,
+            // kept beside it (RoPE's `cos` over a projection's heads, made
+            // once a step and read by every layer).
+            // (A plain tensor where the layout is a plain one.)
+            let laid = relaid(x, &sa, &v.strides)?;
+            let d = match block_view(&laid) {
+                Some((w, _)) => w.src,
+                None => plain_dram(&laid),
+            };
+            ([d.buffer.rows, d.buffer.cols] == [rows, cols]).then(|| whole(d))
+        };
+    let da = operand(a, false)?;
     let db = match b {
         Some(b) => Some(operand(b, broadcasts)?),
         None => None,
@@ -1531,21 +1969,40 @@ fn view_op(
         None => None,
     };
     let device = a.device;
-    let (id, dims) = crate::server::eltwise_op(
-        device,
-        op,
-        v.src.buffer.id,
-        db.as_ref().map(|d| d.buffer.id),
-        dc.as_ref().map(|d| d.buffer.id),
-    );
+    let all_whole = [Some(&da), db.as_ref(), dc.as_ref()]
+        .into_iter()
+        .flatten()
+        .all(|(_, w, _)| *w);
+    let _held = (&da.2, db.as_ref().map(|d| &d.2), dc.as_ref().map(|d| &d.2));
+    let (da, db, dc) = (da.0, db.as_ref().map(|d| d.0), dc.as_ref().map(|d| d.0));
+    let (id, dims) = if all_whole {
+        crate::server::eltwise_op_as(
+            device,
+            op,
+            da.id,
+            db.map(|d| d.id),
+            dc.map(|d| d.id),
+            rounded,
+        )
+    } else if matches!(
+        crate::server::elementwise_mode(device),
+        crate::ElementwiseMode::Matrix { .. }
+    ) {
+        return None;
+    } else {
+        crate::server::eltwise_blocks_as(device, op, da, db, dc, rounded)
+    };
     let sig = tt_kernels::sfpu::ops::elems(kind);
-    let dtype = if sig.out == sig.inputs[0] {
+    let dtype = if rounded {
+        DType::BF16
+    } else if sig.out == sig.inputs[0] {
         a.dtype()
     } else {
         match sig.out {
             Elem::F32 => DType::F32,
             Elem::I32 => DType::I32,
             Elem::Bool => DType::Bool(burn_backend::BoolStore::Native),
+            Elem::Packed(_) => unreachable!("no element-wise op makes a stored packed weight"),
         }
     };
     let out = device_view(device, id, dims, None, dtype).to_dram().clone();
@@ -1631,10 +2088,7 @@ fn swapped_view(tensor: &TtTensor, dim1: usize, dim2: usize) -> Option<TtTensor>
         return None;
     }
     let d = tensor.dram()?;
-    let d = crate::tensor::DramRef {
-        buffer: d.buffer.clone(),
-        transposed: !d.transposed,
-    };
+    let d = crate::tensor::DramRef::of(d.buffer.clone(), !d.transposed, d.generation);
     let s = tensor.shape().to_vec();
     Some(TtTensor::on_device(
         d,
@@ -1673,10 +2127,7 @@ pub(crate) fn reshaped(tensor: TtTensor, shape: burn_backend::Shape) -> TtTensor
             if target == [c, r] && (r == 1 || c == 1) {
                 let plain = plain_dram(&tensor);
                 let view = TtTensor::on_device(
-                    crate::tensor::DramRef {
-                        buffer: plain.buffer,
-                        transposed: true,
-                    },
+                    crate::tensor::DramRef::of(plain.buffer, true, plain.generation),
                     burn_backend::Shape::new([c, r]),
                     tensor.dtype(),
                     tensor.device,
@@ -1771,6 +2222,27 @@ pub mod float {
             fail(
                 op,
                 format_args!("{}, dim={dim}, out_dtype={out_dtype:?}", context(&tensor)),
+            );
+        }
+        // One row along its last dimension (a decode step's logits): one native op
+        // (`Session::argmax_row`), the same choice as the composition below. An argmin is
+        // the argmax of the negation, which keeps both the ties and the NaNs where they were.
+        let row =
+            (shape.len() == 1 || (shape.len() == 2 && shape[0] == 1)) && dim + 1 == shape.len();
+        if row && ARGMAX_ROW.load(std::sync::atomic::Ordering::Relaxed) {
+            let device = tensor.device;
+            let tensor = if minimum { float_neg(tensor) } else { tensor };
+            let _part = crate::report::part("argmax/row");
+            let d = plain_dram(&tensor);
+            let (id, dims) = crate::server::argmax_row(device, d.buffer.id);
+            let mut output = shape;
+            output[dim] = 1;
+            return device_result_shaped(
+                device,
+                id,
+                dims,
+                burn_backend::Shape::from(output),
+                DType::I32,
             );
         }
         if shape.len() > 2 {
@@ -1932,6 +2404,24 @@ pub mod float {
     // an SFPU approximation (`tt_kernels::sfpu::ops::kind_sfpu::DIV`).
     binary!(float_div, tt_kernels::sfpu::ops::kind_sfpu::DIV);
 
+    /// `exp(lhs - rhs)` in one SFPU pass (`kind_sfpu::SUB_EXP`), bit for bit the two ops: a
+    /// softmax's numerator, `rhs` its rows' maximum. Burn's composition where the pass does not
+    /// apply.
+    pub fn float_sub_exp(
+        lhs: FloatTensor<TtBackend>,
+        rhs: FloatTensor<TtBackend>,
+    ) -> FloatTensor<TtBackend> {
+        if let Some(t) = device_eltwise(
+            tt_kernels::sfpu::ops::kind_sfpu::SUB_EXP,
+            0.0,
+            &lhs,
+            Some(&rhs),
+        ) {
+            return t;
+        }
+        float_exp(float_sub(lhs, rhs))
+    }
+
     /// Compound fused addition and ReLU (`relu(lhs + rhs)`) executed in a single SFPU pass.
     pub fn float_add_relu(
         lhs: FloatTensor<TtBackend>,
@@ -1946,6 +2436,106 @@ pub mod float {
             return t;
         }
         super::activation::relu(float_add(lhs, rhs))
+    }
+
+    /// `silu(x) * y` (`SILU_MUL`), or `x * sigmoid(x)` (`SILU`) without `y`, in one SFPU pass:
+    /// bit for bit `sigmoid(x)`, `float_mul(x, s)` and `float_mul(t, y)` on this backend, for
+    /// F32 operands of one shape where those run as SFPU ops (not the matrix element-wise
+    /// mode). `None` where they would not: the caller runs the separate ops, whose own paths
+    /// (widening, block-float storage, broadcasts) then apply.
+    pub fn float_silu_mul(x: &TtTensor, y: Option<&TtTensor>) -> Option<TtTensor> {
+        use tt_kernels::sfpu::ops::kind_sfpu;
+        let plain = |t: &TtTensor| {
+            t.dtype() == DType::F32 && t.storage_format() == crate::storage::StorageFormat::F32
+        };
+        if !plain(x)
+            || y.is_some_and(|y| !plain(y) || y.shape() != x.shape())
+            || matches!(
+                crate::server::elementwise_mode(x.device),
+                crate::ElementwiseMode::Matrix { .. }
+            )
+        {
+            return None;
+        }
+        let kind = if y.is_some() {
+            kind_sfpu::SILU_MUL
+        } else {
+            kind_sfpu::SILU
+        };
+        device_eltwise(kind, 0.0, x, y)
+    }
+
+    /// `c + a * b` in one SFPU pass (`kind_sfpu::MUL_ADD`), bit for bit `float_mul` then
+    /// `float_add(c, product)` where those run as SFPU ops on plain F32 of one shape. `None`
+    /// elsewhere: the caller runs the separate ops.
+    pub fn float_mul_add(a: &TtTensor, b: &TtTensor, c: &TtTensor) -> Option<TtTensor> {
+        use tt_kernels::sfpu::ops::kind_sfpu;
+        let f32 = |t: &TtTensor| {
+            t.dtype() == DType::F32 && t.storage_format() == crate::storage::StorageFormat::F32
+        };
+        // A `b` that broadcasts to `a` (RoPE's table over the heads) laid out as `a` is, by the
+        // tile copies `float_mul` makes and keeps beside it (`relaid`): the kernel then reads
+        // three operands of one layout.
+        let laid;
+        let b = if b.shape() == a.shape() {
+            b
+        } else {
+            let v = a.as_strided()?;
+            laid = super::relaid(b, &a.shape().to_vec(), &v.strides)?;
+            &laid
+        };
+        if !f32(a)
+            || !f32(b)
+            || !f32(c)
+            || c.shape() != a.shape()
+            || matches!(
+                crate::server::elementwise_mode(a.device),
+                crate::ElementwiseMode::Matrix { .. }
+            )
+        {
+            return None;
+        }
+        let op = tt_kernels::tensor::Eltwise {
+            kind: kind_sfpu::MUL_ADD,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        device_op(op, a, Some(b), Some(c))
+    }
+
+    /// Burn's `RmsNorm` without its scale, `x / sqrt(mean(x x) + eps)` over the last dimension,
+    /// as two ops: the statistic in one kernel (`tt_kernels::sfpu::norm`), then `float_div` by
+    /// it. Bit for bit `float_mul(x, x)`, `float_mean_dim`, `float_add_scalar(eps)`, `float_sqrt`
+    /// and `float_div` on this backend, where those run as SFPU ops on F32 (not the matrix
+    /// element-wise mode) and a row fits one job. `None` where they would not: the caller runs
+    /// the separate ops.
+    pub fn float_rms_norm(x: &TtTensor, eps: f32) -> Option<TtTensor> {
+        let shape = x.shape().to_vec();
+        let cols = *shape.last()?;
+        if x.dtype() != DType::F32
+            || x.storage_format() != crate::storage::StorageFormat::F32
+            || shape.contains(&0)
+            || !x.is_storable()
+            || !crate::server::supports_dram(x.device)
+            || matches!(
+                crate::server::elementwise_mode(x.device),
+                crate::ElementwiseMode::Matrix { .. }
+            )
+            || !tt_kernels::sfpu::norm::fits(cols)
+        {
+            return None;
+        }
+        // The statistic and the division as one op where the session can
+        // (`Session::rms_norm`), else the two: bit for bit either way.
+        let d = plain_dram(x);
+        let (id, dims) = crate::server::rms_norm(x.device, d.buffer.id, None, eps);
+        Some(device_result_shaped(
+            x.device,
+            id,
+            dims,
+            burn_backend::Shape::from(shape),
+            DType::F32,
+        ))
     }
 
     /// `atan2(lhs, rhs)` on the device where the data is, within
@@ -2086,7 +2676,8 @@ pub mod float {
         // stay there -- operands uploaded once, the result never downloaded
         // unless a host op asks for it (`tensor.rs`).
         if lhs.is_matrix_f32() && rhs.is_matrix_f32() && crate::server::supports_dram(device) {
-            let (a, b) = (lhs.to_dram().clone(), rhs.to_dram().clone());
+            let a = lhs.to_dram().clone();
+            let b = rhs.to_dram().plain_for_matmul(|| plain_dram(&rhs));
             let (id, [m, n]) = crate::server::matmul_dram(
                 device,
                 a.buffer.id,
@@ -2269,16 +2860,28 @@ pub mod float {
     }
 
     /// The buffer a batched matmul reads `t` from, and `t`'s block for each
-    /// index of `batch` (`Strided::matrix_blocks`).
+    /// index of `batch` (`Strided::matrix_blocks`). A view whose matrices are
+    /// not blocks of its buffer is made plain first, once: grouped-query
+    /// attention's `q`, heads laid along a projection's row and regrouped
+    /// `[kv, groups, d]`, whose groups' rows lie along the buffer's columns.
     pub(crate) fn operand_blocks(
         t: &TtTensor,
         batch: &[usize],
     ) -> Option<(crate::BufferId, Vec<crate::Block>)> {
+        let shape = t.shape().to_vec();
         let v = t.as_strided().or_else(|| {
             t.to_dram();
             t.as_strided()
         })?;
-        let blocks = v.matrix_blocks(&t.shape().to_vec(), batch)?;
+        if let Some(blocks) = v.matrix_blocks(&shape, batch) {
+            return Some((v.src.buffer.id, blocks));
+        }
+        if !t.is_view() {
+            return None;
+        }
+        t.to_dram();
+        let v = t.as_strided()?;
+        let blocks = v.matrix_blocks(&shape, batch)?;
         Some((v.src.buffer.id, blocks))
     }
 
@@ -2407,6 +3010,11 @@ pub mod float {
         tensor: FloatTensor<TtBackend>,
         shape: burn_backend::Shape,
     ) -> FloatTensor<TtBackend> {
+        // The same shape: the tensor itself, view or not (a view's reshape would otherwise copy
+        // it out: `Llama`'s multi-head `q` folded to `[n, kv, groups t, d]` is its own shape).
+        if tensor.shape() == shape {
+            return tensor;
+        }
         let tensor = if tensor.storage_format() != crate::storage::StorageFormat::F32
             && (tensor.is_transposed()
                 || tensor.stored() != crate::tensor::stored_dims(&shape.to_vec()))
@@ -2672,6 +3280,48 @@ pub mod float {
         dim: usize,
     ) -> Option<TtTensor> {
         device_reduce_ungated(tensor, op, dim)
+    }
+
+    /// `clamp_min(reduce(tensor, dim), min)`, a softmax's guarded maximum and sum: one op over the
+    /// last dimension (`Session::reduce_then`, the clamp applied to the result before its pack),
+    /// bit for bit the two ops; the two ops elsewhere.
+    pub(crate) fn reduce_clamp_min(
+        tensor: TtTensor,
+        op: tt_kernels::sfpu::reduce::ReduceOp,
+        dim: usize,
+        min: f32,
+    ) -> TtTensor {
+        use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+        let shape = tensor.shape().to_vec();
+        let then = Some((kind_sfpu::CLAMP_MIN, min.to_bits()));
+        let fits = dim + 1 == shape.len()
+            && !shape.contains(&0)
+            && tensor.is_storable()
+            && tensor.elem() == Some(op.elem())
+            && crate::server::supports_dram(tensor.device)
+            && crate::tensor::stored_dims(&shape).is_some_and(|dims| {
+                tt_kernels::tensor::reduce_then_fits(op, Axis::Cols, dims, then)
+            });
+        if fits {
+            let device = tensor.device;
+            let d = plain_dram(&tensor);
+            let mut out_shape = shape;
+            out_shape[dim] = 1;
+            let (id, dims) = crate::server::reduce_then(device, d.buffer.id, op, Axis::Cols, then);
+            return device_result_shaped(
+                device,
+                id,
+                dims,
+                burn_backend::Shape::from(out_shape),
+                tensor.dtype(),
+            );
+        }
+        let reduced = match op {
+            ReduceOp::Max => float::float_max_dim(tensor, dim),
+            ReduceOp::Sum => float::float_sum_dim(tensor, dim),
+            _ => unreachable!("a softmax's maximum or sum"),
+        };
+        float::float_clamp_min(reduced, min.into())
     }
 
     /// The sum over a leading dimension `dim` with nothing before it (`[n,
@@ -2941,7 +3591,7 @@ pub mod float {
             tensor.device,
             id,
             dims,
-            Some(d.buffer.clone()),
+            Some(d),
             tensor.dtype(),
         ))
     }
@@ -3157,6 +3807,26 @@ pub mod float {
             "float_mask_fill",
             format_args!("tensor=({}), mask=({})", context(&tensor), context(&mask)),
         )
+    }
+
+    /// `mask ? value : tensor * scale` in one SFPU pass (`kind_sfpu::SCALE_MASK_FILL`), bit for
+    /// bit `float_mask_fill(float_mul_scalar(tensor, scale), mask, value)`: an attention's scaled,
+    /// masked scores. That composition where the pass does not apply.
+    pub fn float_scale_mask_fill(
+        tensor: FloatTensor<TtBackend>,
+        scale: Scalar,
+        mask: BoolTensor<TtBackend>,
+        value: Scalar,
+    ) -> FloatTensor<TtBackend> {
+        let op = op2(
+            kind_sfpu::SCALE_MASK_FILL,
+            scalar_f32(scale),
+            scalar_f32(value),
+        );
+        if let Some(t) = device_op(op, &tensor, Some(&mask), None) {
+            return t;
+        }
+        float_mask_fill(float_mul_scalar(tensor, scale), mask, value)
     }
 
     /// `mask ? value : x`, all three one shape, on the device where the data is;
@@ -3465,12 +4135,76 @@ mod ctc;
 mod deform_conv;
 mod exact_matmul;
 pub use accurate_matmul::set_slicing as set_accurate_matmul_slicing;
+
+/// Whether a row's argmax runs as one native op (`Session::argmax_row`); on unless turned off.
+static ARGMAX_ROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn off (or back on) a row's argmax as one native op, process-wide: off, it is the
+/// composition of predicates, masks and reductions. For gates' comparisons. Dev-facing.
+#[doc(hidden)]
+pub fn set_argmax_row(on: bool) {
+    ARGMAX_ROW.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether attention for a few query rows a key/value head runs as one op
+/// (`module::attention_rows`, `Session::attention_rows`); on unless turned off.
+static ATTENTION_ROWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn off (or back on) attention as one op for a decode step's rows, process-wide: off,
+/// attention runs as its composition of products, scale, mask and softmax. For gates' and
+/// benches' comparisons. Dev-facing.
+#[doc(hidden)]
+pub fn set_attention_rows(on: bool) {
+    ATTENTION_ROWS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// When attention's scale, mask and softmax run as one op over each row of the scores
+/// (`module::softmax_rows`, `Session::softmax_rows`): [`SOFTMAX_ROWS_AUTO`] by default, on rows
+/// too long for one reduction run, where the composition's maximum and sum each stream the row
+/// through GDDR again on a unit a tile row (`tensor::reduce_chunked`); `TT_SOFTMAX_ROWS=1` on
+/// every row it takes, `0` never. On short rows the composition's own reductions read each row
+/// once on every unit, and the one op measured slower there (`docs/plans/long-context.md`,
+/// "Long-prompt softmax passes").
+static SOFTMAX_ROWS: std::sync::LazyLock<std::sync::atomic::AtomicU8> =
+    std::sync::LazyLock::new(|| {
+        std::sync::atomic::AtomicU8::new(match std::env::var("TT_SOFTMAX_ROWS").as_deref() {
+            Ok("1") => SOFTMAX_ROWS_ON,
+            Ok("0") => SOFTMAX_ROWS_OFF,
+            _ => SOFTMAX_ROWS_AUTO,
+        })
+    });
+const SOFTMAX_ROWS_OFF: u8 = 0;
+const SOFTMAX_ROWS_ON: u8 = 1;
+const SOFTMAX_ROWS_AUTO: u8 = 2;
+
+/// Turn attention's softmax as one op on for every row it takes (`true`) or off (`false`),
+/// process-wide: off, the scale and mask, the maximum, `SUB_EXP`, the sum and `DIV` run as their
+/// own ops. For gates' and benches' comparisons; [`set_softmax_rows_auto`] restores the default.
+/// Dev-facing.
+#[doc(hidden)]
+pub fn set_softmax_rows(on: bool) {
+    let v = if on {
+        SOFTMAX_ROWS_ON
+    } else {
+        SOFTMAX_ROWS_OFF
+    };
+    SOFTMAX_ROWS.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Attention's softmax as one op on long rows only, the default ([`SOFTMAX_ROWS`]). Dev-facing.
+#[doc(hidden)]
+pub fn set_softmax_rows_auto() {
+    SOFTMAX_ROWS.store(SOFTMAX_ROWS_AUTO, std::sync::atomic::Ordering::SeqCst);
+}
 pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
 mod interpolate;
 mod nhwc;
+pub(crate) mod norm;
 mod pool;
 mod region;
+pub(crate) mod rope;
+pub(crate) mod rounded;
 mod scan;
 mod sort;
 
@@ -3540,32 +4274,70 @@ pub mod module {
                 return cast_native(out, dtype);
             }
         }
+        if let (Some(m), None, None, false) =
+            (&mask, &attn_bias, options.softcap, options.is_causal)
+        {
+            if let Some(out) = {
+                let _part = part("attention/rows");
+                attention_rows(&query, &key, &value, m, scale)
+            } {
+                let _part = part("attention/narrow");
+                return cast_native(out, dtype);
+            }
+        }
         let scores = {
             let _part = part("attention/qk");
             float::float_matmul(query, float::float_transpose(key))
         };
-        let mut scores = {
-            let _part = part("attention/scale");
-            let mut scores = float::float_mul_scalar(scores, scale.into());
-            if let Some(cap) = options.softcap {
-                scores = float::float_mul_scalar(
-                    float::float_tanh(float::float_div_scalar(scores, cap.into())),
-                    cap.into(),
-                );
+        if let Some(mask) = &mask {
+            assert_eq!(device, mask.device, "attention mask device differs");
+        }
+        // The caller's mask, then the causal one: with no softcap between them, the scale and the
+        // first are one pass.
+        let mut causal = options.is_causal.then(|| causal_mask(device, &qs, &ks));
+        let mask = mask.or_else(|| causal.take());
+        // One mask and nothing between the scale and the softmax: the scale, the mask and the
+        // softmax as one op over each row, where it takes the shapes.
+        if let (Some(m), None, None, None) = (&mask, options.softcap, &causal, &attn_bias) {
+            let probabilities = {
+                let _part = part("attention/softmax");
+                softmax_rows(&scores, m, scale)
+            };
+            if let Some(probabilities) = probabilities {
+                let out = {
+                    let _part = part("attention/pv");
+                    float::float_matmul(probabilities, value)
+                };
+                let _part = part("attention/narrow");
+                return cast_native(out, dtype);
             }
-            scores
+        }
+        let (mut scores, mask) = match (mask, options.softcap) {
+            (Some(mask), None) => {
+                let _part = part("attention/scale");
+                let scores = float::float_scale_mask_fill(
+                    scores,
+                    scale.into(),
+                    mask,
+                    f32::NEG_INFINITY.into(),
+                );
+                (scores, None)
+            }
+            (mask, softcap) => {
+                let _part = part("attention/scale");
+                let mut scores = float::float_mul_scalar(scores, scale.into());
+                if let Some(cap) = softcap {
+                    scores = float::float_mul_scalar(
+                        float::float_tanh(float::float_div_scalar(scores, cap.into())),
+                        cap.into(),
+                    );
+                }
+                (scores, mask)
+            }
         };
         let _part = part("attention/mask");
-        if let Some(mask) = mask {
-            assert_eq!(device, mask.device, "attention mask device differs");
+        for mask in [mask, causal].into_iter().flatten() {
             scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
-        }
-        if options.is_causal {
-            scores = float::float_mask_fill(
-                scores,
-                causal_mask(device, &qs, &ks),
-                f32::NEG_INFINITY.into(),
-            );
         }
         if let Some(bias) = attn_bias {
             assert_eq!(device, bias.device, "attention bias device differs");
@@ -3575,12 +4347,18 @@ pub mod module {
         drop(_part);
         let probabilities = {
             let _part = part("attention/softmax");
-            let max =
-                float::float_clamp_min(float::float_max_dim(scores.clone(), 3), (-f32::MAX).into());
-            let exp = float::float_exp(float::float_sub(scores, max));
-            let sum = float::float_clamp_min(
-                float::float_sum_dim(exp.clone(), 3),
-                f32::MIN_POSITIVE.into(),
+            let max = float::reduce_clamp_min(
+                scores.clone(),
+                tt_kernels::sfpu::reduce::ReduceOp::Max,
+                3,
+                -f32::MAX,
+            );
+            let exp = float::float_sub_exp(scores, max);
+            let sum = float::reduce_clamp_min(
+                exp.clone(),
+                tt_kernels::sfpu::reduce::ReduceOp::Sum,
+                3,
+                f32::MIN_POSITIVE,
             );
             float::float_div(exp, sum)
         };
@@ -3656,6 +4434,144 @@ pub mod module {
     /// other than `Fast`, a mask or bias (the caller's), a causal mask past a
     /// million elements, or where padding would grow the scores by more than a
     /// quarter (one query a head: 32 rows for 1).
+    /// Attention for a few query rows a key/value head under one mask row -- a decode step's --
+    /// as one op (`Session::attention_rows`): bit for bit the composition below, a head's
+    /// scores, softmax and `P V` on one unit with nothing in GDDR between them. `None` where
+    /// it does not apply: the composition runs.
+    fn attention_rows(
+        query: &TtTensor,
+        key: &TtTensor,
+        value: &TtTensor,
+        mask: &TtTensor,
+        scale: f64,
+    ) -> Option<TtTensor> {
+        use tt_kernels::attention::{fits, Item};
+        let device = query.device;
+        if !ATTENTION_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::matmul_mode::effective(device) != crate::MatmulMode::Fast
+            || crate::matmul_mode::fidelity_override().is_some()
+            || !crate::server::supports_batched_layout(device)
+        {
+            return None;
+        }
+        let (qs, ks, vs, ms) = (
+            query.shape().to_vec(),
+            key.shape().to_vec(),
+            value.shape().to_vec(),
+            mask.shape().to_vec(),
+        );
+        let dims = [qs[2], qs[3], ks[2], vs[3]];
+        let [m, d, l, dv] = dims;
+        // One mask row for every query row of every head.
+        if ms.len() != 4 || ms[..3].iter().any(|&x| x != 1) || ms[3] != l || !fits(dims, 0) {
+            return None;
+        }
+        let key_t = float::float_transpose(key.clone());
+        let qk = float::batched_plan(query, &key_t)?;
+        let (vb, value_blocks) = float::operand_blocks(value, &qk.batch)?;
+        if qk.mkn != [m, d, l] || value_blocks.len() != qk.items.len() {
+            return None;
+        }
+        let items: Vec<Item> = qk
+            .items
+            .iter()
+            .zip(&value_blocks)
+            .map(|((bq, bk), bv)| {
+                (!bq.transposed && bk.transposed && !bv.transposed && fits(dims, bq.at[0] % 32))
+                    .then_some(Item {
+                        q: bq.at,
+                        k: bk.at,
+                        v: bv.at,
+                    })
+            })
+            .collect::<Option<_>>()?;
+        let mask_dram = plain_dram(mask);
+        if [mask_dram.buffer.rows, mask_dram.buffer.cols] != [1, l] {
+            return None;
+        }
+        let (id, out_dims) = crate::server::attention_rows(
+            device,
+            [qk.a, qk.b, vb, mask_dram.buffer.id],
+            items,
+            dims,
+            scale as f32,
+        );
+        // The heads' rows in row-major order along one row: `[b, heads, m, dv]` viewed over it,
+        // so the context's `swap_dims(1, 2).reshape([b, t, heads dv])` is the row itself.
+        let out = device_view(device, id, out_dims, None, DType::F32)
+            .to_dram()
+            .clone();
+        Some(TtTensor::view(
+            crate::views::Strided {
+                src: out,
+                base: [0, 0],
+                strides: vec![[0, qs[1] * m * dv], [0, m * dv], [0, dv], [0, 1]],
+            },
+            Shape::new([qs[0], qs[1], m, dv]),
+            DType::F32,
+            device,
+        ))
+    }
+
+    /// `softmax(scale scores, masked)` over the last dimension as one op
+    /// (`Session::softmax_rows`): bit for bit the scale and mask (`SCALE_MASK_FILL`), the clamped
+    /// maximum, `SUB_EXP`, the clamped sum and `DIV` the composition runs, with the scores read
+    /// three times instead of eleven and no row too long. `mask` is the scores' shape or a block of
+    /// whole tile rows repeated down them ([`block_of`]). `None` where it does not apply: F32
+    /// scores and a `Bool` mask, whole tiles, SFPU element-wise ops (not the matrix mode).
+    fn softmax_rows(scores: &TtTensor, mask: &TtTensor, scale: f64) -> Option<TtTensor> {
+        let device = scores.device;
+        let when = SOFTMAX_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        if when == SOFTMAX_ROWS_OFF
+            || !scores.is_storable()
+            || !mask.is_storable()
+            || scores.elem() != Some(Elem::F32)
+            || mask.elem() != Some(Elem::Bool)
+            || mask.device != device
+            || !crate::server::supports_dram(device)
+            || matches!(
+                crate::server::elementwise_mode(device),
+                crate::ElementwiseMode::Matrix { .. }
+            )
+        {
+            return None;
+        }
+        let (ss, ms) = (scores.shape().to_vec(), mask.shape().to_vec());
+        let ([xr, xc], [yr, yc]) = (
+            crate::tensor::stored_dims(&ss)?,
+            crate::tensor::stored_dims(&ms)?,
+        );
+        if !(ms == ss || block_of(&ss, &ms))
+            || xc != yc
+            || [xr, xc, yr].iter().any(|d| d % 32 != 0 || *d == 0)
+            || xr % yr != 0
+        {
+            return None;
+        }
+        // Auto: only where the composition's clamped reductions would not run as one pass.
+        let clamp = (kind_sfpu::CLAMP_MIN, (-f32::MAX).to_bits());
+        if when == SOFTMAX_ROWS_AUTO
+            && tt_kernels::tensor::reduce_then_fits(
+                tt_kernels::sfpu::reduce::ReduceOp::Max,
+                tt_kernels::sfpu::reduce::Axis::Cols,
+                [xr, xc],
+                Some(clamp),
+            )
+        {
+            return None;
+        }
+        let (dx, dm) = (plain_dram(scores), plain_dram(mask));
+        let (id, dims) =
+            crate::server::softmax_rows(device, dx.buffer.id, dm.buffer.id, scale as f32);
+        Some(device_result_shaped(
+            device,
+            id,
+            dims,
+            scores.shape(),
+            DType::F32,
+        ))
+    }
+
     fn padded_attention(
         query: &TtTensor,
         key: &TtTensor,
@@ -3705,30 +4621,47 @@ pub mod module {
             );
             device_result_shaped(device, id, dims, Shape::new([rows, sk]), DType::F32)
         };
-        let mut scores = {
-            let _part = part("attention/scale");
-            let mut scores = float::float_mul_scalar(scores, scale.into());
-            if let Some(cap) = options.softcap {
-                scores = float::float_mul_scalar(
-                    float::float_tanh(float::float_div_scalar(scores, cap.into())),
-                    cap.into(),
-                );
+        let causal = options
+            .is_causal
+            .then(|| causal_blocks(device, count, [m, sk], stride, Shape::new([rows, sk])));
+        // With no softcap between them, the scale and the causal mask are one pass.
+        let scores = match (causal, options.softcap) {
+            (Some(mask), None) => {
+                let _part = part("attention/scale");
+                float::float_scale_mask_fill(scores, scale.into(), mask, f32::NEG_INFINITY.into())
             }
-            scores
+            (causal, softcap) => {
+                let _part = part("attention/scale");
+                let mut scores = float::float_mul_scalar(scores, scale.into());
+                if let Some(cap) = softcap {
+                    scores = float::float_mul_scalar(
+                        float::float_tanh(float::float_div_scalar(scores, cap.into())),
+                        cap.into(),
+                    );
+                }
+                match causal {
+                    Some(mask) => {
+                        let _part = part("attention/mask");
+                        float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into())
+                    }
+                    None => scores,
+                }
+            }
         };
-        if options.is_causal {
-            let _part = part("attention/mask");
-            let mask = causal_blocks(device, count, [m, sk], stride, Shape::new([rows, sk]));
-            scores = float::float_mask_fill(scores, mask, f32::NEG_INFINITY.into());
-        }
         let probabilities = {
             let _part = part("attention/softmax");
-            let max =
-                float::float_clamp_min(float::float_max_dim(scores.clone(), 1), (-f32::MAX).into());
-            let exp = float::float_exp(float::float_sub(scores, max));
-            let sum = float::float_clamp_min(
-                float::float_sum_dim(exp.clone(), 1),
-                f32::MIN_POSITIVE.into(),
+            let max = float::reduce_clamp_min(
+                scores.clone(),
+                tt_kernels::sfpu::reduce::ReduceOp::Max,
+                1,
+                -f32::MAX,
+            );
+            let exp = float::float_sub_exp(scores, max);
+            let sum = float::reduce_clamp_min(
+                exp.clone(),
+                tt_kernels::sfpu::reduce::ReduceOp::Sum,
+                1,
+                f32::MIN_POSITIVE,
             );
             float::float_div(exp, sum)
         };
@@ -3967,13 +4900,16 @@ pub mod activation {
             t
         };
         let max = reduce(t, ReduceOp::Max, dim)?;
-        let shifted = device_eltwise_ungated(kind::SUB, 0.0, t, Some(&max))?;
-        let exp = device_eltwise_ungated(kind_sfpu::EXP, 0.0, &shifted, None)?;
-        let sum = reduce(&exp, ReduceOp::Sum, dim)?;
         if log {
+            let shifted = device_eltwise_ungated(kind::SUB, 0.0, t, Some(&max))?;
+            let exp = device_eltwise_ungated(kind_sfpu::EXP, 0.0, &shifted, None)?;
+            let sum = reduce(&exp, ReduceOp::Sum, dim)?;
             let log_sum = device_eltwise_ungated(kind_sfpu::LOG, 0.0, &sum, None)?;
             device_eltwise_ungated(kind::SUB, 0.0, &shifted, Some(&log_sum))
         } else {
+            // `exp(t - max)` in one pass, bit for bit `SUB` then `EXP`.
+            let exp = device_eltwise_ungated(kind_sfpu::SUB_EXP, 0.0, t, Some(&max))?;
+            let sum = reduce(&exp, ReduceOp::Sum, dim)?;
             device_eltwise_ungated(kind_sfpu::DIV, 0.0, &exp, Some(&sum))
         }
     }

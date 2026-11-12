@@ -307,6 +307,13 @@ impl Banks<Loaded, Loaded> {
     pub fn cleardvalid_both(self) -> Result<(Instruction, Banks<Empty, Empty>), EncodeError> {
         Ok((encode::cleardvalid(1, 1, 0, 0)?, banks()))
     }
+
+    /// `SETRWC` with both flips: hand both back without consuming them again. For operands
+    /// that stay loaded across many consumers whose words must not differ (a whole tile in each
+    /// `Src`, read by a repeated block of `MVMUL`s): the release follows the block.
+    pub fn release_both(self) -> Result<(Instruction, Banks<Empty, Empty>), EncodeError> {
+        Ok((release(true, true)?, banks()))
+    }
 }
 
 // --- Unpacker 0: `SrcA` --------------------------------------------------------

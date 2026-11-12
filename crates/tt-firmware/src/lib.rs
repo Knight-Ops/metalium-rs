@@ -128,7 +128,7 @@ const CFG0_DIS_TRISC_CACHE: u32 = 1 << 18;
 /// Blackhole boots with gathering on. It buys nothing here: this repo's
 /// firmware pushes Tensix instructions with stores, not `.ttinsn`, and
 /// measuring a `.ttinsn` push with gathering on or off gave identical cycles
-/// (`docs/plans/ttinsn-push-experiment.md`). Off removes the hazard for free.
+/// (`docs/completed-plans/ttinsn-push-experiment.md`). Off removes the hazard for free.
 ///
 /// The sequence is tt-metal's: set `DisBp`, set `DisTriscCache`, clear `DisBp`,
 /// with fences. `cfg0` is then read back, and a core where the bit did not
@@ -243,6 +243,8 @@ fn panic(info: &PanicInfo) -> ! {
 /// Pushing Tensix instructions from a baby RISC-V core.
 pub mod corpus;
 pub mod dataflow;
+/// Calling fused `.ttinsn` code the host placed in the program cache.
+pub mod fused;
 /// Run-time `.ttinsn` translation: the experiment's, behind its feature.
 #[cfg(feature = "ttinsn-experiment")]
 pub mod ttinsn;
@@ -505,9 +507,7 @@ pub mod cfg {
 /// NIU: NoC #0's or NoC #1's, named per request.
 pub mod noc {
     use core::ptr::{read_volatile, write_volatile};
-    use tt_isa::noc::niu::{
-        self, initiator, Batch, Command, InFlight, Niu, RequestError, TxnId,
-    };
+    use tt_isa::noc::niu::{self, initiator, Batch, Command, InFlight, Niu, RequestError, TxnId};
 
     const _: () = assert!(niu::NOC1_BASE <= u32::MAX as u64 && niu::NOC0_BASE < niu::NOC1_BASE);
 
@@ -534,6 +534,12 @@ pub mod noc {
     /// counters too.
     #[link_section = ".local"]
     static mut NOC1_USED: bool = false;
+    /// Bytes of the GDDR requests issued through NoC #0 since `reset` (wrapping), in a `profile`
+    /// image; never counted otherwise. On RISCV B, which writes no GDDR, its reads: what its
+    /// `READ_BYTES` marks count (`tt_isa::mailbox::trace::READ_BYTES`). Counted here rather than
+    /// read from the NIU's read-data counter, which also counts reads of other tiles' L1.
+    #[link_section = ".local"]
+    static mut READ_BYTES: u32 = 0;
 
     /// Requests that waited for room under their ID's cap, and the cycles
     /// they waited by the image's clock (`set_clock`; 0 without one).
@@ -561,6 +567,22 @@ pub mod noc {
         unsafe { &mut *core::ptr::addr_of_mut!(NOC1_USED) }
     }
 
+    /// Count `len` bytes issued through NoC #0's GDDR paths ([`read_bytes`]), in a `profile` image.
+    #[inline(always)]
+    fn count_read(len: u32) {
+        if cfg!(feature = "profile") {
+            // SAFETY: as `in_flight`.
+            unsafe { READ_BYTES = READ_BYTES.wrapping_add(len) };
+        }
+    }
+
+    /// The GDDR bytes issued through NoC #0 since `reset`, wrapping: 0 without the `profile`
+    /// feature.
+    pub fn read_bytes() -> u32 {
+        // SAFETY: as `in_flight`.
+        unsafe { READ_BYTES }
+    }
+
     /// Every ID at no requests in flight and the default cap; nothing issued
     /// on NoC #1; no stalls, no clock. Called once, before `firmware_main`.
     pub(crate) fn reset() {
@@ -572,6 +594,8 @@ pub mod noc {
             clock: None,
         };
         *noc1_used() = false;
+        // SAFETY: as `in_flight`; nothing else runs yet.
+        unsafe { READ_BYTES = 0 };
     }
 
     /// This tile's own coordinate as `niu` names it (`NOC_ID_LOGICAL`,
@@ -598,6 +622,25 @@ pub mod noc {
     fn outstanding(niu: Niu, txn: TxnId) -> u8 {
         // SAFETY: a read-only NIU counter.
         unsafe { read_volatile(reg(niu, niu::reqs_outstanding(txn))) as u8 }
+    }
+
+    /// Use in-flight cap `cap` for `txn` on both NIUs from now on, with requests possibly in
+    /// flight ([`InFlight::set_cap_in_flight`]).
+    pub fn set_cap_in_flight(txn: TxnId, cap: u32) {
+        in_flight(Niu::Noc0, txn).set_cap_in_flight(cap);
+        in_flight(Niu::Noc1, txn).set_cap_in_flight(cap);
+    }
+
+    /// `txn`'s in-flight cap on NoC #0.
+    pub fn cap(txn: TxnId) -> u32 {
+        in_flight(Niu::Noc0, txn).cap() as u32
+    }
+
+    /// Whether `txn` has room under its cap on NoC #0 for one more request now: what a caller
+    /// that would rather do something else than wait asks before [`issue_dram_on`].
+    #[inline(always)]
+    pub fn has_room(txn: TxnId) -> bool {
+        in_flight(Niu::Noc0, txn).try_room(|| outstanding(Niu::Noc0, txn))
     }
 
     /// Use in-flight cap `cap` for `txn` on both NIUs from now on: 0 for
@@ -665,6 +708,8 @@ pub mod noc {
         let niu = if NOC1 { Niu::Noc1 } else { Niu::Noc0 };
         if NOC1 {
             *noc1_used() = true;
+        } else {
+            count_read(len);
         }
         if in_flight(niu, txn).at_cap() {
             make_room(niu, txn);
@@ -780,6 +825,7 @@ pub mod noc {
     ) {
         use initiator::*;
         let niu = Niu::Noc0;
+        count_read(len);
         let p = read_path();
         let key = targ_hi | len << 12;
         // SAFETY: initiator 1's registers, MMIO in every Tensix and Ethernet tile,
@@ -876,6 +922,7 @@ pub mod noc {
             if self.batch.full() {
                 refill_batch(&mut self.batch, self.txn);
             }
+            count_read(len);
             let key = targ_hi | len << 12;
             // SAFETY: initiator 1's registers, as `issue_read`.
             unsafe {
@@ -974,6 +1021,41 @@ pub mod noc {
             let _ = read_volatile(reg(niu, initiator::CMD_CTRL));
         }
         in_flight(niu, txn).after_issue();
+    }
+
+    /// Issue a multicast write already encoded (`tt_isa::noc::multicast::registers_to`) through
+    /// NoC #0, outside the in-flight caps: a response-marked broadcast leaves its ID's
+    /// outstanding counter meaningless (one up, one down per recipient), so its completion is
+    /// counted on [`wr_acks`] instead, and nothing waits on its ID. Waits for the initiator to be
+    /// free first and reads `CMD_CTRL` back after, as [`issue_on`].
+    #[inline(never)]
+    pub fn issue_multicast(regs: &[(u64, u32); 11]) {
+        issue_multicast_on(Niu::Noc0, regs);
+    }
+
+    /// [`issue_multicast`] through `niu`.
+    #[inline(never)]
+    pub fn issue_multicast_on(niu: Niu, regs: &[(u64, u32); 11]) {
+        // SAFETY: as `issue_on`.
+        unsafe {
+            while read_volatile(reg(niu, initiator::CMD_CTRL)) & 1 != 0 {}
+            for &(off, value) in regs {
+                write_volatile(reg(niu, off), value);
+            }
+            write_volatile(reg(niu, initiator::CMD_CTRL), 1);
+            let _ = read_volatile(reg(niu, initiator::CMD_CTRL));
+        }
+    }
+
+    /// NoC #0's `NIU_MST_WR_ACK_RECEIVED`: write acknowledgements this tile's NIU has received.
+    pub fn wr_acks() -> u32 {
+        wr_acks_on(Niu::Noc0)
+    }
+
+    /// `niu`'s `NIU_MST_WR_ACK_RECEIVED`.
+    pub fn wr_acks_on(niu: Niu) -> u32 {
+        // SAFETY: a read-only NIU counter.
+        unsafe { read_volatile(reg(niu, niu::WR_ACK_RECEIVED)) }
     }
 
     /// Wait until every response-marked request issued under `txn` has

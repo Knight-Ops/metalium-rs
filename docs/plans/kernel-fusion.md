@@ -4,12 +4,21 @@ This plan defines the concrete specification, architecture, and verification che
 
 It tracks milestones **B12** and **B13a–B13c** from [`burn-backend-parity.md`](burn-backend-parity.md).
 
+**Decision (2026-10-16): fusion lives in burn-fusion fusers.** The alternative was model-level fused ops in tt-models.
+Fusers are the end state, reliable and benefiting any model that runs on TT through Burn. Individual ops are still
+optimised as far as they go, since every fuser falls back to them. Evidence:
+[decode-small-ops.md](../completed-plans/decode-small-ops.md) F0.
+- A decode step on `Fusion<TtBackend>` captures and replays (gate `step193`), and fuses nothing yet.
+- It costs +1.5 / +2.2 ms a step (135M / 1.7B), because burn-fusion 0.21 expands `sigmoid` into Burn's 8-op
+  composition.
+- RMSNorm's and SiLU's ops are contiguous in the stream, with scalars bound at execution.
+
 Current BFP contract (2026-10-06): `StorageBackend` also supports
 `Fusion<TtBackend>`. Explicit casts resolve pending work and register a new
 handle, preserving compression boundaries. Compressed add/ReLU executes its
 constituent storage rules rather than collapsing their rounding into the F32
 fused path. Step95 gates storage propagation and residency on both cards.
-See [the delivered storage and training rules](mixed-bfp-storage.md).
+See [the delivered storage and training rules](../completed-plans/mixed-bfp-storage.md).
 
 ---
 
@@ -97,7 +106,7 @@ flowchart TD
 - **Behavior**:
   All operations stream through Burn's fusion client thread and execute eagerly on `TtBackend`.
 - **Verification Gate**:
-  - `cargo test -p tt-tests --features e2e --test step12_mnist` passes bit-for-bit when run with `Tt = Fusion<TtBackend>`.
+  - `cargo xtask silicon --release --device 0 --filter step12_mnist` passes bit-for-bit when run with `Tt = Fusion<TtBackend>`.
   - Transformer regression `step59_burn_transformer` passes.
   - Step latency and memory usage remain within baseline noise.
 
@@ -148,6 +157,12 @@ flowchart TD
 ---
 
 ### Milestone B13c: Matmul Epilogue Fuser (Unified FPU + SFPU)
+
+**Bounded 2026-10-31 (dataflow-compiler F6.0, H10): not built.** On the 1.7B decode step every residual add and
+`silu_mul` removed outright saves 0.10-0.16 ms (they run under the weight stream); eager training's forward bias adds and
+activations are 1.7-3.2% of a step on the card, and the training bench runs `TtBackend`, which a burn-fusion fuser does
+not reach. The design below stands for a workload whose consumers do not hide under a stream
+([log](../learnings/performance-log.md#f60-register-fusion-and-spatial-pipelining-bounded-on-the-card-2026-10-31-card-1)).
 **Objective**: Fuse Matrix Multiplication with Bias Addition and Activation functions into a single pass through Tensix `Dst` registers, sharing the exact same SFPU micro-op engine.
 
 - **Dependencies**: B13b, [`tt_kernels::matmul`](../../crates/tt-kernels/src/matmul.rs).
@@ -205,6 +220,25 @@ flowchart TD
 - [x] Add backend execution path in `crates/burn-tt/src/ops.rs` (`float_add_relu`).
 - [x] Support Traced Execution + Kernel Fusion simultaneously in `burn_tt::Trace` and `crates/tt-mnist`.
 - [x] Validate on silicon hardware across both Blackhole devices (`compare_all_four_execution_modes_latency_and_traffic`).
+- [x] **Burn's default `sigmoid` composition** (cast, `x -1`, `exp`, `+1`, `log`, `x -1`, `exp`, cast) runs the
+  native `SIGMOID` (2026-10-16, `fusion/chain.rs`). Decode on `Tt` is `TtBackend`'s bit for bit.
+  - **How:** `ChainFuser` matches a declarative pattern (`Pattern`: steps and the step counts where it may end).
+    - Every intermediate must die inside the match (read `ReadWrite`, or dropped).
+    - Exact scalars (`-1`, `1`) are checked at execution; a miss runs the operations.
+    - The casts are required, so a hand-written chain stays as written.
+    - A chain may begin one op into its block when that op is one `ElementWiseFuser` stays open on (an `Add`); the
+      op runs first as itself. Passing over any other op broke `add_relu`: it kept a matmul's block open over the
+      bias `Add` that must begin one.
+  - **Gate:** `step194` (bit for bit `TtBackend::sigmoid` over special values; near misses: `+2`, a kept `exp(-x)`,
+    no casts) and `step193` (a decode step's logits equal `TtBackend`'s).
+  - **Fixed on the way:** `ElementWiseFuser` lost its match to any later op while another fuser kept the block open.
+- [x] **SiLU** (`x sigmoid(x) y`, decode-small-ops S2b) as one SFPU body (`SILU_MUL`, `SILU`), bit for bit the
+  three ops (unit gate `sfpu::ops::silu`; `step194`, a fused projection's halves read in place). BF16 and the
+  matrix element-wise mode run the separate ops.
+> **Superseded** by ADR 0003 (the dataflow compiler) and, for the matmul epilogue, by H10's kill on the 1.7B
+> ([failed-approaches.md](../learnings/failed-approaches.md)); the boxes below are kept as a record and will not be done
+> in this form. Fused training kernels are [tt-metal-parity.md](tt-metal-parity.md) W8.
+
 - [ ] Define `SfpuMicroOp` instruction enum and parameterized execution kernel in `tt_kernels::sfpu`.
 - [ ] Implement greedy virtual register allocator (`L0..L7`) with 8-register budget splitting.
 - [ ] Generalize `ElementWiseFuser` to emit arbitrary micro-op bytecode chains.
@@ -217,7 +251,38 @@ flowchart TD
 - [ ] Measure throughput and memory bandwidth savings in benchmark suite.
 
 ### Phase 4: Reduce-Map Normalization Fuser (B13d)
-- [ ] Implement `ReduceMapFuser` in `crates/burn-tt/src/fusion/reduce.rs`.
-- [ ] Add L1 circular-buffer streaming path for multi-tile row reductions.
-- [ ] Verify fused RMSNorm and LayerNorm against unfused baseline in `step70_native_norms`.
+- [x] RMSNorm up to its scale as two ops (2026-10-16): the chain fuser's `RMS_NORM` pattern (`Mul(x, x)`,
+  `MeanDim` of the last dimension, `AddScalar(eps)`, `Sqrt`, `Div`).
+  - **The statistic** runs as one reduction kernel (`tt_kernels::sfpu::norm`, `Session::rms`, one job a tile row):
+    the sum of squares in `sum_dim`'s order, then `MUL_SCALAR`, `ADD_SCALAR` and `SQRT`'s bodies before the pack.
+  - **The division** is the existing multi-unit `DIV`.
+  - Bit for bit the five ops (unit gate `sfpu::norm`, with a reversed-order control; `step195`; `step193`).
+  - **Measured:** a single-kernel version that also divided cost 640 us a norm on silicon. `DIV`'s instructions are
+    pushed one by one, all on one unit. A reduce-map whose map is long must spread its map over the units.
+  - **The scale is not in it:** its `Reshape` is a block of its own in burn-fusion, and the product joins neither
+    (observed). Since 2026-10-27 a model calls `burn_tt::rms_norm(x, gamma, eps)` (a custom operation, as RoPE's), which
+    multiplies by the scale inside the norm's job on a decode row (`step195`, `step210`).
+  - **Its result's dtype named** (2026-11-11, roadmap W1's BF16 activations): `burn_tt::rms_norm_as(x, gamma, eps,
+    BF16)` rounds the norm's last op once in `Dst` before a BF16 pack, bit for bit the norm then the cast, one custom
+    operation; likewise `burn_tt::silu_mul_as` (`SILU_MUL` with a BF16 result) and `burn_tt::matmul_as` (a BF16 `A`,
+    an F32 result). Not a chain match: Burn's `cast` after a custom operation, and a product whose weight's `Reshape`
+    is a block of its own, leave a fuser nothing to hold (`step76`, `step270`).
+  - **A residual sum and its norm** (2026-10-27, opt-in, `TT_ADD_RMS_NORM=1`): chains `ADD_RMS_NORM` (an `Add`, then the
+    composition above) and `ADD_RMS_NORM_SCALED` (an `Add`, then `burn_tt::rms_norm`'s custom operation, matched by the
+    chain's `ScaledNorm` step, `eps` from its id). The first chains with **a second output**: a `Pattern`'s `keep` names
+    steps whose results outlive the match (here the sum, the next residual's input), registered beside the result
+    (`ChainMatch::kept`). Bit for bit; slower on silicon, so off ([decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md)
+    Phase 7).
+  - **Limit:** rows of up to 128 tiles (4096 columns); longer rows run the separate ops.
+  - **Row-limited** (2026-10-16): a tile row of fewer than 32 rows runs only the row groups they occupy
+    (`sfpu::reduce::row_offsets`); a decode row's kernel 14.95 -> 5.58 us (`step196`, decode-small-ops.md S3).
+- [ ] LayerNorm and softmax as reduce-maps. **Softmax, built and opt-in** (2026-10-25, `tt_kernels::softmax`,
+  `Session::softmax_rows`, gate `step230`; `TT_SOFTMAX_ROWS=1`): attention's scale, mask and softmax over each row, a tile
+  row a job, three passes streamed through L1, the statistics kept there, bit for bit the composition. **Slower than
+  the composition** on the 1.7B's long prefill. `SUB_EXP` and `DIV` are compute-bound there (push-bound, ~10 us a tile,
+  since staged to replay), and the op computes `SUB_EXP` twice on as many units as tile rows (64 at a 64-token chunk).
+  A reduce-map that pays must compute each element once over every unit
+  ([log](../learnings/performance-log.md#the-long-context-softmax-sub_exp-and-div-push-bound-their-row-loops-staged-to-replay-2026-10-25-card-0)).
+- [x] Add L1 circular-buffer streaming path for rows too long for one job (2026-10-25: the softmax op's passes, a
+  chunk a kernel in alternating halves, the unfolded accumulator carried in L1).
 - [ ] Benchmark fused transformer encoder layer in `step59_burn_transformer`.

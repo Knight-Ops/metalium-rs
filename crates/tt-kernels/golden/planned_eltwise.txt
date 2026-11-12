@@ -1,0 +1,818 @@
+case 0x1 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x2 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x2 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x3 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x3 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x4 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x4 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x5 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x5 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x6 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x6 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x7 s 0.5/2.0 [[37, 70], [1, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x7 s 0.5/2.0 [[64, 128], [1, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0xb s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0xb s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x100 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x100 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x101 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x102 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x102 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x103 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x103 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x104 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x104 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x105 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x105 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x106 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x106 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x107 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x107 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x108 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x108 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x109 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x109 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x10a s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x10a s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x10b s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x10b s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x10c s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x10c s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x10d s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x10d s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x10e s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x10e s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x10f s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x10f s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x110 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x110 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x111 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x111 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x112 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x112 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x113 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x113 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x114 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x114 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x115 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x115 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x116 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x116 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x117 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x117 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x118 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x118 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x119 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x119 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x11a s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x11a s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x11b s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x11b s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x11c s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x11c s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x11d s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x11d s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x11e s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x11e s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x11f s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x11f s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x120 s 0.5/2.0 [[37, 70], [37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x28200 need 0x28200
+case 0x120 s 0.5/2.0 [[64, 128], [64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x40800 need 0x40800
+case 0x121 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x121 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x122 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x122 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x123 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x123 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x124 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x124 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x125 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x125 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x126 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x126 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x127 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x127 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x128 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x128 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x129 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x129 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x12a s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x12a s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x12b s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x12b s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x12c s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x12c s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x12d s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x12d s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x12e s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x12e s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x12f s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x12f s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x130 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x130 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x131 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x131 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x132 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x132 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x133 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x133 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x134 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x134 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x135 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x135 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x136 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x136 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x137 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x137 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x138 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x138 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x139 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x139 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x13a s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x13a s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x13b s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x13b s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x13c s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x13c s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x13d s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x13d s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x13e s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x13e s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x13f s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x13f s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x140 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x140 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x141 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x141 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x142 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x142 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x160 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x160 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x161 s 0.5/2.0 [[37, 70], [37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x28200 need 0x28200
+case 0x161 s 0.5/2.0 [[64, 128], [64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x40800 need 0x40800
+case 0x162 s 0.5/2.0 [[37, 70], [37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x28200 need 0x28200
+case 0x162 s 0.5/2.0 [[64, 128], [64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x40800 need 0x40800
+case 0x163 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x163 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x164 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x164 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x165 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x165 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x170 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x170 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x171 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x171 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x172 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x172 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x173 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x173 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x174 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x174 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x175 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x175 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x176 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x176 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x177 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x177 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x178 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x178 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x179 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x179 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x17a s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x17a s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x17b s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x17b s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x17c s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x17c s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x17d s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x17d s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x17e s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x17e s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x180 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x180 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x181 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x181 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x182 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x182 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x183 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x183 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x184 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x184 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x185 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x185 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x186 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x186 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x187 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x187 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x188 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x188 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x189 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x189 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x18a s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x18a s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x18b s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x18b s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x18c s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x18c s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x18d s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x18d s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x18e s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x18e s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x24100 need 0x24100
+case 0x18f s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x18f s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x24100 need 0x24100
+case 0x190 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x190 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x191 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x191 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x192 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x192 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x193 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x193 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x194 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x194 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x195 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x195 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x196 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x196 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1a0 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1a0 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x24100 need 0x24100
+case 0x1a1 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1a1 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x24100 need 0x24100
+case 0x1b0 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1b0 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1b1 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1b1 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1b2 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1b2 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1b3 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1b3 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1b4 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1b4 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1b5 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1b5 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1d0 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1d0 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1d1 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1d1 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1d2 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1d2 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1d3 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1d3 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1d4 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1d4 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1d5 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1d5 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1f0 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1f0 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x1f1 s 0.5/2.0 [[37, 70]] units 3 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x1f1 s 0.5/2.0 [[64, 128]] units 1 Off twin false
+  planned top 0x30400 need 0x30400
+case 0x1f2 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1f2 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x1f3 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1f3 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x1f4 s 0.5/2.0 [[37, 70], [37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x28200 need 0x28200
+case 0x1f4 s 0.5/2.0 [[64, 128], [64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x40800 need 0x40800
+case 0x1f5 s 0.5/2.0 [[37, 70], [37, 70]] units 3 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1f5 s 0.5/2.0 [[64, 128], [64, 128]] units 1 Off twin false
+  planned top 0x38600 need 0x38600
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Fresh twin false
+  planned top 0xf1800 need 0xf1800
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Captured twin false
+  planned top 0xf1800 need 0xf1800
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Off twin false
+  planned top 0xa3040 need 0xa3040
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Fresh twin false
+  planned top 0xa3040 need 0xa3040
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Captured twin false
+  planned top 0xd3080 need 0xd3080
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Off twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Fresh twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Captured twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Off twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x103 s 0.0/0.0 [[256, 512]] units 1 Off twin false
+  planned top 0xa2000 need 0xa2000
+case 0x103 s 0.0/0.0 [[256, 512]] units 1 Fresh twin false
+  planned top 0xe7580 need 0xe7580
+case 0x103 s 0.0/0.0 [[256, 512]] units 1 Captured twin false
+  planned top 0xe7580 need 0xe7580
+case 0x103 s 0.0/0.0 [[256, 512]] units 3 Off twin false
+  planned top 0x77580 need 0x77580
+case 0x103 s 0.0/0.0 [[256, 512]] units 3 Fresh twin false
+  planned top 0x77580 need 0x77580
+case 0x103 s 0.0/0.0 [[256, 512]] units 3 Captured twin false
+  planned top 0xbcb00 need 0xbcb00
+case 0x103 s 0.0/0.0 [[256, 512]] units 8 Off twin false
+  planned top 0x40800 need 0x40800
+case 0x103 s 0.0/0.0 [[256, 512]] units 8 Fresh twin false
+  planned top 0x40800 need 0x40800
+case 0x103 s 0.0/0.0 [[256, 512]] units 8 Captured twin false
+  planned top 0x40800 need 0x40800
+case 0x103 s 0.0/0.0 [[256, 512]] units 120 Off twin false
+  planned top 0x24100 need 0x24100
+case 0x103 s 0.0/0.0 [[256, 512]] units 120 Fresh twin false
+  planned top 0x24100 need 0x24100
+case 0x103 s 0.0/0.0 [[256, 512]] units 120 Captured twin false
+  planned top 0x24100 need 0x24100
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Fresh twin false
+  planned top 0xf1800 need 0xf1800
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Captured twin false
+  planned top 0xf1800 need 0xf1800
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Off twin false
+  planned top 0xa3040 need 0xa3040
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Fresh twin false
+  planned top 0xa3040 need 0xa3040
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Captured twin false
+  planned top 0xd3080 need 0xd3080
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Off twin false
+  planned top 0x50c00 need 0x50c00
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Fresh twin false
+  planned top 0x50c00 need 0x50c00
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Captured twin false
+  planned top 0x50c00 need 0x50c00
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Off twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Fresh twin false
+  planned top 0xf1800 need 0xf1800
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 1 Captured twin false
+  planned top 0xf1800 need 0xf1800
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Off twin false
+  planned top 0xa3040 need 0xa3040
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Fresh twin false
+  planned top 0xa3040 need 0xa3040
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 3 Captured twin false
+  planned top 0xd3080 need 0xd3080
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Off twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Fresh twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 8 Captured twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Off twin false
+  planned top 0x26180 need 0x26180
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1f2 s 0.0/0.0 [[256, 512], [256, 512]] units 120 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[37, 70], [1, 70]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x1 s 0.0/0.0 [[37, 70], [1, 70]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[37, 70], [1, 70]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[37, 70], [37, 1]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x1 s 0.0/0.0 [[37, 70], [37, 1]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[37, 70], [37, 1]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[37, 70], [37, 70]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x1 s 0.0/0.0 [[37, 70], [37, 70]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[37, 70], [37, 70]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1 s 0.0/0.0 [[256, 512], [1, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x1 s 0.0/0.0 [[256, 512], [1, 512]] units 5 Captured twin false
+  planned top 0x6f380 need 0x6f380
+case 0x1 s 0.0/0.0 [[256, 512], [1, 512]] units 4 Fresh twin false
+  planned top 0x81800 need 0x81800
+case 0x1 s 0.0/0.0 [[256, 512], [256, 1]] units 1 Off twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1 s 0.0/0.0 [[256, 512], [256, 1]] units 5 Captured twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1 s 0.0/0.0 [[256, 512], [256, 1]] units 4 Fresh twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1 s 0.0/0.0 [[256, 512], [64, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x1 s 0.0/0.0 [[256, 512], [64, 512]] units 5 Captured twin false
+  planned top 0x6f380 need 0x6f380
+case 0x1 s 0.0/0.0 [[256, 512], [64, 512]] units 4 Fresh twin false
+  planned top 0x81800 need 0x81800
+case 0x3 s 0.0/0.0 [[37, 70], [1, 70]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x3 s 0.0/0.0 [[37, 70], [1, 70]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x3 s 0.0/0.0 [[37, 70], [1, 70]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x3 s 0.0/0.0 [[37, 70], [37, 1]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x3 s 0.0/0.0 [[37, 70], [37, 1]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x3 s 0.0/0.0 [[37, 70], [37, 1]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x3 s 0.0/0.0 [[37, 70], [37, 70]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x3 s 0.0/0.0 [[37, 70], [37, 70]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x3 s 0.0/0.0 [[37, 70], [37, 70]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x3 s 0.0/0.0 [[256, 512], [1, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x3 s 0.0/0.0 [[256, 512], [1, 512]] units 5 Captured twin false
+  planned top 0x6f380 need 0x6f380
+case 0x3 s 0.0/0.0 [[256, 512], [1, 512]] units 4 Fresh twin false
+  planned top 0x81800 need 0x81800
+case 0x3 s 0.0/0.0 [[256, 512], [256, 1]] units 1 Off twin false
+  planned top 0x50c00 need 0x50c00
+case 0x3 s 0.0/0.0 [[256, 512], [256, 1]] units 5 Captured twin false
+  planned top 0x50c00 need 0x50c00
+case 0x3 s 0.0/0.0 [[256, 512], [256, 1]] units 4 Fresh twin false
+  planned top 0x50c00 need 0x50c00
+case 0x3 s 0.0/0.0 [[256, 512], [64, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x3 s 0.0/0.0 [[256, 512], [64, 512]] units 5 Captured twin false
+  planned top 0x6f380 need 0x6f380
+case 0x3 s 0.0/0.0 [[256, 512], [64, 512]] units 4 Fresh twin false
+  planned top 0x81800 need 0x81800
+case 0x101 s 0.0/0.0 [[37, 70], [1, 70]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x101 s 0.0/0.0 [[37, 70], [1, 70]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.0/0.0 [[37, 70], [1, 70]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.0/0.0 [[37, 70], [37, 1]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x101 s 0.0/0.0 [[37, 70], [37, 1]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.0/0.0 [[37, 70], [37, 1]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.0/0.0 [[37, 70], [37, 70]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x101 s 0.0/0.0 [[37, 70], [37, 70]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.0/0.0 [[37, 70], [37, 70]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x101 s 0.0/0.0 [[256, 512], [1, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x101 s 0.0/0.0 [[256, 512], [1, 512]] units 5 Captured twin false
+  planned top 0x6f380 need 0x6f380
+case 0x101 s 0.0/0.0 [[256, 512], [1, 512]] units 4 Fresh twin false
+  planned top 0x81800 need 0x81800
+case 0x101 s 0.0/0.0 [[256, 512], [256, 1]] units 1 Off twin false
+  planned top 0x50c00 need 0x50c00
+case 0x101 s 0.0/0.0 [[256, 512], [256, 1]] units 5 Captured twin false
+  planned top 0x50c00 need 0x50c00
+case 0x101 s 0.0/0.0 [[256, 512], [256, 1]] units 4 Fresh twin false
+  planned top 0x50c00 need 0x50c00
+case 0x101 s 0.0/0.0 [[256, 512], [64, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x101 s 0.0/0.0 [[256, 512], [64, 512]] units 5 Captured twin false
+  planned top 0x6f380 need 0x6f380
+case 0x101 s 0.0/0.0 [[256, 512], [64, 512]] units 4 Fresh twin false
+  planned top 0x81800 need 0x81800
+case 0x1f3 s 0.0/0.0 [[37, 70], [1, 70]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x1f3 s 0.0/0.0 [[37, 70], [1, 70]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x1f3 s 0.0/0.0 [[37, 70], [1, 70]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1f3 s 0.0/0.0 [[37, 70], [37, 1]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x1f3 s 0.0/0.0 [[37, 70], [37, 1]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x1f3 s 0.0/0.0 [[37, 70], [37, 1]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1f3 s 0.0/0.0 [[37, 70], [37, 70]] units 1 Off twin false
+  planned top 0x32480 need 0x32480
+case 0x1f3 s 0.0/0.0 [[37, 70], [37, 70]] units 5 Captured twin false
+  planned top 0x26180 need 0x26180
+case 0x1f3 s 0.0/0.0 [[37, 70], [37, 70]] units 4 Fresh twin false
+  planned top 0x26180 need 0x26180
+case 0x1f3 s 0.0/0.0 [[256, 512], [1, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x1f3 s 0.0/0.0 [[256, 512], [1, 512]] units 5 Captured twin false
+  planned top 0x6f380 need 0x6f380
+case 0x1f3 s 0.0/0.0 [[256, 512], [1, 512]] units 4 Fresh twin false
+  planned top 0x81800 need 0x81800
+case 0x1f3 s 0.0/0.0 [[256, 512], [256, 1]] units 1 Off twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1f3 s 0.0/0.0 [[256, 512], [256, 1]] units 5 Captured twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1f3 s 0.0/0.0 [[256, 512], [256, 1]] units 4 Fresh twin false
+  planned top 0x50c00 need 0x50c00
+case 0x1f3 s 0.0/0.0 [[256, 512], [64, 512]] units 1 Off twin false
+  planned top 0xe3000 need 0xe3000
+case 0x1f3 s 0.0/0.0 [[256, 512], [64, 512]] units 5 Captured twin false
+  planned top 0x6f380 need 0x6f380
+case 0x1f3 s 0.0/0.0 [[256, 512], [64, 512]] units 4 Fresh twin false
+  planned top 0x81800 need 0x81800
+case 0x1f1 s 0.0/0.0 [[1, 2048]] units 1 Fresh twin true
+  planned top 0xd1000 need 0xd1000
+case 0x1f1 s 0.0/0.0 [[1, 2048]] units 8 Fresh twin true
+  planned top 0x30400 need 0x30400
+case blocks [64, 512] at [0, 128] dims [64, 128] units 1 Off
+  planned top 0x38600 need 0x38600
+case blocks [64, 512] at [0, 128] dims [64, 128] units 3 Fresh
+  planned top 0x29240 need 0x29240
+case blocks [64, 512] at [0, 128] dims [64, 128] units 8 Captured
+  planned top 0x230c0 need 0x230c0
+case blocks [96, 640] at [32, 320] dims [64, 320] units 1 Off
+  planned top 0x5cf00 need 0x5cf00
+case blocks [96, 640] at [32, 320] dims [64, 320] units 3 Fresh
+  planned top 0x35540 need 0x35540
+case blocks [96, 640] at [32, 320] dims [64, 320] units 8 Captured
+  planned top 0x29240 need 0x29240
+case blocks [37, 512] at [0, 256] dims [37, 256] units 1 Off
+  planned top 0x50c00 need 0x50c00
+case blocks [37, 512] at [0, 256] dims [37, 256] units 3 Fresh
+  planned top 0x32480 need 0x32480
+case blocks [37, 512] at [0, 256] dims [37, 256] units 8 Captured
+  planned top 0x26180 need 0x26180

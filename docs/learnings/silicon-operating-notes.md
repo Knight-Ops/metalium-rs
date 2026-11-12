@@ -788,7 +788,7 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
 
 ## `.ttinsn` push fusion (2026-10-10, card 0)
 
-`docs/plans/ttinsn-push-experiment.md`; gates `probe_ttinsn_push`, run only with
+`docs/completed-plans/ttinsn-push-experiment.md`; gates `probe_ttinsn_push`, run only with
 `cargo xtask silicon --feature ttinsn-experiment` (a feature no shippable build enables).
 
 - **Fused `.ttinsn` words run on silicon.** On RISC-V T1 pushing to Tensix thread 1 (`INSTRN_BUF_BASE`):
@@ -847,6 +847,26 @@ tensor route changed; no performance claim accompanies diagnostic adoption.
 - **Under `cargo test`, tests that fork a ttsim hung about one run in five when run concurrently**
   (idle processes, always inside a forked child) and never single-threaded; not diagnosed. The
   experiment's ttsim tests serialize on a mutex.
+
+### Fused code from the program cache (2026-10-25, card 0)
+
+`docs/completed-plans/ttinsn-push.md`; gate `step231_ttinsn_push` (ttsim and card 0, run `1792956507`), opt-in
+(`TT_TTINSN=1`).
+
+- **The shipped T1 runner calls code the host wrote into the program cache over the NoC** (fused `.ttinsn`
+  code, `tt_firmware::fused`), after invalidating its own instruction cache with the documented sequence,
+  once a run. The program cache reuses its addresses, so without the invalidation a run would execute what
+  the cache held of the previous program there (the experiment's stale-code control). Verified on silicon
+  with a real reuse: GELU's fused code run, the cache forgotten, TANH's fused code placed at the same address
+  (`Session::probe_forget_programs`, `probe_last_fused_at`): TANH's bits, not GELU's.
+- **The host's NoC writes need no device-side read-back before the invalidation**: the runner reads one
+  word of the code (any) as the sequence's read-back; the host's writes landed before the list that names
+  the code was queued (the order every resident program already relies on).
+- **The pushing measured from the runner** (the profile mode's push totals, `mailbox::PUSH_CYCLES`,
+  `PUSH_WORDS`): a push into a full instruction FIFO stalls the core, so cycles spent pushing are not
+  push-boundness. A kernel is bound by its pushing when its words go at the runner's ~3.3 cycles each; the
+  1.7B's products push at ~40-500 cycles a word (behind the Matrix Unit), its `silu_mul` at 5.6 and its
+  RMSNorm at 7.3 (runs `1792956684`).
 
 ## Card lock (2026-10-11, both cards)
 
@@ -938,6 +958,61 @@ matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-
 
 ## RISCV B's image budget (2026-10-13, ttsim and card 0)
 
+**Update 2026-11-06: the firmware diet; B's slot is 52,224 bytes, the role slots 7,168 (`0x1C00`).** Measured with
+`cargo xtask fw-size` (new: every shipped feature set, each image's bytes to the end of its last L1 section, its slot
+from the link script, the room left; and B's hot path by address). The role images carried the guarded-run machinery
+(`guard_wait` and its helpers, ~2.4 KB a `profile` image) that only `tt_kernels::atomics` arms, for `step105` and
+`step106`. It is now compiled into the probe images `guarded_t0..2` (at the cores' default reset PCs) and the
+single-core `corpus` images only; `atomics::start` refuses a guarded program on the production role images by name
+(gate `step105`'s `a_guarded_program_on_the_production_role_images_is_refused`). B's and the role images' link
+scripts are generated from `tt_isa::dm::IMAGE_MAX` and `tt_isa::l1::roles` (`crates/tt-firmware/build.rs`), so a slot
+is one constant. B's code is unchanged byte for byte (`run_record` still at `0x2794`); only its limit moved. Card 0:
+`step105`, `step106` and `step12_mnist`, 56 of 57 (`1793983256`; the one failure is
+`guard_poll_rate_calibration_full`, expected to fail on silicon as its comment says).
+
+| image, feature set | bytes before | room before | bytes after | room after |
+|---|--:|--:|--:|--:|
+| `dm_b`, safe | 40,360 | 4,568 | 40,360 | 11,864 |
+| `dm_b`, `encoded-guard` | 42,532 | 2,396 | 42,532 | 9,692 |
+| `dm_b`, `profile` + `encoded-guard` | 44,748 | 180 | 44,748 | 7,476 |
+| `role_t1`, safe | 7,704 | 1,896 | 5,168 | 2,000 |
+| `role_t1`, `profile` (the largest role) | 8,884 | 716 | 6,496 | 672 |
+| `dm_nc`, `profile` | 21,544 | 3,032 | 21,544 | 3,032 |
+
+Then two retirements, each its own commit, measured the same way:
+- **Layer sub-traces** (`61604b9`): `CALL_BODY`, `ARG_REF`, `ARG_WORD` and the argument table out of both movers.
+  `dm_b` 40,360 -> 38,736 (safe), `dm_nc` 20,428 -> 19,724. Nothing before `run_record` moved (`0x2794`).
+- **X9's two-copy weight layout** (`61a71b2`): the one-channel span (`BSpan::of`) and its block in the `GATHER` arm.
+  `dm_b` 38,736 -> 37,596 (safe); `run_record` 8,180 -> 7,892 bytes, still at `0x2794`. This one changes the arm's
+  bytes, so its speed was checked on card 1 (the performance log, "the firmware diet").
+- Not taken: the two compatibility forms the survey named (`READ_RUN`'s word 5 of 0, `STREAM_CAP`'s plain word) are
+  a few bytes each and both still mean "the default"; `expand_reads`' `POKE_RUN` arm is the host's oracle that
+  `step175` holds the firmware's `poke_run` to, and B's `run_record` returns before reaching it.
+
+| image, tightest build (`profile` + `encoded-guard`) | 2026-11-04 | 2026-11-06 |
+|---|--:|--:|
+| `dm_b` bytes / room | 44,748 / 180 | 41,868 / 10,356 |
+| `dm_nc` bytes / room | 21,544 / 3,032 | 20,868 / 3,708 |
+| largest role image / room | 8,884 / 716 | 6,496 / 672 |
+
+**Update 2026-11-04: B's slot is 44,928 bytes; the role slots are 9,600 (`0x2580`).** Weights laid by column
+(`docs/plans/decode-bytes-in-flight.md` Phase C1) add 3.6 KB to every B image, and with them the `profile` image
+built with `fast-reads` (and `encoded-guard`) no longer fit 43,008 bytes. The role images are at most 8,884 bytes (a
+`profile` one; 7,704 otherwise), so each slot gave up 640 bytes: T0 `0xAF80`, T1 `0xD500`, T2 `0xFA80`, still ending at
+NC's reset PC. Room left: B 4,584 (safe), 2,420 (`encoded-guard`), 220 (`profile` + `fast-reads` + `encoded-guard`);
+the role images 716 (`profile`). The opt-in `ttinsn-experiment` image (`ttinsn_t1`) did not fit its slot before this
+either (about 4 KB over at `1ff07dc`).
+
+**Where B's code sits matters, not only its size** (C1, 2026-11-04). B's and NC's instruction caches are ~4 KiB; the
+per-tile loops are in `run_record`, which `sections.x` places after `.text.hot`. The first C1 build put a by-column
+test in `TensorRef::tile` / `Cursor`, and a later one by-column code inside the `GATHER` arm, between its loops: both
+made every model 1.5-3% slower with no tensor laid by column (ViT-Tiny 7.50-7.72 -> 7.80-7.89 ms), with the compute
+cores' push cycles a word up 8-12% while their own images were unchanged (`TT_PROFILE`, `1793799184` against
+`1793799228`). The form that held: the arm is the baseline's code byte for byte, and a by-column record leaves it once,
+at its top, for one cold function (`record::gather_by_column`); `run_record` then starts at the baseline's address
+(`0x2794`) and is 112 bytes larger. A `bool` in `BSpan` (its `Option`'s niche) also made every copy of a span byte by
+byte (81 more `lbu` in `run_record`); a `u32` does not.
+
 **Update 2026-10-13: B's slot is 42 KiB, not 24 KiB.** The role images moved (below); the measurements and
 lessons that follow were taken against the old 24,576-byte slot and still describe how code size moves.
 
@@ -948,7 +1023,8 @@ every core but B. The role images are now linked at `tt_isa::l1::roles::BASE` (T
 `0xF800`, 10 KiB slots ending at NC's reset PC), so `tt_isa::dm::IMAGE_MAX` is 43,008 bytes (`dm_b`: 24,404, so 18,604
 left). Only the production role images moved; probe images (`corpus`, `icache_t*`, ...) keep the default PCs and are
 never loaded beside the mover. Silicon is unchanged in speed ([performance-log.md](performance-log.md#firmware-image-budget-and-core-assignment-2026-10-13-card-0)).
-Also measured there: `opt-level` 2 is as fast as 3 and 1.7 KB smaller; `s` and `z` are not usable (mover 1.6x
+Also measured there: `opt-level` 2 is as fast as 3 and 1.7 KB smaller (**no longer, 2026-11-06:** 4.3 KB smaller on
+today's B image but ResNet-18 1.9% and prefill 1.2% slower on card 1, H16 in `dataflow-compiler.md`); `s` and `z` are not usable (mover 1.6x
 slower, role push loop 7x).
 
 Before the role images moved, RISCV B's mover image (`dm_b`) could not pass 0x6000 = 24,576 bytes: T0's default
@@ -982,6 +1058,17 @@ What the numbers taught (each from a build, not from reading code):
   CI lint. It strips both now, so the firmware is the same bytes whoever builds it; firmware is linted on its own
   (`cargo clippy --manifest-path crates/tt-firmware/Cargo.toml ...`).
 - RISCV NC's image (`dm_nc`, 14,240 bytes of its 24,576-byte slot, `dm::nc::IMAGE_MAX`) has about 10 KB free.
+- **NC's first index-reading record, `SCATTER_ROWS` (2026-10-15, `size -A`, same path, release):** `dm_nc` 13,908 ->
+  15,088 bytes (9.5 KB of its slot free). `dm_b` grew too, 24,608 -> 25,724, although B never runs the record (its
+  arm is compiled out of B): giving the new op a length in `record::len` alone moved LLVM's inlining in B's
+  `run_record` (23 `record_entry` call sites against 10). Neither the opcode's place (0x12, inside the record range,
+  or 0x1A after it) nor where `len` lists it changed that. B has ~17 KB of its 42 KiB slot left. The record is the
+  writing half the split BF16 select below needs: NC reads its index slot after `publish()`, one index slot a staging
+  half.
+- **Writes to one GDDR address through different ports are not ordered**: `write_rows` and `SCATTER_ROWS` rotate
+  ports, and each port is its own endpoint (`port_for`). A repeated index is therefore resolved in the record (only
+  the last index naming a row is written), and across batches by the writer's credit pop, which waits for its
+  writes (`Action::Pop`).
 
 **Open: a packed-BF16 row select** (roadmap, Track 2, "Gather without staging"). A BF16 face-row is 32 bytes at
 `TILE_DATA + face x 512 + row x 32`: congruent to `TILE_DATA` mod 64 (the GDDR read rule) only on an even row,
@@ -996,6 +1083,666 @@ fails the same congruence for one of the two source parities. The candidates:
    batch's indices while NC still writes the last), and the output's rows past `n` are not written, so its padding
    is `Undefined`.
 3. Make room in B: no longer needed -- B's slot grew by 18 KiB (above), so the B-side branch (1) fits.
+
+## Partial-tile GDDR reads in records: one entry beats fewer bytes (2026-10-16, ttsim and cards 0 and 1)
+
+From [decode-matmul-bandwidth.md](../completed-plans/decode-matmul-bandwidth.md) P1 (log:
+[decode matmuls](performance-log.md#decode-matmuls-read-only-the-activation-rows-they-use-2026-10-16-cards-0-and-1)).
+
+- **A read shorter than a slot is legal and lands as asked.** `Descriptor::decode` checks only a nonzero length, the
+  range inside its channel and `gddr % 64 == l1 % 64`. A read that starts at the same offset inside a GDDR slot and
+  an L1 slot is congruent for any length, since both slots are 64-byte aligned (`TILE_SLOT` and `BF16_TILE_SLOT` are
+  multiples of 64). Records expand on the card through `Descriptor::decode` (never `READ_ENCODED`), so the
+  fast-reads encoder plays no part. Gates `step190` (both read modes) and `step77` on card 0.
+- **The B mover pays per entry as much as per byte.** For an `m = 1` product's `A` tiles (one used row in 32):
+  - **Two 64-byte face-row reads a tile** (1/32 of the bytes, twice the entries): a 1.7B decode step 1.5 ms faster,
+    but the 135M step ~1 ms *slower* (its products are 18 `A` tiles a job).
+  - **One read through row `r` of face 1** (`1024 + 64 r` bytes, 27% for `r = 1`, the same entry count): the 1.7B
+    step 6.1 ms faster and the 135M step 0.3 ms.
+
+  After it, a `q` job's 128 entries take ~60 us on each of 64 units (~0.45 us an entry, ~290 GB/s card-wide), so
+  these products are bound by B's record-expanded entries, not GDDR. Choose a read shape by entry count first.
+- **L1 left unread is the next op's data.** Silicon keeps L1 between programs, so a slot's unread rows hold a
+  previous op's values (NaN in `step190`'s priming). They are safe only where they reach nothing but padding, with
+  the output's padding claim `Undefined`; `step190`'s negative control shows a false `Pad::Zero` there makes
+  `C^T @ C` non-finite.
+- **B's image:** 25,724 -> 26,528 bytes of 43,008 (default build); NC unchanged at 15,088.
+
+## A decode product's weights: what the card reads at (2026-10-17, card 0)
+
+From [decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Phase 0 (log:
+[decode products against their weight stream](performance-log.md#decode-products-against-their-weight-stream-2026-10-17-card-0)).
+The probe is `silicon_probe_decode_stream`, traced, so the times are the card's.
+
+- **The read ceiling is ~488 GB/s, 95% of 512.**
+  - **Pattern:** every tile of a weight read once as `READ_RUN`s of consecutive tiles, on 120 units: 485-489 GB/s
+    for 17-137 MB.
+  - **Method:** whole 4,160-byte slots, record-expanded, in the default (safe) image, so `fast-reads` is not needed
+    for it.
+  - **Against the scoreboard:** above its 469 GB/s.
+- **One channel a column costs ~7%, not more.** Each unit reads whole columns down their `K` tiles, as an `m = 1`
+  product deals `B`, so all of a column's tiles are on channel `j % 8`. That pattern reads at 440-458 GB/s, on 64
+  units and on 120 alike.
+  - **This refutes** decode-matmul-bandwidth P5's leading hypothesis, that channels bind the narrow products.
+- **64 units saturate GDDR.** One unit streams ~7 GB/s (a 266 KB column share in ~38 us), so ~64 units reach the
+  ceiling.
+  - **Past 64, units buy no bandwidth.** An `m = 1` product on 120 units is no faster than on 64:
+    - `o` and `down` are the same;
+    - `qkv` 180 against 160 us, `gate|up` 383 against 352, the 1.7B head 1,051 against 1,024.
+  - **The 135M head is the exception.** At `K` = 576 it prefers 48-120 units.
+- **So the products' gap is not the read stream.** A product takes 1.2-1.8x its weights' stream on the same units:
+  - `o` 74 against 38 us;
+  - `down` 269 against 150;
+  - `qkv` 160 against 113;
+  - `gate|up` 352 against 300.
+- **The profile mode shows the same.** It splits a product into the mover's data phase, a ~15 us kernel tail and
+  the barrier. The data phase is `B`'s stream plus `A`'s reads.
+- **What the gap is made of:**
+  - **`A`'s reads:** one entry a `K` tile on every unit. That is 64 at `K` = 2048 and 256 for `down`'s 8192;
+  - **the compute after the last read:** ~15 us an op, not overlapped;
+  - **a deal's last round:** uneven on 120 units.
+- **The "kernel tail" is compute, and it scales with the job** (profile `1792298755`, read 2026-10-18). The profile's
+  `kernels` phase is unit 0's `KERNEL_WAIT`: the last block's compute, ~0.23 us a `K`-tile pair (~305 cycles) plus
+  ~0.5 us. Attention's `qk`/`pv` (2 pairs) 1.0 us, `o` and `qkv`'s last job (64 pairs) 15.0, `down`'s last K-block
+  (64) 15.3, `gate|up`'s last 2-column job (128) 29.6.
+  - **The kernel is already launched before the reads** (`streaming_segments`: `LAUNCH` first). Its start-up is
+    hidden; the block's compute waits for the whole gather (`CB Push` drains the reads).
+  - **Earlier blocks' compute is serialized too.** Under `Staging::Slots` the ring holds one block, so a unit's next
+    gather waits for the block before it to be computed. That time is counted as `data`. `down` (4 K-blocks a unit)
+    also round-trips each partial through GDDR.
+  - **An m = 1 pair may do ~4x the work it needs** (from the code, not yet measured): `matmul_items_reloading`
+    unpacks and multiplies all four faces (64 `MVMUL`s a pair at HiFi4), where row 0 needs 16. Whether a pair is
+    bound by its `MVMUL`s or its unpacks is unmeasured.
+
+## A BF16 `B` beside a TF32 `A`: the same product (2026-10-26, card 0 and ttsim)
+
+Gate `step232_mixed_src_formats` (card 0 `1792986764`): `A` FP32 in L1 unpacked to `SrcB` under `OutDataFormat` TF32
+(4), `B` BF16 in L1 unpacked to `SrcA` under BF16 (5), is **bit for bit the product of the same values both in FP32
+through TF32**, at LoFi, HiFi2 and HiFi4, with signed zeros, BF16 subnormals, `bf16::MAX`, infinities and NaN in `B`.
+So the Matrix Unit takes the two `Src` registers in different formats, and a BF16 datum in `SrcA` is the TF32 datum of
+the same value (the phases slice by bit position). What it buys: a weight stored BF16 (half the bytes) multiplies as
+its F32 widening (`SrcRoute::Tf32WithBf16B`, [bf16-weight-storage.md](../completed-plans/bf16-weight-storage.md)). BF16 in with
+TF32 out (code 5 in, 4 out) is not a way to write it: the specification calls a mismatched pair undefined and ttsim
+refuses it (`in_data_format=5 mismatches out_data_format=4`); not tried on silicon. Blackhole's `UNPACR_Regular.md` is
+a stub; this is measured, not read off Wormhole's `WriteSrcBF16`.
+
+**A trap found on the way (fixed):** unpacker 0's address counters outlive a kernel. A product's face selects
+(`SETADCZW`) leave its `Z` counter on a later face; the BF16 widening (`bf16::expand`, through `SrcA` and `MOVA2D`) set
+only `X`, so every widening after any product read the wrong datums (on ttsim and card 0 alike: `step233`'s widening,
+elements shifted by whole faces). It now clears the counters first, as the narrowing always did. Any kernel that
+unpacks after another must set every counter it relies on.
+
+## A whole tile in each `Src`, rows reached through the RWCs (2026-10-26, ttsim and card 1)
+
+Probes `probe_pair_src_rows` (each alone on one unit; card 1 `1793037041`, `1793037048`, `1793037050`,
+`1793037053`; ttsim first), and the product gates after them (`step229` `pair_orders_are_the_faces_order_bit_for_bit`,
+card 1 `1793037349`): exact against host integer sums and bit for bit the face-at-a-time product, at one to four
+phases, `B` transposed by the unpacker or stored BF16, one, sixteen and all of a tile's rows.
+- **One `UNPACR` of 1,024 datums fills `SrcA` rows 0-63** (`SETADCXX` `X1` 1023 from `Z` 0, `SrcA` row 0 at
+  `Dest_cntx0` 64, `SetOvrdWithAddr` set; Wormhole's `UNPACR_Regular.md` says `Row &= 63` on Blackhole). With
+  `Haloize_mode` each 16-row face is transposed in place.
+- **Unpacker 1 fills `SrcB` rows 0-63** the same way (512 datums for rows 0-31).
+- **`MVMUL` reads `SrcA` at `RWCs.SrcA` 16, 32 and 48 and `SrcB` at 8 to 56**, the RWCs moved only by address
+  modifiers: plain increments, the carry form (`SrcACR`/`SrcBCR`: `Cr += Incr`, the RWC to it) and clears, as `RWCs.md`
+  `ApplyAddrMod` says. A tile pair is then two unpacks (`matmul::PairOrder::Tiles`), not twelve.
+- **The pair is not bound by its unpacks.** Two unpacks a pair instead of twelve barely moves a blocked product
+  while it gathers its operands (`silicon_probe_pair_cost::pair_orders`); with the gathers left out
+  (`without_gathers`, `1793037314`) the tiles kernel runs **23.7-28.8 TFLOPS against the faces kernel's 15.4-15.9**
+  (F32 `B`, HiFi4), at LoFi alike. So the kernel was half the products' time, and its unpack count was not what bound it.
+- **Phases outer is slower with an F32 `B` only while the product gathers.** Interleaving each `SrcB` half's phases
+  with the other half's (`PairOrder::PhasesOuter`, the same unpacks and the same release points: each bank is handed
+  back by the same `MVMUL` of the group as in the faces order): with its gathers, HiFi4 15.3 -> 13.7 and 14.9 -> 13.2
+  TFLOPS with an F32 `B`, 17.5 -> 18.1 and 15.3 -> 18.9 with a BF16 `B` (`1793036200`, `1793036219`-`1793036229`,
+  `1793038281`). What it is not, and what it is:
+  - **Not the fused form.** Every (order, `B` format, fidelity) measured takes T1's fused `.ttinsn` form (host report
+    `matmul::order` `fused_forms_of_the_pair_cost_products`: 638-3,840 words pushed, all past `FUSE_MIN_WORDS`), and
+    with `TT_TTINSN=0` the gap is the same (13.72 / 13.17 against 15.22 / 14.89, `1793038277`).
+  - **Not the kernel.** With the gathers left out (`without_gathers`, `1793038270`) the phases outer are faster for
+    both formats: F32 `B` HiFi4 15.96 -> 19.92 and 15.50 -> 21.34, BF16 17.75 -> 23.41 and 15.51 -> 21.72; equal at
+    LoFi (the same program), and HiFi2 21.40 -> 21.60, 23.80 -> 25.43.
+  - **It is the kernel against its gathers.** With them, an F32 `B` product sits at ~14.5-15.3 TFLOPS whatever the
+    kernel, and a faster kernel can be slower: the faces order's own LoFi (14.78 / 14.52) and HiFi2 (14.38 / 14.00) run
+    below its HiFi4 (15.26 / 14.90) there, as the phases outer do. A kernel that unpacks sooner contends with the mover
+    writing the next chunk into L1 (or returns its banks at worse moments for it); a BF16 `B` halves the bytes both
+    move, and the faster kernel wins. Which of the two (L1 contention or bank timing) is not isolated.
+
+- **`REG1_ovrd_default_throttle_mode` shares `Config` word 70 with packer 0** (`THCON_SEC0_REG1`): set from the
+  unpack role with `ConfigWords` it would clear the packer's formats, so the probe has the pack role write it.
+  Unpacker 1's (word 118) ttsim refuses (divergence row 105). Products exact at x1 and x2 with it set.
+
+## A packed operand's tile in `Src`, and fewer fidelity phases (2026-10-28, ttsim and card 0)
+
+`docs/completed-plans/dataflow-compiler.md` F1 (H7, F1d), gates `step239`, `step241`.
+- **A BFP8, BFP4 or BFP2 tile unpacks whole into `SrcA`** (one `UNPACR` of its 1,024 datums, the exponent section
+  with them, rows then through the RWCs): bit for bit the face order, with `A` whole or by faces, at HiFi4 and at three
+  phases (`step239::whole_tile_orders_give_a_packed_weights_bits`, run alone first on card 0 `1793160473`). The unpack
+  configuration is the faces order's; only `SETADCXX`'s count differs. `TileFormat::whole_tile_unpack` records which
+  unpacks are measured whole.
+- **A BF16, BFP8, BFP4 or BFP2 tile unpacks whole into `SrcB` too** (a packed `A`, roadmap W1, 2026-11-10): unpacker
+  1, one `UNPACR` of 1,024 datums (512, rows 0-31, where only the first face row is live), the exponent section with
+  them, the configuration again the faces order's. Bit for bit the faces order and the decoded FP32 product, `A` BF16
+  laid as a weight or interleaved as an activation, beside every `B` format (FP32 transposed by the unpacker too), at
+  one, sixteen and all of a tile's rows, every fidelity, whole `K`, `K` blocks and 2-D blocks looped and not
+  (`probe_pair_src_rows::srcb_whole_packed_tile` / `both_whole_packed_tiles`, run alone first, card 0 `1794328961`,
+  `1794328968`; `step241::whole_tile_orders_give_every_packed_a_its_bits`, `1794328978`; ttsim agrees). The control
+  (`matmul::probe_half_whole_srcb`: only the first face row unpacked) changes over a quarter of the outputs under
+  both whole orders and none under faces (`1794328972`). `PairOrder::Auto` now holds both tiles whole for every pair
+  of edge formats; FP32 cut to BF16 (`Bf16FromFp32`) is still unmeasured and takes faces.
+- **A BF16 `A` unpacks into `SrcB` from a 32-byte face row of a packed row** (roadmap W1, 2026-11-10): a one-row BF16
+  `A` packed `[K / 32, 32]` (`tensor::pack_row`) has `K` tile `kk`'s unpack start `(kk % 16) * 32` bytes into packed
+  face `2 ((kk % 32) / 16)`, a BF16 face row, where an FP32 row's starts on 64-byte rows (`matmul::packed_a_pairs`).
+  The unpacker reads from there as from a tile's base, under the faces order and the 512-datum whole unpack alike:
+  `SrcB`'s row 0 is `K` tile `kk`'s row 0, bit for bit the row read as whole BF16 tiles, beside `B` FP32, BF16 and
+  BFP8, every fidelity, `K` 1,024, 1,056 and 2,048, on one unit (`probe_pair_src_rows::srcb_packed_bf16_row`, ttsim,
+  then alone on card 0 `1794347716`); and through the product path, whole, K-blocked, streamed and prefetched
+  (`step204`, `step205`, `step216`, card 0 `1794348020`). The control, relayed at FP32's 64-byte rows
+  (`matmul::probe_fp32_row_strides`), changes every output column. The packed row's tiles are a `TILE_SLOT` apart
+  in GDDR and in L1 whatever its format: `READ_RUN` steps by it.
+- **Every pair of FP32, BF16 and BFP8/4/2 operands multiplies in one kernel**, each unpacked in its own format (BF16 and
+  BFP moved as they are, FP32 cut to TF32), including TF32 in `SrcA` beside BF16 or BFP in `SrcB`: bit for bit the
+  FP32 product of the decoded values (`step241`, card 0 `1793162345`).
+- **Fewer phases than HiFi4 keep HiFi4's bits only while no product overflows FP32.** The phases an edge pair needs
+  (`full_precision_phases`) give HiFi4's bits with signed zeros and subnormals; with operands of `1e30` they differ
+  (`step241::derived_phases_are_hifi4_until_a_product_overflows`, card 0 `1793163275`; ttsim agrees). Which step of
+  an overflowing product the extra phases change is not isolated. The derived phases are opt-in
+  (`TT_DERIVED_FIDELITY=1`).
+
+## `Dst` in two halves: math, pack and reloads side by side (2026-10-30, card 0 and ttsim)
+
+`docs/completed-plans/dataflow-compiler.md` F5 (H2), gate `step246_dst_subblocks`, kernel
+`matmul::block_stream_kernel_subblocked`.
+- **Half-sync works as tt-metal's `SyncHalf` does**: the math role accumulates up to four FP32 tiles in one half of
+  `Dst` while the pack role drains the other, handing them over through `ready`/`free` started at `(0, 2)`. Each
+  tile is reached on the math side by `DEST_TARGET_REG_CFG_MATH_Offset` (one `SETC16` a tile pair, no stall between
+  it and the `MVMUL`s before it), on the pack side by `DEST_TARGET_REG_CFG_PACK_SEC0_Offset` (rows 0-448), and on a
+  reload by `REG5_Dest_cntx0_address` (rows to 448); a half is cleared tile by tile with sixteen-row `ZEROACC`s.
+  Bit for bit the one-tile kernel, and both negative controls (every subblock clearing all of `Dst`; the halves
+  overlapping by three tiles) change thousands of outputs, on ttsim as on card 0.
+- **A `WRCFG` of a base just stepped in its GPR needs the Scalar Unit settled first, between two tiles too.** The
+  subblocked unpack role steps `B`'s base a slot between a subblock's tiles (`ADDDMAREG`, then `WRCFG`); without
+  `datapath::gpr_settled` between them, now and then the next tile unpacked from the old base: one output tile a run,
+  always the second of a subblock at the first `K` step after a reload, its terms of that step `B`'s first tile's
+  (`step246::probe_wrong_tiles`, card 0 `1793338674`-`1793338787`; 0 in 60 repeats with the settle, `1793338835`).
+  The same rule as "A role's addresses from GPRs" below, which ttsim does not show.
+- **An `UnpackToDst` while the Matrix Unit runs `MVMUL`s on other `Dst` rows gives wrong products.** A variant whose
+  unpack role reloaded a continuing chunk's priors into a half as soon as the packer freed it -- the math role still
+  accumulating the subblock before in the other half -- was wrong in thousands of outputs, by whole terms
+  (`14.36` against `35.50`), at every shape and format of `step246` (card 0 `1793339454`, with the settle above),
+  while the host model and ttsim pass it. `UNPACR_Regular.md` says an `UnpackToDst` clobbers `SrcA[Bank]`, rows not
+  characterised; which of that or a shared `Dst` write path does it is not isolated. The kernel keeps the one-tile
+  kernel's order: the math role clears the half and hands it to the unpack role (`cleared`), which reloads it with no
+  `MVMUL` running, and the math role waits for it (`loaded`). The variant was removed.
+
+## A prefetch placed before a barrier arrival reads under the barrier; an in-line list delays it (2026-10-29, cards 0 and 1)
+
+From [dataflow-compiler.md](../completed-plans/dataflow-compiler.md) F4a.2.
+- **What holds:** B pumps a prefetch's reads (`GATHER_PREFETCH`) in every barrier wait loop (`mover::barrier`,
+  `pump(PUMP_TURN)`), and a unit's own share has landed by the entry before its arrival (each pair ends with NC done,
+  `finish_pair`; `BARRIER` waits for B's own requests). So a prefetch list put just before a unit's arrival reads while
+  the unit waits for the product's slowest units. On a 1.7B decode step that filled half the products' tails
+  (11.32 -> 10.95 ms, bit for bit, card 1).
+- **What it needs:** no other unit of the op may touch the L1 the list's reads land in until the barrier releases
+  (`barriers::others_touch_l1`, on the list's own extent: a capture's residency region above `DATA` takes readers'
+  writes above the ring's base, not in it).
+- **What does not:** a list B runs in line (plain `GATHER`s, the idle units' `PREFETCH` lists) placed before an arrival
+  delays the barrier for every unit: 0.6 ms slower a 1.7B step.
+
+## An op's recorded L1 top must cover everything it lays out (2026-10-26, card 0 and 1)
+
+Busy prefetch places a unit's next weight ring above the highest `l1_top` the ops since the last product recorded
+(`Session::busy_start`), so an op that lays out L1 itself must note its whole reach (`crate::l1::note_planned_top`), not
+leave it to the layouts of the kernels it calls. Decode attention's job did not: at `Step(512)` its `K` and `V` slots
+sat above what its inner products and reductions noted, the next weights landed on them, and a 1.7B step chose other
+tokens (found in `silicon_bench_models::traced_generation`'s 256-token prompt, which the bit-for-bit gates at shorter
+lengths never reached; gate `step209` `a_captured_job_records_the_l1_its_slots_reach`). Symptom to recognise: a traced
+run that disagrees with itself between the logits path and the token path, fixed by `TT_BUSY_PREFETCH=0`.
+
+## A matmul's transposed `B` through unpacker 0 (2026-10-17, card 0)
+
+From [decode-attention.md](../completed-plans/decode-attention.md) A0b; gate `step201_unpacker_transposed_b`.
+- **The mechanism:** a transposed `B` (its tiles in their slots as they lie in GDDR) is unpacked into `SrcA` with
+  `Haloize_mode` set, which transposes within each face. `B`'s face `(k, fj)` is unpacked from the slot's face
+  `(fj, k)`. The products are **bit for bit** those of the mover's datum-by-datum transpose (`READ_TRANSPOSED`) and
+  of `B^T` uploaded plain: TF32, HiFi4, every special value, whole, ragged, thin, K-blocked and batched.
+- **What that shows:** the unpack's per-datum conversion into `SrcA` (normalising -0, subnormals and low mantissa
+  bits) commutes with the transpose, as the earlier unpacker-mode probes implied.
+- **State:** `Haloize_mode` is persistent. Every later unpack configuration writes the whole `SEC0_REG2` word with it
+  clear: `unpack_src_config` by construction, `unpack_config` explicitly. So no other kernel unpacks transposed, and
+  none unpacks to `Dst` with it set (undefined behaviour).
+
+## A one-row product's compute, `A` reads and weight stream (2026-10-18, cards 0 and 1)
+
+From [decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Phase 4 and 5, SmolLM2-1.7B `Step(64)` profiles on
+card 1; gates on card 0.
+
+- **A tile pair is bound by its `MVMUL`s.**
+  - **The change:** computing only the rows an output tile holds (`matmul::LiveRows`, `step203`) cut 64 `MVMUL`s a
+    pair at HiFi4 to 16 for one row.
+  - **The effect:** the last block's compute fell 15.0 -> 4.8 us (64 pairs), ~0.07 us a pair. The unpacks were not
+    the bound.
+  - **Measured:** profile `1792341444`; 1.7B `Step(64)` 30.91 -> 29.55 ms.
+- **Unpacker 1 takes a base anywhere on 16 bytes.**
+  - **The setup:** a packed `A` (`[1, K]` laid out `[K / 32, 32]`) is unpacked from a base 64 bytes times the row
+    into a packed tile.
+  - **What it reads:** face `(0, k)`'s 16 rows of 64 bytes from there, the face 1,024 bytes on.
+  - **Result:** bit for bit on every unit of card 0 (`step204`, `1792342641`). The reads past a slot's end land in the
+    next slot and only reach output rows past the product's one.
+- **Thin `A` reads are entry-bound, and packing pays.**
+  - **The rate:** ~0.27 us an entry.
+  - **Packed:** `A` is `K / 1024` whole tiles a unit (2 at `K` = 2048, 8 at 8192), plus one packing op of ~5-7 us,
+    one read and two face-row writes a tile spread over the product's units.
+  - **Measured** (profile `1792342758`, products before -> after, plus the pack): `qkv` 148 -> 135, `o` 64 -> 53,
+    `gate|up` 349 -> 337, `down` 246 -> 190 us. The step went 29.55 -> 27.90 ms.
+- **The barrier skew is not channel locality.**
+  - **The experiment:** dealing `gate|up`'s rounds rotated, so each unit walked every channel pair rather than
+    staying on one.
+  - **Result:** its barrier went 40 -> 30 us, but its data phase went 269 -> 283 us. The step was 27.90 -> 27.84 ms
+    (`1792343591`), so it was reverted.
+- **A K chunk as its own batch costs ~3 us of role work.**
+  - **What it is:** the FP32 reload, the pack, and the three roles' lockstep retire.
+  - **Measured:** streaming every product's `K` in 4 chunks raised `qkv`'s control phase to 36 us and `gate|up`'s to
+    89 (`1792358552`). It pays only where `K` would be K-blocked anyway: `down` 184 -> 173 us, the step 27.77 ->
+    27.51 ms (`1792359572`).
+- **Prefetching weights under small ops slows those ops.**
+  - **The cost:** units 64-119 reading the next product's `B` while the small ops run made the latency-bound ones
+    slower.
+  - **Where it showed:** the residual adds +12 us, RMSNorm's one-unit statistic +11, `gamma`'s product +4, each a
+    layer. One unit reading 64 tiles queues behind ~56 units' streams in the GDDR controllers.
+  - **Measured, at 56 units:** the products gained ~3.1 ms and the small ops lost ~1.6. The step went 27.51 ->
+    25.96 ms (`1792360408`).
+  - **The cap, by units:**
+    - 32: 25.60 ms (`1792361675`);
+    - 20: 26.74 (`1792362531`);
+    - 40: 25.61 / 26.03 / 26.40 / 27.23 at `Step(64)` to `Step(512)` (`1792363365`), the setting
+      (`session::PREFETCH_UNITS`).
+
+## The movers' per-entry costs in small moves (2026-10-18, card 1, profiles `1792293993`, `1792296384`)
+
+Small moves are bound by the movers' entries, not by GDDR. What a decode step's moves measured:
+- **A `FILL` of a staged tile's other 31 rows: ~10 us a tile.** B stores word by word. A one-row
+  `resident row select` of 64 tiles in groups of 24 took 253 us on 3 units, and 67 us dealt one tile a unit over 64
+  (`index::select_taps_jobs`). Spread a ragged fill across units, or avoid it.
+- **A `SCATTER_ROWS` write entry: ~0.37 us to issue on NC.** 64 face-row writes on a unit took ~24 us; split over 16
+  units (`record::scatter_rows_range`), the op took 8.8 us.
+- **A repack of 32 one-row reads a unit:** ~38 us with each read into one slot before its copy. It was 31-33 us with
+  the reads in flight together, and no faster with each read cut from 4,160 to 1,152 bytes (31.0 us on 74 KB,
+  `1792298755`). Neither the reads' latency nor their bytes bounds it: it is ~96 entries a unit (32 reads, 64
+  `COPY_WORDS`), ~0.3 us an entry.
+
+## A barrier released by multicast from a mover (2026-10-19, cards 0 and 1)
+
+The B mover now issues NoC multicast writes in normal operation (it was only the probe image before): unit 0's B, after
+its barrier counter reaches a target, writes it to every other unit's `dm::BARRIER_RELEASE` with one response-marked,
+path-reserved multicast per rectangle on static VC 4 (`noc::multicast::registers_to`), rectangles of session tiles only.
+On card 0 (`step208`, 8 units) and on card 1 in every decode bench since (120 units, ~1,000 barriers a step, 835 ops), no
+hang. What was learned:
+- **Completion:** counted on `NIU_MST_WR_ACK_RECEIVED`, never on the transaction ID's outstanding counter (a broadcast
+  adds one and takes one per recipient), which is never cleared: ttsim refuses that write, and nothing waits on the ID.
+- **L1 keeps the release words across sessions:** they are zeroed with the counter when unit 0's mover starts, before
+  any barrier is queued.
+- **The release changes little:** 0.05-0.25 ms of a 24-25 ms step against every unit polling unit 0 over NoC0. The
+  barrier's time is the slowest unit's arrival.
+
+## A column broadcast costs the mover ~10 us a tile (2026-10-19, card 1, profiles `1792363365`, `1792372923`)
+
+`READ_BROADCAST_COL` reads a `[rows, 1]` operand's tile into the scratch slot and then copies column 0 into every
+column with 1,024 single-word stores (`broadcast_col0_from_scratch`). On silicon that is ~10 us a tile: an op with one
+such operand took ~15 us of data phase where the same reads without it take ~4.5 (RMSNorm's `DIV` on 64 units 24.1 us,
+the softmax's 2-unit ops 24.7). Broadcasting in the SFPU instead (`sfpu::Program::broadcast_col0`, seven lane-row
+rotations with the first lane held, ~100 instructions a tile) took them to 14.7 and 15.0 us. Element-wise programs now
+read the column as it lies (`record::READ_RUN_COL_AS_IT_LIES`); `READ_BROADCAST_COL` is left to the integer division's
+programs.
+
+## What an SFPU kind costs a tile, and a kernel a block (2026-10-19, card 0, `silicon_probe_attention_rows`)
+
+- **An exp-based kind over whole tiles is ~8.5 us a tile.** `SUB_EXP` of a `[1, 512]` row on one unit, all 32 rows
+  computed: 153.3 us for 16 tiles, against `MUL`'s 21.7 (runs `1792424868`, `1792424899`). Row-limited to one row,
+  in the attention job's 16 score tiles, its kernel took 15.0 us against 13.5 for a `MUL` in its place (`1792425322`,
+  `1792424459`). Build exp-, reciprocal- and divide-based kinds for the rows a tile holds
+  (`sfpu::ops::code_for_rows`, `reduce::math_programs_rows`).
+- **Row-limited `DIV` is ~0.5 us a tile over `MUL`,** and its time does not depend on the divisor: zero, a denormal,
+  NaN, infinity and 1e-38 gave 29.4-29.6 us over 16 tiles.
+- **Only the rows from 0 count as limited.** Programs built for rows `0..r0 + m` compute every row group up to the last
+  live row: a head at row 31 of a stacked tile ran the whole-tile `SUB_EXP` and `DIV`, ~8 us a score tile. Move a
+  few live rows to row 0 first (64-byte face-row reads, as `attention::attention_rows` does).
+- **A region costs ~3.5-4 us** (a `PAIR_CALL`'s start and finish, its credits, the roles' retirement), whatever it
+  computes. Consecutive blocks of a job join one region only with equal semaphore initialisations: a job mixing matmul,
+  SFPU and reduction kernels was a region a kernel (seven in the attention op, ~25 of its 35 us at 64 positions) until
+  they shared their union (`tensor::share_semaphore_init`; 25 us).
+- **A capture holds every program it places,** so an op whose kernels are many and long cannot be captured beside a model's
+  traces: the device sort of a 256-wide row nearly fills the 240 KiB cache by itself, 512 does not capture at all (card 0,
+  ttsim; the 1.7B's traces hold 231 KB). Eager runs evict between lists and are not limited so. Make a kernel's program one
+  body repeated (`code::Loop`), not one a tile: a row's argmax with a program a tile took ~11 KB a unit and broke the 1.7B's
+  captures.
+- **Many units reading the same few tiles serialise on a channel:** 64 units each reading one row's 2-tile packed twin made
+  a norm 17.5 us against 14.4 on 32 (`1792431978`).
+
+## A channel's rate by readers and entry size (2026-10-27, card 0)
+
+From decode-to-bandwidth.md Phase 10 (F27), `silicon_bench_memory::gddr_readers_by_channel` (runs `1793131300` safe,
+`1793131553` `fast-reads`; [log](performance-log.md#f27-probed-bank-local-reads-and-what-does-not-bind-a-decode-product-2026-10-27-card-0)).
+
+- **A tile's read rate is set by its entry size, not by its channel or how few share it.** At one 2,112-byte BF16 slot an
+  entry a tile reads ~6.5 GB/s in the safe image (~360 cycles an entry) and ~20 (cap 3) to ~35 (cap 8) with `fast-reads`;
+  1, 2, 4 and 8 tiles a channel scale that linearly (8 a channel: 401-425 safe, 420-466 fast).
+- **Long entries fill a channel from 2 readers:** 16 KiB or 128 KiB entries give 505-511 GB/s at 2, 4 or 8 tiles a
+  channel; one tile a channel reads 63.7 GB/s at 128 KiB (99.6% of 64).
+- **Reading only the channel beside a tile buys nothing at decode's entry size:** 8 such readers a channel equal 64 units
+  reading an interleaved weight's columns (`m = 1` products' deal) to within 1 GB/s in both images.
+- **Large entries serve many readers unevenly** (2026-10-31, card 1, `1793463838`, `Mix::DecodeContiguous`). With 64
+  or 96 units, each reading 1.08 MB contiguous in one channel (8-12 a channel, the decode deal's units):
+  - 16 KiB entries give 499 / 496 GB/s at cap 1, but the units' list ends spread over 28 / 96 us of a ~130 / ~200 us
+    run, and 74-160 us at caps 2-3;
+  - the same bytes as the decode deal's 2,112-byte entries end within 1-14 us (52 at 96 units, cap 3);
+  - the deal itself reads 499 GB/s on 96 units at cap 2.
+
+  So long entries buy rate only where few readers would otherwise under-fill the channels (64 units: 395 -> 499),
+  and pay for it in fairness ([log](performance-log.md#h11s-bound-a-decode-products-reads-at-large-entries-2026-10-31-card-1)).
+- **Inside a decode product, the same holds** (2026-11-02, card 1, roadmap 2b, the in-model probe
+  `tensor::probe_contiguous_b`):
+  - **Large entries pay where few units read.** Each unit's weight share contiguous in one channel, in 16 KiB entries,
+    makes the 64-unit `down` 1.34-1.43x faster on its slowest unit.
+  - **They serve many units unevenly.** The 120-unit `gate|up`'s mean unit is 12-14% faster, but its slowest unit is
+    not.
+  - **More tile-sized requests do not pay.** Raising a stream's cap from 3 to 8 slows the 120-unit products up to 23%.
+  ([log](performance-log.md#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1))
+- **Large reads ahead crowd the ops they run under** (2026-11-03, card 1, the weight layout,
+  [log](performance-log.md#x9s-weight-layout-bit-for-bit-a-17b-decode-step-1108---990-ms-2026-11-03-cards-0-and-1)).
+  - **At the default read-ahead cap of 2,** 16 KiB reads ahead made the small ops after `qkv` 0.5 ms a step slower
+    (`rope` and the cache's scatter 586 -> 1,102 us) and `rms_norm` 0.15 ms.
+  - **At a cap of 1** most of that goes, and the products keep their gain.
+  - **Bytes in flight, not request count, is what a GDDR reader takes from the others.**
+- **The NoC #0 endpoint nearest above a tile** (shortest Y leg) is how the bench picks its port; on card 0 the
+  nearest tiles to channels 0-3 sit at raw X 1-6 and to 4-7 at raw X 11-16 (`banked_tiles`).
+- **The B mover's list loop is that tight:** one more check per entry there (a barrier test, nothing stamped) cost
+  tile-sized plain reads ~4% (8 a channel 428.6 -> 411.6 GB/s at cap 8, against HEAD's `profile` image the same session,
+  `1793140610`, `1793138241`); counting each request's bytes in a `.local` word costs ~1%. Keep profiling work out of
+  the loop and in cold functions ([log](performance-log.md#the-cards-gddr-reads-over-a-decode-step-2026-10-27-card-0)).
+- **Past ~32 requests in flight a channel the card reads less** (`fast-reads`, 2026-10-28): 8 readers a channel at
+  16 KiB, 500-506 GB/s at 8-24 a channel, 467 at 64, 452 at 128; by count, not bytes. **Reading across the chip costs
+  ~15 GB/s more:** 120 tiles each on its own half's channels hold ~505 while every tile reads, on all eight ~485-490. With
+  equal shares the finish is unfair (tiles end between ~310 and ~1,000 us). What makes the scoreboard's 469
+  ([log](performance-log.md#why-card-wide-reads-plateau-at-469-and-what-it-means-for-decode-2026-10-28-card-0)).
+- **`NIU_MST_RD_DATA_WORD_RECEIVED` counts every read landing at the tile,** GDDR and other tiles' L1 alike, in 64-byte
+  flits: over a 1.7B decode step 3,847 MB against the 3,568 of GDDR reads. Not a GDDR meter; ttsim refuses it (row 106).
+
+## GDDR reads are one queue: prefetch traffic is paid by the small ops (2026-10-20, cards 0 and 1)
+
+[decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Phase 8.
+- **A unit's reads are issue-bound.** A whole-tile read lands ~1 us after the mover issues it, and the mover issues
+  one in ~0.27 us; with ID 6 at a cap of 8, a 128-tile prefetch stalled 0 times (`step215`, `1792468449`). A read the
+  mover issues before an entry has almost always landed by the next entry; only reads it has not issued yet are
+  still to come.
+- **Transaction IDs throttle and drain separately.** With B's own ID capped at one, a plain gather stalled 127 times
+  and the same gather on ID 6 none (`step215`).
+- **A small op's reads wait behind every unit's streaming reads.** With ~100 units reading a product's weights ahead
+  (8 requests each), the residual add after a product went from 14 to ~100 us, nearly all of it its own reads' wait.
+  That held whether the prefetch was issued at once or a read per wait-loop turn (profiles `1792470019`,
+  `1792504522`). With weights streaming on 40 / 56 idle units only (~260 / ~300 GB/s), a step's own work cost 1.34x /
+  1.61x (`1792465817`, `1792465464`). There is no idle GDDR bandwidth under the small ops to take for free: what a
+  window streams, its ops wait for. Throttling the stream (ID 6's cap 1-2) traded the two at best ~0.2-0.4 ms a 1.7B
+  step.
+- **Correction (2026-10-21, card 0): GDDR is not the whole wait.** With planned residency's Phase 3, the residual add
+  reads both operands from its own unit's L1 region (`READ_L1`, no GDDR read at all) and takes 8.0 us a call. With busy
+  prefetch on (cap 2) it takes **70.5 us** still reading no GDDR, and RoPE and RMSNorm slow ~1.7x (profiles
+  `1792596738` off, `1792597186` on). So a small op on a unit that is reading a product's weights ahead waits on that
+  unit's own side, not at the controllers. **Cause (probed 2026-10-21):** the next entry.
+
+## Units reading GDDR together are served unevenly; two in flight evens them (2026-10-22, cards 0 and 1)
+
+[decode-to-bandwidth.md](../completed-plans/decode-to-bandwidth.md) Phase 8, "The stream's rate"; profiles `1792629809`,
+`1792632189` (`skew.tsv`: each unit's own time at each op).
+- **What:** in a 1.7B decode step's `down` product, 64 units each read one 1.06 MB weight column (256 tiles, all on
+  one channel, column `j` on channel `j % 8`), the same bytes a unit. Units 0-15 take 150 us, 16-31 154, 32-47 126,
+  48-63 113, the same to 0.1 us in two runs; unit 20 is the slowest in all 24 layers. Grouped by channel (unit modulo
+  8) the times are flat (132-139 us). `gate|up`, `o` and `qkv` show the same order.
+- **Where:** units are numbered row-major from the grid's top (`tt_isa::noc::grid::Tensix::tiles`), so the slow units
+  are the top rows. This is the unfair service of the [aggregate-read
+  measurement](performance-log.md#what-holds-card-reads-at-430-gbs-unfair-service-not-distance), now tied to position.
+- **What it costs:** a product dealt evenly waits for its slowest units: `down` ~38 us a layer over its median unit,
+  `gate|up` ~60-80 us.
+- **Card 1 is the same** to ~0.1 us (`1792632927`). **But it is not the rows:** with the tiles opened in reverse order,
+  so that the product's 64 units are the bottom rows, the order reverses too (`down`'s units 0-15 106.5 us, 48-63 155.0,
+  `1792633435`). A unit's service depends on where it sits among the units reading together.
+- **What evens it: fewer reads in flight a unit.** At 2 in flight `down`'s units take 145-151 us by group, where at 8
+  they took 113-154, and the product is ~20 us faster a layer; at 1 every unit is too slow. Latency-bound reads (few
+  tiles a unit, few units) lose ~3% at 2, so only a weight stream's reads use it (`record::GATHER_STREAM`,
+  `dm::STREAM_CAP`, default 2; [log](performance-log.md#the-weight-stream-metered-what-is-read-ahead-the-prefetchs-wait-and-each-units-own-time-2026-10-22-card-0)).
+
+## A credit between tiles: a NoC atomic after the mover's requests (2026-10-28, ttsim and cards 0 and 1)
+
+`op::CREDIT` and `op::WAIT_CREDIT` (F2, `tt_kernels::channel::Ring`, gate `step242_channel_credits`) hand pages
+between tiles without a barrier.
+- **What orders a credit after its data.** A write followed by an atomic is not ordered on the NoC. So the credit
+  first waits for every request the mover issued under its own ID (`noc::wait(TXN)`: a write's acknowledgement, a
+  read's data). A multicast run is counted before any entry not of it. Only then does the mover send one full-width
+  increment, and it waits for that response too.
+  - Each mover sends under its own ID (9 for B, 10 for NC), since an ID's count is the tile's NIU's (below).
+  - NC's credit goes out on the NIU its writes use. After the acknowledgements, the NoC it takes does not matter.
+- **The wait reads its word through a fence.** NoC writes do not invalidate the L0 cache, so every poll fences first
+  (`publish`). Every poll also reads the streams' abort word, so the host can cancel a wait that will never end
+  (`channel::cancel`).
+- **The abort word now matters outside a packet.** A credit wait in a plain list reads it, silicon keeps L1 between
+  processes, and only a packet's start clears the word. So the host clears it, with the credit words, before either
+  side runs (`channel::prepare`). The card never resets a credit word, so a peer's early credit cannot be lost.
+- **Measured (card 1, `1793200301`):**
+  - a credited 64-byte handoff between neighbouring units is 1.81 us;
+  - the two-unit barrier is 2.66 us polled and 2.59 us released;
+  - a 4 KiB page at depth 2 is 9.39 us, mostly the consumer B's word-by-word copy.
+- **Rings run on card 0, every page byte for byte across laps (`1793199635`):**
+  - remote, 24 pages of 20 KiB (two requests each);
+  - broadcast to a 2x2 rectangle, one multicast a request and a credit to each consumer;
+  - GDDR, NC writing channel 1 and B fetching after its credit.
+
+  A consumer held for a credit that never comes stays held (the host reads `WAIT_REASON` 40 and the word), copies
+  nothing, and fails with the abort's code when cancelled.
+
+## A transaction ID's outstanding count is the tile's, not the core's (2026-10-21, card 0)
+
+`noc::wait(id)` spins on the NIU's `reqs_outstanding(id)` counter, and the NIU is the tile's: B and NC issuing under the
+same ID on the same NoC count into one counter, and either core's wait waits for both.
+- **What it cost:** NC ended every `CALL` (a pair's writer section) with `noc::wait(PREFETCH_TXN)`, though it never
+  issues a prefetch. Under busy-unit prefetch B keeps ID 6's reads in flight on NoC #0, and while it waits for NC to
+  finish a pair (`finish_pair`) it issues another each turn the cap has room. NC's `DONE` came only when the count
+  happened to reach zero: the residual add's wait for its writer was 66% of a 70.5 us call (1.7B decode, cap 2, profile
+  `1792605585`), against 1.5 us with the prefetch off.
+- **How it was found:** the profile mode now stamps B's trace fetches and its waits for NC (`fetch`, `writer`
+  columns), and a profile image counts NC's own waits (`tt_isa::dataflow::NC_WAITS`, `TT_PROBE_NC_WAITS=1` on the
+  stream-ceiling bench). NC's section fetches (~0.1 ms a step), credit waits, write issues and drains did not change
+  with the prefetch, nor did its `CALL`s less their parts; B's pump turns were each at most 0.4 us. What was left was
+  NC's list-end drain.
+- **Fixed:** only B drains the prefetch ID at a list's end (`finish_prefetch`). The add 70.5 -> 12.8 us under cap 2,
+  and busy prefetch pays for the first time: a 1.7B step 19.51 / 20.75 -> **18.40 / 19.92 ms** (`1792608298`,
+  `1792608583`).
+- **Still shared:** NC's `noc::wait(TXN)` (before a `Pop`, at a section's end) also drains NoC #0's `TXN` count, B's
+  ordinary reads. Measured small (NC's drains ~30 us a 1.7B step); a wait that must be one core's alone needs an ID
+  only that core issues on.
+
+## NC writes another tile's L1 (2026-10-20, ttsim and card 0)
+
+[planned-l1-residency.md](../completed-plans/planned-l1-residency.md) Phase 2b: `op::WRITE_L1`, one unicast `noc::Command::Write`
+from NC's L1 into a peer Tensix tile's L1 (gate `step218_l1_write_records`; card 0, safe image `1792524683`,
+`fast-reads` `1792524825`, `fast-reads` + `encoded-guard` `1792524963`).
+- **The peer is named by the coordinate the session uses for it, on either NoC.** With translation on, NoC #1 takes
+  the same `(x, y)` as NoC #0 (`step50`), so the record carries one coordinate and the NIU NC's writes go out on
+  issues it. Writes of 64 B to 16 KiB into two peers, on NoC #1 and NoC #0 and at three 16-byte skews, landed byte for
+  byte; the guard below the window and a tile no entry named stayed poisoned. No hang.
+- **Completion needs nothing new.** A `Command::Write` is response-marked, so NC's drain at a list's end (`noc::wait`
+  on its ID, both NIUs once used) waits for it before NC reports done, and its unit then arrives at the barrier: the
+  reader after the barrier sees the bytes.
+- **What the card can and cannot refuse.** Its decode refuses a coordinate outside the Tensix rows and columns, a
+  length of zero or past one request, a range outside `DATA`, and addresses not congruent mod 16, before any NoC
+  access (each sent raw, refused with its code, nothing written). It cannot tell a harvested tile (translated X 15
+  and 16 here) from a present one: that refusal is the host's alone (`DataMover::set_l1_writes`: the session's own
+  tiles and its window), and no such entry is ever sent past it.
+- **Image sizes:** B 30,404 -> 30,612 bytes of 43,008 (the decode arm); NC 15,540 -> 16,704 of 24,576 (7,872 left).
+- **B reads a tile's L1 over the NoC, its own included** (`op::READ_L1`, a loopback read of the unit's region; every
+  `step219` run and the 1.7B with residency on, `1792526703`): no hang, the bytes as written. **A peer's too**
+  (`step218` `a_read_pulls_a_peers_window`, 2026-10-20; card 0 safe `1792531966`, `fast-reads` `1792532114`,
+  `fast-reads` + `encoded-guard` `1792532259`): B on the gate tile read 64 B to 16 KiB from two peers' windows and its
+  own, at three 16-byte skews, byte for byte, nothing past the reads written. The host refuses a peer not the
+  session's, a harvested column's and an address outside the window (the remote side is the one checked against it);
+  the tile refuses the decode's cases sent raw and on NC, and writes nothing.
+- **Many units multicasting into one rectangle at once serialize.** 64 units each multicasting a row's 64-byte face rows
+  into the same 104-tile rectangle took ~250 us an op where its GDDR writes took ~14 (`1792527601`): path-reserved
+  multicasts that share a rectangle wait for one another. A row many units read whole is delivered some other way
+  (`planned-l1-residency.md` 2f).
+- **The multicasts' cost is the NoC's, not NC's waits** (2f (c), `dm::MCAST_RUN_ACKS`, card 0, 120 tiles,
+  `silicon_probe_row_delivery` `1792533708`): with a producer's run of multicasts drained once and its
+  acknowledgements counted once, a `[1, 2048]` row's 64 producers into 32 / 64 / 104 readers took 130 / 200 / 240 us
+  against 140 / 210 / 240 counted an entry, and a `[1, 8192]` row 760 against 780. No hang, the bytes as written
+  (`step218`, `step220`).
+- **A row held by a few of its readers and pulled from them costs what GDDR does, and less under a stream** (2f (a),
+  same run): 64 producers unicasting each face row to `h` holders, each reader one `READ_L1` of the whole row from its
+  holder. A `[1, 2048]` row to 32-104 readers: 7.5-11 us with 2 or 4 holders against 9-17 through GDDR; under a GDDR
+  stream on the idle units, 11-23 against 23-70. One holder serializes its readers (a `[1, 8192]` row, 64 readers:
+  33 us), eight cost each producer more writes (28). The unicasts slow under the stream too (4 -> 11-16 us), but
+  less than GDDR's reads do. Delivered by one gatherer's multicast, an op and a barrier more: 16-51 us.
+- **NC multicasts through NoC #1 too** (`op::WRITE_L1_MCAST`, `step218` `1792525425`): the first NoC #1 multicast
+  here, a 2x2 rectangle in translated coordinates with the corners swapped (`multicast::corners_hi`), landed in all four
+  tiles and none beside them; no hang. Completion is NoC #1's `WR_ACK_RECEIVED`, read after NC's earlier writes have
+  drained and counted to the rectangle's tiles before the next entry. NoC #1's counter is NC's alone: B, on the same
+  NIUs, never writes through NoC #1, where NoC #0's counts B's barrier release too. With the multicast, B 30,996 and NC
+  17,872 bytes (6,704 left).
+
+## A region at the top of L1 costs a product only past its plan's floor (2026-10-21, card 0)
+
+`silicon_probe_region_cliff` (`1792546573`; `planned-l1-residency.md` 2h-i). A one-row product's layout depends on
+the arena it plans in (`l1::arena`) only through the choices sized from it, and those are exact:
+- **`K` whole:** `matmul::plan_in` takes the widest block whose *probe* layout fits, and the probe charges `A`
+  unpacked (`kt` slots), where the kernel runs a packed `A` (`kt/32 + 1`). The block stands while the arena ends at or
+  above `DATA.base + 4160 * ((kt + 1)(nc + 1) - 1)`. At `K` = 2048 that leaves **110,464 bytes**, which is Phase 2a's
+  96 KiB / 128 KiB cliff. At 110,464 the layout and the time are those of no region. 64 bytes past it, `nc` 2 -> 1 and
+  `qkv` 148 -> 161 us, `gate|up` 342 -> 376, the head 991 -> 1069 (+8-10%). Qwen2.5-1.5B's `gate|up` (`K` = 1536)
+  narrows at 106,304 and is **faster** narrowed (319 -> 293 us): the widest block is not always the best.
+- **`K` blocked, `A` packed** (8B `qkv` at 4096, every `down`): the jobs are a column each, whatever `plan_in`'s
+  width, so its floor binds nothing. The streamed chunk layout's does: 1.7B `down` 339,264 bytes (Phase 1's budget), Qwen
+  `down` (8960) 285,184, 8B `down` (14,336) 222,784, 8B `qkv` 376,704. Past each, the chunks change and the time moves
+  under 2% (+1.6%, -1.6%, +0.8%, +0.3%).
+- **K = 4096 is never `K`-whole today:** the unpacked probe needs 257 slots of 220, so an 8B's `hidden`-wide products
+  stream, and no weight prefetch runs ahead of them.
+- **`l1_need` depended on a warm cache.** `plan_in`'s probes were noted only on a cache miss, so a capture after an eager
+  run recorded the packed layout's need (684,352), not the probe's (938,112). `plan_in` now notes its floor on every
+  call, without its probes (`matmul::plan_floor`).
+
+## Trace sections: 64-byte alignment, not 32 (2026-10-15, ttsim and cards 0 and 1)
+
+- **What the code checks:** a `PAIR_CALL` entry's decode checks only that each section's offset is a multiple of
+  `ENTRY_BYTES` (32, `tt_isa::dm` `Entry::decode`).
+- **What the mover does:** it reads a section in chunks of 64 entries through a `READ` descriptor (`call`,
+  `crates/tt-firmware/src/mover.rs`) into L1 chunk addresses that are multiples of 64. A DRAM-to-L1 read needs source
+  and destination congruent mod 64 (`tt_isa::dram::ALIGN`).
+- **So:** a section at an offset of 32 mod 64 passes the entry's decode and fails its first chunk read (`ALIGNMENT`).
+- **Since the change:** `Session::store_stream` packs a unit's stream and its sections into one region, so it starts
+  each section on a 64-byte boundary. Before, every section had a slot-aligned region of its own: at least one
+  `TILE_SLOT`, 4,160 bytes, which made a trace 5x to 7x its entries (SmolLM2's four traces 3.75 GB, now 563 MB;
+  [decode-length-cost.md](../completed-plans/decode-length-cost.md)). Every trace gate passes in both layouts on card
+  0, and `step147` on both cards.
+
+## The Tensix L1 map, and changing it (2026-10-22, ttsim and card 0)
+
+Since 2026-10-22 (`docs/completed-plans/decode-to-bandwidth.md`, "Room for a second job's `B`", M2) a Tensix tile's L1 is, in
+order: the five baby RISC-V images and B's mover list (`0x0..0x1A000`), NC's mover image (`..0x20000`), **`DATA`**
+(`0x20000..0x100000`, 896 KiB, unchanged), **`CAPTURE_ONLY`** (`0x100000..0x116000`, where the mailboxes were: only a
+trace's capture plans there), **`PROGRAMS`** (the four fixed program slots, `0x116000..0x136000`), **`MAILBOXES`**
+(`0x136000..0x140000`, 40 KiB: the single-core and role mailboxes with their guard blocks and `Dst` dumps, both movers'
+mailboxes, the probes' scratch, NC's list ring), `TRACE` (the timestamper's buffer) and the program cache
+(`0x144000..0x180000`). `tt_isa::l1::REGIONS` and `l1::FIXED` (every block of the mailboxes) are checked at compile time.
+
+- **Every L1 address is a constant of `tt-isa`, shared by host and firmware.** A change of the map rebuilds every image
+  (`tt-firmware-images` embeds them) and needs no address edited elsewhere: the only literals were the probes' scratch,
+  now `mailbox::PROBE_SCRATCH`.
+- **After a map change, the first process on a card is a `Session` bring-up.** L1 survives between processes, and a core
+  still running an image of the old map polls addresses that are now `DATA` or `PROGRAMS`: an old mover reading a
+  garbage queue issues arbitrary NoC reads. A `Session` holds every baby core before it writes anything, and its
+  driver cleanup holds them again when the process ends; processes outside a `Session` (the harness's single-core
+  runs, probes) are not covered if they crash, so start with a `Session` gate. The first run after M2 was
+  `step185`/`step187`/`step188`/`step191`/`step219`/`step221`, then `step221` again in a new process.
+- **Growing `DATA` is not free even when nothing moves into it.** The first form of this change gave `DATA` the 88 KiB
+  (to `0x116000`); every choice sized from the arena changed with it: a `K` = 1024 product took 6 columns, not 5, and
+  left its residency region half the room; a `[512]^3` product's blocks and an element-wise op's run lengths changed
+  (36-37 tiles instead of 32, whose layouts then met in one half); a 113-tile `K` no longer needed a continuation; and on
+  one tile the longer column-sum runs' programs no longer fit the program cache beside a traced 135M's
+  (`step193`, silicon only). Hence the capture-only arena: eager sizes stay as they were, and only a capture, whose
+  choices are pinned (P3), sees the room.
+- **What guards it:** `step221_l1_map` poisons the capture-only arena (the old mailboxes) and every word of `MAILBOXES`
+  no `FIXED` block holds, runs eager ops, a norm, a product and a planned capture with replays, and requires every
+  poisoned word intact; on ttsim it also opens a
+  second session on the first's L1 and requires the same bits (ttsim starts every process from zeroed L1, so this is
+  how a gate there sees state an earlier process left).
+- **The free L1 below `OUTER_CHUNK` holds a layer body's argument table** (2026-10-23,
+  `docs/completed-plans/layer-sub-traces.md`): `dataflow::ARG_TABLE` at `0x12040`, 126 entries, between NC's 8-byte stub at
+  `0x12000` and `OUTER_CHUNK` (`0x13000`). B reads a table there for each `CALL_BODY`, and NC reads it in place
+  during the body's pairs. Both fence after the read lands (`publish`), so neither core's L0 data cache serves a
+  previous layer's table. B's safe image is 35,284 of 43,008 bytes since (it was 33,668), NC's 19,020 of 24,576.
+  After F1 and F2's credits (2026-10-28, `656e340`): B 35,344, NC 20,392.
+
+## A stalled replay: what to read (2026-10-23, card 0)
+
+A list that stops making progress is reported as `descriptor N did not finish`, which names only the tile the host
+waited on. With `TT_STALL_DUMP=1` the host prints, for each tile whose wait times out (`DataMover::dump_stall`):
+- both movers' descriptor, queue and trace-progress words;
+- the pair counters and NC's wait reasons;
+- the roles' generation, acknowledgement, status and panic words;
+- the barrier counter, poll, return and release words.
+
+How to read it:
+- Roles with generation equal to acknowledgement are idle.
+- NC with `SEQ == DONE` is not in a pair.
+- If every unit's last release is below the coordinator's counter, the units wait at a release-mode barrier. The
+  coordinator never releases when an arrival is missing: look for the unit that stopped before arriving. That is how
+  the layer sub-traces' one silicon bug was found (a unit with no repeated ops given an empty body, which the mover
+  refuses, so it never reached its tail's arrival); bisecting by capture and then by unit, with a temporary knob,
+  found the unit.
+
+## A role's addresses from GPRs: settle the Scalar Unit before `WRCFG` (2026-10-23, card 0)
+
+An element-wise kernel's and a reduction's unpack and pack now take each tile's L1 address from a Tensix GPR stepped
+by `ADDDMAREG`, so a tile's block is the same words for every tile and the runner repeats it
+(`sfpu::kernel::roles_looped`, `sfpu::reduce::roles_looped`; `docs/plans/long-context.md` 1.A). Written as
+`ADDDMAREG` then, at once, the `WRCFG` that reads the GPR into `THCON_SEC0_REG3_Base_address`, silicon unpacked from
+the GPR's old value where ttsim read the new one: every multi-tile element-wise and reduce gate failed on card 0
+(`1792793167`; an `add` returned `A`, `B` read from elsewhere). A `STALLWAIT` blocking the Configuration Unit on C0
+(this thread's Scalar Unit work outstanding) between them fixed all 39 (`1792793443`, `1792793456`):
+`datapath::gpr_settled`, before every `WRCFG` of a stepped GPR. tt-metal's Blackhole LLK does the same after its own
+GPR writes (`TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::THCON)`). The Wormhole page `ScalarUnit.md` says a thread's
+next instruction waits for a Scalar Unit instruction to complete; on Blackhole, for a `WRCFG` reading the result, that
+is not enough. `SETDMAREG` then `WRCFG` (every `config_program`) has always worked without it. The matmul's
+`gpr_step` (`ADDDMAREG`, `ADDDMAREG`, `WRCFG`, `WRCFG`) has none and passes; it is not known to be safe by
+construction. ttsim divergence row 104.
+
+## The timestamper repeats and drops events in a burst (2026-11-02, cards 0 and 1)
+
+The tile's debug timestamper (`tensix::timestamper`, `RISCV_DEBUG_REG_TIMESTAMP`) is not a reliable channel
+for a burst of events. RISCV B stamped each pair's batch tables back to back after a kernel's `ROLES_DONE`: six
+`BATCH_TIME`s a batch, ~25 per pair. On a 1.7B decode step (card 1, `1793635538`, `1793636433`), those streams
+held one event repeated four times, 64 cycles apart, with later events missing. That is faster than B's own
+loop could stamp: ~1,400 cycles a stamp once each was paced and fenced, in the card-0 debugging runs of the
+pipeline gate.
+- Pacing each stamp until the buffer position (`STATUS`) moved did not stop it.
+- Neither did a fence before every read of the tables.
+- The tables themselves were right: the host read them back clean (`step266_batch_tables`), and the plain
+  stores that copy them to L1 are.
+
+Stamps issued one at a time between other work (entries, credits, barriers) paired as expected in the same runs.
+Even a single stamp after a kernel is repeated now and then: about 5% of the `BATCH_BASE`s in that position came
+back two or more times (15,980 of ~347,000 on `Step(64)`, `1793638678`).
+
+**The rule:** send at most one event a moment through the timestamper. Put anything bulky in L1 with plain stores,
+and stamp one event naming it (`dm::BATCH_LOG`, `profile_mode::splice_batch_log`). A consumer must tolerate a
+repeated stamp: a record named twice in one drain is a repeat. The profile mode's existing three-stamp burst after
+a kernel (`ROLE_PUSH`, `ROLE_DRAIN`, `ROLE_WORDS`) is exposed to the same behaviour and has not been checked for it.
+
+## A pack from 32-bit `Dst` to BF16 keeps each datum's high half (2026-11-11, card 0)
+
+The packer configured as `datapath::pack_config` with `Out_data_format=5` (BF16) and `Read_32b_data=1` (what
+`bf16::compress` and a native BF16 SFPU result use) writes each FP32 `Dst` datum's high 16 bits, nothing else:
+over ~100,000 results of 15 element-wise ops on every BF16 class (signed zeros, subnormals, infinities, NaN
+payloads, ties) none differed from `bits >> 16` (`step270_native_bf16`, the `Out::Bf16Unrounded` control,
+`1794407220`). It truncates, NaN payloads and subnormals included: it neither rounds, nor quiets, nor flushes. A
+BF16 result's ties-even rounding is the SFPU quantize's alone (`bf16::quantize_code`), which zeroes the low half
+first, so the pack then moves exact bits. Without it 22-36% of the corpus's results changed (36 of 300 to 2,444
+of 6,700 per op). Not the rounding packer (`Round_10b_mant` and kin), which is unused.
 
 ## Handling silicon runs
 
@@ -1014,6 +1761,29 @@ Rules that held through the Phase 10 close-out; follow them for any new probe.
   the pattern, so it never ends and leaks shells; wait on the run's log or exit status instead.
 - **A worktree needs `vendor/`.** It is git-ignored, so copy it from the main checkout before building
   there (`cargo xtask fetch-ttsim`/`fetch-spec` also work).
+
+## Opening a card costs ~0.7 s, most of it BAR4's page tables (2026-10-29, card 0)
+
+`strace -f -T` of one fast Burn gate under the release silicon build
+(`step63_burn_full_reduce::full_views_and_row_slices_reduce_on_the_device`, 0.79 s wall, 0.66 s of it
+system time, 478 minor faults). The forked child spent:
+
+| Step | Time | Where |
+|---|---|---|
+| `mmap` BAR4 uncached and write-combining, 32 GiB each | 116 + 115 ms | `tt_kmd::Kmd::open` (`RESOURCE2_UC`, `RESOURCE2_WC`) |
+| AICLK busy settle, 14 polls 5 ms apart | ~72 ms | `Device::set_busy` (`arc_msg.rs`) |
+| 1 GiB hugepage host buffer, `MAP_POPULATE` | 52 ms | `HostBuffer::pin` |
+| AICLK idle settle, 7 polls | ~36 ms | `Device` drop |
+| `munmap` of the two BAR4 views | 182 + 190 ms | `Kmd` drop |
+| The gate itself | a few ms | |
+
+- **The cost is proportional to what is mapped.** The driver populates every PTE of a 32 GiB PFN
+  mapping when it is mapped and tears all of them down at `munmap`, about 600 ms of the 0.79 s.
+- **Most smoke gates are this short.** The suite's median of 0.81 s a test is mostly this fixed
+  cost.
+- **Not changed yet.** Mapping BAR4 lazily or a 4 GiB window at a time (`tt-kmd`, shippable) would
+  shorten every process that opens a card, the suite's and an application's. The
+  [test-tier notes](test-tiers.md#where-the-silicon-suites-time-goes) have the proposal.
 
 ## Running tt-metal after this repo's gates (2026-10-13, card 1)
 
@@ -1037,3 +1807,10 @@ hang after "Opening subset of mmio devices" (the first attempt, killed by its 50
   kernel JIT fails), so the working route is a tree with its own SFPI: `tt-metal-v077`'s `build_Release` (SFPI 7.69), which JIT-compiles
   kernels itself.
 - **Fast dispatch reserves cores:** the compute grid is 11x10 = 110 on a card where this repo has 12x10 = 120.
+- **2026-11-09, card 1, v077 (`d53c2a71fb0`), firmware bundle 19.14.0:** without a reset first, `ttnn.open_device` succeeded
+  but the first op hung silently, the process spinning at 95% CPU for over 10 minutes with no Ethernet-timeout message.
+  After `tt-smi -r 0000:02:00.0` every run worked. Reset the card before tt-metal, whatever the symptom.
+- **Afterwards, mesh gates fail until both boards are reset.** `cargo xtask silicon --device 1 --filter step12_mnist`
+  passed 7 of 8 on card 1 (`1794198015`). The eighth, a two-chip test, opens card 0 too whatever `--device` says, and
+  failed with "transfer 1 was not acknowledged", the link state above. A `--device 1` filter is not fenced to card 1
+  when it selects a mesh test.

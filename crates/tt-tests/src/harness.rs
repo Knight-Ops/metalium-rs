@@ -193,8 +193,13 @@ impl<'a> Run<'a> {
 
     /// Have each role record `START`, `PUSHED` and `RETIRED` through the
     /// tile's timestamper (`tt_isa::mailbox::trace`), returned in
-    /// [`Outcome::trace`]. Silicon only: ttsim's support is its own probe.
+    /// [`Outcome::trace`]. Silicon only: ttsim's support is its own probe. The firmware stamps
+    /// only when built with `profile` (`tt-tests/profile`, `cargo xtask silicon --profile`):
+    /// refused without it, rather than returning an empty trace.
     pub fn traced(mut self) -> Self {
+        if !cfg!(feature = "profile") {
+            panic!("a traced run needs the `profile` firmware: cargo xtask silicon --profile");
+        }
         self.trace = true;
         self
     }

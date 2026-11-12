@@ -456,6 +456,7 @@ dependencies = [
  "half",
  "libm",
  "num-traits",
+ "rayon",
 ]
 
 [[package]]
@@ -5003,6 +5004,7 @@ name = "tt-ttsim"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rayon",
  "tt-device",
  "tt-isa",
  "tt-ttsim-sys",

@@ -156,7 +156,7 @@ fn footprint_of_passes<T: tt_device::Transport>(
     assert_eq!(units.len(), sections.len());
     for (u, (fp, sec)) in units.iter().zip(&sections).enumerate() {
         let stored: u32 = sec.iter().sum();
-        // The stream's entries are its own plus every section's, padding included.
+        // The stream's entries are its own and every section's, padding included.
         assert_eq!(
             fp.stream.entries,
             fp.top_level_entries + stored,
@@ -169,10 +169,32 @@ fn footprint_of_passes<T: tt_device::Transport>(
             "unit {u}"
         );
         assert!(fp.gddr_bytes >= fp.stream.entries as u64 * 32, "unit {u}");
+        // The stream and its sections share one region: their entries, each part from a 64-byte
+        // boundary, rounded up to whole slots once (not a slot a section).
+        let parts = sec.len() as u64 + 1;
+        let packed = fp.stream.entries as u64 * 32 + 64 * parts;
+        assert!(
+            fp.gddr_bytes <= packed.next_multiple_of(tt_isa::dm::TILE_SLOT),
+            "unit {u}: {} GDDR bytes for {} entries in {} sections",
+            fp.gddr_bytes,
+            fp.stream.entries,
+            sec.len()
+        );
         assert!(fp.top_level_entries <= fp.stream.entries, "unit {u}");
         assert!(fp.program_bytes <= fp.cache_held_bytes, "unit {u}: {fp:?}");
         assert!(fp.cache_held_bytes <= fp.cache_bytes, "unit {u}: {fp:?}");
         assert!(fp.programs > 0 && fp.program_bytes > 0, "unit {u}");
+        // A replay's movers restore its programs from a copy of each in GDDR, each from a 64-byte
+        // boundary plus its address's residue, rounded up to whole slots once.
+        let most = fp.program_bytes + 128 * fp.programs as u64;
+        assert!(
+            fp.program_store_bytes >= fp.program_bytes
+                && fp.program_store_bytes <= most.next_multiple_of(tt_isa::dm::TILE_SLOT),
+            "unit {u}: {} GDDR bytes for {} program bytes in {} programs",
+            fp.program_store_bytes,
+            fp.program_bytes,
+            fp.programs
+        );
     }
     let what = if shapes.len() > 1 {
         "layer-forward (mixed shapes)"
@@ -221,6 +243,10 @@ fn footprint_of_passes<T: tt_device::Transport>(
 /// The same pass captured once, twice and four times in one trace: the stream grows with the
 /// ops, the pinned programs do not.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step174_trace_footprint"
+)]
 fn a_repeated_pass_grows_the_stream_and_pins_no_new_programs() {
     for tiles in [1, 2] {
         with_tiles(tiles, |s| {
@@ -248,6 +274,10 @@ fn a_repeated_pass_grows_the_stream_and_pins_no_new_programs() {
 /// The control for the test above: a pass of another shape does pin more programs, so equal
 /// counts there mean shared programs, not a count that cannot move.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step174_trace_footprint"
+)]
 fn a_pass_of_another_shape_pins_more_programs() {
     with_tiles(1, |s| {
         let same = footprint_of_passes(s, 2, 1, &[MNIST]);
@@ -264,6 +294,10 @@ fn a_pass_of_another_shape_pins_more_programs() {
 
 /// A stream long enough to cross chunks pays padding; the small passes above do not.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step174_trace_footprint"
+)]
 fn a_long_section_pays_chunk_padding_in_entries_and_bytes() {
     with_tiles(1, |s| {
         let chunk = tt_isa::dm::TRACE_CHUNK_ENTRIES;

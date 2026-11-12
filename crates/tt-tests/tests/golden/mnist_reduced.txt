@@ -1,6 +1,6 @@
-# The reduced MNIST run's loss per step, as f32 bits. Written by the ttsim run
-# of step12_mnist::the_mlp_trains_on_a_reduced_dataset with TT_BLESS=1; the
-# silicon run must reproduce it exactly.
+# The reduced MNIST run's loss per step, as f32 bits. Written by the silicon run
+# of step12_mnist::the_mlp_trains_on_a_reduced_dataset with TT_BLESS=1; every
+# other configuration must reproduce it exactly.
 40148d03 2.3211067
 400bafe6 2.182611
 400c457e 2.1917415

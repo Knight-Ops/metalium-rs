@@ -627,7 +627,7 @@ specification does not make.
       signature change, and `TileImage` sizes and places the shared-exponent section
       for BFP8/4/2. Native device pack/unpack and independent f64/integer encoding
       oracles now pass step92/94 on both cards. `tt-layout` retains only ordinary
-      host scalar conversions; see [the delivered storage contract](../plans/mixed-bfp-storage.md).
+      host scalar conversions; see [the delivered storage contract](mixed-bfp-storage.md).
 - [x] **Gate (silicon):** passed on both cards (two tests).
       **The alignment scope is narrower than the plan first assumed.**
       `WormholeB0/NoC/Alignment.md:19,23` says data travelling *from the host via
@@ -1578,7 +1578,7 @@ table. Ticks happen there. The rationale is `phases-0-10-roadmap.md`, "Phase 10"
 - [x] **10.3** Native general reductions/scans, pooling and norms landed; the payload-preserving transpose is the mover's `READ_TRANSPOSED`/repack (M3 `[-]`).
 - [x] **10.4** BF16 and FP16 storage and casts, BF16 compute, I32 ALU/casts, checked division/remainder and integer scans/masks landed; see hardware coverage.
 - [x] **10.5** Resident indexing (including ND gather/scatter), convolution/attention, gradients and mesh trace replay landed.
-- [x] **10.6** M1 `ELW*`, BFP8/4/2 storage, native seeded random (S7), `SFPLOADMACRO` (S9) and `SHIFTXB` (M4) landed; `DOTPV` and `SHIFTXA` are excluded. D2 is complete only for delivered formats. See [mixed BFP storage](../plans/mixed-bfp-storage.md).
+- [x] **10.6** M1 `ELW*`, BFP8/4/2 storage, native seeded random (S7), `SFPLOADMACRO` (S9) and `SHIFTXB` (M4) landed; `DOTPV` and `SHIFTXA` are excluded. D2 is complete only for delivered formats. See [mixed BFP storage](mixed-bfp-storage.md).
 
 ---
 

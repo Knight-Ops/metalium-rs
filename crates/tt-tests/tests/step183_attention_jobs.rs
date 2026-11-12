@@ -5,7 +5,8 @@
 //! the shapes the model ladder runs -- a SmolLM2 decode step (nine heads of one query over a cache
 //! stacked by rows), ViT-Tiny (three heads of 197 tokens, read in place from one projection) and a
 //! causal prefill -- and holds each product to **one job** (P1, P2; it was `3 heads + 1`: 28 of a
-//! decode call's 64 jobs each). Run with `--nocapture` to see the table.
+//! decode call's 64 jobs each). With no softcap, a mask is applied in the scale's own job
+//! (`kind_sfpu::SCALE_MASK_FILL`), so `/mask` holds none. Run with `--nocapture` to see the table.
 //!
 //! Each call's result is bit for bit the same attention run one head at a time: every product is
 //! `matmul_dram`'s on its head's blocks either way (`step184`), and the softmax is per row. Where
@@ -109,10 +110,11 @@ fn jobs(
     assert_eq!(of("attention"), 0, "{what}: every job is charged to a part");
     assert_eq!(of("attention/qk"), 1, "{what}: q k^T is one job");
     assert_eq!(of("attention/pv"), 1, "{what}: p v is one job");
+    assert_eq!(of("attention/scale"), 1, "{what}: the scale is one job");
     assert_eq!(
         of("attention/mask"),
-        u64::from(causal),
-        "{what}: a kept causal mask is one mask_fill"
+        0,
+        "{what}: a kept causal mask rides in the scale's job (`SCALE_MASK_FILL`)"
     );
     rows
 }

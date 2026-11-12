@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::testrun::{build, list, run_one, Built, Verdict};
+use crate::testrun::{build, list_all, run_one, Built, Verdict};
 use crate::util::workspace_root;
 
 struct Opts {
@@ -38,6 +38,10 @@ struct Opts {
     /// Extra `tt-tests` features for the build, beyond `silicon`.
     features: Vec<String>,
     timeout: Duration,
+    /// `--timeout-secs` was given: it holds for every test, [`LONG`] included.
+    timeout_given: bool,
+    /// Run each test in burn-tt's profile mode (`TT_PROFILE`), each into a directory of its own.
+    profile: bool,
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
@@ -50,6 +54,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         release: false,
         features: Vec::new(),
         timeout: Duration::from_secs(120),
+        timeout_given: false,
+        profile: false,
     };
     let mut smoke = false;
     let mut args = args.peekable();
@@ -77,12 +83,18 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
                     v.parse()
                         .map_err(|_| format!("`--timeout-secs {v}`: expected a number"))?,
                 );
+                o.timeout_given = true;
             }
             "--smoke" => smoke = true,
             "--include-ignored" => o.include_ignored = true,
             "--keep-going" => o.keep_going = true,
             "--list" => o.list_only = true,
             "--release" => o.release = true,
+            "--profile" => {
+                // The profile mode needs firmware that can stamp (`tt-tests`'s `profile`).
+                o.profile = true;
+                o.features.push("profile".to_string());
+            }
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
@@ -98,12 +110,50 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
 /// minute finding it. Simulator validation is plain `cargo test`; this is the
 /// tier that says burn-tt still computes what Burn's CPU backend computes, on
 /// the hardware it is for.
+/// Gates that need longer than the default limit, by `binary::test`, with the least time each
+/// is given unless `--timeout-secs` says otherwise: about 1.7x its last measured run.
+const LONG: &[(&str, u64)] = &[
+    // 2,138 s on card 0, 1,472 of it burn-flex's 8,192-position reference (`1792941361`).
+    (
+        "step188_smollm2_1_7b::the_native_context_agrees_with_flex",
+        3600,
+    ),
+    // 127-137 s on card 0 (`1793118783`, `1793123581`, `1793216293`): past the default, so it
+    // timed out unless a run raised the limit (`1793216268`).
+    (
+        "step188_smollm2_1_7b::traced_generation_equals_the_eager_one",
+        240,
+    ),
+    // 116-135 s on card 0 (`1793030672`, `1793123716`): about the default, so it timed out at
+    // 120.16 s in a run that otherwise passed (`1793216912`).
+    ("step188_smollm2_1_7b::device_agrees_with_flex", 240),
+    // The performance contract's model gate: 357 s on card 0 for all eight prompts
+    // (`1794287910`), 287 s for the smoke run's two (`1794287596`), burn-flex's F32 run and three
+    // traced 1.7B builds each.
+    (
+        "step269_performance_contract::smollm2_1_7b_agrees_with_huggingface_under_each_contract",
+        660,
+    ),
+    (
+        "step269_performance_contract::smollm2_1_7b_agrees_with_huggingface_smoke",
+        500,
+    ),
+    // 383 s on card 0 (`1793550834`), beside a bench on card 1: it timed out at the default 120 s,
+    // and its child, still holding the card, failed the next gate's attach (`1793550535`).
+    (
+        "step224_long_context::traced_generation_equals_the_eager_one_at_long_context",
+        660,
+    ),
+];
+
 pub const SMOKE: &[&str] = &[
     // The B mover's read mode, whichever way the firmware was built: the safe image's
     // refusals, or with `--feature fast-reads` the encoded reads' (step172).
     "step172_encoded_reads::",
     "step173_mover_differential::",
     "step19_eltwise::",
+    // Reductions, a line past one run's 219 tiles included (the continuations).
+    "step31_reduce::",
     "step27_burn_eltwise::",
     "step32_burn_softmax::",
     "step35_burn_rank_n::",
@@ -221,8 +271,131 @@ pub const SMOKE: &[&str] = &[
     // SmolLM2's decode step with fixed shapes, traced and replayed at every position (roadmap
     // Track 2 item 6).
     "step185_fixed_decode::",
+    // A buffer read transposed as a matmul's `B` is transposed once (`replay-fixed-cost.md` P2).
+    "step186_kept_transpose::",
+    // Traced generation for any fixed-shape decoder: a step and prefill chunks over one cache
+    // (roadmap Track 2 item 6, next steps 2 and 3).
+    "step187_traced_generation::",
+    // `scatter_nd` with `Assign` as one row scatter at resident indices (NC's `SCATTER_ROWS`): a
+    // fixed cache's write of one row a head, not the whole cache (roadmap Track 2 item 6, step 6).
+    "step189_scatter_rows::",
+    // A matmul reads only the rows of `A`'s last tile row it uses (decode-matmul-bandwidth P1).
+    "step190_thin_matmul::",
+    // `Llama::fused`: `q|k|v` and `gate|up` one product each, bit for bit the unfused model (P3).
+    "step191_fused_projections::",
+    // Element-wise ops on block views read in place, and RoPE on a projection's heads by tile
+    // copies (decode-small-ops.md S1, S2a).
+    "step192_block_views::",
+    // A decode step traced on `Fusion<TtBackend>`, bit for bit `TtBackend`'s (decode-small-ops.md F0).
+    "step193_fusion_decode_trace::",
+    // Burn's default sigmoid, silu and silu(gate) * up fused on `Tt` (kernel-fusion.md Phase 2).
+    "step194_fused_sigmoid_silu::",
+    // RMSNorm up to its scale as one kernel on `Tt` (decode-small-ops.md S3).
+    "step195_fused_rms_norm::",
+    // RMSNorm's statistic over only the row groups a tile row's rows occupy (decode-small-ops.md S3).
+    "step196_row_limited_rms::",
+    // A traced decode step's GDDR bytes, counted at its store: each weight read once
+    // (decode-step-bandwidth.md B0).
+    "step197_trace_bytes::",
+    // A traced decode step's cache written in place, a stale read refused by name
+    // (in-place-cache-write.md D1-D3).
+    "step199_in_place_cache_write::",
+    // Element-wise ops on a decode row's row groups only (decode-to-bandwidth.md Phase 3).
+    "step200_row_limited_eltwise::",
+    // A matmul's transposed `B` transposed by the unpacker, bit for bit the mover's (decode-attention.md).
+    "step201_unpacker_transposed_b::",
+    // A native repack's reads in flight together (decode-to-bandwidth.md Phase 1).
+    "step202_repack_reads::",
+    // A product's last tile row computes only its rows (decode-to-bandwidth.md Phase 4).
+    "step203_live_rows::",
+    // A one-row product reads a packed `A`, and a blocked `K` streams (decode-to-bandwidth.md Phase 4).
+    "step204_packed_thin_a::",
+    // A captured product's weights prefetched on idle units (decode-to-bandwidth.md Phase 5).
+    "step205_weight_prefetch::",
+    // A column operand broadcast by the SFPU, read as it lies (decode-to-bandwidth.md Phase 3).
+    "step206_sfpu_col_broadcast::",
+    // A one-row result written packed by the op that makes it (decode-to-bandwidth.md Phase 3).
+    "step207_packed_twin::",
+    // Barriers released by unit 0's multicast, each unit waiting on its own L1 (decode-to-bandwidth.md Phase 3).
+    "step208_barrier_release::",
+    // A decode step's attention a key/value head on one unit, bit for bit (decode-to-bandwidth.md Phase 6).
+    "step209_attention_rows::",
+    // A decode row's RMSNorm statistic and `DIV` as one op (decode-to-bandwidth.md Phase 7).
+    "step210_rms_divide::",
+    // A row's argmax as one native op; the token chosen on the card; RoPE as one op (decode-to-bandwidth.md Phase 7).
+    "step211_argmax_row::",
+    "step212_device_sampling::",
+    "step213_rope::",
+    // The Phase 8 probe's switches: weights skipped, a background stream (decode-to-bandwidth.md Phase 8).
+    "step214_stream_ceiling_probe::",
+    // B's prefetch reads on a transaction ID of their own (decode-to-bandwidth.md Phase 8).
+    "step215_prefetch_txn::",
+    // A product's own units reading their first job's `B` ahead, in a capture (opt-in).
+    "step216_busy_prefetch::",
+    // A captured graph's L1 residency plan, reported only (planned-l1-residency.md Phase 1).
+    "step217_residency_plan::",
+    // NC writing another tile's L1 (planned-l1-residency.md Phase 2b).
+    "step218_l1_write_records::",
+    // A planned capture keeping its tensors in L1 (planned-l1-residency.md Phase 2), its region
+    // sized by its plan and its plan cached (2h).
+    "step219_residency_decode::",
+    // A row read whole on many units, delivered by each scheme (planned-l1-residency.md 2f).
+    "step220_row_delivery::",
+    // The L1 map: nothing writes the old or the new mailboxes outside their blocks
+    // (decode-to-bandwidth.md Phase 8, M2).
+    "step221_l1_map::",
+    // A capture leaves the program slots alone, and the eager runtime writes them again after
+    // one (decode-to-bandwidth.md Phase 8, P2).
+    "step222_programs_for_traces::",
+    // A grouped-query mask read as a block of whole tile rows, not a row gather
+    // (long-context.md D3).
+    "step227_block_broadcast::",
+    // Attention's softmax over rows of any length as one op, bit for bit the composition
+    // (roadmap Track 1, "The long-context softmax"; opt-in in burn-tt).
+    "step230_softmax_rows::",
+    "step231_ttinsn_push::",
+    // An embedding's gradient at resident indices, three ops an index in index order, where the
+    // mask loop took ~20 (the tt-mnist transformer 92 -> 26 ms/step).
+    "step236_select_add_rows::",
+    // A gather and a scatter-add of one index a row (cross-entropy's), 2 and 6 jobs where 8 and 18.
+    "step237_column_picks::",
+    // Hypothesis H3 (docs/learnings/dataflow-compiler.md): the fidelity phases the operand
+    // formats need give HiFi4's bits.
+    "step238_exact_fidelity::",
+    // F1c: a weight stored in any packed format (BF16, BFP8/4/2) multiplies as its decoded
+    // values on every product path, and H3 for TF32 beside BFP.
+    "step239_packed_weight_products::",
+    // F1c through burn-tt: a model with BFP-stored weights is the F32 model holding the values
+    // they decode to, bit for bit, eager and traced, with no weight widened.
+    "step240_bfp_weight_storage::",
+    // F2: cross-core channels; pages handed over by NoC atomic credits (remote, broadcast and
+    // GDDR rings), a missing credit stalls and is cancelled, malformed credits refused.
+    "step242_channel_credits::",
+    // F4b: operand reuse; a blocked product's readers copy `A` from a holder's L1 under credits,
+    // bit for bit the unshared product, eager and replayed, every credit word back at zero.
+    "step244_operand_reuse::",
+    // F4b.2: a measured block choice; the chosen candidate runs bit for bit, a question is
+    // timed once, and a capture paused to measure records what it would unpaused.
+    "step245_measured_block::",
+    // F5: `Dst` subblocks under half-sync (the default product kernel) are the one-tile kernel
+    // bit for bit, every format and model shape; clearing both halves or overlapping them fails.
+    "step246_dst_subblocks::",
+    // F4a.1: kept barriers lowered to per-edge credits (opt-in); sparse ops and a SmolLM2-135M
+    // decode replay bit for bit, a dropped edge and an unbalanced credit refused.
+    "step265_edge_credits::",
+    // Roadmap 2b, Phase C1: weights laid by column (the default for stored weights); one-row
+    // products read by column and blocks a tile at a time, bit for bit against interleaved,
+    // eager and replayed; the weight holds what was stored; its channels rotated give other bits.
+    "step268_column_weights::",
+    // Roadmap W1, native BF16 arithmetic: a BF16 edge is its widened edge over every pattern;
+    // BF16 tensors in their own slots; element-wise ops on BF16 operands are their widened op
+    // rounded once, bit for bit, and without the quantize differ.
+    "step270_native_bf16::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
+    // ADR 0006, roadmap W1: the performance contract's model gate on its first two prompts
+    // (the 1.7B traced under each contract, teacher-forced against HuggingFace).
+    "step269_performance_contract::smollm2_1_7b_agrees_with_huggingface_smoke",
     "step165_resnet18::",
     "step166_vit_tiny::",
     "step170_checkpoint_round_trip::",
@@ -233,6 +406,13 @@ pub const SMOKE: &[&str] = &[
     "step12_mnist::the_first_forward_pass",
     "step12_mnist::the_mlp_trains_on_a_reduced_dataset",
     "step12_mnist::the_mlp_trains_on_four_tiles",
+    // Model workloads that left the simulator tier (docs/learnings/test-tiers.md): their only
+    // routine run is this one.
+    "step12_mnist::compare_all_four_execution_modes",
+    "step12_mnist::the_mlp_trains_sharded_over_two_chips",
+    "step34_batching::several_lists_per_unit_queued",
+    "step40_burn_trace::transformer_traced_training",
+    "step174_trace_footprint::",
     "step59_burn_transformer::",
     "step60_batched_blocks::",
     "step61_burn_gather::",
@@ -369,19 +549,26 @@ usage: cargo xtask silicon [options]
   --device N|all        which /dev/tenstorrent/N to run against (default 0);
                         `all` runs the whole selection on each card in turn
   --filter S            run only tests whose `binary::test` name contains S;
-                        repeatable, and the selection runs in filter order
+                        repeatable, and the selection runs in filter order. S
+                        selects from the binaries whose name contains its part
+                        before `::` (only those are built); S whose part names
+                        no binary selects from all of them
   --smoke               the everyday smoke test: burn-tt against burn-flex,
                         from single ops up to the reduced training runs
                         (adds the filters in `SMOKE`, after any given)
   --include-ignored     also run #[ignore] tests (the exploratory probes)
   --keep-going          do not stop at the first failure
-  --timeout-secs N      per-test wall-clock limit (default 120)
+  --timeout-secs N      per-test wall-clock limit (default 120; the few gates listed
+                        in `LONG` get at least theirs unless this is given)
   --feature NAME        also build `tt-tests` with this feature (repeatable): the opt-in
                         experiment `ttinsn-experiment`, or the B mover's read mode,
                         `fast-reads` (host-encoded reads) or `encoded-guard` (and the card's
                         guard); the default is the safe mode
   --release             build the suite optimised; every timing worth quoting
                         comes from this, since the dev build is not a baseline
+  --profile             run each test in burn-tt's profile mode (`TT_PROFILE`): where the
+                        device's and the host's time goes, by Burn op, eager and traced,
+                        written to target/silicon/profile/<stamp>/<test>/chip<N>/
   --list                print the selection and exit without touching a card";
 
 /// Every card the driver has enumerated.
@@ -417,6 +604,9 @@ pub const BENCH: &[&str] = &[
     "silicon_bench_eth::",
     "silicon_perf::pcie_l1",
     "silicon_perf::pcie_dram",
+    // `tt-mnist`'s training as the binary runs it (MNIST at both sizes, the transformer), beside
+    // burn-flex: the scoreboard's rows went stale for three weeks without it.
+    "bench_training::",
 ];
 
 pub const BENCH_USAGE: &str = "\
@@ -504,7 +694,7 @@ pub fn bench(args: impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 /// A value from one flat JSON object, as its text, quotes removed.
-fn json_field(obj: &str, key: &str) -> Option<String> {
+pub(crate) fn json_field(obj: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\":");
     let start = obj.find(&pat)? + pat.len();
     let rest = &obj[start..];
@@ -524,11 +714,15 @@ type Results = Vec<(u16, String, Verdict, PathBuf)>;
 
 fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
     let root = workspace_root();
-    let binaries = build(&root, o.release, &select(&o.features))?;
+    let binaries = build(
+        &root,
+        o.release,
+        &select(&o.features, &targets(&root, &o.filters)),
+    )?;
 
     let mut selection = Vec::new();
-    for b in &binaries {
-        for test in list(&b.exe, o.include_ignored)? {
+    for (b, tests) in binaries.iter().zip(list_all(&binaries, o.include_ignored)?) {
+        for test in tests {
             let full = format!("{}::{test}", b.name);
             selection.push((full, b.clone(), test));
         }
@@ -596,8 +790,20 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
                 .join(format!("{stamp}-dev{dev}-{}.txt", full.replace("::", "__")));
             let started = Instant::now();
             // `cargo test` runs a package's tests from its own directory.
-            let env = [("TT_SILICON_DEVICE", dev.to_string())];
-            let verdict = run_one(&bin.exe, test, &bin.dir, &env, o.timeout, &out_path)?;
+            let mut env = vec![("TT_SILICON_DEVICE", dev.to_string())];
+            if o.profile {
+                let at = dir
+                    .join("profile")
+                    .join(stamp.to_string())
+                    .join(full.replace("::", "__"));
+                println!("dev{dev} profile {}", at.display());
+                env.push(("TT_PROFILE", at.display().to_string()));
+            }
+            let timeout = match LONG.iter().find(|(name, _)| *name == full) {
+                Some(&(_, secs)) if !o.timeout_given => o.timeout.max(Duration::from_secs(secs)),
+                _ => o.timeout,
+            };
+            let verdict = run_one(&bin.exe, test, &bin.dir, &env, timeout, &out_path)?;
             let secs = started.elapsed().as_secs_f64();
             log.line(&format!(
                 "{} boot={boot} dev={dev} END {full} {verdict} {secs:.2}s",
@@ -626,22 +832,62 @@ fn run_opts(o: &Opts) -> Result<(u64, Results), String> {
 }
 
 /// The cargo selection for the silicon test binaries: `tt-tests` with its `silicon`
-/// feature (and any experiment features the caller asked for), and the Burn
-/// conformance suite built for silicon too, whose smoke subset `SMOKE` lists.
-fn select(features: &[String]) -> Vec<String> {
+/// feature (and any experiment features the caller asked for), the Burn
+/// conformance suite built for silicon too, whose smoke subset `SMOKE` lists, and
+/// `tt-mnist`'s benchmarks; only the test binaries `targets` names, if it names any.
+fn select(features: &[String], targets: &Option<Vec<String>>) -> Vec<String> {
     let features: Vec<String> = std::iter::once("silicon".to_string())
         .chain(features.iter().cloned())
         .map(|f| format!("tt-tests/{f}"))
         .chain(std::iter::once("burn-tt-conformance/silicon".to_string()))
         .collect();
-    vec![
+    let mut select: Vec<String> = vec![
         "-p".into(),
         "tt-tests".into(),
         "-p".into(),
         "burn-tt-conformance".into(),
+        // Its training benchmarks (`crates/tt-mnist/tests/bench_training.rs`, ignored: run by
+        // `cargo xtask bench`), which run the `tt-mnist` binary cargo builds beside them.
+        "-p".into(),
+        "tt-mnist".into(),
         "--features".into(),
         features.join(","),
-    ]
+    ];
+    for t in targets.iter().flatten() {
+        select.extend(["--test".into(), t.clone()]);
+    }
+    select
+}
+
+/// The test binaries the filters can select from, so a filtered run builds only
+/// those (linking all of them takes minutes). A filter selects from the binaries
+/// whose name contains its first `::`-separated part. `None`, build everything,
+/// when there are no filters or a filter's first part is in no binary's name: it
+/// may be a test path, matched in any binary.
+fn targets(root: &Path, filters: &[String]) -> Option<Vec<String>> {
+    if filters.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = ["tt-tests", "burn-tt-conformance", "tt-mnist"]
+        .iter()
+        .flat_map(|c| std::fs::read_dir(root.join("crates").join(c).join("tests")).into_iter())
+        .flatten()
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            (p.extension()? == "rs").then_some(())?;
+            Some(p.file_stem()?.to_str()?.to_string())
+        })
+        .collect();
+    let mut want = std::collections::BTreeSet::new();
+    for f in filters {
+        let bin = f.split("::").next().unwrap_or_default();
+        let hits: Vec<&String> = names.iter().filter(|n| n.contains(bin)).collect();
+        if bin.is_empty() || hits.is_empty() {
+            return None;
+        }
+        want.extend(hits.into_iter().cloned());
+    }
+    Some(want.into_iter().collect())
 }
 
 /// Binaries whose tests always run on card 0 (`TtDevice::default()`), whatever

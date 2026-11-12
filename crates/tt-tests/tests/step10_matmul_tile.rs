@@ -778,7 +778,7 @@ fn ttsim_models_the_timestamper_clock_but_not_its_event_stream() {
 }
 
 /// Each role's `(START, RETIRED)` interval, by thread, from a traced run.
-#[cfg(feature = "silicon")]
+#[cfg(all(feature = "silicon", feature = "profile"))]
 fn role_intervals(trace: &[tt_device::trace::TraceEvent]) -> [(u64, u64); 3] {
     use tt_isa::mailbox::trace as ev;
     let at = |thread: u32, event: u32| {
@@ -806,9 +806,9 @@ fn role_intervals(trace: &[tt_device::trace::TraceEvent]) -> [(u64, u64); 3] {
 /// The timestamper shows what the results only imply: released together, the
 /// three roles of a tile matmul run *at the same time* -- every role starts
 /// before any has retired -- and released in order, they do not. Nine events
-/// per run, one counter, three cores.
+/// per run, one counter, three cores. The firmware stamps only with `profile`.
 #[test]
-#[cfg(feature = "silicon")]
+#[cfg(all(feature = "silicon", feature = "profile"))]
 fn the_timestamper_shows_the_roles_overlap() {
     let (a, b) = small_integer_operands(0x71ce);
     let concurrent = Staged::new(&a, &b, 2, Handoff::Semaphore);

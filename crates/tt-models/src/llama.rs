@@ -1,17 +1,22 @@
-//! A decoder-only Llama-architecture language model: SmolLM2-135M.
+//! A decoder-only Llama-architecture language model, its shape a [`LlamaConfig`]: pre-norm layers
+//! of grouped-query attention with rotary position embeddings and a SwiGLU MLP, the output head
+//! either the embedding table (`tie_word_embeddings`) or an `lm_head`. SmolLM2-135M
+//! ([`SMOLLM2_135M`]) is the checkpoint the gates load; the code is the architecture's, not that
+//! model's.
 //!
-//! 30 pre-norm layers of grouped-query attention (9 query heads, 3 key/value heads, head size 64)
-//! with rotary position embeddings, and a SwiGLU MLP, over a 49,152-token vocabulary whose
-//! embedding table is also the output projection (`tie_word_embeddings`). Written with Burn's own
-//! `Embedding`, `Linear` and `RmsNorm`, so it exercises what a real model uses: RMSNorm, SiLU, RoPE
-//! (`sin` and `cos` computed on the device from the positions), `cat`/`slice` for the rotation,
-//! and a key/value cache kept in preallocated tensors and filled with `slice_assign`.
+//! Written with Burn's own `Embedding`, `Linear` and `RmsNorm`, so it exercises what a real model
+//! uses: RMSNorm, SiLU, RoPE (`sin` and `cos` computed on the device from the positions),
+//! `cat`/`slice` for the rotation, and a key/value cache kept in preallocated tensors. Two caches:
+//! a growing one filled with `slice_assign` at host positions ([`Llama::forward`], the eager
+//! reference), and a [`FixedCache`] whose steps have the same shapes at every position
+//! ([`Llama::step_fixed`], [`Llama::step_chunk`]), so they can be traced
+//! ([`crate::generate::TracedGenerator`]).
 //!
-//! Field names follow the checkpoint, so only the `model.` prefix and the norms' `weight` need
-//! remapping on load (`Layout::remaps`: Burn's `RmsNorm` calls its scale `gamma`, and `burn-store`'s
-//! PyTorch adapter renames only batch, layer and group norms).
+//! Field names follow the HuggingFace checkpoints, so only the `model.` prefix and the norms'
+//! `weight` need remapping on load (`Layout::remaps`: Burn's `RmsNorm` calls its scale `gamma`, and
+//! `burn-store`'s PyTorch adapter renames only batch, layer and group norms).
 //!
-//! The checkpoint is BF16. [`Precision::Bf16`] keeps it so, and every activation follows;
+//! A checkpoint in BF16 stays so under [`Precision::Bf16`], and every activation follows;
 //! [`Precision::F32`] widens each parameter once after loading (lossless), which is what makes a
 //! comparison with burn-flex a comparison of the same arithmetic on the same values.
 
@@ -23,18 +28,95 @@ use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{DType, Int, Tensor, TensorData};
 
+pub use crate::generate::Generation;
+use crate::generate::{argmax, FixedShapeCache, FixedShapeDecoder};
+use crate::kv_cache::{CacheLayout, FixedCache, FixedWrite};
 use crate::load::{load_safetensors, weights_path, Layout, LoadError, Loaded};
+use crate::rope::Rope;
 
-pub const HIDDEN: usize = 576;
-pub const HEADS: usize = 9;
-pub const KV_HEADS: usize = 3;
-pub const HEAD_DIM: usize = HIDDEN / HEADS;
-pub const GROUPS: usize = HEADS / KV_HEADS;
-pub const FF: usize = 1536;
-pub const VOCAB: usize = 49_152;
-pub const FULL_LAYERS: usize = 30;
-const ROPE_THETA: f64 = 100_000.0;
-const EPS: f64 = 1e-5;
+/// The shape of a Llama-architecture model: what differs between SmolLM2, Llama 2 and 3,
+/// Mistral (bar its sliding window) and their kin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LlamaConfig {
+    /// The residual stream's width.
+    pub hidden: usize,
+    /// Query heads, key/value heads (grouped-query attention when fewer), and each head's width.
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    /// The MLP's inner width.
+    pub ff: usize,
+    pub vocab: usize,
+    pub layers: usize,
+    pub rope_theta: f64,
+    /// RMSNorm's epsilon.
+    pub eps: f64,
+    /// The output projection is the embedding table (`tie_word_embeddings`), not an `lm_head`.
+    pub tied_head: bool,
+}
+
+/// SmolLM2-135M (`HuggingFaceTB/SmolLM2-135M`): 30 layers of 9 query and 3 key/value heads of 64,
+/// a 49,152-token vocabulary, the head tied to the embedding.
+pub const SMOLLM2_135M: LlamaConfig = LlamaConfig {
+    hidden: 576,
+    heads: 9,
+    kv_heads: 3,
+    head_dim: 64,
+    ff: 1536,
+    vocab: 49_152,
+    layers: 30,
+    rope_theta: 100_000.0,
+    eps: 1e-5,
+    tied_head: true,
+};
+
+/// SmolLM2-1.7B-Instruct (`HuggingFaceTB/SmolLM2-1.7B-Instruct`): 24 layers of 32 query and 32
+/// key/value heads of 64 (multi-head attention), width 2048, an MLP of 8,192, SmolLM2's
+/// 49,152-token vocabulary, the head tied to the embedding. Checked against the checkpoint's
+/// `config.json` by `crates/tt-models/reference/llama_reference.py`
+/// (`tests/llama_1_7b_host.rs`).
+pub const SMOLLM2_1_7B_INSTRUCT: LlamaConfig = LlamaConfig {
+    hidden: 2048,
+    heads: 32,
+    kv_heads: 32,
+    head_dim: 64,
+    ff: 8192,
+    vocab: 49_152,
+    layers: 24,
+    rope_theta: 130_000.0,
+    eps: 1e-5,
+    tied_head: true,
+};
+
+impl LlamaConfig {
+    /// The same architecture with its first `layers` layers.
+    pub fn with_layers(self, layers: usize) -> Self {
+        Self { layers, ..self }
+    }
+
+    /// Query heads that share a key/value head.
+    pub fn groups(&self) -> usize {
+        self.heads / self.kv_heads
+    }
+
+    fn check(&self) {
+        assert!(
+            self.layers >= 1 && self.heads >= 1 && self.kv_heads >= 1,
+            "{self:?}"
+        );
+        assert!(
+            self.heads % self.kv_heads == 0,
+            "{} query heads do not group over {} key/value heads",
+            self.heads,
+            self.kv_heads
+        );
+        assert!(
+            self.head_dim % 2 == 0,
+            "a rotary head of odd width {}",
+            self.head_dim
+        );
+    }
+}
 
 /// The dtype the model computes in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,23 +140,106 @@ fn linear<B: Backend>(inp: usize, out: usize, device: &B::Device) -> Linear<B> {
     LinearConfig::new(inp, out).with_bias(false).init(device)
 }
 
-fn rms_norm<B: Backend>(device: &B::Device) -> RmsNorm<B> {
-    RmsNormConfig::new(HIDDEN).with_epsilon(EPS).init(device)
+fn rms_norm<B: Backend>(cfg: &LlamaConfig, device: &B::Device) -> RmsNorm<B> {
+    RmsNormConfig::new(cfg.hidden)
+        .with_epsilon(cfg.eps)
+        .init(device)
+}
+
+/// `norm.forward(x)`: on the card one op with its scale where it can be (`burn_tt::rms_norm`, bit
+/// for bit the module), else the module.
+fn normed<B: Backend, const D: usize>(norm: &RmsNorm<B>, x: Tensor<B, D>) -> Tensor<B, D> {
+    burn_tt::rms_norm(&x, &norm.gamma.val(), norm.epsilon).unwrap_or_else(|| norm.forward(x))
+}
+
+/// [`normed`], rounded once to `operand` where it is given (the dtype the products after it read
+/// their activations in): bit for bit `normed(norm, x).cast(operand)`, on the card one op
+/// (`burn_tt::rms_norm_as`).
+fn normed_as<B: Backend, const D: usize>(
+    norm: &RmsNorm<B>,
+    x: Tensor<B, D>,
+    operand: Option<DType>,
+) -> Tensor<B, D> {
+    match operand {
+        Some(dtype) if dtype != x.dtype() => {
+            burn_tt::rms_norm_as(&x, &norm.gamma.val(), norm.epsilon, dtype)
+                .unwrap_or_else(|| normed(norm, x).cast(dtype))
+        }
+        _ => normed(norm, x),
+    }
 }
 
 #[derive(Module, Debug)]
 pub struct SelfAttn<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
+    /// The three projections as loaded; `None` once fused into [`SelfAttn::qkv`].
+    q_proj: Option<Linear<B>>,
+    k_proj: Option<Linear<B>>,
+    v_proj: Option<Linear<B>>,
     o_proj: Linear<B>,
+    /// `q|k|v` as one `[hidden, q + 2 kv]` matrix ([`Llama::fused`]), in place of the three
+    /// projections above. `None` as loaded.
+    qkv: Option<Linear<B>>,
 }
 
 #[derive(Module, Debug)]
 pub struct Mlp<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
+    /// The two projections as loaded; `None` once fused into [`Mlp::gate_up`].
+    gate_proj: Option<Linear<B>>,
+    up_proj: Option<Linear<B>>,
     down_proj: Linear<B>,
+    /// `gate|up` as one `[hidden, 2 ff]` matrix ([`Llama::fused`]), as `qkv` is.
+    gate_up: Option<Linear<B>>,
+}
+
+/// The projections `parts` as one matrix, their weights concatenated along the outputs, the parts
+/// themselves dropped: the fused matrix is the only copy of their weights. `None`, and `parts`
+/// untouched, unless every part is present, of one dtype and without a bias.
+fn fuse<B: Backend>(parts: &mut [&mut Option<Linear<B>>]) -> Option<Linear<B>> {
+    let weights = parts
+        .iter()
+        .map(|p| p.as_ref().map(|l| (l.weight.val(), l.bias.is_some())))
+        .collect::<Option<Vec<_>>>()?;
+    let dtype = weights[0].0.dtype();
+    if weights.iter().any(|(w, bias)| *bias || w.dtype() != dtype) {
+        return None;
+    }
+    let whole = Tensor::cat(weights.into_iter().map(|(w, _)| w).collect(), 1);
+    for p in parts.iter_mut() {
+        **p = None;
+    }
+    Some(Linear {
+        weight: Param::from_tensor(whole),
+        bias: None,
+    })
+}
+
+/// A projection of an unfused layer: present unless [`Llama::fused`] replaced it, and a fused
+/// layer reads its fused matrix instead.
+fn part<B: Backend>(p: &Option<Linear<B>>) -> &Linear<B> {
+    p.as_ref()
+        .expect("a projection fused away is read only through its fused matrix")
+}
+
+/// `x @ W` for the fused `whole`, split back into the parts' outputs, `widths` columns each, the
+/// product in `stream` ([`project_into`]).
+fn project_split<B: Backend, const N: usize>(
+    x: Tensor<B, 3>,
+    whole: &Linear<B>,
+    widths: [usize; N],
+    stream: DType,
+) -> [Tensor<B, 3>; N] {
+    split(project_into(x, whole, stream), widths)
+}
+
+/// `y`'s column blocks of `widths`, left to right: views of it.
+fn split<B: Backend, const N: usize>(y: Tensor<B, 3>, widths: [usize; N]) -> [Tensor<B, 3>; N] {
+    let [n, t, _] = y.dims();
+    let mut at = 0;
+    widths.map(|w| {
+        let part = y.clone().slice([0..n, 0..t, at..at + w]);
+        at += w;
+        part
+    })
 }
 
 #[derive(Module, Debug)]
@@ -85,76 +250,13 @@ pub struct Layer<B: Backend> {
     mlp: Mlp<B>,
 }
 
-/// Rotary tables for a run of positions: `[1, 1, t, HEAD_DIM]` each.
-struct Rope<B: Backend> {
-    cos: Tensor<B, 4>,
-    sin: Tensor<B, 4>,
-}
-
-impl<B: Backend> Rope<B> {
-    /// `angle = position * theta^(-2i / HEAD_DIM)`, the first half of the row repeated as the
-    /// second (the rotate-half layout). The positions and the frequencies are host data that
-    /// the shapes fix; the products and the `sin` and `cos` run on the device.
-    fn new(start: usize, t: usize, dtype: DType, device: &B::Device) -> Self {
-        let positions: Vec<f32> = (start..start + t).map(|p| p as f32).collect();
-        let freqs: Vec<f32> = (0..HEAD_DIM / 2)
-            .map(|i| ROPE_THETA.powf(-(2.0 * i as f64) / HEAD_DIM as f64) as f32)
-            .collect();
-        let pos = Tensor::<B, 2>::from_data(TensorData::new(positions, [t, 1]), device);
-        let freq = Tensor::<B, 2>::from_data(TensorData::new(freqs, [1, HEAD_DIM / 2]), device);
-        let angles = pos * freq;
-        let angles = Tensor::cat(vec![angles.clone(), angles], 1).reshape([1, 1, t, HEAD_DIM]);
-        Self {
-            cos: angles.clone().cos().cast(dtype),
-            sin: angles.sin().cast(dtype),
-        }
-    }
-
-    /// The tables for every position below `max_len`, `[max_len, HEAD_DIM]` each: what
-    /// [`Rope::at`] selects a position's row from. Each row is [`Rope::new`]'s for that position,
-    /// the same products in the same order.
-    fn table(max_len: usize, dtype: DType, device: &B::Device) -> Self {
-        let r = Self::new(0, max_len, dtype, device);
-        Self {
-            cos: r.cos.reshape([1, 1, max_len, HEAD_DIM]),
-            sin: r.sin.reshape([1, 1, max_len, HEAD_DIM]),
-        }
-    }
-
-    /// The rows of a [`Rope::table`] at `positions` (`[n]`, on the device): a row select, so a
-    /// traced step replays it with new positions.
-    fn at(&self, positions: Tensor<B, 1, Int>) -> Self {
-        let [_, _, max_len, d] = self.cos.dims();
-        let [n] = positions.dims();
-        let row = |t: &Tensor<B, 4>| {
-            t.clone()
-                .reshape([max_len, d])
-                .select(0, positions.clone())
-                .reshape([1, 1, n, d])
-        };
-        Self {
-            cos: row(&self.cos),
-            sin: row(&self.sin),
-        }
-    }
-
-    fn apply(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let [n, h, t, d] = x.dims();
-        let half = d / 2;
-        let x1 = x.clone().slice([0..n, 0..h, 0..t, 0..half]);
-        let x2 = x.clone().slice([0..n, 0..h, 0..t, half..d]);
-        let rotated = Tensor::cat(vec![x2.neg(), x1], 3);
-        x * self.cos.clone() + rotated * self.sin.clone()
-    }
-}
-
 /// Each key/value head repeated for its group of query heads (`repeat_interleave`).
-fn repeat_kv<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
+pub(crate) fn repeat_kv<B: Backend>(x: Tensor<B, 4>, groups: usize) -> Tensor<B, 4> {
     let [n, kv, l, d] = x.dims();
-    let mut heads = Vec::with_capacity(kv * GROUPS);
+    let mut heads = Vec::with_capacity(kv * groups);
     for h in 0..kv {
         let one = x.clone().slice([0..n, h..h + 1, 0..l, 0..d]);
-        heads.extend((0..GROUPS).map(|_| one.clone()));
+        heads.extend((0..groups).map(|_| one.clone()));
     }
     Tensor::cat(heads, 1)
 }
@@ -163,10 +265,57 @@ fn repeat_kv<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
 /// so a precision plan can hold an activation in another format ([`crate::quant`]).
 pub type ActFn<B> = std::sync::Arc<dyn Fn(&str, Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>;
 
+/// What [`probe_free_consumers`] removes: bit 0 the residual adds after `o` and `down`, bit 1
+/// `silu(gate) * up`.
+static PROBE_FREE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// A timing bound (`docs/completed-plans/dataflow-compiler.md` F6.0, H10): with `adds`, a layer's residual
+/// adds return the projection alone; with `silu_mul`, the MLP's hidden state is `up` alone. The
+/// step then runs as if those ops were free, its graph whole otherwise, so captures, residency
+/// plans and prefetches see a consistent model. **Timing only: the logits are wrong.**
+/// Process-wide; dev-facing.
+#[doc(hidden)]
+pub fn probe_free_consumers(adds: bool, silu_mul: bool) {
+    let bits = u8::from(adds) | u8::from(silu_mul) << 1;
+    PROBE_FREE.store(bits, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn probing_free(bit: u8) -> bool {
+    PROBE_FREE.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
+}
+
+/// `x + y`, or `y` alone under [`probe_free_consumers`].
+fn residual<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 3>) -> Tensor<B, 3> {
+    if probing_free(1) {
+        y
+    } else {
+        x + y
+    }
+}
+
+/// [`project`] with its result in `stream` where `x` is in another dtype (a BF16 operand of an F32
+/// stream, [`Llama::operand`]): `x`'s values multiplied in the weight's dtype and the result cast
+/// to `stream`, bit for bit; on the card one product reading `x` as it lies
+/// (`burn_tt::matmul_as`).
+fn project_into<B: Backend>(x: Tensor<B, 3>, linear: &Linear<B>, stream: DType) -> Tensor<B, 3> {
+    if x.dtype() == stream {
+        return project(x, linear);
+    }
+    let weight = linear.weight.val();
+    let y = burn_tt::matmul_as(&x, &weight, stream).unwrap_or_else(|| {
+        let dtype = weight.dtype();
+        Tensor::matmul(x.cast(dtype), weight.unsqueeze()).cast(stream)
+    });
+    match &linear.bias {
+        Some(b) => y + b.val().cast(stream).unsqueeze(),
+        None => y,
+    }
+}
+
 /// `x @ W` for a projection, computed in the weight's own dtype: the activation is cast in and the
 /// result cast back to the residual stream's dtype, so matrices held in different formats (F32,
 /// BF16, F16, block floating point) share one stream.
-fn project<B: Backend>(x: Tensor<B, 3>, linear: &Linear<B>) -> Tensor<B, 3> {
+pub(crate) fn project<B: Backend>(x: Tensor<B, 3>, linear: &Linear<B>) -> Tensor<B, 3> {
     let stream = x.dtype();
     let weight = linear.weight.val().dtype();
     if weight == stream {
@@ -177,110 +326,122 @@ fn project<B: Backend>(x: Tensor<B, 3>, linear: &Linear<B>) -> Tensor<B, 3> {
 }
 
 impl<B: Backend> Layer<B> {
-    fn new(device: &B::Device) -> Self {
+    fn new(cfg: &LlamaConfig, device: &B::Device) -> Self {
+        let (h, q, kv) = (
+            cfg.hidden,
+            cfg.heads * cfg.head_dim,
+            cfg.kv_heads * cfg.head_dim,
+        );
         Self {
-            input_layernorm: rms_norm(device),
+            input_layernorm: rms_norm(cfg, device),
             self_attn: SelfAttn {
-                q_proj: linear(HIDDEN, HEADS * HEAD_DIM, device),
-                k_proj: linear(HIDDEN, KV_HEADS * HEAD_DIM, device),
-                v_proj: linear(HIDDEN, KV_HEADS * HEAD_DIM, device),
-                o_proj: linear(HEADS * HEAD_DIM, HIDDEN, device),
+                q_proj: Some(linear(h, q, device)),
+                k_proj: Some(linear(h, kv, device)),
+                v_proj: Some(linear(h, kv, device)),
+                o_proj: linear(q, h, device),
+                qkv: None,
             },
-            post_attention_layernorm: rms_norm(device),
+            post_attention_layernorm: rms_norm(cfg, device),
             mlp: Mlp {
-                gate_proj: linear(HIDDEN, FF, device),
-                up_proj: linear(HIDDEN, FF, device),
-                down_proj: linear(FF, HIDDEN, device),
+                gate_proj: Some(linear(h, cfg.ff, device)),
+                up_proj: Some(linear(h, cfg.ff, device)),
+                down_proj: linear(cfg.ff, h, device),
+                gate_up: None,
             },
         }
     }
 
+    /// [`Llama::fused`] for one layer.
+    fn fuse(&mut self) {
+        let a = &mut self.self_attn;
+        if a.qkv.is_none() {
+            a.qkv = fuse(&mut [&mut a.q_proj, &mut a.k_proj, &mut a.v_proj]);
+        }
+        let m = &mut self.mlp;
+        if m.gate_up.is_none() {
+            m.gate_up = fuse(&mut [&mut m.gate_proj, &mut m.up_proj]);
+        }
+    }
+
+    /// The layer's output, and its cache's keys and values (`cache_k`, `cache_v`: `[1, kv_heads,
+    /// max_len, head_dim]` for a growing cache, as a [`FixedCache`] stores them for a fixed one)
+    /// with this step's written as `write` says. `operand`: the dtype the products of the norms'
+    /// and the MLP's outputs read them in, where not the stream's ([`Llama::operand`]).
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
+        cfg: &LlamaConfig,
         x: Tensor<B, 3>,
         rope: &Rope<B>,
-        cache: &mut LayerCache<B>,
-        write: &Write<B>,
+        cache_k: &Tensor<B, 4>,
+        cache_v: &Tensor<B, 4>,
+        write: &Write<'_, B>,
         index: usize,
         act: Option<&ActFn<B>>,
-    ) -> Tensor<B, 3> {
+        operand: Option<DType>,
+    ) -> (Tensor<B, 3>, Tensor<B, 4>, Tensor<B, 4>) {
         let hook = |name: &str, t: Tensor<B, 3>| match act {
             Some(f) => f(&format!("layers.{index}.{name}"), t),
             None => t,
         };
+        let (kv_heads, head_dim, groups) = (cfg.kv_heads, cfg.head_dim, cfg.groups());
         let [n, t, _] = x.dims();
-        let h = self.input_layernorm.forward(x.clone());
+        let stream = x.dtype();
+        let h = normed_as(&self.input_layernorm, x.clone(), operand);
         let a = &self.self_attn;
         let heads =
-            |p: Tensor<B, 3>, count: usize| p.reshape([n, t, count, HEAD_DIM]).swap_dims(1, 2);
-        let q = rope.apply(heads(project(h.clone(), &a.q_proj), HEADS));
-        let k = rope.apply(heads(project(h.clone(), &a.k_proj), KV_HEADS));
-        let v = heads(project(h, &a.v_proj), KV_HEADS);
+            |p: Tensor<B, 3>, count: usize| p.reshape([n, t, count, head_dim]).swap_dims(1, 2);
+        let (qw, kvw) = (cfg.heads * head_dim, kv_heads * head_dim);
+        let [q, k, v] = match &a.qkv {
+            Some(qkv) => project_split(h, qkv, [qw, kvw, kvw], stream),
+            None => [
+                project_into(h.clone(), part(&a.q_proj), stream),
+                project_into(h.clone(), part(&a.k_proj), stream),
+                project_into(h, part(&a.v_proj), stream),
+            ],
+        };
+        let q = rope.apply(heads(q, cfg.heads));
+        let k = rope.apply(heads(k, kv_heads));
+        let v = heads(v, kv_heads);
 
-        let (keys, values, mask, is_causal) =
-            match write {
-                Write::At(start) => {
-                    let total = start + t;
-                    cache.k = cache
-                        .k
+        let (q, new_k, new_v, keys, values, mask, is_causal) = match write {
+            Write::At(start) => {
+                let total = start + t;
+                let new_k = cache_k
+                    .clone()
+                    .slice_assign([0..n, 0..kv_heads, *start..total, 0..head_dim], k);
+                let new_v = cache_v
+                    .clone()
+                    .slice_assign([0..n, 0..kv_heads, *start..total, 0..head_dim], v);
+                let keys = repeat_kv(
+                    new_k
                         .clone()
-                        .slice_assign([0..n, 0..KV_HEADS, *start..total, 0..HEAD_DIM], k);
-                    cache.v = cache
-                        .v
+                        .slice([0..n, 0..kv_heads, 0..total, 0..head_dim]),
+                    groups,
+                );
+                let values = repeat_kv(
+                    new_v
                         .clone()
-                        .slice_assign([0..n, 0..KV_HEADS, *start..total, 0..HEAD_DIM], v);
-                    let keys = repeat_kv(cache.k.clone().slice([
-                        0..n,
-                        0..KV_HEADS,
-                        0..total,
-                        0..HEAD_DIM,
-                    ]));
-                    let values = repeat_kv(cache.v.clone().slice([
-                        0..n,
-                        0..KV_HEADS,
-                        0..total,
-                        0..HEAD_DIM,
-                    ]));
-                    // A prompt attends causally to itself; one new token attends to everything cached.
-                    (keys, values, None, t > 1)
-                }
-                Write::Masked { here, later } => {
-                    // The new key and value land where `here` is set, every other position kept;
-                    // the query attends to every position not `later` than its own.
-                    let shape = cache.k.dims();
-                    let here = here.clone().expand(shape);
-                    cache.k = cache.k.clone().mask_where(here.clone(), k.expand(shape));
-                    cache.v = cache.v.clone().mask_where(here, v.expand(shape));
-                    (
-                        repeat_kv(cache.k.clone()),
-                        repeat_kv(cache.v.clone()),
-                        Some(later.clone()),
-                        false,
-                    )
-                }
-                Write::Chunk { here, later, index } => {
-                    // The chunk's keys and values laid over the whole cache by a row gather (row
-                    // `index` of the chunk's `[KV_HEADS c, HEAD_DIM]` for each cache row), kept
-                    // where `here` is set; each query attends to every position not `later` than
-                    // its own.
-                    let shape = cache.k.dims();
-                    let place = |x: Tensor<B, 4>| {
-                        let [_, kv, c, d] = x.dims();
-                        x.reshape([kv * c, d])
-                            .select(0, index.clone())
-                            .reshape(shape)
-                    };
-                    let here = here.clone().expand(shape);
-                    cache.k = cache.k.clone().mask_where(here.clone(), place(k));
-                    cache.v = cache.v.clone().mask_where(here, place(v));
-                    (
-                        repeat_kv(cache.k.clone()),
-                        repeat_kv(cache.v.clone()),
-                        Some(later.clone()),
-                        false,
-                    )
-                }
-            };
+                        .slice([0..n, 0..kv_heads, 0..total, 0..head_dim]),
+                    groups,
+                );
+                // A prompt attends causally to itself; one new token attends to everything cached.
+                (q, new_k, new_v, keys, values, None, t > 1)
+            }
+            Write::Fixed { write, mask } => {
+                // The new keys and values land where the step writes, every other position kept;
+                // each query attends to every position not later than its own. Grouped-query
+                // attention reads the cache's own key/value heads: each group of query heads is
+                // folded into the rows (query head `h groups + g` is `repeat_kv`'s order, its row
+                // `i` is row `g t + i`), so nothing repeats the cache, and each score and each sum
+                // is the one `repeat_kv`'s attention computes.
+                let new_k = write.write(cache_k.clone(), k);
+                let new_v = write.write(cache_v.clone(), v);
+                let q = q.reshape([n, kv_heads, groups * t, head_dim]);
+                let (keys, values) = (write.attended(new_k.clone()), write.attended(new_v.clone()));
+                (q, new_k, new_v, keys, values, Some(mask.clone()), false)
+            }
+        };
         let out = attention(
             q,
             keys,
@@ -293,74 +454,102 @@ impl<B: Backend> Layer<B> {
                 is_causal,
             },
         );
+        // Unfolded (a no-op unless the query heads were folded into rows above).
+        let out = out.reshape([n, cfg.heads, t, head_dim]);
         let context = hook(
             "attn_ctx",
-            out.swap_dims(1, 2).reshape([n, t, HEADS * HEAD_DIM]),
+            out.swap_dims(1, 2).reshape([n, t, cfg.heads * head_dim]),
         );
-        let x = x + project(context, &a.o_proj);
+        let x = residual(x, project_into(context, &a.o_proj, stream));
 
-        let h = self.post_attention_layernorm.forward(x.clone());
+        let h = normed_as(&self.post_attention_layernorm, x.clone(), operand);
         let m = &self.mlp;
-        let hidden = hook(
-            "mlp_hidden",
-            silu(project(h.clone(), &m.gate_proj)) * project(h, &m.up_proj),
-        );
-        x + project(hidden, &m.down_proj)
+        let [gate, up] = match &m.gate_up {
+            Some(gate_up) => project_split(h, gate_up, [cfg.ff, cfg.ff], stream),
+            None => [
+                project_into(h.clone(), part(&m.gate_proj), stream),
+                project_into(h, part(&m.up_proj), stream),
+            ],
+        };
+        let hidden = if probing_free(2) {
+            drop(gate);
+            up
+        } else {
+            match operand {
+                // Rounded once where it is made (`burn_tt::silu_mul_as`): bit for bit the F32
+                // product then the cast.
+                Some(dtype) if dtype != gate.dtype() => burn_tt::silu_mul_as(&gate, &up, dtype)
+                    .unwrap_or_else(|| (silu(gate) * up).cast(dtype)),
+                _ => silu(gate) * up,
+            }
+        };
+        let hidden = hook("mlp_hidden", hidden);
+        (
+            residual(x, project_into(hidden, &m.down_proj, stream)),
+            new_k,
+            new_v,
+        )
     }
 }
 
-/// One layer's keys and values, `[batch, KV_HEADS, max_len, HEAD_DIM]`, filled front to back.
+/// One layer's keys and values, `[batch, kv_heads, max_len, head_dim]`, filled front to back.
 struct LayerCache<B: Backend> {
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
 }
 
 /// How a step puts its keys and values into a layer's cache, and which of them it attends to.
-enum Write<B: Backend> {
+enum Write<'a, B: Backend> {
     /// At positions `start..start + t`, known on the host; the query attends to positions
     /// `..start + t` (causally within the new ones).
     At(usize),
-    /// At the one position set in `here` (`[1, 1, max_len, 1]`); the query attends to every
-    /// position but those set in `later` (`[1, 1, 1, max_len]`). Both are tensors, so the step's
-    /// shapes do not depend on the position ([`FixedCache`]).
-    Masked {
-        here: Tensor<B, 4, burn::tensor::Bool>,
-        later: Tensor<B, 4, burn::tensor::Bool>,
-    },
-    /// A chunk of `c` tokens at the positions set in `here` (`[1, 1, max_len, 1]`, a run from the
-    /// chunk's start): cache row `j` of head `h` takes the chunk's row `index[h max_len + j]` of
-    /// its `[KV_HEADS c, HEAD_DIM]` keys and values; query `i` attends to every position but those
-    /// set in row `i` of `later` (`[1, 1, c, max_len]`).
-    Chunk {
-        here: Tensor<B, 4, burn::tensor::Bool>,
-        later: Tensor<B, 4, burn::tensor::Bool>,
-        index: Tensor<B, 1, Int>,
+    /// Where a [`FixedCache`] step writes: positions given as tensors, so the step's shapes do not
+    /// depend on them.
+    Fixed {
+        write: &'a FixedWrite<B>,
+        /// `write`'s attention mask with each row repeated for the query heads folded into it
+        /// (`[1, 1, groups t, max_len]`): made once a step.
+        mask: Tensor<B, 4, burn::tensor::Bool>,
     },
 }
 
-/// A key/value cache whose step has the same shapes at every position, so it can be traced: one
-/// token a step, its position a tensor, attention over all `max_len` positions with the ones not
-/// yet written masked. [`Llama::step_fixed`] is [`Llama::forward_embedded`]'s decode step with
-/// the same arithmetic on every position it attends to.
-pub struct FixedCache<B: Backend> {
-    layers: Vec<LayerCache<B>>,
-    max_len: usize,
+/// A [`FixedCache`] and the rotary table its steps select their rows from: what
+/// [`Llama::step_fixed`] and [`Llama::step_chunk`] read.
+#[derive(Clone, Debug)]
+pub struct LlamaCache<B: Backend> {
+    kv: FixedCache<B>,
     rope: Rope<B>,
-    /// `0..max_len`, to compare a position with.
-    positions: Tensor<B, 1, Int>,
 }
 
-impl<B: Backend> FixedCache<B> {
+impl<B: Backend> LlamaCache<B> {
     pub fn max_len(&self) -> usize {
-        self.max_len
+        self.kv.max_len()
     }
 
     /// Every layer's keys and values, in layer order: the state a traced step writes back.
     pub fn state(&self) -> Vec<Tensor<B, 4>> {
-        self.layers
-            .iter()
-            .flat_map(|c| [c.k.clone(), c.v.clone()])
-            .collect()
+        self.kv.state()
+    }
+
+    /// Replace the state with what a step returned.
+    pub fn set_state(&mut self, state: Vec<Tensor<B, 4>>) {
+        self.kv.set_state(state)
+    }
+
+    pub fn kv(&self) -> &FixedCache<B> {
+        &self.kv
+    }
+}
+
+impl<B: Backend> FixedShapeCache<B> for LlamaCache<B> {
+    fn max_len(&self) -> usize {
+        self.kv.max_len()
+    }
+    fn state(&self) -> Vec<Tensor<B, 4>> {
+        self.kv.state()
+    }
+    fn set_state(&mut self, state: Vec<Tensor<B, 4>>) {
+        self.kv.set_state(state)
     }
 }
 
@@ -394,6 +583,17 @@ pub struct Llama<B: Backend> {
     embed_tokens: Embedding<B>,
     layers: Vec<Layer<B>>,
     norm: RmsNorm<B>,
+    /// The output projection, absent when it is the embedding table ([`LlamaConfig::tied_head`]).
+    lm_head: Option<Linear<B>>,
+    /// Not a parameter: the module derive skips it.
+    config: LlamaConfig,
+    /// The numeric contract the model was made for ([`Llama::for_inference`]), or `None` for one
+    /// put together otherwise. Not a parameter.
+    numerics: Option<burn_tt::Numerics>,
+    /// The dtype the products of the norms' and the MLP's outputs read them in where it is not
+    /// the stream's: BF16 under `WeightOptions::bf16_activations`, each such output rounded once
+    /// where it is made, the residual stream and every op's arithmetic F32. Not a parameter.
+    operand: Option<DType>,
 }
 
 /// Widens every float parameter to F32.
@@ -406,24 +606,69 @@ impl<B: Backend> ModuleMapper<B> for ToF32 {
 }
 
 impl<B: Backend> Llama<B> {
-    /// The architecture with `layers` layers and its initialiser's weights.
-    pub fn new(layers: usize, device: &B::Device) -> Self {
-        assert!((1..=FULL_LAYERS).contains(&layers), "layers {layers}");
+    /// The architecture `config` describes, with its initialiser's weights.
+    pub fn new(config: &LlamaConfig, device: &B::Device) -> Self {
+        config.check();
         Self {
-            embed_tokens: EmbeddingConfig::new(VOCAB, HIDDEN).init(device),
-            layers: (0..layers).map(|_| Layer::new(device)).collect(),
-            norm: rms_norm(device),
+            embed_tokens: EmbeddingConfig::new(config.vocab, config.hidden).init(device),
+            layers: (0..config.layers)
+                .map(|_| Layer::new(config, device))
+                .collect(),
+            norm: rms_norm(config, device),
+            lm_head: (!config.tied_head).then(|| linear(config.hidden, config.vocab, device)),
+            config: *config,
+            numerics: None,
+            operand: None,
         }
     }
 
-    /// The pretrained model (`cargo xtask fetch-weights --model smollm2-135m`), keeping the first
-    /// `layers` of its thirty, computing in `precision`.
+    pub fn config(&self) -> &LlamaConfig {
+        &self.config
+    }
+
+    /// The same model with each layer's `q|k|v` and `gate|up` projections one matrix each, their
+    /// outputs split back by column views: three products and two become one each, so a decode
+    /// step's narrow `m = 1` products spread over more of the card. Every output column keeps its
+    /// own accumulation over the hidden dimension, so the logits are the unfused model's **bit for
+    /// bit** (`step191_fused_projections`). The separate matrices are dropped: the fused ones are
+    /// the only copy of their weights (`step240`'s footprint gate), and a save of a fused model
+    /// holds `qkv` and `gate_up` in their place. A group whose matrices differ in dtype stays
+    /// unfused. Fuse **before** a [`crate::quant`] plan is applied, whose rules then name the fused
+    /// matrices (`qkv`, `gate_up`); not after, since block-float storage is invisible here (the
+    /// dtype is F32) and the parts would be concatenated by widening.
+    pub fn fused(mut self) -> Self {
+        for layer in &mut self.layers {
+            layer.fuse();
+        }
+        self
+    }
+
+    /// The same model with a tied output head made a projection of its own: the embedding table,
+    /// transposed, as `lm_head`'s weight (the same values; a lookup still reads the table). A
+    /// model whose head is its own already is returned as it is. What lets the head be stored in
+    /// another format than the table ([`crate::quant::Plan::bf16_weights`]).
+    pub fn untied(mut self) -> Self {
+        if self.lm_head.is_none() {
+            self.lm_head = Some(Linear {
+                weight: Param::from_tensor(self.embed_tokens.weight.val().transpose()),
+                bias: None,
+            });
+        }
+        self
+    }
+
+    /// A pretrained Llama-architecture checkpoint (`cargo xtask fetch-weights --model <weights>`)
+    /// whose shape `config` gives, keeping its first `config.layers` layers, computing in
+    /// `precision`. Every tensor the kept layers need must be in the file, and the file must hold
+    /// nothing else but the dropped layers.
     pub fn pretrained(
-        layers: usize,
+        config: &LlamaConfig,
+        weights: &str,
         precision: Precision,
         device: &B::Device,
     ) -> Result<(Self, Loaded), LoadError> {
-        let mut model = Self::new(layers, device);
+        let mut model = Self::new(config, device);
+        let layers = config.layers;
         let dropped = move |name: &str| {
             name.strip_prefix("layers.")
                 .and_then(|rest| rest.split('.').next())
@@ -432,7 +677,7 @@ impl<B: Backend> Llama<B> {
         };
         let loaded = load_safetensors(
             &mut model,
-            &weights_path("smollm2-135m"),
+            &weights_path(weights),
             &Layout {
                 remaps: &[
                     (
@@ -453,14 +698,44 @@ impl<B: Backend> Llama<B> {
         Ok((model, loaded))
     }
 
-    /// The embedding rows of `tokens` `[1, t]`, as `[1, t, HIDDEN]`.
+    /// SmolLM2-1.7B-Instruct ([`SMOLLM2_1_7B_INSTRUCT`], `cargo xtask fetch-weights --model
+    /// smollm2-1.7b-instruct`), its first `layers` layers of twenty-four.
+    pub fn smollm2_1_7b_instruct(
+        layers: usize,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Result<(Self, Loaded), LoadError> {
+        Self::pretrained(
+            &SMOLLM2_1_7B_INSTRUCT.with_layers(layers),
+            "smollm2-1.7b-instruct",
+            precision,
+            device,
+        )
+    }
+
+    /// SmolLM2-135M ([`SMOLLM2_135M`], `cargo xtask fetch-weights --model smollm2-135m`), its
+    /// first `layers` layers of thirty.
+    pub fn smollm2_135m(
+        layers: usize,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Result<(Self, Loaded), LoadError> {
+        Self::pretrained(
+            &SMOLLM2_135M.with_layers(layers),
+            "smollm2-135m",
+            precision,
+            device,
+        )
+    }
+
+    /// The embedding rows of `tokens` `[1, t]`, as `[1, t, hidden]`.
     pub fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         self.embed_tokens.forward(tokens)
     }
 
     /// An empty cache for `max_len` positions of one sequence.
     pub fn cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> KvCache<B> {
-        let shape = [1, KV_HEADS, max_len, HEAD_DIM];
+        let shape = [1, self.config.kv_heads, max_len, self.config.head_dim];
         KvCache {
             layers: self
                 .layers
@@ -476,7 +751,7 @@ impl<B: Backend> Llama<B> {
         }
     }
 
-    /// The logits `[1, VOCAB]` after the last of `tokens` (`[1, t]`), which are appended to
+    /// The logits `[1, vocab]` after the last of `tokens` (`[1, t]`), which are appended to
     /// `cache`. Either a prompt into an empty cache, or one token into a filled one.
     pub fn forward(
         &self,
@@ -488,7 +763,7 @@ impl<B: Backend> Llama<B> {
         self.forward_embedded(x, cache, dtype)
     }
 
-    /// [`Self::forward`] from the embedded tokens `[1, t, HIDDEN]`: everything after the table
+    /// [`Self::forward`] from the embedded tokens `[1, t, hidden]`: everything after the table
     /// lookup. It exists to time the model apart from the lookup (`silicon_bench_models`).
     pub fn forward_embedded(
         &self,
@@ -509,145 +784,227 @@ impl<B: Backend> Llama<B> {
         if x.dtype() != dtype {
             x = x.cast(dtype);
         }
-        let rope = Rope::new(start, t, dtype, &device);
+        let cfg = &self.config;
+        let rope = Rope::new(start, t, cfg.head_dim, cfg.rope_theta, dtype, &device);
         let act = cache.act.clone();
         let write = Write::At(start);
         for (index, (layer, c)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
-            x = layer.forward(x, &rope, c, &write, index, act.as_ref());
+            let (y, k, v) = layer.forward(
+                cfg,
+                x,
+                &rope,
+                &c.k,
+                &c.v,
+                &write,
+                index,
+                act.as_ref(),
+                self.operand,
+            );
+            (x, c.k, c.v) = (y, k, v);
         }
         cache.len += t;
         self.head(x, t)
     }
 
-    /// An empty [`FixedCache`] for `max_len` positions.
-    pub fn fixed_cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> FixedCache<B> {
-        let shape = [1, KV_HEADS, max_len, HEAD_DIM];
-        FixedCache {
-            layers: self
-                .layers
-                .iter()
-                .map(|_| LayerCache {
-                    k: Tensor::zeros(shape, (device, dtype)),
-                    v: Tensor::zeros(shape, (device, dtype)),
-                })
-                .collect(),
-            max_len,
-            rope: Rope::table(max_len, dtype, device),
-            positions: Tensor::arange(0..max_len as i64, device),
+    /// An empty [`LlamaCache`] for `max_len` positions, in the layout the heads take
+    /// ([`CacheLayout::for_heads`]).
+    pub fn fixed_cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> LlamaCache<B> {
+        let cfg = &self.config;
+        let layout = CacheLayout::for_heads(cfg.kv_heads, cfg.head_dim);
+        self.fixed_cache_in(max_len, layout, dtype, device)
+    }
+
+    /// An empty [`LlamaCache`] for `max_len` positions, laid out as `layout` says (of the model's
+    /// key/value heads).
+    pub fn fixed_cache_in(
+        &self,
+        max_len: usize,
+        layout: CacheLayout,
+        dtype: DType,
+        device: &B::Device,
+    ) -> LlamaCache<B> {
+        let cfg = &self.config;
+        assert_eq!(
+            layout.heads(),
+            (cfg.kv_heads, cfg.head_dim),
+            "a layout of the model's key/value heads"
+        );
+        LlamaCache {
+            kv: FixedCache::zeros_in(cfg.layers, layout, max_len, dtype, device),
+            rope: Rope::table(max_len, cfg.head_dim, cfg.rope_theta, dtype, device),
         }
     }
 
     /// One decode step whose shapes do not depend on its position: the embedded token `x`
-    /// (`[1, 1, HIDDEN]`) at `position` (`[1]`, below `cache.max_len()`), its keys and values
-    /// written into `cache` there, the logits `[1, VOCAB]` returned. The position is a tensor,
+    /// (`[1, 1, hidden]`) at `position` (`[1]`, below `cache.max_len()`), its keys and values
+    /// written into `cache` there, the logits `[1, vocab]` returned. The position is a tensor,
     /// so the step can be captured once and replayed at every position
-    /// (`burn_tt::TracedInference::capture_with_state`, with [`FixedCache::state`]).
+    /// ([`crate::generate::TracedGenerator`]).
     pub fn step_fixed(
+        &self,
+        x: Tensor<B, 3>,
+        position: Tensor<B, 1, Int>,
+        cache: &mut LlamaCache<B>,
+        dtype: DType,
+    ) -> Tensor<B, 2> {
+        let (logits, state) = self.fixed_step(x, position, cache, dtype);
+        cache.set_state(state);
+        logits
+    }
+
+    /// [`Self::step_fixed`] that returns the new state instead of writing it.
+    pub fn fixed_step(
+        &self,
+        x: Tensor<B, 3>,
+        position: Tensor<B, 1, Int>,
+        cache: &LlamaCache<B>,
+        dtype: DType,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        self.fixed_step_within(x, position, cache.max_len(), cache, dtype)
+    }
+
+    /// [`Self::fixed_step`] attending only to the cache's first `len` positions (`position` below
+    /// `len`): the same logits, at a cost that follows `len` (`FixedCache::step_write_within`).
+    pub fn fixed_step_within(
         &self,
         mut x: Tensor<B, 3>,
         position: Tensor<B, 1, Int>,
-        cache: &mut FixedCache<B>,
+        len: usize,
+        cache: &LlamaCache<B>,
         dtype: DType,
-    ) -> Tensor<B, 2> {
-        assert_eq!(x.dims(), [1, 1, HIDDEN], "one token a step");
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        assert_eq!(x.dims(), [1, 1, self.config.hidden], "one token a step");
         if x.dtype() != dtype {
             x = x.cast(dtype);
         }
-        let max_len = cache.max_len;
-        let at = position.clone().expand([max_len]);
-        let write = Write::Masked {
-            here: cache
-                .positions
-                .clone()
-                .equal(at.clone())
-                .reshape([1, 1, max_len, 1]),
-            later: cache
-                .positions
-                .clone()
-                .greater(at)
-                .reshape([1, 1, 1, max_len]),
-        };
+        let write = cache.kv.step_write_within(position.clone(), len);
         let rope = cache.rope.at(position);
-        for (index, (layer, c)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
-            x = layer.forward(x, &rope, c, &write, index, None);
-        }
-        self.head(x, 1)
+        let (x, state) = self.layers_fixed(x, &rope, cache, &write);
+        (self.head(x, 1), state)
     }
 
-    /// `c` tokens of a prompt (`x`, `[1, c, HIDDEN]`) from position `start` (`[1]`) on, with shapes
+    /// `c` tokens of a prompt (`x`, `[1, c, hidden]`) from position `start` (`[1]`) on, with shapes
     /// that depend on neither: their keys and values written into `cache` at `start..start + c`,
-    /// the logits `[1, VOCAB]` of chunk row `last` (`[1]`) returned. A prompt is its chunks in
+    /// the logits `[1, vocab]` of chunk row `last` (`[1]`) returned. A prompt is its chunks in
     /// order, the last one padded (padding tokens write cache rows past the prompt, which a decode
     /// step overwrites before it reads them, and their rotary rows are clamped into the table);
     /// `last` is the prompt's last token within it. Like [`Self::step_fixed`], it can be captured
-    /// once for a chunk size and replayed at every start (the prefill of `attention-jobs`' traced
-    /// decode), and each row's arithmetic is [`Self::forward_embedded`]'s.
+    /// once for a chunk size and replayed at every start, and each row's arithmetic is
+    /// [`Self::forward_embedded`]'s.
     pub fn step_chunk(
+        &self,
+        x: Tensor<B, 3>,
+        start: Tensor<B, 1, Int>,
+        last: Tensor<B, 1, Int>,
+        cache: &mut LlamaCache<B>,
+        dtype: DType,
+    ) -> Tensor<B, 2> {
+        let (logits, state) = self.fixed_chunk(x, start, last, cache, dtype);
+        cache.set_state(state);
+        logits
+    }
+
+    /// [`Self::step_chunk`] that returns the new state instead of writing it.
+    pub fn fixed_chunk(
+        &self,
+        x: Tensor<B, 3>,
+        start: Tensor<B, 1, Int>,
+        last: Tensor<B, 1, Int>,
+        cache: &LlamaCache<B>,
+        dtype: DType,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        self.fixed_chunk_within(x, start, last, cache.max_len(), cache, dtype)
+    }
+
+    /// [`Self::fixed_chunk`] attending only to the cache's first `len` positions (every row of
+    /// the chunk below `len`): the same logits, at a cost that follows `len`
+    /// (`FixedCache::chunk_write_within`).
+    pub fn fixed_chunk_within(
         &self,
         mut x: Tensor<B, 3>,
         start: Tensor<B, 1, Int>,
         last: Tensor<B, 1, Int>,
-        cache: &mut FixedCache<B>,
+        len: usize,
+        cache: &LlamaCache<B>,
         dtype: DType,
-    ) -> Tensor<B, 2> {
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
         let [n, c, h] = x.dims();
-        let max_len = cache.max_len;
+        let hidden = self.config.hidden;
+        let max_len = cache.max_len();
         assert!(
-            n == 1 && h == HIDDEN && c <= max_len,
-            "a chunk of at most {max_len} tokens"
+            n == 1 && h == hidden && c <= len && len <= max_len,
+            "a chunk of {c} tokens attending to {len} of {max_len} positions"
         );
         if x.dtype() != dtype {
             x = x.cast(dtype);
         }
-        let positions = cache.positions.clone();
-        let from = start.clone().expand([max_len]);
-        let here = positions
-            .clone()
-            .greater_equal(from.clone())
-            .bool_and(positions.clone().lower(from.clone().add_scalar(c as i64)))
-            .reshape([1, 1, max_len, 1]);
-        // Each token's own position.
-        let own = start.expand([c]) + positions.clone().narrow(0, 0, c);
-        let later = positions
-            .clone()
-            .reshape([1, max_len])
-            .expand([c, max_len])
-            .greater(own.clone().reshape([c, 1]).expand([c, max_len]))
-            .reshape([1, 1, c, max_len]);
-        let offset = (positions.clone() - from).clamp(0, c as i64 - 1);
-        let base = positions
-            .narrow(0, 0, KV_HEADS)
-            .mul_scalar(c as i64)
-            .reshape([KV_HEADS, 1])
-            .expand([KV_HEADS, max_len]);
-        let index = (base + offset.reshape([1, max_len]).expand([KV_HEADS, max_len]))
-            .reshape([KV_HEADS * max_len]);
-        let write = Write::Chunk { here, later, index };
+        let (write, own) = cache.kv.chunk_write_within(start, c, len);
         let rope = cache.rope.at(own.clamp_max(max_len as i64 - 1));
-        for (index, (layer, cl)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
-            x = layer.forward(x, &rope, cl, &write, index, None);
-        }
-        let row = self
-            .norm
-            .forward(x)
-            .reshape([c, HIDDEN])
+        let (x, state) = self.layers_fixed(x, &rope, cache, &write);
+        let row = normed(&self.norm, x)
+            .reshape([c, hidden])
             .select(0, last)
-            .reshape([1, HIDDEN]);
-        self.project_out(row)
+            .reshape([1, hidden]);
+        (self.project_out(row), state)
     }
 
-    /// The logits `[1, VOCAB]` of the last of `t` positions of `x`.
+    /// Every layer over a [`LlamaCache`] step: the last layer's output and the new state.
+    fn layers_fixed(
+        &self,
+        mut x: Tensor<B, 3>,
+        rope: &Rope<B>,
+        cache: &LlamaCache<B>,
+        write: &FixedWrite<B>,
+    ) -> (Tensor<B, 3>, Vec<Tensor<B, 4>>) {
+        let groups = self.config.groups();
+        let later = write.later();
+        // A query row of every folded head shares its position's mask row (`Layer::forward`).
+        let mask = if groups == 1 || later.dims()[2] == 1 {
+            later
+        } else {
+            later.repeat_dim(2, groups)
+        };
+        let write = Write::Fixed { write, mask };
+        let mut state = Vec::with_capacity(2 * self.layers.len());
+        for (index, layer) in self.layers.iter().enumerate() {
+            let (k, v) = cache.kv.layer(index);
+            let (y, k, v) = layer.forward(
+                &self.config,
+                x,
+                rope,
+                &k,
+                &v,
+                &write,
+                index,
+                None,
+                self.operand,
+            );
+            x = y;
+            state.extend([k, v]);
+        }
+        (x, state)
+    }
+
+    /// The logits `[1, vocab]` of the last of `t` positions of `x`.
     fn head(&self, x: Tensor<B, 3>, t: usize) -> Tensor<B, 2> {
-        let last = self
-            .norm
-            .forward(x)
-            .slice([0..1, t - 1..t, 0..HIDDEN])
-            .reshape([1, HIDDEN]);
+        let hidden = self.config.hidden;
+        let last = normed(&self.norm, x)
+            .slice([0..1, t - 1..t, 0..hidden])
+            .reshape([1, hidden]);
         self.project_out(last)
     }
 
-    /// The logits `[1, VOCAB]` of a normed hidden row `[1, HIDDEN]`.
+    /// The logits `[1, vocab]` of a normed hidden row `[1, hidden]`.
     fn project_out(&self, last: Tensor<B, 2>) -> Tensor<B, 2> {
+        if let Some(head) = &self.lm_head {
+            let weight = head.weight.val().dtype();
+            let x = if weight == last.dtype() {
+                last
+            } else {
+                last.cast(weight)
+            };
+            return head.forward(x);
+        }
         // The output projection is the embedding table, transposed, computed in its dtype.
         let table = self.embed_tokens.weight.val();
         let last = if table.dtype() == last.dtype() {
@@ -659,40 +1016,40 @@ impl<B: Backend> Llama<B> {
     }
 }
 
-/// The logits a run of next-token predictions produced.
-#[derive(Debug)]
-pub struct Generation {
-    /// Wall time of each forward pass, the prompt's first, including reading its logits back.
-    pub times: Vec<std::time::Duration>,
-    /// The tokens chosen (greedy), or fed (teacher-forced), after the prompt.
-    pub tokens: Vec<i32>,
-    /// `logits[i]` is the prediction for the position after `prompt + tokens[..i]`, `[VOCAB]`.
-    pub logits: Vec<Vec<f32>>,
-}
+impl<B: Backend> FixedShapeDecoder<B> for Llama<B> {
+    type Cache = LlamaCache<B>;
 
-impl Generation {
-    /// Run one forward pass, read its logits back and record the wall time of both.
-    fn step<B: Backend>(&mut self, forward: impl FnOnce() -> Tensor<B, 2>) {
-        let t0 = std::time::Instant::now();
-        self.logits.push(read(forward()));
-        self.times.push(t0.elapsed());
-        if std::env::var_os("TT_MODELS_TRACE").is_some() {
-            eprintln!("forward {}: {:.2?}", self.times.len() - 1, t0.elapsed());
-        }
+    fn numerics(&self) -> Option<burn_tt::Numerics> {
+        self.numerics
     }
-}
 
-fn argmax(v: &[f32]) -> usize {
-    (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap()
-}
+    /// A cache in the model's own dtype.
+    fn new_cache(&self, max_len: usize, device: &B::Device) -> LlamaCache<B> {
+        self.fixed_cache(max_len, self.embed_tokens.weight.val().dtype(), device)
+    }
 
-fn read<B: Backend>(logits: Tensor<B, 2>) -> Vec<f32> {
-    // BF16 logits widen exactly; F32 ones are unchanged.
-    logits
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .expect("F32 logits")
+    fn chunk(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        start: Tensor<B, 1, Int>,
+        last: Tensor<B, 1, Int>,
+        len: usize,
+        cache: &LlamaCache<B>,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        let x = self.embed(tokens);
+        self.fixed_chunk_within(x, start, last, len, cache, cache.kv.dtype())
+    }
+
+    fn step(
+        &self,
+        token: Tensor<B, 2, Int>,
+        position: Tensor<B, 1, Int>,
+        len: usize,
+        cache: &LlamaCache<B>,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        let x = self.embed(token);
+        self.fixed_step_within(x, position, len, cache, cache.kv.dtype())
+    }
 }
 
 fn ids<B: Backend>(tokens: &[i32], device: &B::Device) -> Tensor<B, 2, Int> {
@@ -779,5 +1136,80 @@ impl<B: Backend> Llama<B> {
             out.step(|| self.forward(ids(&[token], device), &mut cache, dtype));
         }
         out
+    }
+}
+
+impl<B: Backend> crate::generate::EagerDecoder<B> for Llama<B> {
+    fn generate(
+        &self,
+        prompt: &[i32],
+        steps: usize,
+        precision: Precision,
+        device: &B::Device,
+    ) -> Generation {
+        Llama::generate(self, prompt, steps, precision, device)
+    }
+
+    fn forced(
+        &self,
+        prompt: &[i32],
+        continuation: &[i32],
+        precision: Precision,
+        device: &B::Device,
+    ) -> Generation {
+        Llama::forced(self, prompt, continuation, precision, device)
+    }
+}
+
+impl<B: burn_tt::storage::StorageBackend> Llama<B> {
+    /// The model as inference runs it under the numeric contract `numerics` (ADR 0006): fused
+    /// ([`Llama::fused`]), its head untied, and every weight but the embedding table stored in the
+    /// contract's format ([`crate::quant::Plan::for_numerics`]: BF16 under the reference contract,
+    /// BFP8 under the performance one, and BFP4 for `gate|up` with [`WeightOptions::mlp_bfp4`]).
+    /// For a checkpoint of BF16 values, as every one `tt-models` loads. A traced generator captures
+    /// the model's steps under its contract ([`FixedShapeDecoder::numerics`]).
+    ///
+    /// [`WeightOptions::mlp_bfp4`]: crate::quant::WeightOptions::mlp_bfp4
+    pub fn for_inference(
+        self,
+        numerics: burn_tt::Numerics,
+        options: crate::quant::WeightOptions,
+    ) -> Self {
+        let mut model = crate::quant::apply(
+            self.fused().untied(),
+            &crate::quant::Plan::for_numerics(numerics, options),
+            &crate::quant::Native,
+        );
+        // The performance contract's products read BF16 activations, each rounded once where it
+        // is made ([`crate::quant::WeightOptions::f32_activations`] opts out); the reference
+        // contract's read F32, bit for bit.
+        if numerics == burn_tt::Numerics::Performance && !options.f32_activations {
+            model.operand = Some(DType::BF16);
+        }
+        model.numerics = Some(numerics);
+        model
+    }
+
+    /// Every weight but the embedding table stored BF16, the output head untied first
+    /// ([`Llama::untied`], [`crate::quant::Plan::bf16_weights`]): half the bytes a decode step
+    /// reads, and for a BF16 checkpoint widened to F32 ([`Precision::F32`]) the same logits **bit
+    /// for bit**, since BF16 storage holds those values exactly and burn-tt multiplies them as it
+    /// multiplies F32 (`docs/completed-plans/bf16-weight-storage.md`). Apply after [`Llama::fused`], so the
+    /// fused matrices are the ones stored.
+    pub fn with_bf16_weights(self) -> Self {
+        self.with_stored_weights(crate::quant::Format::Bf16Stored)
+    }
+
+    /// Every weight but the embedding table stored in `format` (BF16 or BFP8/4/2), the output
+    /// head untied first ([`crate::quant::Plan::stored_weights`]). Each product reads its weight in
+    /// that format where it lies and computes the values it decodes to in F32, so the logits equal
+    /// the F32 model's whose weights hold those values, bit for bit
+    /// (`docs/completed-plans/dataflow-compiler.md` F1c). Apply after [`Llama::fused`].
+    pub fn with_stored_weights(self, format: crate::quant::Format) -> Self {
+        crate::quant::apply(
+            self.untied(),
+            &crate::quant::Plan::stored_weights(format),
+            &crate::quant::Native,
+        )
     }
 }

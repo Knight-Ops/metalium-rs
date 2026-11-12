@@ -144,7 +144,7 @@ fn diagnostic_impl(
     let cleared = req.semaphore("matrix clear retired", 0, 0..1);
     let loaded = req.semaphore("source handover retired", 0, 0..1);
     let released = req.semaphore("source release retired", 0, 0..1);
-    let plan = req.plan(tt_isa::l1::DATA).unwrap();
+    let plan = req.plan(crate::l1::arena()).unwrap();
     let (staged, cleared, loaded, released) = (
         plan.semaphore(staged),
         plan.semaphore(cleared),

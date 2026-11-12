@@ -124,13 +124,6 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
-    fn matmul_bf16(
-        &mut self,
-        _a: BufferId,
-        _b: BufferId,
-    ) -> Result<(BufferId, [usize; 2]), TtError> {
-        Err(unsupported())
-    }
     /// Convert between resident F32 and physical BF16 storage on Tensix.
     fn cast_float(
         &mut self,
@@ -147,10 +140,12 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
-    fn matmul_bfp(
+    /// A logical F32 buffer stored as BF16 (`store`: `Session::store_bf16`, half the bytes, read
+    /// by a product as its `B`) or such a buffer widened back to F32 (`Session::widen_bf16`).
+    fn cast_bf16_storage(
         &mut self,
-        _a: BufferId,
-        _b: BufferId,
+        _id: BufferId,
+        _store: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -172,8 +167,9 @@ pub trait Engine {
     }
     /// Forget one.
     fn free(&mut self, _id: BufferId) {}
-    /// `op(A) @ op(B)`, each operand transposed if asked, result left on the
-    /// device, as `(id, [rows, cols])`.
+    /// `op(A) @ op(B)`, each operand transposed if asked and in its own storage format (F32,
+    /// BF16, BFP: one product for every pair, `Session::matmul_dram`), result left on the device as
+    /// F32, as `(id, [rows, cols])`.
     fn matmul_dram(
         &mut self,
         _a: BufferId,
@@ -182,6 +178,22 @@ pub trait Engine {
         _b_transposed: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
+    }
+    /// [`Engine::matmul_dram`] with a BF16 result (roadmap W1, native BF16 arithmetic): the F32
+    /// product narrowed once, ties-even (`Session::bf16_from_f32`'s rounding). An engine with its
+    /// own native product (`Session::matmul_dram_as`, each output rounded in `Dst` before a BF16
+    /// pack, bit for bit this) takes it; the default runs the composition.
+    fn matmul_dram_bf16(
+        &mut self,
+        a: BufferId,
+        a_transposed: bool,
+        b: BufferId,
+        b_transposed: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (c, _) = self.matmul_dram(a, a_transposed, b, b_transposed)?;
+        let out = self.cast_float(c, true);
+        self.free(c);
+        out
     }
     /// [`Engine::matmul_dram`] at `fidelity` in place of the engine's own (`MatmulMode::Accurate`
     /// multiplies integer slices at `Fidelity::Lo`). An engine that cannot refuses.
@@ -232,6 +244,17 @@ pub trait Engine {
         _items: &[(Block, Block)],
         _mkn: [usize; 3],
         _layout: BatchedLayout,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// Attention for a few query rows a key/value head, as one op
+    /// (`Session::attention_rows`): `[q, k, v, mask]`, each head's blocks in `items`.
+    fn attention_rows(
+        &mut self,
+        _buffers: [BufferId; 4],
+        _items: &[tt_kernels::attention::Item],
+        _dims: [usize; 4],
+        _scale: f32,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -316,6 +339,25 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// `input[r, indices[r]]` for each row, `[rows, 1]`, the indices resident `[rows, 1]` I32
+    /// (`Session::pick_columns`).
+    fn pick_columns(
+        &mut self,
+        _input: BufferId,
+        _indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// `t` with `value`'s rows added to the rows the resident `[1, n]` I32 `indices` name, in
+    /// order (`Session::select_add_rows`): an embedding's gradient, no index read by the host.
+    fn select_add_rows(
+        &mut self,
+        _t: BufferId,
+        _indices: BufferId,
+        _value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// A copy of `t` with `value`'s row `s` at row `d` for each `(d, s)`
     /// (`Session::assign_rows`): a `slice_assign` of whole rows.
     fn assign_rows(
@@ -324,6 +366,28 @@ pub trait Engine {
         _value: BufferId,
         _rows: &[(usize, usize)],
     ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// A copy of `table` with `values`' row `i` at its row `indices[i]`, the
+    /// indices a resident I32 buffer, `[1, n]` or (`column`) `[n, 1]`
+    /// (`Session::scatter_rows`): a `scatter_nd` with `Assign` over whole rows.
+    fn scatter_rows(
+        &mut self,
+        _table: BufferId,
+        _indices: BufferId,
+        _values: BufferId,
+        _column: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// [`Engine::scatter_rows`] into `table` itself (`Session::scatter_rows_into`).
+    fn scatter_rows_into(
+        &mut self,
+        _table: BufferId,
+        _indices: BufferId,
+        _values: BlockArg,
+        _column: bool,
+    ) -> Result<(), TtError> {
         Err(unsupported())
     }
     /// The sum over rows of `a`, `[1, cols]`, left on the device.
@@ -337,6 +401,7 @@ pub trait Engine {
         _a: BufferId,
         _op: tt_kernels::sfpu::reduce::ReduceOp,
         _axis: tt_kernels::sfpu::reduce::Axis,
+        _then: tt_kernels::tensor::ReduceThen,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -346,6 +411,65 @@ pub trait Engine {
         _a: BufferId,
         _op: tt_kernels::sfpu::scan::ScanOp,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// Each row's `sqrt(mean(a a) + eps)`, `[rows, 1]`, left on the device
+    /// (`tt_kernels::session::Session::rms`).
+    fn rms(&mut self, _a: BufferId, _eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// `softmax(scale x, masked)` over each row of `x`, `mask` read for rows `r % mask_rows`,
+    /// left on the device (`tt_kernels::session::Session::softmax_rows`).
+    fn softmax_rows(
+        &mut self,
+        _x: BufferId,
+        _mask: BufferId,
+        _scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// `a / sqrt(mean(a a) + eps)` over each row, left on the device
+    /// (`tt_kernels::session::Session::rms_norm`), times `gamma` (`[1, cols]`) if given.
+    fn rms_norm(
+        &mut self,
+        _a: BufferId,
+        _gamma: Option<BufferId>,
+        _eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// [`Engine::rms_norm`], its F32 result rounded once to BF16 where `bf16`
+    /// (`Session::rms_norm_as`). The default runs the composition, the norm then
+    /// [`Engine::cast_float`]: bit for bit the native one.
+    fn rms_norm_as(
+        &mut self,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (out, dims) = self.rms_norm(a, gamma, eps)?;
+        if !bf16 {
+            return Ok((out, dims));
+        }
+        let narrow = self.cast_float(out, true);
+        self.free(out);
+        narrow
+    }
+    /// `s = a + b` and `s`'s RMSNorm times `gamma` if given, `(s, norm)`, left on the device
+    /// (`tt_kernels::session::Session::add_rms_norm`).
+    fn add_rms_norm(
+        &mut self,
+        _a: BufferId,
+        _b: BufferId,
+        _gamma: Option<BufferId>,
+        _eps: f32,
+    ) -> Result<[(BufferId, [usize; 2]); 2], TtError> {
+        Err(unsupported())
+    }
+    /// The index of a `[1, cols]` row's largest element, `[1, 1]` I32, left on the device
+    /// (`tt_kernels::session::Session::argmax_row`).
+    fn argmax_row(&mut self, _a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
     /// Rows `[first, first + rows)` of `a` as a view: no copy. The caller
@@ -384,6 +508,65 @@ pub trait Engine {
         }
         self.eltwise(op.kind, op.scalar, a, b)
     }
+    /// [`Engine::eltwise_op`], its F32 result rounded once to BF16 where `bf16`
+    /// (`Session::eltwise3_as`). The default runs the composition, the op then
+    /// [`Engine::cast_float`]: bit for bit the native one.
+    fn eltwise_op_as(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (out, dims) = self.eltwise_op(op, a, b, c)?;
+        if !bf16 {
+            return Ok((out, dims));
+        }
+        let narrow = self.cast_float(out, true);
+        self.free(out);
+        narrow
+    }
+    /// [`Engine::eltwise_blocks`] as [`Engine::eltwise_op_as`] takes it.
+    fn eltwise_blocks_as(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (out, dims) = self.eltwise_blocks(op, a, b, c)?;
+        if !bf16 {
+            return Ok((out, dims));
+        }
+        let narrow = self.cast_float(out, true);
+        self.free(out);
+        narrow
+    }
+    /// [`Engine::eltwise_op`] over blocks of resident F32 buffers
+    /// (`Session::eltwise_blocks`): each operand read where it lies, the
+    /// result a new buffer of `a`'s block's dims.
+    fn eltwise_blocks(
+        &mut self,
+        _op: tt_kernels::tensor::Eltwise,
+        _a: BlockArg,
+        _b: Option<BlockArg>,
+        _c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
+    /// Rotary position embedding as one op (`tt_kernels::session::Session::rope`): `x cos +
+    /// rotate(x) sin` over blocks whose columns are heads of `head` columns.
+    fn rope_blocks(
+        &mut self,
+        _x: BlockArg,
+        _cos: BlockArg,
+        _sin: BlockArg,
+        _head: usize,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// `x^y` as `powf` (`tt_kernels::session::Session::pow`), result on the
     /// device.
     fn pow(&mut self, _x: BufferId, _y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
@@ -406,6 +589,49 @@ pub trait Engine {
     fn end_trace(&mut self) -> Result<u64, TtError> {
         Err(no_traces())
     }
+    /// Start capturing a trace that applies the residency plan the last plan pass made, kept
+    /// under `key` if it holds (`Session::begin_trace_planned_as`): `false`, starting nothing,
+    /// without one.
+    fn begin_trace_planned(&mut self, _key: u64) -> Result<bool, TtError> {
+        Ok(false)
+    }
+    /// Start capturing a trace that applies the residency plan kept under `key`
+    /// (`Session::begin_trace_cached`): `false`, starting nothing, without one.
+    fn begin_trace_cached(&mut self, _key: u64) -> Result<bool, TtError> {
+        Ok(false)
+    }
+    /// Whether the last plan pass made a plan for [`Engine::begin_trace_planned`] to apply
+    /// (`Session::has_pending_plan`).
+    fn has_pending_plan(&mut self) -> Result<bool, TtError> {
+        Ok(false)
+    }
+    /// Start capturing a trace that, with residency on, plans the next
+    /// (`Session::begin_trace_plan_pass`); otherwise [`Engine::begin_trace`].
+    fn begin_trace_plan_pass(&mut self) -> Result<(), TtError> {
+        self.begin_trace()
+    }
+    /// Plan every capture from here on for L1 residency, in a region of `bytes` a unit (0: off;
+    /// `Session::set_residency`).
+    #[doc(hidden)]
+    fn set_residency(&mut self, _bytes: u64) -> Result<(), TtError> {
+        Err(no_traces())
+    }
+    /// How many captures the session has begun (`Session::probe_captures`).
+    #[doc(hidden)]
+    fn probe_captures(&mut self) -> Result<u64, TtError> {
+        Err(no_traces())
+    }
+    /// Every unit's NC waits since last taken, zeroed (`Session::probe_nc_waits`).
+    #[doc(hidden)]
+    fn probe_nc_waits(&mut self) -> Result<Vec<[u32; 8]>, TtError> {
+        Err(no_traces())
+    }
+    /// Program bytes replays have put back in the units' caches: the host's
+    /// (`Session::restored_bytes`) and the B movers' (`Session::mover_restored_bytes`).
+    #[doc(hidden)]
+    fn probe_restored_bytes(&mut self) -> Result<(u64, u64), TtError> {
+        Err(no_traces())
+    }
     /// Overwrite `input`'s values, replay `trace`, and read `output` back:
     /// one round trip.
     fn run_trace(
@@ -419,6 +645,86 @@ pub trait Engine {
     }
     /// Give a trace back.
     fn release_trace(&mut self, _trace: u64) {}
+    /// Name the device work queued from here on: the Burn op (or part) whose job
+    /// runs next, kept in a capture's records (`Session::set_op_label`).
+    fn set_op_label(&mut self, _label: &'static str) {}
+    /// The ops `trace` captured, in order, each with its label and its share of
+    /// every unit's stream (`tt_kernels::trace::OpRecord`).
+    fn trace_ops(&mut self, _trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+        Err(no_traces())
+    }
+    /// What `trace` costs each unit: its stream's GDDR bytes and the program-cache bytes it
+    /// holds, beside what every trace on the unit holds (`Session::trace_footprint`).
+    /// Name `trace` for the profile mode's report.
+    fn set_trace_name(&mut self, _trace: u64, _name: String) {}
+    /// Turn the profile mode on (`Some`) or off (`None`, returning what it recorded):
+    /// `Session::profile_mode`.
+    fn profile_mode(
+        &mut self,
+        _options: Option<tt_kernels::profile_mode::ProfileOptions>,
+    ) -> Result<Option<crate::profile::Profile>, TtError> {
+        Err(TtError::Device(
+            "this engine has no profile mode (`TT_PROFILE` is for a single card's KMD engine)"
+                .into(),
+        ))
+    }
+    /// What the profile mode has recorded so far.
+    fn profile_report(&mut self) -> Result<Option<crate::profile::Profile>, TtError> {
+        Ok(None)
+    }
+    fn trace_footprint(
+        &mut self,
+        _trace: u64,
+    ) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+        Err(no_traces())
+    }
+    /// [`Engine::run_generic_trace`] with the timestamper on around the replay alone
+    /// (`Session::profile_start`): every unit's data mover stamps its entries. The roles
+    /// stamp only if the capture was made while profiling, which a capture through
+    /// burn-tt never is. Each unit's buffer holds 1,024 events, so this is for small
+    /// traces (a model of one layer); a larger one fails its sync. Silicon only.
+    #[doc(hidden)]
+    fn set_profile_buffer(&mut self, _bytes: Option<u64>) -> Result<(), TtError> {
+        Err(no_traces())
+    }
+    /// GDDR bytes free on the fullest channel and in all (`Session::dram_free_bytes_by_channel`).
+    #[doc(hidden)]
+    fn gddr_free_bytes(&mut self) -> Result<(u64, u64), TtError> {
+        Err(no_traces())
+    }
+    /// The session's host stages so far (`Session::host_times`): each stage's name, its time
+    /// in ms, its count and its write calls. A diagnosis's snapshot.
+    #[doc(hidden)]
+    fn host_stage_times(&mut self) -> Result<Vec<(String, f64, u64, u64)>, TtError> {
+        Err(no_traces())
+    }
+    /// Count what each op of every trace captured from here on moves through GDDR
+    /// (`Session::set_count_trace_bytes`), read back with [`Engine::trace_ops`].
+    #[doc(hidden)]
+    fn set_count_trace_bytes(&mut self, _on: bool) -> Result<(), TtError> {
+        Err(no_traces())
+    }
+    /// Let the traces captured from here on reuse their own tensors' GDDR
+    /// (`Session::set_capture_reuse`); the previous setting.
+    #[doc(hidden)]
+    fn set_capture_reuse(&mut self, _on: bool) -> Result<bool, TtError> {
+        Err(no_traces())
+    }
+    /// Keep `bytes` at the top of each unit's L1 arena for a persistent region in every trace
+    /// captured from here on (`Session::set_l1_region`).
+    #[doc(hidden)]
+    fn set_l1_region(&mut self, _bytes: u64) -> Result<(), TtError> {
+        Err(no_traces())
+    }
+    #[doc(hidden)]
+    fn profile_generic_trace(
+        &mut self,
+        _trace: u64,
+        _inputs: &[(BufferId, InputPayload)],
+        _outputs: &[(BufferId, OutputKind)],
+    ) -> Result<(GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+        Err(no_traces())
+    }
     /// Copy `src` into `dst` on the device without allocating a new buffer.
     fn copy_into(&mut self, _src: BufferId, _dst: BufferId) -> Result<(), TtError> {
         Err(unsupported())
@@ -551,9 +857,14 @@ pub struct DramBuffers {
     next: BufferId,
     live: HashMap<BufferId, tt_kernels::tensor::DramTensor>,
     bf16: HashMap<BufferId, tt_kernels::bf16::Bf16Tensor>,
-    bfp: HashMap<BufferId, tt_kernels::bfp::BfpTensor>,
     next_trace: u64,
     traces: HashMap<u64, tt_kernels::trace::TraceId>,
+    /// The profile mode's names for traces, by the session's trace number
+    /// ([`DramBuffers::set_trace_name`]), kept after a trace is released.
+    trace_names: std::collections::BTreeMap<u64, String>,
+    /// While the profile mode is on: each replay's input write, replay and output read, by the
+    /// session's trace number.
+    replay_times: Option<std::collections::BTreeMap<u64, Vec<[std::time::Duration; 3]>>>,
 }
 
 impl DramBuffers {
@@ -648,27 +959,6 @@ impl DramBuffers {
             .map_err(TtError::from)?;
         Ok(self.insert(out))
     }
-    pub fn matmul_bf16<T: tt_device::Transport>(
-        &mut self,
-        s: &mut Session<T>,
-        a: BufferId,
-        b: BufferId,
-        fidelity: Fidelity,
-        budget: u64,
-    ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let ta = self
-            .bf16
-            .get(&a)
-            .ok_or_else(|| TtError::Device(format!("no BF16 buffer {a}")))?;
-        let tb = self
-            .bf16
-            .get(&b)
-            .ok_or_else(|| TtError::Device(format!("no BF16 buffer {b}")))?;
-        let out = s
-            .matmul_bf16(ta, tb, fidelity, budget)
-            .map_err(TtError::from)?;
-        Ok(self.insert(out))
-    }
     pub fn upload_bf16<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -719,35 +1009,31 @@ impl DramBuffers {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let error = |e: tt_kernels::tensor::TensorError| TtError::from(e);
         if let Some(format) = format {
-            let t = s.bfp_from_f32(self.get(id)?, format).map_err(error)?;
-            let dims = [t.rows(), t.cols()];
-            self.next += 1;
-            self.bfp.insert(self.next, t);
-            Ok((self.next, dims))
+            let t = s.store_bfp(self.get(id)?, format).map_err(error)?;
+            Ok(self.insert(t))
         } else {
-            let t = self
-                .bfp
-                .get(&id)
-                .ok_or_else(|| TtError::Device(format!("no BFP buffer {id}")))?;
-            let t = s.bfp_to_f32(t).map_err(error)?;
+            let t = self.bfp(id)?;
+            let t = s.bfp_to_f32(&t).map_err(error)?;
             Ok(self.insert(t))
         }
     }
 
-    pub fn matmul_bfp<T: tt_device::Transport>(
+    pub fn cast_bf16_storage<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
-        a: BufferId,
-        b: BufferId,
-        fidelity: Fidelity,
+        id: BufferId,
+        store: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let a = self.bfp.get(&a).ok_or_else(unsupported)?;
-        let b = self.bfp.get(&b).ok_or_else(unsupported)?;
-        let out = s
-            .bfp_matmul(a, false, b, false, fidelity)
-            .map_err(TtError::from)?;
+        let t = self.get(id)?;
+        let out = if store {
+            s.store_bf16(t)
+        } else {
+            s.widen_bf16(t)
+        }
+        .map_err(TtError::from)?;
         Ok(self.insert(out))
     }
+
     fn insert_bf16(&mut self, t: tt_kernels::bf16::Bf16Tensor) -> (BufferId, [usize; 2]) {
         let dims = [t.rows, t.cols];
         self.next += 1;
@@ -759,6 +1045,29 @@ impl DramBuffers {
         s: &mut Session<T>,
     ) -> Result<(), TtError> {
         s.begin_trace().map_err(TtError::from)
+    }
+
+    pub fn begin_trace_planned<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        key: u64,
+    ) -> Result<bool, TtError> {
+        s.begin_trace_planned_as(key).map_err(TtError::from)
+    }
+
+    pub fn begin_trace_cached<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        key: u64,
+    ) -> Result<bool, TtError> {
+        s.begin_trace_cached(key).map_err(TtError::from)
+    }
+
+    pub fn begin_trace_plan_pass<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+    ) -> Result<(), TtError> {
+        s.begin_trace_plan_pass().map_err(TtError::from)
     }
 
     pub fn end_trace<T: tt_device::Transport>(
@@ -802,6 +1111,30 @@ impl DramBuffers {
         })
     }
 
+    pub fn trace_ops<T: tt_device::Transport>(
+        &self,
+        s: &Session<T>,
+        trace: u64,
+    ) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+        let id = *self
+            .traces
+            .get(&trace)
+            .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
+        Ok(s.trace_ops(id).map_err(TtError::from)?.to_vec())
+    }
+
+    pub fn trace_footprint<T: tt_device::Transport>(
+        &self,
+        s: &Session<T>,
+        trace: u64,
+    ) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+        let id = *self
+            .traces
+            .get(&trace)
+            .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
+        s.trace_footprint(id).map_err(TtError::from)
+    }
+
     pub fn release_trace<T: tt_device::Transport>(&mut self, s: &mut Session<T>, trace: u64) {
         if let Some(id) = self.traces.remove(&trace) {
             let _ = s.release_trace(id);
@@ -814,14 +1147,13 @@ impl DramBuffers {
         src: BufferId,
         dst: BufferId,
     ) -> Result<(), TtError> {
-        if let Some(src_t) = self.bfp.get(&src) {
+        if let Ok(src_t) = self.bfp(src) {
             let dst_t = self
-                .bfp
-                .get(&dst)
-                .ok_or_else(|| TtError::Device("copy_into storage formats differ".into()))?;
-            return s.copy_into_bfp(src_t, dst_t).map_err(TtError::from);
+                .bfp(dst)
+                .map_err(|_| TtError::Device("copy_into storage formats differ".into()))?;
+            return s.copy_into_bfp(&src_t, &dst_t).map_err(TtError::from);
         }
-        if self.bfp.contains_key(&dst) {
+        if self.is_bfp(dst) {
             return Err(TtError::Device("copy_into storage formats differ".into()));
         }
         if let Some(src_t) = self.bf16.get(&src) {
@@ -859,12 +1191,97 @@ impl DramBuffers {
         s.sync().map_err(TtError::from)?;
         let t2 = Instant::now();
         let out_data = self.read_trace_outputs(s, outputs)?;
-        Ok(GenericTraceRun {
+        let run = GenericTraceRun {
             outputs: out_data,
             write: t1 - t0,
             replay: t2 - t1,
             read: t2.elapsed(),
-        })
+        };
+        if let Some(times) = self.replay_times.as_mut() {
+            times
+                .entry(id.raw())
+                .or_default()
+                .push([run.write, run.replay, run.read]);
+        }
+        Ok(run)
+    }
+
+    /// Name trace `trace` for the profile mode's report.
+    pub fn set_trace_name(&mut self, trace: u64, name: String) {
+        if let Some(id) = self.traces.get(&trace) {
+            self.trace_names.insert(id.raw(), name);
+        }
+    }
+
+    /// Turn the profile mode on or off (`Session::profile_mode`), keeping each replay's timing
+    /// while it is on; off, what it recorded, with the traces' names.
+    pub fn profile_mode<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        options: Option<tt_kernels::profile_mode::ProfileOptions>,
+    ) -> Result<Option<crate::profile::Profile>, TtError> {
+        let on = options.is_some();
+        let device = s.profile_mode(options).map_err(TtError::from)?;
+        let profile = device.map(|device| self.profile(s, device));
+        self.replay_times = on.then(Default::default);
+        Ok(profile)
+    }
+
+    /// What the profile mode has recorded so far.
+    pub fn profile_report<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+    ) -> Result<Option<crate::profile::Profile>, TtError> {
+        let device = s.profile_report().map_err(TtError::from)?;
+        Ok(device.map(|device| self.profile(s, device)))
+    }
+
+    fn profile<T: tt_device::Transport>(
+        &self,
+        s: &Session<T>,
+        device: tt_kernels::profile_mode::ProfileReport,
+    ) -> crate::profile::Profile {
+        crate::profile::Profile {
+            device,
+            names: self.trace_names.clone(),
+            replays: self.replay_times.clone().unwrap_or_default(),
+            host: crate::profile::session_text(s),
+        }
+    }
+
+    pub fn profile_generic_trace<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        trace: u64,
+        inputs: &[(BufferId, InputPayload)],
+        outputs: &[(BufferId, OutputKind)],
+    ) -> Result<(GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+        use std::time::Instant;
+        let id = *self
+            .traces
+            .get(&trace)
+            .ok_or_else(|| TtError::Device(format!("no trace {trace}")))?;
+        s.sync().map_err(TtError::from)?;
+        let t0 = Instant::now();
+        self.write_trace_inputs(s, inputs)?;
+        // The inputs' writes land first, so the stamps hold the replay alone.
+        s.sync().map_err(TtError::from)?;
+        s.profile_start().map_err(TtError::from)?;
+        let t1 = Instant::now();
+        s.replay(id).map_err(TtError::from)?;
+        s.sync().map_err(TtError::from)?;
+        let t2 = Instant::now();
+        let profile = s.profile_stop().map_err(TtError::from)?;
+        let out_data = self.read_trace_outputs(s, outputs)?;
+        Ok((
+            GenericTraceRun {
+                outputs: out_data,
+                write: t1 - t0,
+                replay: t2 - t1,
+                read: t2.elapsed(),
+            },
+            profile,
+        ))
     }
 
     /// Write each of a generic trace's inputs into its buffer.
@@ -933,8 +1350,8 @@ impl DramBuffers {
         s: &mut Session<T>,
         id: BufferId,
     ) -> Result<Vec<f32>, TtError> {
-        if let Some(t) = self.bfp.get(&id) {
-            return s.download_bfp(t).map_err(TtError::from);
+        if let Ok(t) = self.bfp(id) {
+            return s.download_bfp(&t).map_err(TtError::from);
         }
         let t = self.get(id)?;
         s.download(t).map_err(TtError::from)
@@ -994,9 +1411,6 @@ impl DramBuffers {
         if let Some(t) = self.live.remove(&id) {
             let _ = s.free(t);
         }
-        if let Some(t) = self.bfp.remove(&id) {
-            let _ = s.free_bfp(t);
-        }
         if let Some(t) = self.bf16.remove(&id) {
             let _ = s.free_bf16(t);
         }
@@ -1014,9 +1428,45 @@ impl DramBuffers {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
-        let c = s
-            .matmul_dram(
+        self.matmul_as(
+            s,
+            a,
+            a_transposed,
+            b,
+            b_transposed,
+            route,
+            fidelity,
+            budget,
+            Elem::F32,
+        )
+    }
+
+    /// [`DramBuffers::matmul`] with a result of `out` (F32, or BF16: `Session::matmul_dram_as`,
+    /// roadmap W1). A BF16 result the session has no schedule for (`K` blocked through the
+    /// result) is the F32 product narrowed, which it is bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_as<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        a_transposed: bool,
+        b: BufferId,
+        b_transposed: bool,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        out: Elem,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (ta, tb) = (self.operand(a)?, self.operand(b)?);
+        // A packed operand's values are exact in either `Src` type: its edge picks the route.
+        let route = match (ta.elem, tb.elem) {
+            (tt_kernels::tensor::Elem::Packed(_), _) | (_, tt_kernels::tensor::Elem::Packed(_)) => {
+                SrcRoute::Tf32FromFp32
+            }
+            _ => route,
+        };
+        let product = |s: &mut Session<T>, out| {
+            s.matmul_dram_as(
                 &ta,
                 a_transposed,
                 &tb,
@@ -1024,12 +1474,29 @@ impl DramBuffers {
                 route,
                 fidelity,
                 budget,
+                out,
             )
-            .map_err(TtError::from)?;
-        let dims = [c.rows, c.cols];
-        self.next += 1;
-        self.live.insert(self.next, c);
-        Ok((self.next, dims))
+        };
+        let c = match product(s, out) {
+            Err(tt_kernels::tensor::TensorError::Shape(e))
+                if out == Elem::BF16 && e.contains("K-blocked") =>
+            {
+                let wide = product(s, Elem::F32).map_err(TtError::from)?;
+                let narrowed = s.bf16_from_f32(&wide);
+                let _ = s.free(wide);
+                return Ok(self.insert_bf16(narrowed.map_err(TtError::from)?));
+            }
+            c => c.map_err(TtError::from)?,
+        };
+        Ok(self.insert_any(c))
+    }
+
+    /// `t` under a new id: a BF16 tensor among the BF16 buffers, every other in the live map.
+    fn insert_any(&mut self, t: tt_kernels::tensor::DramTensor) -> (BufferId, [usize; 2]) {
+        match t.as_bf16() {
+            Some(bf16) => self.insert_bf16(bf16),
+            None => self.insert(t),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1052,6 +1519,28 @@ impl DramBuffers {
         Ok(self.insert(c))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        [q, k, v, mask]: [BufferId; 4],
+        items: &[tt_kernels::attention::Item],
+        dims: [usize; 4],
+        scale: f32,
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let [tq, tk, tv, tm] = [q, k, v, mask].map(|id| self.get(id).cloned());
+        let (tq, tk, tv, tm) = (tq?, tk?, tv?, tm?);
+        let c = s
+            .attention_rows(
+                &tq, &tk, &tv, &tm, items, dims, scale, route, fidelity, budget,
+            )
+            .map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
     pub fn gather_rows<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1065,6 +1554,33 @@ impl DramBuffers {
             .collect::<Result<Vec<_>, _>>()?;
         let refs: Vec<_> = ts.iter().collect();
         let c = s.gather_rows(&refs, rows, cols).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn pick_columns<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (ti, tx) = (self.get(input)?.clone(), self.get(indices)?.clone());
+        let c = s.pick_columns(&ti, &tx).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn select_add_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        t: BufferId,
+        indices: BufferId,
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (tt, ti, tv) = (
+            self.get(t)?.clone(),
+            self.get(indices)?.clone(),
+            self.get(value)?.clone(),
+        );
+        let c = s.select_add_rows(&tt, &ti, &tv).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1090,6 +1606,58 @@ impl DramBuffers {
         let (tt, tv) = (self.get(t)?.clone(), self.get(value)?.clone());
         let c = s.assign_rows(&tt, &tv, rows).map_err(TtError::from)?;
         Ok(self.insert(c))
+    }
+
+    /// [`Session::scatter_rows`]: a 32-bit table only, a packed one refused.
+    pub fn scatter_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        for b in [table, values] {
+            if self.bf16.contains_key(&b) || self.is_bfp(b) {
+                return Err(TtError::Device(
+                    "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
+                ));
+            }
+        }
+        let (tt, ti, tv) = (
+            self.get(table)?.clone(),
+            self.get(indices)?.clone(),
+            self.get(values)?.clone(),
+        );
+        let c = s
+            .scatter_rows(&tt, &ti, &tv, column)
+            .map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn scatter_rows_into<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        table: BufferId,
+        indices: BufferId,
+        values: BlockArg,
+        column: bool,
+    ) -> Result<(), TtError> {
+        for b in [table, values.id] {
+            if self.bf16.contains_key(&b) || self.is_bfp(b) {
+                return Err(TtError::Device(
+                    "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
+                ));
+            }
+        }
+        let (tt, ti, tv) = (self.get(table)?, self.get(indices)?, self.get(values.id)?);
+        let block = tt_kernels::tensor::BlockOperand {
+            tensor: tv,
+            at: values.at,
+            dims: values.dims,
+        };
+        s.scatter_rows_into_block(tt, ti, block, column)
+            .map_err(TtError::from)
     }
 
     pub fn repack<T: tt_device::Transport>(
@@ -1155,7 +1723,7 @@ impl DramBuffers {
         table: BufferId,
         indices: BufferId,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+        if self.bf16.contains_key(&table) || self.is_bfp(table) {
             return Err(TtError::Device(
                 "a row select of a packed (BF16, F16 or BFP) table is not implemented".into(),
             ));
@@ -1176,7 +1744,7 @@ impl DramBuffers {
         indices: BufferId,
         zero_row: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if self.bf16.contains_key(&table) || self.bfp.contains_key(&table) {
+        if self.bf16.contains_key(&table) || self.is_bfp(table) {
             return Err(TtError::Device(
                 "a tap select of a packed (BF16, F16 or BFP) table is not implemented".into(),
             ));
@@ -1225,6 +1793,19 @@ impl DramBuffers {
         dims: [usize; 2],
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         if let Some(t) = self.bf16.get(&a) {
+            // Untransposed blocks on tile boundaries: whole tiles in their own slots
+            // (`Session::copy_blocks`, `READ_RUN`/`WRITE_RUN` step by a BF16 slot), as an F32
+            // tensor's move; anything else is the bit repack below.
+            if moves.iter().all(|m| !m.transposed) {
+                let source = tt_kernels::tensor::DramTensor::from_bf16(
+                    t.clone(),
+                    tt_kernels::tensor::Pad::Undefined,
+                );
+                if let Ok(c) = s.copy_blocks(&source, moves, dims) {
+                    return Ok(self.insert_any(c));
+                }
+            }
+            let t = self.bf16.get(&a).expect("checked above");
             let [rows, cols] = dims;
             let count = rows
                 .checked_mul(cols)
@@ -1279,7 +1860,22 @@ impl DramBuffers {
         b: Option<BufferId>,
         c: Option<BufferId>,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.eltwise_op_as(s, op, a, b, c, None)
+    }
+
+    /// [`DramBuffers::eltwise_op`] with its result's element type asked for
+    /// (`Session::eltwise3_as`): BF16 rounds an F32 result once before its pack.
+    pub fn eltwise_op_as<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+        out: Option<Elem>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
         if c.is_none()
+            && out.is_none()
             && matches!(
                 op.kind,
                 tt_kernels::kind::ADD
@@ -1297,16 +1893,86 @@ impl DramBuffers {
                 return self.matrix_eltwise(s, op, a, b, precision, fidelity);
             }
         }
-        let ta = self.get(a)?.clone();
-        let tb = b.map(|b| self.get(b).cloned()).transpose()?;
-        let tc = c.map(|c| self.get(c).cloned()).transpose()?;
+        // BF16 buffers as they lie: an element-wise op on BF16 operands is its widened op
+        // rounded once (`Session::eltwise3`, roadmap W1), its result BF16.
+        let ta = self.operand(a)?;
+        let tb = b.map(|b| self.operand(b)).transpose()?;
+        let tc = c.map(|c| self.operand(c)).transpose()?;
         let c = s
-            .eltwise3(op, &ta, tb.as_ref(), tc.as_ref())
+            .eltwise3_as(op, &ta, tb.as_ref(), tc.as_ref(), out)
             .map_err(TtError::from)?;
-        let dims = [c.rows, c.cols];
-        self.next += 1;
-        self.live.insert(self.next, c);
-        Ok((self.next, dims))
+        Ok(self.insert_any(c))
+    }
+
+    pub fn eltwise_blocks<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.eltwise_blocks_as(s, op, a, b, c, None)
+    }
+
+    /// [`DramBuffers::eltwise_blocks`] with its result's element type asked for, as
+    /// [`DramBuffers::eltwise_op_as`] takes it.
+    pub fn eltwise_blocks_as<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+        out: Option<Elem>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        // BF16 buffers as they lie, as `eltwise_op` reads them (roadmap W1).
+        let (ta, tb, tc) = (
+            self.operand(a.id)?,
+            b.map(|b| self.operand(b.id)).transpose()?,
+            c.map(|c| self.operand(c.id)).transpose()?,
+        );
+        fn block(
+            t: &tt_kernels::tensor::DramTensor,
+            x: BlockArg,
+        ) -> tt_kernels::tensor::BlockOperand<'_> {
+            tt_kernels::tensor::BlockOperand {
+                tensor: t,
+                at: x.at,
+                dims: x.dims,
+            }
+        }
+        let made = s
+            .eltwise_blocks_as(
+                op,
+                block(&ta, a),
+                tb.as_ref().zip(b).map(|(t, x)| block(t, x)),
+                tc.as_ref().zip(c).map(|(t, x)| block(t, x)),
+                out,
+            )
+            .map_err(TtError::from)?;
+        Ok(self.insert_any(made))
+    }
+
+    pub fn rope_blocks<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        x: BlockArg,
+        cos: BlockArg,
+        sin: BlockArg,
+        head: usize,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let block = |b: BlockArg| -> Result<tt_kernels::tensor::BlockOperand<'_>, TtError> {
+            Ok(tt_kernels::tensor::BlockOperand {
+                tensor: self.get(b.id)?,
+                at: b.at,
+                dims: b.dims,
+            })
+        };
+        let out = s
+            .rope(block(x)?, block(cos)?, block(sin)?, head)
+            .map_err(TtError::from)?;
+        Ok(self.insert(out))
     }
 
     pub fn sum_rows<T: tt_device::Transport>(
@@ -1325,9 +1991,93 @@ impl DramBuffers {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
+        then: tt_kernels::tensor::ReduceThen,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let ta = self.get(a)?.clone();
-        let c = s.reduce(&ta, op, axis).map_err(TtError::from)?;
+        let c = s.reduce_then(&ta, op, axis, then).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn rms<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let ta = self.get(a)?.clone();
+        let c = s.rms(&ta, eps).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn softmax_rows<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        x: BufferId,
+        mask: BufferId,
+        scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let (tx, tm) = (self.get(x)?.clone(), self.get(mask)?.clone());
+        let c = s.softmax_rows(&tx, &tm, scale).map_err(TtError::from)?;
+        Ok(self.insert(c))
+    }
+
+    pub fn rms_norm<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.rms_norm_as(s, a, gamma, eps, Elem::F32)
+    }
+
+    /// [`DramBuffers::rms_norm`] with its result as `out` (`Session::rms_norm_as`): BF16 rounds
+    /// the F32 norm once before its pack.
+    pub fn rms_norm_as<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+        out: Elem,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let ta = self.get(a)?.clone();
+        let tg = match gamma {
+            Some(g) => Some(self.get(g)?.clone()),
+            None => None,
+        };
+        let c = s
+            .rms_norm_as(&ta, tg.as_ref(), eps, out)
+            .map_err(TtError::from)?;
+        Ok(self.insert_any(c))
+    }
+
+    pub fn add_rms_norm<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+        b: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<[(BufferId, [usize; 2]); 2], TtError> {
+        let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
+        let tg = match gamma {
+            Some(g) => Some(self.get(g)?.clone()),
+            None => None,
+        };
+        let (sum, out) = s
+            .add_rms_norm(&ta, &tb, tg.as_ref(), eps)
+            .map_err(TtError::from)?;
+        Ok([self.insert(sum), self.insert(out)])
+    }
+
+    pub fn argmax_row<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let ta = self.get(a)?.clone();
+        let c = s.argmax_row(&ta).map_err(TtError::from)?;
         Ok(self.insert(c))
     }
 
@@ -1418,12 +2168,9 @@ impl DramBuffers {
         first: usize,
         rows: usize,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if let Some(t) = self.bfp.get(&a) {
+        if let Ok(t) = self.bfp(a) {
             let v = t.rows_view(first, rows).map_err(TtError::from)?;
-            let dims = [v.rows(), v.cols()];
-            self.next += 1;
-            self.bfp.insert(self.next, v);
-            return Ok((self.next, dims));
+            return Ok(self.insert(tt_kernels::tensor::DramTensor::from_bfp(v)));
         }
         if let Some(t) = self.bf16.get(&a) {
             let v = t.rows_view(first, rows).map_err(TtError::from)?;
@@ -1442,17 +2189,45 @@ impl DramBuffers {
 
     /// How many are live.
     pub fn len(&self) -> usize {
-        self.live.len() + self.bf16.len() + self.bfp.len()
+        self.live.len() + self.bf16.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.live.is_empty() && self.bf16.is_empty() && self.bfp.is_empty()
+        self.live.is_empty() && self.bf16.is_empty()
     }
 
     fn get(&self, id: BufferId) -> Result<&tt_kernels::tensor::DramTensor, TtError> {
         self.live
             .get(&id)
             .ok_or_else(|| TtError::Device(format!("no device buffer {id}")))
+    }
+
+    /// A product's operand: a buffer of the live map, or a BF16 one as a packed tensor (the same
+    /// allocation; its padding unknown, which the product repairs where `K` reaches it).
+    fn operand(&self, id: BufferId) -> Result<tt_kernels::tensor::DramTensor, TtError> {
+        if let Some(t) = self.bf16.get(&id) {
+            return Ok(tt_kernels::tensor::DramTensor::from_bf16(
+                t.clone(),
+                tt_kernels::tensor::Pad::Undefined,
+            ));
+        }
+        Ok(self.get(id)?.clone())
+    }
+
+    /// Whether `id` is a BF16 buffer (`Elem`'s half dtype, not a stored weight).
+    pub fn is_bf16(&self, id: BufferId) -> bool {
+        self.bf16.contains_key(&id)
+    }
+
+    /// A buffer stored BFP, as the BFP ops take it (the same allocation).
+    fn bfp(&self, id: BufferId) -> Result<tt_kernels::bfp::BfpTensor, TtError> {
+        self.get(id)?
+            .as_bfp()
+            .ok_or_else(|| TtError::Device(format!("no BFP buffer {id}")))
+    }
+
+    fn is_bfp(&self, id: BufferId) -> bool {
+        self.bfp(id).is_ok()
     }
 }
 
@@ -1555,6 +2330,7 @@ type Job = Box<dyn FnOnce(&mut dyn Engine, &mut Ids) + Send>;
 /// (`report::server_report`).
 fn timed_job(op: &'static str, job: Job) -> Job {
     Box::new(move |engine, ids| {
+        engine.set_op_label(op);
         let t0 = std::time::Instant::now();
         job(engine, ids);
         crate::report::served(op, t0.elapsed());
@@ -1691,6 +2467,8 @@ struct Attached {
     elementwise: ElementwiseMode,
     matmul: MatmulMode,
     exact_matmul_ok: bool,
+    /// The attachment's numeric contract ([`crate::Numerics`]).
+    numerics: crate::Numerics,
     poison: Poison,
     /// Set once the factory has served the first job's worth of state: until
     /// then `elementwise` is a placeholder.
@@ -1833,7 +2611,8 @@ pub(crate) fn ensure_attached(device: TtDevice) -> Result<(), TtError> {
 /// holds [`OPENING`].
 pub(crate) fn attach_auto(device: TtDevice, cfg: crate::TtConfig) -> Result<(), TtError> {
     let factory = crate::registry::default_factory(device, &cfg)?;
-    let guard = attach_inner(device, factory, Some(cfg))?;
+    let numerics = cfg.contract();
+    let guard = attach_inner(device, factory, Some(cfg), numerics)?;
     let old = locked(&AUTO)
         .get_or_insert_with(HashMap::new)
         .insert(device, guard);
@@ -1921,7 +2700,19 @@ pub fn attach<F>(device: TtDevice, factory: F) -> Result<AttachGuard, TtError>
 where
     F: FnOnce(Serve) -> Result<(), TtError> + Send + 'static,
 {
-    attach_inner(device, factory, None)
+    attach_inner(device, factory, None, crate::Numerics::Reference)
+}
+
+/// [`attach`] under the numeric contract `numerics` ([`crate::attach_with`]).
+pub(crate) fn attach_under<F>(
+    device: TtDevice,
+    factory: F,
+    numerics: crate::Numerics,
+) -> Result<AttachGuard, TtError>
+where
+    F: FnOnce(Serve) -> Result<(), TtError> + Send + 'static,
+{
+    attach_inner(device, factory, None, numerics)
 }
 
 /// [`attach`]; `config` is `Some` for the registry's attachments.
@@ -1929,6 +2720,7 @@ fn attach_inner<F>(
     device: TtDevice,
     factory: F,
     config: Option<crate::TtConfig>,
+    numerics: crate::Numerics,
 ) -> Result<AttachGuard, TtError>
 where
     F: FnOnce(Serve) -> Result<(), TtError> + Send + 'static,
@@ -1950,6 +2742,7 @@ where
                     elementwise: ElementwiseMode::Sfpu,
                     matmul: MatmulMode::Fast,
                     exact_matmul_ok: true,
+                    numerics,
                     poison,
                     ready: false,
                     config,
@@ -2156,6 +2949,59 @@ fn submit(
     (id, dims)
 }
 
+/// [`submit`] for an op that makes two buffers: both named now, `dims` their shapes; a failure
+/// fails both.
+fn submit_pair(
+    kind: &'static str,
+    device: TtDevice,
+    dims: [[usize; 2]; 2],
+    what: impl FnOnce() -> String + Send + 'static,
+    op: impl FnOnce(&mut dyn Engine, &Ids) -> Result<[(BufferId, [usize; 2]); 2], TtError>
+        + Send
+        + 'static,
+) -> [(BufferId, [usize; 2]); 2] {
+    let ids = dims.map(name);
+    crate::traffic::timed(kind, || {
+        send(
+            device,
+            Box::new(move |engine, map| {
+                let made = op(engine, map).and_then(|made| {
+                    if made.iter().zip(&dims).all(|((_, got), want)| got == want) {
+                        Ok(made.map(|(e, _)| e))
+                    } else {
+                        for (e, _) in made {
+                            engine.free(e);
+                        }
+                        Err(TtError::Device(format!(
+                            "made {:?} where {dims:?} was expected",
+                            made.map(|(_, got)| got)
+                        )))
+                    }
+                });
+                match made {
+                    Ok(made) => {
+                        for (id, e) in ids.into_iter().zip(made) {
+                            map.map.insert(id, Ok(e));
+                        }
+                    }
+                    Err(e) => {
+                        let why = Arc::new(TtError::Op {
+                            what: what(),
+                            device,
+                            cause: Arc::new(e),
+                        });
+                        map.failed.get_or_insert_with(|| why.clone());
+                        for id in ids {
+                            map.map.insert(id, Err(why.clone()));
+                        }
+                    }
+                }
+            }),
+        )
+    });
+    [(ids[0], dims[0]), (ids[1], dims[1])]
+}
+
 /// `A[m, k] @ B[k, n]` on `device`, panicking on a device error.
 pub(crate) fn matmul(device: TtDevice, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Vec<f32> {
     crate::report::staged(mkn);
@@ -2187,6 +3033,13 @@ pub(crate) fn matmul_mode(device: TtDevice) -> MatmulMode {
     ensure_attached(device).unwrap_or_else(|e| panic!("{e}"));
     with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.matmul))
         .unwrap_or_else(|| panic!("{}", TtError::NotAttached { device }))
+}
+
+/// `device`'s attachment's numeric contract, attaching it if nothing has.
+pub(crate) fn numerics(device: TtDevice) -> Result<crate::Numerics, TtError> {
+    ensure_attached(device)?;
+    with_attached(|a| a.get(&device).filter(|d| d.live()).map(|d| d.numerics))
+        .ok_or(TtError::NotAttached { device })
 }
 
 /// Can `device`'s engine run [`MatmulMode::Exact`]? The attachment's snapshot.
@@ -2360,34 +3213,19 @@ pub(crate) fn cast_bfp(
     )
 }
 
-pub(crate) fn matmul_bfp(
+/// [`Engine::cast_bf16_storage`]: `id` stored as BF16, or widened back to F32.
+pub(crate) fn cast_bf16_storage(
     device: TtDevice,
-    a: BufferId,
-    b: BufferId,
+    id: BufferId,
     dims: [usize; 2],
+    store: bool,
 ) -> (BufferId, [usize; 2]) {
     submit(
-        "matmul_bfp",
+        "cast_bf16_storage",
         device,
         dims,
-        || "packed BFP matmul".into(),
-        move |engine, ids| engine.matmul_bfp(ids.get(a)?, ids.get(b)?),
-    )
-}
-
-/// Upload datums as bits, panicking on a device error.
-pub(crate) fn matmul_bf16(
-    device: TtDevice,
-    a: BufferId,
-    b: BufferId,
-    dims: [usize; 2],
-) -> (BufferId, [usize; 2]) {
-    submit(
-        "matmul_bf16",
-        device,
-        dims,
-        || "direct BF16 matmul".into(),
-        move |engine, ids| engine.matmul_bf16(ids.get(a)?, ids.get(b)?),
+        move || format!("BF16 storage, store {store}"),
+        move |engine, ids| engine.cast_bf16_storage(ids.get(id)?, store),
     )
 }
 
@@ -2516,15 +3354,104 @@ pub(crate) fn eltwise_op(
     b: Option<BufferId>,
     c: Option<BufferId>,
 ) -> (BufferId, [usize; 2]) {
+    eltwise_op_as(device, op, a, b, c, false)
+}
+
+/// [`eltwise_op`], its F32 result rounded once to BF16 on the card where `bf16`
+/// (`Engine::eltwise_op_as`), without waiting.
+pub(crate) fn eltwise_op_as(
+    device: TtDevice,
+    op: tt_kernels::tensor::Eltwise,
+    a: BufferId,
+    b: Option<BufferId>,
+    c: Option<BufferId>,
+    bf16: bool,
+) -> (BufferId, [usize; 2]) {
     submit(
         "eltwise",
         device,
         dims_of(a),
-        move || format!("element-wise {:#x}", op.kind),
+        move || match bf16 {
+            false => format!("element-wise {:#x}", op.kind),
+            true => format!("element-wise {:#x}, a BF16 result", op.kind),
+        },
         move |engine, ids| {
             let b = b.map(|b| ids.get(b)).transpose()?;
             let c = c.map(|c| ids.get(c)).transpose()?;
-            engine.eltwise_op(op, ids.get(a)?, b, c)
+            match bf16 {
+                false => engine.eltwise_op(op, ids.get(a)?, b, c),
+                true => engine.eltwise_op_as(op, ids.get(a)?, b, c, true),
+            }
+        },
+    )
+}
+
+/// A block of a resident buffer, as [`Engine::eltwise_blocks`] reads it: the
+/// `dims` elements whose top-left is `at` (a tile boundary; ragged only at
+/// the buffer's own edge).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BlockArg {
+    pub id: BufferId,
+    pub at: [usize; 2],
+    pub dims: [usize; 2],
+}
+
+/// [`eltwise_op`] over blocks of resident buffers, without waiting: the
+/// result is `a`'s block's dims, its F32 result rounded once to BF16 on the card where `bf16`
+/// (`Engine::eltwise_blocks_as`).
+pub(crate) fn eltwise_blocks_as(
+    device: TtDevice,
+    op: tt_kernels::tensor::Eltwise,
+    a: BlockArg,
+    b: Option<BlockArg>,
+    c: Option<BlockArg>,
+    bf16: bool,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "eltwise",
+        device,
+        a.dims,
+        move || match bf16 {
+            false => format!("element-wise {:#x} on blocks", op.kind),
+            true => format!("element-wise {:#x} on blocks, a BF16 result", op.kind),
+        },
+        move |engine, ids| {
+            let get = |x: BlockArg| -> Result<BlockArg, TtError> {
+                Ok(BlockArg {
+                    id: ids.get(x.id)?,
+                    ..x
+                })
+            };
+            let (b, c) = (b.map(get).transpose()?, c.map(get).transpose()?);
+            match bf16 {
+                false => engine.eltwise_blocks(op, get(a)?, b, c),
+                true => engine.eltwise_blocks_as(op, get(a)?, b, c, true),
+            }
+        },
+    )
+}
+
+/// Rotary position embedding as one op on the device, without waiting: `x`'s block's dims.
+pub(crate) fn rope_blocks(
+    device: TtDevice,
+    x: BlockArg,
+    cos: BlockArg,
+    sin: BlockArg,
+    head: usize,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "rope",
+        device,
+        x.dims,
+        move || format!("rope, heads of {head}"),
+        move |engine, ids| {
+            let get = |b: BlockArg| -> Result<BlockArg, TtError> {
+                Ok(BlockArg {
+                    id: ids.get(b.id)?,
+                    ..b
+                })
+            };
+            engine.rope_blocks(get(x)?, get(cos)?, get(sin)?, head)
         },
     )
 }
@@ -2555,6 +3482,18 @@ pub(crate) fn reduce(
     op: tt_kernels::sfpu::reduce::ReduceOp,
     axis: tt_kernels::sfpu::reduce::Axis,
 ) -> (BufferId, [usize; 2]) {
+    reduce_then(device, a, op, axis, None)
+}
+
+/// [`reduce`] with `then`'s exact unary kind on the result before its pack
+/// (`tt_kernels::tensor::sfpu_reduce_then`): a softmax's clamps.
+pub(crate) fn reduce_then(
+    device: TtDevice,
+    a: BufferId,
+    op: tt_kernels::sfpu::reduce::ReduceOp,
+    axis: tt_kernels::sfpu::reduce::Axis,
+    then: tt_kernels::tensor::ReduceThen,
+) -> (BufferId, [usize; 2]) {
     use tt_kernels::sfpu::reduce::Axis;
     let [r, c] = dims_of(a);
     let dims = match axis {
@@ -2566,7 +3505,87 @@ pub(crate) fn reduce(
         device,
         dims,
         move || format!("{op:?} over {axis:?}"),
-        move |engine, ids| engine.reduce(ids.get(a)?, op, axis),
+        move |engine, ids| engine.reduce(ids.get(a)?, op, axis, then),
+    )
+}
+
+/// RMSNorm's statistic on the device, without waiting: each row's `sqrt(mean(a a) + eps)`,
+/// `[rows, 1]`. The caller has checked the row fits one job (`tt_kernels::sfpu::norm::fits`).
+/// The index of a row's largest element on the device, without waiting.
+pub(crate) fn argmax_row(device: TtDevice, a: BufferId) -> (BufferId, [usize; 2]) {
+    submit(
+        "argmax_row",
+        device,
+        [1, 1],
+        || "argmax row".into(),
+        move |engine, ids| engine.argmax_row(ids.get(a)?),
+    )
+}
+
+/// `softmax(scale x, masked)` over each row of `x` on the device, without waiting
+/// (`Session::softmax_rows`).
+pub(crate) fn softmax_rows(
+    device: TtDevice,
+    x: BufferId,
+    mask: BufferId,
+    scale: f32,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "softmax_rows",
+        device,
+        dims_of(x),
+        move || format!("scale {scale:e}"),
+        move |engine, ids| engine.softmax_rows(ids.get(x)?, ids.get(mask)?, scale),
+    )
+}
+
+/// `a / sqrt(mean(a a) + eps)` over each row on the device, without waiting.
+pub(crate) fn rms_norm(
+    device: TtDevice,
+    a: BufferId,
+    gamma: Option<BufferId>,
+    eps: f32,
+) -> (BufferId, [usize; 2]) {
+    rms_norm_as(device, a, gamma, eps, false)
+}
+
+/// [`rms_norm`], its F32 result rounded once to BF16 on the card where `bf16`
+/// (`Engine::rms_norm_as`), without waiting.
+pub(crate) fn rms_norm_as(
+    device: TtDevice,
+    a: BufferId,
+    gamma: Option<BufferId>,
+    eps: f32,
+    bf16: bool,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "rms_norm",
+        device,
+        dims_of(a),
+        move || format!("eps {eps:e}, scaled {}, BF16 {bf16}", gamma.is_some()),
+        move |engine, ids| {
+            let gamma = match gamma {
+                Some(g) => Some(ids.get(g)?),
+                None => None,
+            };
+            match bf16 {
+                false => engine.rms_norm(ids.get(a)?, gamma, eps),
+                true => engine.rms_norm_as(ids.get(a)?, gamma, eps, true),
+            }
+        },
+    )
+}
+
+/// Each row's `sqrt(mean(a a) + eps)`, `[rows, 1]` F32 (`Engine::rms`, `Session::rms`), without
+/// waiting.
+pub(crate) fn rms_stat(device: TtDevice, a: BufferId, eps: f32) -> (BufferId, [usize; 2]) {
+    let [rows, _] = dims_of(a);
+    submit(
+        "rms",
+        device,
+        [rows, 1],
+        move || format!("RMS statistic, eps {eps:e}"),
+        move |engine, ids| engine.rms(ids.get(a)?, eps),
     )
 }
 
@@ -2624,6 +3643,41 @@ pub(crate) fn matmul_dram(
     })
 }
 
+/// [`matmul_dram`] with a BF16 result (`Engine::matmul_dram_bf16`; roadmap W1), without waiting. At
+/// a fidelity override, the product at it narrowed once (`cast_float`), which the native one is.
+pub(crate) fn matmul_dram_bf16(
+    device: TtDevice,
+    a: BufferId,
+    a_transposed: bool,
+    b: BufferId,
+    b_transposed: bool,
+) -> (BufferId, [usize; 2]) {
+    let ([ar, ac], [br, bc]) = (dims_of(a), dims_of(b));
+    let m = if a_transposed { ac } else { ar };
+    let n = if b_transposed { br } else { bc };
+    submit(
+        "matmul_dram",
+        device,
+        [m, n],
+        move || "matmul, a BF16 result".into(),
+        {
+            let fidelity = crate::matmul_mode::fidelity_override();
+            move |engine, ids| {
+                let (a, b) = (ids.get(a)?, ids.get(b)?);
+                match fidelity {
+                    None => engine.matmul_dram_bf16(a, a_transposed, b, b_transposed),
+                    Some(f) => {
+                        let (c, _) = engine.matmul_dram_at(a, a_transposed, b, b_transposed, f)?;
+                        let out = engine.cast_float(c, true);
+                        engine.free(c);
+                        out
+                    }
+                }
+            }
+        },
+    )
+}
+
 /// A batched matmul over blocks on the device with `layout`
 /// (`Session::matmul_dram_batched_with`), without waiting. Only where
 /// [`supports_batched_layout`], at the attachment's own fidelity.
@@ -2676,6 +3730,33 @@ pub(crate) fn matmul_dram_batched(
     )
 }
 
+/// Attention for a few query rows a key/value head as one op on the device
+/// (`Session::attention_rows`), without waiting: `[q, k, v, mask]`.
+pub(crate) fn attention_rows(
+    device: TtDevice,
+    buffers: [BufferId; 4],
+    items: Vec<tt_kernels::attention::Item>,
+    dims: [usize; 4],
+    scale: f32,
+) -> (BufferId, [usize; 2]) {
+    let [m, _, _, dv] = dims;
+    submit(
+        "attention_rows",
+        device,
+        [1, items.len() * m * dv],
+        || "attention rows".into(),
+        move |engine, ids| {
+            let buffers = [
+                ids.get(buffers[0])?,
+                ids.get(buffers[1])?,
+                ids.get(buffers[2])?,
+                ids.get(buffers[3])?,
+            ];
+            engine.attention_rows(buffers, &items, dims, scale)
+        },
+    )
+}
+
 /// A row gather on the device, without waiting.
 pub(crate) fn gather_rows(
     device: TtDevice,
@@ -2695,6 +3776,62 @@ pub(crate) fn gather_rows(
                 .collect::<Result<Vec<_>, _>>()?;
             engine.gather_rows(&sources, &rows, cols)
         },
+    )
+}
+
+/// A residual sum and its RMSNorm on the device, `(s, norm)`, without waiting: both `a`'s shape.
+pub(crate) fn add_rms_norm(
+    device: TtDevice,
+    a: BufferId,
+    b: BufferId,
+    gamma: Option<BufferId>,
+    eps: f32,
+) -> [(BufferId, [usize; 2]); 2] {
+    let dims = dims_of(a);
+    submit_pair(
+        "add_rms_norm",
+        device,
+        [dims, dims],
+        move || format!("eps {eps:e}, scaled {}", gamma.is_some()),
+        move |engine, ids| {
+            let gamma = match gamma {
+                Some(g) => Some(ids.get(g)?),
+                None => None,
+            };
+            engine.add_rms_norm(ids.get(a)?, ids.get(b)?, gamma, eps)
+        },
+    )
+}
+
+/// Each row's element at its resident index on the device, without waiting: `[rows, 1]`.
+pub(crate) fn pick_columns(
+    device: TtDevice,
+    input: BufferId,
+    indices: BufferId,
+) -> (BufferId, [usize; 2]) {
+    let rows = dims_of(input)[0];
+    submit(
+        "pick_columns",
+        device,
+        [rows, 1],
+        || "a pick of one column a row".into(),
+        move |engine, ids| engine.pick_columns(ids.get(input)?, ids.get(indices)?),
+    )
+}
+
+/// Rows added at resident indices on the device, in order, without waiting: `t`'s shape.
+pub(crate) fn select_add_rows(
+    device: TtDevice,
+    t: BufferId,
+    indices: BufferId,
+    value: BufferId,
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "select_add_rows",
+        device,
+        dims_of(t),
+        || "rows added at resident indices".into(),
+        move |engine, ids| engine.select_add_rows(ids.get(t)?, ids.get(indices)?, ids.get(value)?),
     )
 }
 
@@ -2729,6 +3866,28 @@ pub(crate) fn assign_rows(
         dims,
         || "rows written over a copy".into(),
         move |engine, ids| engine.assign_rows(ids.get(t)?, ids.get(value)?, &rows),
+    )
+}
+
+/// A copy of `table` with `values`' row `i` at its row `indices[i]`
+/// (`Engine::scatter_rows`), the indices a resident I32 buffer, `[1, n]` or
+/// (`column`) `[n, 1]`, without waiting: `dims` is `table`'s.
+pub(crate) fn scatter_rows(
+    device: TtDevice,
+    table: BufferId,
+    indices: BufferId,
+    values: BufferId,
+    column: bool,
+    dims: [usize; 2],
+) -> (BufferId, [usize; 2]) {
+    submit(
+        "scatter_rows",
+        device,
+        dims,
+        || "checked resident row scatter".into(),
+        move |engine, ids| {
+            engine.scatter_rows(ids.get(table)?, ids.get(indices)?, ids.get(values)?, column)
+        },
     )
 }
 
@@ -2910,15 +4069,6 @@ impl Engine for KmdEngine {
             dims,
         )
     }
-    fn matmul_bf16(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
-        self.buffers.as_mut().ok_or_else(unsupported)?.matmul_bf16(
-            &mut self.session,
-            a,
-            b,
-            self.fidelity,
-            self.budget,
-        )
-    }
     fn upload_bf16(&mut self, bits: &[u16], rows: usize, cols: usize) -> Result<BufferId, TtError> {
         self.buffers.as_mut().ok_or_else(unsupported)?.upload_bf16(
             &mut self.session,
@@ -2949,13 +4099,15 @@ impl Engine for KmdEngine {
             .ok_or_else(unsupported)?
             .cast_bfp(&mut self.session, id, format)
     }
-    fn matmul_bfp(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
-        self.buffers.as_mut().ok_or_else(unsupported)?.matmul_bfp(
-            &mut self.session,
-            a,
-            b,
-            self.fidelity,
-        )
+    fn cast_bf16_storage(
+        &mut self,
+        id: BufferId,
+        store: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .cast_bf16_storage(&mut self.session, id, store)
     }
     fn matmul(&mut self, a: &[f32], b: &[f32], mkn: [usize; 3]) -> Result<Vec<f32>, TtError> {
         Ok(self
@@ -3020,6 +4172,26 @@ impl Engine for KmdEngine {
             self.budget,
         )
     }
+    fn matmul_dram_bf16(
+        &mut self,
+        a: BufferId,
+        ta: bool,
+        b: BufferId,
+        tb: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.matmul_as(
+            &mut self.session,
+            a,
+            ta,
+            b,
+            tb,
+            self.route,
+            self.fidelity,
+            self.budget,
+            Elem::BF16,
+        )
+    }
     fn matmul_dram_at(
         &mut self,
         a: BufferId,
@@ -3081,6 +4253,48 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.eltwise_op(&mut self.session, op, a, b, c)
     }
+    fn eltwise_blocks(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise_blocks(&mut self.session, op, a, b, c)
+    }
+    fn eltwise_op_as(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BufferId,
+        b: Option<BufferId>,
+        c: Option<BufferId>,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise_op_as(&mut self.session, op, a, b, c, bf16.then_some(Elem::BF16))
+    }
+    fn eltwise_blocks_as(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.eltwise_blocks_as(&mut self.session, op, a, b, c, bf16.then_some(Elem::BF16))
+    }
+    fn rope_blocks(
+        &mut self,
+        x: BlockArg,
+        cos: BlockArg,
+        sin: BlockArg,
+        head: usize,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.rope_blocks(&mut self.session, x, cos, sin, head)
+    }
     fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.pow(&mut self.session, x, y)
@@ -3094,9 +4308,57 @@ impl Engine for KmdEngine {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
+        then: tt_kernels::tensor::ReduceThen,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
-        bufs.reduce(&mut self.session, a, op, axis)
+        bufs.reduce(&mut self.session, a, op, axis, then)
+    }
+    fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.rms(&mut self.session, a, eps)
+    }
+    fn softmax_rows(
+        &mut self,
+        x: BufferId,
+        mask: BufferId,
+        scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.softmax_rows(&mut self.session, x, mask, scale)
+    }
+    fn rms_norm(
+        &mut self,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.rms_norm(&mut self.session, a, gamma, eps)
+    }
+    fn rms_norm_as(
+        &mut self,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        let out = if bf16 { Elem::BF16 } else { Elem::F32 };
+        bufs.rms_norm_as(&mut self.session, a, gamma, eps, out)
+    }
+    fn add_rms_norm(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<[(BufferId, [usize; 2]); 2], TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.add_rms_norm(&mut self.session, a, b, gamma, eps)
+    }
+    fn argmax_row(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.argmax_row(&mut self.session, a)
     }
     fn scan(
         &mut self,
@@ -3159,6 +4421,25 @@ impl Engine for KmdEngine {
             self.fidelity,
             self.budget,
             layout,
+        )
+    }
+    fn attention_rows(
+        &mut self,
+        buffers: [BufferId; 4],
+        items: &[tt_kernels::attention::Item],
+        dims: [usize; 4],
+        scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.attention_rows(
+            &mut self.session,
+            buffers,
+            items,
+            dims,
+            scale,
+            self.route,
+            self.fidelity,
+            self.budget,
         )
     }
     fn copy_blocks(
@@ -3251,6 +4532,23 @@ impl Engine for KmdEngine {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.rows_add(&mut self.session, t, indices, value)
     }
+    fn select_add_rows(
+        &mut self,
+        t: BufferId,
+        indices: BufferId,
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.select_add_rows(&mut self.session, t, indices, value)
+    }
+    fn pick_columns(
+        &mut self,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.pick_columns(&mut self.session, input, indices)
+    }
     fn assign_rows(
         &mut self,
         t: BufferId,
@@ -3259,6 +4557,26 @@ impl Engine for KmdEngine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.assign_rows(&mut self.session, t, value, rows)
+    }
+    fn scatter_rows(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.scatter_rows(&mut self.session, table, indices, values, column)
+    }
+    fn scatter_rows_into(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        values: BlockArg,
+        column: bool,
+    ) -> Result<(), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.scatter_rows_into(&mut self.session, table, indices, values, column)
     }
     fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
         Some(self.session.device().traffic())
@@ -3270,6 +4588,37 @@ impl Engine for KmdEngine {
     fn end_trace(&mut self) -> Result<u64, TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
         bufs.end_trace(&mut self.session)
+    }
+    fn begin_trace_planned(&mut self, key: u64) -> Result<bool, TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.begin_trace_planned(&mut self.session, key)
+    }
+    fn begin_trace_cached(&mut self, key: u64) -> Result<bool, TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.begin_trace_cached(&mut self.session, key)
+    }
+    fn begin_trace_plan_pass(&mut self) -> Result<(), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.begin_trace_plan_pass(&mut self.session)
+    }
+    fn set_residency(&mut self, bytes: u64) -> Result<(), TtError> {
+        self.session.set_residency(bytes);
+        Ok(())
+    }
+    fn probe_captures(&mut self) -> Result<u64, TtError> {
+        Ok(self.session.probe_captures())
+    }
+    fn probe_nc_waits(&mut self) -> Result<Vec<[u32; 8]>, TtError> {
+        Ok(self.session.probe_nc_waits()?)
+    }
+    fn probe_restored_bytes(&mut self) -> Result<(u64, u64), TtError> {
+        Ok((
+            self.session.restored_bytes(),
+            self.session.mover_restored_bytes(),
+        ))
+    }
+    fn has_pending_plan(&mut self) -> Result<bool, TtError> {
+        Ok(self.session.has_pending_plan())
     }
     fn run_trace(
         &mut self,
@@ -3285,6 +4634,85 @@ impl Engine for KmdEngine {
         if let Some(b) = self.buffers.as_mut() {
             b.release_trace(&mut self.session, trace);
         }
+    }
+    fn set_op_label(&mut self, label: &'static str) {
+        self.session.set_op_label(label);
+    }
+    fn trace_ops(&mut self, trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+        let bufs = self.buffers.as_ref().ok_or_else(unsupported)?;
+        bufs.trace_ops(&self.session, trace)
+    }
+    fn trace_footprint(
+        &mut self,
+        trace: u64,
+    ) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+        let bufs = self.buffers.as_ref().ok_or_else(unsupported)?;
+        bufs.trace_footprint(&self.session, trace)
+    }
+    fn set_trace_name(&mut self, trace: u64, name: String) {
+        if let Some(b) = self.buffers.as_mut() {
+            b.set_trace_name(trace, name);
+        }
+    }
+    fn profile_mode(
+        &mut self,
+        options: Option<tt_kernels::profile_mode::ProfileOptions>,
+    ) -> Result<Option<crate::profile::Profile>, TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.profile_mode(&mut self.session, options)
+    }
+    fn profile_report(&mut self) -> Result<Option<crate::profile::Profile>, TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.profile_report(&mut self.session)
+    }
+    fn set_profile_buffer(&mut self, bytes: Option<u64>) -> Result<(), TtError> {
+        self.session
+            .set_profile_buffer(bytes)
+            .map_err(TtError::from)
+    }
+    fn set_count_trace_bytes(&mut self, on: bool) -> Result<(), TtError> {
+        self.session.set_count_trace_bytes(on);
+        Ok(())
+    }
+    fn set_capture_reuse(&mut self, on: bool) -> Result<bool, TtError> {
+        let was = self.session.capture_reuse();
+        self.session.set_capture_reuse(on);
+        Ok(was)
+    }
+    fn host_stage_times(&mut self) -> Result<Vec<(String, f64, u64, u64)>, TtError> {
+        Ok(self
+            .session
+            .host_times()
+            .stages
+            .iter()
+            .map(|(stage, t)| {
+                (
+                    format!("{stage:?}"),
+                    t.time.as_secs_f64() * 1e3,
+                    t.count,
+                    t.traffic.write_calls,
+                )
+            })
+            .collect())
+    }
+    fn gddr_free_bytes(&mut self) -> Result<(u64, u64), TtError> {
+        self.session.sync().map_err(TtError::from)?;
+        self.session
+            .dram_free_bytes_by_channel()
+            .ok_or_else(|| TtError::Device("no GDDR attached".into()))
+    }
+    fn set_l1_region(&mut self, bytes: u64) -> Result<(), TtError> {
+        self.session.set_l1_region(bytes);
+        Ok(())
+    }
+    fn profile_generic_trace(
+        &mut self,
+        trace: u64,
+        inputs: &[(BufferId, InputPayload)],
+        outputs: &[(BufferId, OutputKind)],
+    ) -> Result<(GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+        let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
+        bufs.profile_generic_trace(&mut self.session, trace, inputs, outputs)
     }
     fn copy_into(&mut self, src: BufferId, dst: BufferId) -> Result<(), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
@@ -3347,11 +4775,111 @@ pub(crate) fn is_written_in_place(id: BufferId) -> bool {
     locked(&WRITTEN).as_ref().is_some_and(|w| w.contains(&id))
 }
 
+/// Buffers an open capture owns as its state and may write in place
+/// (`trace::Donation`), each with its [`write_generation`] when donated. Empty outside a
+/// capture with state, so [`donated_since`] is then one atomic load.
+static DONATED: Mutex<Option<HashMap<BufferId, u64>>> = Mutex::new(None);
+static DONATED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many times a capture has written each buffer in place ([`scatter_rows_into`]).
+static GENERATIONS: Mutex<Option<HashMap<BufferId, u64>>> = Mutex::new(None);
+
+/// Give `id` to the open capture as state it may write in place. Anything derived from it
+/// and kept is dropped ([`written_in_place`]): the capture changes its contents.
+pub(crate) fn donate(id: BufferId) {
+    written_in_place(id);
+    let generation = write_generation(id);
+    let mut d = locked(&DONATED);
+    if d.get_or_insert_with(Default::default)
+        .insert(id, generation)
+        .is_none()
+    {
+        DONATED_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// End `id`'s donation ([`donate`]).
+pub(crate) fn undonate(id: BufferId) {
+    let mut d = locked(&DONATED);
+    if d.as_mut().is_some_and(|d| d.remove(&id).is_some()) {
+        DONATED_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `id`'s generation when the open capture was given it, if it was ([`donate`]).
+pub(crate) fn donated_since(id: BufferId) -> Option<u64> {
+    if DONATED_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return None;
+    }
+    locked(&DONATED).as_ref().and_then(|d| d.get(&id).copied())
+}
+
+/// How many times a capture has written `id` in place.
+pub(crate) fn write_generation(id: BufferId) -> u64 {
+    locked(&GENERATIONS)
+        .as_ref()
+        .and_then(|g| g.get(&id).copied())
+        .unwrap_or(0)
+}
+
+/// `table` with `values`' row `i` written at its row `indices[i]`, in place
+/// (`Session::scatter_rows_into`), for a buffer the open capture owns as its state
+/// ([`donate`]). Returns the generation of `table`'s contents after the write: handles made
+/// before it are refused from then on ([`crate::tensor::DramRef::current`]).
+pub(crate) fn scatter_rows_into(
+    device: TtDevice,
+    table: BufferId,
+    indices: BufferId,
+    values: BlockArg,
+    column: bool,
+) -> Result<u64, TtError> {
+    if donated_since(table).is_none() {
+        return Err(TtError::Device(format!(
+            "buffer {table} is not state of the open capture: it is not written in place"
+        )));
+    }
+    run(device, move |engine, ids| {
+        ids.healthy()?;
+        let values = BlockArg {
+            id: ids.get(values.id)?,
+            ..values
+        };
+        engine.scatter_rows_into(ids.get(table)?, ids.get(indices)?, values, column)
+    })?;
+    let mut g = locked(&GENERATIONS);
+    let n = g
+        .get_or_insert_with(Default::default)
+        .entry(table)
+        .or_insert(0);
+    *n += 1;
+    Ok(*n)
+}
+
 pub fn copy_into(device: TtDevice, src: BufferId, dst: BufferId) -> Result<(), TtError> {
     written_in_place(dst);
     run(device, move |engine, ids| {
         ids.healthy()?;
         engine.copy_into(ids.get(src)?, ids.get(dst)?)
+    })
+}
+
+/// [`run_generic_trace`] with the replay stamped ([`Engine::profile_generic_trace`]).
+pub(crate) fn profile_generic_trace(
+    device: TtDevice,
+    trace: u64,
+    inputs: Vec<(BufferId, InputPayload)>,
+    outputs: Vec<(BufferId, OutputKind)>,
+) -> Result<(GenericTraceRun, tt_kernels::profile::DeviceProfile), TtError> {
+    run(device, move |engine, ids| {
+        ids.healthy()?;
+        let inputs = inputs
+            .into_iter()
+            .map(|(buf, p)| ids.get(buf).map(|b| (b, p)))
+            .collect::<Result<Vec<_>, TtError>>()?;
+        let outputs = outputs
+            .into_iter()
+            .map(|(buf, k)| ids.get(buf).map(|b| (b, k)))
+            .collect::<Result<Vec<_>, TtError>>()?;
+        engine.profile_generic_trace(trace, &inputs, &outputs)
     })
 }
 
@@ -3374,6 +4902,13 @@ pub fn run_generic_trace(
         engine.run_generic_trace(trace, &mapped_inputs?, &mapped_outputs?)
     })
 }
+
+/// The spread of an eager op on a multi-tile session unless `TT_SPREAD` says otherwise: on
+/// every tile, ResNet-18 146 ms against 232 at `all` and ViT-Tiny 116 against 223
+/// (2026-10-27), and the `tt-mnist` transformer's training 9.4 against 12.4 ms a step
+/// (2026-11-09; `docs/learnings/performance-log.md`, "Training on every tile").
+pub(crate) const EAGER_SPREAD: tt_kernels::session::Spread =
+    tt_kernels::session::Spread::Work { share: 64, min: 4 };
 
 /// `TT_SPREAD`'s value (`Session::set_spread`): `all`, a positive tile count, or
 /// `work:<share>[:<min>]` with positive numbers. `None` for anything else.
@@ -3446,13 +4981,19 @@ pub(crate) fn kmd_engine_with_elementwise(
             Ok("0") => session.set_pipeline(false),
             Ok(v) => return Err(TtError::Device(format!("TT_PIPELINE={v}: expected 0 or 1"))),
         }
-        // `TT_SPREAD`: how many of the session's tiles each op runs on
-        // (`Session::set_spread`): `all` (the default), a count, or
-        // `work:<share>[:<min>]`, one tile for each `share` of the op's work and at
-        // least `min` (1 if not given). The bits are the same.
+        // How many of the session's tiles each op runs on (`Session::set_spread`). By default
+        // an eager op one tile for each 64 of its work, at least 4 ([`EAGER_SPREAD`]), and a
+        // captured op every tile (`Session::set_capture_spread`): a fresh op pays the host for
+        // each tile it runs on, a replayed one does not. `TT_SPREAD` sets both: `all`, a count,
+        // or `work:<share>[:<min>]` (`min` 1 if not given). The bits are the same.
+        session.set_spread(EAGER_SPREAD);
+        session.set_capture_spread(Some(tt_kernels::session::Spread::All));
         if let Ok(v) = std::env::var("TT_SPREAD") {
             match parse_spread(&v) {
-                Some(spread) => session.set_spread(spread),
+                Some(spread) => {
+                    session.set_spread(spread);
+                    session.set_capture_spread(None);
+                }
                 None => {
                     return Err(TtError::Device(format!(
                         "TT_SPREAD={v}: expected `all`, a tile count, or `work:<share>[:<min>]`"
@@ -3484,10 +5025,19 @@ pub(crate) fn kmd_engine_with_elementwise(
         // `TT_PROFILE=<path>`: a device-side profile of everything this
         // attachment runs, written as Chrome trace JSON when it detaches
         // (`tt_kernels::profile`). `{chip}` in the path becomes the card.
+        //
+        // `TT_PROFILE=<dir>`: the profile mode (`crate::profile`): every op's device time,
+        // eager and traced, by Burn op, written to `<dir>/chip<N>/` when it detaches.
+        // `TT_PROFILE_DETAIL=full` times data entries one by one.
         let profile_to = std::env::var("TT_PROFILE")
             .ok()
             .map(|p| p.replace("{chip}", &device.chip.to_string()));
-        if profile_to.is_some() {
+        let (raw_profile, profile_dir) = match profile_to {
+            Some(p) if p.ends_with(".json") => (Some(p), None),
+            Some(p) => (None, Some(std::path::PathBuf::from(p))),
+            None => (None, None),
+        };
+        if raw_profile.is_some() {
             session
                 .profile_start()
                 .map_err(|e| TtError::Device(format!("TT_PROFILE: {e}")))?;
@@ -3501,6 +5051,11 @@ pub(crate) fn kmd_engine_with_elementwise(
             matmul,
         }
         .with_elementwise_mode(elementwise)?;
+        if profile_dir.is_some() {
+            engine
+                .profile_mode(Some(crate::profile::options_from_env()))
+                .map_err(|e| TtError::Device(format!("TT_PROFILE: {e}")))?;
+        }
         let served = std::time::Instant::now();
         serve.serve(&mut engine);
         // `TT_HOST_TIMES=1`: where the server thread's time went queueing ops
@@ -3533,7 +5088,18 @@ pub(crate) fn kmd_engine_with_elementwise(
                 lists.iter().max().copied().unwrap_or(0)
             );
         }
-        if let Some(path) = profile_to {
+        if let Some(dir) = profile_dir {
+            let dir = dir.join(format!("chip{}", device.chip));
+            match engine.profile_mode(None) {
+                Ok(Some(profile)) => match profile.write(&dir) {
+                    Ok(()) => eprintln!("burn-tt: profile written to {}", dir.display()),
+                    Err(e) => eprintln!("burn-tt: TT_PROFILE: {e}"),
+                },
+                Ok(None) => {}
+                Err(e) => eprintln!("burn-tt: TT_PROFILE: {e}"),
+            }
+        }
+        if let Some(path) = raw_profile {
             let written = engine
                 .session
                 .profile_stop()
@@ -3566,6 +5132,43 @@ pub struct MeshEngine<T: tt_device::Transport> {
 }
 
 impl<T: tt_device::Transport> MeshEngine<T> {
+    /// A product with a BF16 operand: the fabric moves F32 tiles, so both are widened first.
+    fn matmul_bf16_widened(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        // The existing Ethernet fabric transports F32 physical tiles. Widen
+        // on the root chip, compute BF16 Src products across the mesh, and
+        // let the Burn boundary narrow the joined F32 output once.
+        let mut temporary = Vec::new();
+        let result = (|| {
+            let (a, _) = self.cast_float(a, false)?;
+            temporary.push(a);
+            let (b, _) = self.cast_float(b, false)?;
+            temporary.push(b);
+            let a = self.buffers.get(a)?.clone();
+            let b = self.buffers.get(b)?.clone();
+            let out = self
+                .fabric
+                .matmul_resident(
+                    &a,
+                    false,
+                    &b,
+                    false,
+                    SrcRoute::Bf16FromFp32,
+                    self.fidelity,
+                    self.budget,
+                )
+                .map_err(TtError::from)?;
+            Ok(self.buffers.insert(out))
+        })();
+        for id in temporary {
+            self.buffers.free(self.fabric.chips[0].session(), id);
+        }
+        result
+    }
+
     /// Exact matmul would run unpartitioned on chip 0 here: refused by name.
     pub fn with_matmul_mode(self, mode: MatmulMode) -> Result<Self, TtError> {
         if mode != MatmulMode::Fast {
@@ -3647,9 +5250,9 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         let result = (|| {
             let input = self.upload(values, r, c)?;
             temporary.push(input);
-            let (column, _) = self.reduce(input, ReduceOp::Sum, Axis::Cols)?;
+            let (column, _) = self.reduce(input, ReduceOp::Sum, Axis::Cols, None)?;
             temporary.push(column);
-            let (mut scalar, _) = self.reduce(column, ReduceOp::Sum, Axis::Rows)?;
+            let (mut scalar, _) = self.reduce(column, ReduceOp::Sum, Axis::Rows, None)?;
             temporary.push(scalar);
             if mean {
                 (scalar, _) = self.eltwise(
@@ -3692,37 +5295,6 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         self.buffers
             .pool_bf16(self.fabric.chips[0].session(), a, windows, divisors, dims)
     }
-    fn matmul_bf16(&mut self, a: BufferId, b: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
-        // The existing Ethernet fabric transports F32 physical tiles. Widen
-        // on the root chip, compute BF16 Src products across the mesh, and
-        // let the Burn boundary narrow the joined F32 output once.
-        let mut temporary = Vec::new();
-        let result = (|| {
-            let (a, _) = self.cast_float(a, false)?;
-            temporary.push(a);
-            let (b, _) = self.cast_float(b, false)?;
-            temporary.push(b);
-            let a = self.buffers.get(a)?.clone();
-            let b = self.buffers.get(b)?.clone();
-            let out = self
-                .fabric
-                .matmul_resident(
-                    &a,
-                    false,
-                    &b,
-                    false,
-                    SrcRoute::Bf16FromFp32,
-                    self.fidelity,
-                    self.budget,
-                )
-                .map_err(TtError::from)?;
-            Ok(self.buffers.insert(out))
-        })();
-        for id in temporary {
-            self.buffers.free(self.fabric.chips[0].session(), id);
-        }
-        result
-    }
     fn upload(&mut self, v: &[f32], rows: usize, cols: usize) -> Result<BufferId, TtError> {
         let b = &mut self.buffers;
         b.upload(self.fabric.chips[0].session(), v, rows, cols)
@@ -3764,6 +5336,12 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         b: BufferId,
         tb: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
+        if self.buffers.is_bf16(a) || self.buffers.is_bf16(b) {
+            if ta || tb {
+                return Err(unsupported());
+            }
+            return self.matmul_bf16_widened(a, b);
+        }
         let a = self.buffers.get(a)?.clone();
         let b = self.buffers.get(b)?.clone();
         let out = self
@@ -3792,6 +5370,26 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         let bufs = &mut self.buffers;
         bufs.eltwise_op(self.fabric.chips[0].session(), op, a, b, c)
     }
+    fn eltwise_blocks(
+        &mut self,
+        op: tt_kernels::tensor::Eltwise,
+        a: BlockArg,
+        b: Option<BlockArg>,
+        c: Option<BlockArg>,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.eltwise_blocks(self.fabric.chips[0].session(), op, a, b, c)
+    }
+    fn rope_blocks(
+        &mut self,
+        x: BlockArg,
+        cos: BlockArg,
+        sin: BlockArg,
+        head: usize,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.rope_blocks(self.fabric.chips[0].session(), x, cos, sin, head)
+    }
     fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.pow(self.fabric.chips[0].session(), x, y)
@@ -3805,9 +5403,46 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         a: BufferId,
         op: tt_kernels::sfpu::reduce::ReduceOp,
         axis: tt_kernels::sfpu::reduce::Axis,
+        then: tt_kernels::tensor::ReduceThen,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
-        bufs.reduce(self.fabric.chips[0].session(), a, op, axis)
+        bufs.reduce(self.fabric.chips[0].session(), a, op, axis, then)
+    }
+    fn rms(&mut self, a: BufferId, eps: f32) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.rms(self.fabric.chips[0].session(), a, eps)
+    }
+    fn softmax_rows(
+        &mut self,
+        x: BufferId,
+        mask: BufferId,
+        scale: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.softmax_rows(self.fabric.chips[0].session(), x, mask, scale)
+    }
+    fn rms_norm(
+        &mut self,
+        a: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.rms_norm(self.fabric.chips[0].session(), a, gamma, eps)
+    }
+    fn add_rms_norm(
+        &mut self,
+        a: BufferId,
+        b: BufferId,
+        gamma: Option<BufferId>,
+        eps: f32,
+    ) -> Result<[(BufferId, [usize; 2]); 2], TtError> {
+        let bufs = &mut self.buffers;
+        bufs.add_rms_norm(self.fabric.chips[0].session(), a, b, gamma, eps)
+    }
+    fn argmax_row(&mut self, a: BufferId) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.argmax_row(self.fabric.chips[0].session(), a)
     }
     fn scan(
         &mut self,
@@ -3985,6 +5620,23 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         let bufs = &mut self.buffers;
         bufs.rows_add(self.fabric.chips[0].session(), t, indices, value)
     }
+    fn select_add_rows(
+        &mut self,
+        t: BufferId,
+        indices: BufferId,
+        value: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.select_add_rows(self.fabric.chips[0].session(), t, indices, value)
+    }
+    fn pick_columns(
+        &mut self,
+        input: BufferId,
+        indices: BufferId,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.pick_columns(self.fabric.chips[0].session(), input, indices)
+    }
     fn assign_rows(
         &mut self,
         t: BufferId,
@@ -3993,6 +5645,38 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
         bufs.assign_rows(self.fabric.chips[0].session(), t, value, rows)
+    }
+    fn scatter_rows(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        values: BufferId,
+        column: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.scatter_rows(
+            self.fabric.chips[0].session(),
+            table,
+            indices,
+            values,
+            column,
+        )
+    }
+    fn scatter_rows_into(
+        &mut self,
+        table: BufferId,
+        indices: BufferId,
+        values: BlockArg,
+        column: bool,
+    ) -> Result<(), TtError> {
+        let bufs = &mut self.buffers;
+        bufs.scatter_rows_into(
+            self.fabric.chips[0].session(),
+            table,
+            indices,
+            values,
+            column,
+        )
     }
     fn mesh_execution(&mut self) -> Option<tt_kernels::shard::FabricExecution> {
         Some(self.fabric.execution().clone())

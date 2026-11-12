@@ -18,8 +18,11 @@
 
 pub mod adc_copy;
 pub mod atomics;
+pub mod attention;
+pub mod barriers;
 pub mod bf16;
 pub mod bfp;
+pub mod channel;
 pub mod code;
 pub mod datapath;
 pub mod dm;
@@ -35,13 +38,17 @@ pub mod matrix_eltwise;
 pub mod mesh_trace;
 pub mod prng;
 pub mod profile;
+pub mod profile_mode;
 pub mod program_cache;
+pub mod residency;
 pub mod runtime;
 pub mod session;
 pub mod sfpu;
 pub mod shard;
+pub mod softmax;
 pub mod source_banks;
 pub mod tensor;
+pub mod tile_op;
 pub mod trace;
 
 mod local_movement;

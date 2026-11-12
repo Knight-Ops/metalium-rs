@@ -60,6 +60,28 @@ pub enum Event {
     /// The list just ended had requests wait `cycles` in all for room under
     /// the in-flight cap.
     Throttle { cycles: u32 },
+    /// After a kernel's `ROLES_DONE`: the math role's totals for it, `amount`
+    /// a multiple of 64.
+    RolePush { what: RoleTotal, amount: u64 },
+    /// RISCV B's GDDR read bytes issued since its last such mark (`tt_isa::mailbox::trace::READ_BYTES`).
+    ReadBytes { bytes: u64 },
+    /// After a kernel's `ROLES_DONE`: RISCV B logged T0's and T2's batch tables as the record at
+    /// word `record` of its batch log (`tt_isa::mailbox::trace::BATCH_BASE`), or, `log_full`, did
+    /// not. The host replaces it with the record ([`crate::profile_mode::splice_batch_log`]).
+    BatchBase { record: u32, log_full: bool },
+    /// The host's, in place of an [`Event::BatchBase`]: its record's header, `batches` with
+    /// `truncated` if the run had more and `mismatched` if the two roles counted different
+    /// numbers (`tt_isa::mailbox::trace::BATCH_TABLE`). Its [`Event::BatchTime`]s follow.
+    BatchTable {
+        batches: u32,
+        truncated: bool,
+        mismatched: bool,
+    },
+    /// The host's: one clock read of a batch table, the event's counter
+    /// (`tt_isa::mailbox::trace::BATCH_TIME`).
+    BatchTime,
+    /// The host's: a repeated copy of an [`Event::BatchBase`] (`tt_isa::mailbox::trace::BATCH_REPEAT`).
+    BatchRepeat,
     /// Anything else: a token no firmware of this build writes.
     Unknown(u32),
 }
@@ -101,6 +123,28 @@ impl Event {
                 what: RoleEvent::Acked,
             },
             (ev::MOVER, ev::THROTTLE) => Event::Throttle { cycles: detail },
+            (ev::MOVER, ev::ROLE_PUSH | ev::ROLE_DRAIN | ev::ROLE_WORDS) => Event::RolePush {
+                what: match event {
+                    ev::ROLE_PUSH => RoleTotal::Push,
+                    ev::ROLE_DRAIN => RoleTotal::Drain,
+                    _ => RoleTotal::Words,
+                },
+                amount: (detail as u64) << ev::PUSH_UNIT_SHIFT,
+            },
+            (ev::MOVER, ev::READ_BYTES) => Event::ReadBytes {
+                bytes: (detail as u64) << ev::READ_UNIT_SHIFT,
+            },
+            (ev::MOVER, ev::BATCH_BASE) => Event::BatchBase {
+                record: detail & !ev::BATCH_LOG_FULL,
+                log_full: detail & ev::BATCH_LOG_FULL != 0,
+            },
+            (ev::MOVER, ev::BATCH_TABLE) => Event::BatchTable {
+                batches: detail & (ev::BATCH_TRUNCATED - 1),
+                truncated: detail & ev::BATCH_TRUNCATED != 0,
+                mismatched: detail & ev::BATCH_MISMATCHED != 0,
+            },
+            (ev::MOVER, ev::BATCH_TIME) => Event::BatchTime,
+            (ev::MOVER, ev::BATCH_REPEAT) => Event::BatchRepeat,
             (ev::MOVER, ev::KICK | ev::ROLES_DONE) => Event::Kick {
                 done: event == ev::ROLES_DONE,
                 generation: detail,
@@ -116,6 +160,17 @@ impl Event {
             _ => Event::Unknown(token),
         }
     }
+}
+
+/// What an [`Event::RolePush`] counts (`tt_isa::mailbox::PUSH_CYCLES` and its neighbours).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleTotal {
+    /// Cycles pushing instruction words.
+    Push,
+    /// Cycles waiting, after pushing, for the coprocessor to retire them.
+    Drain,
+    /// Instruction words the runner read and pushed.
+    Words,
 }
 
 /// The name a mover entry's first word goes by.
@@ -134,12 +189,25 @@ pub fn op_name(op: u32) -> &'static str {
         op::CB => "buffer credit",
         op::RELEASED => "output released",
         op::WAIT => "wait",
+        op::BARRIER => "barrier",
+        op::POKE => "poke",
+        op::COPY_WORDS => "copy words",
+        op::COPY_HALFWORDS => "copy halfwords",
+        op::FILL_HALFWORDS => "fill halfwords",
+        op::READ_BROADCAST_COL => "read broadcast column",
+        op::READ_L1 => "read L1",
+        op::WRITE_L1 => "write L1",
+        op::WRITE_L1_MCAST => "write L1 multicast",
+        op::READ_ENCODED => "read encoded",
         record::GATHER => "gather",
         record::SCATTER => "scatter",
         record::FILL_PAD => "fill pad",
         record::PAD_WRITE => "pad write",
         record::READ_RUN => "read run",
         record::WRITE_RUN => "write run",
+        record::POKE_RUN => "poke run",
+        record::SELECT_ROWS => "select rows",
+        record::SCATTER_ROWS => "scatter rows",
         _ => "entry",
     }
 }
@@ -266,6 +334,13 @@ impl UnitProfile {
                     begin: e.cycles.saturating_sub(cycles as u64),
                     end: e.cycles,
                 }),
+                // Totals, not moments: the profile mode attributes them.
+                Event::RolePush { .. }
+                | Event::ReadBytes { .. }
+                | Event::BatchBase { .. }
+                | Event::BatchTable { .. }
+                | Event::BatchTime
+                | Event::BatchRepeat => {}
                 Event::Role {
                     thread,
                     what: RoleEvent::Woke,

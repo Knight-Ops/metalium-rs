@@ -948,9 +948,41 @@ pub fn render(
                     };
                     impls.push_str(&format!("if let Some(output) = crate::ops::matrix_float_op(tt_kernels::kind::{kind}, {args}) {{ return output; }}\n"));
                 }
+                // Ops that are one element-wise op on the card, which reads BF16 operands as they
+                // lie and rounds its result once (roadmap W1, native BF16 arithmetic): bit for bit
+                // the widened op narrowed, so a BF16 tensor goes to them as it is. F16, and every
+                // other op (a composition would round each of its steps), widen as before.
+                const NATIVE_BF16: &[&str] = &[
+                    "float_add",
+                    "float_sub",
+                    "float_mul",
+                    "float_div",
+                    "float_add_scalar",
+                    "float_sub_scalar",
+                    "float_mul_scalar",
+                    "float_div_scalar",
+                    "float_exp",
+                    "float_log",
+                    "float_neg",
+                    "float_abs",
+                    "float_sqrt",
+                    "float_recip",
+                    "float_tanh",
+                    "float_erf",
+                    "float_sin",
+                    "float_cos",
+                    "float_log1p",
+                    "relu",
+                    "sigmoid",
+                ];
                 if !is_future && !floats.is_empty() && !storage.contains(&m.name.as_str()) {
+                    let widens = if NATIVE_BF16.contains(&m.name.as_str()) {
+                        "crate::tensor::is_half(compute_dtype) && compute_dtype != burn_backend::DType::BF16"
+                    } else {
+                        "crate::tensor::is_half(compute_dtype)"
+                    };
                     impls.push_str(&format!(
-                        "let compute_dtype = crate::ops::float_compute_dtype(&[{}]);\nif crate::tensor::is_half(compute_dtype) {{\n",
+                        "let compute_dtype = crate::ops::float_compute_dtype(&[{}]);\nif {widens} {{\n",
                         floats.iter().map(|name| format!("&{name}")).collect::<Vec<_>>().join(", ")
                     ));
                     if m.name == "float_matmul" {

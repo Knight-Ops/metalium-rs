@@ -5,13 +5,17 @@
 //! `tt-isa` is `no_std` with no dependencies: it is the one crate both targets
 //! can share.
 //!
-//! The mailbox sits at 1 MiB into L1, clear of every core's default reset PC
-//! (the highest is NC's at `0x1_2000`) with a wide margin for code growth.
+//! The mailboxes sit together above the data arena and the program slots
+//! (`crate::l1`): the single-core one, the three roles', the two movers', the
+//! probes' scratch and RISCV NC's list ring, 40 KiB up to the trace buffer.
 
-/// Byte offset of the mailbox within a tile's L1.
 pub mod guard;
 
-pub const MAILBOX_BASE: u64 = 0x0010_0000;
+/// Byte offset of the single-core mailbox within a tile's L1: the first of the
+/// mailboxes, right after the program slots ([`PROGRAM_REGION_END`]).
+pub const MAILBOX_BASE: u64 = 0x0013_6000;
+/// The end of the mailboxes: everything [`MAILBOX_BASE`] begins, up to the trace buffer.
+pub const MAILBOX_REGION_END: u64 = 0x0014_0000;
 
 /// Offsets of the words the firmware runtime itself writes, from whichever base
 /// the image was linked with: [`MAILBOX_BASE`] for Tensix images,
@@ -53,10 +57,27 @@ pub const DUMP_ROW_COUNT: u64 = MAILBOX_BASE + 0x28;
 /// First `Dst` row to copy.
 pub const DUMP_ROW_FIRST: u64 = MAILBOX_BASE + 0x2C;
 
-/// Non-zero: the firmware records its progress through the tile's timestamper
-/// (`tensix::timestamper`), which the host has configured. Zero on the
-/// simulator, whose timestamper support is probed separately.
+/// What the firmware records, a set of [`trace_word`] bits. [`trace_word::RUNS`]: its
+/// progress through the tile's timestamper (`tensix::timestamper`), which the host
+/// has configured. Zero on the simulator, whose timestamper support is probed
+/// separately.
 pub const TRACE: u64 = MAILBOX_BASE + 0x30;
+
+/// The bits of [`TRACE`]. Both are acted on only by an image built with the
+/// `profile` feature.
+pub mod trace_word {
+    /// Stamp each run's `START`, `PUSHED` and `RETIRED` (`super::trace`).
+    pub const RUNS: u32 = 1;
+    /// Total the run's pushing and its waits for the coprocessor into
+    /// [`super::PUSH_CYCLES`] and [`super::DRAIN_CYCLES`], for the data mover to
+    /// stamp at the kernel's end (`super::trace::ROLE_PUSH`). Set for the math
+    /// role by the profile mode.
+    pub const PUSH: u32 = 2;
+    /// Record each batch of a streamed run in [`super::BATCH_TIMES`], for the data mover
+    /// to log at the kernel's end (`super::trace::BATCH_BASE`). Acted on by T0 and T2;
+    /// set for them by the profile mode's pipeline detail.
+    pub const BATCHES: u32 = 4;
+}
 
 /// Non-zero `n`: after every `n` instruction words pushed, the firmware waits
 /// for the coprocessor to retire everything it has pushed so far. Zero: it
@@ -123,6 +144,47 @@ pub const MOP_CFG: u64 = MAILBOX_BASE + 0x4C;
 /// Total size the firmware may assume is its own.
 pub const MAILBOX_SIZE: u64 = 0x70;
 
+/// Wall-clock cycles the last run spent pushing instruction words, written by a
+/// `profile` image's runner before it acknowledges, 0 unless its [`TRACE`] has
+/// [`trace_word::PUSH`]. Past [`MAILBOX_SIZE`], so no `POKE` reaches it: only the
+/// runner writes it, and the data mover reads it.
+pub const PUSH_CYCLES: u64 = MAILBOX_BASE + 0x80;
+/// Wall-clock cycles the last run waited, after pushing, for the coprocessor to
+/// retire what it pushed: as [`PUSH_CYCLES`]. A run whose pushes are the
+/// bottleneck waits little here.
+pub const DRAIN_CYCLES: u64 = MAILBOX_BASE + 0x84;
+/// Instruction words the last run's runner read and pushed, as [`PUSH_CYCLES`]: with it, whether
+/// the pushing ran at the runner's rate (~3.3 cycles a word on silicon, push-bound) or stalled on
+/// a full instruction FIFO (the backend, or a semaphore it waits on, set the pace). Fused code's
+/// words are not counted.
+pub const PUSH_WORDS: u64 = MAILBOX_BASE + 0x88;
+const _: () = assert!(PUSH_CYCLES >= MAILBOX_BASE + MAILBOX_SIZE);
+const _: () = assert!(PUSH_WORDS + 4 <= MAILBOX_BASE + guard::OFFSET);
+
+/// A streamed run's batch table, written by a `profile` image's T0 and T2 runners when their
+/// [`TRACE`] has [`trace_word::BATCHES`], before they acknowledge; the data mover copies it into
+/// its batch log after the kernel's `ROLES_DONE` (`trace::BATCH_BASE`) and then clears its count.
+///
+/// Word 0 is the run's batch count (all of them, even past [`BATCH_TIMES_MAX`]); then, for each
+/// of the first [`BATCH_TIMES_MAX`] batches, [`BATCH_TIME_WORDS`] reads of the timestamper's
+/// counter (`tensix::timestamper::WALL_CLOCK_L`, the low word of the counter the timestamper
+/// stamps events with):
+/// - T0: entering its input wait, the wait returning (the batch's data is in L1), and its pop
+///   (the batch unpacked);
+/// - T2: entering its output reserve, the reserve returning (NC freed a slot), and its push (the
+///   batch packed).
+///
+/// Between the guard block and the dump, so neither `POKE`s nor a descriptor reach it.
+pub const BATCH_TIMES: u64 = MAILBOX_BASE + 0x180;
+/// Batches a [`BATCH_TIMES`] table holds: a pair's most (`tt_kernels`'s `GROUP_MAX`).
+pub const BATCH_TIMES_MAX: u32 = 40;
+/// Clock reads a batch in [`BATCH_TIMES`].
+pub const BATCH_TIME_WORDS: u32 = 3;
+/// Bytes of [`BATCH_TIMES`].
+pub const BATCH_TIMES_BYTES: u64 = 4 * (1 + BATCH_TIMES_MAX * BATCH_TIME_WORDS) as u64;
+const _: () = assert!(BATCH_TIMES >= MAILBOX_BASE + guard::OFFSET + guard::Guard::BYTES);
+const _: () = assert!(BATCH_TIMES + BATCH_TIMES_BYTES <= DUMP);
+
 /// A program's block repeats: with [`loops::LOOPED`] set in its length
 /// ([`PROGRAM_LEN`], a `KERNEL` entry's), the program's first word is how
 /// many entries follow ([`loops::entry`], at most [`loops::MAX`]), and the
@@ -168,11 +230,11 @@ pub mod loops {
     }
 }
 
-/// Where the host points the timestamper's event buffer: after the program
-/// slots, 1024 events. Sized for a profiled list (`trace`): the mover records
+/// Where the host points the timestamper's event buffer: after the mailboxes,
+/// 1024 events. Sized for a profiled list (`trace`): the mover records
 /// two events per list entry or record, never per expanded move, and each
 /// role three per run, so a full list of records with a kernel apiece fits.
-pub const TRACE_BUFFER: u64 = PROGRAM_REGION_END;
+pub const TRACE_BUFFER: u64 = MAILBOX_REGION_END;
 /// Bytes in [`TRACE_BUFFER`].
 pub const TRACE_BUFFER_BYTES: u64 = 1024 * crate::tensix::timestamper::EVENT_BYTES;
 
@@ -216,6 +278,55 @@ pub mod trace {
     /// waited in all, saturated at [`DETAIL_MAX`]. One per list, after its
     /// `LIST_END`, and only when something waited.
     pub const THROTTLE: u32 = 22;
+    /// After a stamped `ROLES_DONE`: the math role's [`super::PUSH_CYCLES`] for
+    /// the kernel, in units of `1 << PUSH_UNIT_SHIFT` cycles, saturated at [`DETAIL_MAX`].
+    /// Only when the role measured them (`super::trace_word::PUSH`).
+    pub const ROLE_PUSH: u32 = 23;
+    /// The math role's [`super::DRAIN_CYCLES`], as [`ROLE_PUSH`].
+    pub const ROLE_DRAIN: u32 = 24;
+    /// The math role's [`super::PUSH_WORDS`], in units of `1 << PUSH_UNIT_SHIFT` words.
+    pub const ROLE_WORDS: u32 = 25;
+    /// Cycles a [`ROLE_PUSH`] or [`ROLE_DRAIN`] detail counts: 64, so a detail
+    /// holds ~8.4 million (about 6 ms at 1.35 GHz).
+    pub const PUSH_UNIT_SHIFT: u32 = 6;
+    /// RISCV B's GDDR read bytes issued since its last `READ_BYTES` mark (or since the mark
+    /// before, unstamped, outside the window), in units of `1 << READ_UNIT_SHIFT` bytes, at
+    /// most [`DETAIL_MAX`]; what does not fit (under a unit, or past the most) carries to the
+    /// next mark. B marks at
+    /// each `BARRIER`'s begin and end whose barriers meet the window, at a traced list's
+    /// begin, and when a queued prefetch starts and when its last read is issued: with each
+    /// mark's time, a unit's issue curve, which the profile mode sums into the card's read
+    /// rate over a replay (`tt_kernels::profile_mode`).
+    pub const READ_BYTES: u32 = 26;
+    /// Bytes a [`READ_BYTES`] detail counts: 64, so a detail holds ~8.4 MB.
+    pub const READ_UNIT_SHIFT: u32 = 6;
+    /// After a stamped `ROLES_DONE` whose kernel was a streamed run with batch tables
+    /// (`super::BATCH_TIMES`, `super::trace_word::BATCHES`): RISCV B copied T0's and T2's
+    /// tables into its batch log (`crate::dm::BATCH_LOG`) as one record, and the detail is
+    /// the record's word offset there, or [`BATCH_LOG_FULL`] if it did not fit. The stamp's
+    /// counter anchors the record's clock reads, which are the same counter's low word.
+    ///
+    /// Only this one stamp goes through the timestamper: stamped back to back after a
+    /// kernel, the tables' times came out repeated and lost on card 0 and card 1 (the same
+    /// event four times 64 cycles apart, later ones missing; `1793636433` and the pipeline
+    /// gate's debugging runs), while plain stores to L1 are not.
+    pub const BATCH_BASE: u32 = 27;
+    /// The host's, never stamped: in place of a [`BATCH_BASE`], its record from the batch log
+    /// (`tt_kernels::profile_mode::splice_batch_log`). The detail is the record's header: its
+    /// batches, with [`BATCH_TRUNCATED`] and [`BATCH_MISMATCHED`]. [`BATCH_TIME`]s follow.
+    pub const BATCH_TABLE: u32 = 28;
+    /// The host's, never stamped: one clock read of a [`BATCH_TABLE`], whose counter is the
+    /// read itself; in order, each batch's three T0 reads, then its three T2 reads.
+    pub const BATCH_TIME: u32 = 29;
+    /// The host's, never stamped: in place of a [`BATCH_BASE`] naming a record an earlier base
+    /// of the same drain already named, a copy the timestamper repeated (a record is named once).
+    pub const BATCH_REPEAT: u32 = 30;
+    /// A batch log record's header flag: the run had more batches than the record holds.
+    pub const BATCH_TRUNCATED: u32 = 1 << 15;
+    /// A batch log record's header flag: T0's and T2's batch counts differ.
+    pub const BATCH_MISMATCHED: u32 = 1 << 16;
+    /// [`BATCH_BASE`]'s flag: the record did not fit the batch log, so it was not kept.
+    pub const BATCH_LOG_FULL: u32 = 1 << 16;
 
     /// The source of the data mover's events. Role runners use their Tensix
     /// thread, 0..3.
@@ -275,7 +386,12 @@ pub mod trace {
 /// firmware never pushes from wherever a stale or corrupt pointer says. They were
 /// once 256 words inside each mailbox, which a 32x32 matmul outgrows several times
 /// over: its flushed configuration alone is a hundred-odd.
-pub const PROGRAM_REGION: u64 = 0x0012_0000;
+///
+/// They sit right after the data arena (`crate::l1::DATA`) and before the
+/// mailboxes, so a trace -- which runs every kernel from the program cache and
+/// leaves the slots idle -- can plan into them as one arena with `DATA`
+/// (`crate::l1::TRACE_ARENA`).
+pub const PROGRAM_REGION: u64 = 0x0011_6000;
 /// Bytes in one program slot.
 pub const PROGRAM_SLOT: u64 = 0x8000;
 /// Slots: the single-core mailbox's, then one per Tensix thread.
@@ -291,7 +407,7 @@ pub const PROGRAM_MAX: u32 = (PROGRAM_SLOT / 4) as u32;
 ///
 /// `Dst` is not reachable over the NoC, so this is the only way a host sees a
 /// compute result. Sixteen 32-bit datums per row.
-pub const DUMP: u64 = MAILBOX_BASE + 0x2000;
+pub const DUMP: u64 = MAILBOX_BASE + 0x400;
 /// Most `Dst` rows a run may copy out.
 pub const DUMP_MAX_ROWS: u32 = 16;
 /// Datums in one `Dst` row.
@@ -301,6 +417,20 @@ pub const DUMP_ROW_WORDS: u32 = 16;
 pub const fn dump_offset(row: u32, column: u32) -> u64 {
     DUMP + ((row * DUMP_ROW_WORDS + column) as u64) * 4
 }
+
+/// L1 the development probes own, which no shipped image touches: the instruction-cache probes'
+/// timings ([`icache_results`]) and the `.ttinsn` experiment's block ([`TTINSN_SCRATCH`]).
+pub const PROBE_SCRATCH: u64 = MAILBOX_BASE + 0x3400;
+/// [`PROBE_SCRATCH`]'s length.
+pub const PROBE_SCRATCH_BYTES: u64 = 0x600;
+/// Where instruction-cache probe `i` (B, NC, T0, T1, T2) writes its timings: 0x100 bytes each.
+pub const fn icache_results(i: u64) -> u64 {
+    PROBE_SCRATCH + i * 0x100
+}
+/// The `.ttinsn` experiment's block (`tt-firmware` `bin/ttinsn_t1.rs`).
+pub const TTINSN_SCRATCH: u64 = PROBE_SCRATCH + 0x500;
+const _: () = assert!(icache_results(5) <= TTINSN_SCRATCH);
+const _: () = assert!(TTINSN_SCRATCH + 0x100 <= PROBE_SCRATCH + PROBE_SCRATCH_BYTES);
 
 // Compile-time rather than a test: if the mailbox ever moved past the end of L1,
 // every access to it would be out of bounds, and that should stop the build rather
@@ -320,6 +450,7 @@ const _: () = assert!(UNWEDGE + 4 <= MOP_CFG_VALID);
 const _: () = assert!(MOP_CFG + 9 * 4 <= MAILBOX_BASE + MAILBOX_SIZE);
 const _: () = assert!(TRACE_BUFFER + TRACE_BUFFER_BYTES <= crate::tensix::L1_SIZE);
 const _: () = assert!(TRACE_BUFFER % 16 == 0);
+const _: () = assert!(PROGRAM_REGION_END == MAILBOX_BASE && MAILBOX_BASE % 0x1000 == 0);
 
 /// One mailbox per Tensix thread, for the three-role datapath.
 ///
@@ -331,10 +462,10 @@ const _: () = assert!(TRACE_BUFFER % 16 == 0);
 /// reports through its own mailbox, laid out like the single-core one above:
 /// the same offsets, from a per-thread base.
 pub mod role {
-    /// First role mailbox, clear of the single-core mailbox, program and dump.
-    pub const BASE: u64 = 0x0011_0000;
-    /// Distance between role mailboxes: room for the program and the dump.
-    pub const STRIDE: u64 = 0x4000;
+    /// First role mailbox, after the single-core mailbox and its dump.
+    pub const BASE: u64 = super::MAILBOX_BASE + STRIDE;
+    /// Distance between mailboxes: the words, the guard block (`super::guard`) and the dump.
+    pub const STRIDE: u64 = 0x800;
 
     /// The mailbox of the role that runs on Tensix thread `thread` (0, 1 or 2).
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -409,6 +540,24 @@ pub mod role {
         pub const fn program_addr(self) -> u64 {
             self.base + (super::PROGRAM_ADDR - super::MAILBOX_BASE)
         }
+        pub const fn push_cycles(self) -> u64 {
+            self.base + (super::PUSH_CYCLES - super::MAILBOX_BASE)
+        }
+        pub const fn drain_cycles(self) -> u64 {
+            self.base + (super::DRAIN_CYCLES - super::MAILBOX_BASE)
+        }
+        pub const fn push_words(self) -> u64 {
+            self.base + (super::PUSH_WORDS - super::MAILBOX_BASE)
+        }
+        /// [`super::BATCH_TIMES`]'s count word.
+        pub const fn batch_count(self) -> u64 {
+            self.base + (super::BATCH_TIMES - super::MAILBOX_BASE)
+        }
+        /// [`super::BATCH_TIMES`]'s clock read `k` (0..3) of batch `batch`.
+        pub const fn batch_time(self, batch: u32, k: u32) -> u64 {
+            assert!(k < super::BATCH_TIME_WORDS);
+            self.batch_count() + 4 * (1 + batch * super::BATCH_TIME_WORDS + k) as u64
+        }
         /// This mailbox's program slot in [`super::PROGRAM_REGION`].
         pub const fn program(self) -> u64 {
             self.program
@@ -423,9 +572,9 @@ pub mod role {
         Mailbox::of(2).dump_offset(super::DUMP_MAX_ROWS - 1, super::DUMP_ROW_WORDS - 1) + 4
             <= crate::tensix::L1_SIZE
     );
-    // The role mailboxes end before the program region begins, and the last
-    // role's slot is the region's last.
-    const _: () = assert!(BASE + 3 * STRIDE <= super::PROGRAM_REGION);
+    // The role mailboxes end inside the mailboxes, and the last role's slot is
+    // the program region's last.
+    const _: () = assert!(BASE + 3 * STRIDE <= super::MAILBOX_REGION_END);
     const _: () =
         assert!(Mailbox::of(2).program() + super::PROGRAM_SLOT == super::PROGRAM_REGION_END);
     const _: () =
@@ -553,7 +702,7 @@ mod tests {
                 assert!(a_end <= b.program() || b.program() + PROGRAM_SLOT <= a.program());
             }
             // Nothing else the host stages lands in a slot.
-            assert!(a.dump_offset(DUMP_MAX_ROWS - 1, DUMP_ROW_WORDS - 1) < PROGRAM_REGION);
+            assert!(a.dump_offset(0, 0) >= PROGRAM_REGION_END);
         }
     }
 

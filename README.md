@@ -33,7 +33,7 @@ cargo xtask fetch-ttsim   # pinned libttsim builds (1, 2 and 4 chip) into vendor
 cargo xtask fetch-spec    # pinned ISA specification tree into vendor/
 cargo xtask fetch-mnist   # MNIST into vendor/mnist/; tt-mnist's build.rs needs it
 cargo xtask fetch-kmd     # optional: tt-kmd's ioctl.h, for its ABI layout test
-cargo xtask fetch-weights # optional: pretrained weights and photos for tt-models (340 MB)
+cargo xtask fetch-weights # optional: pretrained weights and photos for tt-models (3.8 GB; --model <name> for one)
 cargo test                # builds the riscv32im firmware and runs the validation tier
 ```
 
@@ -46,10 +46,9 @@ build that depends on it. `rust-toolchain.toml` requests the
 
 | Tier | Command | What it is |
 |---|---|---|
-| Validation | `cargo test` | Host tests and every simulator gate: ISA, kernels, data mover, residency, many tiles. Bit-exact against ttsim. |
-| End to end | `cargo test -p tt-tests --features e2e --test step12_mnist` | Whole Burn training runs on ttsim, held to `crates/tt-tests/tests/golden/mnist_reduced.txt`. Run when the arithmetic changes; CI runs it on every push. |
-| Smoke | `cargo xtask silicon --smoke --release` | burn-tt against burn-flex on the cards, single ops up to the reduced training runs. |
-| Silicon | `cargo xtask silicon --release` | Every gate on hardware (`tt-tests` feature `silicon`, which implies `e2e`). |
+| Validation | `cargo test` | Host tests and every simulator gate: ISA, kernels, data mover, residency, many tiles. Bit-exact against ttsim. No model workloads ([test tiers](docs/learnings/test-tiers.md)). |
+| Smoke | `cargo xtask silicon --smoke --release` | burn-tt against burn-flex on the cards, single ops up to the models: MNIST training held to `crates/tt-tests/tests/golden/mnist_reduced.txt`, synthetic and pretrained decoders. |
+| Silicon | `cargo xtask silicon --release` | Every gate on hardware (`tt-tests` feature `silicon`). |
 | Benchmarks | `cargo xtask bench` | The firmware benchmarks on the cards, device-timed and held against the spec's peaks, collected into `target/silicon/bench/`. The current numbers are in [`docs/learnings/performance-scoreboard.md`](docs/learnings/performance-scoreboard.md); history is in [`docs/learnings/performance-log.md`](docs/learnings/performance-log.md). |
 
 `cargo xtask silicon --help` lists the options (`--device N|all`, `--filter`,
@@ -117,7 +116,7 @@ Native reductions, K-blocked products, resident indexing, BF16 storage/casts,
 convolution/pooling/attention and matrix elementwise arithmetic have landed.
 BFP8/4/2 per-tensor storage, native conversions/products and mixed-storage
 training/traces are delivered; see the
-[storage contract and completed checklist](docs/plans/mixed-bfp-storage.md).
+[storage contract and completed checklist](docs/completed-plans/mixed-bfp-storage.md).
 General payload-preserving Tensix transpose and further format coverage
 (INT8, `a` variants, quantization) remain open. Burn random draws on the device
 (seeded uniform, Bernoulli, normal and integer ranges, step140-142). See

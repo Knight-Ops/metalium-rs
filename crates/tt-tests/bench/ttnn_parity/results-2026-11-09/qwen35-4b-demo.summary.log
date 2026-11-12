@@ -1,0 +1,105 @@
+# tt-metal (ttnn) Qwen3.5-4B on card 1 (p150a, 0000:02:00.0), 2026-11-09
+# Tree /home/carl/projects/tt-metal-v077 (d53c2a71fb0, ttnn 0.77.1.dev0), models/demos/blackhole/qwen36, demo/text_demo.py
+# Weights: vendor/weights/qwen3.5-4b (Qwen/Qwen3.5-4B @ 851bf6e8, BF16 shards) symlinked into an HF dir with the
+#   snapshot's config/tokenizer and a model.safetensors.index.json generated from the shard headers (no code changes).
+# Env: TT_METAL_HOME=... ARCH_NAME=blackhole PYTHONPATH=$TT_METAL_HOME TT_VISIBLE_DEVICES=1 MESH_DEVICE=P150
+#      HF_MODEL=<scratch>/qwen35-4b-hf TT_CACHE_PATH=<scratch>/ttcache-qwen HF_HUB_OFFLINE=1; tt-smi -r 0000:02:00.0 first.
+# Cmd: pytest models/demos/blackhole/qwen36/demo/text_demo.py -v -s -k "traced_128 and not 128k" --timeout 1200
+#   (plain -k traced_128 also selects traced_128k; run1 was stopped before it started.)
+# "timing*" runs add `-p qwen_timing_plugin` (qwen35-4b-timing-plugin.py here, on PYTHONPATH as qwen_timing_plugin.py; same decode loop, 199 steps, plus raw replays of
+#   the captured decode trace: device time without input copy/readback/host argmax).
+# Batch 1, prompt 128 tokens, greedy (host argmax over full logits), 50 generated tokens (49 timed steps).
+# Precision: MLP gate/up BFP4_b, down BFP8_b; attention + GDN projections BFP8_b; LM head BFP8_b; norms/conv/A_log BF16;
+#   all matmuls MathFidelity.LoFi, fp32_dest_acc_en; KV cache BF16; SDPA BF16 (QWEN_SDPA_BF8 unset).
+# Host: 12 cores shared with another lane's cargo builds; host-timed decode varies with load, device replay does not.
+
+== run1
+2026-11-09 14:41:27.066 Model load: 44.2s
+2026-11-09 14:41:27.728 Prompt: 128 tokens (block budget: 64 blocks x 64 = 4096 tokens)
+2026-11-09 14:45:33.228 Prefill trace captured in 245.5s
+2026-11-09 14:46:09.031   Prefill 128 tokens:  TTFT = 0.375s (341 tok/s)
+2026-11-09 14:46:09.031   Decode:  74.9ms/token  (13.4 tok/s)
+2026-11-09 14:46:09.031   Generated 50 tokens in 49 steps
+2026-11-09 14:46:09.031   Text:  bringing its unique flavor and texture to enhance different dishes. Do you prefer the classic taste of ketchup, the creamy richness of mayonnaise, the spicy kick of burgers, or perhaps something more exotic like sriracha or hoisin sauce? Maybe
+=========== 1 passed, 17 deselected, 4 warnings in 334.09s (0:05:34) ===========
+
+== run2
+ 14:46:28 up 25 min,  4 users,  load average: 10.45, 7.90, 3.93
+2026-11-09 14:46:57.448 Model load: 22.9s
+2026-11-09 14:46:57.948 Prompt: 128 tokens (block budget: 64 blocks x 64 = 4096 tokens)
+2026-11-09 14:47:09.576 Prefill trace captured in 11.5s
+2026-11-09 14:47:15.754   Prefill 128 tokens:  TTFT = 0.428s (299 tok/s)
+2026-11-09 14:47:15.755   Decode:  82.9ms/token  (12.1 tok/s)
+2026-11-09 14:47:15.755   Generated 50 tokens in 49 steps
+2026-11-09 14:47:15.755   Text:  bringing its unique flavor and texture to enhance different dishes. Do you prefer the classic taste of ketchup, the creamy richness of mayonnaise, the spicy kick of burgers, or perhaps something more exotic like sriracha or hoisin sauce? Maybe
+================ 1 passed, 18 deselected, 4 warnings in 43.12s =================
+
+== run3
+ 14:49:02 up 27 min,  4 users,  load average: 5.51, 7.26, 4.34
+2026-11-09 14:49:34.200 Model load: 24.7s
+2026-11-09 14:49:34.702 Prompt: 128 tokens (block budget: 64 blocks x 64 = 4096 tokens)
+2026-11-09 14:49:46.807 Prefill trace captured in 11.9s
+2026-11-09 14:49:53.386   Prefill 128 tokens:  TTFT = 0.394s (325 tok/s)
+2026-11-09 14:49:53.386   Decode:  80.9ms/token  (12.4 tok/s)
+2026-11-09 14:49:53.386   Generated 50 tokens in 49 steps
+2026-11-09 14:49:53.386   Text:  bringing its unique flavor and texture to enhance different dishes. Do you prefer the classic taste of ketchup, the creamy richness of mayonnaise, the spicy kick of burgers, or perhaps something more exotic like sriracha or hoisin sauce? Maybe
+================ 1 passed, 18 deselected, 4 warnings in 46.10s =================
+
+== run4
+ 14:49:56 up 28 min,  4 users,  load average: 10.47, 8.45, 4.92
+2026-11-09 14:50:24.012 Model load: 21.0s
+2026-11-09 14:50:24.525 Prompt: 128 tokens (block budget: 64 blocks x 64 = 4096 tokens)
+2026-11-09 14:50:35.911 Prefill trace captured in 11.2s
+2026-11-09 14:50:40.437   Prefill 128 tokens:  TTFT = 0.355s (360 tok/s)
+2026-11-09 14:50:40.437   Decode:  64.3ms/token  (15.6 tok/s)
+2026-11-09 14:50:40.437   Generated 50 tokens in 49 steps
+2026-11-09 14:50:40.437   Text:  bringing its unique flavor and texture to enhance different dishes. Do you prefer the classic taste of ketchup, the creamy richness of mayonnaise, the spicy kick of burgers, or perhaps something more exotic like sriracha or hoisin sauce? Maybe
+================ 1 passed, 18 deselected, 4 warnings in 39.82s =================
+
+== timing
+ 14:47:58 up 26 min,  4 users,  load average: 8.44, 8.07, 4.37
+2026-11-09 14:48:24.628 Model load: 19.7s
+2026-11-09 14:48:25.130 Prompt: 128 tokens (block budget: 64 blocks x 64 = 4096 tokens)
+2026-11-09 14:48:46.400 TIMING demo-window (49 steps): mean 47.03 ms, median 45.09 ms
+2026-11-09 14:48:46.400 TIMING all 199 host-timed steps: mean 46.52 median 45.12 min 44.02 p10 44.37 p90 46.39 ms
+2026-11-09 14:48:46.401 TIMING last 100 steps median 45.18 ms (positions 227..327)
+2026-11-09 14:48:50.395 TIMING device trace replay, 100 back-to-back, one sync: 38.04 ms/replay
+2026-11-09 14:48:51.539 TIMING device trace replay with sync each: median 38.14 ms
+2026-11-09 14:48:51.551   Prefill 128 tokens:  TTFT = 0.344s (372 tok/s)
+2026-11-09 14:48:51.551   Decode:  47.0ms/token  (21.3 tok/s)
+2026-11-09 14:48:51.551   Generated 50 tokens in 49 steps
+2026-11-09 14:48:51.551   Text:  bringing its unique flavor and texture to enhance different dishes. Do you prefer the classic taste of ketchup, the creamy richness of mayonnaise, the spicy kick of burgers, or perhaps something more exotic like sriracha or hoisin sauce? Maybe
+================ 1 passed, 18 deselected, 4 warnings in 49.09s =================
+
+== timing2
+ 14:50:53 up 29 min,  4 users,  load average: 8.11, 8.22, 5.05
+2026-11-09 14:51:17.537 Model load: 18.6s
+2026-11-09 14:51:18.040 Prompt: 128 tokens (block budget: 64 blocks x 64 = 4096 tokens)
+2026-11-09 14:51:39.155 TIMING demo-window (49 steps): mean 45.97 ms, median 44.94 ms
+2026-11-09 14:51:39.155 TIMING all 199 host-timed steps: mean 45.71 median 44.98 min 43.98 p10 44.38 p90 46.10 ms
+2026-11-09 14:51:39.155 TIMING last 100 steps median 45.13 ms (positions 227..327)
+2026-11-09 14:51:43.149 TIMING device trace replay, 100 back-to-back, one sync: 38.04 ms/replay
+2026-11-09 14:51:44.296 TIMING device trace replay with sync each: median 38.17 ms
+2026-11-09 14:51:44.308   Prefill 128 tokens:  TTFT = 0.345s (371 tok/s)
+2026-11-09 14:51:44.308   Decode:  46.0ms/token  (21.8 tok/s)
+2026-11-09 14:51:44.308   Generated 50 tokens in 49 steps
+2026-11-09 14:51:44.308   Text:  bringing its unique flavor and texture to enhance different dishes. Do you prefer the classic taste of ketchup, the creamy richness of mayonnaise, the spicy kick of burgers, or perhaps something more exotic like sriracha or hoisin sauce? Maybe
+================ 1 passed, 18 deselected, 4 warnings in 47.28s =================
+
+== timing3
+ 14:51:46 up 30 min,  4 users,  load average: 4.57, 7.22, 4.89
+2026-11-09 14:52:10.963 Model load: 18.5s
+2026-11-09 14:52:11.465 Prompt: 128 tokens (block budget: 64 blocks x 64 = 4096 tokens)
+2026-11-09 14:52:34.859 TIMING demo-window (49 steps): mean 61.15 ms, median 65.99 ms
+2026-11-09 14:52:34.859 TIMING all 199 host-timed steps: mean 56.24 median 52.50 min 44.22 p10 44.97 p90 68.85 ms
+2026-11-09 14:52:34.859 TIMING last 100 steps median 46.12 ms (positions 227..327)
+2026-11-09 14:52:38.853 TIMING device trace replay, 100 back-to-back, one sync: 38.04 ms/replay
+2026-11-09 14:52:39.999 TIMING device trace replay with sync each: median 38.16 ms
+2026-11-09 14:52:40.010   Prefill 128 tokens:  TTFT = 0.358s (357 tok/s)
+2026-11-09 14:52:40.010   Decode:  61.2ms/token  (16.4 tok/s)
+2026-11-09 14:52:40.010   Generated 50 tokens in 49 steps
+2026-11-09 14:52:40.010   Text:  bringing its unique flavor and texture to enhance different dishes. Do you prefer the classic taste of ketchup, the creamy richness of mayonnaise, the spicy kick of burgers, or perhaps something more exotic like sriracha or hoisin sauce? Maybe
+================ 1 passed, 18 deselected, 4 warnings in 49.38s =================
+
+== timing run full 200-token text (greedy)
+TIMING full text (200 tokens): ' bringing its unique flavor and texture to enhance different dishes. Do you prefer the classic taste of ketchup, the creamy richness of mayonnaise, the spicy kick of burgers, or perhaps something more exotic like sriracha or hoisin sauce? Maybe you enjoy the tangy zest of salsa or the smooth and savory taste of aioli. Share what your favorite condiment is and why you love it. Does it remind you of a specific dish or meal?\n\n<think>\nThinking Process:\n\n1.  **Analyze the Request:**\n    *   The user is asking a question: "What is your favorite condiment?"\n    *   The prompt includes a lot of repetition and similar phrasing (the text is duplicated twice with slight variations).\n    *   The user wants me to share my favorite condiment, why I love it, and if it reminds me of a specific dish or meal.\n    *   **Constraint:** As an AI, I don\'t have personal'

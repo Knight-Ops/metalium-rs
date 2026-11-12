@@ -53,8 +53,10 @@ fn with_session(f: impl FnOnce(&mut Session<tt_ttsim::LibTtsim<'_>>)) {
             .unwrap();
         // These gates count programs and bytes for the plain path's block
         // shapes; a pipelined matmul (the default) stages each shape twice,
-        // once per half (`step54_pipeline`).
+        // once per half (`step54_pipeline`), and a blocked product of several tile rows
+        // (`step229`) is other programs again.
         s.set_pipeline(false);
+        s.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         f(&mut s);
     }) {
         panic!("{e}");
@@ -74,8 +76,10 @@ fn with_session(f: impl FnOnce(&mut Session<tt_kmd::Kmd>)) {
             .unwrap();
         // These gates count programs and bytes for the plain path's block
         // shapes; a pipelined matmul (the default) stages each shape twice,
-        // once per half (`step54_pipeline`).
+        // once per half (`step54_pipeline`), and a blocked product of several tile rows
+        // (`step229`) is other programs again.
         s.set_pipeline(false);
+        s.set_block_stream(tt_kernels::tensor::BlockStream::Off);
         f(&mut s);
     }) {
         panic!("{e}");

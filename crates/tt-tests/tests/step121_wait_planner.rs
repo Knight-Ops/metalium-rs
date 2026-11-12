@@ -23,7 +23,7 @@ use tt_isa::isa::Instruction;
 use tt_isa::tile::L1Format;
 use tt_kernels::code::Code;
 use tt_kernels::loops::frontend_stream;
-use tt_kernels::matmul::{self, Fidelity, MatmulSemaphores, OutputTile, SrcRoute};
+use tt_kernels::matmul::{self, Fidelity, LiveRows, MatmulSemaphores, OutputTile, SrcRoute};
 use tt_kernels::sfpu::kernel::{self, Operands};
 use tt_kernels::sfpu::ops::{self, kind_sfpu, Broadcast};
 use tt_kernels::sfpu::reduce::{self, Axis, ReduceOp};
@@ -127,16 +127,25 @@ fn corpus() -> Vec<Checked> {
                     }],
                 ),
             ] {
-                for allow_mop in [false, true] {
+                for (allow_mop, b_t, live) in [
+                    (false, false, LiveRows::All),
+                    (true, false, LiveRows::All),
+                    (false, true, LiveRows::All),
+                    (false, false, LiveRows::Sixteen),
+                    (true, false, LiveRows::Eight),
+                    (false, true, LiveRows::Eight),
+                ] {
                     let (sems, _) = MatmulSemaphores::alone();
-                    let (words, mop) =
-                        matmul::matmul_kernel(&outputs, sems, in_fmt, out_fmt, fidelity, allow_mop);
+                    let (words, mop) = matmul::matmul_kernel(
+                        &outputs, sems, in_fmt, out_fmt, fidelity, allow_mop, b_t, live,
+                    );
                     for t in 0..3 {
                         let stream = frontend_stream(&words[t], mop[t].as_ref())
                             .expect("frontend model accepts the matmul");
                         out.push(check(
                             format!(
-                                "matmul {route:?} {fidelity:?} {tag} mop={allow_mop} {}",
+                                "matmul {route:?} {fidelity:?} {tag} mop={allow_mop} b_t={b_t} \
+                                 {live:?} {}",
                                 role[t]
                             ),
                             &stream,
@@ -459,18 +468,18 @@ fn the_unmodified_sfpu_kernel_passes_and_each_removed_wait_is_flagged() {
     );
 
     // 3. The packer's config rewrite must land before the PACR: drop the
-    // `STALLWAIT(PACKER | CONFIG, CONFIG_BUSY)` of `pack_tile_from_dst` alone
-    // leaves the scheduling `NOP` (the documented separation), which suffices;
-    // dropping the wait and the `NOP` both is the miss.
+    // `STALLWAIT(PACKER | CONFIG, CONFIG_BUSY)` of `pack_tile_from_dst_gpr` alone
+    // leaves the separating `SFPNOP` (the documented separation, one instruction),
+    // which suffices; dropping the wait and the `SFPNOP` both is the miss.
     let wait = |i: &Instruction| is_wait(i, block::PACKER | block::CONFIG, cond::CONFIG_BUSY);
     let m = remove_first(&pack, wait);
     assert!(
         misses(&m).is_empty(),
-        "the NOP alone is the documented rule"
+        "the SFPNOP alone is the documented rule"
     );
     let at = pack.iter().position(wait).unwrap();
-    assert_eq!(pack[at - 1].def().mnemonic(), "NOP");
-    // Everything between the last `WRCFG` and the first `PACR` (the `NOP`, the
+    assert_eq!(pack[at - 1].def().mnemonic(), "SFPNOP");
+    // Everything between the last `WRCFG` and the first `PACR` (the `SFPNOP`, the
     // wait, `SETC16`s and ADC setup, all of which also separate them) goes, so
     // the `PACR` follows the write directly.
     let first_pacr = at
@@ -645,30 +654,50 @@ fn how_push_bound_are_the_sfpu_math_programs() {
     }
 }
 
-/// The `.ttinsn` experiment's Phase 0 (`docs/plans/ttinsn-push-experiment.md`): the same
+/// The `.ttinsn` experiment's Phase 0 (`docs/completed-plans/ttinsn-push-experiment.md`): the same
 /// model as above, but one row per kind, so the push-bound kinds can be named. A kind is
 /// *scalar-free* when two different scalar pairs give the same words, which is what a
 /// build-time image per kind needs. `stored` is the words the program slot holds (loops
 /// stored once), what a `.ttinsn` image would have to contain. The ratio is the model's (`2.8 * pushed / backend`,
 /// the backend taken at one instruction a cycle), so it can only overstate how
 /// push-bound a kernel is: a slower real backend lowers it.
+///
+/// Every form a kind is built in is a row of its own (`form`): `none` the same shape, `row` and
+/// `col` its broadcasts (`row` is always unrolled), and `rows1` the decode form, a tile of which
+/// one tensor row is computed (`ops::code_for_rows`, unrolled since its body is short). `staged`
+/// says the body was split into replayed row loops (`sfpu::ops::staged`). Kinds the 2026-10-25
+/// staging left long are what `.ttinsn` would serve (`docs/plans/roadmap.md`, "Fused `.ttinsn`
+/// push").
 #[test]
 fn per_kind_push_table() {
     const CYCLES_PER_WORD: f64 = 2.8;
-    eprintln!("kind\toperands\tscalar_free\tstored\tpushed\tbackend\tratio");
-    for kind in (1..=tt_kernels::kind::LAST).chain(0x100..=kind_sfpu::LAST) {
-        let Some((operands, code)) = ops::code_for(kind, [0.5, 2.0], Broadcast::None) else {
-            continue;
-        };
-        let words = |c: &Code| c.expand().iter().map(|i| i.word()).collect::<Vec<u32>>();
-        let scalar_free = ops::code_for(kind, [0.75, 3.0], Broadcast::None)
-            .is_some_and(|(_, other)| words(&other) == words(&code));
-        let pushed = code.expand().len();
-        let stored = code.stored().map_or(0, |(w, _)| w.len());
-        let backend_words = backend_of_code(&code).len();
-        eprintln!(
-            "{kind:#x}\t{operands:?}\t{scalar_free}\t{stored}\t{pushed}\t{backend_words}\t{:.2}",
-            CYCLES_PER_WORD * pushed as f64 / backend_words as f64
-        );
+    eprintln!("kind\tform\toperands\tscalar_free\tstaged\tstored\tpushed\tbackend\tratio");
+    let forms = [
+        ("none", Broadcast::None, 32),
+        ("row", Broadcast::Row, 32),
+        ("col", Broadcast::Col, 32),
+        ("rows1", Broadcast::None, 1),
+    ];
+    // The original range, then the integer, rounding and index kinds and the fused ones past it.
+    for kind in (1..=tt_kernels::kind::LAST).chain(0x100..=0x1ff) {
+        for (form, bcast, rows) in forms {
+            let Some((operands, code)) = ops::code_for_rows(kind, [0.5, 2.0], bcast, rows) else {
+                continue;
+            };
+            if rows < 32 && !ops::row_limited(kind) {
+                continue;
+            }
+            let words = |c: &Code| c.expand().iter().map(|i| i.word()).collect::<Vec<u32>>();
+            let scalar_free = ops::code_for_rows(kind, [0.75, 3.0], bcast, rows)
+                .is_some_and(|(_, other)| words(&other) == words(&code));
+            let staged = rows == 32 && ops::is_staged(kind);
+            let pushed = code.expand().len();
+            let stored = code.stored().map_or(0, |(w, _)| w.len());
+            let backend_words = backend_of_code(&code).len();
+            eprintln!(
+                "{kind:#x}\t{form}\t{operands:?}\t{scalar_free}\t{staged}\t{stored}\t{pushed}\t{backend_words}\t{:.2}",
+                CYCLES_PER_WORD * pushed as f64 / backend_words as f64
+            );
+        }
     }
 }

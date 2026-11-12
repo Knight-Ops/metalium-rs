@@ -38,7 +38,9 @@ pub mod fusion;
 mod generated;
 mod host;
 mod matmul_mode;
+mod numerics;
 mod ops;
+pub mod profile;
 mod random;
 mod registry;
 mod report;
@@ -53,28 +55,48 @@ mod views;
 
 pub use error::TtError;
 pub use matmul_mode::{accurate_matmul, exact_matmul, with_matmul_mode, MatmulMode};
+pub use numerics::{numerics, with_numerics, Numerics};
 #[doc(hidden)]
-pub use ops::{set_accurate_matmul_slicing, set_exact_matmul_chunk_products};
+pub use ops::norm::{add_rms_norm_count, rms_norm, rms_norm_count, set_add_rms_norm};
+#[doc(hidden)]
+pub use ops::rope::{rope, rope_count};
+pub use ops::rounded::{matmul_as, rms_norm_as, silu_mul_as};
+pub use ops::{
+    set_accurate_matmul_slicing, set_argmax_row, set_attention_rows,
+    set_exact_matmul_chunk_products, set_softmax_rows, set_softmax_rows_auto,
+};
 pub use random::Draw;
 pub use report::{
     host_ok, report, report_reset, server_report, server_report_reset, set_strict, strict,
     strictly, with_report, OpStat, Report, ServerStat,
 };
 pub use server::{
-    attach, device_traffic, mesh_execution, AttachGuard, BufferId, DramBuffers, Elem, Engine,
-    GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind, OutputPayload, PowArg, Serve,
-    SortedBuffers, TraceRun,
+    attach, device_traffic, mesh_execution, AttachGuard, BlockArg, BufferId, DramBuffers, Elem,
+    Engine, GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind, OutputPayload,
+    PowArg, Serve, SortedBuffers, TraceRun,
 };
 #[cfg(feature = "fusion")]
 pub use tensor::TtHandle;
 pub use tensor::{TtQTensor, TtTensor};
-pub use trace::{StepTiming, Trace, TracedInference, TracedTrainingStep};
+#[doc(hidden)]
+pub use trace::{
+    gddr_free_bytes, host_stage_times, probe_captures, probe_nc_waits, probe_restored_bytes,
+    set_capture_reuse, set_count_trace_bytes, set_l1_region, set_profile_buffer, set_residency,
+    set_state_in_place,
+};
+pub use trace::{
+    SetFootprint, SharedStateTraces, StepTiming, Trace, TracedInference, TracedTrainingStep,
+};
 
 #[cfg(feature = "fusion")]
 pub type Tt = burn_fusion::Fusion<TtBackend>;
 #[cfg(feature = "fusion")]
+#[doc(hidden)]
+pub use fusion::resolve_int_tensor;
+#[cfg(feature = "fusion")]
 pub use fusion::{
-    fused_add_relu_count, fused_relu_count, reset_fusion_counters, resolve_float_tensor,
+    fused_add_relu_count, fused_count, fused_relu_count, reset_fusion_counters,
+    resolve_float_tensor,
 };
 #[cfg(not(feature = "fusion"))]
 pub type Tt = TtBackend;
@@ -91,6 +113,7 @@ pub use traffic::{
 pub use tt_kernels::matmul::{Fidelity, SrcRoute};
 pub use tt_kernels::session::TileChoice;
 pub use tt_kernels::tensor::{Block, BlockMove};
+pub use tt_kernels::trace::OpRecord;
 
 use burn_backend::{
     Backend, BackendTypes, DType, DTypeUsage, DTypeUsageSet, DeviceId, DeviceOps, ExecutionError,

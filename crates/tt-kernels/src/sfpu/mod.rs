@@ -33,10 +33,13 @@ pub mod integer;
 pub mod interp;
 pub mod kernel;
 pub mod macro_sched;
+pub mod norm;
 pub mod ops;
 pub mod reduce;
 pub mod round;
 pub mod scan;
+pub mod select;
+pub mod softmax;
 pub mod sort;
 
 use tt_isa::frontend;
@@ -159,6 +162,32 @@ pub struct Program {
     policy: LoopPolicy,
     /// The runner's block repeats over `ins` (`crate::code::Loop`).
     repeats: Vec<crate::code::Loop>,
+    /// The tensor rows of a tile a whole-tile row loop runs over ([`with_rows`]): 32, or
+    /// fewer for a program built for tiles whose rows past these are padding.
+    rows: u32,
+}
+
+std::thread_local! {
+    /// The row limit programs built now take ([`with_rows`]).
+    static ROWS: std::cell::Cell<u32> = const { std::cell::Cell::new(32) };
+}
+
+/// `f`'s programs, built for tiles of which only the first `rows` (1..=32) tensor rows are
+/// computed: each whole-tile row loop (`for_each_row_group(64, ..)`) runs only the row groups
+/// that hold them ([`reduce::row_offsets`]), unrolled, and the other rows of `Dst` are left as
+/// they were. Only for a program that never moves a value between row groups (a lanewise
+/// element-wise kind, `ops::row_limited`): the computed rows then keep their bits.
+pub fn with_rows<R>(rows: u32, f: impl FnOnce() -> R) -> R {
+    assert!((1..=32).contains(&rows), "{rows} rows of a tile");
+    let old = ROWS.with(|r| r.replace(rows));
+    let out = f();
+    ROWS.with(|r| r.set(old));
+    out
+}
+
+/// The row limit programs built now take ([`with_rows`]): 32 outside it.
+pub(crate) fn row_limit() -> u32 {
+    ROWS.with(|r| r.get())
 }
 
 impl Default for Program {
@@ -184,6 +213,7 @@ impl Program {
             loops: Vec::new(),
             policy,
             repeats: Vec::new(),
+            rows: ROWS.with(|r| r.get()),
         };
         // `SFPENCC_MOD1_EI | SFPENCC_MOD1_RI`, both immediate bits set.
         p.push(encode::sfpencc(3, 0, 2 | 8).unwrap());
@@ -445,6 +475,42 @@ impl Program {
         self.push(encode::sfpshft2(0, s.index(), Self::dst(d), 3).unwrap());
     }
 
+    /// `Dst`'s tile at `at` with its column 0 in every column, as raw bits: datum `(r, c)`
+    /// from `(r, 0)`, the tile the mover's `READ_BROADCAST_COL` makes -- in the row groups
+    /// this program computes ([`with_rows`]). Column 0 is the first lane of each lane row of
+    /// face 0's and face 2's even-column loads; seven rotations within each lane row, its
+    /// first lane held, carry it to the other seven, which are then stored to the group's
+    /// four places (even and odd columns, both faces of its rows). Uses `L0..L4` and `L7`.
+    pub fn broadcast_col0(&mut self, at: u32) {
+        assert!(!self.in_loop, "a broadcast inside a row loop");
+        let bases: Vec<u32> = reduce::row_offsets(self.rows)
+            .into_iter()
+            .filter(|o| o % 4 == 0 && o % 32 < 16)
+            .collect();
+        // `L7` = `2 * (lane & 7)`: zero only in a lane row's first lane.
+        self.loadi_bits(LReg::L7, 14);
+        self.and(LReg::LANE_X2, LReg::L7, LReg::L7);
+        let regs = [LReg::L0, LReg::L1, LReg::L2, LReg::L3];
+        for batch in bases.chunks(regs.len()) {
+            let regs = &regs[..batch.len()];
+            for (&o, &r) in batch.iter().zip(regs) {
+                self.load(r, Format::Int32, at + o);
+            }
+            self.if_(Cond::Ne0(LReg::L7), |p| {
+                for _ in 0..7 {
+                    for &r in regs {
+                        p.rotate_row(r, r);
+                    }
+                }
+            });
+            for (&o, &r) in batch.iter().zip(regs) {
+                for d in [0, 2, 16, 18] {
+                    self.store(r, Format::Int32, at + o + d);
+                }
+            }
+        }
+    }
+
     /// Transpose each lane column's 4x4 block of `L0..L4` (and of `L4..L8`):
     /// lane row `j` of `L[i]` swaps with lane row `i` of `L[j]` (`SFPTRANSP`).
     /// So row `i` of a four-row group held in `L0` ends in row 0 of `L[i]`.
@@ -607,6 +673,12 @@ impl Program {
     /// zero keeps its sign; a denormal result flushes, as documented). `max` is
     /// the scaling's register meanwhile, and holds `f32::MAX` again after.
     pub fn recip(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
+        self.recip_steps(x, d, t0, t1, max);
+        self.recip_specials(x, d, t0, t1, max);
+    }
+
+    /// [`Program::recip`]'s first stage: the seed and its two steps, scaled where `|x| > 2^100`.
+    pub(crate) fn recip_steps(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
         assert!(d != x && t0 != x && t1 != x && d != t0 && d != t1 && t0 != t1);
         assert!(max != x && max != d && max != t0 && max != t1);
         self.abs(x, t1);
@@ -632,6 +704,11 @@ impl Program {
                 }
             },
         );
+    }
+
+    /// [`Program::recip`]'s second stage: `1/±0`, a denormal and `1/±inf`, from `x` and the
+    /// steps' `d`; `max` holds `f32::MAX`.
+    pub(crate) fn recip_specials(&mut self, x: LReg, d: LReg, t0: LReg, t1: LReg, max: LReg) {
         // `1/±0`, and a denormal, which the arithmetic flushes to a zero: the
         // seed's infinity met `0 * inf` in the steps. The magnitude by mask,
         // not `SFPABS`, which leaves a negative NaN negative -- it then passed
@@ -722,6 +799,7 @@ impl Program {
             loops: Vec::new(),
             policy: self.policy,
             repeats: Vec::new(),
+            rows: self.rows,
         };
         body(&mut b, 0);
         assert_eq!(
@@ -744,6 +822,14 @@ impl Program {
                 .first()
                 .is_some_and(|i| !i.stalls_automatically_after_mad());
         let fits = b.ins.len() + usize::from(wraps_nop) <= frontend::REPLAY_BUFFER as usize;
+        if rows == 64 && self.rows < 32 {
+            // Built for tiles of `self.rows` rows ([`with_rows`]): their row groups, unrolled.
+            for o in reduce::row_offsets(self.rows) {
+                body(self, o);
+            }
+            self.loops.push(LoopForm::Unrolled { body: b.ins.len() });
+            return;
+        }
         if self.policy == LoopPolicy::Unrolled {
             for k in 0..iterations {
                 body(self, 2 * k);

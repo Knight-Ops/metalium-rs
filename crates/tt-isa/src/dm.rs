@@ -22,10 +22,10 @@ use crate::dram::{Dram, DramRange};
 pub mod encoded;
 pub mod record;
 
-/// The mover's mailbox: the slot after the three role mailboxes
-/// ([`crate::mailbox::role`]), which ends exactly where the program region begins.
+/// The mover's mailbox: the page after the three role mailboxes
+/// ([`crate::mailbox::role`]).
 pub const MAILBOX_BASE: u64 = crate::mailbox::role::BASE + 3 * crate::mailbox::role::STRIDE;
-const _: () = assert!(MAILBOX_BASE + 0x100 <= crate::mailbox::PROGRAM_REGION);
+// Its extent, mailbox and endpoints, is checked with every fixed block (`crate::l1::FIXED`).
 const _: () = assert!(MAILBOX_BASE % 16 == 0);
 
 /// Where the image is linked and loaded: RISCV B has no reset-PC override and
@@ -83,6 +83,40 @@ pub mod trace_mode {
     /// The list's own begin and end and every entry but a plain or encoded read (a barrier's release, a
     /// kernel, a wait): what a benchmark that times lists needs, with the reads running as they do untraced.
     pub const LISTS: u32 = 2;
+    /// The outermost list's begin and end and only the entries that bound an op's phases: its control
+    /// (`LAUNCH`, `KERNEL`, `CB`, `POKE`), its kernels' wait (`KERNEL_WAIT`) and its barrier (`BARRIER`).
+    /// Data entries are not stamped (the span less the rest is their time), so an op costs ~8 events, not
+    /// ~25, and reads keep their untraced fast path: the profile mode's default
+    /// (`tt_kernels::profile`).
+    pub const OPS: u32 = 3;
+
+    /// What B stamps, in `OPS` mode, as an entry headed by this op around each of a
+    /// trace's fetches from GDDR: a chunk of its stream, or of a `PAIR_CALL`'s reader section (the
+    /// read and the wait for it). No entry is headed by `CALL` (a stream's `CALL` is refused), so
+    /// the stamp is never a real entry's.
+    pub const FETCH: u32 = super::op::CALL;
+    /// What B stamps, in `OPS` mode, as an entry headed by this op around its wait for
+    /// NC to finish a pair's writer section (its fetch and its writes). A `PAIR_CALL` entry itself
+    /// is never stamped, so the stamp is never a real entry's.
+    pub const WRITER_WAIT: u32 = super::op::PAIR_CALL;
+    /// What B stamps, in `OPS` mode, as an entry headed by this op around a prefetch `WAIT`
+    /// ([`super::WAIT_PREFETCH`]): issuing the queued prefetch's last reads and waiting for them to
+    /// land. `OPS` stamps no `WAIT` as itself, so there the stamp is the prefetch's; `FULL` stamps
+    /// every `WAIT`, and the host counts those as data.
+    pub const PREFETCH_WAIT: u32 = super::op::WAIT;
+
+    /// Is an entry headed by `op` stamped in `OPS` mode?
+    pub const fn ops_stamped(op: u32) -> bool {
+        matches!(
+            op,
+            super::op::BARRIER
+                | super::op::KERNEL_WAIT
+                | super::op::LAUNCH
+                | super::op::KERNEL
+                | super::op::CB
+                | super::op::POKE
+        )
+    }
 }
 /// Mover -> host: how many of the mover's NoC requests had to wait for room
 /// under the in-flight cap (`crate::noc::niu::InFlight`), since the host last
@@ -106,6 +140,38 @@ pub const TILE_IN_FLIGHT_CAP: u32 = 8;
 /// and NC's: the mover's `TXN`.
 pub const TXN_B: u8 = 2;
 pub const TXN_NC: u8 = 4;
+/// The NoC transaction ID of RISCV B's prefetch reads ([`record::GATHER_PREFETCH`]): apart from
+/// [`TXN_B`], so the entries that drain B's moves -- a kernel's launch, a barrier, a chunk's end
+/// -- leave them in flight. Only an [`op::WAIT`] with [`WAIT_PREFETCH`] drains them, which the
+/// op that reads what they bring puts before its kernel (`docs/completed-plans/decode-to-bandwidth.md`
+/// Phase 8). Its cap is [`TILE_IN_FLIGHT_CAP`], set once when the mover starts.
+pub const TXN_PREFETCH: u8 = 6;
+/// The NoC transaction ID of RISCV NC's multicasts ([`op::WRITE_L1_MCAST`]): apart from
+/// [`TXN_NC`], whose counter a broadcast would leave meaningless. Nothing waits on it: a multicast
+/// is counted by its acknowledgements.
+pub const TXN_NC_MCAST: u8 = 7;
+/// The NoC transaction ID of RISCV B's trace fetches read ahead: the next [`op::PAIR_CALL`]'s first
+/// reader chunk, into [`crate::dataflow::AHEAD_CHUNK`] while B runs the entries before the pair.
+/// Apart from [`TXN_B`], whose drain at every chunk's end would wait for it. Only B waits on it,
+/// before it runs that chunk and at a list's end: an ID's outstanding count is the tile's NIU's,
+/// so NC waiting on it would wait for B's reads (`docs/learnings/silicon-operating-notes.md`,
+/// "A transaction ID's outstanding count is the tile's"). Its cap is [`TILE_IN_FLIGHT_CAP`], set
+/// once when the mover starts.
+pub const TXN_FETCH: u8 = 8;
+/// The NoC transaction IDs of a mover's credits ([`op::CREDIT`]): B's and NC's, apart from every
+/// other ID and from each other, since an ID's outstanding count is the tile's NIU's and each mover
+/// waits for its own credit's response.
+pub const TXN_CREDIT_B: u8 = 9;
+pub const TXN_CREDIT_NC: u8 = 10;
+/// Word 6 of an [`op::WRITE_L1_MCAST`]: counted with the run it belongs to, not on its own.
+pub const MCAST_RUN_ACKS: u32 = 1;
+
+/// [`op::WRITE_L1_MCAST`]'s word 1 for the rectangle `start..=end`.
+pub const fn mcast_corners(start: (u8, u8), end: (u8, u8)) -> u32 {
+    u32::from_le_bytes([start.0, start.1, end.0, end.1])
+}
+/// [`op::WAIT`]'s word 1 for a wait that also drains the prefetch reads ([`TXN_PREFETCH`]).
+pub const WAIT_PREFETCH: u32 = 1;
 const _: () = assert!(IN_FLIGHT_CAP + 4 <= BARRIER_COUNTER);
 /// The barrier counter [`op::BARRIER`] increments, in the coordinating tile's
 /// mover mailbox; zeroed by the host before the session's first barrier.
@@ -115,7 +181,74 @@ pub const BARRIER_COUNTER: u64 = MAILBOX_BASE + 0x60;
 pub const BARRIER_POLL: u64 = MAILBOX_BASE + 0x70;
 /// Where the atomic increment's old value lands.
 pub const BARRIER_RET: u64 = MAILBOX_BASE + 0x80;
+/// Where a credit's atomic increment ([`op::CREDIT`]) returns the word's old value, in the issuing
+/// mover's mailbox ([`Mover::at`]). Nothing reads it.
+pub const CREDIT_RET: u64 = MAILBOX_BASE + 0x84;
+const _: () = assert!(CREDIT_RET + 4 <= QUEUE_HEAD);
+/// The word of a wait-only `op::BARRIER` that says how many barriers it stands for: the
+/// profile mode's window counts it as that many arrivals.
+pub const BARRIER_STANDS_FOR: usize = 5;
 const _: () = assert!(BARRIER_COUNTER % 16 == BARRIER_POLL % 16);
+/// The word of an `op::BARRIER` that asks for the coordinator's release (1) rather than polling
+/// its counter (0).
+pub const BARRIER_RELEASE_MODE: usize = 6;
+/// The last barrier target the coordinator released to this tile (`op::BARRIER` word 6): written
+/// by the coordinator's NoC multicast, read by this tile's B in its own L1. Zeroed by the host
+/// with the counter.
+pub const BARRIER_RELEASE: u64 = MAILBOX_BASE + 0x100;
+/// The coordinator's copy of the target it multicasts, the same offset modulo 16 as
+/// [`BARRIER_RELEASE`], as a NoC write between L1s requires.
+pub const BARRIER_RELEASE_STAGE: u64 = MAILBOX_BASE + 0x110;
+const _: () = assert!(BARRIER_RELEASE % 16 == BARRIER_RELEASE_STAGE % 16);
+/// Host -> the coordinator: the rectangles its release reaches, `[count, (hi, acks) x count]`,
+/// `hi` a rectangle's `NOC_RET_ADDR_HI` on NoC #0 (`noc::multicast::Rect::hi`) and `acks` its
+/// tile count. Every tile of every rectangle is a surviving Tensix tile (`Rect::new`), and none
+/// is the coordinator's.
+pub const BARRIER_RECTS: u64 = MAILBOX_BASE + 0x120;
+/// Most rectangles at [`BARRIER_RECTS`]: `noc::multicast::full_grid_except`'s.
+pub const BARRIER_RECTS_MAX: u32 = 8;
+const _: () = assert!(BARRIER_RECTS + 4 + BARRIER_RECTS_MAX as u64 * 8 <= encoded::ENDPOINTS);
+/// The tile's op-level credit words ([`op::CREDIT`], [`op::WAIT_CREDIT`]): [`CREDIT_WORDS`] words,
+/// each alone in its 16 bytes ([`credit_word`]), past B's mover mailbox and its read endpoints, in
+/// L1 no arena or capture plans into. An op's own L1 is overwritten by other ops' tiles between
+/// two ops that hand data across tiles, so a count kept there would have to be zeroed as the op
+/// starts, which races with a peer that credits early. These words stay put: the host zeroes them
+/// when the tile's movers start, and an op that counts in one returns it to zero after its last
+/// wait on it (a credit of minus its total), so the next op finds them at zero. The barrier
+/// between the two orders that return before any peer's next credit
+/// (`docs/learnings/dataflow-compiler.md` §7).
+pub const CREDITS: u64 = MAILBOX_BASE + 0x400;
+/// How many words [`CREDITS`] holds.
+pub const CREDIT_WORDS: u32 = 8;
+/// The end of [`CREDITS`].
+pub const CREDITS_END: u64 = CREDITS + CREDIT_WORDS as u64 * 16;
+/// RISCV B's batch log, in a `profile` image: T0's and T2's batch tables
+/// (`crate::mailbox::BATCH_TIMES`) copied after each kernel that kept them, one record each,
+/// for the host to read with the stamps (`crate::mailbox::trace::BATCH_BASE` names a record).
+/// Word 0 is the words used after it, which the host zeroes when it reads the log; a record
+/// is a header (its batches, with `trace::BATCH_TRUNCATED` and `trace::BATCH_MISMATCHED`), then
+/// each batch's three T0 clock reads and three T2 reads.
+pub const BATCH_LOG: u64 = CREDITS_END;
+/// The end of [`BATCH_LOG`]: NC's mailbox.
+pub const BATCH_LOG_END: u64 = nc::MAILBOX_BASE;
+/// Words of [`BATCH_LOG`], its count word included.
+pub const BATCH_LOG_WORDS: u32 = ((BATCH_LOG_END - BATCH_LOG) / 4) as u32;
+const _: () = assert!(BATCH_LOG_WORDS >= 1 + 1 + 6 * crate::mailbox::BATCH_TIMES_MAX);
+
+/// Credit word `i` of [`CREDITS`], alone in its 16 bytes.
+pub const fn credit_word(i: u32) -> u32 {
+    assert!(i < CREDIT_WORDS);
+    (CREDITS + i as u64 * 16) as u32
+}
+const _: () = assert!(encoded::ENDPOINTS + encoded::ENDPOINT_WORDS as u64 * 4 <= CREDITS);
+const _: () = assert!(CREDITS_END <= nc::MAILBOX_BASE);
+/// Whether a credit's or a credit wait's word may be at `addr`: a word of
+/// [`crate::l1::LISTED`] (a channel's, in its op's L1) or of [`CREDITS`].
+pub const fn credit_addr(addr: u32) -> bool {
+    addr % 4 == 0
+        && (crate::l1::LISTED.contains(addr as u64, 4)
+            || (addr as u64 >= CREDITS && addr as u64 + 4 <= CREDITS_END))
+}
 
 /// The mover's list queue (`hardware-coverage.md` X4a): the host writes a
 /// list into the ring of entries at [`LIST`] (never across its end), a slot
@@ -174,7 +307,59 @@ const _: () = assert!(READ_FAST + 4 <= CAPS);
 /// made for another mover, fails the card's check. Ignored by an image without `fast-reads`.
 pub const ENCODE_KEY: u64 = MAILBOX_BASE + 0xF0;
 const _: () = assert!(CAPS + 4 <= ENCODE_KEY);
-const _: () = assert!(ENCODE_KEY + 4 <= MAILBOX_BASE + 0x100);
+/// Host -> mover: which ops of a list are stamped while [`TRACE`] is on, `lo | hi << 16`: only the entries
+/// run while `lo <= barriers < hi`, `barriers` counting the `BARRIER` entries the outermost list has run
+/// so far (each op of a multi-unit list ends in one, so it is the op's index). `hi == 0` stamps every
+/// entry. A replay too long for the stamp buffer is profiled a window at a time over successive replays
+/// (`tt_kernels::profile`). Read at the start of each outermost list.
+pub const TRACE_WINDOW: u64 = MAILBOX_BASE + 0xF4;
+const _: () = assert!(ENCODE_KEY + 4 <= TRACE_WINDOW);
+/// Host -> RISCV B: [`TXN_PREFETCH`]'s in-flight cap, applied as each list starts (nothing is then
+/// in flight on it: the last list's end drained it); 0 is [`TILE_IN_FLIGHT_CAP`]. Prefetch reads
+/// share GDDR with the ops they run under, whose latency-bound reads queue behind them
+/// (`docs/completed-plans/decode-to-bandwidth.md` Phase 8).
+pub const PREFETCH_CAP: u64 = MAILBOX_BASE + 0xF8;
+/// The [`PREFETCH_CAP`] a host sets unless told otherwise (`tt_kernels::dm::DataMover::start`,
+/// `TT_PREFETCH_CAP`): two reads in flight, where busy-unit prefetch measured best on a 1.7B decode
+/// step (18.40 ms against 18.73 at 4 and 19.08 at 8, `docs/completed-plans/planned-l1-residency.md` 3b).
+pub const PREFETCH_CAP_DEFAULT: u32 = 2;
+/// Host -> RISCV B: the in-flight cap of a weight stream's reads (`record::GATHER_STREAM`),
+/// read as each such record starts; 0 is [`TILE_IN_FLIGHT_CAP`]. The low 16 bits are an FP32
+/// stream's, the high 16 a stream of packed weights' (`record::gather_b_packed`: BF16, half the
+/// bytes a read, or BFP; 0 there is the low half's) ([`stream_caps`]). One cap serves every packed
+/// format until a measurement asks for one by slot size (`docs/learnings/dataflow-compiler.md` §8).
+pub const STREAM_CAP: u64 = MAILBOX_BASE + 0xFC;
+/// [`STREAM_CAP`]'s word for an FP32 stream's cap and a BF16 stream's.
+pub const fn stream_caps(f32_cap: u32, bf16_cap: u32) -> u32 {
+    (f32_cap & 0xffff) | (bf16_cap & 0xffff) << 16
+}
+/// The cap [`STREAM_CAP`]'s `word` gives a stream record, BF16 (`bf16`) or not.
+pub const fn stream_cap(word: u32, bf16: bool) -> u32 {
+    let cap = if bf16 && word >> 16 != 0 {
+        word >> 16
+    } else {
+        word & 0xffff
+    };
+    if cap == 0 {
+        TILE_IN_FLIGHT_CAP
+    } else {
+        cap
+    }
+}
+const _: () = assert!(PREFETCH_CAP + 4 <= STREAM_CAP);
+const _: () = assert!(STREAM_CAP + 4 <= MAILBOX_BASE + 0x100);
+/// The [`STREAM_CAP`] a host sets unless told otherwise (`tt_kernels::dm::DataMover::start`,
+/// `TT_STREAM_CAP`): two reads in flight. With every B read at 2, a 1.7B decode step measured
+/// 17.27 / 18.91 ms against 18.28 / 19.84 at the tile cap of 8 (4: 17.80 / 19.32, 1: 18.13 /
+/// 19.99), its products' units served evenly (`docs/completed-plans/decode-to-bandwidth.md` Phase 8).
+pub const STREAM_CAP_DEFAULT: u32 = 2;
+/// [`STREAM_CAP_DEFAULT`] for a stream of BF16 weights (`TT_STREAM_CAP_BF16`): three in flight, half
+/// the bytes each. SmolLM2-1.7B with its weights stored BF16, 96 stream units (card 0, 2026-10-26):
+/// 11.91 / 13.14 ms at 2, 11.77 / 12.99 at 3, 11.70 / 12.93 at 4 (32 / 256-token prompts), where an
+/// FP32 stream at 3 is slower (16.82 -> 17.15 ms).
+pub const STREAM_CAP_BF16_DEFAULT: u32 = 3;
+const _: () = assert!(TRACE_WINDOW + 4 <= PREFETCH_CAP);
+const _: () = assert!(PREFETCH_CAP + 4 <= MAILBOX_BASE + 0x100);
 
 /// [`CAPS`]'s bits.
 pub mod caps {
@@ -187,6 +372,10 @@ pub mod caps {
     /// With `FAST_READS`, the image also runs [`super::encoded::guard`] on each
     /// encoded read (the `encoded-guard` feature), not only its checksum.
     pub const GUARD: u32 = 1 << 1;
+    /// The image stamps its work through the tile's timestamper when [`super::TRACE`] asks (the
+    /// `profile` feature). Without it the stamping code is not in the image at all, so a run that
+    /// does not profile pays nothing for it, and the host refuses to profile.
+    pub const STAMPS: u32 = 1 << 2;
 }
 
 /// [`WRITE_NOC`]'s values. Anything else is [`write_noc::NOC0`].
@@ -257,6 +446,73 @@ pub mod op {
     pub const READ_ENCODED: u32 = 0x4A;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
+    /// L1 -> another Tensix tile's L1: `[WRITE_L1, x, y, to, from, len, 0, 0]`, [`WRITE`]'s
+    /// shape with a tile for a channel and port. RISCV NC writes `len` bytes of its own tile's L1
+    /// at `from` to `to` in the L1 of the tile at `(x, y)`, through the NIU its writes go out on
+    /// ([`super::WRITE_NOC`]). `(x, y)` is the tile's coordinate as the session names it, which
+    /// with translation on is the same on both NoCs (`step50_noc1`). Both ranges inside
+    /// `crate::l1::LISTED`, congruent mod 16; `len` at most `crate::noc::niu::MAX_REQUEST_BYTES`;
+    /// `(x, y)` a coordinate a Tensix tile could have (`crate::noc::grid::is_tensix_geometry`),
+    /// which is all the card can check: the host narrows it to the tiles of its session that read
+    /// what is written, and every one of them exists (`docs/completed-plans/planned-l1-residency.md`).
+    /// Response-marked, so the drain at a list's end waits for it: a unit's writes have landed
+    /// before it reports done and arrives at its barrier. NC's only. Only in a list entry.
+    pub const WRITE_L1: u32 = 0x24;
+    /// L1 -> the L1 of every tile of a rectangle: `[WRITE_L1_MCAST, corners, 0, to, from, len, 0,
+    /// 0]`, [`WRITE_L1`] to each of the tiles `x0..=x1` by `y0..=y1`, `corners` `x0 | y0 << 8 |
+    /// x1 << 16 | y1 << 24` ([`super::mcast_corners`]). One response-marked, path-reserved
+    /// multicast (`crate::noc::multicast::registers_to`) through NoC #1, which NC's writes must go
+    /// out on ([`super::WRITE_NOC`]; NoC #0 is [`super::error::DIRECTION`]): RISCV NC counts the
+    /// rectangle's acknowledgements on that NIU's write-ack counter before it runs the next
+    /// entry, having first waited for its earlier writes. A multicast's ID counter proves nothing
+    /// (one up, one down a recipient), nothing else NC sends is then in flight to add to the
+    /// count, and B, which shares the tile's NIUs, never writes through NoC #1 (NoC #0's counter
+    /// is B's barrier release's). So its writes too have landed before NC reports done. Every tile of the
+    /// rectangle must be one a Tensix tile could have (`crate::noc::grid::is_tensix_geometry`):
+    /// no non-memory or DRAM column inside it, which a broadcast would otherwise rely on masks to
+    /// skip; the tile running it is never one (no broadcast to itself); the ranges as
+    /// [`WRITE_L1`]'s. The host narrows the rectangle to its session's tiles. NC's only. Only in
+    /// a list entry.
+    ///
+    /// Word 6 may be [`super::MCAST_RUN_ACKS`]: a multicast so marked that follows another so
+    /// marked neither waits for earlier writes nor counts its own acknowledgements before the
+    /// next entry; the run's acknowledgements are counted together before the first entry that is
+    /// not one of it, and at the list's end (`docs/completed-plans/planned-l1-residency.md` 2f (c)). The
+    /// run's first still waits for NC's earlier writes, so nothing else is in flight to add to the
+    /// count.
+    pub const WRITE_L1_MCAST: u32 = 0x25;
+    /// Another (or this) Tensix tile's L1 -> this tile's L1: `[READ_L1, x, y, from, to, len, 0,
+    /// 0]`, [`WRITE_L1`]'s mirror on the reader. RISCV B reads `len` bytes at `from` in the L1 of
+    /// the tile at `(x, y)` -- this tile's own, a loopback -- into its own L1 at `to`, one request
+    /// through NoC #0 under its read ID, so what drains its reads (a kernel's launch, a list's
+    /// end) drains it. The checks are [`WRITE_L1`]'s; the host narrows `(x, y)` to its session's
+    /// tiles and `from` to the window it keeps (`docs/completed-plans/planned-l1-residency.md`). B's only.
+    /// Only in a list entry.
+    pub const READ_L1: u32 = 0x26;
+    /// A channel's credit to a peer (`tt_kernels::channel`): `[CREDIT, x, y, addr, value, 0, 0,
+    /// 0]`. Once every request this mover has issued under its own ID has completed -- a write's
+    /// acknowledgement, a read's data -- one full-width NoC atomic increment adds `value` to the
+    /// word at `addr` in the L1 of the tile at `(x, y)` (this tile's own included), and the mover
+    /// waits for its response before the next entry. A write followed by an atomic is not ordered
+    /// on the NoC (`docs/learnings/dataflow-compiler.md`, T7), so the wait for the acknowledgements
+    /// is what puts the credit after the data it grants; a multicast run is counted before any entry
+    /// not of it, so a credit after one is after its writes too. RISCV B's goes out on NoC #0, NC's on
+    /// the NIU its writes do ([`super::WRITE_NOC`]); each under its own ID ([`super::TXN_CREDIT_B`],
+    /// [`super::TXN_CREDIT_NC`]), returning the old value to its [`super::CREDIT_RET`]. `addr` a
+    /// word inside `crate::l1::LISTED` or [`super::CREDITS`] ([`super::credit_addr`]); `(x, y)` a coordinate a Tensix tile could have
+    /// (`crate::noc::grid::is_tensix_geometry`), narrowed by the host to its session's tiles; `value`
+    /// not zero. Prefetch reads ([`super::TXN_PREFETCH`]) are not waited for. Both movers. Only in a
+    /// list entry.
+    pub const CREDIT: u32 = 0x4D;
+    /// Wait for credits: `[WAIT_CREDIT, addr, target, 0, ...]`. Polls the word at `addr` in this
+    /// tile's L1, through a fence (the NoC writes L1 without invalidating the L0 cache), until it
+    /// has reached `target`, signed modulo 2^32 as a barrier's counter, so a channel's counts may
+    /// wrap. Every poll reads the streams' abort word ([`crate::dataflow::ABORT`]) as a credit wait
+    /// does, so a wait that will never end is cancelled, never left running; while it waits, the
+    /// mover's wait reason ([`crate::dataflow::WAIT_REASON`]) is [`crate::dataflow::CREDIT_WAIT`].
+    /// `addr` a word inside `crate::l1::LISTED` or [`super::CREDITS`] ([`super::credit_addr`]).
+    /// Both movers. Only in a list entry.
+    pub const WAIT_CREDIT: u32 = 0x4E;
     /// Run [`super::LEN`] list entries ([`super::Entry`]) from [`super::LIST`],
     /// in order. The other descriptor words are unused.
     pub const LIST: u32 = 3;
@@ -284,6 +540,8 @@ pub mod op {
     pub const KERNEL: u32 = 6;
     /// Wait for every move before it to complete: the boundary between what
     /// were separate lists, whose entries may reuse each other's L1 slots.
+    /// `[WAIT, prefetch, 0, ...]`: `prefetch` [`super::WAIT_PREFETCH`] also waits for the
+    /// prefetch reads ([`super::TXN_PREFETCH`]), 0 does not; anything else is refused.
     /// Only in a list entry.
     pub const WAIT: u32 = 7;
     /// As [`READ_TRANSPOSED`], but the mover writes the tile with its column
@@ -304,6 +562,18 @@ pub mod op {
     /// target before its next list, which orders it after those ops' writes
     /// without making it arrive at barriers it had no part in
     /// (`tt_kernels::session`). Only 0 or 1. Only in a list entry.
+    ///
+    /// Word 5 ([`super::BARRIER_STANDS_FOR`]): for a wait, the barriers it stands for -- in a
+    /// trace, the captured ops' barriers the unit sat out -- which the profile mode's window
+    /// (`TRACE_WINDOW`) counts as an arrival counts one, so every unit's count is the op's index.
+    /// Zero for an arrival, at most `0xffff`.
+    ///
+    /// Word 6 ([`super::BARRIER_RELEASE_MODE`]), 0 or 1: 1 waits for the coordinator's release,
+    /// not by polling its counter. The coordinator (the mover whose tile is `(x, y)`) waits on
+    /// its own counter, then writes `target` into [`super::BARRIER_RELEASE`] of every tile of the
+    /// rectangles at [`super::BARRIER_RECTS`] by NoC multicast; every other mover waits on its own
+    /// [`super::BARRIER_RELEASE`], in its own L1, with no NoC traffic. The host sets it only where
+    /// the coordinator reaches the target too (it arrives at that barrier, or at a later one).
     pub const BARRIER: u32 = 9;
     /// Run a list held in GDDR -- a trace (`tt_kernels::trace`):
     /// `[CALL, channel, offset, count, generation_base, barrier_base, 0, 0]`.
@@ -315,6 +585,9 @@ pub mod op {
     /// spans a chunk (the capture pads with `WAIT`s), and a `CALL` inside a
     /// call is refused. Only in a list entry.
     pub const CALL: u32 = 10;
+    // 0x4B was `CALL_BODY` (a layer body called from a trace's stream, layer
+    // sub-traces, opt-in and slower; retired 2026-11-06 for B's image room).
+    // Nothing emits it, and the decode refuses it as an unknown op.
     /// Write one word of a role's mailbox: `[POKE, address, value, 0, ...]`,
     /// the address a word of `crate::mailbox::role`'s three mailboxes. A
     /// trace's role descriptors, which the host writes for an ordinary list
@@ -365,11 +638,21 @@ pub mod op {
 
 // Entry ops and record ops (`record`, from 0x10) share one numbering.
 const _: () = {
-    let ops = [op::HOST_READ, op::HOST_WRITE, op::TILIZE, op::UNTILIZE];
+    let ops = [
+        op::HOST_READ,
+        op::HOST_WRITE,
+        op::TILIZE,
+        op::UNTILIZE,
+        op::WRITE_L1,
+        op::WRITE_L1_MCAST,
+        op::READ_L1,
+        op::CREDIT,
+        op::WAIT_CREDIT,
+    ];
     let mut i = 0;
     while i < ops.len() {
         assert!(!record::is_record(ops[i]));
-        assert!(ops[i] < record::GATHER || ops[i] > record::SELECT_ROWS);
+        assert!(ops[i] < record::GATHER || ops[i] > record::SCATTER_ROWS);
         i += 1;
     }
 };
@@ -453,25 +736,31 @@ impl Mover {
     ///
     /// RISCV B is the reader: it never writes GDDR -- [`op::WRITE`] and the
     /// writing records ([`record::Direction::Write`]) are its
-    /// [`error::DIRECTION`] -- and it keeps everything else: the control
+    /// [`error::DIRECTION`], as is [`op::WRITE_L1`] -- and it keeps everything else: the control
     /// entries, the roles' launches, barriers, PCIe moves ([`op::HOST_WRITE`]
     /// included), and the reading records. RISCV NC is the writer: only
-    /// [`op::WRITE`], the writing records, [`op::WAIT`] and the credits
-    /// ([`op::CB`]). The packet entries ([`op::PAIR`], [`op::PAIR_CALL`],
+    /// [`op::WRITE`], [`op::WRITE_L1`], the writing records, [`op::WAIT`] and the credits
+    /// ([`op::CB`], [`op::CREDIT`], [`op::WAIT_CREDIT`]). The packet entries ([`op::PAIR`], [`op::PAIR_CALL`],
     /// [`op::RELEASED`]) and [`op::CALL`] are B's; NC is started by B's
     /// packet, through its `SHARED` and `CALL` words, which are not entries.
     pub const fn permits(self, op: u32) -> bool {
         match self.core {
             crate::tensix::Core::B => {
                 op != op::WRITE
+                    && op != op::WRITE_L1
+                    && op != op::WRITE_L1_MCAST
                     && op != op::CHECK_FLAGS
                     && !matches!(record::direction(op), Some(record::Direction::Write))
             }
             _ => {
                 op == op::WRITE
+                    || op == op::WRITE_L1
+                    || op == op::WRITE_L1_MCAST
                     || op == op::CHECK_FLAGS
                     || op == op::WAIT
                     || op == op::CB
+                    || op == op::CREDIT
+                    || op == op::WAIT_CREDIT
                     || matches!(record::direction(op), Some(record::Direction::Write))
             }
         }
@@ -511,8 +800,8 @@ impl Mover {
 /// NC's own slot, from its default reset PC (`0x1_2000`) to the mover's list
 /// (`0x1_4000`), is 8 KiB, and the mover image is twice that. So the image
 /// lives in the free L1 between B's mover area and the data arena
-/// ([`crate::l1::NC_IMAGE`]), its list ring, scratch and trace chunk in the
-/// mailbox region's free stretch below the role mailboxes -- the program
+/// ([`crate::l1::NC_IMAGE`]), its list ring, scratch and trace chunk last in
+/// the mailboxes, past both movers' mailboxes -- the program
 /// cache keeps all of the top of L1, which a long column sum needs
 /// (`step21_one_launch`) -- and NC's reset PC holds a two-instruction jump to
 /// the image ([`nc::stub`]). Its reset PC is never moved:
@@ -529,9 +818,8 @@ pub mod nc {
     const _: () = assert!(
         IMAGE_BASE >= super::TRACE_CHUNK + super::TRACE_CHUNK_ENTRIES as u64 * super::ENTRY_BYTES
     );
-    /// NC's list ring, as [`super::LIST`] is B's: in the mailbox region, past
-    /// the single-core mailbox's `Dst` dump (`crate::mailbox::DUMP`) and
-    /// before the role mailboxes (`crate::mailbox::role::BASE`).
+    /// NC's list ring, as [`super::LIST`] is B's: last in the mailboxes, past
+    /// both movers' mailboxes and the probes' scratch.
     pub const LIST: u64 = crate::mailbox::MAILBOX_BASE + 0x4000;
     const _: () = assert!(
         LIST >= crate::mailbox::DUMP
@@ -546,8 +834,7 @@ pub mod nc {
     /// NC's mover mailbox: B's layout ([`super::SEQ`] and on, offset by
     /// `MAILBOX_BASE - super::MAILBOX_BASE`), one page after B's.
     pub const MAILBOX_BASE: u64 = super::MAILBOX_BASE + 0x1000;
-    const _: () = assert!(MAILBOX_BASE + 0x100 <= crate::mailbox::PROGRAM_REGION);
-    const _: () = assert!(END <= crate::mailbox::role::BASE);
+    const _: () = assert!(END <= crate::mailbox::MAILBOX_REGION_END);
     const _: () = assert!(STUB_AT + 8 <= super::LIST);
 
     /// The two instructions at [`STUB_AT`]: `lui t0, %hi(target)` and
@@ -565,10 +852,11 @@ pub mod nc {
 /// (zero, as `tt_layout` writes it), 1024 datums in face order, and padding to
 /// a multiple of [`crate::dram::ALIGN`] -- so every slot is 64-byte aligned
 /// wherever it sits, and any slot may be copied to any other under the C64
-/// read rule (divergence row 64).
-pub const TILE_SLOT: u64 = 4160;
-/// BF16's 1024 two-byte datums plus header, rounded to 64-byte slot alignment.
-pub const BF16_TILE_SLOT: u64 = 2112;
+/// read rule (divergence row 64). [`crate::format::TileFormat::slot_bytes`] of FP32: 4,160.
+pub const TILE_SLOT: u64 = crate::format::TileFormat::FP32.slot_bytes();
+/// BF16's 1024 two-byte datums plus header, rounded to 64-byte slot alignment: 2,112.
+pub const BF16_TILE_SLOT: u64 = crate::format::TileFormat::BF16.slot_bytes();
+const _: () = assert!(TILE_SLOT == 4160 && BF16_TILE_SLOT == 2112);
 /// Where a tile's datums start within its slot.
 pub const TILE_DATA: u64 = 16;
 const _: () = assert!(TILE_SLOT % crate::dram::ALIGN == 0);
@@ -630,6 +918,36 @@ pub enum Entry {
         descriptor: Descriptor,
         transform: Transform,
     },
+    /// [`op::WRITE_L1_MCAST`]: [`Entry::L1Write`] to every tile of `start..=end`.
+    L1Multicast {
+        start: (u8, u8),
+        end: (u8, u8),
+        to: u32,
+        from: u32,
+        len: u32,
+        /// Counted with its run ([`MCAST_RUN_ACKS`]).
+        run: bool,
+    },
+    /// [`op::WRITE_L1`]: `len` bytes of this tile's L1 at `from` to `to` in the L1 of `(x, y)`.
+    L1Write {
+        x: u8,
+        y: u8,
+        to: u32,
+        from: u32,
+        len: u32,
+    },
+    /// [`op::CREDIT`]: add `value` to the word at `addr` in the L1 of `(x, y)`.
+    Credit { x: u8, y: u8, addr: u32, value: u32 },
+    /// [`op::WAIT_CREDIT`]: wait until the word at `addr` in this tile's L1 reaches `target`.
+    WaitCredit { addr: u32, target: u32 },
+    /// [`op::READ_L1`]: `len` bytes at `from` in the L1 of `(x, y)` to `to` in this tile's.
+    L1Read {
+        x: u8,
+        y: u8,
+        from: u32,
+        to: u32,
+        len: u32,
+    },
     /// [`op::FILL`].
     Fill {
         value: u32,
@@ -645,14 +963,15 @@ pub enum Entry {
         /// Per role, `(address, words)` of a resident program, or `(0, 0)`.
         programs: [(u32, u32); 3],
     },
-    /// [`op::WAIT`].
-    Wait,
-    /// [`op::BARRIER`]: `arrive` false is its wait-only form.
+    /// [`op::WAIT`]; `prefetch`, whether it also drains [`TXN_PREFETCH`].
+    Wait { prefetch: bool },
+    /// [`op::BARRIER`]: `arrive` false is its wait-only form; `release`, word 6.
     Barrier {
         target: u32,
         x: u8,
         y: u8,
         arrive: bool,
+        release: bool,
     },
     /// [`op::CALL`]: run `count` entries from GDDR.
     Call {
@@ -706,8 +1025,8 @@ impl Entry {
                 return Err(error::OP);
             }
             if slot % 16 != 0
-                || (slot as u64) < crate::l1::DATA.base
-                || slot as u64 + TILE_SLOT > crate::l1::DATA.end
+                || (slot as u64) < crate::l1::LISTED.base
+                || slot as u64 + TILE_SLOT > crate::l1::LISTED.end
             {
                 return Err(error::ALIGNMENT);
             }
@@ -732,8 +1051,8 @@ impl Entry {
                 let end = at as u64 + (w[3] - 1) as u64 * stride as u64 + width as u64;
                 if at % width != 0
                     || stride % width != 0
-                    || (at as u64) < crate::l1::DATA.base
-                    || end > crate::l1::DATA.end
+                    || (at as u64) < crate::l1::LISTED.base
+                    || end > crate::l1::LISTED.end
                 {
                     return Err(error::ALIGNMENT);
                 }
@@ -745,6 +1064,109 @@ impl Entry {
                 src_stride: w[4],
                 dst_stride: w[5],
                 halfwords: width == 2,
+            });
+        }
+        if w[0] == op::WRITE_L1_MCAST {
+            let (to, from, len) = (w[3], w[4], w[5]);
+            let [x0, y0, x1, y1] = w[1].to_le_bytes();
+            if len == 0
+                || len > crate::noc::niu::MAX_REQUEST_BYTES
+                || w[2] != 0
+                || w[6] & !MCAST_RUN_ACKS != 0
+                || w[7] != 0
+            {
+                return Err(error::LENGTH);
+            }
+            if x0 > x1 || y0 > y1 {
+                return Err(error::RANGE);
+            }
+            let mut x = x0;
+            while x <= x1 {
+                // Rows are a range, so the two corner rows bound every tile's.
+                if !crate::noc::grid::is_tensix_geometry(x, y0)
+                    || !crate::noc::grid::is_tensix_geometry(x, y1)
+                {
+                    return Err(error::RANGE);
+                }
+                x += 1;
+            }
+            if from % 16 != to % 16
+                || !crate::l1::LISTED.contains(from as u64, len as u64)
+                || !crate::l1::LISTED.contains(to as u64, len as u64)
+            {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::L1Multicast {
+                start: (x0, y0),
+                end: (x1, y1),
+                to,
+                from,
+                len,
+                run: w[6] == MCAST_RUN_ACKS,
+            });
+        }
+        if w[0] == op::CREDIT {
+            let (x, y, addr, value) = (w[1], w[2], w[3], w[4]);
+            if w[5..].iter().any(|&word| word != 0) {
+                return Err(error::OP);
+            }
+            if value == 0 {
+                return Err(error::LENGTH);
+            }
+            if x > 0x3f || y > 0x3f || !crate::noc::grid::is_tensix_geometry(x as u8, y as u8) {
+                return Err(error::RANGE);
+            }
+            if !credit_addr(addr) {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::Credit {
+                x: x as u8,
+                y: y as u8,
+                addr,
+                value,
+            });
+        }
+        if w[0] == op::WAIT_CREDIT {
+            let (addr, target) = (w[1], w[2]);
+            if w[3..].iter().any(|&word| word != 0) {
+                return Err(error::OP);
+            }
+            if !credit_addr(addr) {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(Entry::WaitCredit { addr, target });
+        }
+        if w[0] == op::WRITE_L1 || w[0] == op::READ_L1 {
+            // The same five words: the remote address third, the local fourth.
+            let (x, y, to, from, len) = (w[1], w[2], w[3], w[4], w[5]);
+            if len == 0 || len > crate::noc::niu::MAX_REQUEST_BYTES || w[6] != 0 || w[7] != 0 {
+                return Err(error::LENGTH);
+            }
+            if x > 0x3f || y > 0x3f || !crate::noc::grid::is_tensix_geometry(x as u8, y as u8) {
+                return Err(error::RANGE);
+            }
+            if from % 16 != to % 16
+                || !crate::l1::LISTED.contains(from as u64, len as u64)
+                || !crate::l1::LISTED.contains(to as u64, len as u64)
+            {
+                return Err(error::ALIGNMENT);
+            }
+            return Ok(if w[0] == op::READ_L1 {
+                Entry::L1Read {
+                    x: x as u8,
+                    y: y as u8,
+                    from: to,
+                    to: from,
+                    len,
+                }
+            } else {
+                Entry::L1Write {
+                    x: x as u8,
+                    y: y as u8,
+                    to,
+                    from,
+                    len,
+                }
             });
         }
         if w[0] == op::INDEX_PICK {
@@ -764,8 +1186,8 @@ impl Entry {
                 (w[3], if w[7] == 2 { BF16_TILE_SLOT } else { TILE_SLOT }),
             ] {
                 if at % 64 != 0
-                    || (at as u64) < crate::l1::DATA.base
-                    || at as u64 + len > crate::l1::DATA.end
+                    || (at as u64) < crate::l1::LISTED.base
+                    || at as u64 + len > crate::l1::LISTED.end
                 {
                     return Err(error::ALIGNMENT);
                 }
@@ -893,10 +1315,22 @@ impl Entry {
             });
         }
         if w[0] == op::WAIT {
-            return Ok(Entry::Wait);
+            return match w[1] {
+                0 => Ok(Entry::Wait { prefetch: false }),
+                WAIT_PREFETCH => Ok(Entry::Wait { prefetch: true }),
+                _ => Err(error::RANGE),
+            };
         }
         if w[0] == op::BARRIER {
-            if w[2] > 0x3f || w[3] > 0x3f || w[4] > 1 || w[5..].iter().any(|&v| v != 0) {
+            // Word 5, a wait's barriers ([`BARRIER_STANDS_FOR`]): zero on an arrival.
+            if w[2] > 0x3f
+                || w[3] > 0x3f
+                || w[4] > 1
+                || (w[4] == 0 && w[5] != 0)
+                || w[5] > 0xffff
+                || w[6] > 1
+                || w[7] != 0
+            {
                 return Err(error::OP);
             }
             return Ok(Entry::Barrier {
@@ -904,6 +1338,7 @@ impl Entry {
                 x: w[2] as u8,
                 y: w[3] as u8,
                 arrive: w[4] == 0,
+                release: w[6] == 1,
             });
         }
         if w[0] == op::CALL {
@@ -1049,6 +1484,10 @@ pub mod error {
     /// (or, with `encoded-guard`, its guard, [`super::encoded::guard`]): not what the
     /// host's encoder makes, or damaged on the way.
     pub const ENCODED: u32 = 12;
+    /// A tensor reference in a layout its record does not read: a weight laid by column
+    /// ([`super::record::REF_BY_COLUMN`]) anywhere but a [`super::record::GATHER`], or a reader's
+    /// L1 order by column ([`super::record::REF_L1_BY_COLUMN`]) on what cannot take it.
+    pub const LAYOUT: u32 = 13;
 }
 
 /// A descriptor, as both sides see it.
@@ -1108,6 +1547,205 @@ impl Descriptor {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stream's cap from [`STREAM_CAP`]'s word: the low half for FP32, the high half for BF16
+    /// unless it is 0, and 0 the tile cap; an older host's plain word is both.
+    #[test]
+    fn a_stream_cap_word_holds_an_fp32_cap_and_a_bf16_one() {
+        let w = stream_caps(2, 3);
+        assert_eq!((stream_cap(w, false), stream_cap(w, true)), (2, 3));
+        assert_eq!((stream_cap(2, false), stream_cap(2, true)), (2, 2));
+        let w = stream_caps(0, 4);
+        assert_eq!(
+            (stream_cap(w, false), stream_cap(w, true)),
+            (TILE_IN_FLIGHT_CAP, 4)
+        );
+        assert_eq!(stream_cap(0, true), TILE_IN_FLIGHT_CAP);
+    }
+    /// `WRITE_L1`: a Tensix coordinate, both ranges in `DATA` and congruent mod 16, at most one
+    /// request, the reserved words zero; and only NC runs it.
+    #[test]
+    fn an_l1_write_decodes_only_whole_and_only_on_nc() {
+        use super::*;
+        let to = crate::l1::LISTED.end as u32 - 4096;
+        let good = [op::WRITE_L1, 4, 4, to, 0x4_0010, 4096, 0, 0];
+        assert_eq!(
+            Entry::decode(0xFF, [op::WRITE_L1, 4, 4, to + 16, 0x4_0010, 64, 0, 0]),
+            Ok(Entry::L1Write {
+                x: 4,
+                y: 4,
+                to: to + 16,
+                from: 0x4_0010,
+                len: 64
+            })
+        );
+        let with = |k: usize, v: u32| {
+            let mut e = good;
+            e[k] = v;
+            Entry::decode(0xFF, e)
+        };
+        assert!(matches!(
+            Entry::decode(0xFF, good),
+            Ok(Entry::L1Write { .. })
+        ));
+        assert_eq!(with(1, 8), Err(error::RANGE), "the non-memory column");
+        assert_eq!(with(1, 9), Err(error::RANGE), "a DRAM column");
+        assert_eq!(with(2, 1), Err(error::RANGE), "above the Tensix rows");
+        assert_eq!(with(1, 64), Err(error::RANGE), "past six bits");
+        assert_eq!(with(5, 0), Err(error::LENGTH));
+        assert_eq!(with(5, 16384 + 16), Err(error::LENGTH));
+        assert_eq!(with(6, 1), Err(error::LENGTH), "a reserved word");
+        assert_eq!(
+            with(3, to + 8),
+            Err(error::ALIGNMENT),
+            "not congruent mod 16"
+        );
+        assert_eq!(with(3, 0x1_0000), Err(error::ALIGNMENT), "below DATA");
+        assert_eq!(
+            with(3, crate::l1::LISTED.end as u32 - 64),
+            Err(error::ALIGNMENT),
+            "past what a list may name"
+        );
+        assert!(Mover::NC.permits(op::WRITE_L1));
+        assert!(!Mover::B.permits(op::WRITE_L1));
+    }
+
+    /// `READ_L1`: the remote address third and the local fourth, otherwise `WRITE_L1`'s checks;
+    /// any Tensix tile, not only the reader's own; and only B runs it.
+    #[test]
+    fn an_l1_read_decodes_only_whole_and_only_on_b() {
+        use super::*;
+        let from = crate::l1::LISTED.end as u32 - 4096;
+        let good = [op::READ_L1, 5, 4, from, 0x4_0010, 4096, 0, 0];
+        assert_eq!(
+            Entry::decode(0xFF, [op::READ_L1, 5, 4, from + 16, 0x4_0010, 64, 0, 0]),
+            Ok(Entry::L1Read {
+                x: 5,
+                y: 4,
+                from: from + 16,
+                to: 0x4_0010,
+                len: 64
+            })
+        );
+        let with = |k: usize, v: u32| {
+            let mut e = good;
+            e[k] = v;
+            Entry::decode(0xFF, e)
+        };
+        assert!(matches!(
+            Entry::decode(0xFF, good),
+            Ok(Entry::L1Read { .. })
+        ));
+        assert_eq!(with(1, 8), Err(error::RANGE), "the non-memory column");
+        assert_eq!(with(1, 9), Err(error::RANGE), "a DRAM column");
+        assert_eq!(with(2, 1), Err(error::RANGE), "above the Tensix rows");
+        assert_eq!(with(1, 64), Err(error::RANGE), "past six bits");
+        assert_eq!(with(5, 0), Err(error::LENGTH));
+        assert_eq!(with(5, 16384 + 16), Err(error::LENGTH));
+        assert_eq!(with(7, 1), Err(error::LENGTH), "a reserved word");
+        assert_eq!(
+            with(3, from + 8),
+            Err(error::ALIGNMENT),
+            "not congruent mod 16"
+        );
+        assert_eq!(
+            with(3, 0x1_0000),
+            Err(error::ALIGNMENT),
+            "the remote side below DATA"
+        );
+        assert_eq!(
+            with(4, 0x1_0010),
+            Err(error::ALIGNMENT),
+            "the local side below DATA"
+        );
+        assert_eq!(
+            with(4, crate::l1::LISTED.end as u32 - 48),
+            Err(error::ALIGNMENT),
+            "the local side past what a list may name"
+        );
+        assert!(Mover::B.permits(op::READ_L1));
+        assert!(!Mover::NC.permits(op::READ_L1));
+    }
+
+    /// `WRITE_L1_MCAST`: a rectangle of Tensix geometry, `start <= end`, no non-memory or DRAM
+    /// column inside it; the ranges as `WRITE_L1`'s; and only NC runs it.
+    #[test]
+    fn a_multicast_decodes_only_over_tensix_columns() {
+        use super::*;
+        let to = crate::l1::LISTED.end as u32 - 4096;
+        let mc = |s: (u8, u8), e: (u8, u8), len: u32| {
+            Entry::decode(
+                0xFF,
+                [
+                    op::WRITE_L1_MCAST,
+                    mcast_corners(s, e),
+                    0,
+                    to,
+                    0x4_0000,
+                    len,
+                    0,
+                    0,
+                ],
+            )
+        };
+        assert_eq!(
+            mc((1, 2), (7, 11), 64),
+            Ok(Entry::L1Multicast {
+                start: (1, 2),
+                end: (7, 11),
+                to,
+                from: 0x4_0000,
+                len: 64,
+                run: false,
+            })
+        );
+        assert_eq!(mc((10, 2), (14, 11), 4096).map(|_| ()), Ok(()));
+        let flagged = |w6: u32| {
+            Entry::decode(
+                0xFF,
+                [
+                    op::WRITE_L1_MCAST,
+                    mcast_corners((1, 2), (2, 2)),
+                    0,
+                    to,
+                    0x4_0000,
+                    64,
+                    w6,
+                    0,
+                ],
+            )
+        };
+        assert!(matches!(
+            flagged(MCAST_RUN_ACKS),
+            Ok(Entry::L1Multicast { run: true, .. })
+        ));
+        assert_eq!(
+            flagged(2),
+            Err(error::LENGTH),
+            "a bit word 6 does not define"
+        );
+        assert_eq!(flagged(MCAST_RUN_ACKS | 1 << 31), Err(error::LENGTH));
+        assert_eq!(
+            mc((7, 2), (10, 2), 64),
+            Err(error::RANGE),
+            "across columns 8 and 9"
+        );
+        assert_eq!(
+            mc((0, 2), (3, 2), 64),
+            Err(error::RANGE),
+            "from the DRAM column"
+        );
+        assert_eq!(
+            mc((3, 1), (3, 4), 64),
+            Err(error::RANGE),
+            "above the Tensix rows"
+        );
+        assert_eq!(mc((4, 4), (3, 4), 64), Err(error::RANGE), "reversed");
+        assert_eq!(mc((3, 4), (4, 4), 0), Err(error::LENGTH));
+        assert!(Mover::NC.permits(op::WRITE_L1_MCAST));
+        assert!(!Mover::B.permits(op::WRITE_L1_MCAST));
+    }
+
     /// Word 4 of a `BARRIER` says whether the unit arrives (0, as every barrier did before
     /// the wait-only form) or only waits (1); anything else, or a word past it, is refused.
     #[test]
@@ -1120,7 +1758,8 @@ mod tests {
                 target: 7,
                 x: 1,
                 y: 2,
-                arrive: true
+                arrive: true,
+                release: false,
             })
         );
         assert_eq!(
@@ -1129,11 +1768,75 @@ mod tests {
                 target: 7,
                 x: 1,
                 y: 2,
-                arrive: false
+                arrive: false,
+                release: false,
             })
         );
         assert_eq!(decode(2, 0), Err(error::OP));
-        assert_eq!(decode(1, 1), Err(error::OP));
+        // A wait may say how many barriers it stands for; an arrival may not.
+        assert!(decode(1, 3).is_ok());
+        assert_eq!(decode(1, 0x1_0000), Err(error::OP));
+        assert_eq!(decode(0, 1), Err(error::OP));
+        // Word 6: 1 waits for the coordinator's release; nothing else, and word 7 zero.
+        let word = |w6: u32, w7: u32| Entry::decode(0xFF, [op::BARRIER, 7, 1, 2, 0, 0, w6, w7]);
+        assert_eq!(
+            word(1, 0),
+            Ok(Entry::Barrier {
+                target: 7,
+                x: 1,
+                y: 2,
+                arrive: true,
+                release: true,
+            })
+        );
+        assert_eq!(word(2, 0), Err(error::OP));
+        assert_eq!(word(0, 1), Err(error::OP));
+    }
+
+    /// Every entry that names L1 may name the trace arena -- `DATA`, the capture-only arena and
+    /// the program slots, where a trace's capture plans -- and nothing past it: placed at the
+    /// capture-only arena's start, the program slots' start and their last slot, each decodes; at
+    /// the mailboxes' base, none does (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, P1).
+    #[test]
+    fn entries_name_the_trace_arena_and_not_the_mailboxes() {
+        use super::*;
+        use crate::l1::{CAPTURE_ONLY, DATA, MAILBOXES, PROGRAMS};
+        let local = DATA.base as u32 + 0x2_0000;
+        // Each entry kind with `at` in the one place it names L1 the test moves.
+        let entries = |at: u32| {
+            [
+                [op::CHECK_FLAGS, at, 32, 32, 0, 0, 0, 0],
+                [op::COPY_WORDS, local, at, 16, 4, 4, 0, 0],
+                [op::COPY_WORDS, at, local, 16, 4, 4, 0, 0],
+                [op::COPY_HALFWORDS, local, at, 16, 2, 2, 0, 0],
+                [op::WRITE_L1, 4, 4, at, local, 64, 0, 0],
+                [op::WRITE_L1, 4, 4, local, at, 64, 0, 0],
+                [op::READ_L1, 5, 4, at, local, 64, 0, 0],
+                [op::READ_L1, 5, 4, local, at, 64, 0, 0],
+                [
+                    op::WRITE_L1_MCAST,
+                    mcast_corners((1, 2), (2, 3)),
+                    0,
+                    at,
+                    local,
+                    64,
+                    0,
+                    0,
+                ],
+                [op::INDEX_PICK, at, local, local + 0x1040, 35, 32, 32, 4],
+                [op::INDEX_PICK, local, at, local + 0x1040, 35, 32, 32, 4],
+                [op::INDEX_PICK, local, local + 0x1040, at, 35, 32, 32, 4],
+            ]
+        };
+        let last = (PROGRAMS.end - TILE_SLOT) as u32;
+        for at in [CAPTURE_ONLY.base as u32, PROGRAMS.base as u32, last] {
+            for e in entries(at) {
+                assert!(Entry::decode(0xFF, e).is_ok(), "{at:#x}: {e:x?}");
+            }
+        }
+        for e in entries(MAILBOXES.base as u32) {
+            assert_eq!(Entry::decode(0xFF, e), Err(error::ALIGNMENT), "{e:x?}");
+        }
     }
 
     #[test]
@@ -1172,7 +1875,7 @@ mod tests {
                 let mut invalid = valid;
                 invalid[field] += 1;
                 assert_eq!(Entry::decode(0xff, invalid), Err(error::ALIGNMENT));
-                invalid[field] = crate::l1::DATA.end as u32 - 64;
+                invalid[field] = crate::l1::LISTED.end as u32 - 64;
                 assert_eq!(Entry::decode(0xff, invalid), Err(error::ALIGNMENT));
             }
         }
@@ -1193,7 +1896,7 @@ mod tests {
         assert!(!Mover::NC.permits(op::COPY_WORDS));
         for (index, value) in [
             (1, at + 1),
-            (2, crate::l1::DATA.end as u32),
+            (2, crate::l1::LISTED.end as u32),
             (3, 0),
             (3, 1025),
             (4, 3),
@@ -1351,7 +2054,7 @@ mod tests {
             op::PAIR_CALL,
             op::RELEASED,
         ];
-        let shared = [op::WAIT, op::CB];
+        let shared = [op::WAIT, op::CB, op::CREDIT, op::WAIT_CREDIT];
         for o in writes {
             assert!(!Mover::B.permits(o) && Mover::NC.permits(o), "{o:#x}");
         }
@@ -1363,10 +2066,80 @@ mod tests {
         }
     }
 
+    /// `CREDIT`: a Tensix coordinate, a word of `LISTED`, a value that adds something, the
+    /// reserved words zero. `WAIT_CREDIT`: a word of `LISTED`, any target (the count wraps).
+    #[test]
+    fn credits_decode_only_whole() {
+        let word = crate::l1::DATA.base as u32 + 0x40;
+        let good = [op::CREDIT, 4, 4, word, 1, 0, 0, 0];
+        assert_eq!(
+            Entry::decode(ALL, good),
+            Ok(Entry::Credit {
+                x: 4,
+                y: 4,
+                addr: word,
+                value: 1
+            })
+        );
+        let with = |k: usize, v: u32| {
+            let mut e = good;
+            e[k] = v;
+            Entry::decode(ALL, e)
+        };
+        assert_eq!(with(4, 0), Err(error::LENGTH), "a credit of nothing");
+        assert!(matches!(with(4, u32::MAX), Ok(Entry::Credit { .. })));
+        assert_eq!(with(1, 8), Err(error::RANGE), "the non-memory column");
+        assert_eq!(with(1, 0x40), Err(error::RANGE));
+        assert_eq!(with(3, word + 2), Err(error::ALIGNMENT));
+        assert_eq!(
+            with(3, MAILBOX_BASE as u32 + 0x60),
+            Err(error::ALIGNMENT),
+            "a mover's own mailbox, the barrier's counter"
+        );
+        assert_eq!(with(3, crate::l1::LISTED.end as u32), Err(error::ALIGNMENT));
+        // The op-level credit words, each of them and nothing either side.
+        for i in 0..CREDIT_WORDS {
+            assert!(matches!(with(3, credit_word(i)), Ok(Entry::Credit { .. })));
+            let wait = [op::WAIT_CREDIT, credit_word(i), 1, 0, 0, 0, 0, 0];
+            assert!(matches!(
+                Entry::decode(ALL, wait),
+                Ok(Entry::WaitCredit { .. })
+            ));
+        }
+        assert_eq!(with(3, CREDITS as u32 - 4), Err(error::ALIGNMENT));
+        assert_eq!(with(3, CREDITS_END as u32), Err(error::ALIGNMENT));
+        assert_eq!(with(3, credit_word(0) + 2), Err(error::ALIGNMENT));
+        for k in 5..8 {
+            assert_eq!(with(k, 1), Err(error::OP));
+        }
+        let wait = [op::WAIT_CREDIT, word, u32::MAX, 0, 0, 0, 0, 0];
+        assert_eq!(
+            Entry::decode(ALL, wait),
+            Ok(Entry::WaitCredit {
+                addr: word,
+                target: u32::MAX
+            })
+        );
+        let mut misaligned = wait;
+        misaligned[1] = word + 1;
+        assert_eq!(Entry::decode(ALL, misaligned), Err(error::ALIGNMENT));
+        let mut mailbox = wait;
+        mailbox[1] = crate::dataflow::INPUT as u32;
+        assert_eq!(
+            Entry::decode(ALL, mailbox),
+            Err(error::ALIGNMENT),
+            "the streams' counters are not a channel's credit word"
+        );
+        let mut extra = wait;
+        extra[3] = 1;
+        assert_eq!(Entry::decode(ALL, extra), Err(error::OP));
+    }
+
     #[test]
     fn retired_peer_ops_are_refused() {
-        // `SIGNAL` and `WAIT_PEER` (12 and 13) had their own entries once.
-        for retired in [12, 13] {
+        // `SIGNAL` and `WAIT_PEER` (12 and 13) had their own entries once, and
+        // `CALL_BODY` (0x4B) called a layer body until layer sub-traces retired.
+        for retired in [12, 13, 0x4B] {
             assert!(Entry::decode(ALL, [retired, 0, 1, 0, 0, 0, 0, 0]).is_err());
         }
     }
@@ -1514,7 +2287,7 @@ mod tests {
         bad_half[1] += 1;
         assert!(Entry::decode(ALL, bad_half).is_err());
         let mut bad_half = copy_half;
-        bad_half[2] = crate::l1::DATA.end as u32 - 2;
+        bad_half[2] = crate::l1::LISTED.end as u32 - 2;
         assert!(Entry::decode(ALL, bad_half).is_err());
         let mut bad = fill;
         bad[2] = 0x2000;
@@ -1590,7 +2363,15 @@ mod tests {
         );
         assert_eq!(
             Entry::decode(ALL, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]),
-            Ok(Entry::Wait)
+            Ok(Entry::Wait { prefetch: false })
+        );
+        assert_eq!(
+            Entry::decode(ALL, [op::WAIT, WAIT_PREFETCH, 0, 0, 0, 0, 0, 0]),
+            Ok(Entry::Wait { prefetch: true })
+        );
+        assert_eq!(
+            Entry::decode(ALL, [op::WAIT, 2, 0, 0, 0, 0, 0, 0]),
+            Err(error::RANGE)
         );
     }
 

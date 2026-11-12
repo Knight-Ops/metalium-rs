@@ -80,8 +80,17 @@ pub(crate) fn transfer(range: DramRange, read: bool, l1: u64, bytes: u32) -> [u3
 /// Exact ties-even BF16 conversion on raw FP32 bits. Quiet NaNs retain their
 /// sign/high payload and cannot become infinity when the payload is discarded.
 fn quantize() -> Vec<Instruction> {
+    quantize_code(0).expand()
+}
+
+/// [`quantize`] of the tile in `Dst` rows `row..row + 64`, in place, as a role's slot holds it:
+/// the rounding every BF16 result takes once, before its pack (`sfpu::kernel::Out::Bf16`; roadmap
+/// W1, native BF16 arithmetic). Built for the rows [`crate::sfpu::with_rows`] names, as the op's
+/// own program before it is.
+pub(crate) fn quantize_code(row: u32) -> crate::code::Code {
     let mut p = Program::new();
-    p.for_each_row_group(64, |p, row| {
+    p.for_each_row_group(64, |p, o| {
+        let row = row + o;
         p.load(LReg::L0, Format::Int32, row);
         p.loadi_bits(LReg::L3, 0x7fffffff);
         p.and(LReg::L0, LReg::L3, LReg::L1);
@@ -113,7 +122,27 @@ fn quantize() -> Vec<Instruction> {
         });
         p.store(LReg::L0, Format::Int32, row);
     });
-    p.finish()
+    p.finish_code()
+}
+
+/// [`quantize_code`] of `Dst` rows `row..row + 64`, its first `rows` tensor rows
+/// (`sfpu::with_rows`), as loop items for a role program the loop planner lowers
+/// (`loops::items_of`): a product's math role, which quantizes each BF16 output once its `K`
+/// chain is done (roadmap W1). From `Dst` row counter zero, as its row loops step it.
+pub(crate) fn quantize_items(row: u32, rows: u32) -> Vec<crate::loops::Item> {
+    let code = if rows >= 32 {
+        quantize_code(row)
+    } else {
+        crate::sfpu::with_rows(rows, || quantize_code(row))
+    };
+    let mut items = vec![crate::loops::Item::I(
+        tt_isa::isa::generated::encode::Setrwc::ZERO
+            .dst(1)
+            .encode()
+            .unwrap(),
+    )];
+    items.extend(crate::loops::items_of(&code));
+    items
 }
 
 fn roles(layout: &kernel::Layout, compress: bool) -> [Vec<Instruction>; 3] {
@@ -136,6 +165,10 @@ fn roles(layout: &kernel::Layout, compress: bool) -> [Vec<Instruction>; 3] {
         // eight 128-datum chunks by MOVA2D instead of UnpackToDst, which
         // cannot widen this format. Each bank is released exactly once.
         unpack = datapath::src_thread_config();
+        // Every counter from zero: a product's face selects (`SETADCZW`) leave unpacker 0's `Z`
+        // where its last face was, which would offset every datum read here
+        // (`step233`'s widening after a product).
+        unpack.extend(datapath::clear_unpacker0_adcs());
         let mut empty = tt_isa::matrix::Banks::after_reset();
         for chunk in 0..8 {
             unpack.extend(sync::take(s.free, Before::UNPACKER));
@@ -244,15 +277,18 @@ fn jobs(input: &Placement, output: &Placement, compress: bool) -> Result<Vec<Job
         .collect())
 }
 
+/// `input` narrowed to BF16 into a new tensor laid as `layout` says (each tile to its slot, so
+/// either layout is written alike).
 pub(crate) fn compress(
     alloc: &mut DramAlloc,
     input: &DramTensor,
+    layout: crate::tensor::Layout,
 ) -> Result<(Bf16Tensor, Vec<Job>)> {
     input.expect("BF16 conversion", Elem::F32)?;
     let output = Bf16Tensor {
         rows: input.rows,
         cols: input.cols,
-        placement: alloc.alloc_slots(input.placement.tiles(), TILE_SLOT)?,
+        placement: alloc.alloc_laid(input.grid(), TILE_SLOT, layout)?,
     };
     let jobs = jobs(&input.placement, &output.placement, true)?;
     Ok((output, jobs))
@@ -383,7 +419,7 @@ fn repack_many_into(
     let dst = req.scratch("BF16 repack output", TILE_SLOT, 64, 0..1);
     let constant = req.scratch("BF16 repack padding", TILE_SLOT, 64, 0..1);
     let layout = req
-        .plan(tt_isa::l1::DATA)
+        .plan(crate::l1::arena())
         .map_err(|e| TensorError::Shape(e.to_string()))?;
     let (src, dst) = (layout.addr(src), layout.addr(dst));
     let constant = layout.addr(constant);
@@ -478,263 +514,6 @@ fn repack_many_into(
     Ok(jobs)
 }
 
-fn gather(
-    a: &Bf16Tensor,
-    b: &Bf16Tensor,
-    at: [u64; 2],
-    block: [usize; 4],
-    k0: usize,
-    kt: usize,
-) -> Vec<[u32; 8]> {
-    use tt_isa::dm::record;
-    let encode = |input: &Bf16Tensor, origin: [usize; 2]| {
-        let mut encoded = input.placement.tensor_ref(input.cols.div_ceil(32)).encode();
-        encoded[0][4] = input.rows as u32;
-        encoded[0][5] = input.cols as u32;
-        encoded[0][6] = origin[0] as u32;
-        encoded[0][7] = origin[1] as u32;
-        encoded
-    };
-    let [a0, a1] = encode(a, [0, k0]);
-    let [b0, b1] = encode(b, [k0, 0]);
-    let [i0, rows, j0, cols] = block;
-    vec![
-        [
-            record::GATHER,
-            record::GATHER_BF16 | (kt as u32) << 8,
-            at[0] as u32,
-            at[1] as u32,
-            i0 as u32,
-            rows as u32,
-            j0 as u32,
-            cols as u32,
-        ],
-        a0,
-        a1,
-        b0,
-        b1,
-    ]
-}
-
-/// Direct packed BF16 inputs, FP32 matrix accumulation and FP32 output.
-/// K blocks reload the prior FP32 accumulator after NC releases it.
-pub(crate) fn matmul(
-    alloc: &mut DramAlloc,
-    a: &Bf16Tensor,
-    b: &Bf16Tensor,
-    fidelity: crate::matmul::Fidelity,
-    units: usize,
-    k_limit: Option<usize>,
-) -> Result<Work> {
-    use crate::matmul::{self, SrcRoute, Staging};
-    use tt_isa::{dm::record, tile::L1Format};
-    if [a.rows, a.cols, b.rows, b.cols].contains(&0) || a.cols != b.rows {
-        return Err(TensorError::Shape(
-            "BF16 matmul requires nonempty compatible matrices".into(),
-        ));
-    }
-    let [mt, kt, nt] = [
-        a.rows.div_ceil(32),
-        a.cols.div_ceil(32),
-        b.cols.div_ceil(32),
-    ];
-    let shape = matmul::plan_in(
-        [a.rows, a.cols, b.cols],
-        SrcRoute::Bf16FromBf16,
-        fidelity,
-        Staging::Slots,
-    )
-    .ok_or_else(|| TensorError::Shape("no BF16 matmul block fits".into()))?;
-    let kc = shape.tiles[1].min(k_limit.unwrap_or(kt));
-    if kc < kt {
-        return matmul_continuing(alloc, a, b, fidelity, kc);
-    }
-    let [mc, nc] = crate::tensor::blocks([mt, nt], [shape.tiles[0], shape.tiles[2]], units);
-    let out = DramTensor::alloc(alloc, a.rows, b.cols)?;
-    let mut jobs = Vec::new();
-    for i0 in (0..mt).step_by(mc) {
-        for j0 in (0..nt).step_by(nc) {
-            let (rows, cols) = (mc.min(mt - i0), nc.min(nt - j0));
-            let tiles = [rows, kt, cols];
-            let layout = match matmul::plan_layout_in(tiles, L1Format::Bf16, Staging::Slots) {
-                Ok(layout) => layout,
-                Err(error) => {
-                    alloc.free(&out.placement);
-                    return Err(error.into());
-                }
-            };
-            let gather = gather(
-                a,
-                b,
-                [layout.a_at, layout.b_at],
-                [i0, rows, j0, cols],
-                0,
-                kt,
-            );
-            let (roles, mop) = matmul::kernel_programs(
-                tiles,
-                0x90,
-                SrcRoute::Bf16FromBf16,
-                fidelity,
-                layout.sems,
-                false,
-                || {
-                    matmul::matmul_kernel(
-                        &layout.outputs,
-                        layout.sems,
-                        L1Format::Bf16,
-                        5,
-                        fidelity,
-                        false,
-                    )
-                },
-            );
-            let scatter = vec![
-                [
-                    record::SCATTER,
-                    layout.outputs[0].out as u32,
-                    tt_isa::dm::TILE_SLOT as u32,
-                    i0 as u32,
-                    rows as u32,
-                    j0 as u32,
-                    cols as u32,
-                    0,
-                ],
-                out.tensor_ref().encode()[0],
-                out.tensor_ref().encode()[1],
-            ];
-            jobs.push(vec![
-                Step::List {
-                    what: "packed BF16 matmul gather",
-                    entries: gather,
-                },
-                Step::Kernel {
-                    roles,
-                    init: layout.init,
-                    mop: Box::new(mop),
-                    loops: Default::default(),
-                    half: None,
-                },
-                Step::List {
-                    what: "packed BF16 matmul scatter",
-                    entries: scatter,
-                },
-            ]);
-        }
-    }
-    out.set_pad(Pad::Undefined);
-    Ok(Work { out, jobs })
-}
-
-fn matmul_continuing(
-    alloc: &mut DramAlloc,
-    a: &Bf16Tensor,
-    b: &Bf16Tensor,
-    fidelity: crate::matmul::Fidelity,
-    kc: usize,
-) -> Result<Work> {
-    use crate::matmul::{self, SrcRoute};
-    use tt_isa::dm::{record, TILE_SLOT};
-    let route = SrcRoute::Bf16FromBf16;
-    let kc = crate::tensor::k_block_size(kc, route, fidelity)?;
-    let out = DramTensor::alloc(alloc, a.rows, b.cols)?;
-    let build = || -> Result<Vec<Job>> {
-        let mut jobs = Vec::new();
-        let rc = out.tensor_ref().encode();
-        for i in 0..a.rows.div_ceil(32) {
-            for j in 0..b.cols.div_ceil(32) {
-                let mut steps = Vec::new();
-                for k0 in (0..a.cols.div_ceil(32)).step_by(kc) {
-                    let count = kc.min(a.cols.div_ceil(32) - k0);
-                    let (layout, reload) = matmul::k_block_layout(count)?;
-                    let mut entries =
-                        gather(a, b, [layout.a_at, layout.b_at], [i, 1, j, 1], k0, count);
-                    if k0 > 0 {
-                        // Waiting for NC release preserves the prior tile and
-                        // makes the gather conservative for scheduler overlap.
-                        entries.insert(0, [op::WAIT, 0, 0, 0, 0, 0, 0, 0]);
-                        entries.extend([
-                            [
-                                record::READ_RUN,
-                                (i * b.cols.div_ceil(32) + j) as u32,
-                                1,
-                                reload.prior as u32,
-                                0,
-                                0,
-                                0,
-                                0,
-                            ],
-                            rc[0],
-                            rc[1],
-                        ]);
-                    }
-                    let (roles, _) = matmul::kernel_programs(
-                        [1, count, 1],
-                        if k0 > 0 { 0x93 } else { 0x92 },
-                        route,
-                        fidelity,
-                        layout.sems,
-                        false,
-                        || {
-                            (
-                                matmul::k_block_kernel(
-                                    &layout,
-                                    (k0 > 0).then_some(reload),
-                                    route,
-                                    fidelity,
-                                ),
-                                [None; 3],
-                            )
-                        },
-                    );
-                    steps.extend([
-                        Step::List {
-                            what: "packed BF16 K-block gather",
-                            entries,
-                        },
-                        Step::Kernel {
-                            roles,
-                            init: layout.init,
-                            mop: Box::new([None; 3]),
-                            loops: Default::default(),
-                            half: None,
-                        },
-                        Step::List {
-                            what: "packed BF16 K-block scatter",
-                            entries: vec![
-                                [
-                                    record::SCATTER,
-                                    layout.outputs[0].out as u32,
-                                    TILE_SLOT as u32,
-                                    i as u32,
-                                    1,
-                                    j as u32,
-                                    1,
-                                    0,
-                                ],
-                                rc[0],
-                                rc[1],
-                            ],
-                        },
-                    ]);
-                }
-                jobs.push(steps);
-            }
-        }
-        Ok(jobs)
-    };
-    match build() {
-        Ok(jobs) => {
-            out.set_pad(Pad::Undefined);
-            Ok(Work { out, jobs })
-        }
-        Err(error) => {
-            alloc.free(&out.placement);
-            Err(error)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -750,6 +529,29 @@ mod tests {
                 got,
                 [0, 0x80000000, 0x3f800000, 0x3f820000, 0x7fc00000][i % 5],
                 "{i}"
+            );
+        }
+    }
+
+    /// The quantize as loop items is the quantize: the backend receives the same stream,
+    /// recorded or written out, whole tiles or a decode row's (`loops::items_of`).
+    #[test]
+    fn quantize_items_are_the_quantize() {
+        use crate::loops::{frontend_stream, lower_with, Item};
+        for rows in [32, 16, 8, 1] {
+            let code = if rows == 32 {
+                super::quantize_code(128)
+            } else {
+                crate::sfpu::with_rows(rows, || super::quantize_code(128))
+            };
+            let want = frontend_stream(&code.expand(), None).unwrap();
+            let items = super::quantize_items(128, rows);
+            assert_eq!(Item::unrolled(&items[1..]), want, "{rows} rows");
+            let lowered = lower_with(&items[1..], false);
+            assert_eq!(
+                frontend_stream(&lowered.words, None).unwrap(),
+                want,
+                "{rows} rows"
             );
         }
     }

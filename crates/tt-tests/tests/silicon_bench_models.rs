@@ -16,7 +16,8 @@
 //! whole step from a token id, which the row select (`step171_select_rows`) made affordable.
 //!
 //! Silicon only, `#[ignore]`d (run with `cargo xtask bench --filter silicon_bench_models`), and
-//! independent of each other, so two can run at once on two cards.
+//! independent of each other, so two can run at once on two cards. Each runs on every tile of its
+//! card ([`bench_config`]), as burn-tt opens a card by default; `TT_TILES` chooses fewer.
 
 #![cfg(feature = "silicon")]
 
@@ -26,7 +27,7 @@ use burn::tensor::{DType, Tensor, TensorData};
 use burn_flex::{Flex, FlexDevice};
 use burn_tt::TtBackend;
 use tt_models::image_input::{load_chw, HALF_MEAN, HALF_STD, IMAGENET_MEAN, IMAGENET_STD};
-use tt_models::llama::{Llama, Precision, FULL_LAYERS, HIDDEN};
+use tt_models::llama::{Llama, Precision, SMOLLM2_135M, SMOLLM2_1_7B_INSTRUCT};
 use tt_models::resnet::ResNet18;
 use tt_models::vit::{VitTiny, FULL_DEPTH};
 use tt_tests::bench::{git_sha, report, Stats};
@@ -37,10 +38,25 @@ const SAMPLES: usize = 9;
 
 fn conditions(card: usize) {
     println!(
-        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\"}}",
+        "BENCH {{\"kind\":\"conditions\",\"git\":\"{}\",\"release\":{},\"card\":{card},\"warmups\":{WARMUPS},\"samples\":{SAMPLES},\"timing\":\"host dispatch through final readback; validation outside timing\",\"model_inputs\":\"cats.jpg, pretrained weights, batch 1\",\"column_weights\":{},\"even_deal\":{},\"deal_probe\":\"{}\"}}",
         git_sha(),
-        !cfg!(debug_assertions)
+        !cfg!(debug_assertions),
+        std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0"),
+        std::env::var("TT_EVEN_DEAL").map_or(true, |v| v != "0"),
+        std::env::var("TT_PROBE_DEAL").unwrap_or_else(|_| "off".into()),
     );
+}
+
+/// The device a model benchmark attaches: every tile of the card, as burn-tt opens one by default
+/// (`docs/plans/tt-metal-parity.md` W6), unless `TT_TILES` says otherwise. The gate tile alone
+/// cannot hold a 1.7B step's programs: a capture overflows its program cache.
+fn bench_config() -> Config {
+    Config {
+        tiles: std::env::var("TT_TILES")
+            .is_err()
+            .then_some(burn_tt::TileChoice::All),
+        ..Config::default()
+    }
 }
 
 fn card() -> usize {
@@ -120,6 +136,106 @@ fn measure(key: &str, mut forward: impl FnMut() -> Vec<f32>) -> Vec<f32> {
     last
 }
 
+/// What a captured trace is made of (`docs/completed-plans/replay-fixed-cost.md`, P0): its ops, the
+/// barriers among them, how many units each op ran on (a unit whose share of the op is only the
+/// barrier entry sat it out), and by the Burn op that queued each (`OpRecord::label`). Reported as
+/// `BENCH` counts under `key`; the table goes to stderr, and the whole list, one op a line, to the
+/// file `TT_TRACE_OPS` names if set.
+fn trace_shape(key: &str, trace: &burn_tt::TracedInference) {
+    let ops = trace.ops().unwrap();
+    let ran = |o: &tt_kernels::trace::OpRecord| {
+        let fixed = o.barrier as usize;
+        o.entries.iter().filter(|r| r.len() > fixed).count()
+    };
+    let barriers = ops.iter().filter(|o| o.barrier).count();
+    let units = ops.first().map_or(0, |o| o.entries.len());
+    let entries: Vec<usize> = (0..units)
+        .map(|u| ops.iter().map(|o| o.entries[u].len()).sum())
+        .collect();
+    report(
+        &format!("{key} trace ops"),
+        "ops",
+        "count",
+        Stats::of([ops.len() as f64]),
+    );
+    report(
+        &format!("{key} trace barriers"),
+        "barriers",
+        "count",
+        Stats::of([barriers as f64]),
+    );
+    report(
+        &format!("{key} trace units an op ran on"),
+        "units",
+        "count",
+        Stats::of(ops.iter().map(|o| ran(o) as f64).collect::<Vec<_>>()),
+    );
+    eprintln!(
+        "trace: {} ops, {barriers} barriers, {units} units; stream entries on unit 0 {}, most {}",
+        ops.len(),
+        entries.first().copied().unwrap_or(0),
+        entries.iter().max().copied().unwrap_or(0)
+    );
+    // By label: ops, the units they ran on, and their entries summed over every unit.
+    let mut by: std::collections::BTreeMap<&str, (usize, usize, usize)> = Default::default();
+    for o in &ops {
+        let r = by.entry(o.label).or_default();
+        r.0 += 1;
+        r.1 += ran(o);
+        r.2 += o.entries.iter().map(|e| e.len()).sum::<usize>();
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by_key(|&(label, (n, _, _))| (std::cmp::Reverse(n), label));
+    eprintln!(
+        "{:<34} {:>6} {:>10} {:>10}",
+        "label", "ops", "units/op", "entries"
+    );
+    for (label, (n, units, entries)) in rows {
+        eprintln!(
+            "{:<34} {:>6} {:>10.1} {:>10}",
+            label,
+            n,
+            units as f64 / n as f64,
+            entries
+        );
+    }
+    if let Ok(path) = std::env::var("TT_TRACE_OPS") {
+        let mut out = String::from("index\tlabel\twhat\tunits_ran\tunit0_entries\tbarrier\n");
+        for (i, o) in ops.iter().enumerate() {
+            out += &format!(
+                "{i}\t{}\t{}\t{}\t{}\t{}\n",
+                o.label,
+                o.what,
+                ran(o),
+                o.entries[0].len(),
+                o.barrier
+            );
+        }
+        std::fs::write(&path, out).unwrap();
+        eprintln!("trace ops written to {path}");
+    }
+}
+
+/// Medians of a trace's replays split as `run_timed` measures them (`GenericTraceRun`): the input
+/// write, the replay to its end, the output read.
+fn report_split(key: &str, runs: &[burn_tt::GenericTraceRun]) {
+    let ms = |f: fn(&burn_tt::GenericTraceRun) -> std::time::Duration| {
+        Stats::of(
+            runs.iter()
+                .map(|r| f(r).as_secs_f64() * 1e3)
+                .collect::<Vec<_>>(),
+        )
+    };
+    report(
+        &format!("{key}, input write"),
+        "ms",
+        "host",
+        ms(|r| r.write),
+    );
+    report(&format!("{key}, replay"), "ms", "host", ms(|r| r.replay));
+    report(&format!("{key}, output read"), "ms", "host", ms(|r| r.read));
+}
+
 /// The same forward pass on burn-flex (the host), timed the same way: the baseline a device number
 /// is held against.
 fn baseline(key: &str, mut forward: impl FnMut() -> Vec<f32>) -> Vec<f32> {
@@ -160,7 +276,7 @@ fn resnet18_forward() {
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         })
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) = ResNet18::<TtBackend>::pretrained(&d).unwrap();
         let got = measure("resnet18 224x224 batch 1 forward", || {
@@ -229,6 +345,24 @@ fn traced_image_forward(
     report(key, "ms", "host", Stats::of(ms));
     assert_eq!(got, eager, "a replay is the eager forward");
     assert_eq!(argmax(&got), argmax(host));
+    print_measured(key);
+}
+
+/// Each product question `TT_MATMUL_BLOCK=measured` timed in this process
+/// (`tt_kernels::tensor::measured`): its choice, and `Auto`'s time against the choice's.
+fn print_measured(key: &str) {
+    for (q, choice, times) in tt_kernels::tensor::measured() {
+        let times = times.map_or("not timed".into(), |[auto, chosen]| {
+            format!(
+                "Auto {auto:.1} us, chosen {chosen:.1} us ({:.3}x)",
+                auto / chosen
+            )
+        });
+        println!(
+            "MEASURE {key}: measured {:?} {:?} on {}: {choice:?}; {times}",
+            q.tiles, q.transposed, q.units
+        );
+    }
 }
 
 /// `resnet18_forward` as a trace ([`traced_image_forward`]).
@@ -246,7 +380,7 @@ fn resnet18_forward_traced() {
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         })
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) = ResNet18::<TtBackend>::pretrained(&d).unwrap();
         traced_image_forward(
@@ -274,7 +408,7 @@ fn vit_tiny_forward_traced() {
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         })
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) = VitTiny::<TtBackend>::pretrained(FULL_DEPTH, &d).unwrap();
         traced_image_forward(
@@ -301,7 +435,7 @@ fn vit_tiny_forward() {
             m.forward(t).into_data().to_vec::<f32>().unwrap()
         })
     };
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let (m, _) = VitTiny::<TtBackend>::pretrained(FULL_DEPTH, &d).unwrap();
         let got = measure("vit-tiny 224x224 batch 1 forward", || {
@@ -318,24 +452,25 @@ fn vit_tiny_forward() {
 fn smollm2_decode_without_the_embedding_lookup() {
     // The embedding of " Paris" (token 7042), read from the host model: the input of a decode step.
     let row: Vec<f32> = {
-        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) = Llama::<Flex>::smollm2_135m(1, Precision::F32, &FlexDevice).unwrap();
         let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
             TensorData::new(vec![7042i32], [1, 1]),
             &FlexDevice,
         );
         m.embed(ids).into_data().to_vec::<f32>().unwrap()
     };
-    assert_eq!(row.len(), HIDDEN);
+    assert_eq!(row.len(), SMOLLM2_135M.hidden);
     // The host, doing the same decode steps (a fresh cache after sixty, as below).
     {
-        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
         let mut cache = m.cache(64, DType::F32, &FlexDevice);
         let mut step = 0usize;
         baseline(
             "smollm2-135m decode step without the embedding lookup",
             || {
                 let x = Tensor::<Flex, 3>::from_data(
-                    TensorData::new(row.clone(), [1, 1, HIDDEN]),
+                    TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
                     &FlexDevice,
                 );
                 step += 1;
@@ -350,9 +485,10 @@ fn smollm2_decode_without_the_embedding_lookup() {
             },
         );
     }
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
-        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
         // A cache holding a five-token prompt's worth of positions would need the prompt run; a
         // decode step at position 0 has the same operations, with a one-position attention.
         let mut cache = m.cache(64, DType::F32, &d);
@@ -361,7 +497,7 @@ fn smollm2_decode_without_the_embedding_lookup() {
             "smollm2-135m decode step without the embedding lookup",
             || {
                 let x = Tensor::<TtBackend, 3>::from_data(
-                    TensorData::new(row.clone(), [1, 1, HIDDEN]),
+                    TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
                     &d,
                 );
                 step += 1;
@@ -393,7 +529,7 @@ fn smollm2_decode_traced() {
     use burn_tt::{InputPayload, OutputPayload, TracedInference, TtTensor};
     const MAX_LEN: usize = 64;
     let row: Vec<f32> = {
-        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) = Llama::<Flex>::smollm2_135m(1, Precision::F32, &FlexDevice).unwrap();
         let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
             TensorData::new(vec![7042i32], [1, 1]),
             &FlexDevice,
@@ -401,11 +537,12 @@ fn smollm2_decode_traced() {
         m.embed(ids).into_data().to_vec::<f32>().unwrap()
     };
     {
-        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
         let mut cache = m.cache(MAX_LEN, DType::F32, &FlexDevice);
         baseline("smollm2-135m decode step, traced", || {
             let x = Tensor::<Flex, 3>::from_data(
-                TensorData::new(row.clone(), [1, 1, HIDDEN]),
+                TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
                 &FlexDevice,
             );
             m.forward_embedded(x, &mut cache, DType::F32)
@@ -414,12 +551,17 @@ fn smollm2_decode_traced() {
                 .unwrap()
         });
     }
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let dtype = DType::F32;
-        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
-        let x =
-            || Tensor::<TtBackend, 3>::from_data(TensorData::new(row.clone(), [1, 1, HIDDEN]), &d);
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
+        let x = || {
+            Tensor::<TtBackend, 3>::from_data(
+                TensorData::new(row.clone(), [1, 1, SMOLLM2_135M.hidden]),
+                &d,
+            )
+        };
         let at = |p: usize| {
             Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
         };
@@ -490,17 +632,24 @@ fn smollm2_decode_traced() {
         };
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&logits(&first)), bits(&eager[1]), "the capture's run");
+        trace_shape("smollm2-135m decode step, traced", &trace);
         let mut ms = Vec::new();
+        let mut split = Vec::new();
         for (p, want) in eager.iter().enumerate().skip(2) {
             let t0 = Instant::now();
             let got = trace
-                .run(vec![
+                .run_timed(vec![
                     InputPayload::F32(row.clone()),
                     InputPayload::Bits(vec![p as u32]),
                 ])
                 .unwrap();
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
-            assert_eq!(bits(&logits(&got)), bits(want), "replay at position {p}");
+            assert_eq!(
+                bits(&logits(&got.outputs)),
+                bits(want),
+                "replay at position {p}"
+            );
+            split.push(got);
         }
         report(
             "smollm2-135m decode step, traced",
@@ -508,6 +657,7 @@ fn smollm2_decode_traced() {
             "host",
             Stats::of(ms[WARMUPS..].to_vec()),
         );
+        report_split("smollm2-135m decode step, traced", &split[WARMUPS..]);
     });
 }
 
@@ -525,7 +675,7 @@ fn smollm2_prefill_chunk_sweep() {
     const MAX_LEN: usize = 512;
     const PREFILL_CHUNKS: [usize; 5] = [1, 32, 64, 128, 256];
     let row: Vec<f32> = {
-        let (m, _) = Llama::<Flex>::pretrained(1, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) = Llama::<Flex>::smollm2_135m(1, Precision::F32, &FlexDevice).unwrap();
         let ids = Tensor::<Flex, 2, burn::tensor::Int>::from_data(
             TensorData::new(vec![7042i32], [1, 1]),
             &FlexDevice,
@@ -534,13 +684,14 @@ fn smollm2_prefill_chunk_sweep() {
     };
     // burn-flex's whole prefill of a prompt of each length, for the cost a token.
     {
-        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
         for len in [32, 128, 256] {
             let values: Vec<f32> = (0..len).flat_map(|_| row.iter().copied()).collect();
             baseline(&format!("smollm2-135m prefill of {len} tokens"), || {
                 let mut cache = m.cache(len, DType::F32, &FlexDevice);
                 let x = Tensor::<Flex, 3>::from_data(
-                    TensorData::new(values.clone(), [1, len, HIDDEN]),
+                    TensorData::new(values.clone(), [1, len, SMOLLM2_135M.hidden]),
                     &FlexDevice,
                 );
                 m.forward_embedded(x, &mut cache, DType::F32)
@@ -550,10 +701,11 @@ fn smollm2_prefill_chunk_sweep() {
             });
         }
     }
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
         let dtype = DType::F32;
-        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
         let at = |p: usize| {
             Tensor::<TtBackend, 1, Int>::from_data(TensorData::new(vec![p as i32], [1]), &d)
         };
@@ -570,7 +722,7 @@ fn smollm2_prefill_chunk_sweep() {
             let values: Vec<f32> = (0..c).flat_map(|_| row.iter().copied()).collect();
             let x = || {
                 Tensor::<TtBackend, 3>::from_data(
-                    TensorData::new(values.clone(), [1, c, HIDDEN]),
+                    TensorData::new(values.clone(), [1, c, SMOLLM2_135M.hidden]),
                     &d,
                 )
             };
@@ -626,7 +778,7 @@ fn smollm2_prefill_chunk_sweep() {
             };
             let run = |start: usize| {
                 trace
-                    .run(vec![
+                    .run_timed(vec![
                         InputPayload::F32(values.clone()),
                         InputPayload::Bits(vec![start as u32]),
                         InputPayload::Bits(vec![c as u32 - 1]),
@@ -634,19 +786,28 @@ fn smollm2_prefill_chunk_sweep() {
                     .unwrap()
             };
             assert_eq!(
-                bits(&logits(&run(c))),
+                bits(&logits(&run(c).outputs)),
                 bits(&want),
                 "chunk {c}: the replay at {c}"
+            );
+            trace_shape(
+                &format!("smollm2-135m prefill chunk of {c}, traced"),
+                &trace,
             );
             for _ in 0..WARMUPS {
                 run(0);
             }
             let mut ms = Vec::new();
+            let mut split = Vec::new();
             for _ in 0..SAMPLES {
                 let t0 = Instant::now();
-                run(0);
+                split.push(run(0));
                 ms.push(t0.elapsed().as_secs_f64() * 1e3);
             }
+            report_split(
+                &format!("smollm2-135m prefill chunk of {c}, traced"),
+                &split,
+            );
             let per_token: Vec<f64> = ms.iter().map(|t| t / c as f64).collect();
             report(
                 &format!("smollm2-135m prefill chunk of {c}, traced replay"),
@@ -672,7 +833,8 @@ fn smollm2_decode_with_the_embedding_lookup() {
     // A whole decode step from a token id: the lookup, the thirty layers and the output head.
     let ids = |data: Vec<i32>| TensorData::new(data, [1, 1]);
     {
-        let (m, _) = Llama::<Flex>::pretrained(FULL_LAYERS, Precision::F32, &FlexDevice).unwrap();
+        let (m, _) =
+            Llama::<Flex>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &FlexDevice).unwrap();
         let mut cache = m.cache(64, DType::F32, &FlexDevice);
         let mut step = 0usize;
         baseline("smollm2-135m decode step from a token id", || {
@@ -688,9 +850,10 @@ fn smollm2_decode_with_the_embedding_lookup() {
                 .unwrap()
         });
     }
-    with_device(Config::default(), |d| {
+    with_device(bench_config(), |d| {
         conditions(card());
-        let (m, _) = Llama::<TtBackend>::pretrained(FULL_LAYERS, Precision::F32, &d).unwrap();
+        let (m, _) =
+            Llama::<TtBackend>::smollm2_135m(SMOLLM2_135M.layers, Precision::F32, &d).unwrap();
         let mut cache = m.cache(64, DType::F32, &d);
         let mut step = 0usize;
         let got = measure("smollm2-135m decode step from a token id", || {
@@ -706,5 +869,1094 @@ fn smollm2_decode_with_the_embedding_lookup() {
                 .unwrap()
         });
         assert!(got.iter().all(|v| v.is_finite()));
+    });
+}
+
+/// Traced generation end to end (`tt_models::generate::TracedGenerator`, gate
+/// `step187_traced_generation`): SmolLM2, 30 layers, a 512-position cache. Token ids go in and
+/// logits come out; the lookup runs inside the trace and the cache stays on the card.
+///
+/// Two things are measured:
+/// 1. **What the traces cost together:** the step and the chunks (`TT_GEN_BUCKETS`, default
+///    `64,128,256`) over a cache of `TT_GEN_MAX_LEN` positions (default 512), captured in one
+///    attachment. The report gives the program-cache bytes held on the fullest unit and the trace
+///    streams' GDDR bytes. A capture that does not fit fails its attachment for good, so the bench
+///    then stops and names the sizes.
+/// 2. **A generation's time:** prompts of 32, 128 and 256 tokens, each followed by `NEW` tokens.
+///    Reported are:
+///    - the driver's build time (the eager warm-up and the captures);
+///    - the time to the first token (the prefill and its logits read);
+///    - the median decode step;
+///    - the whole generation.
+///
+///    burn-flex's eager growing-cache generation of the same prompts is timed in the same run.
+///
+/// Validated outside the timing:
+/// - a 32-token prompt's first 4 tokens, bit for bit against the eager fixed-shape schedule on
+///   the card (`generate_fixed`);
+/// - every timed run produces the same tokens.
+///
+/// The model runs on `burn_tt::Tt` (burn-fusion over `TtBackend`, with its fusers) for the
+/// warm-up, the captures and the validation; `TT_GEN_FUSION=0` runs it on `TtBackend` itself,
+/// its rows named "on TtBackend" (`docs/completed-plans/decode-small-ops.md` F0; gates
+/// `step193_fusion_decode_trace`, `step194_fused_sigmoid_silu`).
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models"]
+fn traced_generation() {
+    let max_len: usize = std::env::var("TT_GEN_MAX_LEN")
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(512);
+    // The model (`TT_GEN_MODEL`): its preset and the weights `cargo xtask fetch-weights` puts in
+    // place. burn-flex's baseline takes `TT_GEN_FLEX_SAMPLES` samples (SmolLM2-1.7B on the host
+    // takes about a minute a sample), and each generation `TT_GEN_NEW` tokens.
+    let name = std::env::var("TT_GEN_MODEL").unwrap_or_else(|_| "smollm2-135m".into());
+    let config = match name.as_str() {
+        "smollm2-135m" => SMOLLM2_135M,
+        "smollm2-1.7b-instruct" => SMOLLM2_1_7B_INSTRUCT,
+        other => panic!("TT_GEN_MODEL={other}: smollm2-135m or smollm2-1.7b-instruct"),
+    };
+    let env = |key: &str, default: usize| -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let flex_samples = env("TT_GEN_FLEX_SAMPLES", SAMPLES);
+    let new = env("TT_GEN_NEW", 64);
+    // burn-flex, eager, growing cache.
+    {
+        let (m, _) =
+            Llama::<Flex>::pretrained(&config, &name, Precision::F32, &FlexDevice).unwrap();
+        for len in GEN_PROMPTS {
+            let p = gen_prompt(len, config.vocab);
+            let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..WARMUPS.min(flex_samples) + flex_samples {
+                let t0 = Instant::now();
+                let g = m.generate(&p, new, Precision::F32, &FlexDevice);
+                let all = t0.elapsed();
+                if i >= WARMUPS.min(flex_samples) {
+                    first.push(ms(g.times[0]));
+                    step.push(decode_ms(&g));
+                    total.push(ms(all));
+                }
+            }
+            let key = format!("{name} generation, {len}-token prompt, {new} tokens");
+            report(
+                &format!("{key}, prefill (burn-flex, host)"),
+                "tokens/s",
+                "host",
+                Stats::of([len as f64 * 1e3 / median(&first)]),
+            );
+            report(
+                &format!("{key}, decode (burn-flex, host)"),
+                "tokens/s",
+                "host",
+                Stats::of([1e3 / median(&step)]),
+            );
+            report(
+                &format!("{key}, first token (burn-flex, host)"),
+                "ms",
+                "host",
+                Stats::of(first),
+            );
+            report(
+                &format!("{key}, decode step (burn-flex, host)"),
+                "ms",
+                "host",
+                Stats::of(step),
+            );
+            report(
+                &format!("{key}, total (burn-flex, host)"),
+                "ms",
+                "host",
+                Stats::of(total),
+            );
+        }
+    }
+    let buckets: Vec<usize> = std::env::var("TT_GEN_BUCKETS")
+        .map(|v| v.split(',').map(|b| b.trim().parse().unwrap()).collect())
+        .unwrap_or_else(|_| vec![64, 128, 256]);
+    let run = GenRun {
+        name,
+        config,
+        max_len,
+        buckets,
+        new,
+    };
+    with_device(bench_config(), |d| {
+        conditions(card());
+        if std::env::var("TT_GEN_FUSION").is_ok_and(|v| v == "0") {
+            traced_generation_on::<TtBackend>(&d, &run, " on TtBackend");
+        } else {
+            traced_generation_on::<burn_tt::Tt>(&d, &run, "");
+        }
+    });
+}
+
+/// The prompt lengths [`traced_generation`] times.
+const GEN_PROMPTS: [usize; 3] = [32, 128, 256];
+
+/// What [`traced_generation`] runs: the model, the cache, the chunk sizes and the tokens a
+/// generation.
+struct GenRun {
+    name: String,
+    config: tt_models::llama::LlamaConfig,
+    max_len: usize,
+    buckets: Vec<usize>,
+    new: usize,
+}
+
+/// A prompt of `len` token ids below `vocab`.
+fn gen_prompt(len: usize, vocab: usize) -> Vec<i32> {
+    (0..len)
+        .map(|i| ((7 + 7919 * i + 104_729 * i * i) % vocab) as i32)
+        .collect()
+}
+
+/// The median of `v`.
+fn median(v: &[f64]) -> f64 {
+    let mut v = v.to_vec();
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// The median of `times`, in ms.
+fn median_ms(times: &[std::time::Duration]) -> f64 {
+    let mut d: Vec<f64> = times.iter().map(|t| t.as_secs_f64() * 1e3).collect();
+    d.sort_by(f64::total_cmp);
+    d[d.len() / 2]
+}
+
+/// The median decode step of `g`, in ms.
+fn decode_ms(g: &tt_models::generate::Generation) -> f64 {
+    let mut d: Vec<f64> = g.times[1..].iter().map(|t| t.as_secs_f64() * 1e3).collect();
+    d.sort_by(f64::total_cmp);
+    d[d.len() / 2]
+}
+
+/// `TT_WEIGHT_STORAGE`: a probe outside the numeric contracts, every weight but the embedding
+/// table stored in one format (`Llama::with_stored_weights`) and the model made for no contract:
+/// `bf16` (the SmolLM2 checkpoints are BF16, so the logits are the F32 model's bit for bit,
+/// `step234`), `bfp8`, `bfp4`, `bfp2` (block floating point, which rounds the weights: the logits
+/// are those of the F32 model holding the rounded values, `step240`), or `f32` (kept F32). Unset:
+/// the contract decides ([`bench_contract`]).
+fn weight_storage_probe() -> Option<Option<tt_models::quant::Format>> {
+    use tt_models::quant::Format;
+    let v = std::env::var("TT_WEIGHT_STORAGE").ok()?;
+    Some(match v.as_str() {
+        "bf16" => Some(Format::Bf16Stored),
+        "bfp8" => Some(Format::Bfp8),
+        "bfp4" => Some(Format::Bfp4),
+        "bfp2" => Some(Format::Bfp2),
+        "f32" => None,
+        other => panic!("TT_WEIGHT_STORAGE={other}: bf16, bfp8, bfp4, bfp2 or f32"),
+    })
+}
+
+/// The numeric contract a model bench runs under (ADR 0006): `TT_NUMERICS` (`reference` or
+/// `performance`), by default `performance`, the inference contract; `TT_MLP_BFP4=1` its named
+/// option, BFP4 for `gate|up`; `TT_F32_ACTIVATIONS=1` its products' activations F32, the
+/// baseline of its BF16 ones (roadmap W1, `WeightOptions::f32_activations`).
+fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
+    let numerics = burn_tt::Numerics::from_env()
+        .unwrap_or(Ok(burn_tt::Numerics::Performance))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mlp_bfp4 = match std::env::var("TT_MLP_BFP4").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => panic!("TT_MLP_BFP4={other}: expected 0 or 1"),
+    };
+    let f32_activations = match std::env::var("TT_F32_ACTIVATIONS").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => panic!("TT_F32_ACTIVATIONS={other}: expected 0 or 1"),
+    };
+    (
+        numerics,
+        tt_models::quant::WeightOptions {
+            mlp_bfp4,
+            f32_activations,
+        },
+    )
+}
+
+/// The plan a bench's model is stored by: [`weight_storage_probe`]'s, else [`bench_contract`]'s.
+fn bench_plan() -> tt_models::quant::Plan {
+    use tt_models::quant::Plan;
+    match weight_storage_probe() {
+        Some(Some(format)) => Plan::stored_weights(format),
+        Some(None) => Plan::new(),
+        None => {
+            let (numerics, options) = bench_contract();
+            Plan::for_numerics(numerics, options)
+        }
+    }
+}
+
+/// `m` (fused unless `fused` is false) as a bench runs it, its conditions printed: under the
+/// contract ([`bench_contract`], `Llama::for_inference`), or in [`weight_storage_probe`]'s format
+/// for no contract. `for_inference` fuses, so an unfused model is a probe's.
+fn bench_model<B: burn_tt::storage::StorageBackend>(m: Llama<B>, fused: bool) -> Llama<B> {
+    let probe = weight_storage_probe();
+    if let Some(format) = probe.or_else(|| (!fused).then(bench_plan_format)) {
+        println!(
+            "BENCH {{\"kind\":\"conditions\",\"numerics\":\"none\",\"weight_storage\":\"{}\"}}",
+            format.map_or("f32".into(), |f| format!("{f:?}"))
+        );
+        let m = if fused { m.fused() } else { m };
+        return match format {
+            Some(format) => m.with_stored_weights(format),
+            None => m,
+        };
+    }
+    let (numerics, options) = bench_contract();
+    println!(
+        "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{}}}",
+        numerics.name(),
+        options.mlp_bfp4
+    );
+    m.for_inference(numerics, options)
+}
+
+/// The one format of an unfused bench under the contract: the reference's BF16, else a probe.
+fn bench_plan_format() -> Option<tt_models::quant::Format> {
+    match bench_contract() {
+        (burn_tt::Numerics::Reference, _) => Some(tt_models::quant::Format::Bf16Stored),
+        _ => panic!("an unfused model (TT_GEN_FUSED=0) is a probe: set TT_WEIGHT_STORAGE"),
+    }
+}
+
+/// The bytes a decode step reads at least: every parameter of `m` (before fusing, whose views
+/// count twice) once, in the format [`bench_plan`] stores it in. The embedding table counts in the
+/// head's format: a step reads one row of it, and a tied head (the table transposed) whole.
+fn weight_bytes<B: burn::tensor::backend::Backend>(m: &Llama<B>) -> f64 {
+    use burn::module::{Module, ModuleVisitor, Param};
+    use tt_isa::format::TileFormat;
+    use tt_models::quant::Format;
+    struct Count(Vec<String>, tt_models::quant::Plan, f64);
+    impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for Count {
+        fn enter_module(&mut self, name: &str, _: &str) {
+            self.0.push(name.into());
+        }
+        fn exit_module(&mut self, _: &str, _: &str) {
+            self.0.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<B, D>>) {
+            let path = self.0.join(".");
+            let path = if path.contains("embed_tokens") {
+                "lm_head.weight".to_string()
+            } else {
+                path
+            };
+            let format = match self.1.format(&path) {
+                Format::Bf16Stored => TileFormat::BF16,
+                Format::Bfp8 => TileFormat::BFP8,
+                Format::Bfp4 => TileFormat::BFP4,
+                Format::Bfp2 => TileFormat::BFP2,
+                _ => TileFormat::FP32,
+            };
+            let image = format.image();
+            let datum = (image.total_bytes() - image.header_bytes()) as f64
+                / TileFormat::TILE_DATUMS as f64;
+            self.2 += p.val().shape().num_elements() as f64 * datum;
+        }
+    }
+    let mut c = Count(Vec::new(), bench_plan(), 0.0);
+    m.visit(&mut c);
+    c.2
+}
+
+/// The bytes a Qwen3.5 decode step reads at least: every matrix once in the format `plan` stores
+/// it in, the tied head's F32 table once, vectors and taps in F32.
+fn qwen_step_bytes<B: burn::tensor::backend::Backend>(
+    m: &tt_models::qwen35::Qwen35<B>,
+    plan: &tt_models::quant::Plan,
+) -> f64 {
+    use burn::module::{Module, ModuleVisitor, Param};
+    use tt_isa::format::TileFormat;
+    use tt_models::quant::Format;
+    struct Count<'a>(Vec<String>, &'a tt_models::quant::Plan, f64);
+    impl<B: burn::tensor::backend::Backend> ModuleVisitor<B> for Count<'_> {
+        fn enter_module(&mut self, name: &str, _: &str) {
+            self.0.push(name.into());
+        }
+        fn exit_module(&mut self, _: &str, _: &str) {
+            self.0.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<B, D>>) {
+            let format = match (D, self.1.format(&self.0.join("."))) {
+                (2, Format::Bf16Stored) => TileFormat::BF16,
+                (2, Format::Bfp8) => TileFormat::BFP8,
+                (2, Format::Bfp4) => TileFormat::BFP4,
+                (2, Format::Bfp2) => TileFormat::BFP2,
+                _ => TileFormat::FP32,
+            };
+            let image = format.image();
+            let datum = (image.total_bytes() - image.header_bytes()) as f64
+                / TileFormat::TILE_DATUMS as f64;
+            self.2 += p.val().shape().num_elements() as f64 * datum;
+        }
+    }
+    let mut c = Count(Vec::new(), plan, 0.0);
+    m.visit(&mut c);
+    c.2
+}
+
+fn ms(t: std::time::Duration) -> f64 {
+    t.as_secs_f64() * 1e3
+}
+
+/// [`traced_generation`]'s device half, with the model on `B` while it is warmed up, captured
+/// and validated; `suffix` names `B` in the rows (empty for `TtBackend`).
+fn traced_generation_on<B: tt_models::generate::TracedBackend>(
+    d: &burn_tt::TtDevice,
+    run: &GenRun,
+    suffix: &str,
+) {
+    use tt_models::generate::{generate_fixed, Shapes, TracedGenerator};
+    let GenRun {
+        name,
+        config,
+        max_len,
+        buckets,
+        new,
+    } = run;
+    let (name, max_len, new) = (name.as_str(), *max_len, *new);
+    let prompt = |len: usize| gen_prompt(len, config.vocab);
+    {
+        let d = *d;
+        let (m, _) = Llama::<B>::pretrained(config, name, Precision::F32, &d).unwrap();
+        // What a decode step reads at least: every parameter once, in its stored format (counted
+        // before fusing).
+        let weight_bytes = weight_bytes(&m);
+        // `q|k|v` and `gate|up` one product each (`Llama::fused`, bit for bit the unfused model;
+        // `TT_GEN_FUSED=0` keeps them apart, a probe's).
+        let fused = std::env::var("TT_GEN_FUSED").map_or(true, |v| v != "0");
+        println!("BENCH {{\"kind\":\"conditions\",\"fused_projections\":{fused}}}");
+        // The weights in the contract's formats (`TT_NUMERICS`, the performance contract by
+        // default), or a probe's (`TT_WEIGHT_STORAGE`).
+        let m = bench_model(m, fused);
+        let t0 = Instant::now();
+        // Decode steps attending to 64, 128, ... positions (`TT_GEN_STEPS`, "64,128,256"; empty
+        // for the whole cache at every step).
+        let mut shapes = Shapes::new(max_len, buckets);
+        if let Ok(v) = std::env::var("TT_GEN_STEPS") {
+            let steps: Vec<usize> = v
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse().unwrap())
+                .collect();
+            shapes = shapes.with_steps(&steps);
+        }
+        let g = match TracedGenerator::<_, B>::new(&m, &shapes, &d) {
+            Ok(g) => g,
+            Err(e) => {
+                // A capture that does not fit fails the attachment for good: rerun with fewer.
+                eprintln!("SKIP chunks {buckets:?} and the step do not capture together: {e} (set TT_GEN_BUCKETS)");
+                return;
+            }
+        };
+        let traces = format!(
+            "chunks {buckets:?}, steps {:?}, {max_len}-position cache{suffix}",
+            shapes.steps
+        );
+        report(
+            &format!("{name} traced generation, build ({traces})"),
+            "ms",
+            "host",
+            Stats::of([ms(t0.elapsed())]),
+        );
+        // Which block each product question chose in the build (roadmap Track 2 follow-up 1, H14).
+        print_measured(&format!("{name} traced generation ({traces})"));
+        // What the traces hold together: the program cache bounds which chunk sizes fit.
+        for set in g.footprint().unwrap() {
+            let (held, size) = set.cache_held_bytes();
+            eprintln!("{traces}: program cache {held} of {size} bytes on the fullest unit");
+            for (key, units) in &set.traces {
+                let most = units
+                    .iter()
+                    .flatten()
+                    .map(|u| u.program_bytes)
+                    .max()
+                    .unwrap_or(0);
+                let gddr: u64 = units.iter().flatten().map(|u| u.gddr_bytes).sum();
+                // What the streams hold: every entry is 32 bytes (`chunked`'s padding included), and
+                // each `PAIR_CALL` names a reader and a writer section, each stored on its own.
+                let real: u64 = units
+                    .iter()
+                    .flatten()
+                    .map(|u| u.stream.entries as u64 * 32)
+                    .sum();
+                let sections: u64 = units
+                    .iter()
+                    .flatten()
+                    .map(|u| {
+                        2 * *u.stream.heads.get(&tt_isa::dm::op::PAIR_CALL).unwrap_or(&0) as u64
+                    })
+                    .sum();
+                let unit_traces = units.iter().flatten().count();
+                eprintln!(
+                    "  {key}: at most {most} program bytes a unit, {gddr} stream bytes in all, \
+                     {real} bytes of entries ({:.1}x), {sections} sections over {unit_traces} units \
+                     ({:.0} bytes a section allocated)",
+                    gddr as f64 / real.max(1) as f64,
+                    gddr as f64 / (sections + unit_traces as u64).max(1) as f64,
+                );
+                report(
+                    &format!("{name} traced generation, {key} entry bytes ({traces})"),
+                    "bytes",
+                    "count",
+                    Stats::of([real as f64]),
+                );
+                report(
+                    &format!("{name} traced generation, {key} stream bytes ({traces})"),
+                    "bytes",
+                    "count",
+                    Stats::of([gddr as f64]),
+                );
+            }
+            report(
+                &format!("{name} traced generation, program cache held ({traces})"),
+                "bytes",
+                "count",
+                Stats::of([held as f64]),
+            );
+            report(
+                &format!("{name} traced generation, trace streams ({traces})"),
+                "bytes",
+                "count",
+                Stats::of([set.gddr_bytes() as f64]),
+            );
+        }
+        // Validation: the eager schedule on the card, bit for bit.
+        let p = prompt(GEN_PROMPTS[0]);
+        let want = generate_fixed(&m, &p, 4, &shapes, &d).unwrap();
+        let got = g.generate(&p, 4).unwrap();
+        assert_eq!(got.tokens, want.tokens, "tokens against the eager schedule");
+        for (i, (a, b)) in got.logits.iter().zip(&want.logits).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "logits {i} against the eager schedule"
+            );
+        }
+        for len in GEN_PROMPTS {
+            let p = prompt(len);
+            // Timed: each token chosen on the card, only the token read back
+            // (`TracedGenerator::generate_tokens`); the logits path's tokens are the check.
+            let want = g.generate(&p, new).unwrap().tokens;
+            let (mut first, mut step, mut total) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut restored, mut mover_restored, mut restore_ms, mut restore_drain_ms) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            // A host stage's milliseconds, count and PCIe write calls so far (`HostStage::Restore`,
+            // `RestoreDrain`, `RestoreQueue`).
+            let stage = |name: &str| {
+                burn_tt::host_stage_times(d)
+                    .unwrap()
+                    .into_iter()
+                    .find(|(s, ..)| s == name)
+                    .map_or([0.0; 3], |(_, ms, n, w)| [ms, n as f64, w as f64])
+            };
+            let stage_ms = |name: &str| stage(name)[0];
+            let (mut restore_queue_ms, mut restore_calls, mut restore_writes) =
+                (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..WARMUPS + SAMPLES {
+                let r0 = burn_tt::probe_restored_bytes(d).unwrap();
+                let (s0, sd0) = (stage("Restore"), stage_ms("RestoreDrain"));
+                let sq0 = stage_ms("RestoreQueue");
+                let t0 = Instant::now();
+                let out = g.generate_tokens(&p, new).unwrap();
+                let all = t0.elapsed();
+                assert_eq!(out.tokens, want, "a run's tokens, against the logits path");
+                if i >= WARMUPS {
+                    first.push(ms(out.times[0]));
+                    step.push(median_ms(&out.times[1..]));
+                    total.push(ms(all));
+                    let r1 = burn_tt::probe_restored_bytes(d).unwrap();
+                    restored.push((r1.0 - r0.0) as f64);
+                    mover_restored.push((r1.1 - r0.1) as f64);
+                    let s1 = stage("Restore");
+                    restore_ms.push(s1[0] - s0[0]);
+                    restore_calls.push(s1[1] - s0[1]);
+                    restore_writes.push(s1[2] - s0[2]);
+                    restore_queue_ms.push(stage_ms("RestoreQueue") - sq0);
+                    restore_drain_ms.push(stage_ms("RestoreDrain") - sd0);
+                }
+            }
+            let key = format!("{name} generation, {len}-token prompt, {new} tokens ({traces})");
+            // Program bytes the replays put back a generation: the traces' programs paged through
+            // the units' caches when they do not fit together, by the host (`Session::restored_bytes`,
+            // the card idle) and by the B movers from GDDR (`Session::mover_restored_bytes`).
+            report(
+                &format!("{key}, restored program bytes a generation, traced"),
+                "bytes",
+                "count",
+                Stats::of(restored),
+            );
+            report(
+                &format!("{key}, mover-restored program bytes a generation, traced"),
+                "bytes",
+                "count",
+                Stats::of(mover_restored),
+            );
+            // The host's time putting them back, the card idle meanwhile, and the part of it spent
+            // draining a unit first (H15, `docs/learnings/dataflow-compiler.md` §13).
+            report(
+                &format!("{key}, program restore a generation, traced"),
+                "ms",
+                "host",
+                Stats::of(restore_ms),
+            );
+            report(
+                &format!("{key}, program restore drains a generation, traced"),
+                "ms",
+                "host",
+                Stats::of(restore_drain_ms),
+            );
+            report(
+                &format!("{key}, program restore queueing a generation, traced"),
+                "ms",
+                "host",
+                Stats::of(restore_queue_ms),
+            );
+            report(
+                &format!("{key}, program restores (unit replays) a generation, traced"),
+                "count",
+                "count",
+                Stats::of(restore_calls),
+            );
+            report(
+                &format!("{key}, program restore PCIe write calls a generation, traced"),
+                "count",
+                "count",
+                Stats::of(restore_writes),
+            );
+            let step_ms = median(&step);
+            report(
+                &format!("{key}, prefill, traced"),
+                "tokens/s",
+                "host",
+                Stats::of([len as f64 * 1e3 / median(&first)]),
+            );
+            report(
+                &format!("{key}, decode, traced"),
+                "tokens/s",
+                "host",
+                Stats::of([1e3 / step_ms]),
+            );
+            // The F32 weights read a decode step, over its time: how near decode is to GDDR's bound.
+            report(
+                &format!("{key}, decode weight bandwidth, traced"),
+                "GB/s",
+                "host",
+                Stats::of([weight_bytes / step_ms / 1e6]),
+            );
+            report(
+                &format!("{key}, first token, traced"),
+                "ms",
+                "host",
+                Stats::of(first),
+            );
+            report(
+                &format!("{key}, decode step, traced"),
+                "ms",
+                "host",
+                Stats::of(step),
+            );
+            report(
+                &format!("{key}, total, traced"),
+                "ms",
+                "host",
+                Stats::of(total),
+            );
+        }
+    }
+}
+
+/// The Phase 8 feasibility probe (`docs/completed-plans/decode-to-bandwidth.md`): what a decode step costs
+/// with its weight stream made free, and what its ops cost under a stream. **Timing only**: under
+/// the probe the products read no weights, so the tokens are not checked.
+///
+/// `TT_PROBE_STREAM` picks the mode, one a run (so `--profile` attributes one set of traces):
+/// - `off`: today's step, as [`traced_generation`] times it;
+/// - `skip`: products read no `B` and nothing prefetches ([`tt_kernels::tensor::probe_skip_weight_reads`]);
+/// - `skip-bg:<units>`: as `skip`, with `<units>` units from [`tt_kernels::session::THIN_STREAM_UNITS`]
+///   reading GDDR all step ([`tt_kernels::session::probe_background_stream`]), `TT_PROBE_BG_TILES`
+///   tiles a unit a replay (default 16,384: ~68 MB, ~10 ms at ~7 GB/s a unit).
+///
+/// With `TT_PROBE_ATTENTION_SPLIT=1`, each head's attention runs as two halves of its positions on
+/// two units with no exchange ([`tt_kernels::attention::probe_split`]; flash-decode's P0, timing only).
+///
+/// With `TT_PROBE_FREE` (`adds`, `silu_mul` or `adds,silu_mul`), the model leaves those ops out
+/// ([`tt_models::llama::probe_free_consumers`]): the step with them made free, H10's bound
+/// (`docs/completed-plans/dataflow-compiler.md` F6.0). Timing only.
+///
+/// With `TT_PROBE_UNORDER` (comma-separated op labels, e.g. `tt_silu_mul`), captures drop the
+/// barriers on either side of those ops ([`tt_kernels::barriers::probe_unorder`]): each unit runs
+/// on into them as soon as its own work before is done, the overlap H5's pipeline could take with
+/// today's placement (F6.4). Timing only.
+///
+/// Every capture also prints its space report (`SPACE` lines, [`tt_kernels::session::probe_space_report`]):
+/// what its ops take of a unit's `DATA`, the program cache and the stream. With `TT_PROBE_RESIDENCY=1`,
+/// its residency plan too (`RESIDENCY` lines, [`tt_kernels::residency::probe_residency_plan`]: what
+/// could stay in L1 between ops; `docs/completed-plans/planned-l1-residency.md` Phase 1).
+///
+/// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
+/// cache with 64-token chunks (or the comma-separated `TT_GEN_CHUNKS`); prompts of 32 and 256
+/// tokens (or the comma-separated `TT_GEN_PROMPTS`), `TT_GEN_NEW` tokens each, each timed for its
+/// prefill and its median decode step over `TT_GEN_SAMPLES` samples (default 9). Chunks attend to
+/// the step lengths (or the comma-separated `TT_GEN_PREFIXES`, `none` for the whole cache).
+/// NC's waits over one generation of `new` tokens from a `len`-token prompt
+/// (`burn_tt::probe_nc_waits`), per decode step (the prompt's replays included): the units' mean
+/// and the busiest unit's, in us at the profile mode's measured 1350 ticks/us.
+fn report_nc_waits(waits: &[[u32; 8]], len: usize, new: usize) {
+    let us = |c: f64| c / 1350.0 / new as f64;
+    let names = ["fetch", "credits", "drain", "issue", "call", "B pump"];
+    let busy: Vec<&[u32; 8]> = waits.iter().filter(|w| w.iter().any(|&c| c > 0)).collect();
+    let mut line = format!(
+        "NC waits, {len}-token prompt, {} units, us a step:",
+        busy.len()
+    );
+    // The pump's issuing turns, a step, and the longest one, in us.
+    let turns = busy.iter().map(|w| w[6]).max().unwrap_or(0);
+    let longest = busy.iter().map(|w| w[7]).max().unwrap_or(0);
+    line += &format!(
+        " B pump turns max {} a step, longest {:.1} us;",
+        turns as usize / new,
+        longest as f64 / 1350.0
+    );
+    for (k, name) in names.iter().enumerate() {
+        let sum: f64 = busy.iter().map(|w| w[k] as f64).sum();
+        let max = busy.iter().map(|w| w[k]).max().unwrap_or(0) as f64;
+        line += &format!(
+            " {name} mean {:.1} max {:.1};",
+            us(sum / busy.len().max(1) as f64),
+            us(max)
+        );
+    }
+    println!("{line}");
+}
+
+#[test]
+#[ignore = "a probe: cargo xtask bench --filter silicon_bench_models::traced_generation_stream_ceiling"]
+fn traced_generation_stream_ceiling() {
+    use tt_kernels::session::{
+        probe_background_stream, probe_space_report, ProbeBackground, THIN_STREAM_UNITS,
+    };
+    use tt_kernels::tensor::probe_skip_weight_reads;
+    use tt_models::generate::{Shapes, TracedGenerator};
+    let env = |key: &str, default: usize| -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let mode = std::env::var("TT_PROBE_STREAM").unwrap_or_else(|_| "off".into());
+    let background = match mode.as_str() {
+        "off" | "skip" => None,
+        m => {
+            let units = m
+                .strip_prefix("skip-bg:")
+                .and_then(|u| u.parse().ok())
+                .unwrap_or_else(|| panic!("TT_PROBE_STREAM={m}: off, skip or skip-bg:<units>"));
+            Some(ProbeBackground {
+                first: THIN_STREAM_UNITS,
+                units,
+                tiles_per_unit: env("TT_PROBE_BG_TILES", 16_384),
+            })
+        }
+    };
+    let name = std::env::var("TT_GEN_MODEL").unwrap_or_else(|_| "smollm2-1.7b-instruct".into());
+    let config = match name.as_str() {
+        "smollm2-135m" => SMOLLM2_135M,
+        "smollm2-1.7b-instruct" => SMOLLM2_1_7B_INSTRUCT,
+        other => panic!("TT_GEN_MODEL={other}: smollm2-135m or smollm2-1.7b-instruct"),
+    };
+    let (max_len, new) = (env("TT_GEN_MAX_LEN", 512), env("TT_GEN_NEW", 64));
+    probe_skip_weight_reads(mode != "off");
+    // The bound on sharing attention's batched products' `A` reads (`roadmap.md`, "F4b's
+    // leftovers"): their `A` gathers skipped, the products wrong.
+    // `TT_PROBE_BATCHED_A=1` skips every `A` read, `rereads` only those past each row strip's
+    // first column block (what a pull could save).
+    let batched_a = std::env::var("TT_PROBE_BATCHED_A").unwrap_or_default();
+    tt_kernels::tensor::probe_skip_batched_a_reads(batched_a == "1");
+    tt_kernels::tensor::probe_skip_batched_a_rereads(batched_a == "rereads");
+    probe_background_stream(background);
+    // `TT_PROBE_CONTIGUOUS_B=<entry bytes>`: each one-row product's weight stream read from a
+    // contiguous scratch in entries of that size, under B's own cap (`TT_IN_FLIGHT_CAP`), its
+    // products wrong (`tt_kernels::tensor::probe_contiguous_b`, `docs/plans/decode-bytes-in-flight.md`).
+    let contiguous: Option<u32> = std::env::var("TT_PROBE_CONTIGUOUS_B")
+        .ok()
+        .filter(|v| v != "off")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("TT_PROBE_CONTIGUOUS_B={v}: off or an entry's bytes"))
+        });
+    tt_kernels::tensor::probe_contiguous_b(contiguous);
+    // `TT_PROBE_DEAL=even|<file>`: X10's probe, each one-row product's in-span columns dealt over
+    // its prefetching units too, evenly or by the file's per-unit weights (whitespace-separated,
+    // by unit index), over the session's own choice (`TT_EVEN_DEAL`, even by default); bit for bit
+    // (`tt_kernels::tensor::probe_deal`, `docs/plans/decode-bytes-in-flight.md`, "X10: evenness").
+    let deal: Option<Vec<u32>> = std::env::var("TT_PROBE_DEAL")
+        .ok()
+        .filter(|v| v != "off")
+        .map(|v| match v.as_str() {
+            "even" => Vec::new(),
+            path => std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("TT_PROBE_DEAL={path}: {e}"))
+                .split_whitespace()
+                .map(|w| {
+                    w.parse()
+                        .unwrap_or_else(|_| panic!("TT_PROBE_DEAL={path}: `{w}` is no weight"))
+                })
+                .collect(),
+        });
+    tt_kernels::tensor::probe_deal(deal);
+    probe_space_report(true);
+    let split = std::env::var("TT_PROBE_ATTENTION_SPLIT").is_ok_and(|v| v == "1");
+    tt_kernels::attention::probe_split(split);
+    let dropped: Vec<String> = std::env::var("TT_PROBE_FREE").map_or(Vec::new(), |v| {
+        v.split(',').map(|l| l.trim().to_string()).collect()
+    });
+    if let Some(other) = dropped
+        .iter()
+        .find(|l| !["adds", "silu_mul"].contains(&l.as_str()))
+    {
+        panic!("TT_PROBE_FREE={other}: adds, silu_mul or both");
+    }
+    tt_models::llama::probe_free_consumers(
+        dropped.iter().any(|l| l == "adds"),
+        dropped.iter().any(|l| l == "silu_mul"),
+    );
+    // The labels outlive the run: the probe holds them process-wide.
+    let unordered: Vec<&'static str> = std::env::var("TT_PROBE_UNORDER").map_or(Vec::new(), |v| {
+        v.split(',')
+            .map(|l| &*Box::leak(l.trim().to_string().into_boxed_str()))
+            .collect()
+    });
+    tt_kernels::barriers::probe_unorder(&unordered);
+    let mut dropped = dropped;
+    dropped.extend(unordered.iter().map(|l| format!("{l} unordered")));
+    let tag = if dropped.is_empty() {
+        mode.clone()
+    } else {
+        format!("{mode}, {} free", dropped.join("+"))
+    };
+    let tag = match batched_a.as_str() {
+        "1" => format!("{tag}, batched A skipped"),
+        "rereads" => format!("{tag}, batched A re-reads skipped"),
+        _ => tag,
+    };
+    let tag = match contiguous {
+        Some(entry) => format!("{tag}, contiguous B in {entry}-byte reads"),
+        None => tag,
+    };
+    let residency = std::env::var("TT_PROBE_RESIDENCY").is_ok_and(|v| v == "1");
+    let nc_waits = std::env::var("TT_PROBE_NC_WAITS").is_ok_and(|v| v == "1");
+    tt_kernels::residency::probe_residency_plan(residency);
+    with_device(bench_config(), |d| {
+        conditions(card());
+        println!(
+            "BENCH {{\"kind\":\"conditions\",\"probe_stream\":\"{mode}\",\"attention_split\":{split},\"batched_a_skipped\":\"{batched_a}\",\"free\":\"{}\",\"contiguous_b\":{},\"in_flight_cap\":\"{}\",\"stream_cap_bf16\":\"{}\"}}",
+            dropped.join(","),
+            contiguous.unwrap_or(0),
+            std::env::var("TT_IN_FLIGHT_CAP").unwrap_or_default(),
+            std::env::var("TT_STREAM_CAP_BF16").unwrap_or_default(),
+        );
+        let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
+        let m = bench_model(m, true);
+        // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
+        let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
+            v.split(',').map(|n| n.trim().parse().unwrap()).collect()
+        });
+        // The lengths a chunk attends to (`TT_GEN_PREFIXES`, comma-separated; `none` for the
+        // whole cache, as before `docs/plans/long-context.md` D2; default the step lengths).
+        let shapes = match std::env::var("TT_GEN_PREFIXES").as_deref() {
+            Ok("none") => Shapes::new(max_len, &chunks).with_prefixes(&[]),
+            Ok(v) => Shapes::new(max_len, &chunks).with_prefixes(
+                &v.split(',')
+                    .map(|n| n.trim().parse().unwrap())
+                    .collect::<Vec<usize>>(),
+            ),
+            Err(_) => Shapes::new(max_len, &chunks),
+        };
+        // The build, and a second one (with residency on, its plans cached: one capture a trace;
+        // `docs/completed-plans/planned-l1-residency.md` 2h).
+        let build = |what: &str| {
+            let t = std::time::Instant::now();
+            let g = TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap();
+            report(
+                &format!("{name} stream ceiling ({tag}), {what} build"),
+                "ms",
+                "host",
+                Stats::of(vec![t.elapsed().as_secs_f64() * 1e3]),
+            );
+            // What the weights, the cache and the traces leave of GDDR (`long-context.md` 1.G).
+            let (fullest, all) = burn_tt::gddr_free_bytes(d).unwrap();
+            report(
+                &format!("{name} stream ceiling ({tag}), {what} build, GDDR free"),
+                "GB",
+                "host",
+                Stats::of([all as f64 / 1e9]),
+            );
+            report(
+                &format!(
+                    "{name} stream ceiling ({tag}), {what} build, GDDR free on the fullest channel"
+                ),
+                "GB",
+                "host",
+                Stats::of([fullest as f64 / 1e9]),
+            );
+            g
+        };
+        drop(build("first"));
+        let g = build("second");
+        // Which block each product question chose in the builds (roadmap Track 2 follow-up 1, H14).
+        print_measured(&format!("{name} stream ceiling ({tag})"));
+        let prompts: Vec<usize> = std::env::var("TT_GEN_PROMPTS").map_or(vec![32, 256], |v| {
+            v.split(',').map(|n| n.trim().parse().unwrap()).collect()
+        });
+        // A long prompt's prefill takes tens of seconds a sample: `TT_GEN_SAMPLES` takes fewer.
+        let samples = env("TT_GEN_SAMPLES", SAMPLES);
+        for len in prompts {
+            let p = gen_prompt(len, config.vocab);
+            let (mut prefill, mut step) = (Vec::new(), Vec::new());
+            // Every generation's tokens, against the first's: a schedule that changes them fails
+            // here, and the digest compares runs (a probe against its baseline) bit for bit.
+            let mut first: Option<Vec<i32>> = None;
+            for i in 0..WARMUPS + samples {
+                // With `TT_PROBE_NC_WAITS=1`, NC's waits over one measured generation (firmware
+                // built with the profile feature): what B's waits for its writer are made of.
+                let nc_waits = nc_waits && i == WARMUPS;
+                if nc_waits {
+                    burn_tt::probe_nc_waits(d).unwrap();
+                }
+                let out = g.generate_tokens(&p, new).unwrap();
+                if nc_waits {
+                    report_nc_waits(&burn_tt::probe_nc_waits(d).unwrap(), len, new);
+                }
+                match &first {
+                    None => first = Some(out.tokens.clone()),
+                    Some(t) => assert_eq!(&out.tokens, t, "{len}-token prompt, generation {i}"),
+                }
+                if i >= WARMUPS {
+                    prefill.push(ms(out.times[0]));
+                    step.push(median_ms(&out.times[1..]));
+                }
+            }
+            let tokens = first.unwrap_or_default();
+            // FNV-1a over the tokens' bytes.
+            let digest = tokens
+                .iter()
+                .flat_map(|t| t.to_le_bytes())
+                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+                });
+            println!(
+                "TOKENS {name} ({tag}), {len}-token prompt: {} tokens, digest {digest:016x}, first {:?}",
+                tokens.len(),
+                &tokens[..tokens.len().min(8)]
+            );
+            // The prompt's chunks and the first token read back (`generate_tokens`' first time).
+            report(
+                &format!("{name} stream ceiling ({tag}), {len}-token prompt, prefill"),
+                "ms",
+                "host",
+                Stats::of(prefill.clone()),
+            );
+            report(
+                &format!("{name} stream ceiling ({tag}), {len}-token prompt, prefill rate"),
+                "tokens/s",
+                "host",
+                Stats::of([len as f64 * 1e3 / median(&prefill)]),
+            );
+            report(
+                &format!("{name} stream ceiling ({tag}), {len}-token prompt, decode step"),
+                "ms",
+                "host",
+                Stats::of(step),
+            );
+        }
+        // In the device's process (a fork), where the probe counted.
+        if contiguous.is_some() {
+            let [moved, ahead] = tt_kernels::tensor::probe_contiguous_b_bytes();
+            println!(
+                "CONTIGUOUS B: {:.1} GB moved to contiguous reads, {:.1} GB left read ahead ({:.1}%)",
+                moved as f64 / 1e9,
+                ahead as f64 / 1e9,
+                100.0 * ahead as f64 / (moved + ahead).max(1) as f64
+            );
+        }
+    });
+    tt_kernels::tensor::probe_contiguous_b(None);
+    tt_kernels::tensor::probe_deal(None);
+    probe_skip_weight_reads(false);
+    tt_kernels::tensor::probe_skip_batched_a_reads(false);
+    tt_kernels::tensor::probe_skip_batched_a_rereads(false);
+    probe_background_stream(None);
+    probe_space_report(false);
+    tt_models::llama::probe_free_consumers(false, false);
+    tt_kernels::barriers::probe_unorder(&[]);
+    tt_kernels::residency::probe_residency_plan(false);
+}
+
+/// Qwen3.5-4B's traced generation (`tt_models::qwen35::HybridCache`, gate `step263_qwen35_traced`):
+/// the model of `step260_qwen35` with its matrices stored BF16 (the 1.7B's shipped
+/// configuration), on `burn_tt::Tt` (`TT_GEN_FUSION=0`: `TtBackend`), a `TT_GEN_MAX_LEN`-position
+/// cache (default 512), chunks of `TT_GEN_CHUNKS` (default 16) attending to the whole cache, decode
+/// steps attending to 64, 128, ... positions. Prompts of `TT_GEN_PROMPTS` tokens (default 32 and
+/// 256), `TT_GEN_NEW` tokens each (default 32), `TT_GEN_SAMPLES` timed generations (default 3).
+///
+/// Reported: the build, the program cache the traces hold, each trace's ops, and for each prompt
+/// the prefill (`generate_tokens`' first time) and the median decode step, with the bytes a step
+/// reads at least over its time: every matrix in BF16 and the tied head's F32 table.
+///
+/// Validated outside the timing: the 32-token prompt's first 3 tokens bit for bit against the eager
+/// fixed-shape schedule on the card, and every timed run's tokens against the logits path's.
+#[test]
+#[ignore = "a benchmark: cargo xtask bench --filter silicon_bench_models::qwen35_traced_generation"]
+fn qwen35_traced_generation() {
+    if std::env::var("TT_GEN_FUSION").is_ok_and(|v| v == "0") {
+        qwen35_traced_generation_on::<TtBackend>(" on TtBackend");
+    } else {
+        qwen35_traced_generation_on::<burn_tt::Tt>("");
+    }
+}
+
+fn qwen35_traced_generation_on<B: tt_models::generate::TracedBackend>(suffix: &str) {
+    use tt_models::generate::{generate_fixed, Shapes, TracedGenerator};
+    use tt_models::qwen35::{Qwen35, QWEN3_5_4B};
+    let env = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
+    let list = |v: String| -> Vec<usize> {
+        v.split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse().unwrap())
+            .collect()
+    };
+    let max_len: usize = env("TT_GEN_MAX_LEN", "512").parse().unwrap();
+    let chunks = list(env("TT_GEN_CHUNKS", "16"));
+    let prompts = list(env("TT_GEN_PROMPTS", "32,256"));
+    let new: usize = env("TT_GEN_NEW", "32").parse().unwrap();
+    let samples: usize = env("TT_GEN_SAMPLES", "3").parse().unwrap();
+    let name = "qwen3.5-4b";
+    // Every tile, as the 1.7B's numbers are taken (`TT_TILES=all`), unless `TT_TILES` says
+    // otherwise.
+    let config = Config {
+        tiles: std::env::var_os("TT_TILES")
+            .is_none()
+            .then_some(burn_tt::TileChoice::All),
+        ..Config::default()
+    };
+    with_device(config, |d| {
+        conditions(card());
+        // The contract's weights (`TT_NUMERICS`, the performance contract by default); the tied
+        // head stays the F32 table under both (`Qwen35::for_inference`).
+        let (numerics, options) = bench_contract();
+        println!(
+            "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"head\":\"f32 table\"}}",
+            numerics.name(),
+            options.mlp_bfp4
+        );
+        let (m, _) = Qwen35::<B>::qwen3_5_4b(QWEN3_5_4B.layers, Precision::F32, &d).unwrap();
+        // What a step reads at least: every matrix once in its stored format, the tied head's F32
+        // table once.
+        let step_bytes =
+            qwen_step_bytes(&m, &tt_models::quant::Plan::for_numerics(numerics, options));
+        let m = m.for_inference(numerics, options);
+        let shapes = Shapes::new(max_len, &chunks).with_prefixes(&[]);
+        let traces = format!(
+            "chunks {chunks:?}, steps {:?}, {max_len}-position cache{suffix}",
+            shapes.steps
+        );
+        let t0 = Instant::now();
+        let g = TracedGenerator::<_, B>::new(&m, &shapes, &d).unwrap();
+        report(
+            &format!("{name} traced generation, build ({traces})"),
+            "ms",
+            "host",
+            Stats::of([ms(t0.elapsed())]),
+        );
+        // Which block each product question chose in the build (roadmap Track 2 follow-up 1, H14).
+        print_measured(&format!("{name} traced generation ({traces})"));
+        for set in g.footprint().unwrap() {
+            let (held, size) = set.cache_held_bytes();
+            eprintln!("{traces}: program cache {held} of {size} bytes on the fullest unit");
+            report(
+                &format!("{name} traced generation, program cache held ({traces})"),
+                "bytes",
+                "count",
+                Stats::of([held as f64]),
+            );
+        }
+        for (key, ops) in g.trace_ops().unwrap() {
+            // The ops by the Burn op that queued each, most first.
+            let mut by: std::collections::BTreeMap<String, usize> = Default::default();
+            for o in &ops {
+                *by.entry(format!("{} ({})", o.label, o.what)).or_default() += 1;
+            }
+            let mut by: Vec<_> = by.into_iter().collect();
+            by.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let barriers = ops.iter().filter(|o| o.barrier).count();
+            eprintln!("{key}: {} ops, {barriers} barriers; by label:", ops.len());
+            for (label, n) in by.iter().take(40) {
+                eprintln!("  {n:>6}  {label}");
+            }
+            report(
+                &format!("{name} traced generation, {key} ops ({traces})"),
+                "ops",
+                "count",
+                Stats::of([ops.len() as f64]),
+            );
+        }
+        let prompt = |len: usize| gen_prompt(len, QWEN3_5_4B.vocab);
+        // Validation: the eager schedule on the card, bit for bit.
+        let p = prompt(32);
+        let want = generate_fixed(&m, &p, 3, &shapes, &d).unwrap();
+        let got = g.generate(&p, 3).unwrap();
+        assert_eq!(got.tokens, want.tokens, "tokens against the eager schedule");
+        for (i, (a, b)) in got.logits.iter().zip(&want.logits).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "logits {i} against the eager schedule"
+            );
+        }
+        for len in prompts {
+            let p = prompt(len);
+            let want = g.generate(&p, new).unwrap().tokens;
+            let (mut first, mut step) = (Vec::new(), Vec::new());
+            for i in 0..WARMUPS.min(samples) + samples {
+                let out = g.generate_tokens(&p, new).unwrap();
+                assert_eq!(out.tokens, want, "a run's tokens, against the logits path");
+                if i >= WARMUPS.min(samples) {
+                    first.push(ms(out.times[0]));
+                    step.push(median_ms(&out.times[1..]));
+                }
+            }
+            let key = format!("{name} generation, {len}-token prompt, {new} tokens ({traces})");
+            let step_ms = median(&step);
+            report(
+                &format!("{key}, prefill, traced"),
+                "ms",
+                "host",
+                Stats::of(first),
+            );
+            report(
+                &format!("{key}, decode step, traced"),
+                "ms",
+                "host",
+                Stats::of(step),
+            );
+            report(
+                &format!("{key}, decode, traced"),
+                "tokens/s",
+                "host",
+                Stats::of([1e3 / step_ms]),
+            );
+            report(
+                &format!("{key}, decode weight bandwidth, traced"),
+                "GB/s",
+                "host",
+                Stats::of([step_bytes / step_ms / 1e6]),
+            );
+        }
     });
 }

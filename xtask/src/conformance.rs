@@ -514,9 +514,23 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         None
     };
 
+    // The previous run of this lane's times put its slowest tests (the timeouts above
+    // all) first, so they overlap the rest rather than leaving a tail.
+    let lane = format!(
+        "{}{}{}",
+        features.join("+").replace('/', "_"),
+        if o.exact { "+exact" } else { "" },
+        if o.accurate { "+accurate" } else { "" }
+    );
+    let times_path = root
+        .join("target/conformance")
+        .join(format!("times-{lane}.tsv"));
+    let order = slowest_first(&selection, &read_times(&times_path));
+
     let started = Instant::now();
-    let ran = run_all(&o, &selection, &dir.join("out"), log.as_ref());
+    let ran = run_all(&o, &selection, &order, &dir.join("out"), log.as_ref());
     let elapsed = started.elapsed();
+    write_times(&times_path, &ran);
 
     if o.reference_flex {
         let failed: Vec<&Ran> = ran.iter().filter(|r| r.verdict != Verdict::Pass).collect();
@@ -656,10 +670,50 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Run the selection `o.jobs` at a time, each test in its own process.
+/// Each test's last time on this lane, from [`write_times`]; empty when there is none.
+fn read_times(path: &Path) -> BTreeMap<String, f64> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (name, secs) = l.split_once('\t')?;
+            Some((name.to_string(), secs.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Record every test's time, for the next run's order. Best effort: a run without it
+/// is only slower.
+fn write_times(path: &Path, ran: &[Ran]) {
+    let mut times = read_times(path);
+    times.extend(ran.iter().map(|r| (r.full.clone(), r.secs)));
+    let text: String = times
+        .iter()
+        .map(|(name, secs)| format!("{name}\t{secs:.2}\n"))
+        .collect();
+    let _ = fs::write(path, text);
+}
+
+/// The order to start the selection in: longest last time first, a test with none
+/// after them in suite order. Results and outputs keep suite order regardless.
+fn slowest_first(
+    selection: &[(String, Built, String)],
+    times: &BTreeMap<String, f64>,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..selection.len()).collect();
+    order.sort_by(|&a, &b| {
+        let t = |i: usize| times.get(&selection[i].0).copied().unwrap_or(0.0);
+        t(b).total_cmp(&t(a))
+    });
+    order
+}
+
+/// Run the selection `o.jobs` at a time, each test in its own process, starting
+/// them in `order`.
 fn run_all(
     o: &Opts,
     selection: &[(String, Built, String)],
+    order: &[usize],
     out_dir: &Path,
     log: Option<&Mutex<Log>>,
 ) -> Vec<Ran> {
@@ -676,13 +730,17 @@ fn run_all(
     if o.accurate {
         env.push(("TT_ACCURATE_MATMUL", "1".into()));
     }
+    // One test per CPU already: burn-flex's rayon pool in each would make that N x N threads.
+    if o.jobs > 1 {
+        env.push(("RAYON_NUM_THREADS", "1".into()));
+    }
     std::thread::scope(|scope| {
         for _ in 0..o.jobs.min(selection.len()) {
             scope.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::SeqCst);
-                let Some((full, bin, test)) = selection.get(i) else {
+                let Some(&i) = order.get(next.fetch_add(1, Ordering::SeqCst)) else {
                     return;
                 };
+                let (full, bin, test) = &selection[i];
                 // Long names are cut, and the index keeps them distinct.
                 let stem: String = full.replace("::", "__").chars().take(150).collect();
                 let out = out_dir.join(format!("{i:04}-{stem}.txt"));

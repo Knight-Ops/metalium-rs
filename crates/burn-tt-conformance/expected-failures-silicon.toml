@@ -25,30 +25,13 @@ tests = [
 
 [[group]]
 category = "precision"
-reason = "BF16 (`tensor_bf16`, `autodiff_bf16`): the Matrix Unit matmul, as the F32 and F16 `precision` entries in expected-failures.toml. These miss the vendored tolerance on silicon in the default (fast) matmul mode (run 1791827110, card 0) and pass in the same binary under `--accurate` (`MatmulMode::Accurate`, card 0, runs 1791829833 and 1791830481). The misses are one BF16 step (2^-8, about 4e-3 relative) against tolerances of 1e-3 to 5e-3, or larger where a deform_conv2d / LU composition amplifies it. Not decomposed beyond that; the vendored tolerances stay."
+reason = "BF16 (`tensor_bf16`, `autodiff_bf16`): the Matrix Unit matmul, as the F32 and F16 `precision` entries in expected-failures.toml. These miss the vendored tolerance on silicon in the default (fast) matmul mode (run 1791827110, card 0) and pass in the same binary under `--accurate` (`MatmulMode::Accurate`, card 0, runs 1791829833 and 1791830481). The misses are one BF16 step (2^-8, about 4e-3 relative) against tolerances of 1e-3 to 5e-3, or larger where a deform_conv2d / LU composition amplifies it. Not decomposed beyond that; the vendored tolerances stay. The conv1d, conv2d and deform_conv2d entries left on 2026-11-11: they pass on card 0 (run 1794409578), and already did at 9f873b8 (run 1794412198), so an earlier change fixed them."
 tests = [
     "tensor_bf16::bf16::linalg::lu::test_lu_500x500_block_dispatch",
     "tensor_bf16::bf16::linalg::lu::test_lu_medium_tall",
     "tensor_bf16::bf16::module::attention::test_attention_custom_scale",
-    "tensor_bf16::bf16::module::conv1d::test_conv1d_complex",
-    "tensor_bf16::bf16::module::conv1d::test_conv1d_dilation",
-    "tensor_bf16::bf16::module::conv1d::test_conv1d_groups",
-    "tensor_bf16::bf16::module::conv1d::test_conv1d_simple",
-    "tensor_bf16::bf16::module::conv2d::test_conv2d_complex",
-    "tensor_bf16::bf16::module::conv2d::test_conv2d_groups_channels_out",
-    "tensor_bf16::bf16::module::conv2d::test_conv2d_groups_padding_larger_than_output_width_regression",
-    "tensor_bf16::bf16::module::conv2d::test_conv2d_simple_implicit",
     "tensor_bf16::bf16::module::conv_transpose3d::test_conv_transpose3d_simple_2",
     "tensor_bf16::bf16::module::conv_transpose3d::test_conv_transpose3d_stride2_out_padding",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_batched",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_dilation",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_kernel_size",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_padding_size",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_stride",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_different_width",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_offset_groups",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_simple",
-    "tensor_bf16::bf16::module::deform_conv2d::test_deform_conv2d_weight_groups",
 ]
 
 [[group]]

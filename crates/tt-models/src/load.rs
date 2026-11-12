@@ -29,6 +29,15 @@ pub fn weights_path(model: &str) -> PathBuf {
         .join("model.safetensors")
 }
 
+/// The files of a checkpoint fetched as several (`cargo xtask fetch-weights --model <model>`), in
+/// the order given.
+pub fn weights_files(model: &str, files: &[&str]) -> Vec<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vendor/weights")
+        .join(model);
+    files.iter().map(|f| dir.join(f)).collect()
+}
+
 /// How a checkpoint's names and layouts map onto the module.
 pub struct Layout<'a> {
     /// `(regex, replacement)` applied to the file's tensor names, in order.
@@ -95,37 +104,57 @@ pub fn load_safetensors<B: Backend, M: Module<B>>(
     path: &Path,
     layout: &Layout,
 ) -> Result<Loaded, LoadError> {
-    if !path.exists() {
-        return Err(LoadError::NotFetched(path.to_path_buf()));
-    }
-    let mut store = SafetensorsStore::from_file(path);
-    if layout.pytorch {
-        store = store.with_from_adapter(PyTorchToBurnAdapter);
-    }
-    for (from, to) in layout.remaps {
-        store = store.with_key_remapping(*from, *to);
-    }
-    // Leniency is switched off by checking the result below, not by `allow_partial(false)`,
-    // which aborts at the first missing name and so reports one problem at a time.
-    store = store.allow_partial(true);
+    load_safetensors_shards(model, &[path.to_path_buf()], layout)
+}
 
-    let result = model
-        .load_from(&mut store)
-        .map_err(|e| LoadError::Store(e.to_string()))?;
-
+/// [`load_safetensors`] for a checkpoint split over several files (`model-00001-of-00002...`):
+/// each shard is applied in turn, and the checks are made over all of them, so a parameter is
+/// missing only when no shard has it, and a file tensor unused only when nothing consumed it.
+pub fn load_safetensors_shards<B: Backend, M: Module<B>>(
+    model: &mut M,
+    paths: &[PathBuf],
+    layout: &Layout,
+) -> Result<Loaded, LoadError> {
+    if let Some(absent) = paths.iter().find(|p| !p.exists()) {
+        return Err(LoadError::NotFetched(absent.clone()));
+    }
     let mut problems = Vec::new();
-    for e in &result.errors {
-        problems.push(e.to_string());
+    let mut applied = Vec::new();
+    let mut missing = Vec::new();
+    let mut unused = Vec::new();
+    for path in paths {
+        let mut store = SafetensorsStore::from_file(path);
+        if layout.pytorch {
+            store = store.with_from_adapter(PyTorchToBurnAdapter);
+        }
+        for (from, to) in layout.remaps {
+            store = store.with_key_remapping(*from, *to);
+        }
+        // Leniency is switched off by checking the result below, not by `allow_partial(false)`,
+        // which aborts at the first missing name and so reports one problem at a time (and which
+        // a shard, holding only part of the model, would always fail).
+        store = store.allow_partial(true);
+
+        let result = model
+            .load_from(&mut store)
+            .map_err(|e| LoadError::Store(e.to_string()))?;
+        problems.extend(result.errors.iter().map(|e| e.to_string()));
+        applied.extend(result.applied);
+        missing.extend(result.missing);
+        unused.extend(result.unused);
     }
-    for (name, why) in &result.missing {
-        problems.push(format!("'{name}' is not in the file ({why})"));
+
+    let applied: std::collections::HashSet<&str> = applied.iter().map(String::as_str).collect();
+    let mut reported = std::collections::HashSet::new();
+    for (name, why) in &missing {
+        if !applied.contains(name.as_str()) && reported.insert(name.as_str()) {
+            problems.push(format!("'{name}' is not in the file ({why})"));
+        }
     }
     // `burn-store` lists a norm layer's `weight` and `bias` as unused even though the adapter
     // found them under the module's `gamma` and `beta` and applied them (checked in
     // `a_norm_layers_scale_and_shift_load_although_burn_store_lists_them_unused`). A file name
     // counts as consumed when its alias was applied; anything else unused is still reported.
-    let applied: std::collections::HashSet<&str> =
-        result.applied.iter().map(String::as_str).collect();
     let consumed_by_alias = |name: &str| {
         layout.pytorch
             && [(".weight", ".gamma"), (".bias", ".beta")]
@@ -135,8 +164,7 @@ pub fn load_safetensors<B: Backend, M: Module<B>>(
                         .is_some_and(|stem| applied.contains(format!("{stem}{module}").as_str()))
                 })
     };
-    let (ignored, unexpected): (Vec<String>, Vec<String>) = result
-        .unused
+    let (ignored, unexpected): (Vec<String>, Vec<String>) = unused
         .iter()
         .filter(|name| !consumed_by_alias(name))
         .cloned()
@@ -148,7 +176,7 @@ pub fn load_safetensors<B: Backend, M: Module<B>>(
     }
     if problems.is_empty() {
         Ok(Loaded {
-            applied: result.applied.len(),
+            applied: applied.len(),
             ignored,
         })
     } else {
@@ -296,6 +324,51 @@ mod tests {
         let err = load_safetensors(&mut wrong, &path, &torch()).unwrap_err();
         assert!(err.to_string().contains("expected"), "{err}");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[derive(Module, Debug)]
+    struct OnlyFc<B: Backend> {
+        fc: Linear<B>,
+    }
+
+    #[derive(Module, Debug)]
+    struct OnlyBn<B: Backend> {
+        bn: BatchNorm<B>,
+    }
+
+    #[test]
+    fn a_checkpoint_in_shards_loads_only_whole() {
+        // Each shard is saved from its own module and compared with that module, not with a
+        // clone: a clone of a parameter not yet read draws its initialiser again.
+        let fc = OnlyFc {
+            fc: LinearConfig::new(5, 3).init(&FlexDevice),
+        };
+        let mut bn = OnlyBn {
+            bn: BatchNormConfig::new(3).init(&FlexDevice),
+        };
+        bn.bn.gamma = bn.bn.gamma.map(|t| t.add_scalar(0.5));
+        let (first, second) = (scratch("shard-fc"), scratch("shard-bn"));
+        save(&fc, &first);
+        save(&bn, &second);
+
+        let mut target = small();
+        let loaded =
+            load_safetensors_shards(&mut target, &[first.clone(), second.clone()], &torch())
+                .unwrap();
+        assert!(loaded.applied >= 4, "applied {}", loaded.applied);
+        assert_eq!(bits(fc.fc.weight.val()), bits(target.fc.weight.val()));
+        assert_eq!(bits(bn.bn.gamma.val()), bits(target.bn.gamma.val()));
+
+        // The control: either shard alone is missing the other's parameters, by name.
+        let err = load_safetensors_shards(&mut small(), std::slice::from_ref(&first), &torch())
+            .unwrap_err();
+        assert!(err.to_string().contains("bn."), "{err}");
+        assert!(!err.to_string().contains("fc."), "{err}");
+        let err = load_safetensors_shards(&mut small(), std::slice::from_ref(&second), &torch())
+            .unwrap_err();
+        assert!(err.to_string().contains("fc."), "{err}");
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 
     #[test]

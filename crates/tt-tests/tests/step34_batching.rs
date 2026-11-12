@@ -131,6 +131,10 @@ fn a_full_program_cache_never_evicts_what_queued_lists_run() {
 /// several lists per op -- `[m, 784] @ [784, 128]`, a bias row, `relu`,
 /// `@ [128, 10]` -- is the same bits queued as run op by op.
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step34_batching"
+)]
 fn several_lists_per_unit_queued_are_the_unbatched_bits() {
     use tt_kernels::kind;
     use tt_kernels::matmul::{Fidelity, SrcRoute};

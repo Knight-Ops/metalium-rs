@@ -603,7 +603,7 @@ pub fn plan_layout(inputs: usize, outputs: usize) -> Result<Layout, crate::l1::P
     let unpacked = req.semaphore("sfpu unpacked", 0, 0..1);
     let free = req.semaphore("sfpu Dst free", 1, 0..1);
     let computed = req.semaphore("sfpu computed", 0, 0..1);
-    let plan = req.plan(tt_isa::l1::DATA)?;
+    let plan = req.plan(crate::l1::arena())?;
     Ok(Layout {
         in_at: plan.addr(a),
         out_at: plan.addr(out),
@@ -661,13 +661,15 @@ type Programs = (Layout, Arc<[Vec<Instruction>; 3]>);
 
 /// A kernel's layout and role programs, memoised.
 fn programs(spec: Spec, kernel: Kernel) -> Result<Programs, TensorError> {
-    type Memo = Mutex<std::collections::HashMap<(Spec, Kernel), Programs>>;
+    // By the arena's end too (`crate::l1::arena`), where the layout is planned.
+    type Memo = Mutex<std::collections::HashMap<(Spec, Kernel, u64), Programs>>;
     static MEMO: OnceLock<Memo> = OnceLock::new();
     let memo = MEMO.get_or_init(Default::default);
+    let end = crate::l1::arena().end;
     if let Some(p) = memo
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(&(spec, kernel))
+        .get(&(spec, kernel, end))
     {
         return Ok(p.clone());
     }
@@ -678,7 +680,7 @@ fn programs(spec: Spec, kernel: Kernel) -> Result<Programs, TensorError> {
     let p = (layout, roles);
     memo.lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert((spec, kernel), p.clone());
+        .insert((spec, kernel, end), p.clone());
     Ok(p)
 }
 

@@ -260,19 +260,6 @@ fn sim_factory(
             self.buffers
                 .pool_bf16(&mut self.session, a, windows, divisors, dims)
         }
-        fn matmul_bf16(
-            &mut self,
-            a: burn_tt::BufferId,
-            b: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
-            self.buffers.matmul_bf16(
-                &mut self.session,
-                a,
-                b,
-                self.config.fidelity,
-                self.config.budget,
-            )
-        }
         fn upload_bf16(
             &mut self,
             bits: &[u16],
@@ -305,14 +292,6 @@ fn sim_factory(
             format: Option<tt_kernels::bfp::BfpFormat>,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.cast_bfp(&mut self.session, id, format)
-        }
-        fn matmul_bfp(
-            &mut self,
-            a: burn_tt::BufferId,
-            b: burn_tt::BufferId,
-        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
-            self.buffers
-                .matmul_bfp(&mut self.session, a, b, self.config.fidelity)
         }
         fn supports_dram(&self) -> bool {
             true
@@ -363,6 +342,26 @@ fn sim_factory(
                 c.route,
                 c.fidelity,
                 c.budget,
+            )
+        }
+        fn matmul_dram_bf16(
+            &mut self,
+            a: burn_tt::BufferId,
+            ta: bool,
+            b: burn_tt::BufferId,
+            tb: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            let c = &self.config;
+            self.buffers.matmul_as(
+                &mut self.session,
+                a,
+                ta,
+                b,
+                tb,
+                c.route,
+                c.fidelity,
+                c.budget,
+                tt_kernels::tensor::Elem::BF16,
             )
         }
         fn matmul_dram_at(
@@ -416,6 +415,25 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.eltwise_op(&mut self.session, op, a, b, c)
         }
+        fn eltwise_blocks(
+            &mut self,
+            op: tt_kernels::tensor::Eltwise,
+            a: burn_tt::BlockArg,
+            b: Option<burn_tt::BlockArg>,
+            c: Option<burn_tt::BlockArg>,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.eltwise_blocks(&mut self.session, op, a, b, c)
+        }
+        fn rope_blocks(
+            &mut self,
+            x: burn_tt::BlockArg,
+            cos: burn_tt::BlockArg,
+            sin: burn_tt::BlockArg,
+            head: usize,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers
+                .rope_blocks(&mut self.session, x, cos, sin, head)
+        }
         fn pow(
             &mut self,
             x: burn_tt::BufferId,
@@ -434,8 +452,48 @@ fn sim_factory(
             a: burn_tt::BufferId,
             op: tt_kernels::sfpu::reduce::ReduceOp,
             axis: tt_kernels::sfpu::reduce::Axis,
+            then: tt_kernels::tensor::ReduceThen,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
-            self.buffers.reduce(&mut self.session, a, op, axis)
+            self.buffers.reduce(&mut self.session, a, op, axis, then)
+        }
+        fn rms(
+            &mut self,
+            a: burn_tt::BufferId,
+            eps: f32,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.rms(&mut self.session, a, eps)
+        }
+        fn softmax_rows(
+            &mut self,
+            x: burn_tt::BufferId,
+            mask: burn_tt::BufferId,
+            scale: f32,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.softmax_rows(&mut self.session, x, mask, scale)
+        }
+        fn rms_norm(
+            &mut self,
+            a: burn_tt::BufferId,
+            gamma: Option<burn_tt::BufferId>,
+            eps: f32,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.rms_norm(&mut self.session, a, gamma, eps)
+        }
+        fn add_rms_norm(
+            &mut self,
+            a: burn_tt::BufferId,
+            b: burn_tt::BufferId,
+            gamma: Option<burn_tt::BufferId>,
+            eps: f32,
+        ) -> Result<[(burn_tt::BufferId, [usize; 2]); 2], TtError> {
+            self.buffers
+                .add_rms_norm(&mut self.session, a, b, gamma, eps)
+        }
+        fn argmax_row(
+            &mut self,
+            a: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.argmax_row(&mut self.session, a)
         }
         fn scan(
             &mut self,
@@ -501,6 +559,25 @@ fn sim_factory(
                 c.fidelity,
                 c.budget,
                 layout,
+            )
+        }
+        fn attention_rows(
+            &mut self,
+            buffers: [burn_tt::BufferId; 4],
+            items: &[tt_kernels::attention::Item],
+            dims: [usize; 4],
+            scale: f32,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            let c = &self.config;
+            self.buffers.attention_rows(
+                &mut self.session,
+                buffers,
+                items,
+                dims,
+                scale,
+                c.route,
+                c.fidelity,
+                c.budget,
             )
         }
         fn repack(
@@ -577,6 +654,22 @@ fn sim_factory(
             self.buffers
                 .gather_rows(&mut self.session, sources, rows, cols)
         }
+        fn pick_columns(
+            &mut self,
+            input: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers.pick_columns(&mut self.session, input, indices)
+        }
+        fn select_add_rows(
+            &mut self,
+            t: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+            value: burn_tt::BufferId,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers
+                .select_add_rows(&mut self.session, t, indices, value)
+        }
         fn rows_add(
             &mut self,
             t: burn_tt::BufferId,
@@ -593,6 +686,26 @@ fn sim_factory(
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
             self.buffers.assign_rows(&mut self.session, t, value, rows)
         }
+        fn scatter_rows(
+            &mut self,
+            table: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+            values: burn_tt::BufferId,
+            column: bool,
+        ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
+            self.buffers
+                .scatter_rows(&mut self.session, table, indices, values, column)
+        }
+        fn scatter_rows_into(
+            &mut self,
+            table: burn_tt::BufferId,
+            indices: burn_tt::BufferId,
+            values: burn_tt::BlockArg,
+            column: bool,
+        ) -> Result<(), TtError> {
+            self.buffers
+                .scatter_rows_into(&mut self.session, table, indices, values, column)
+        }
         fn device_traffic(&mut self) -> Option<tt_device::Traffic> {
             Some(self.session.device().traffic())
         }
@@ -601,6 +714,28 @@ fn sim_factory(
         }
         fn end_trace(&mut self) -> Result<u64, TtError> {
             self.buffers.end_trace(&mut self.session)
+        }
+        fn begin_trace_planned(&mut self, key: u64) -> Result<bool, TtError> {
+            self.buffers.begin_trace_planned(&mut self.session, key)
+        }
+        fn begin_trace_cached(&mut self, key: u64) -> Result<bool, TtError> {
+            self.buffers.begin_trace_cached(&mut self.session, key)
+        }
+        fn begin_trace_plan_pass(&mut self) -> Result<(), TtError> {
+            self.buffers.begin_trace_plan_pass(&mut self.session)
+        }
+        fn set_residency(&mut self, bytes: u64) -> Result<(), TtError> {
+            self.session.set_residency(bytes);
+            Ok(())
+        }
+        fn probe_captures(&mut self) -> Result<u64, TtError> {
+            Ok(self.session.probe_captures())
+        }
+        fn probe_nc_waits(&mut self) -> Result<Vec<[u32; 8]>, TtError> {
+            Ok(self.session.probe_nc_waits()?)
+        }
+        fn has_pending_plan(&mut self) -> Result<bool, TtError> {
+            Ok(self.session.has_pending_plan())
         }
         fn run_trace(
             &mut self,
@@ -614,6 +749,31 @@ fn sim_factory(
         }
         fn release_trace(&mut self, trace: u64) {
             self.buffers.release_trace(&mut self.session, trace)
+        }
+        fn set_op_label(&mut self, label: &'static str) {
+            self.session.set_op_label(label);
+        }
+        fn trace_ops(&mut self, trace: u64) -> Result<Vec<tt_kernels::trace::OpRecord>, TtError> {
+            self.buffers.trace_ops(&self.session, trace)
+        }
+        fn set_count_trace_bytes(&mut self, on: bool) -> Result<(), TtError> {
+            self.session.set_count_trace_bytes(on);
+            Ok(())
+        }
+        fn set_capture_reuse(&mut self, on: bool) -> Result<bool, TtError> {
+            let was = self.session.capture_reuse();
+            self.session.set_capture_reuse(on);
+            Ok(was)
+        }
+        fn set_l1_region(&mut self, bytes: u64) -> Result<(), TtError> {
+            self.session.set_l1_region(bytes);
+            Ok(())
+        }
+        fn trace_footprint(
+            &mut self,
+            trace: u64,
+        ) -> Result<Vec<Option<tt_kernels::trace::UnitFootprint>>, TtError> {
+            self.buffers.trace_footprint(&self.session, trace)
         }
         fn copy_into(
             &mut self,

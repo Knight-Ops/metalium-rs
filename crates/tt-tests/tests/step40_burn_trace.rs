@@ -213,6 +213,10 @@ fn traced_training_step_updates_weights_in_place_and_reduces_loss() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step40_burn_trace"
+)]
 fn transformer_traced_training_runs_and_loss_decreases() {
     with_device(Config::default(), |device| {
         let weights = tt_mnist::transformer::init(59);
@@ -226,5 +230,49 @@ fn transformer_traced_training_runs_and_loss_decreases() {
             run.losses[0],
             run.losses[2]
         );
+    });
+}
+
+/// Roadmap W1, the contract switch (ADR 0006): a trace records the numeric contract it was
+/// captured under -- the attachment's (the reference contract by default) or a
+/// `burn_tt::with_numerics` scope's -- and a capture that switches to another contract part way
+/// is refused without leaving the device capturing. Negative control: the switching capture.
+#[test]
+fn a_trace_freezes_the_contract_it_was_captured_under() {
+    use burn_tt::{with_numerics, Numerics, TracedInference};
+    with_device(Config::default(), |device| {
+        let x: T2 = Tensor::from_data(TensorData::new(values(7, 32 * 32), [32, 32]), &device);
+        let xp = primitive(x.clone());
+        let relu = || vec![primitive(burn::tensor::activation::relu(x.clone()))];
+
+        assert_eq!(burn_tt::numerics(device).unwrap(), Numerics::Reference);
+        let (plain, _) = TracedInference::capture(&[&xp], relu).unwrap();
+        assert_eq!(plain.numerics(), Numerics::Reference);
+        let (scoped, _) = with_numerics(Numerics::Performance, || {
+            TracedInference::capture(&[&xp], relu).unwrap()
+        });
+        assert_eq!(scoped.numerics(), Numerics::Performance);
+        // Recorded, not looked up: outside the scope it is still the performance trace.
+        assert_eq!(burn_tt::numerics(device).unwrap(), Numerics::Reference);
+        assert_eq!(scoped.numerics(), Numerics::Performance);
+
+        let switched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            TracedInference::capture(&[&xp], || with_numerics(Numerics::Performance, relu))
+        }));
+        let message = switched.expect_err("a capture switched contracts part way");
+        let message = message
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(message.contains("inside a capture"), "{message}");
+
+        // Not left capturing, nor under the switched contract: an ordinary capture works.
+        let (again, first) = TracedInference::capture(&[&xp], relu).unwrap();
+        assert_eq!(again.numerics(), Numerics::Reference);
+        let want = burn::tensor::activation::relu(x.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(first[0].as_f32().unwrap(), want.as_slice());
     });
 }

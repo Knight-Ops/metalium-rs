@@ -601,6 +601,11 @@ pub struct Resident<N: NocId> {
     /// definitions too, which cost more than the PCIe writes it saved
     /// (`MEASURED`: 14 us per descriptor write, on silicon).
     slots: std::cell::RefCell<[Vec<u32>; 3]>,
+    /// A setup program already in the program cache, as its words and address: the next setup run
+    /// of exactly those words runs from there, and writes no fixed slot. A capture's own run sets
+    /// it ([`Resident::setup_from_cache`]): the slots are trace data while a capture plans into them
+    /// (`tt_isa::l1::TRACE_ARENA`).
+    setup_from: Option<(Vec<u32>, u32)>,
     /// The semaphores the tile is known to hold, as `(semaphore, value, max)`:
     /// set by a setup run, kept by kernels that restore theirs, dropped by
     /// anything else. A kernel touches only the semaphores it declares, so the
@@ -624,6 +629,13 @@ pub struct Resident<N: NocId> {
     /// Whether a profile records the roles' events too, or the mover's
     /// alone (`Resident::set_profile_roles`).
     profile_roles: bool,
+    /// Whether a profile has the math role total its pushing for the mover to
+    /// stamp (`Resident::set_profile_push`).
+    profile_push: bool,
+    /// Whether a profile has T0 and T2 keep their batch tables (`Resident::set_profile_batches`).
+    profile_batches: bool,
+    /// Whether T0 and T2 keep their batch tables with no profile (`Resident::set_batch_tables`).
+    batch_tables: bool,
     /// The last setup run's generation and program, until taken: a trace's
     /// capture records it as a kernel of its own (`crate::trace`).
     last_setup: Option<(u32, Vec<Instruction>)>,
@@ -649,6 +661,7 @@ impl<N: NocId> Resident<N> {
             generation: 1,
             poisoned: false,
             slots: Default::default(),
+            setup_from: None,
             semaphores: None,
             semaphores_after: None,
             last_setup: None,
@@ -656,6 +669,9 @@ impl<N: NocId> Resident<N> {
             pending: None,
             profiling: false,
             profile_roles: true,
+            profile_push: false,
+            profile_batches: false,
+            batch_tables: false,
             reservations: Default::default(),
         };
         for thread in 0..3 {
@@ -669,6 +685,7 @@ impl<N: NocId> Resident<N> {
                 false,
                 None,
                 (Vec::new(), 0),
+                None,
             )?;
             dev.write32(&r.window, tile, Mailbox::of(thread as u32).generation(), 1)?;
         }
@@ -701,8 +718,44 @@ impl<N: NocId> Resident<N> {
         self.profile_roles = on;
     }
 
+    /// Whether a profile has the math role total each kernel's pushing and its
+    /// waits for the coprocessor, which the mover stamps after the kernel
+    /// (`mailbox::trace_word::PUSH`, `crate::profile_mode::ProfileOptions::push`).
+    /// Off by default.
+    pub fn set_profile_push(&mut self, on: bool) {
+        self.profile_push = on;
+    }
+
+    /// Whether a profile has T0 and T2 record each streamed batch's times, which the mover
+    /// stamps after the kernel (`mailbox::trace_word::BATCHES`,
+    /// `crate::profile_mode::Detail::Pipeline`). Off by default.
+    pub fn set_profile_batches(&mut self, on: bool) {
+        self.profile_batches = on;
+    }
+
+    /// Whether T0 and T2 keep their batch tables with no profile running, for a gate to read them
+    /// back (`mailbox::BATCH_TIMES`): on the simulator, which refuses the stamp stream, nothing
+    /// else reads them. A `profile` image's roles only.
+    pub fn set_batch_tables(&mut self, on: bool) {
+        self.batch_tables = on;
+    }
+
     fn roles_traced(&self) -> bool {
         self.profiling && self.profile_roles
+    }
+
+    /// Role `thread`'s `mailbox::TRACE` word: its runs stamped if `runs`, and the
+    /// math role's push totals in a profile that asks for them.
+    fn trace_word(&self, thread: usize, runs: bool) -> u32 {
+        let push = self.profiling && self.profile_push && thread == 1;
+        let batches = (self.profiling && self.profile_batches || self.batch_tables) && thread != 1;
+        (if runs { mailbox::trace_word::RUNS } else { 0 })
+            | if push { mailbox::trace_word::PUSH } else { 0 }
+            | if batches {
+                mailbox::trace_word::BATCHES
+            } else {
+                0
+            }
     }
 
     /// The window this tile is reached through. A [`crate::dm::DataMover`] on
@@ -878,7 +931,7 @@ impl<N: NocId> Resident<N> {
             let d = mailbox::Descriptor {
                 thread_index: thread as u32,
                 dst_access_fmt: kernel.dst_fmt,
-                trace: u32::from(self.roles_traced()),
+                trace: self.trace_word(thread, self.roles_traced()),
                 push_window,
                 // A MOP configuration different from the queued kernels'
                 // would be rewritten under them.
@@ -924,6 +977,37 @@ impl<N: NocId> Resident<N> {
         *self.descriptors.borrow_mut() = [None; 3];
         self.semaphores = None;
         self.semaphores_after = None;
+        self.forget_program_slots();
+    }
+
+    /// What the fixed program slots hold is no longer known: a trace plans into them
+    /// (`tt_isa::l1::TRACE_ARENA`), so after a replay or a capture the next fixed-slot kernel
+    /// writes its programs again.
+    pub fn forget_program_slots(&mut self) {
+        self.slots.borrow_mut().iter_mut().for_each(Vec::clear);
+    }
+
+    /// The setup run [`Resident::reserve`] would run before `kernel` on this tile: its program,
+    /// or `None` where `kernel` sets no semaphores or the tile already holds them.
+    pub fn pending_setup(&self, kernel: &Kernel<'_>) -> Result<Option<Vec<Instruction>>, RunError> {
+        let (setup, _) = assemble(kernel)?;
+        Ok(setup.filter(|_| !self.setup_skipped(kernel)))
+    }
+
+    /// Run the next setup run whose program is `words` from the program cache at `at`, where the
+    /// caller placed it, not from role 0's fixed slot.
+    pub fn setup_from_cache(&mut self, words: Vec<u32>, at: u32) {
+        self.setup_from = Some((words, at));
+    }
+
+    /// Whether `kernel` needs no setup run: it clears nothing, and the tile holds its semaphores.
+    fn setup_skipped(&self, kernel: &Kernel<'_>) -> bool {
+        let clears = kernel.clear_dst && kernel.dump_rows > 0;
+        let holds = match (&kernel.schedule, &self.semaphores) {
+            (Schedule::Concurrent(i), Some(k)) => i.iter().all(|e| k.contains(e)),
+            _ => false,
+        };
+        !clears && holds
     }
 
     /// Role `thread`'s descriptor as a resident kernel runs it from a list:
@@ -944,7 +1028,7 @@ impl<N: NocId> Resident<N> {
         Ok(mailbox::Descriptor {
             thread_index: thread as u32,
             dst_access_fmt: kernel.dst_fmt,
-            trace: u32::from(kernel.trace || self.roles_traced()),
+            trace: self.trace_word(thread, kernel.trace || self.roles_traced()),
             push_window,
             mop_cfg: kernel.mop_words(thread)?,
             ..Default::default()
@@ -1025,13 +1109,9 @@ impl<N: NocId> Resident<N> {
         };
         // The setup only initialises semaphores (nothing to clear), and they
         // already hold that: nothing to do.
-        let clears = kernel.clear_dst && kernel.dump_rows > 0;
+        let skip_setup = self.setup_skipped(kernel);
         let known = self.semaphores.take();
-        let holds = match (&init, &known) {
-            (Some(i), Some(k)) => i.iter().all(|e| k.contains(e)),
-            _ => false,
-        };
-        let skip_setup = !clears && holds;
+        let from = self.setup_from.take();
         // After the kernel: its own semaphores as it found them, everyone
         // else's untouched.
         self.semaphores_after = init.as_ref().map(|i| {
@@ -1052,7 +1132,29 @@ impl<N: NocId> Resident<N> {
                     thread: 0,
                     reason: e,
                 })?;
-            self.stage(dev, 0, 0, false, kernel.dst_fmt, true, false, None, stored)?;
+            // From the program cache, where the caller put it, or else role 0's fixed slot.
+            let at = match from {
+                Some((words, at)) if words == stored.0 => Some(at),
+                Some(_) => {
+                    return Err(RunError::Transport(TransportError::Hazard {
+                        address: 0,
+                        reason: "a setup program placed in the program cache is not the one run",
+                    }))
+                }
+                None => None,
+            };
+            self.stage(
+                dev,
+                0,
+                0,
+                false,
+                kernel.dst_fmt,
+                true,
+                false,
+                None,
+                stored,
+                at,
+            )?;
             let stuck = self.wait(dev, &[0], images, budget)?;
             if let Some((_, _, e)) = stuck.into_iter().next() {
                 self.poisoned = true;
@@ -1090,6 +1192,7 @@ impl<N: NocId> Resident<N> {
                 resident_programs,
                 kernel.mop_words(thread)?,
                 kernel.stored_program(thread, program)?,
+                None,
             )?;
         }
         clock.lap(dev, Phase::Programs);
@@ -1171,7 +1274,8 @@ impl<N: NocId> Resident<N> {
     }
 
     /// Write role `thread`'s descriptor and program; with `go`, also move its
-    /// generation so it runs.
+    /// generation so it runs. With `program_at`, the program is already in the
+    /// program cache there: the descriptor names it, and no fixed slot is written.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn stage<T: Transport>(
@@ -1185,6 +1289,7 @@ impl<N: NocId> Resident<N> {
         resident_programs: bool,
         mop_cfg: Option<[u32; 9]>,
         stored: (Vec<u32>, u32),
+        program_at: Option<u32>,
     ) -> Result<(), RunError> {
         let (w, tile) = (&self.window, self.tile);
         let mb = Mailbox::of(thread as u32);
@@ -1201,9 +1306,10 @@ impl<N: NocId> Resident<N> {
             dst_access_fmt: dst_fmt,
             program_len: len,
             dump_row_count: dump,
-            trace: u32::from(traced),
+            trace: self.trace_word(thread, traced),
             push_window,
             mop_cfg,
+            program_addr: program_at.unwrap_or(0),
             ..Default::default()
         };
         let mut descs = self.descriptors.borrow_mut();
@@ -1226,7 +1332,7 @@ impl<N: NocId> Resident<N> {
         descs[thread] = Some(writes.map(|(_, v)| v));
         drop(descs);
         let mut slots = self.slots.borrow_mut();
-        if !words.is_empty() && slots[thread] != words {
+        if program_at.is_none() && !words.is_empty() && slots[thread] != words {
             // Forget the slot first: if the write fails, it holds neither.
             slots[thread].clear();
             dev.l1_write(w, tile, mb.program(), &word_bytes(&words))?;

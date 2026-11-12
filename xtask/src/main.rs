@@ -7,14 +7,17 @@
 
 use std::process::ExitCode;
 
+mod bench_diff;
 mod burn_coverage;
 mod burn_tests;
 mod conformance;
 mod fetch;
+mod fw_size;
 mod gen_burn;
 mod gen_cfg;
 mod gen_isa;
 mod pin;
+mod pipeline_report;
 mod ship;
 mod silicon;
 mod spec;
@@ -50,6 +53,9 @@ fn main() -> ExitCode {
         Some("silicon") => silicon::run(args),
         Some("conformance") => conformance::run(args),
         Some("bench") => silicon::bench(args),
+        Some("bench-diff") => bench_diff::run(args),
+        Some("fw-size") => fw_size::run(args),
+        Some("pipeline-report") => pipeline_report::run(args),
         Some(other) => Err(format!("unknown task `{other}`\n\n{USAGE}")),
         None => Err(USAGE.to_string()),
     };
@@ -76,9 +82,12 @@ tasks:
                           training gate reads it
   fetch-weights [--model <name>] [--force]
                           download the pinned pretrained weights (resnet18,
-                          vit-tiny, smollm2-135m) and test images (images) into
-                          vendor/weights/<name>/ and verify each against its
-                          pinned length and SHA-256; tt-models reads them
+                          vit-tiny, smollm2-135m, smollm2-1.7b-instruct) and test
+                          images (images) into vendor/weights/<name>/ and verify
+                          each against its pinned length and SHA-256; tt-models
+                          reads them. The larger architectures (qwen3.5-4b,
+                          nemotron-3.5-bolt-e4b, moss-image-base) are
+                          fetched only when named with --model
   fetch-burn-tests [--force]
                           download Burn's backend test suite (the pinned tag's
                           crates/burn-backend-tests/tests) into
@@ -111,4 +120,15 @@ tasks:
                           list; `cargo xtask conformance --help` for options
   bench [options]         the firmware benchmarks on silicon (release, ignored
                           tests included), collected into target/silicon/bench/;
-                          `cargo xtask bench --help`";
+                          `cargo xtask bench --help`
+  bench-diff <before.jsonl> <after.jsonl>
+                          two bench collections side by side, each result's
+                          ratio and whether it moved past its own spread
+  fw-size [options]       each firmware image's bytes against its slot in every
+                          shipped feature set, and the B mover's hot path;
+                          `cargo xtask fw-size --help`
+  pipeline-report <profile dir> [options]
+                          a decode step's products unit against unit from a
+                          TT_PROFILE_DETAIL=pipeline profile: slowest and mean
+                          unit, an even and a rate-weighted re-deal, and what
+                          explains the spread; `cargo xtask pipeline-report --help`";

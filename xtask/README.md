@@ -12,7 +12,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `fetch-spec [--force]` | Pinned tt-isa-documentation tree into `vendor/`, verified by content digest. |
 | `fetch-kmd [--force]` | Pinned tt-kmd `ioctl.h` into `vendor/` (the driver ABI `tt-kmd` binds). |
 | `fetch-mnist [--force]` | MNIST into `vendor/mnist/`, decompressed and hash-verified. |
-| `fetch-weights [--model <name>] [--force]` | The model ladder's pretrained weights (`resnet18`, `vit-tiny`, `smollm2-135m`) and test images (`images`) into `vendor/weights/<name>/`, checked against the pinned length and SHA-256; `tt-models` reads them. |
+| `fetch-weights [--model <name>] [--force]` | The model ladder's pretrained weights (`resnet18`, `vit-tiny`, `smollm2-135m`, `smollm2-1.7b-instruct`; `qwen3.5-4b`, `nemotron-3.5-bolt-e4b` and `moss-image-base` only when named) and test images (`images`) into `vendor/weights/<name>/`, checked against the pinned length and SHA-256; `tt-models` reads them. |
 | `fetch-burn-tests [--force]` | Burn's own backend tests (`crates/burn-backend-tests/tests/` at the pinned tag) into `vendor/burn-backend-tests/`, verified by content digest. |
 | `gen-cfg [--check]` | `tt-isa/src/cfg/generated.rs` from the pinned `cfg_defines.h` (fetched if absent). |
 | `gen-isa [--check]` | `tt-isa/src/isa/generated.rs` from `Bits32.lua`, cross-checked against the spec's syntax blocks, plus the measured Blackhole layouts in `src/gen_isa/Bits32_BH.lua`. |
@@ -24,6 +24,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 | `silicon [options]` | The silicon suite, one test per process. |
 | `conformance [options]` | Burn's own backend tests against `burn-tt` on ttsim, one test per process, compared with `crates/burn-tt-conformance/expected-failures.toml`; `--exact` runs the second profile, with exact matmul accumulation (`expected-failures-exact.toml`). See that crate's README. |
 | `bench [options]` | The firmware benchmarks on silicon, collected into `target/silicon/bench/`. |
+| `fw-size [--set <name>]... [--symbols] [--top <n>]` | Builds `crates/tt-firmware` in every shipped feature set (safe, `fast-reads`, `encoded-guard`, each with `profile`) into `target/fw-size/` and prints each loaded image's bytes, slot and room (`dm_b`, `dm_nc`, `role_t0..2`), then the B mover's hot-path functions by address. The span comes from `sections.x`'s `__image_base`/`__image_limit` and `__bss_end`. Quote it for any firmware change: sizes move by tens of bytes with unrelated changes. |
 
 `--check` fails if the committed file is stale instead of rewriting it. CI runs all
 three generators with `--check`. All pins are in `PINS.toml`.
@@ -41,7 +42,7 @@ directly, one test per process, single-threaded.
 | `--include-ignored` | Also run `#[ignore]` probes. |
 | `--keep-going` | Do not stop at the first failure. |
 | `--feature NAME` | Also build `tt-tests` with this feature (repeatable). For opt-in experiments such as `ttinsn-experiment`, and for the B mover's read mode: `fast-reads` (host-encoded reads, checksum on the card) or `encoded-guard` (plus the semantic guard). The default is the safe mode. |
-| `--timeout-secs N` | Per-test wall-clock limit (default 120). |
+| `--timeout-secs N` | Per-test wall-clock limit (default 120). The gates in `LONG` (`src/silicon.rs`), such as the 1.7B at its native context, get at least their own limit unless this is given. |
 | `--release` | Optimised build. Quote timings only from this. |
 | `--list` | Print the selection without touching a card. |
 
@@ -57,11 +58,15 @@ Background: [`docs/learnings/silicon-operating-notes.md`](../docs/learnings/sili
 The benchmark preset of `cargo xtask silicon`: always `--release
 --include-ignored`, a 900 s per-test limit unless `--timeout-secs` is given, and
 by default the `BENCH` selection in `src/silicon.rs`:
-- `silicon_bench_memory`: GDDR6 through the data mover, one tile and every tile.
+- `silicon_bench_memory`: GDDR6 through the data mover, one tile and every tile, and tt-metal's adjacent-core
+  DRAM read gate (`gddr_adjacent_banks`). Its spans are the mover's stamps, so run it with `--feature profile`.
 - `silicon_bench_path`: B through T0/T1/T2, hop by hop, and real ops.
 - `silicon_eth_clock`: E1's cycle counter, gated alone.
 - `silicon_bench_eth`: one link, both links, both directions.
 - `silicon_perf::pcie_*`.
+- `bench_training` (`crates/tt-mnist/tests`): the `tt-mnist` binary's training as a user runs it (MNIST
+  784-128-10 and 784-512-256-10, the transformer), three runs each, beside burn-flex, each run's accuracy
+  and loss checked: the scoreboard's tt-mnist rows.
 
 Every other `silicon` option applies; `--filter` replaces the default selection.
 The ignored BFP release benchmark is selected explicitly with

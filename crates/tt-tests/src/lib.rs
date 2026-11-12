@@ -9,7 +9,9 @@ pub mod backend;
 pub mod bench;
 pub mod burn_device;
 pub mod data;
+pub mod flash_oracle;
 pub mod harness;
+pub mod matrix_unit;
 pub mod mnist;
 #[cfg(not(feature = "silicon"))]
 pub mod topology;
@@ -21,7 +23,7 @@ pub use tt_kernels::{datapath, matmul};
 /// Firmware images, built from `crates/tt-firmware` by `tt-firmware-images`
 /// and checked there for instructions Blackhole cannot execute.
 pub mod firmware {
-    pub use tt_firmware_images::{HEARTBEAT, LOAD_ADDRESS, ROLES, SFPU_MUL};
+    pub use tt_firmware_images::{GUARDED_ROLES, HEARTBEAT, LOAD_ADDRESS, ROLES, SFPU_MUL};
 
     /// The generic single-thread Tensix program runner, built for the core
     /// [`crate::harness::CORE`] names: T1 on the simulator, T0 on silicon. See

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tt_device::core_control::CYCLES_PER_POLL;
 use tt_device::{Device, Transport, TransportError, Window};
 use tt_isa::dataflow::{Channel, Endpoint};
-use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Mover};
+use tt_isa::dm::{self, encoded, op, record, Descriptor, Entry, Mover, Transform};
 use tt_isa::dram::{Dram, DramRange};
 use tt_isa::mailbox::{offset, status};
 use tt_isa::noc::niu::Niu;
@@ -177,10 +177,37 @@ fn containment() -> Containment {
     })
 }
 
-/// `op`'s access of `len` bytes at L1 address `l1` lies in the data arena.
-fn contained(op: u32, l1: u32, len: u64) -> Result<()> {
+/// A program-restore list's check ([`DataMover::enqueue_program_restore`]): on B, at most
+/// `dm::LIST_MAX` entries, each a plain `READ` (no transform) whose whole L1 range lies in
+/// `tt_isa::l1::PROGRAM_CACHE`, decoded against the chip's `usable` channels as the mover will.
+pub fn check_program_restore(mover: Mover, usable: u32, reads: &[[u32; 8]]) -> Result<()> {
+    if reads.is_empty() || reads.len() > dm::LIST_MAX as usize {
+        return Err(DmError::Invalid(dm::error::LENGTH));
+    }
+    if mover != Mover::B {
+        return Err(DmError::Invalid(dm::error::DIRECTION));
+    }
+    for e in reads {
+        if e[0] != op::READ {
+            return Err(DmError::Invalid(dm::error::OP));
+        }
+        match Entry::decode(usable, *e).map_err(DmError::Invalid)? {
+            Entry::Move {
+                descriptor,
+                transform: Transform::None,
+            } if tt_isa::l1::PROGRAM_CACHE
+                .contains(descriptor.l1 as u64, descriptor.range.len()) => {}
+            _ => return Err(DmError::Invalid(dm::error::RANGE)),
+        }
+    }
+    Ok(())
+}
+
+/// `op`'s access of `len` bytes at L1 address `l1` lies in `arena`: the data arena, or the trace
+/// arena while a capture plans into it ([`DataMover::set_arena`]).
+fn contained(arena: tt_isa::l1::Region, op: u32, l1: u32, len: u64) -> Result<()> {
     let mode = containment();
-    if mode == Containment::Off || tt_isa::l1::DATA.contains(l1 as u64, len) {
+    if mode == Containment::Off || arena.contains(l1 as u64, len) {
         return Ok(());
     }
     if mode == Containment::Report {
@@ -190,10 +217,15 @@ fn contained(op: u32, l1: u32, len: u64) -> Result<()> {
     Err(DmError::Invalid(dm::error::RANGE))
 }
 
-/// [`Entry::decode`], and a read or write's L1 range must be in the data arena.
-fn decode_contained(usable: u32, e: [u32; 8]) -> std::result::Result<(), u32> {
+/// [`Entry::decode`], and a read or write's L1 range must be in `arena` ([`contained`]).
+fn decode_contained(
+    arena: tt_isa::l1::Region,
+    usable: u32,
+    e: [u32; 8],
+) -> std::result::Result<(), u32> {
     if let Entry::Move { descriptor, .. } = Entry::decode(usable, e)? {
-        contained(e[0], descriptor.l1, descriptor.range.len()).map_err(|_| dm::error::RANGE)?;
+        contained(arena, e[0], descriptor.l1, descriptor.range.len())
+            .map_err(|_| dm::error::RANGE)?;
     }
     Ok(())
 }
@@ -233,6 +265,12 @@ pub struct DataMover<N: NocId> {
     /// What an encoded read is bound to: this chip, this tile and the key written to the
     /// mover's mailbox as it started (`encoded::Context`), plus the endpoint bitmap `validate` needs.
     context: encoded::Context,
+    /// Where this mover's [`op::WRITE_L1`] entries may write ([`DataMover::set_l1_writes`]): none
+    /// until the session says.
+    l1_writes: L1Writes,
+    /// What this mover's lists may name in L1, as the host checks them: `tt_isa::l1::DATA`, or
+    /// `tt_isa::l1::TRACE_ARENA` while a capture plans into it ([`DataMover::set_arena`]).
+    arena: tt_isa::l1::Region,
     /// How long a descriptor may take on silicon. On ttsim the budget is
     /// simulated cycles instead, since the simulator's clock only moves when
     /// ticked.
@@ -298,8 +336,39 @@ impl<N: NocId> DataMover<N> {
         ] {
             d.write32(w, tile, word, 0)?;
         }
-        d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), dm::TILE_IN_FLIGHT_CAP)?;
+        // B's own reads' cap: `TILE_IN_FLIGHT_CAP`, or `TT_IN_FLIGHT_CAP` (a development knob,
+        // decode-to-bandwidth.md Phase 8, "The stream's rate": whether a lower cap evens the NoC's
+        // service between units). NC's writes keep the tile cap.
+        let cap = match mover.core {
+            tt_isa::tensix::Core::B => std::env::var("TT_IN_FLIGHT_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(dm::TILE_IN_FLIGHT_CAP),
+            _ => dm::TILE_IN_FLIGHT_CAP,
+        };
+        d.write32(w, tile, mover.at(dm::IN_FLIGHT_CAP), cap)?;
         if mover.core == tt_isa::tensix::Core::B {
+            // The prefetch reads' cap: `PREFETCH_CAP_DEFAULT`, or `TT_PREFETCH_CAP` (a development
+            // knob, decode-to-bandwidth.md Phase 8; 0 is `TILE_IN_FLIGHT_CAP`).
+            let cap = std::env::var("TT_PREFETCH_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(dm::PREFETCH_CAP_DEFAULT);
+            d.write32(w, tile, mover.at(dm::PREFETCH_CAP), cap)?;
+            // A weight stream's reads' cap: `STREAM_CAP_DEFAULT`, or `TT_STREAM_CAP` (a development
+            // knob, decode-to-bandwidth.md Phase 8; 0 is `TILE_IN_FLIGHT_CAP`).
+            // `TT_STREAM_CAP_BF16`, a BF16 weights' stream's (`dm::stream_caps`).
+            let env = |key: &str, default: u32| {
+                std::env::var(key)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(default)
+            };
+            let caps = dm::stream_caps(
+                env("TT_STREAM_CAP", dm::STREAM_CAP_DEFAULT),
+                env("TT_STREAM_CAP_BF16", dm::STREAM_CAP_BF16_DEFAULT),
+            );
+            d.write32(w, tile, mover.at(dm::STREAM_CAP), caps)?;
             // The semantic guard of an `encoded-guard` image (`encoded::guard`): which
             // `TARG_ADDR_HI` words are a usable DRAM endpoint. Other images ignore it.
             let bits: Vec<u8> = encoded::endpoint_bitmap(dram.usable_mask() as u32)
@@ -351,6 +420,8 @@ impl<N: NocId> DataMover<N> {
             caps,
             encode_reads: caps & dm::caps::FAST_READS != 0,
             context: encoded::Context::new(dram.usable_mask() as u32, (tile.x(), tile.y()), key),
+            l1_writes: L1Writes::default(),
+            arena: tt_isa::l1::DATA,
             deadline: Duration::from_secs(1),
         })
     }
@@ -359,9 +430,62 @@ impl<N: NocId> DataMover<N> {
         self.tile
     }
 
+    /// Let this mover's [`op::WRITE_L1`] entries write into `writes` (see [`L1Writes`]); the
+    /// default admits none. Host state only: what a list is checked against before it is queued.
+    pub fn set_l1_writes(&mut self, writes: L1Writes) -> Result<()> {
+        let listed = tt_isa::l1::LISTED;
+        if [&writes.window, &writes.reads]
+            .into_iter()
+            .any(|w| !w.is_empty() && (w.start < listed.base || w.end > listed.end))
+        {
+            return Err(DmError::Invalid(dm::error::RANGE));
+        }
+        if writes
+            .tiles
+            .iter()
+            .any(|&(x, y)| !tt_isa::noc::grid::is_tensix_geometry(x, y))
+        {
+            return Err(DmError::Invalid(dm::error::RANGE));
+        }
+        self.l1_writes = writes;
+        Ok(())
+    }
+
+    /// Let this mover's lists name `arena` in L1: `tt_isa::l1::DATA`, or `tt_isa::l1::TRACE_ARENA`
+    /// while a capture plans into it (`docs/completed-plans/decode-to-bandwidth.md` Phase 8, P3). Host state
+    /// only: what a list is checked against before it is queued.
+    pub fn set_arena(&mut self, arena: tt_isa::l1::Region) -> Result<()> {
+        if arena != tt_isa::l1::DATA && arena != tt_isa::l1::TRACE_ARENA {
+            return Err(DmError::Invalid(dm::error::RANGE));
+        }
+        self.arena = arena;
+        Ok(())
+    }
+
     /// Which core's mover this is, and where its mailbox and ring are.
     pub fn mover(&self) -> Mover {
         self.mover
+    }
+
+    /// NC's waits since they were last taken, in tile cycles, in `tt_isa::dataflow::NcWait` order
+    /// (`tt_isa::dataflow::NC_WAITS`; counted only by an image built with the profile feature),
+    /// and zeroed. `None` for B. Dev-facing.
+    pub fn take_nc_waits<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+    ) -> Result<Option<[u32; 8]>> {
+        use tt_isa::dataflow::{NC_WAITS, NC_WAIT_WORDS};
+        if self.mover != dm::Mover::NC {
+            return Ok(None);
+        }
+        let mut out = [0u32; NC_WAIT_WORDS as usize];
+        for (k, v) in out.iter_mut().enumerate() {
+            let at = NC_WAITS + k as u64 * 4;
+            *v = d.read32(w, self.tile, at)?;
+            d.write32(w, self.tile, at, 0)?;
+        }
+        Ok(Some(out))
     }
 
     /// What the in-flight cap (`tt_isa::noc::niu::InFlight`) has cost this
@@ -372,6 +496,18 @@ impl<N: NocId> DataMover<N> {
             stalls: d.read32(w, self.tile, self.mover.at(dm::THROTTLE_STALLS))?,
             cycles: d.read32(w, self.tile, self.mover.at(dm::THROTTLE_CYCLES))?,
         })
+    }
+
+    /// Cap this mover's prefetch reads (`dm::TXN_PREFETCH`) in flight at `cap` from its next list
+    /// (0: `dm::TILE_IN_FLIGHT_CAP`). A mover starts at `dm::PREFETCH_CAP_DEFAULT`.
+    pub fn set_prefetch_cap<T: Transport>(
+        &self,
+        d: &mut Device<T>,
+        w: &Window,
+        cap: u32,
+    ) -> Result<()> {
+        d.write32(w, self.tile, self.mover.at(dm::PREFETCH_CAP), cap)?;
+        Ok(())
     }
 
     /// Cap this mover's requests in flight at `cap` from its next list: 0 for
@@ -387,6 +523,12 @@ impl<N: NocId> DataMover<N> {
     ) -> Result<()> {
         d.write32(w, self.tile, self.mover.at(dm::IN_FLIGHT_CAP), cap)?;
         Ok(())
+    }
+
+    /// Whether this mover's image can stamp its work (`dm::caps::STAMPS`, the firmware's `profile`
+    /// feature): what profiling needs.
+    pub fn stamps(&self) -> bool {
+        self.caps & dm::caps::STAMPS != 0
     }
 
     /// Whether this mover's image runs host-encoded reads (`dm::caps::FAST_READS`): the
@@ -656,14 +798,33 @@ impl<N: NocId> DataMover<N> {
                 // The host's whole check of an encoded read, which the card only
                 // verifies (`encoded::verify`).
                 encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
-                contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
+                contained(
+                    self.arena,
+                    entries[i][0],
+                    entries[i][3],
+                    entries[i][7] as u64,
+                )?;
             } else if n == 1 {
-                decode_contained(usable, entries[i]).map_err(DmError::Invalid)?;
+                decode_contained(self.arena, usable, entries[i]).map_err(DmError::Invalid)?;
+                if matches!(
+                    entries[i][0],
+                    op::WRITE_L1 | op::WRITE_L1_MCAST | op::READ_L1 | op::CREDIT
+                ) && !self.l1_writes.admits(entries[i])
+                {
+                    return Err(DmError::Invalid(dm::error::RANGE));
+                }
+                // A credit word waited on is this tile's, in what its lists may name, or one of
+                // its op-level credit words (`tt_isa::dm::CREDITS`), which no arena holds.
+                let credits = tt_isa::dm::CREDITS..tt_isa::dm::CREDITS_END;
+                if entries[i][0] == op::WAIT_CREDIT && !credits.contains(&(entries[i][1] as u64)) {
+                    contained(self.arena, op::WAIT_CREDIT, entries[i][1], 4)?;
+                }
             } else {
                 let rec = entries
                     .get(i..i + n)
                     .ok_or(DmError::Invalid(dm::error::LENGTH))?;
-                record::expand(rec, |e| decode_contained(usable, e)).map_err(DmError::Invalid)?;
+                record::expand(rec, |e| decode_contained(self.arena, usable, e))
+                    .map_err(DmError::Invalid)?;
             }
             i += n;
         }
@@ -712,7 +873,12 @@ impl<N: NocId> DataMover<N> {
                     return Err(DmError::Invalid(dm::error::OP));
                 }
                 encoded::validate(&self.context, entries[i]).map_err(DmError::Invalid)?;
-                contained(entries[i][0], entries[i][3], entries[i][7] as u64)?;
+                contained(
+                    self.arena,
+                    entries[i][0],
+                    entries[i][3],
+                    entries[i][7] as u64,
+                )?;
             }
             i += record::len(entries[i][0]);
         }
@@ -728,6 +894,41 @@ impl<N: NocId> DataMover<N> {
         d: &mut Device<T>,
         w: &Window,
         entries: &[[u32; 8]],
+    ) -> Result<u32> {
+        self.enqueue_form(d, w, entries, true)
+    }
+
+    /// Queue `reads`, each a program's words that the B mover copies from GDDR into this unit's
+    /// program cache (`Session::restore_programs`, `docs/plans/roadmap.md` item 1a). The one list
+    /// that may write the program cache: every other list's moves stay in the arena
+    /// ([`contained`]), and lists never name the cache (`tt_isa::l1::LISTED`). Each entry must be
+    /// a plain `READ` on B whose whole L1 range lies in `tt_isa::l1::PROGRAM_CACHE`; which ranges,
+    /// and that the words are a program the session placed there, is the caller's bookkeeping
+    /// (`ProgramCache::restore` returned `Upload` for exactly that range). The reads go as they
+    /// are, never encoded: an encoded read's guard holds it to the arena. A kernel after them
+    /// waits for them to land (the mover's `KERNEL` and `LAUNCH` wait for B's reads).
+    pub fn enqueue_program_restore<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        reads: &[[u32; 8]],
+    ) -> Result<u32> {
+        self.check_program_restore(reads)?;
+        self.enqueue_form(d, w, reads, false)
+    }
+
+    /// [`DataMover::enqueue_program_restore`]'s check ([`check_program_restore`]).
+    pub fn check_program_restore(&self, reads: &[[u32; 8]]) -> Result<()> {
+        check_program_restore(self.mover, self.usable as u32, reads)
+    }
+
+    /// [`DataMover::enqueue_raw`], its short reads encoded for a fast image only if `encode`.
+    fn enqueue_form<T: Transport>(
+        &mut self,
+        d: &mut Device<T>,
+        w: &Window,
+        entries: &[[u32; 8]],
+        encode: bool,
     ) -> Result<u32> {
         let n = entries.len() as u32;
         let mut refreshed = false;
@@ -756,8 +957,11 @@ impl<N: NocId> DataMover<N> {
                 .0;
             self.wait_for(d, w, oldest)?;
         };
-        let bytes: Vec<u8> = self
-            .upload_form(entries)
+        let form = match encode {
+            true => self.upload_form(entries),
+            false => std::borrow::Cow::Borrowed(entries),
+        };
+        let bytes: Vec<u8> = form
             .iter()
             .flatten()
             .flat_map(|v| v.to_le_bytes())
@@ -841,11 +1045,88 @@ impl<N: NocId> DataMover<N> {
                     (since, ticks) = (Instant::now(), 0);
                     continue;
                 }
+                if std::env::var("TT_STALL_DUMP").is_ok_and(|v| v == "1") {
+                    self.dump_stall(d, w);
+                }
                 return Err(DmError::TimedOut { seq: number, done });
             }
             d.tick(CYCLES_PER_POLL);
             ticks += CYCLES_PER_POLL as u64;
         }
+    }
+
+    /// A stalled tile's state, on stderr (`TT_STALL_DUMP=1`, a development switch read when a
+    /// list times out): both movers' descriptor, queue and trace-progress words, the pair counters
+    /// and NC's wait reasons (`tt_isa::dataflow`), the
+    /// three roles' generation, acknowledgement, status and panic words, and the barrier words.
+    /// What it shows: whether the tile waits in a pair, for its roles or at a barrier.
+    fn dump_stall<T: Transport>(&self, d: &mut Device<T>, w: &Window) {
+        let nc = dm::Mover::NC;
+        let words = |d: &mut Device<T>, at: &[u64]| -> Vec<String> {
+            at.iter()
+                .map(|&a| match d.read32(w, self.tile, a) {
+                    Ok(v) => format!("{v:#x}"),
+                    Err(_) => "?".into(),
+                })
+                .collect()
+        };
+        let b = words(
+            d,
+            &[
+                dm::SEQ,
+                dm::DONE,
+                dm::ERROR,
+                dm::OP,
+                dm::QUEUE_HEAD,
+                dm::QUEUE_DONE,
+                dm::TRACE_PROGRESS,
+            ]
+            .map(|o| self.mover.at(o)),
+        );
+        let n = words(
+            d,
+            &[
+                dm::SEQ,
+                dm::DONE,
+                dm::ERROR,
+                dm::OP,
+                dm::L1_ADDR,
+                dm::LEN,
+                dm::TRACE_PROGRESS,
+            ]
+            .map(|o| nc.at(o)),
+        );
+        let flow = words(
+            d,
+            &(0..15)
+                .map(|i| tt_isa::dataflow::INPUT + 4 * i)
+                .collect::<Vec<_>>(),
+        );
+        use tt_isa::mailbox::role::Mailbox;
+        let roles = words(
+            d,
+            &(0..3u32)
+                .flat_map(|t| {
+                    let m = Mailbox::of(t);
+                    [m.generation(), m.ack(), m.status(), m.panic_code()]
+                })
+                .collect::<Vec<_>>(),
+        );
+        let barrier = words(
+            d,
+            &[
+                dm::BARRIER_COUNTER,
+                dm::BARRIER_POLL,
+                dm::BARRIER_RET,
+                dm::BARRIER_RELEASE,
+            ],
+        );
+        eprintln!(
+                "STALL tile {:?}: B [seq done error op qhead qdone progress] {b:?}; NC [seq done error op l1_addr len progress] {n:?}; \
+                 dataflow [input2 output2 abort role_progress3 wait_reason5 transfer2] {flow:?}; \
+                 roles [gen ack status panic]x3 {roles:?}; barrier [counter poll ret release] {barrier:?}",
+                self.tile
+            );
     }
 
     /// Wait for every list enqueued so far.
@@ -895,11 +1176,65 @@ impl<N: NocId> DataMover<N> {
     }
 }
 
+/// Where a mover's [`op::WRITE_L1`] entries may write: into `window` of the L1 of one of `tiles`.
+/// The card checks only that a destination could be a Tensix tile and lies in `DATA`; a coordinate
+/// of a tile this chip does not have is a NoC access nothing answers, which hangs the NoC and can
+/// take the host down (`docs/learnings/ttsim-divergence.md` row 35). So the host refuses every
+/// `WRITE_L1` but those into the tiles its session runs on (each read off the chip's grid) and the
+/// window it keeps for them (a capture's persistent region, `docs/completed-plans/planned-l1-residency.md`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct L1Writes {
+    /// `(x, y)` as the session names its tiles.
+    pub tiles: Vec<(u8, u8)>,
+    /// Inside `tt_isa::l1::DATA`; empty refuses every write.
+    pub window: std::ops::Range<u64>,
+    /// Where an [`op::READ_L1`] may also read, beyond `window`: a holder's slots, which its
+    /// readers copy (`crate::tile_op::reuse`), wherever the op's arena placed them. Inside
+    /// `tt_isa::l1::LISTED`; empty admits reads only inside `window`. Reading moves nothing into
+    /// the tile read, so a capture's narrower write window (planned residency) leaves it.
+    pub reads: std::ops::Range<u64>,
+}
+
+impl L1Writes {
+    /// Whether [`op::WRITE_L1`] or [`op::WRITE_L1_MCAST`] entry `e` writes inside the window of
+    /// the tiles (one of them, or a rectangle all of whose tiles are), [`op::READ_L1`] entry
+    /// `e` reads inside the window or the read window of one of them, or [`op::CREDIT`] entry
+    /// `e` credits a word inside the window of one of them or of its [`tt_isa::dm::CREDITS`].
+    pub fn admits(&self, e: [u32; 8]) -> bool {
+        let (to, len) = if e[0] == op::CREDIT {
+            (e[3] as u64, 4)
+        } else {
+            (e[3] as u64, e[5] as u64)
+        };
+        let ours = |x: u8, y: u8| self.tiles.contains(&(x, y));
+        let tiles = match e[0] {
+            op::WRITE_L1 | op::READ_L1 | op::CREDIT => u8::try_from(e[1])
+                .ok()
+                .zip(u8::try_from(e[2]).ok())
+                .is_some_and(|(x, y)| ours(x, y)),
+            op::WRITE_L1_MCAST => {
+                let [x0, y0, x1, y1] = e[1].to_le_bytes();
+                x0 <= x1 && y0 <= y1 && (y0..=y1).all(|y| (x0..=x1).all(|x| ours(x, y)))
+            }
+            _ => false,
+        };
+        // The op-level credit words are no op's L1 (`tt_isa::dm::CREDITS`): a credit to one of a
+        // session tile's is admitted whatever the window.
+        let credits =
+            e[0] == op::CREDIT && to >= tt_isa::dm::CREDITS && to + len <= tt_isa::dm::CREDITS_END;
+        let inside = |w: &std::ops::Range<u64>| to >= w.start && to + len <= w.end;
+        let read = e[0] == op::READ_L1 && inside(&self.reads);
+        tiles && (credits || read || inside(&self.window))
+    }
+}
+
 /// A shared packet's ownership rules, beyond what each entry's decode checks:
 /// every credit names the header's capacity (the role scripts carry it too,
-/// from the same header), and the writer section only writes to GDDR, so NC
-/// stays on NoC #1 -- an NC read would share B's NoC #0 initiator. `entries`
-/// is the header, the reader section and the writer section.
+/// from the same header), and the writer section only writes -- to GDDR, or
+/// to other tiles' L1 ([`op::WRITE_L1`], checked against the mover's
+/// [`L1Writes`]) -- so NC stays on NoC #1: an NC read would share B's NoC #0
+/// initiator. `entries` is the header, the reader section and the writer
+/// section.
 pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
     let header = entries.first().ok_or(dm::error::LENGTH)?;
     let capacity = header[3];
@@ -940,6 +1275,9 @@ pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
                             .is_some_and(|ch| ch.permits(endpoint(writer), action)) => {}
                     Entry::Buffer { .. } => return Err(dm::error::OP),
                     Entry::Move { descriptor, .. } if writer && descriptor.op == op::WRITE => {}
+                    Entry::L1Write { .. } | Entry::L1Multicast { .. } if writer => {}
+                    // A cross-core channel's credits, either way (`crate::channel`).
+                    Entry::Credit { .. } | Entry::WaitCredit { .. } if writer => {}
                     Entry::CheckFlags { .. } if writer => {}
                     _ if writer => return Err(dm::error::OP),
                     _ => {}
@@ -951,6 +1289,55 @@ pub fn check_pair(entries: &[[u32; 8]]) -> std::result::Result<(), u32> {
     };
     each(&entries[1..1 + readers], false)?;
     each(&entries[1 + readers..], true)
+}
+
+#[cfg(test)]
+mod l1_writes {
+    use super::L1Writes;
+    use tt_isa::dm::op;
+
+    /// A read window admits reads only: a holder's slots may be copied from, never written,
+    /// and a read outside both windows, or of a tile not the session's, is refused.
+    #[test]
+    fn the_read_window_admits_reads_and_no_writes() {
+        let w = L1Writes {
+            tiles: vec![(1, 2)],
+            window: 0x9_0000..0xA_0000,
+            reads: 0x2_0000..0x8_0000,
+        };
+        let read = |x, from, len| [op::READ_L1, x, 2, from, 0x3_0000, len, 0, 0];
+        let write = |to, len| [op::WRITE_L1, 1, 2, to, 0x3_0000, len, 0, 0];
+        assert!(
+            w.admits(read(1, 0x2_0000, 0x1000)),
+            "a read in the read window"
+        );
+        assert!(
+            w.admits(read(1, 0x9_0000, 0x1000)),
+            "a read in the write window"
+        );
+        assert!(
+            !w.admits(read(1, 0x7_F000, 0x2000)),
+            "a read past the read window"
+        );
+        assert!(
+            !w.admits(read(1, 0x8_0000, 0x1000)),
+            "a read between the windows"
+        );
+        assert!(
+            !w.admits(read(3, 0x2_0000, 0x1000)),
+            "a read of a tile not ours"
+        );
+        assert!(
+            !w.admits(write(0x2_0000, 0x1000)),
+            "a write in the read window"
+        );
+        assert!(
+            w.admits(write(0x9_0000, 0x1000)),
+            "a write in the write window"
+        );
+        let none = L1Writes { reads: 0..0, ..w };
+        assert!(!none.admits(read(1, 0x2_0000, 0x1000)), "no read window");
+    }
 }
 
 #[cfg(test)]
@@ -1003,5 +1390,99 @@ mod ring {
                 q.pop_front();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod program_restore {
+    use super::{check_program_restore, DmError};
+    use tt_isa::dm::{self, op, Mover};
+    use tt_isa::l1::{DATA, PROGRAM_CACHE};
+
+    const USABLE: u32 = 0xff;
+
+    fn read(l1: u64, len: u32) -> [u32; 8] {
+        // GDDR offset with the L1 address's 64-byte residue, as the session stores it.
+        [
+            op::READ,
+            0,
+            0,
+            0x10_0000 + (l1 % 64) as u32,
+            l1 as u32,
+            len,
+            0,
+            0,
+        ]
+    }
+
+    fn code(r: Result<(), DmError>) -> u32 {
+        match r {
+            Ok(()) => dm::error::NONE,
+            Err(DmError::Invalid(c)) => c,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_into_the_program_cache_passes() {
+        let at = PROGRAM_CACHE.base + 0x40;
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[read(at, 4096)])),
+            0
+        );
+        let last = PROGRAM_CACHE.end - 64;
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[read(last, 64)])),
+            0
+        );
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        let at = PROGRAM_CACHE.base + 0x40;
+        // Out of the cache: the arena, a range that starts in it and runs below, and past L1.
+        for e in [read(DATA.base, 4096), read(PROGRAM_CACHE.base - 64, 128)] {
+            assert_eq!(
+                code(check_program_restore(Mover::B, USABLE, &[e])),
+                dm::error::RANGE,
+                "{e:x?}"
+            );
+        }
+        assert_ne!(
+            code(check_program_restore(
+                Mover::B,
+                USABLE,
+                &[read(PROGRAM_CACHE.end - 64, 128)]
+            )),
+            dm::error::NONE
+        );
+        // Not a plain read.
+        let mut w = read(at, 64);
+        w[0] = op::WRITE;
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[w])),
+            dm::error::OP
+        );
+        // On NC, which only writes.
+        assert_eq!(
+            code(check_program_restore(Mover::NC, USABLE, &[read(at, 64)])),
+            dm::error::DIRECTION
+        );
+        // A misaligned GDDR offset, an empty list and one too long.
+        let mut m = read(at, 64);
+        m[3] += 16;
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[m])),
+            dm::error::ALIGNMENT
+        );
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &[])),
+            dm::error::LENGTH
+        );
+        let long = vec![read(at, 64); dm::LIST_MAX as usize + 1];
+        assert_eq!(
+            code(check_program_restore(Mover::B, USABLE, &long)),
+            dm::error::LENGTH
+        );
     }
 }

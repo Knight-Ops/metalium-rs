@@ -19,6 +19,8 @@
 //! movement, hand-offs and the roles' programs.
 
 #![cfg(feature = "silicon")]
+// The profiling helpers serve only the benches that need the `profile` feature.
+#![cfg_attr(not(feature = "profile"), allow(dead_code, unused_imports))]
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -289,7 +291,21 @@ fn bf16_mnist_matmul() {
                 for rep in 0..=REPS {
                     let start = Instant::now();
                     let out = if packed {
-                        s.matmul_bf16(&ba, &bb, Fidelity::HiFi4, 40_000_000)
+                        s.matmul_dram(
+                            &tt_kernels::tensor::DramTensor::from_bf16(
+                                ba.clone(),
+                                tt_kernels::tensor::Pad::Zero,
+                            ),
+                            false,
+                            &tt_kernels::tensor::DramTensor::from_bf16(
+                                bb.clone(),
+                                tt_kernels::tensor::Pad::Zero,
+                            ),
+                            false,
+                            tt_kernels::matmul::SrcRoute::Tf32FromFp32,
+                            Fidelity::HiFi4,
+                            40_000_000,
+                        )
                     } else {
                         s.matmul_dram(
                             &fa,
@@ -341,10 +357,16 @@ struct Split {
 }
 
 fn split(p: &DeviceProfile) -> Split {
+    try_split(p).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`split`], or the unit whose events do not nest: with NC writing beside B, a profile's
+/// events can come out unbalanced (an entry's end repeated), and then no device time is certified.
+fn try_split(p: &DeviceProfile) -> Result<Split, tt_kernels::profile::Unbalanced> {
     let mut s = Split::default();
     let (mut first, mut last) = (u64::MAX, 0);
     for u in &p.units {
-        for sp in u.spans().unwrap_or_else(|e| panic!("{e}")) {
+        for sp in u.spans()? {
             let len = (sp.end - sp.begin) as f64;
             if sp.name == "list" {
                 s.lists += 1;
@@ -358,7 +380,7 @@ fn split(p: &DeviceProfile) -> Split {
         }
     }
     s.device = last.saturating_sub(first) as f64;
-    s
+    Ok(s)
 }
 
 /// Real ops through a one-unit `Session`, profiled: per op, the device time
@@ -369,6 +391,8 @@ fn split(p: &DeviceProfile) -> Split {
 /// movement the roles waited on).
 #[test]
 #[ignore = "benchmark"]
+// Profiles its runs: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 fn workflow_ops() {
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     use tt_kernels::sfpu::ops::kind_sfpu;
@@ -517,6 +541,8 @@ fn workflow_ops() {
 /// hides of the per-op path, and what it does not.
 #[test]
 #[ignore = "benchmark"]
+// Profiles its runs: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 fn queue_steady_state() {
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     let card = device_index();
@@ -617,6 +643,8 @@ fn sweep_arm(s: &mut Session<tt_kmd::Kmd>, on: bool) {
 /// would show. `SWEEP_TILES` picks the tile counts.
 #[test]
 #[ignore = "benchmark"]
+// Profiles its runs: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 fn matmul_pipeline_sweep() {
     use tt_kernels::matmul::{Fidelity, SrcRoute};
     let card = device_index();
@@ -697,7 +725,8 @@ fn matmul_pipeline_sweep() {
                     // the buffer (and the op's sync reports it): time those
                     // from the host.
                     // With NC scattering, B's timestamper events come out
-                    // garbled (an entry's end repeated): host time instead.
+                    // garbled (an entry's end repeated): host time instead,
+                    // for the whole configuration, where any run's do.
                     let profiled = m * k * n < 1 << 29;
                     overflowed |= !profiled;
                     for _ in 0..REPS {
@@ -709,7 +738,10 @@ fn matmul_pipeline_sweep() {
                         host.push(h0.elapsed().as_secs_f64() * 1e6);
                         if profiled {
                             match s.profile_stop() {
-                                Ok(p) => device.push(split(&p).device),
+                                Ok(p) => match try_split(&p) {
+                                    Ok(sp) => device.push(sp.device),
+                                    Err(_) => overflowed = true,
+                                },
                                 Err(_) => overflowed = true,
                             }
                         }
@@ -765,6 +797,8 @@ fn matmul_pipeline_sweep() {
 /// from.
 #[test]
 #[ignore = "benchmark"]
+// Profiles its runs: firmware that can stamp (`--features tt-tests/profile`).
+#[cfg(feature = "profile")]
 fn sfpu_pipeline_sweep() {
     use tt_kernels::kind;
     use tt_kernels::sfpu::ops::kind_sfpu;
@@ -958,22 +992,70 @@ fn sfpu_pipeline_sweep() {
     }
 }
 
-/// Where the host's time goes queueing an op (checklist 9.17): an add of
-/// MNIST's size and of 512², and a 256³ matmul, 50 of each queued back to
-/// back on 1, 8 and 32 tiles (`SWEEP_TILES`), with `Session::host_times`'s
-/// stages, PCIe traffic and TLB retargets per op, and the call's wall time.
+/// Where the host's time goes queueing an op (checklist 9.17), and what
+/// building its jobs costs (F3's before and after): an add of MNIST's size and
+/// of 512², an `exp`, an add of one row broadcast down 512², a sum over a
+/// 512² tensor's columns and a 256³ matmul, 50 of each queued back to back on
+/// 1, 8 and 32 tiles (`SWEEP_TILES`), `REPS` times. Each rep reports per op:
+/// the call's wall time, `Session::host_times`'s `Enqueue` stage (queueing
+/// the jobs), and the rest of the call (`build`: planning and building the
+/// jobs). The very first call of each op in a process is reported alone
+/// (`cold`, one sample): its plans and programs not yet memoised. The last
+/// rep's stages, PCIe traffic and TLB retargets are printed per op.
 #[test]
 #[ignore = "benchmark"]
 fn host_time_per_op() {
     use tt_kernels::kind;
     use tt_kernels::matmul::{Fidelity, SrcRoute};
-    use tt_kernels::tensor::Eltwise;
+    use tt_kernels::session::HostStage;
+    use tt_kernels::sfpu::ops::kind_sfpu;
+    use tt_kernels::sfpu::reduce::{Axis, ReduceOp};
+    use tt_kernels::tensor::{DramTensor, Eltwise};
     let card = device_index();
     let counts: Vec<usize> = match std::env::var("SWEEP_TILES") {
         Ok(s) => s.split(',').map(|n| n.trim().parse().unwrap()).collect(),
         Err(_) => vec![1, 8, 32],
     };
     const OPS: usize = 50;
+    fn ew(kind: u32) -> Eltwise {
+        Eltwise {
+            kind,
+            scalar: 0.0,
+            scalar2: 0.0,
+        }
+    }
+    type Op<T> = fn(&mut Session<T>, &DramTensor, &DramTensor) -> DramTensor;
+    /// The op's name, `a`'s shape, `b`'s shape and the op.
+    type Row = (&'static str, [usize; 2], [usize; 2], Op<tt_kmd::Kmd>);
+    let ops: [Row; 6] = [
+        ("add", [64, 784], [64, 784], |s, a, b| {
+            s.eltwise(ew(kind::ADD), a, Some(b)).unwrap()
+        }),
+        ("add", [512, 512], [512, 512], |s, a, b| {
+            s.eltwise(ew(kind::ADD), a, Some(b)).unwrap()
+        }),
+        ("exp", [512, 512], [1, 1], |s, a, _| {
+            s.eltwise(ew(kind_sfpu::EXP), a, None).unwrap()
+        }),
+        ("add row", [512, 512], [1, 512], |s, a, b| {
+            s.eltwise(ew(kind::ADD_ROW), a, Some(b)).unwrap()
+        }),
+        ("sum over cols", [512, 512], [1, 1], |s, a, _| {
+            s.reduce(a, ReduceOp::Sum, Axis::Cols).unwrap()
+        }),
+        ("matmul", [256, 256], [256, 256], |s, a, b| {
+            s.matmul_dram(
+                a,
+                false,
+                b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                BUDGET,
+            )
+            .unwrap()
+        }),
+    ];
     for tiles in counts {
         if let Err(e) = fork_scope(|| {
             let mut s =
@@ -981,58 +1063,85 @@ fn host_time_per_op() {
                     .unwrap_or_else(|e| panic!("{e}"));
             s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
                 .unwrap();
-            let add = Eltwise {
-                kind: kind::ADD,
-                scalar: 0.0,
-                scalar2: 0.0,
-            };
-            for (name, r, c) in [("add", 64, 784), ("add", 512, 512), ("matmul", 256, 256)] {
+            let t = s.tile();
+            Conditions::measure(s.device(), card, t).print();
+            for (name, [r, c], [br, bc], op) in ops {
+                let key = format!("host {name} {r}x{c} on {tiles} tiles");
                 let a = s.upload(&vec![0.5; r * c], r, c).unwrap();
-                let b = s.upload(&vec![0.25; r * c], r, c).unwrap();
-                let op = |s: &mut Session<tt_kmd::Kmd>| {
-                    if name == "add" {
-                        s.eltwise(add, &a, Some(&b)).unwrap()
-                    } else {
-                        s.matmul_dram(
-                            &a,
-                            false,
-                            &b,
-                            false,
-                            SrcRoute::Tf32FromFp32,
-                            Fidelity::HiFi4,
-                            BUDGET,
-                        )
-                        .unwrap()
-                    }
+                let b = s.upload(&vec![0.25; br * bc], br, bc).unwrap();
+                let enqueue = |s: &Session<tt_kmd::Kmd>| {
+                    s.host_times()
+                        .stages
+                        .iter()
+                        .find(|(st, _)| *st == HostStage::Enqueue)
+                        .map_or(0.0, |(_, t)| t.time.as_secs_f64() * 1e6)
                 };
+                // Cold: the first call of this op in this process.
+                s.reset_host_times();
+                let t0 = Instant::now();
+                let o = op(&mut s, &a, &b);
+                let cold = t0.elapsed().as_secs_f64() * 1e6;
+                let cold_enqueue = enqueue(&s);
+                s.sync().unwrap();
+                s.free(o).unwrap();
+                report(
+                    &format!("{key}, cold call"),
+                    "us",
+                    "host",
+                    Stats::of([cold]),
+                );
+                report(
+                    &format!("{key}, cold build"),
+                    "us",
+                    "host",
+                    Stats::of([cold - cold_enqueue]),
+                );
                 // Warm: programs resident, movers started.
                 for _ in 0..3 {
-                    let o = op(&mut s);
+                    let o = op(&mut s, &a, &b);
                     s.sync().unwrap();
                     s.free(o).unwrap();
                 }
-                s.reset_host_times();
-                let t0 = Instant::now();
-                let outs: Vec<_> = (0..OPS).map(|_| op(&mut s)).collect();
-                let calls = t0.elapsed();
-                s.sync().unwrap();
-                let total = t0.elapsed();
-                for o in outs {
-                    s.free(o).unwrap();
+                let (mut call, mut synced, mut queued, mut build) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for _ in 0..REPS {
+                    s.reset_host_times();
+                    let t0 = Instant::now();
+                    let outs: Vec<_> = (0..OPS).map(|_| op(&mut s, &a, &b)).collect();
+                    let calls = t0.elapsed().as_secs_f64() * 1e6 / OPS as f64;
+                    s.sync().unwrap();
+                    let total = t0.elapsed().as_secs_f64() * 1e6 / OPS as f64;
+                    for o in outs {
+                        s.free(o).unwrap();
+                    }
+                    let q = enqueue(&s) / OPS as f64;
+                    call.push(calls);
+                    synced.push(total);
+                    queued.push(q);
+                    build.push(calls - q);
                 }
+                report(&format!("{key}, call"), "us/op", "host", Stats::of(call));
+                report(
+                    &format!("{key}, with sync"),
+                    "us/op",
+                    "host",
+                    Stats::of(synced),
+                );
+                report(
+                    &format!("{key}, enqueue"),
+                    "us/op",
+                    "host",
+                    Stats::of(queued),
+                );
+                report(&format!("{key}, build"), "us/op", "host", Stats::of(build));
                 let h = s.host_times().clone();
                 let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / OPS as f64;
-                println!(
-                    "MEASURE host {name} {r}x{c} on {tiles} tiles: call {:.1} us/op, with sync {:.1} us/op",
-                    per(calls),
-                    per(total)
-                );
                 for (stage, t) in h.stages.iter() {
                     if t.count == 0 {
                         continue;
                     }
                     println!(
-                        "MEASURE host {name} {r}x{c} on {tiles} tiles:   {:<10} {:>7.1} us/op  x{:<5.1} reads {:>5.1} writes {:>6.1} retargets {:>5.1} /op",
+                        "MEASURE {key}:   {:<10} {:>7.1} us/op  x{:<5.1} reads {:>5.1} writes {:>6.1} retargets {:>5.1} /op",
                         format!("{stage:?}"),
                         per(t.time),
                         t.count as f64 / OPS as f64,

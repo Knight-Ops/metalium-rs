@@ -2,7 +2,9 @@
 //!
 //! Six formats meet in one network: F32, BF16 and F16 (logical dtypes, the matrix is computed in
 //! that dtype) and BFP8, BFP4 and BFP2 (block floating point, physical storage of a logical F32
-//! tensor that the device decodes as it computes, `burn_tt::storage`). A [`Plan`] names the format
+//! tensor that the device decodes as it computes, `burn_tt::storage`). A seventh, [`Format::Bf16Stored`],
+//! is BF16 storage of a logical F32 matrix: computed in F32 on the same values, at half the bytes
+//! ([`Plan::bf16_weights`], `docs/completed-plans/bf16-weight-storage.md`). A [`Plan`] names the format
 //! of each matrix by a substring of its parameter path (`layers.3.mlp.down_proj.weight`), and
 //! [`apply`] rewrites a model's matrices accordingly.
 //!
@@ -27,6 +29,10 @@ pub enum Format {
     Bfp8,
     Bfp4,
     Bfp2,
+    /// BF16 storage of a logical F32 matrix: rounded to BF16 (ties-even, which changes nothing in
+    /// a BF16 checkpoint's weights) and computed in F32. burn-tt reads it as a product's `B`
+    /// directly, bit for bit the product of the same values held in F32.
+    Bf16Stored,
 }
 
 impl Format {
@@ -48,14 +54,33 @@ impl Format {
         }
     }
 
-    fn storage(self) -> StorageFormat {
+    /// The storage a matrix in this format is held in (F32 for the half dtypes and F32).
+    pub fn storage(self) -> StorageFormat {
         match self {
             Format::Bfp8 => StorageFormat::Bfp8,
             Format::Bfp4 => StorageFormat::Bfp4,
             Format::Bfp2 => StorageFormat::Bfp2,
+            Format::Bf16Stored => StorageFormat::Bf16,
             _ => StorageFormat::F32,
         }
     }
+}
+
+/// The named options of a contract's weight formats ([`Plan::for_numerics`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct WeightOptions {
+    /// Under the performance contract, the MLP's `gate` and `up` in BFP4 (ADR 0006's named
+    /// option); `down` and the rest stay BFP8. Recorded, not gated: on SmolLM2-1.7B it misses
+    /// tt-metal's acceptance floors (teacher-forced top-1 86.6%, logit PCC 0.93, against 90% and
+    /// 0.95; `step269_performance_contract`), to be judged again on the 8B-class model (W5).
+    pub mlp_bfp4: bool,
+    /// Under the performance contract, F32 activations into the products: the measurement's
+    /// baseline. By default (since 2026-11-11, roadmap W1) the contract's products read BF16
+    /// activations: each norm's output and the MLP's `silu(gate) * up` rounded once to BF16 where
+    /// it is made and read as it lies by the products after it, which give F32; the residual
+    /// stream, the attention block and every op's arithmetic stay F32 (`Llama::for_inference`).
+    /// Not a weight format: the plan is the contract's either way.
+    pub f32_activations: bool,
 }
 
 /// The format of each named tensor: the first rule whose pattern is a substring of the name wins,
@@ -73,6 +98,60 @@ impl Plan {
     pub fn rule(mut self, pattern: &str, format: Format) -> Self {
         self.rules.push((pattern.to_string(), format));
         self
+    }
+
+    /// Every matrix stored BF16 ([`Format::Bf16Stored`]) but the embedding table, whose rows a
+    /// lookup reads (an output head tied to it is stored on its own, [`crate::llama::Llama::untied`]).
+    pub fn bf16_weights() -> Self {
+        Self::stored_weights(Format::Bf16Stored)
+    }
+
+    /// Every matrix stored in `format` ([`Format::Bf16Stored`], [`Format::Bfp8`], [`Format::Bfp4`]
+    /// or [`Format::Bfp2`]: a logical F32 matrix whose storage the products read where it lies)
+    /// but the embedding table, as [`Plan::bf16_weights`].
+    ///
+    /// # Panics
+    /// For a format that is not stored (F32 or a half dtype).
+    pub fn stored_weights(format: Format) -> Self {
+        assert!(
+            format.storage() != StorageFormat::F32,
+            "{format:?} is not a stored weight format"
+        );
+        Self::new()
+            .rule("embed_tokens", Format::F32)
+            .rule("", format)
+    }
+
+    /// The weight formats of the numeric contract `numerics` (ADR 0006), for a model whose
+    /// weights are BF16 values (every checkpoint `tt-models` loads), fused or not:
+    ///
+    /// - [`Numerics::Reference`]: [`Plan::bf16_weights`], which holds such weights exactly, so the
+    ///   model computes the F32 model's logits bit for bit.
+    /// - [`Numerics::Performance`]: every matrix but the embedding table BFP8, and with
+    ///   [`WeightOptions::mlp_bfp4`] the MLP's `gate` and `up` (`gate_up` fused) BFP4. Its
+    ///   specification model is the F32 model holding the rounded values ([`Emulated`]).
+    ///
+    /// [`Numerics::Reference`]: burn_tt::Numerics::Reference
+    /// [`Numerics::Performance`]: burn_tt::Numerics::Performance
+    pub fn for_numerics(numerics: burn_tt::Numerics, options: WeightOptions) -> Self {
+        match numerics {
+            burn_tt::Numerics::Reference => {
+                assert!(
+                    !options.mlp_bfp4,
+                    "BFP4 weights are a performance-contract option"
+                );
+                Self::bf16_weights()
+            }
+            burn_tt::Numerics::Performance => {
+                let mut plan = Self::new().rule("embed_tokens", Format::F32);
+                if options.mlp_bfp4 {
+                    for part in ["gate_up", "gate_proj", "up_proj"] {
+                        plan = plan.rule(part, Format::Bfp4);
+                    }
+                }
+                plan.rule("", Format::Bfp8)
+            }
+        }
     }
 
     pub fn format(&self, name: &str) -> Format {
@@ -153,8 +232,8 @@ impl<B: StorageBackend> Quantizer<B> for Native {
     fn matrix(&self, format: Format, t: Tensor<B, 2>) -> Tensor<B, 2> {
         if let Some(dtype) = format.half() {
             t.cast(dtype)
-        } else if format.bfp_width().is_some() {
-            // Block formats take a logical F32 tensor (`StorageBackend`).
+        } else if format.storage() != StorageFormat::F32 {
+            // Stored formats take a logical F32 tensor (`StorageBackend`).
             t.cast(DType::F32).with_storage(format.storage())
         } else {
             t
@@ -165,7 +244,7 @@ impl<B: StorageBackend> Quantizer<B> for Native {
         let own = t.dtype();
         if let Some(dtype) = format.half() {
             t.cast(dtype).cast(own)
-        } else if format.bfp_width().is_some() {
+        } else if format.storage() != StorageFormat::F32 {
             t.cast(DType::F32).with_storage(format.storage())
         } else {
             t
@@ -196,6 +275,8 @@ impl<B: Backend> Quantizer<B> for Emulated {
             t.cast(dtype)
         } else if format.bfp_width().is_some() {
             Self::round(format, t.cast(DType::F32))
+        } else if format == Format::Bf16Stored {
+            t.cast(DType::BF16).cast(DType::F32)
         } else {
             t
         }
@@ -207,6 +288,8 @@ impl<B: Backend> Quantizer<B> for Emulated {
             t.cast(dtype).cast(own)
         } else if format.bfp_width().is_some() {
             Self::round(format, t.cast(DType::F32))
+        } else if format == Format::Bf16Stored {
+            t.cast(DType::BF16).cast(own)
         } else {
             t
         }
@@ -257,6 +340,47 @@ pub fn apply<B: Backend, M: Module<B>>(model: M, plan: &Plan, quantizer: &impl Q
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_contract_names_its_weight_formats() {
+        use burn_tt::Numerics;
+        let names = [
+            "embed_tokens.weight",
+            "layers.0.self_attn.qkv.weight",
+            "layers.0.self_attn.o_proj.weight",
+            "layers.0.mlp.gate_up.weight",
+            "layers.0.mlp.gate_proj.weight",
+            "layers.0.mlp.up_proj.weight",
+            "layers.0.mlp.down_proj.weight",
+            "lm_head.weight",
+        ];
+        let formats = |numerics, mlp_bfp4| {
+            let plan = Plan::for_numerics(
+                numerics,
+                WeightOptions {
+                    mlp_bfp4,
+                    ..Default::default()
+                },
+            );
+            names.map(|n| plan.format(n))
+        };
+        use Format::*;
+        assert_eq!(
+            formats(Numerics::Reference, false),
+            [
+                F32, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored,
+                Bf16Stored
+            ]
+        );
+        assert_eq!(
+            formats(Numerics::Performance, false),
+            [F32, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8]
+        );
+        assert_eq!(
+            formats(Numerics::Performance, true),
+            [F32, Bfp8, Bfp8, Bfp4, Bfp4, Bfp4, Bfp8, Bfp8]
+        );
+    }
 
     fn data() -> Vec<f32> {
         // Two rows of 32: a spread of magnitudes inside each block, both signs, zeros.

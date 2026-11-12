@@ -19,9 +19,17 @@ type AD = Autodiff<TtBackend>;
 fn f32_policy(_: &str) -> S {
     S::F32
 }
+/// A BFP2 operand of a product, weight or activation: a product reads each operand where it lies in
+/// its own format (`SrcRoute::Edges`), and ttsim refuses a BFP2 `Src` (divergence "Packed BFP2
+/// matrix multiply"), so on ttsim the policy stores it BFP4.
+const WEIGHT_BFP2: S = if cfg!(feature = "silicon") {
+    S::Bfp2
+} else {
+    S::Bfp4
+};
 fn policy2(name: &str) -> S {
     if name.ends_with("hidden.weight") || name.ends_with("conv.weight") {
-        S::Bfp2
+        WEIGHT_BFP2
     } else if name.ends_with("head.weight") {
         S::Bfp8
     } else if name.ends_with("relu") {
@@ -36,7 +44,7 @@ fn policy4(name: &str) -> S {
     } else if name.ends_with("head.weight") {
         S::Bfp8
     } else if name.ends_with("relu") {
-        S::Bfp2
+        WEIGHT_BFP2
     } else {
         S::F32
     }
@@ -45,7 +53,7 @@ fn policy8(name: &str) -> S {
     if name.ends_with("hidden.weight") || name.ends_with("conv.weight") {
         S::Bfp8
     } else if name.ends_with("head.weight") {
-        S::Bfp2
+        WEIGHT_BFP2
     } else if name.ends_with("relu") {
         S::Bfp4
     } else {
@@ -157,6 +165,10 @@ fn inputs(split: &mnist::Split, d: &burn_tt::TtDevice) -> (Tensor<AD, 2>, Tensor
     )
 }
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step96_mixed_bfp_mnist"
+)]
 fn mnist_mlp_policies_keep_f32_training_state_and_replay() {
     let split = mnist::load(true);
     with_device(Config::default(), |d| {
@@ -182,6 +194,10 @@ fn mnist_mlp_policies_keep_f32_training_state_and_replay() {
     });
 }
 #[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step96_mixed_bfp_mnist"
+)]
 fn mnist_cnn_policies_keep_f32_training_state_and_replay() {
     let split = mnist::load(true);
     with_device(Config::default(), |d| {

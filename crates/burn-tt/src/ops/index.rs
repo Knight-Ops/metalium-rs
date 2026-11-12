@@ -27,8 +27,12 @@
 //!   fold in index order, `((data + v_0) + v_1) + ...`, as Flex's sequential
 //!   `+=` does.
 //! * `scatter_nd(Assign)`: **the last writer in index order wins** (Flex's
-//!   sequential overwrite). Each index tuple, in order, replaces its row through
-//!   a mask select, so a later tuple replaces an earlier one by construction.
+//!   sequential overwrite). One row scatter on the card (`Session::scatter_rows`,
+//!   the mover's `SCATTER_ROWS`): a tile copy of the data, then each tuple's row
+//!   written at the row the card holds, a repeated row from its last tuple. With
+//!   `K = 1` the indices are read where they are and the mover's own `DOMAIN`
+//!   check is the coordinate's, so a cache write at a resident position is one
+//!   op. Packed storage keeps the mask loop of `Mul` below.
 //! * `scatter_nd(Mul | Min | Max)` run the same per-tuple loop as Assign, so
 //!   duplicates fold in index order as Flex's sequential update does (Burn leaves
 //!   the order undefined; ours is Flex's). `Mul` replaces the row by
@@ -270,14 +274,125 @@ fn scatter_nd(
             ),
         );
     }
-    let flat = nd_flat_rows(&data, &indices, &nd);
     let table = restack(&data, vec![nd.rows, nd.rest]);
     let rows = restack(&values, vec![nd.n, nd.rest]);
+    if reduction == IndexingUpdateOp::Assign {
+        if let Some(updated) = scatter_rows_native(&data, &indices, &table, &rows, &nd) {
+            return restack(&updated, data.shape().to_vec());
+        }
+    }
+    let flat = nd_flat_rows(&data, &indices, &nd);
     let updated = match reduction {
         IndexingUpdateOp::Add => select_add_native(table, 0, flat, rows),
         _ => scatter_rows(table, flat, rows, reduction),
     };
     restack(&updated, data.shape().to_vec())
+}
+
+/// `scatter_nd(Assign)` as one row scatter on the card (`Session::scatter_rows`):
+/// a copy of `table` (`[P, R]`) with `rows[j]` written at row `flat[j]`, the
+/// last writer winning, no mask pass over the table. With one coordinate
+/// (`K = 1`) the indices are the flat rows themselves, an `[N, 1]` column the
+/// mover reads where it is, and its own `DOMAIN` check (`0..P`, read as
+/// unsigned) is the coordinate's; with more, the checked flat rows of
+/// [`nd_flat_rows`]. `None` for what the primitive does not take (packed
+/// storage), which the mask loop then runs.
+fn scatter_rows_native(
+    data: &TtTensor,
+    indices: &TtTensor,
+    table: &TtTensor,
+    rows: &TtTensor,
+    nd: &Nd,
+) -> Option<TtTensor> {
+    let device = data.device;
+    let (index, column) = if nd.k == 1 {
+        (restack(indices, vec![nd.n, 1]), true)
+    } else {
+        (nd_flat_rows(data, indices, nd), false)
+    };
+    // An `[n, 1]` column that is a `[1, n]` buffer read transposed (a `[n]` index reshaped, as a
+    // cache write's rows are) is read as the row it is: the record takes either, so no copy.
+    let (i, column) = match index.dram() {
+        Some(d) if column && d.transposed && [d.buffer.rows, d.buffer.cols] == [1, nd.n] => (
+            crate::tensor::DramRef::of(d.buffer.clone(), false, d.generation),
+            false,
+        ),
+        _ => (plain_dram(&index), column),
+    };
+    let t = plain_dram(table);
+    let words = |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
+    let index_dims = if column { [nd.n, 1] } else { [1, nd.n] };
+    if !words(&t)
+        || !words(&i)
+        || [t.buffer.rows, t.buffer.cols] != [nd.rows, nd.rest]
+        || [i.buffer.rows, i.buffer.cols] != index_dims
+    {
+        return None;
+    }
+    // The rows written in place may be read where they lie, a block of their buffer (a value
+    // head's columns of a projection's row): no copy of them first. Elsewhere, made plain.
+    let in_place = !t.transposed
+        && t.buffer.parent.is_none()
+        && crate::server::donated_since(t.buffer.id).is_some();
+    let block = in_place
+        .then(|| super::block_view(rows))
+        .flatten()
+        .filter(|(w, dims)| *dims == [nd.n, nd.rest] && w.base[0] % 32 == 0 && w.base[1] % 32 == 0);
+    let (v, values) = match block {
+        Some((w, dims)) => {
+            let arg = crate::server::BlockArg {
+                id: w.src.buffer.id,
+                at: w.base,
+                dims,
+            };
+            (w.src, arg)
+        }
+        None => {
+            let v = plain_dram(rows);
+            if !words(&v) || [v.buffer.rows, v.buffer.cols] != [nd.n, nd.rest] {
+                return None;
+            }
+            let arg = crate::server::BlockArg {
+                id: v.buffer.id,
+                at: [0, 0],
+                dims: [nd.n, nd.rest],
+            };
+            (v, arg)
+        }
+    };
+    // A table the open capture owns as its state (a traced decode step's cache) is written in
+    // place: the step's result is the state's own buffer, at the generation the write made, so
+    // the trace needs neither the copy nor a write-back. Everything else, and every eager
+    // call, writes a copy and leaves `table` as it was.
+    if !t.transposed
+        && t.buffer.parent.is_none()
+        && crate::server::donated_since(t.buffer.id).is_some()
+    {
+        let generation =
+            crate::server::scatter_rows_into(device, t.buffer.id, i.buffer.id, values, column)
+                .unwrap_or_else(|e| crate::unsupported::fail("scatter_nd", e));
+        return Some(TtTensor::on_device(
+            crate::tensor::DramRef::of(t.buffer.clone(), false, generation),
+            vec![nd.rows, nd.rest].into(),
+            data.dtype(),
+            device,
+        ));
+    }
+    let (id, dims) = crate::server::scatter_rows(
+        device,
+        t.buffer.id,
+        i.buffer.id,
+        v.buffer.id,
+        column,
+        [nd.rows, nd.rest],
+    );
+    Some(device_result_shaped(
+        device,
+        id,
+        dims,
+        vec![nd.rows, nd.rest].into(),
+        data.dtype(),
+    ))
 }
 
 /// `table` (`[P, R]`) updated by `rows[j]` into row `flat[j]` for `j = 0..N` in
