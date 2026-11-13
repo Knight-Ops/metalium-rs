@@ -20,14 +20,14 @@
 - **Models run on the card,** traced:
   - ResNet-18 in 12.7 ms and ViT-Tiny in 7.7 ms;
   - SmolLM2-1.7B decodes at ~130 tokens/s (7.68 ms a step) under the performance contract, the inference default since 2026-11-10 (BFP8 weights, the tied table stored once, BF16, since 2026-11-12; top-1 98.28% against HuggingFace, `step269`; 7.52 with a BFP8 head beside the table, the option); 9.81 ms under the reference contract (BF16-stored weights, bit for bit the F32 model; not re-measured with the one table);
-  - Qwen3.5-4B decodes in 54.5 ms a step under the performance contract (BFP8 weights, the tied head the BF16 table; no quality gate yet), 62.5 under the reference (~21 of either a greedy pick, W4);
+  - Qwen3.5-4B decodes in 34.1 ms a step under the performance contract (BFP8 weights, the tied head the BF16 table, the greedy pick one op on the grid since 2026-11-12; no quality gate yet), 62.5 under the reference (measured with the old ~21 ms pick);
   - a 7,992-token prompt prefills in 5.98 s.
 
-  All of this is single card and batch 1. The 1.7B's 7.68 ms and Qwen3.5's 54.5 are under the performance contract; everything else is under the bit-exact reference contract.
+  All of this is single card and batch 1. The 1.7B's 7.68 ms and Qwen3.5's 34.1 are under the performance contract; everything else is under the bit-exact reference contract.
 - **Against tt-metal, same card and model (2026-11-09):**
   - Our batch-1 decode leads: 7.68 (performance) / 9.81 (reference) against 10.55-12.24 ms.
   - tt-metal batches 32 users at 1,289 tokens/s, prefills 2.2-3.1x faster, and runs prefill-shape products 2.4-22x faster (BF16/BFP8, HiFi2/LoFi, 2-D operand multicast).
-  - Qwen3.5-4B: tt-metal 38.0 ms on the card and 44-46 host-timed, with BFP4/BFP8 weights at LoFi and the argmax on the host; ours 54.5 with BFP8 weights (62.5 with BF16), or ~33 without our 21 ms greedy pick.
+  - Qwen3.5-4B: tt-metal 38.0 ms on the card and 44-46 host-timed, with BFP4/BFP8 weights at LoFi and the argmax on the host; ours 34.1 host-timed with BFP8 weights and the pick on the card (W4, 2026-11-12).
   - Training, since 2026-11-09 traced on every tile by default (`tt-mnist`), beats burn-flex on the CPU: MNIST 1.31 against 2.3-2.6 ms a step, the small transformer 3.75 against 3.9-4.3.
   - [tt-metal-parity.md](tt-metal-parity.md) §1-§3.
 - **Multi-chip** is a proof of concept: matmul, conv and attention split across two cards; no all-reduce.
@@ -128,11 +128,7 @@ A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmet
 - [ ] **Later:** bit-exact speculative decode (H12). A draft proposes `k`, the target verifies in one `m = k` step, and greedy acceptance gives plain decode's tokens. Ceiling 2-3x tokens/s.
 
 ### W4. Sampling on the grid
-- [ ] **Diagnose the wide-vocabulary greedy pick.**
-  - Qwen3.5: eight ~2.7 ms parts, ~21.4 ms a step, ~1.5 GB/s; [log](../learnings/performance-log.md#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1).
-  - The code spreads partials over up to 64 units (`Session::argmax_row`); the profile puts each part's gather on unit 0.
-  - Profile one part (`TT_PROFILE_DETAIL=pipeline`) before changing code.
-- [ ] **One grid-wide argmax for any vocabulary.** Retire the 65,536-column split in `tt-models/src/generate.rs`. Bit for bit, including first max, NaN and `-inf` padding.
+The greedy pick is one op for any vocabulary since 2026-11-12: Qwen3.5-4B 54.7 -> 34.1 ms a step (achievements).
 - [ ] **Native top-k / top-p over the grid,** trace-compatible (F7). The current on-card sampler is eager and ~112 ms a token.
 
 ### W5. An 8B-class model

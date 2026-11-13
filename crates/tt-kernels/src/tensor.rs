@@ -5679,13 +5679,9 @@ pub fn rope_blocks(
 pub const ARGMAX_RUN_MAX: usize = 32;
 
 /// Phase 1 of a row's argmax ([`crate::sfpu::select`]): the `[1, cols]` F32 row `a` dealt in runs
-/// of tiles over `units`, each run's best key and index in a tile of the `[1, 32 runs]` result.
-/// Also each run's first column, which [`argmax_choose`] adds to its index.
-pub fn argmax_partials(
-    alloc: &mut DramAlloc,
-    a: &DramTensor,
-    units: usize,
-) -> Result<(Work, Vec<usize>)> {
+/// of tiles over `units`, each run's best key and its index (the row's own column) in a tile of
+/// the `[1, 32 runs]` result.
+pub fn argmax_partials(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
     use crate::sfpu::{reduce, select};
     a.expect("an argmax", Elem::F32)?;
     if a.rows != 1 || a.cols == 0 {
@@ -5699,7 +5695,6 @@ pub fn argmax_partials(
     let out = DramTensor::alloc(alloc, 1, 32 * all.len())?;
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let mut jobs = Vec::with_capacity(all.len());
-    let mut starts = Vec::with_capacity(all.len());
     let body = select::accumulate(a.cols - 1);
     let fold = select::fold();
     for (j, run) in all.into_iter().enumerate() {
@@ -5719,7 +5714,6 @@ pub fn argmax_partials(
             &fold,
         );
         let (roles, loops) = (Arc::new(roles), Arc::new(loops));
-        starts.push(32 * run.start);
         let gather = [
             [
                 record::READ_RUN,
@@ -5766,40 +5760,41 @@ pub fn argmax_partials(
             },
         ]);
     }
-    Ok((Work { out, jobs }, starts))
+    Ok(Work { out, jobs })
 }
 
-/// Phase 2 of a row's argmax: one job over [`argmax_partials`]' tiles, in order, each index moved
-/// by its run's first column (`starts`); the chosen index as an I32 `[1, 1]`.
-pub fn argmax_choose(
-    alloc: &mut DramAlloc,
+/// Most partials one job of [`argmax_fold`] or [`argmax_choose`] reads: all of them sit in its L1
+/// at once, and its unpacker's program is a tile's each. A row of up to 2,048 tiles (65,536
+/// columns) has at most this many partials ([`ARGMAX_RUN_MAX`] tiles a run over at most
+/// `ARGMAX_UNITS` units), so its choice is one job; a wider row's partials fold in levels first.
+pub const ARGMAX_FAN_IN: usize = 64;
+
+/// One job of a row's argmax past its partials: `tiles` of `partials` (each a best key in row 0
+/// and its index in row 4) in order, the best kept as [`crate::sfpu::select::combine`] keeps it,
+/// then `finish`, written to tile `at` of `out`.
+fn argmax_combine_job(
     partials: &DramTensor,
-    starts: &[usize],
-) -> Result<Work> {
+    tiles: std::ops::Range<usize>,
+    out: &DramTensor,
+    at: usize,
+    finish: &[tt_isa::isa::Instruction],
+) -> Result<Vec<Step>> {
     use crate::sfpu::{reduce, select};
-    let pt = partials.grid()[1];
-    if pt != starts.len() || partials.rows != 1 {
-        return Err(TensorError::Shape(format!(
-            "an argmax's {pt} partials for {} runs",
-            starts.len()
-        )));
-    }
-    let layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (len, pt) = (tiles.len(), partials.grid()[1]);
+    let layout = reduce::plan_layout(1, len).map_err(|e| TensorError::Shape(e.to_string()))?;
     let (roles, loops) = select::roles(
         &layout,
-        pt,
+        len,
         &select::choice_prologue(),
         &select::combine(),
-        &select::index_out(),
+        finish,
     );
-    let (roles, loops) = (Arc::new(roles), Arc::new(loops));
-    let out = DramTensor::alloc_elem(alloc, 1, 1, Elem::I32)?;
     let (rp, ro) = (partials.tensor_ref(), out.tensor_ref());
     let gather = [
         [
             record::READ_RUN,
-            0,
-            pt as u32,
+            tiles.start as u32,
+            len as u32,
             layout.in_at as u32,
             0,
             pt as u32,
@@ -5810,30 +5805,89 @@ pub fn argmax_choose(
         rp.encode()[1],
     ];
     let scatter = [
-        [record::WRITE_RUN, 0, 1, layout.out_at as u32, 0, 0, 0, 0],
+        [
+            record::WRITE_RUN,
+            at as u32,
+            1,
+            layout.out_at as u32,
+            0,
+            0,
+            0,
+            0,
+        ],
         ro.encode()[0],
         ro.encode()[1],
     ];
-    Ok(Work {
-        out,
-        jobs: vec![vec![
-            Step::List {
-                what: "argmax choice gather",
-                entries: gather.to_vec(),
-            },
-            Step::Kernel {
-                roles,
-                init: layout.init.clone(),
-                mop: Box::new([None; 3]),
-                loops,
-                half: None,
-            },
-            Step::List {
-                what: "argmax choice scatter",
-                entries: scatter.to_vec(),
-            },
-        ]],
-    })
+    Ok(vec![
+        Step::List {
+            what: "argmax choice gather",
+            entries: gather.to_vec(),
+        },
+        Step::Kernel {
+            roles: Arc::new(roles),
+            init: layout.init.clone(),
+            mop: Box::new([None; 3]),
+            loops: Arc::new(loops),
+            half: None,
+        },
+        Step::List {
+            what: "argmax choice scatter",
+            entries: scatter.to_vec(),
+        },
+    ])
+}
+
+/// A middle level of a row's argmax, for more partials than one choice takes
+/// ([`ARGMAX_FAN_IN`]): `partials` in runs of at most that many, each run's best written as a
+/// partial again ([`crate::sfpu::select::partial_out`]), one job a run. The best is a total
+/// order's and every index is the row's own column, so the levels choose what one choice over
+/// every partial would.
+pub fn argmax_fold(alloc: &mut DramAlloc, partials: &DramTensor) -> Result<Work> {
+    let pt = partials.grid()[1];
+    if partials.rows != 1 || pt <= ARGMAX_FAN_IN {
+        return Err(TensorError::Shape(format!(
+            "an argmax level over [{}, {}]: one row of more than {ARGMAX_FAN_IN} partials",
+            partials.rows, partials.cols
+        )));
+    }
+    let all = runs(pt, 1, ARGMAX_FAN_IN);
+    let out = DramTensor::alloc(alloc, 1, 32 * all.len())?;
+    let finish = crate::sfpu::select::partial_out();
+    let jobs = all
+        .into_iter()
+        .enumerate()
+        .map(|(j, run)| argmax_combine_job(partials, run, &out, j, &finish))
+        .collect::<Result<Vec<_>>>();
+    match jobs {
+        Ok(jobs) => Ok(Work { out, jobs }),
+        Err(e) => {
+            alloc.free(&out.placement);
+            Err(e)
+        }
+    }
+}
+
+/// Phase 2 of a row's argmax: one job over the partials' tiles, in order (at most
+/// [`ARGMAX_FAN_IN`]; [`argmax_fold`] makes fewer); the chosen index as an I32 `[1, 1]`.
+pub fn argmax_choose(alloc: &mut DramAlloc, partials: &DramTensor) -> Result<Work> {
+    let pt = partials.grid()[1];
+    if partials.rows != 1 || pt == 0 || pt > ARGMAX_FAN_IN {
+        return Err(TensorError::Shape(format!(
+            "an argmax's choice over [{}, {}]: one row of at most {ARGMAX_FAN_IN} partials",
+            partials.rows, partials.cols
+        )));
+    }
+    let out = DramTensor::alloc_elem(alloc, 1, 1, Elem::I32)?;
+    match argmax_combine_job(partials, 0..pt, &out, 0, &crate::sfpu::select::index_out()) {
+        Ok(job) => Ok(Work {
+            out,
+            jobs: vec![job],
+        }),
+        Err(e) => {
+            alloc.free(&out.placement);
+            Err(e)
+        }
+    }
 }
 
 /// Inclusive scan down matrix rows. Each column tile is a job, so its

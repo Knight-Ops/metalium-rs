@@ -125,3 +125,67 @@ fn the_token_on_the_card_against_the_logits_downloaded() {
         println!("MEASURE sampling: argmax {got:?}, host first maximum {want}");
     });
 }
+
+/// Roadmap W4's diagnosis: where Qwen3.5-4B's ~2.7 ms a greedy part goes. Traced on every tile,
+/// each alone: one 31,040-column part's `argmax` on a row of its own; the same part sliced from
+/// a 248,320-column row; and `generate::greedy` over the whole row (eight such parts).
+#[test]
+#[ignore = "benchmark"]
+fn a_wide_vocabulary_s_greedy_pick() {
+    let config = Config {
+        tiles: Some(TileChoice::All),
+        ..Config::default()
+    };
+    with_device(config, |d| {
+        let (part, vocab) = (31_040usize, 248_320usize);
+        let wide = floats(3, vocab);
+        let x = Tensor::<TtBackend, 2>::from_data(TensorData::new(wide.clone(), [1, vocab]), &d);
+        let _ = (x.clone() * 1.0).sum().into_data();
+        let xi = native(x.clone());
+        let narrow = wide[..part].to_vec();
+        let y = Tensor::<TtBackend, 2>::from_data(TensorData::new(narrow.clone(), [1, part]), &d);
+        let yi = native(y.clone());
+        let (own, _) =
+            TracedInference::capture(&[&yi], || vec![y.clone().argmax(1).into_primitive()])
+                .unwrap();
+        let (first, _) = TracedInference::capture(&[&xi], || {
+            vec![x.clone().slice([0..1, 0..part]).argmax(1).into_primitive()]
+        })
+        .unwrap();
+        let (last, _) = TracedInference::capture(&[&xi], || {
+            vec![x
+                .clone()
+                .slice([0..1, vocab - part..vocab])
+                .argmax(1)
+                .into_primitive()]
+        })
+        .unwrap();
+        let (slice, _) = TracedInference::capture(&[&xi], || {
+            vec![native(x.clone().slice([0..1, vocab - part..vocab]) * 1.0)]
+        })
+        .unwrap();
+        let (greedy, _) = TracedInference::capture(&[&xi], || {
+            vec![tt_models::generate::greedy(x.clone()).into_primitive()]
+        })
+        .unwrap();
+        for (name, trace, values) in [
+            ("one part, its own row", &own, &narrow),
+            ("the first part, sliced", &first, &wide),
+            ("the last part, sliced", &last, &wide),
+            ("the last part's slice alone, x 1", &slice, &wide),
+            ("greedy (one argmax) over the whole row", &greedy, &wide),
+        ] {
+            let [all, write, replay, read] = time(trace, values);
+            println!(
+                "MEASURE greedy pick: {name}: {all:.1} us (write {write:.1}, replay {replay:.1}, read {read:.1})"
+            );
+        }
+        let want = (0..vocab)
+            .max_by(|&a, &b| wide[a].partial_cmp(&wide[b]).unwrap().then(b.cmp(&a)))
+            .unwrap();
+        let got = greedy
+            .run(vec![burn_tt::InputPayload::F32(wide.clone())])
+            .unwrap();
+        println!("MEASURE greedy pick: {got:?}, host first maximum {want}");
+    });
+}

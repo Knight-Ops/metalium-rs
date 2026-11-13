@@ -238,7 +238,9 @@ Left:
     inputs (1010880 bytes) does not fit the 917504-byte L1 arena"); `generate::greedy` takes a row past 65,536
     columns in single-row parts (the Llamas' traces unchanged; `step187` and `step188`'s traced test pass on card
     1, `1793344290`, as do `step260`'s BF16-weight test there, largest logit difference 7.79e-2 and eager ~3 s a
-    token on one tile, and `qwen35_host` against `transformers`). (7) A tied
+    token on one tile, and `qwen35_host` against `transformers`). The parts were retired on 2026-11-12 (roadmap W4):
+    `Session::argmax_row` folds a wide row's partials in levels (`tensor::argmax_fold`), one op for any
+    vocabulary. (7) A tied
     head as `table @ last^T` returns a transposed view, which a trace cannot output: an F32 table's head is now
     `last @ table^T` (a BF16 table's too since 2026-11-12, (1)). (8) **The build is host-bound and
     superlinear in a trace's ops**: 1,487 s for two steps and two chunks (`step263`), 1,108 s for four steps and a

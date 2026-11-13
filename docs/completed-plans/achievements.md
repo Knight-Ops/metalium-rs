@@ -367,6 +367,13 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   (`SCATTER_ROWS_BF16`), and attention reading BF16 keys and values as they lie, bit for bit their widened values'
   (`step273`). The 1.7B at 2K 19.44 -> 18.89 ms, at 8K 43.44 -> 38.67, at short context 7.70 -> 7.84 (the values'
   cast); half the cache's GDDR; `attention_rows` to 1,344 positions; `step269` 228 of 232, PCC 0.99976.
+- **W4: the wide-vocabulary greedy pick, one op for any vocabulary** (2026-11-12, gates ttsim and card 0, benches
+  card 1; [log](../learnings/performance-log.md#w4-the-wide-vocabulary-greedy-pick-one-op-for-any-vocabulary-2026-11-12-cards-0-and-1)).
+  Diagnosed first: Qwen3.5-4B's ~21.4 ms pick was the eight parts' slices (~1.5 ms copy each), not the argmax. A row's
+  partials now fold in levels past 64 (`tensor::argmax_fold`, `select::partial_out`), so `Session::argmax_row` takes
+  any width in one op and `generate::greedy` is `argmax(1)`: 248,320 columns in 153 us on the card, bit for bit
+  (`step211`, widths to 262,144). Qwen3.5-4B decode 54.71 -> **34.10 ms** (0.90x tt-metal's 38.0 on the card); the
+  1.7B unchanged.
 
 ## Prefill and long context
 

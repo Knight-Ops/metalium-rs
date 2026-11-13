@@ -8621,15 +8621,29 @@ impl<T: Transport> Session<T> {
     /// (`crate::sfpu::select`): the first maximum, any NaN above every number (the first NaN),
     /// `-0` and `+0` equal, as `torch.argmax` and burn-tt's argmax choose. Two ops: each unit's
     /// run of tiles to a partial, then one unit's choice among them. A decode step's next token,
-    /// with no download of its logits.
+    /// with no download of its logits. Any width: past [`tensor::ARGMAX_FAN_IN`] partials (a row
+    /// wider than 65,536 columns), they fold in levels first ([`tensor::argmax_fold`]), one op a
+    /// level, so a wide vocabulary's row is never cut into parts.
     pub fn argmax_row(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
         let ct = a.grid()[1];
         let units = self.spread_for(ct).clamp(1, ARGMAX_UNITS);
-        let (work, starts) = tensor::argmax_partials(&mut self.dram_state()?.alloc, a, units)?;
-        let partials = self.execute_on(work, units, RESET_BUDGET)?;
+        let work = tensor::argmax_partials(&mut self.dram_state()?.alloc, a, units)?;
+        let mut partials = self.execute_on(work, units, RESET_BUDGET)?;
+        while partials.grid()[1] > tensor::ARGMAX_FAN_IN {
+            let work = self
+                .dram_state()
+                .and_then(|d| tensor::argmax_fold(&mut d.alloc, &partials));
+            let next = work.and_then(|work| {
+                let jobs = work.jobs.len();
+                let units = self.spread_for(jobs).clamp(1, ARGMAX_UNITS.min(jobs));
+                self.execute_on(work, units, RESET_BUDGET)
+            });
+            self.free(partials)?;
+            partials = next?;
+        }
         let chosen = self
             .dram_state()
-            .and_then(|d| tensor::argmax_choose(&mut d.alloc, &partials, &starts))
+            .and_then(|d| tensor::argmax_choose(&mut d.alloc, &partials))
             .and_then(|work| self.execute_on(work, 1, RESET_BUDGET));
         self.free(partials)?;
         let out = chosen?;

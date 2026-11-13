@@ -13,7 +13,14 @@
 //! - **It is one op, natively:** the report charges the call's jobs to `argmax/row` and nothing is
 //!   downloaded or staged.
 //!
-//! Negative control: the same rows with the first maximum moved by one give the other index.
+//! - **Any width is one op** (roadmap W4): a row past 65,536 columns has more partials than one
+//!   choice takes (`tensor::ARGMAX_FAN_IN`), so they fold in levels (`tensor::argmax_fold`), and a
+//!   wide vocabulary's row (Qwen3.5's 248,320) is never cut into parts. Equal maxima on both
+//!   sides of a level's boundary: the first. The simulator runs the narrowest row that folds
+//!   (65,601 columns, one level); silicon the vocabularies too.
+//!
+//! Negative controls: the same rows with the first maximum moved by one give the other index; the
+//! larger of two values on either side of a level's boundary, swapped, gives the other index.
 
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_tt::{TileChoice, TtBackend};
@@ -116,5 +123,69 @@ fn the_maximum_moved_is_the_other_index() {
         assert_ne!(first, second);
         let x = Tensor::<TtBackend, 2>::from_data(TensorData::new(v, [1, n]), &d);
         assert_eq!(chosen(x.argmax(1)) as usize, second);
+    });
+}
+
+/// The first column of the second group a row's first middle level folds, on `units` units: the
+/// deal `Session::argmax_row` makes (`tensor::runs`), or `None` for a row with no middle level.
+fn level_boundary(n: usize, units: usize) -> Option<usize> {
+    use tt_kernels::tensor::{runs, ARGMAX_FAN_IN, ARGMAX_RUN_MAX};
+    let partials = runs(n.div_ceil(32), units, ARGMAX_RUN_MAX);
+    if partials.len() <= ARGMAX_FAN_IN {
+        return None;
+    }
+    let level = runs(partials.len(), 1, ARGMAX_FAN_IN);
+    Some(32 * partials[level[1].start].start)
+}
+
+/// Widths past one choice: the simulator's narrowest that folds, silicon's vocabularies besides.
+fn wide_widths() -> &'static [usize] {
+    if cfg!(feature = "silicon") {
+        &[49_152, 65_601, 151_936, 248_320, 262_144]
+    } else {
+        &[65_601]
+    }
+}
+
+#[test]
+fn a_wide_row_s_argmax_is_one_op_through_levels() {
+    with_device(config(), |d| {
+        for &n in wide_widths() {
+            let mut all = cases(n);
+            if let Some(b) = level_boundary(n, 8) {
+                let mut across = row(5, n);
+                for i in [b - 1, b, n - 1] {
+                    across[i] = 30.0;
+                }
+                all.push(("equal maxima across a level's boundary".into(), across));
+            } else {
+                assert!(n <= 65_536, "[1, {n}] folds in a level");
+            }
+            for (what, v) in all {
+                let x = Tensor::<TtBackend, 2>::from_data(TensorData::new(v.clone(), [1, n]), &d);
+                let (got, report) = burn_tt::with_report(|| chosen(x.argmax(1)));
+                assert_native_model(&report);
+                assert!(
+                    report.op("argmax/row").map_or(0, |s| s.jobs) > 0,
+                    "[1, {n}] {what}: the native op"
+                );
+                assert_eq!(got as usize, select::host(&v), "[1, {n}] {what}");
+            }
+        }
+    });
+}
+
+#[test]
+fn the_larger_across_a_level_s_boundary_is_the_other_index() {
+    with_device(config(), |d| {
+        let n = 65_601;
+        let b = level_boundary(n, 8).expect("a row that folds");
+        for (before, after, want) in [(31.0, 30.0, b - 1), (30.0, 31.0, b)] {
+            let mut v = row(17, n);
+            v[b - 1] = before;
+            v[b] = after;
+            let x = Tensor::<TtBackend, 2>::from_data(TensorData::new(v, [1, n]), &d);
+            assert_eq!(chosen(x.argmax(1)) as usize, want, "{before} | {after}");
+        }
     });
 }

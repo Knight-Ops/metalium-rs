@@ -1837,3 +1837,8 @@ hang after "Opening subset of mmio devices" (the first attempt, killed by its 50
   passed 7 of 8 on card 1 (`1794198015`). The eighth, a two-chip test, opens card 0 too whatever `--device` says, and
   failed with "transfer 1 was not acknowledged", the link state above. A `--device 1` filter is not fenced to card 1
   when it selects a mesh test.
+- **2026-11-12, without tt-metal:** after hours of single-card gates and benches on both cards (this repo only), the
+  card-0 smoke's `step147_mesh_trace::product_trace_replays_changed_inputs_equal_to_fresh_runs` failed mid-run with
+  "transfer 206 was not acknowledged (last acknowledged: 205)" (`1794522227`); every `--device all` rerun then failed
+  at "transfer 1". `tt-smi -r 0000:01:00.0 0000:02:00.0`, and step147 passed 6 of 6 with the same build. The link can
+  drop with no tt-metal involved; the remedy is the same.

@@ -353,6 +353,12 @@ They run in this order; W1-W4 can overlap.
 - **Predicted gain:** Qwen3.5-4B 62.5 -> ~41.5 ms a step (the 21.4 ms greedy pick to < 0.5 ms).
 - **Kill:** the pick above 1 ms after the fix.
 - **Gate:** the pick equals `argmax` over the whole row bit for bit, including ties, NaN and `-inf` padding, on a 248,320 vocabulary.
+- **Items 1 and 2 done (2026-11-12,** cards 0 and 1;
+  [log](../learnings/performance-log.md#w4-the-wide-vocabulary-greedy-pick-one-op-for-any-vocabulary-2026-11-12-cards-0-and-1)):
+  the 21.4 ms were the eight parts' slices (each a ~1.5 ms copy), not the argmax nor one unit. A row's partials fold in
+  levels (`tensor::argmax_fold`), one op for any width: 153 us on the card for 248,320 columns. Qwen3.5-4B 54.71 ->
+  **34.10 ms** a step (predicted ~41.5 from 62.5, i.e. ~33 from 54.5), 0.90x tt-metal's 38.0 on the card. The kill (> 1
+  ms) does not fire. Item 3 (top-k / top-p) is open.
 
 ### W5. An 8B-class model
 
@@ -433,7 +439,7 @@ They run in this order; W1-W4 can overlap.
    - Either the bench's chunking or warm-up differs between those runs (`TT_GEN_CHUNKS`, default 64), or something between `5a1640f` and `f29b104` lost ~45% at 256 tokens.
    - Settle it first: re-run `5a1640f` and `HEAD` with the same command on one card. Bisect if they differ.
    - The scoreboard still quotes 3,827.
-2. **The wide-vocabulary greedy pick reads at ~1.5 GB/s** (W4). The docs and the code disagree on its unit count. Confirm with a profiled run (`TT_PROFILE_DETAIL=pipeline`) of one part before changing the code.
+2. **The wide-vocabulary greedy pick reads at ~1.5 GB/s** (W4). The docs and the code disagree on its unit count. Confirm with a profiled run (`TT_PROFILE_DETAIL=pipeline`) of one part before changing the code. **Settled 2026-11-12:** the parts' slices were the cost, not the units; the parts are gone (W4).
 3. **BF16 is storage only.**
    - `float_matmul` refuses non-F32 operands (`burn-tt/src/ops.rs:2559`).
    - BF16 element-wise arithmetic widens through cast ops (`cast_native`).

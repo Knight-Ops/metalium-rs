@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W4: the wide-vocabulary greedy pick, one op for any vocabulary](#w4-the-wide-vocabulary-greedy-pick-one-op-for-any-vocabulary-2026-11-12-cards-0-and-1) | 2026-11-12 | roadmap W4's first two boxes: the 21.4 ms pick was the eight parts' slices (~1.5 ms a copy each), not the argmax; partials folded in levels (`tensor::argmax_fold`), one op for any width, 153 us on the card for 248,320 columns; **Qwen3.5-4B 54.71 -> 34.10 ms a step** (-37.7%, 0.90x tt-metal's 38.0 on the card), the 1.7B unchanged |
 | [W1: a BF16 KV cache, the performance contract's default](#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1) | 2026-11-12 | the 1.7B's decode with a BF16 cache against an F32 one: **18.89 against 19.44 ms at 2K (-2.8%), 38.67 against 43.44 at 8K (-11.0%)**, 7.84 against 7.70 at 32 tokens (+1.9%, a value cast a layer); prefill at 7,992 tokens 5,481 against 5,605 ms; half the cache's GDDR; `step269` 228 of 232, PCC 0.99976; the default (the plan's kill reads "and") |
 | [W1: a BF16 KV cache bounded before building](#w1-a-bf16-kv-cache-bounded-before-building-2026-11-12-card-1) | 2026-11-12 | the 1.7B's decode with the batched products' keys and values not read: 19.54 -> 17.72 ms at 2,000 tokens, 43.48 -> 34.10 at 7,992; a BF16 cache predicted **~0.9 ms (4.7%) at 2K, ~4.7 ms (10.8%) at 8K**, ~0 at short context; built. The other ~26 ms of attention at 8K is not the cache |
 | [W1: the BF16 defects fixed, the BF16 lookup, and one tied table](#w1-the-bf16-defects-fixed-the-bf16-lookup-and-one-tied-table-2026-11-12-cards-0-and-1) | 2026-11-12 | W1's leftovers: a cast widens a host BF16 tensor on the host; a retiling to the same matrix is a view (the BF16 Qwen3.5 holds 4.3 GB of host memory flat, not 40+); `expand` past 2,097,152 rows in chunks; a transposed BF16 `B` transposed by the unpacker; `SELECT_ROWS_BF16`; a tied table stored once, BF16 (owner's call): the 1.7B 7.52 -> 7.68 ms (+2.1%, 312 MB of GDDR less), Qwen3.5-4B 56.93 -> **54.47 ms**; `step167` BF16 229 -> 6.3 s |
@@ -463,6 +464,59 @@ the products are wrong. It is what a zero-byte cache would save; a BF16 one move
   the [next section](#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1).)
 - Builds at 8,192 positions: 695 s first, 170 s second (each block choice measured; build time is not a target).
   The default 900 s silicon timeout cut the first attempt (`1794491283`): such runs take `--timeout-secs 3600`.
+
+## W4: the wide-vocabulary greedy pick, one op for any vocabulary (2026-11-12, cards 0 and 1)
+
+Roadmap W4's first two boxes. Qwen3.5-4B's greedy pick was ~21.4 ms of its step
+([2026-11-08](#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1)):
+`generate::greedy` cut a row past 65,536 columns into parts (248,320 = 8 x 31,040), because one `Session::argmax_row`
+choice holds all of a row's partials in L1, and a 248,320-column row has at least 243 (1 MB; the arena is 896 KiB).
+
+**Diagnosed before any change** (`silicon_probe_sampling::a_wide_vocabulary_s_greedy_pick`, card 0, every tile,
+traced, each alone, host-timed replay, `1794519649`):
+
+| trace | replay, us |
+|---|--:|
+| one 31,040-column part, on a row of its own | 401 |
+| the same part sliced from the 248,320-column row, then `argmax` | 1,873 / 1,913 (first / last part) |
+| the last part's slice alone (`x 1`) | 1,833 |
+| `greedy` over the whole row (eight parts) | **22,556** |
+
+The time was the split itself: each part's `slice` copies its ~4 MB of tiles (~1.5 ms a part), not the argmax.
+The 2026-11-08 reading (each part on one unit) was the profile's: a part's stamps overflowed every window, so no
+replay stamped it.
+
+**Built:** a middle level (`tensor::argmax_fold`, `select::partial_out`) folds more partials than one choice takes
+(`ARGMAX_FAN_IN` = 64, what a 65,536-column row has) in runs of 64, each run's best written as a partial again (its key
+in row 0, its index, the row's own column, in row 4); `Session::argmax_row` folds until one choice remains. The order
+is total and every index is the row's own column, so the levels choose what one choice over every partial would: the
+first maximum, NaN above every number. A row of up to 65,536 columns runs the same programs as before (the 1.7B's
+49,152). `generate::greedy` is `argmax(1)`; the parts, `GREEDY_WHOLE` and `GREEDY_PART` are gone.
+
+**After** (`1794520063`, the probe again; profile `1794520100`, `TT_PROFILE_DETAIL=pipeline`): `greedy` over the
+whole row **1,808 us** host-timed, **153 us on the card** (three ops: partials over 64 units, one level of 4 jobs, the
+choice; 18 replays, none overflowed). The host-timed replay is mostly the probe's own 31.8 MB tilized input landing
+(the one-part trace: 100 us on the card against 401 host-timed); in a model the logits are already on the card.
+The kill (the pick above 1 ms) does not fire; the prediction (under 0.5 ms) is met.
+
+| card 1, performance contract, tree at `b35fc7a` + this change | before | after | |
+|---|--:|--:|--:|
+| Qwen3.5-4B decode, 32 / 256-token prompt, ms (`qwen35_traced_generation`) | 54.71 / 55.40 (`1794508679`) | **34.10 / 34.78** (`1794520159`) | **-37.7% / -37.2%** |
+| Qwen3.5-4B, tokens/s at 32 | 18.3 | **29.3** | |
+| the 1.7B decode, 32 / 128 / 256-token prompt, ms (`traced_generation`, `TT_GEN_MODEL=smollm2-1.7b-instruct`) | 7.842 / 8.307 / 8.853 (`1794506197`) | 7.804 / 8.293 / 8.843 (`1794521323`) | -0.5% / -0.2% / -0.1% |
+
+- Against tt-metal on the same card (§2.3, 2026-11-09): 38.0 ms a step on the card, 44-46 host-timed. Ours, host-timed,
+  is now 0.90x its card time and 0.74-0.77x its host time.
+- Qwen3.5's run checks its traced tokens against the eager schedule and against the logits path, bit for bit.
+- Prefill is unchanged (Qwen3.5 407 ms at 32 tokens; the 1.7B 1,241 / 3,513 / 4,148 tokens/s).
+- What is left of Qwen3.5's step is the DeltaNet layers' small ops, the head and the products (2026-11-08: head
+  5.4-5.6 ms, weight products ~19.5).
+
+Gates: `select::tests::the_programs_choose_the_host_s_index` (the interpreter, widths to 248,320 and fan-ins of 2-64,
+equal maxima on both sides of a level's boundary; a `partial_out` writing its index to the wrong row fails it);
+`step211_argmax_row` (ttsim and card 0, `1794520054`): rows of 49,152, 65,601, 151,936, 248,320 and 262,144 columns
+(ttsim: 65,601, the narrowest that folds) against `select::host`, one native op, and a negative control (the larger
+value on either side of a level's boundary, swapped, gives the other index).
 
 ## W1: a BF16 KV cache, the performance contract's default (2026-11-12, cards 0 and 1)
 

@@ -157,6 +157,17 @@ pub fn combine() -> Vec<Instruction> {
     p.finish()
 }
 
+/// A middle level's finish: the best of its partials as a partial again, its key in row 0 and its
+/// index in row 4, as [`fold`] leaves them. A row too wide for one choice's partials folds them in
+/// levels ([`crate::tensor::argmax_fold`]); the order is total, so the levels choose what one
+/// choice over every partial would.
+pub fn partial_out() -> Vec<Instruction> {
+    let mut p = Program::with_policy(LoopPolicy::Unrolled);
+    p.load(LReg::L1, Format::Int32, C_ROW);
+    p.store(LReg::L1, Format::Int32, OUT_ROW + 4);
+    p.finish()
+}
+
 /// Phase 2's finish: the index as an I32 at `(0, 0)` of the output tile (as `INDEX_TO_I32`
 /// converts: `x + 2^23`, whose low mantissa bits are `x`).
 pub fn index_out() -> Vec<Instruction> {
@@ -250,8 +261,9 @@ pub fn host(row: &[f32]) -> usize {
 }
 
 /// What the device computes for `row` dealt in runs of `run` tiles, on the interpreter: each
-/// run's partial, then the choice.
-pub fn reference(row: &[f32], run: usize) -> usize {
+/// run's partial; while more than `fan_in` partials remain, a level that folds them in runs of
+/// `fan_in` ([`partial_out`]); then the choice.
+pub fn reference(row: &[f32], run: usize, fan_in: usize) -> usize {
     use super::interp::Vector;
     use tt_isa::dm::face_index;
     let ct = row.len().div_ceil(32);
@@ -278,14 +290,23 @@ pub fn reference(row: &[f32], run: usize) -> usize {
         v.run(&fold()).unwrap_or_else(|e| panic!("fold: {e}"));
         partials.push(v.tile(OUT_ROW as usize));
     }
-    let mut v = Vector::new();
-    v.run(&choice_prologue()).unwrap();
-    for t in &partials {
-        v.put_tile(A_ROW as usize, t);
-        v.run(&combine()).unwrap_or_else(|e| panic!("combine: {e}"));
+    let combined = |tiles: &[Vec<u32>], finish: &[Instruction]| {
+        let mut v = Vector::new();
+        v.run(&choice_prologue()).unwrap();
+        for t in tiles {
+            v.put_tile(A_ROW as usize, t);
+            v.run(&combine()).unwrap_or_else(|e| panic!("combine: {e}"));
+        }
+        v.run(finish).unwrap_or_else(|e| panic!("finish: {e}"));
+        v.tile(OUT_ROW as usize)
+    };
+    while partials.len() > fan_in.max(2) {
+        partials = partials
+            .chunks(fan_in.max(2))
+            .map(|level| combined(level, &partial_out()))
+            .collect();
     }
-    v.run(&index_out()).unwrap_or_else(|e| panic!("out: {e}"));
-    v.tile(OUT_ROW as usize)[face_index(0, 0)] as usize
+    combined(&partials, &index_out())[face_index(0, 0)] as usize
 }
 
 #[cfg(test)]
@@ -306,14 +327,30 @@ mod tests {
 
     #[test]
     fn the_programs_choose_the_host_s_index() {
-        for (n, run) in [
-            (1024usize, 4usize),
-            (2048, 13),
-            (3000, 7),
-            (49152, 13),
-            (100, 1),
+        // `fan_in` partials a choice takes: a narrower row than `fan_in` runs is one level, as
+        // before levels; the others fold in one or more middle levels ([`partial_out`]).
+        for (n, run, fan_in) in [
+            (1024usize, 4usize, 64usize),
+            (2048, 13, 64),
+            (3000, 7, 64),
+            (49152, 13, 64),
+            (100, 1, 64),
+            (3000, 1, 4),
+            (49152, 13, 2),
+            (248_320, 32, 64),
+            (65_601, 32, 64),
         ] {
             let mut cases = vec![row(n as u64, n)];
+            // Equal maxima at the last column of the first middle level's partials, the first
+            // column of the next, and the row's last: the first chosen, across the boundary.
+            let level = 32 * run * fan_in;
+            if n > level {
+                let mut across = row(5, n);
+                across[level - 1] = 30.0;
+                across[level] = 30.0;
+                across[n - 1] = 30.0;
+                cases.push(across);
+            }
             // Ties: the maximum at three places, the first chosen.
             let mut tie = row(7, n);
             for &i in &[n / 3, n / 2, n - 1] {
@@ -338,9 +375,9 @@ mod tests {
             cases.push(small);
             for (k, case) in cases.iter().enumerate() {
                 assert_eq!(
-                    reference(case, run),
+                    reference(case, run, fan_in),
                     host(case),
-                    "n {n}, runs of {run}, case {k}"
+                    "n {n}, runs of {run}, {fan_in} partials a choice, case {k}"
                 );
             }
         }
