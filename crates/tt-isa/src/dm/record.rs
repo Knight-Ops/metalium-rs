@@ -910,7 +910,8 @@ fn tensor_of(rec: &[[u32; 8]], at: usize, any: bool, slotted: bool) -> Result<Te
 }
 
 /// A [`GATHER`]'s `B` span, by its reference's marks: by column ([`BSpan::of_columns`]) where its
-/// reader asks for that order, else none (a tile at a time). Refuses an order its `B` cannot take, a mark beside a layout it does
+/// reader asks for that order, else none (a tile at a time, or resident: a resident `B`'s mark names
+/// the order its slots hold). Refuses an order its `B` cannot take, a mark beside a layout it does
 /// not describe, and a read ahead ([`GATHER_PREFETCH`]) of a `B` laid by column but read a tile
 /// at a time: [`PrefetchCursor`] walks only interleaved tiles, so that its per-read code is the
 /// interleaved code alone (the host reads such a record in place, `tile_op::ahead::split`).
@@ -931,8 +932,12 @@ fn gather_span(
         return Err(super::error::LAYOUT);
     }
     if l1_by_column(rec, 3) {
-        if b.col_tiles == 0 || b_t || b_resident {
+        if b.col_tiles == 0 || b_t {
             return Err(super::error::LAYOUT);
+        }
+        // Resident, the mark names the order its slots already hold: nothing is read.
+        if b_resident {
+            return Ok(None);
         }
         let piece = BSpan::piece(flags, slot);
         return BSpan::of_columns(b, b_at, kt, j0, cols, slot, piece).map(Some);
@@ -1305,11 +1310,15 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             if thin > 16 || (thin != 0 && a_t) {
                 return Err(super::error::RANGE);
             }
-            // A by-column operand, or a mark of the L1 order, goes out of line once a record: what
-            // follows is the interleaved code as it was before the layout, byte for byte (tests in
-            // its per-tile loops, or its blocks spread apart, cost every model 2-3%: the movers'
-            // code shares L1 with the compute cores' instruction fetches).
-            if a.col_tiles != 0 || b.col_tiles != 0 || l1_by_column(rec, 1) || l1_by_column(rec, 3)
+            // A by-column operand the record reads, or a mark of the L1 order on one, goes out of
+            // line once a record: what follows is the interleaved code as it was before the
+            // layout, byte for byte (tests in its per-tile loops, or its blocks spread apart, cost
+            // every model 2-3%: the movers' code shares L1 with the compute cores' instruction
+            // fetches). A resident operand's layout names nothing read: a multicast sender of `A`
+            // beside a resident weight reads its `A` here, inline. A mark on `A` is refused there.
+            if l1_by_column(rec, 1)
+                || (!resident && a.col_tiles != 0)
+                || (!b_resident && (b.col_tiles != 0 || l1_by_column(rec, 3)))
             {
                 let slots = [a_slot as u32, b_slot as u32];
                 return gather_by_column(rec, &a, &b, slots, &mut |e| sink.entry(e));
@@ -3393,6 +3402,59 @@ mod tests {
         }
     }
 
+    /// A multicast sender of `A` beside a resident weight: a `B` laid by column (marked or not)
+    /// that the record does not read leaves it inline, its `A` reads through [`Sink::read`] as an
+    /// interleaved `B`'s record's are, entry for entry. Read, the same `B` sends it out of line.
+    #[test]
+    fn a_resident_b_laid_by_column_leaves_the_record_inline() {
+        struct Counted(Vec<[u32; 8]>, usize);
+        impl Sink for Counted {
+            fn entry(&mut self, e: [u32; 8]) -> Result<(), u32> {
+                self.0.push(e);
+                Ok(())
+            }
+            fn read(&mut self, ch: u32, port: u32, off: u32, to: u32, len: u32) -> Result<(), u32> {
+                self.1 += 1;
+                self.entry([op::READ, ch, port, off, to, len, 0, 0])
+            }
+        }
+        let a = TensorRef {
+            n: 2,
+            ct: 6,
+            channels: [3, 5, 0, 0, 0, 0, 0, 0],
+            base: [0x10_0000, 0x20_0000, 0, 0, 0, 0, 0, 0],
+            ..TensorRef::default()
+        };
+        let interleaved = TensorRef {
+            n: 1,
+            ct: 4,
+            ..TensorRef::default()
+        };
+        let (rows, kt) = (3u32, 6u32);
+        let run = |flags: u32, b: &TensorRef, mark: bool| {
+            let (ar, mut br) = (a.encode(), b.encode());
+            if mark {
+                br[0][4] |= REF_L1_BY_COLUMN;
+            }
+            let h = [GATHER, flags | kt << 8, 0x8_0000, 0x2_0000, 1, rows, 0, 2];
+            let mut sink = Counted(Vec::new(), 0);
+            expand_reads_into(&[h, ar[0], ar[1], br[0], br[1]], |_| 0, &mut sink).map(|_| sink)
+        };
+        let want = run(GATHER_B_RESIDENT, &interleaved, false).unwrap();
+        assert_eq!(
+            (want.0.len(), want.1),
+            ((rows * kt) as usize, (rows * kt) as usize)
+        );
+        for mark in [false, true] {
+            let got = run(GATHER_B_RESIDENT, &by_column(2, 4, kt, 0), mark).unwrap();
+            assert_eq!(got.0, want.0, "marked {mark}");
+            assert_eq!(got.1, want.1, "marked {mark}: every `A` read inline");
+            // Read, `B` by column goes out of line: no read reaches `Sink::read`.
+            let read = run(0, &by_column(2, 4, kt, 0), mark).unwrap();
+            assert_eq!(read.1, 0, "marked {mark}, read");
+        }
+    }
+
     /// A stored weight on a product's left: an `A` laid by column is read as an interleaved `A`
     /// is, a read a tile into `a_at + (i * kt + kk) * slot`, each from where the layout puts it:
     /// whole, packed (its own slot), its last row's first rows alone (`thin`), and transposed
@@ -3625,7 +3687,8 @@ mod tests {
             }),
             Err(LAYOUT)
         );
-        // Transposed, resident, on `A`, or marked laid for its reader too.
+        // Transposed, on `A`, or marked laid for its reader too. Resident, the mark names the
+        // order the slots hold: nothing is read.
         let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
         rec[0][1] |= 2;
         rec[3][4] |= REF_L1_BY_COLUMN;
@@ -3633,7 +3696,16 @@ mod tests {
         let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
         rec[0][1] |= GATHER_B_RESIDENT;
         rec[3][4] |= REF_L1_BY_COLUMN;
-        assert_eq!(read(&rec), Err(LAYOUT));
+        assert_eq!(read(&rec), Ok(()), "resident and marked: nothing read");
+        let mut rec = b_gather(0, 4, 0, 2, &interleaved, false);
+        rec[0][1] |= GATHER_B_RESIDENT;
+        rec[3][4] |= REF_L1_BY_COLUMN;
+        // A `B` the record does not read is not checked: no read can land where the mark says.
+        assert_eq!(
+            read(&rec),
+            Ok(()),
+            "resident, marked over an interleaved `B`"
+        );
         let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
         rec[1][4] |= REF_L1_BY_COLUMN;
         assert_eq!(read(&rec), Err(LAYOUT));

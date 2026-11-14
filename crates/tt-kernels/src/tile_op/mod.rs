@@ -263,6 +263,14 @@ pub trait Microkernel {
         let _ = o;
         false
     }
+    /// Whether the body takes operand `o`, laid by column in GDDR, into its slots by column (each
+    /// column's `K` tiles consecutive), so that its gathers read it a column a request
+    /// (`record::REF_L1_BY_COLUMN`). The lowering marks the gathers where this says so, and only
+    /// there: the body's kernels and the mover must agree on the order.
+    fn by_column(&self, o: usize) -> bool {
+        let _ = o;
+        false
+    }
     /// Whether operand `o`'s slots keep its tiles from a unit's run to its next, so that a run
     /// needing the same tiles in the same slots reads none.
     fn holds(&self, o: usize) -> bool {

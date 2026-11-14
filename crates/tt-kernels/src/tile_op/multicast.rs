@@ -511,11 +511,18 @@ mod tests {
                     }
                 }
                 Operand::B => {
+                    // By column where its reference asks for that order in L1.
+                    let by_column = e[at + reference][4] & record::REF_L1_BY_COLUMN != 0;
                     for kk in 0..kt {
                         for j in 0..h[7] {
                             let mut v = name.clone();
                             v.extend([h[6] + j, kk]);
-                            out.push((h[3] + (kk * h[7] + j) * slot, v));
+                            let index = if by_column {
+                                j * kt + kk
+                            } else {
+                                kk * h[7] + j
+                            };
+                            out.push((h[3] + index * slot, v));
                         }
                     }
                 }

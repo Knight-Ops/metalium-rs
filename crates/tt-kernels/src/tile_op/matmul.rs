@@ -149,7 +149,9 @@ pub fn matmul(
             fidelity,
             unpack_b: unpack_b && b.transposed,
             packed: packed.is_some(),
-            b_by_column: packed.is_some() && !b.transposed && b.at.col_tiles != 0,
+            b_by_column: !b.transposed
+                && b.at.col_tiles != 0
+                && (packed.is_some() || matches!(schedule, Schedule::BlockStream { .. })),
             kt: k.div_ceil(32),
             schedule,
             out,
@@ -317,7 +319,8 @@ impl Microkernel for Mma {
         };
         match &self.schedule {
             Schedule::BlockStream { tiles: shape } => {
-                let layout = BlockStreamLayout::placed(*shape, route.slots(), l1);
+                let mut layout = BlockStreamLayout::placed(*shape, route.slots(), l1);
+                layout.b_by_column = self.b_by_column;
                 let (chunk, _) = layout.chunk(c, tiles);
                 // The `Dst` pass: the block row's subblocks, half-sync (`tile_op::dst`).
                 let dst = matmul::dst_row_plan(cols);
@@ -550,6 +553,10 @@ impl Microkernel for Mma {
 
     fn transposes(&self, o: usize) -> bool {
         o == 1 && self.unpack_b
+    }
+
+    fn by_column(&self, o: usize) -> bool {
+        o == 1 && self.b_by_column
     }
 
     fn holds(&self, o: usize) -> bool {

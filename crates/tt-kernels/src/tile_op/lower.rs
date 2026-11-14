@@ -486,6 +486,12 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
     let formats =
         edge_format(a, record::gather_a_format)? | edge_format(b, record::gather_b_format)?;
     let unpack_b = op.body.transposes(pair.b);
+    let b_by_column = op.body.by_column(pair.b);
+    if b_by_column && (pair.transposed[1] || rb.col_tiles == 0) {
+        return Err(TensorError::Shape(
+            "a body takes `B` by column, but `B` is transposed or not laid by column".into(),
+        ));
+    }
     let holds = op.body.holds(pair.a);
     // The outer iterator's last tile row: the rows that hold data.
     let (rt, ragged) = (op.domain[p].tiles(), op.domain[p].elems % 32);
@@ -622,8 +628,9 @@ fn block_jobs(op: &TileOp, deal: &Deal, units: usize, first: usize) -> Result<Ve
                 }
                 | formats;
             let (are, mut bre) = (ar.encode(), br.encode());
-            // A one-row product takes a `B` laid by column into L1 by column (`Mma`'s pairs).
-            if row.is_some() && !tb && br.col_tiles != 0 {
+            // A body that takes a `B` laid by column into L1 by column (`Mma`'s one-row pairs,
+            // its blocks) has its gathers read it so, a column a request (`record::BSpan`).
+            if b_by_column {
                 bre[0][4] |= record::REF_L1_BY_COLUMN;
             }
             let mut gather = tensor::probe_gather(

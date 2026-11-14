@@ -3296,26 +3296,33 @@ fn block_stream_programs_fit(
     fidelity: Fidelity,
 ) -> bool {
     let dst = matmul::dst_row_plan(layout.tiles[2]);
+    // Either `B` order (`BlockStreamLayout::b_by_column`): by column adds a word a subblock.
+    let orders = [false, true].map(|b_by_column| matmul::BlockStreamLayout {
+        b_by_column,
+        ..layout.clone()
+    });
     (0..2).all(|c| {
-        let (roles, loops, _) = matmul::block_stream_programs(
-            layout,
-            c,
-            layout.tiles,
-            route,
-            fidelity,
-            false,
-            matmul::LiveRows::All,
-            dst.as_ref(),
-            crate::matmul::Out::Fp32,
-        );
-        roles.iter().zip(loops.iter()).all(|(p, l)| {
-            let code = crate::code::Code {
-                ins: p.clone(),
-                loops: l.clone(),
-            };
-            code.stored().is_ok_and(|(words, _)| {
-                words.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
-                    && crate::program_cache::admitted(words.len())
+        orders.iter().all(|layout| {
+            let (roles, loops, _) = matmul::block_stream_programs(
+                layout,
+                c,
+                layout.tiles,
+                route,
+                fidelity,
+                false,
+                matmul::LiveRows::All,
+                dst.as_ref(),
+                crate::matmul::Out::Fp32,
+            );
+            roles.iter().zip(loops.iter()).all(|(p, l)| {
+                let code = crate::code::Code {
+                    ins: p.clone(),
+                    loops: l.clone(),
+                };
+                code.stored().is_ok_and(|(words, _)| {
+                    words.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                        && crate::program_cache::admitted(words.len())
+                })
             })
         })
     })

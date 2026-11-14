@@ -423,6 +423,78 @@ fn mover_gather_rate() {
             one.m
                 .set_in_flight_cap(one.d, &one.w, dm::TILE_IN_FLIGHT_CAP)
                 .unwrap();
+            // Roadmap W2, a by-column `B` (`tensor::Layout::ByColumn`, the weights' default): the
+            // same strips with `B` laid by column, read a tile at a time (today's block products:
+            // the record goes out of line, `walk_by_column`), read a column a request
+            // (`REF_L1_BY_COLUMN`, `BSpan`: the one-row products'), and resident (a multicast
+            // `A` sender: only `A` is read, yet the record goes out of line for `B`'s layout);
+            // and the interleaved `A`-only strip for scale. Cycles a tile's worth of bytes.
+            // A tensor laid by column names no slot of its own (`TensorRef::decode`): the
+            // gather's slot steps it.
+            let by_column = TensorRef {
+                ct: COLS * RECORDS,
+                col_tiles: KT,
+                slot: 0,
+                ..tensor
+            }
+            .encode();
+            let mut marked = by_column;
+            marked[0][4] |= record::REF_L1_BY_COLUMN;
+            let b_resident = flags | record::GATHER_B_RESIDENT;
+            let cases = [
+                (
+                    "B by column, a tile a read",
+                    flags,
+                    by_column,
+                    ROWS * KT + KT * COLS,
+                ),
+                (
+                    "B by column, a column a read",
+                    flags,
+                    marked,
+                    ROWS * KT + KT * COLS,
+                ),
+                (
+                    "B by column, resident (A only)",
+                    b_resident,
+                    by_column,
+                    ROWS * KT,
+                ),
+                ("B interleaved, resident (A only)", b_resident, b, ROWS * KT),
+            ];
+            for (what, flags, b, tiles) in cases {
+                let list: Vec<Entry> = (0..RECORDS)
+                    .flat_map(|r| {
+                        [
+                            [
+                                record::GATHER,
+                                flags,
+                                a_at,
+                                b_at,
+                                r * ROWS,
+                                ROWS,
+                                r * COLS,
+                                COLS,
+                            ],
+                            a[0],
+                            a[1],
+                            b[0],
+                            b[1],
+                        ]
+                    })
+                    .collect();
+                for rec in list.chunks(record::len(record::GATHER)) {
+                    record::expand_reads(rec, |_| 0, |_| Ok(())).unwrap();
+                }
+                let tiles = (RECORDS * tiles) as f64;
+                let cycles = list_cycles(one.d, &one.w, &mut one.m, &list);
+                report(
+                    &format!("gather rate: {what}, cycles a {slot}-byte tile's bytes"),
+                    "cycles",
+                    "device",
+                    cycles.map(|c| c / tiles),
+                );
+            }
             one.d
                 .write32(&one.w, t, trace, dm::trace_mode::FULL)
                 .unwrap();

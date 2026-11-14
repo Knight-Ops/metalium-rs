@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W2: block gathers read a weight a column a request](#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0) | 2026-11-14 | a by-column weight read a column a request costs ~86 cycles a tile against ~248 a tile at a time; block products take weights into L1 by column. H1 default 69.3 / 92.0 -> 70.7 / 98.7 TFLOPS, multicast 74.2 / 89.1 -> 79.3 / 95.3; the 1.7B's prefill +7-13%, decode unchanged |
 | [W2: a stable measured block choice](#w2-a-stable-measured-block-choice-2026-11-14-card-0) | 2026-11-14 | the noise was path dependence: the climb from the fastest listed candidate missed H1's `[8,4,9]` basin. Three starts and near ties timed again: H1 LoFi `[8,4,9]` in 5 of 5 processes (92.0-92.6 TFLOPS), HiFi2 a 1% tie (68.8-69.5); the 1.7B's decode and prefill unchanged (ABBA) |
 | [The movers' per-chunk code placement, tried and reverted; what moved the plain product](#the-movers-per-chunk-code-placement-tried-and-reverted-what-moved-the-plain-product-2026-11-14-card-0) | 2026-11-14 | the instruction cache is **2-way, 16-byte lines, 128 sets** (`instruction_cache_geometry_by_aliasing`). The 11-14 "placement moves a product by 20%" was **the measured block choice**, which differs from process to process (and once chose a block 14% slower). Placing B's and NC's per-chunk code (`exec` split hot / cold, rare record arms out of line, `.text.chunk`) gave the 1.7B decode step 1.5-2.1% for ~3.1 KiB on B and ~2 KiB on NC (`profile` room 764): **reverted**, not worth the room |
 | [W2: a cheaper gather, the send-ahead kept, and B's code placement](#w2-a-cheaper-gather-the-send-ahead-kept-and-bs-code-placement-2026-11-14-card-0) | 2026-11-14 | a gather's tile read 386 -> **260 cycles** (safe; 374 -> 241 `fast-reads`): `dm::ReadPlan` and `record::Sink`, held to the general path by a host test; multicast product 61.9 / 67.7 -> **65.2 / 70.1 TFLOPS** with the send-ahead kept (`B` alone 90.4 -> 85.0); the 1.7B's prefill +7-11%, its decode unchanged. Found: **B's code placement moves a product by up to 20%** (the plain product's no-gathers HiFi2 132.4 -> 113.1, LoFi 76.5 -> 92.6, with nothing it runs changed) |
@@ -439,6 +440,64 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W2: block gathers read a weight a column a request (2026-11-14, card 0)
+
+Roadmap W2's "the gather's remaining ~160 cycles a tile". Performance contract, release, safe image, card 0.
+
+**Bound first** (`silicon_bench_memory::mover_gather_rate`, profile image, `1794637454`; strips of 7 x 4 `A` tiles
+and 4 x 8 `B` tiles, cycles a tile's worth of bytes):
+
+| case | cycles |
+|---|---|
+| both interleaved, inline (the plain product's) | 259.9 |
+| `B` by column, a tile a read (block products on a weight, out of line) | 283.9 |
+| `B` by column, a column a request (`BSpan`) | 197.6 |
+| `B` resident and by column (an `A` sender beside a weight; out of line) | 325.5 |
+| `B` resident and interleaved (inline) | 304.4 |
+
+Less `A`'s share, `B` costs ~248 cycles a tile read a tile at a time, ~221 interleaved inline, and **~86** by
+column. `B` needed no new layout: weights are already stored by column (`TT_WEIGHT_COLUMNS`); only one-row products
+read them so.
+
+**Built:**
+- **Block products take a by-column weight into L1 by column.** `Microkernel::by_column` (new) tells the lowering
+  which operand the body takes so, and the lowering marks only those gathers `REF_L1_BY_COLUMN`, so the kernels and
+  the mover cannot disagree. `Mma` says so for a one-row product (as before) and now for `Schedule::BlockStream`.
+- **The block kernels step `B` by column** (`BlockStreamLayout::b_by_column`, `b_index`; `chunk` names the pairs):
+  - unrolled: through `chunk`;
+  - looped: its two strides swapped;
+  - subblocked: a `K` row's first column in GPR 49, so each `K` step is two independent adds and none negative.
+    `SUBDMAREG` would be one add, but ttsim refuses it, and `ADDDMAREG`'s wraparound is unverified.
+- **A record reads its operands' layouts only where it reads them** (`record.rs`): a resident by-column operand no
+  longer sends the record out of line (a multicast `A` sender beside a weight reads `A` inline), and a resident `B`
+  may carry the mark, which names the order its slots hold.
+- **Gates:**
+  - `matmul::order`: the subblocked and looped kernels pack the by-column chunk's canonical order under the
+    adversarial interpreter, and row-stepping kernels miss it;
+  - `step229`'s and `step274`'s new by-column tests, bit for bit against the unblocked path, on ttsim and card 0.
+    Each was watched failing with the kernels stepping by row; step274 first did not fail, because it compared
+    two blocked products, so it now compares against the unblocked path too;
+  - a record test that a resident by-column `B` keeps `A`'s reads in `Sink::read` (watched failing on the old
+    condition);
+  - `step172` / `step173` in safe, `fast-reads` and `encoded-guard`;
+  - `step12_mnist`, 8/8;
+  - `dm_b`'s room at its tightest (profile + encoded-guard) is 4,440 bytes.
+
+**H1 `[2048,2048]@[2048,16384]`**, against the parent `231aaf2` in the same session, BF16-HiFi2 / BF16 x BFP8 LoFi:
+- **Default (pull, 120 units):** 69.3 / 92.0 (`1794638828`) -> **70.7 / 98.7 TFLOPS** (`1794638523`). Without `A`'s
+  gathers 72.7 / 126.8: `A` is now the larger share of the gathers.
+- **Multicast** (`TT_OPERAND_REUSE=mcast`, 10x12): 74.2 / 89.1 (`1794638976`) -> **79.3 / 95.3** (`1794638654`), at
+  `[7,4,9]` / `[7,4,11]` both times. HiFi2 multicast is above the default for the first time. The 65.2 / 70.1
+  quoted before were at the unstable block choice (the entry below). The "every sender's reads skipped" row is
+  86.5 / 101.9 against 85.6 / 101.2: the product is now within 8% / 6% of it.
+
+**The 1.7B, ABBA** (new `1794639138` / `1794641348`, parent `1794639831` / `1794640576`): prefill 1,377 / 3,757 /
+4,451 -> **1,562 / 4,025 / 4,768 tokens/s** at 32 / 128 / 256 tokens (+13.4 / +7.1 / +7.1%); decode step 7.864 /
+8.253 / 8.739 -> 7.833 / 8.253 / 8.737 ms (unchanged). The bench's captures are ~60 s faster (489 against 550 s).
+
+**Next:** `A`'s reads. A gather that reads both operands still goes out of line for `B`'s mark, so `A` takes the
+per-entry path (325 against 304 cycles a tile alone). Then `A` laid by row.
 
 ## W2: a stable measured block choice (2026-11-14, card 0)
 

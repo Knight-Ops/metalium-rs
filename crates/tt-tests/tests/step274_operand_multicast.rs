@@ -182,6 +182,47 @@ fn a_multicast_product_is_the_unshared_one_bit_for_bit() {
     case([2, 3], [128, 256, 288], [2, 2, 1], true, true);
 }
 
+/// A weight laid by column (the stored weights' default): its strips gathered a column a request
+/// into L1 by column (`record::BSpan`), multicast as they lie, and the readers' kernels stepping
+/// `B` by column over their resident strips. Both operands, `A` alone and `B` alone (the senders
+/// of `A` beside a resident weight read their `A` inline), each fidelity.
+#[test]
+fn a_weight_laid_by_column_multicasts_bit_for_bit() {
+    let (m, k, n) = (128, 256, 512);
+    with_session(rect(2, 4), |s| {
+        s.set_block_stream(BlockStream::Fixed([2, 2, 2]));
+        let bits: Vec<u16> = values(k * n, 12)
+            .iter()
+            .map(|v| (v.to_bits() >> 16) as u16)
+            .collect();
+        let b = s.upload_bf16_weight(&bits, k, n).unwrap();
+        assert_eq!(
+            b.placement.layout(),
+            tt_kernels::tensor::Layout::ByColumn,
+            "the weight by column"
+        );
+        let a = s.upload(&values(m * k, 11), m, k).unwrap();
+        for fidelity in [Fidelity::HiFi4, Fidelity::Lo] {
+            // Unblocked, `B` read a tile at a time: the order by column is not on both sides.
+            s.set_block_stream(BlockStream::Off);
+            let (want, _) = product(s, &a, false, &b, false, fidelity, Reuse::Off);
+            s.set_block_stream(BlockStream::Fixed([2, 2, 2]));
+            let (plain, _) = product(s, &a, false, &b, false, fidelity, Reuse::Off);
+            same(&want, &plain, &format!("by column, blocked, {fidelity:?}"));
+            for (a_, b_) in [(true, true), (true, false), (false, true)] {
+                let what = format!("by column, A {a_}, B {b_}, {fidelity:?}");
+                let reuse_ = Reuse::Multicast { a: a_, b: b_ };
+                let (shared, strips) = product(s, &a, false, &b, false, fidelity, reuse_);
+                assert!(strips > 0, "{what}: nothing was multicast");
+                same(&plain, &shared, &what);
+                zeroed(s, &what);
+            }
+        }
+        s.free(a).unwrap();
+        s.free(b).unwrap();
+    });
+}
+
 /// `A` alone, and `B` alone.
 #[test]
 fn either_operand_alone_gives_the_same_bits() {
