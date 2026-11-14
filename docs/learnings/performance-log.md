@@ -499,6 +499,19 @@ read them so.
 **Next:** `A`'s reads. A gather that reads both operands still goes out of line for `B`'s mark, so `A` takes the
 per-entry path (325 against 304 cycles a tile alone). Then `A` laid by row.
 
+**The gather-ahead's bound, after this** (roadmap W2 (2); `TT_CONTRACT_PIPELINE=1`, `--profile`, multicast on 10x12,
+`1794644501`; LoFi only, since HiFi2's log overflowed):
+- The slowest sender, per batch of 64: its strip read 7.3 us (467 us), then its wait for the other operand's strips
+  11.2 us (716 us), in series. The kernel takes 14.5 us (929 us) and T0 starves 9.0 us (577 us). Over all units:
+  `pipe` 1,515 us against an `ideal` of 1,221.
+- Hiding every sender's read behind its wait is worth at most the "every sender's reads skipped" row: 85.6 / 101.2
+  against 79.3 / 95.3, so **+7.9% / +6.2%**.
+- The meter cannot isolate T0's pop from T2's push (`kernel` spans both), so the consumed-to-packed tail the guard
+  would recover is unmeasured. Reordering puts `push(c)` behind `gather(c + 1)`, which starts only once chunk
+  `c - 1` is consumed, so T0 may wait a strip read a batch: the hazard that lost 53.1 / 56.2 under the packed guard.
+- The same ceiling is also reachable without the reorder, by making the senders' reads cheaper: `A`'s reads
+  inline beside a `B` span, then `A` laid by row.
+
 ## W2: a stable measured block choice (2026-11-14, card 0)
 
 Roadmap W2's "the measured block choice is noisy". Performance contract, release, safe image, card 0.
