@@ -374,6 +374,10 @@ pub const SMOKE: &[&str] = &[
     // F4b: operand reuse; a blocked product's readers copy `A` from a holder's L1 under credits,
     // bit for bit the unshared product, eager and replayed, every credit word back at zero.
     "step244_operand_reuse::",
+    // W2: operand multicast over a grid rectangle; a row's sender multicasts `A`, a column's `B`,
+    // credited both ways (a ready word), bit for bit the unshared product, eager and replayed,
+    // misroutes caught, a stall recovered, every credit word back at zero.
+    "step274_operand_multicast::",
     // F4b.2: a measured block choice; the chosen candidate runs bit for bit, a question is
     // timed once, and a capture paused to measure records what it would unpaused.
     "step245_measured_block::",

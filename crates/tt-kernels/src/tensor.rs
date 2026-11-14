@@ -2053,11 +2053,19 @@ pub enum Reuse {
     /// Where a measurement chose it ([`BlockStream::Measured`]); unmeasured, nothing is shared
     /// (`crate::tile_op::reuse::share`).
     Auto,
+    /// The units are a grid of rows (consecutive units on one tile row, the first row's width),
+    /// each grid row a group of the deal and each column of it a column group: the first unit
+    /// of a grid row reads its strips of `A` from GDDR and multicasts them along the row, the
+    /// first grid row's units read the strips of `B` and multicast them down their columns
+    /// (`op::WRITE_L1_MCAST`, credited both ways; roadmap W2, `crate::tile_op::multicast`).
+    /// `a` and `b` say which operands are shared.
+    Multicast { a: bool, b: bool },
 }
 
 impl Reuse {
-    /// `TT_OPERAND_REUSE`: `off`, `auto`, or `pull`, `pull:<holders>` (one by default) or
-    /// `pull:<holders>,<b_holders>` (`B` shared too); [`Reuse::Auto`] when unset, the session's
+    /// `TT_OPERAND_REUSE`: `off`, `auto`, `pull`, `pull:<holders>` (one by default) or
+    /// `pull:<holders>,<b_holders>` (`B` shared too), or `mcast` / `mcast:a|b|ab`
+    /// ([`Reuse::Multicast`], both operands by default); [`Reuse::Auto`] when unset, the session's
     /// default since F4b.2 (a measured choice pulls `A` where it gains; nothing else shares).
     pub fn from_env() -> Self {
         match std::env::var("TT_OPERAND_REUSE") {
@@ -2080,6 +2088,13 @@ impl std::str::FromStr for Reuse {
                 holders: 1,
                 b_holders: None,
             }),
+            None if s == "mcast" => Ok(Reuse::Multicast { a: true, b: true }),
+            Some(("mcast", which)) => match which {
+                "a" => Ok(Reuse::Multicast { a: true, b: false }),
+                "b" => Ok(Reuse::Multicast { a: false, b: true }),
+                "ab" => Ok(Reuse::Multicast { a: true, b: true }),
+                _ => Err(format!("`mcast:{which}`: expected `a`, `b` or `ab`")),
+            },
             Some(("pull", h)) => {
                 let count = |c: &str| match c.trim().parse::<usize>() {
                     Ok(n) if n > 0 => Ok(n),
@@ -2097,8 +2112,8 @@ impl std::str::FromStr for Reuse {
                 }
             }
             _ => Err(format!(
-                "expected `off`, `auto`, `pull`, `pull:<holders>` or `pull:<holders>,<b_holders>`, \
-                 not `{s}`"
+                "expected `off`, `auto`, `pull`, `pull:<holders>`, `pull:<holders>,<b_holders>`, \
+                 `mcast` or `mcast:a|b|ab`, not `{s}`"
             )),
         }
     }

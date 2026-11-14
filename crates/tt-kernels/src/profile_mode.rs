@@ -98,11 +98,14 @@ impl Default for ProfileOptions {
 }
 
 impl ProfileOptions {
-    /// The mover's `tt_isa::dm::TRACE` word for this detail.
+    /// The mover's `tt_isa::dm::TRACE` word for this detail. [`Detail::Pipeline`] adds B's credit
+    /// stamps (`trace_mode::CREDITS`) and NC's entry log (`trace_mode::NC_LOG`).
     pub fn trace_mode(&self) -> u32 {
+        use tt_isa::dm::trace_mode as m;
         match self.detail {
-            Detail::Ops | Detail::Pipeline => tt_isa::dm::trace_mode::OPS,
-            Detail::Full => tt_isa::dm::trace_mode::FULL,
+            Detail::Ops => m::OPS,
+            Detail::Pipeline => m::OPS | m::CREDITS | m::NC_LOG,
+            Detail::Full => m::FULL,
         }
     }
 
@@ -119,7 +122,8 @@ impl ProfileOptions {
         marks
             + base
             + match self.detail {
-                Detail::Ops | Detail::Pipeline if !tt_isa::dm::trace_mode::ops_stamped(op) => 0,
+                Detail::Ops if !tt_isa::dm::trace_mode::ops_stamped(op) => 0,
+                Detail::Pipeline if !tt_isa::dm::trace_mode::ops_stamped_with(op, true) => 0,
                 _ if waits && self.push => 6,
                 _ => 3,
             }
@@ -342,10 +346,13 @@ struct Classes {
 impl Classes {
     fn see(&mut self, event: Event, t: u64) {
         match event {
-            Event::Entry { begin: true, op } => self.open.push((op, t)),
+            Event::Entry {
+                begin: true, op, ..
+            } => self.open.push((op, t)),
             Event::Entry {
                 begin: false,
                 op: end,
+                ..
             } => {
                 if let Some(at) = self.open.iter().rposition(|&(o, _)| o == end) {
                     let (_, t0) = self.open.remove(at);
@@ -427,6 +434,7 @@ pub fn attribute_replay(events: &[TraceEvent], lo: u32, detail: Detail) -> Vec<O
         if let Event::Entry {
             begin: false,
             op: op::BARRIER,
+            ..
         } = event
         {
             match since {
@@ -477,13 +485,17 @@ pub fn attribute_entries(events: &[TraceEvent], lo: u32) -> Vec<EntryCosts> {
     let mut out = Vec::new();
     for &(event, t) in &stamps[start..] {
         match event {
-            Event::Entry { begin: true, op } => {
+            Event::Entry {
+                begin: true, op, ..
+            } => {
                 if open.is_empty() {
                     costs.entry(op).or_default().gap += t.saturating_sub(last);
                 }
                 open.push((op, t));
             }
-            Event::Entry { begin: false, op } => {
+            Event::Entry {
+                begin: false, op, ..
+            } => {
                 if let Some(at) = open.iter().rposition(|&(o, _)| o == op) {
                     let (_, t0) = open.remove(at);
                     let c = costs.entry(op).or_default();
@@ -535,10 +547,12 @@ pub fn unit_times(
             Event::Entry {
                 begin: true,
                 op: op::BARRIER,
+                ..
             } => open = Some((t, std::mem::take(&mut totals))),
             Event::Entry {
                 begin: false,
                 op: op::BARRIER,
+                ..
             } => {
                 let (arrive, totals) = open.take()?;
                 pairs.push((arrive, t, totals));
@@ -625,6 +639,7 @@ pub fn unit_reads(
             Event::Entry {
                 begin,
                 op: op::BARRIER,
+                ..
             } => {
                 if begin {
                     begins.push(t);
@@ -778,6 +793,16 @@ pub struct Batch {
     pub t0: [u64; 3],
     /// T2 entering its output reserve, the reserve returning, and its push (the batch packed).
     pub t2: [u64; 3],
+    /// On a unit that hands what it reads to its NC to send on (a multicast sender,
+    /// `tile_op::multicast`): B's transfer-stream reserve inside the batch, its begin and end, and
+    /// its push, begin and end. The reserve waits for NC to free a half; the gather runs from its
+    /// end to the push's begin. All zero on a unit that does not.
+    pub transfer: [u64; 4],
+    /// B's credit waits (`WAIT_CREDIT`) inside the batch, in cycles: a reader waiting for the
+    /// strips its senders multicast.
+    pub credit_wait: u64,
+    /// B's credits (`CREDIT`) inside the batch, in cycles: a reader freeing its half for a sender.
+    pub credit: u64,
 }
 
 impl Batch {
@@ -789,6 +814,130 @@ impl Batch {
     /// The batch's kernel: from T0 seeing it to T2 pushing it.
     pub fn kernel(&self) -> (u64, u64) {
         (self.t0[1], self.t2[2])
+    }
+
+    /// Whether B handed the batch's reads to its NC to send on ([`Batch::transfer`]).
+    pub fn sent(&self) -> bool {
+        self.transfer[1] != 0
+    }
+}
+
+/// What RISCV NC did on one unit for one op, from its entry log (`tt_isa::dm::nc_log`,
+/// [`splice_nc_log`]), in tile cycles: each record's entry lasts until the next record. On a
+/// multicast sender (`tile_op::multicast`) a strip is a transfer wait (its B's gather done), a wait
+/// for its readers' frees, the multicast, its acknowledgements, the ready word raised and copied,
+/// and the transfer's pop; its own results are an output wait (its T2's push), a write and a pop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NcStats {
+    /// Records the log kept, and those it lost (it was full: the op's NC time is short by theirs).
+    pub records: u64,
+    pub lost: u64,
+    /// Transfer batches NC took from B (the transfer stream's waits): a multicast sender's strips,
+    /// or a plain transfer's tiles.
+    pub strips: u64,
+    /// Output batches NC took from T2 (the output stream's waits).
+    pub outputs: u64,
+    /// Waiting for B's transfer batch: the strip's reads not landed.
+    pub transfer_wait: u64,
+    /// Popping a transfer batch (its writes drained first).
+    pub transfer_pop: u64,
+    /// Waiting for T2's output batch: the unit's own kernel behind.
+    pub output_wait: u64,
+    /// Popping an output batch (its writes drained first).
+    pub output_pop: u64,
+    /// `WAIT_CREDIT`s: a sender waiting for its readers' frees.
+    pub credit_wait: u64,
+    /// `CREDIT`s: raising a credit word (after the requests before it completed).
+    pub credit: u64,
+    /// Issuing a multicast run's requests.
+    pub multicast: u64,
+    /// Counting a multicast run's acknowledgements.
+    pub settle: u64,
+    /// Lone multicasts: a credit word's copy into readers.
+    pub copy: u64,
+    /// Writes: an output's scatter, `WRITE`, `WRITE_L1`.
+    pub write: u64,
+    /// Any other entry, and a list's start.
+    pub other: u64,
+    /// Between lists: from a list's end to the next list's start.
+    pub idle: u64,
+}
+
+impl NcStats {
+    /// One unit's records on one op, `(tag, time)` in order, and the records its log lost.
+    pub fn of(records: &[(u32, u64)], lost: u64) -> NcStats {
+        use tt_isa::dataflow::{Action, Stream};
+        use tt_isa::dm::nc_log as l;
+        let mut s = NcStats {
+            records: records.len() as u64,
+            lost,
+            ..NcStats::default()
+        };
+        for (i, &(tag, t)) in records.iter().enumerate() {
+            let arg = l::arg(tag);
+            let (stream, action) = (Stream::decode(arg >> 2), Action::decode(arg & 3));
+            if l::kind(tag) == l::CB && action == Some(Action::Wait) {
+                match stream {
+                    Some(Stream::Transfer) => s.strips += 1,
+                    Some(Stream::Output) => s.outputs += 1,
+                    _ => {}
+                }
+            }
+            let Some(&(_, next)) = records.get(i + 1) else {
+                continue;
+            };
+            let d = next.saturating_sub(t);
+            let to = match (l::kind(tag), stream, action) {
+                (l::CB, Some(Stream::Transfer), Some(Action::Wait)) => &mut s.transfer_wait,
+                (l::CB, Some(Stream::Transfer), _) => &mut s.transfer_pop,
+                (l::CB, Some(Stream::Output), Some(Action::Wait)) => &mut s.output_wait,
+                (l::CB, Some(Stream::Output), _) => &mut s.output_pop,
+                (l::WAIT_CREDIT, ..) => &mut s.credit_wait,
+                (l::CREDIT, ..) => &mut s.credit,
+                (l::MCAST, ..) if arg == 0 => &mut s.multicast,
+                (l::MCAST, ..) => &mut s.copy,
+                (l::SETTLE, ..) => &mut s.settle,
+                (l::WRITE, ..) => &mut s.write,
+                (l::END, ..) => &mut s.idle,
+                _ => &mut s.other,
+            };
+            *to += d;
+        }
+        s
+    }
+
+    /// NC's time inside its lists.
+    pub fn busy(&self) -> u64 {
+        self.transfer_wait
+            + self.transfer_pop
+            + self.output_wait
+            + self.output_pop
+            + self.credit_wait
+            + self.credit
+            + self.multicast
+            + self.settle
+            + self.copy
+            + self.write
+            + self.other
+    }
+
+    pub fn add(&mut self, o: &NcStats) {
+        self.records += o.records;
+        self.lost += o.lost;
+        self.strips += o.strips;
+        self.outputs += o.outputs;
+        self.transfer_wait += o.transfer_wait;
+        self.transfer_pop += o.transfer_pop;
+        self.output_wait += o.output_wait;
+        self.output_pop += o.output_pop;
+        self.credit_wait += o.credit_wait;
+        self.credit += o.credit;
+        self.multicast += o.multicast;
+        self.settle += o.settle;
+        self.copy += o.copy;
+        self.write += o.write;
+        self.other += o.other;
+        self.idle += o.idle;
     }
 }
 
@@ -827,6 +976,22 @@ pub struct PipeStats {
     /// `pipe` had every batch's reads overlapped the kernel before (`r0 + Σ max(r_i, k_(i-1)) +
     /// k_last`): what a deeper ring could reach at the same read and kernel times.
     pub ideal: u64,
+    /// Batches B handed to its NC to send on ([`Batch::sent`]): a multicast sender's strips.
+    pub sent: u64,
+    /// B waiting for a transfer half (NC still sending the strip before last), summed over the
+    /// sent batches.
+    pub transfer_ring: u64,
+    /// B's gather of a sent batch, from its transfer reserve's end to its push's begin: the strip's
+    /// GDDR reads issued.
+    pub gather: u64,
+    /// B's transfer push: waiting for the strip's reads to land.
+    pub transfer_land: u64,
+    /// B's credit waits inside its batches ([`Batch::credit_wait`]): a reader waiting for strips.
+    pub credit_wait: u64,
+    /// B's credits inside its batches ([`Batch::credit`]).
+    pub credit: u64,
+    /// The unit's NC on the op ([`NcStats`]), when its log was kept.
+    pub nc: NcStats,
 }
 
 impl PipeStats {
@@ -855,6 +1020,15 @@ impl PipeStats {
             s.starve += b.t0[1].saturating_sub(b.t0[0]);
             s.kernel += len(b.kernel());
             s.out_wait += b.t2[1].saturating_sub(b.t2[0]);
+            if b.sent() {
+                let t = b.transfer;
+                s.sent += 1;
+                s.transfer_ring += t[1].saturating_sub(t[0]);
+                s.gather += t[2].saturating_sub(t[1]);
+                s.transfer_land += t[3].saturating_sub(t[2]);
+            }
+            s.credit_wait += b.credit_wait;
+            s.credit += b.credit;
             if i > 0 {
                 ideal += len(b.read()).max(len(batches[i - 1].kernel()));
             }
@@ -865,6 +1039,17 @@ impl PipeStats {
         }
         s.ideal = ideal + len(last.kernel());
         s
+    }
+
+    /// These stats with the unit's NC on the op.
+    pub fn with_nc(self, nc: NcStats) -> PipeStats {
+        PipeStats { nc, ..self }
+    }
+
+    /// Whether the unit sent strips on the op: B handed batches to NC to send, or NC multicast.
+    /// (NC's transfer waits alone do not say so: a plain transfer takes them too.)
+    pub fn sender(&self) -> bool {
+        self.sent > 0 || self.nc.multicast > 0
     }
 
     pub fn add(&mut self, o: &PipeStats) {
@@ -881,20 +1066,35 @@ impl PipeStats {
         self.overlap += o.overlap;
         self.pipe += o.pipe;
         self.ideal += o.ideal;
+        self.sent += o.sent;
+        self.transfer_ring += o.transfer_ring;
+        self.gather += o.gather;
+        self.transfer_land += o.transfer_land;
+        self.credit_wait += o.credit_wait;
+        self.credit += o.credit;
+        self.nc.add(&o.nc);
     }
 }
 
-/// One unit's batches on one op: `(unit, since, arrive, batches)`, on the unit's clock (`since`
-/// its previous barrier's release, `arrive` its arrival at the op's).
-pub type UnitBatches = (u16, u64, u64, Vec<Batch>);
+/// A label's row of [`ProfileReport::sender_table`]: `(label, samples, units, every unit's sum,
+/// senders, the senders' sum)`.
+type SenderRow<'a> = (&'a str, u64, u64, &'a PipeStats, u64, &'a PipeStats);
+
+/// One unit's batches on one op: `(unit, since, arrive, batches, nc)`, on the unit's clock (`since`
+/// its previous barrier's release, `arrive` its arrival at the op's), with its NC's log.
+pub type UnitBatches = (u16, u64, u64, Vec<Batch>, NcStats);
 
 /// One op's [`PipeStats`] in one replay: its slowest unit's (most `work`), and the sum over the
-/// `units` that streamed batches for it.
+/// `units` that streamed batches for it; and of those, the units that sent strips
+/// ([`PipeStats::sender`]): their slowest and their sum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PipeSample {
     pub slowest: PipeStats,
     pub sum: PipeStats,
     pub units: u64,
+    pub slowest_sender: PipeStats,
+    pub senders: PipeStats,
+    pub sender_units: u64,
 }
 
 /// Why [`unit_pipes`] could not tell a pair's batches, an index into [`UnitPipes::dropped`]: its
@@ -914,9 +1114,12 @@ pub const DROP_REASONS: [&str; 7] = [
 
 /// How far apart two cores' times may stand against the credit protocol's order and still be
 /// taken as in order, in cycles. B stamps a credit's end after publishing it, so the role it
-/// frees may act before that stamp: by 6 cycles on card 0 (`1793635382`); the roles' own times
-/// are exact reads of the same counter. 64 cycles (~47 ns) is a tenth of a stamp's spacing.
-pub const CROSS_CORE_SLACK: u64 = 64;
+/// frees may act before that stamp: by 6 cycles on card 0 (`1793635382`), and by 65-70 on a
+/// pair's first input push once a gather's reads went straight to the NoC (`dm::ReadPlan`, card
+/// 0, `1794613736`: T0's wait returned that far before B's push stamped its end); the roles' own
+/// times are exact reads of the same counter. 128 cycles (~95 ns) is still a fortieth of such a
+/// product's batch (~5,000 cycles), so a join off by a batch is not taken as in order.
+pub const CROSS_CORE_SLACK: u64 = 128;
 
 /// The host's half of the batch log (`tt_isa::dm::BATCH_LOG`): unit `u`'s stamps since its last
 /// drain, each `BATCH_BASE` replaced by its record from `log` (the log's words after its count)
@@ -970,6 +1173,77 @@ pub fn splice_batch_log(events: Vec<TraceEvent>, log: &[u32]) -> Vec<TraceEvent>
     out
 }
 
+/// The host's half of RISCV NC's entry log (`tt_isa::dm::nc_log`): unit `u`'s stamps since its
+/// last drain with the log's records (`log`, its words after the header) merged in by time, each an
+/// `NC_RECORD` on the tile's full counter, and an `NC_LOST` after the last if `lost` records did not
+/// fit. An anchor's word is the counter's low word, placed as the full counter nearest before `now`
+/// (the counter when the log was read: a record is less than 2^32 cycles, ~3 s, older); each
+/// record after it is placed from the one before, its field counting forward (to within the
+/// [`tt_isa::dm::nc_log::CLOCK_SHIFT`] bits it drops). Records before the first anchor, and an
+/// anchor without its word, are left out.
+pub fn splice_nc_log(events: Vec<TraceEvent>, log: &[u32], lost: u32, now: u64) -> Vec<TraceEvent> {
+    use tt_isa::dm::nc_log as l;
+    let mut records: Vec<TraceEvent> = Vec::new();
+    let mut at: Option<u64> = None;
+    let mut i = 0;
+    while i < log.len() {
+        let w = log[i];
+        let tag = l::tag_of(w);
+        let cycles = if l::kind(tag) == l::ANCHOR {
+            let Some(&low) = log.get(i + 1) else {
+                break;
+            };
+            i += 1;
+            let full = (now & !0xFFFF_FFFF) | u64::from(low);
+            if full > now {
+                full.saturating_sub(1 << 32)
+            } else {
+                full
+            }
+        } else if let Some(prev) = at {
+            let mask = u64::from(l::CLOCK_MASK);
+            let was = (prev >> l::CLOCK_SHIFT) & mask;
+            prev + ((u64::from(w & l::CLOCK_MASK).wrapping_sub(was) & mask) << l::CLOCK_SHIFT)
+        } else {
+            i += 1;
+            continue;
+        };
+        at = Some(cycles);
+        records.push(TraceEvent {
+            token: ev::token_with(ev::MOVER, ev::NC_RECORD, tag),
+            cycles,
+        });
+        i += 1;
+    }
+    if lost > 0 {
+        records.push(TraceEvent {
+            token: ev::token_with(ev::MOVER, ev::NC_LOST, lost),
+            cycles: at.unwrap_or(0),
+        });
+    }
+    if records.is_empty() {
+        return events;
+    }
+    let mut out = Vec::with_capacity(events.len() + records.len());
+    let mut nc = records.into_iter().peekable();
+    for e in events {
+        while let Some(r) = nc.next_if(|r| r.cycles < e.cycles) {
+            out.push(r);
+        }
+        out.push(e);
+    }
+    out.extend(nc);
+    out
+}
+
+/// What a writer section's NC log costs a window, in stamps: its `words` (at most one a writer entry,
+/// and three a list), scaled so a window's logs fit NC's log as its stamps fit the buffer
+/// (`tt_isa::dm::nc::LOG_WORDS` against [`WINDOW_EVENTS`]).
+pub fn nc_log_cost(words: u32) -> u32 {
+    let room = tt_isa::dm::nc::LOG_WORDS - tt_isa::dm::nc_log::HEADER_WORDS;
+    (u64::from(words) * u64::from(WINDOW_EVENTS)).div_ceil(u64::from(room)) as u32
+}
+
 /// What a pair's batch log record costs a window, in stamps: its `words`, scaled so a window's
 /// records fit the log as its stamps fit the buffer (`tt_isa::dm::BATCH_LOG_WORDS` against
 /// [`WINDOW_EVENTS`]).
@@ -994,17 +1268,21 @@ pub fn in_protocol_order(batches: &[Batch]) -> bool {
             && b.t2[1] <= b.t2[2]
             && b.landed <= b.t0[1] + slack
             && b.t0[1] <= b.t2[2] + slack
+            && (!b.sent()
+                || (b.granted <= b.transfer[0]
+                    && b.transfer.windows(2).all(|w| w[0] <= w[1])
+                    && b.transfer[3] <= b.issued))
     }) && batches.windows(2).all(|w| {
         w[0].t0[2] <= w[1].t0[0] && w[0].t2[2] <= w[1].t2[0] && w[0].landed <= w[1].reserve
     })
 }
 
-/// What [`unit_pipes`] found on one unit in one replay: each op it streamed batches for, as `(op,
-/// since, arrive, batches)` on the unit's clock; and the pairs whose batches it could not tell,
-/// by reason ([`DROP_REASONS`]).
+/// What [`unit_pipes`] found on one unit in one replay: each op it streamed batches for, or whose
+/// NC logged, as `(op, since, arrive, batches, nc)` on the unit's clock; and the pairs whose
+/// batches it could not tell, by reason ([`DROP_REASONS`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnitPipes {
-    pub ops: Vec<(usize, u64, u64, Vec<Batch>)>,
+    pub ops: Vec<(usize, u64, u64, Vec<Batch>, NcStats)>,
     /// Pairs told: their batches are in `ops`.
     pub told: u32,
     /// Bases the timestamper repeated ([`splice_batch_log`]), not pairs.
@@ -1034,12 +1312,20 @@ pub fn unit_pipes(
         return Some(UnitPipes::default());
     };
     let words = tt_isa::mailbox::BATCH_TIME_WORDS as usize;
+    use tt_isa::dataflow::{Action, Stream};
     let mut out = UnitPipes::default();
-    // The current pair's credits, `(begin, end)`, and the batches since the last barrier.
+    // The current pair's input credits, `(begin, end)`; what B did inside each of its batches, from
+    // the input reserve's end to the push's begin (`Batch::transfer`, `credit_wait`, `credit`, the
+    // rest default); and the batches since the last barrier.
     let mut credits: Vec<(u64, u64)> = Vec::new();
-    let mut open_credit = None;
+    let mut inside: Vec<Batch> = Vec::new();
+    let mut open_credit: Option<(u32, u64)> = None;
+    let mut open_wait: Option<(u32, u64)> = None;
     let mut batches: Vec<Batch> = Vec::new();
     let mut drops = 0u32;
+    // NC's records since the last barrier, `(tag, time)`, and those its log lost.
+    let mut nc: Vec<(u32, u64)> = Vec::new();
+    let mut nc_lost = 0u64;
     // A table being read: its batches, why it cannot be used (if it cannot), and its times so far.
     let mut table: Option<(usize, Option<usize>, Vec<u64>)> = None;
     let mut pairs = Vec::new();
@@ -1049,19 +1335,71 @@ pub fn unit_pipes(
             Event::Entry {
                 begin: true,
                 op: op::LAUNCH,
-            } => credits.clear(),
+                ..
+            } => {
+                credits.clear();
+                inside.clear();
+            }
             Event::Entry {
                 begin: true,
                 op: op::CB,
-            } => open_credit = Some(t),
+                arg,
+            } => open_credit = Some((arg, t)),
             Event::Entry {
                 begin: false,
                 op: op::CB,
+                ..
             } => {
-                if let Some(b) = open_credit.take() {
-                    credits.push((b, t));
+                let Some((arg, b)) = open_credit.take() else {
+                    continue;
+                };
+                let action = Action::decode(arg & 3);
+                match Stream::decode(arg >> 2) {
+                    Some(Stream::Input) => {
+                        credits.push((b, t));
+                        if action == Some(Action::Reserve) {
+                            inside.push(Batch::default());
+                        }
+                    }
+                    // Inside an input batch (its reserve stamped, its push not yet).
+                    Some(Stream::Transfer) if credits.len() % 2 == 1 => {
+                        if let Some(x) = inside.last_mut() {
+                            match action {
+                                Some(Action::Reserve) => x.transfer[..2].copy_from_slice(&[b, t]),
+                                Some(Action::Push) => x.transfer[2..].copy_from_slice(&[b, t]),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
+            Event::Entry {
+                begin: true,
+                op: o @ (op::WAIT_CREDIT | op::CREDIT),
+                ..
+            } => open_wait = Some((o, t)),
+            Event::Entry {
+                begin: false,
+                op: op::WAIT_CREDIT | op::CREDIT,
+                ..
+            } => {
+                let Some((o, b)) = open_wait.take() else {
+                    continue;
+                };
+                if credits.len() % 2 == 1 {
+                    if let Some(x) = inside.last_mut() {
+                        let d = t.saturating_sub(b);
+                        if o == op::WAIT_CREDIT {
+                            x.credit_wait += d;
+                        } else {
+                            x.credit += d;
+                        }
+                    }
+                }
+            }
+            Event::NcRecord { tag } => nc.push((tag, t)),
+            Event::NcLost { records } => nc_lost += u64::from(records),
             Event::BatchBase { .. } => {
                 // Not replaced by its record: not in the log.
                 out.dropped[4] += 1;
@@ -1083,6 +1421,7 @@ pub fn unit_pipes(
                     out.dropped[3] += 1;
                     drops += 1;
                     credits.clear();
+                    inside.clear();
                     continue;
                 }
                 let why = if truncated {
@@ -1117,6 +1456,7 @@ pub fn unit_pipes(
                                 landed: p.1,
                                 t0: [at(0), at(1), at(2)],
                                 t2: [at(3), at(4), at(5)],
+                                ..inside.get(i).copied().unwrap_or_default()
                             });
                         }
                     }
@@ -1129,18 +1469,29 @@ pub fn unit_pipes(
                         batches.extend(pair);
                     }
                     credits.clear();
+                    inside.clear();
                 }
             }
             Event::Entry {
                 begin: true,
                 op: op::BARRIER,
-            } => open = Some((t, std::mem::take(&mut batches), std::mem::take(&mut drops))),
+                ..
+            } => {
+                let logged = NcStats::of(&std::mem::take(&mut nc), std::mem::take(&mut nc_lost));
+                open = Some((
+                    t,
+                    std::mem::take(&mut batches),
+                    std::mem::take(&mut drops),
+                    logged,
+                ))
+            }
             Event::Entry {
                 begin: false,
                 op: op::BARRIER,
+                ..
             } => {
-                let (arrive, b, d) = open.take()?;
-                pairs.push((arrive, t, b, d));
+                let (arrive, b, d, logged) = open.take()?;
+                pairs.push((arrive, t, b, d, logged));
             }
             _ => {}
         }
@@ -1150,10 +1501,10 @@ pub fn unit_pipes(
     let mut count = 0u32;
     for b in seq {
         if hi == 0 || (lo <= count && count < hi) {
-            let (arrive, release, batches, drops) = pairs.next()?;
+            let (arrive, release, batches, drops, logged) = pairs.next()?;
             if let (Some(k), Some(s)) = (b.arrival_of, since) {
-                if !batches.is_empty() {
-                    out.ops.push((k as usize, s, arrive, batches));
+                if !batches.is_empty() || logged.records > 0 {
+                    out.ops.push((k as usize, s, arrive, batches, logged));
                 }
                 if drops > 0 {
                     out.dropped_ops.push((k as usize, drops));
@@ -1720,15 +2071,22 @@ impl TraceSamples {
                     *d += n;
                 }
             }
-            for (k, since, arrive, batches) in found.ops {
-                let stats = PipeStats::of(since, arrive, &batches);
+            for (k, since, arrive, batches, nc) in found.ops {
+                let stats = PipeStats::of(since, arrive, &batches).with_nc(nc);
                 let (sample, kept) = by_op.entry(k).or_default();
                 sample.sum.add(&stats);
                 sample.units += 1;
                 if stats.work >= sample.slowest.work {
                     sample.slowest = stats;
                 }
-                kept.push((u as u16, since, arrive, batches));
+                if stats.sender() {
+                    sample.senders.add(&stats);
+                    sample.sender_units += 1;
+                    if stats.work >= sample.slowest_sender.work {
+                        sample.slowest_sender = stats;
+                    }
+                }
+                kept.push((u as u16, since, arrive, batches, nc));
             }
         }
         for (k, (sample, kept)) in by_op {
@@ -2430,6 +2788,8 @@ impl ProfileReport {
             units: u64,
             slowest: PipeStats,
             sum: PipeStats,
+            sender_units: u64,
+            senders: PipeStats,
         }
         let mut rows: Vec<(&str, Row)> = Vec::new();
         for (o, samples) in t.ops.iter().zip(&t.pipes) {
@@ -2450,6 +2810,8 @@ impl ProfileReport {
                 r.units += s.units;
                 r.slowest.add(&s.slowest);
                 r.sum.add(&s.sum);
+                r.sender_units += s.sender_units;
+                r.senders.add(&s.senders);
             }
         }
         rows.sort_by_key(|(_, r)| std::cmp::Reverse(r.slowest.work / r.samples.max(1) * r.ops));
@@ -2499,7 +2861,7 @@ impl ProfileReport {
             t.pipe_repeats
         );
         let share = |part: u64, whole: u64| 100.0 * part as f64 / whole.max(1) as f64;
-        for (label, r) in rows {
+        for (label, r) in rows.iter().filter(|(_, r)| r.sum.batches > 0) {
             let (w, m) = (&r.slowest, &r.sum);
             let _ = writeln!(
                 out,
@@ -2524,6 +2886,142 @@ impl ProfileReport {
                 share(m.starve, m.work),
             );
         }
+        let senders: Vec<SenderRow> = rows
+            .iter()
+            .map(|(l, r)| (*l, r.samples, r.units, &r.sum, r.sender_units, &r.senders))
+            .collect();
+        self.sender_table(out, &senders);
+    }
+
+    /// [`Detail::Pipeline`]'s units that send strips on (`tile_op::multicast`), and every unit's NC
+    /// ([`NcStats`]), by label: the mean sender's B and NC, and the mean other unit's B credit waits
+    /// and NC, each as a share of the mean unit's work.
+    fn sender_table(&self, out: &mut String, rows: &[SenderRow]) {
+        if rows.iter().all(|r| r.3.nc.records == 0 && r.4 == 0) {
+            return;
+        }
+        let lost: u64 = rows.iter().map(|r| r.3.nc.lost).sum();
+        let _ = writeln!(
+            out,
+            "\nSenders and NC by label (`Detail::Pipeline`, NC's entry log): the mean sender's (`s`) and \
+             the mean other unit's (`r`) times as shares of that unit's work. B: gather (its strip's \
+             reads issued), ring (waiting for a transfer half), credit wait (for strips). NC: transfer \
+             wait (for B's strip), credit wait (for readers' frees), multicast and settle (its \
+             requests and acknowledgements), ready (raising and copying the ready word), output wait \
+             (for its own T2), write, idle (between its lists). NC records lost: {lost}.\n\n\
+             | label | senders | s work us | s strips | s B gather | s B ring | s B credit wait | \
+             s NC transfer wait | s NC credit wait | s NC multicast | s NC settle | s NC ready | \
+             s NC output wait | s NC write | s NC idle | r work us | r B credit wait | \
+             r NC output wait | r NC write | r NC idle |\n\
+             |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"
+        );
+        let share = |part: u64, whole: u64| 100.0 * part as f64 / whole.max(1) as f64;
+        for &(label, samples, units, all, n, s) in rows {
+            let mut r = *all;
+            // The others: every unit less the senders.
+            for (a, b) in [
+                (&mut r.work, s.work),
+                (&mut r.credit_wait, s.credit_wait),
+                (&mut r.nc.output_wait, s.nc.output_wait),
+                (&mut r.nc.write, s.nc.write),
+                (&mut r.nc.idle, s.nc.idle),
+            ] {
+                *a = a.saturating_sub(b);
+            }
+            let others = units.saturating_sub(n);
+            let (sn, rn) = (n.max(1) as f64, others.max(1) as f64);
+            let nc = &s.nc;
+            let _ = writeln!(
+                out,
+                "| {label} | {:.1} | {:.1} | {:.1} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | \
+                 {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.1} | {:.0}% | {:.0}% | \
+                 {:.0}% | {:.0}% |",
+                n as f64 / samples.max(1) as f64,
+                self.us(s.work) / sn,
+                nc.strips.max(s.sent) as f64 / sn,
+                share(s.gather, s.work),
+                share(s.transfer_ring, s.work),
+                share(s.credit_wait, s.work),
+                share(nc.transfer_wait, s.work),
+                share(nc.credit_wait, s.work),
+                share(nc.multicast, s.work),
+                share(nc.settle, s.work),
+                share(nc.credit + nc.copy, s.work),
+                share(nc.output_wait, s.work),
+                share(nc.write, s.work),
+                share(nc.idle, s.work),
+                self.us(r.work) / rn,
+                share(r.credit_wait, r.work),
+                share(r.nc.output_wait, r.work),
+                share(r.nc.write, r.work),
+                share(r.nc.idle, r.work),
+            );
+        }
+    }
+
+    /// [`Detail::Pipeline`]: every trace op's units from the first replay that stamped it, one line
+    /// a unit, tab-separated: whether it sent strips, B's sent batches and their times, and its NC's
+    /// times ([`NcStats`]), in microseconds, with the unit's work on the op.
+    pub fn nc_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
+        let mut out = String::from(
+            "source\tindex\tlabel\twhat\tunit\tsender\twork_us\tbatches\tsent\tgather_us\t\
+             transfer_ring_us\ttransfer_land_us\tcredit_wait_us\tcredit_us\tstarve_us\tkernel_us\t\
+             nc_records\tnc_lost\tnc_strips\tnc_outputs\tnc_transfer_wait_us\tnc_transfer_pop_us\t\
+             nc_credit_wait_us\tnc_multicast_us\tnc_settle_us\tnc_credit_us\tnc_copy_us\t\
+             nc_output_wait_us\tnc_output_pop_us\tnc_write_us\tnc_other_us\tnc_idle_us\n",
+        );
+        for (&id, t) in &self.traces {
+            let source = name(id);
+            for (i, (o, units)) in t.ops.iter().zip(&t.pipe_batches).enumerate() {
+                for (u, since, arrive, batches, nc) in units {
+                    let p = PipeStats::of(*since, *arrive, batches).with_nc(*nc);
+                    let _ = write!(
+                        out,
+                        "{source}\t{i}\t{}\t{}\t{u}\t{}\t{:.3}\t{}\t{}",
+                        o.label,
+                        o.what,
+                        u8::from(p.sender()),
+                        self.us(p.work),
+                        p.batches,
+                        p.sent,
+                    );
+                    for c in [
+                        p.gather,
+                        p.transfer_ring,
+                        p.transfer_land,
+                        p.credit_wait,
+                        p.credit,
+                        p.starve,
+                        p.kernel,
+                    ] {
+                        let _ = write!(out, "\t{:.3}", self.us(c));
+                    }
+                    let _ = write!(
+                        out,
+                        "\t{}\t{}\t{}\t{}",
+                        nc.records, nc.lost, nc.strips, nc.outputs
+                    );
+                    for c in [
+                        nc.transfer_wait,
+                        nc.transfer_pop,
+                        nc.credit_wait,
+                        nc.multicast,
+                        nc.settle,
+                        nc.credit,
+                        nc.copy,
+                        nc.output_wait,
+                        nc.output_pop,
+                        nc.write,
+                        nc.other,
+                        nc.idle,
+                    ] {
+                        let _ = write!(out, "\t{:.3}", self.us(c));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 
     /// [`Detail::Pipeline`]: every trace op's streamed batches from the first replay that stamped
@@ -2532,12 +3030,14 @@ impl ProfileReport {
     pub fn pipeline_tsv(&self, name: &dyn Fn(u64) -> String) -> String {
         let mut out = String::from(
             "source\tindex\tlabel\twhat\tunit\tbatch\twork_us\treserve_us\tgranted_us\tissued_us\t\
-             landed_us\tt0_wait_us\tt0_ready_us\tt0_pop_us\tt2_wait_us\tt2_reserved_us\tt2_push_us\n",
+             landed_us\tt0_wait_us\tt0_ready_us\tt0_pop_us\tt2_wait_us\tt2_reserved_us\tt2_push_us\t\
+             transfer_reserve_us\ttransfer_granted_us\ttransfer_push_us\ttransfer_landed_us\t\
+             credit_wait_us\tcredit_us\n",
         );
         for (&id, t) in &self.traces {
             let source = name(id);
             for (i, (o, units)) in t.ops.iter().zip(&t.pipe_batches).enumerate() {
-                for (u, since, arrive, batches) in units {
+                for (u, since, arrive, batches, _) in units {
                     let at = |c: u64| self.us(c) - self.us(*since);
                     for (b, x) in batches.iter().enumerate() {
                         let _ = write!(
@@ -2554,6 +3054,15 @@ impl ProfileReport {
                         {
                             let _ = write!(out, "\t{:.3}", at(c));
                         }
+                        for c in x.transfer {
+                            let _ = write!(out, "\t{:.3}", if x.sent() { at(c) } else { 0.0 });
+                        }
+                        let _ = write!(
+                            out,
+                            "\t{:.3}\t{:.3}",
+                            self.us(x.credit_wait),
+                            self.us(x.credit)
+                        );
                         out.push('\n');
                     }
                 }
@@ -3239,13 +3748,38 @@ mod tests {
     /// One op on a unit: a pair of two batches through a one-batch ring, its credits stamped as
     /// `CB` entries, and after its kernel the roles' tables as the host splices them from the log
     /// (`BATCH_TABLE` with `header`, a `BATCH_TIME` a clock read); then the unit's arrival at 430.
+    /// A `CB` entry's two stamps, its stream and action in the detail (`dm::entry_detail`).
+    fn cb(
+        stream: tt_isa::dataflow::Stream,
+        action: tt_isa::dataflow::Action,
+        t0: u64,
+        t1: u64,
+    ) -> [TraceEvent; 2] {
+        let w = [op::CB, stream.word(), action.word(), 2, 0, 0, 0, 0];
+        let d = tt_isa::dm::entry_detail(&w);
+        [e(ev::ENTRY_BEGIN, d, t0), e(ev::ENTRY_END, d, t1)]
+    }
+
+    /// A credit entry's two stamps (`WAIT_CREDIT` or `CREDIT`) on credit word `word`.
+    fn credit_entry(o: u32, word: u32, t0: u64, t1: u64) -> [TraceEvent; 2] {
+        let at = tt_isa::dm::credit_word(word);
+        let w = if o == op::WAIT_CREDIT {
+            [o, at, 1, 0, 0, 0, 0, 0]
+        } else {
+            [o, 1, 2, at, 1, 0, 0, 0]
+        };
+        let d = tt_isa::dm::entry_detail(&w);
+        [e(ev::ENTRY_BEGIN, d, t0), e(ev::ENTRY_END, d, t1)]
+    }
+
     fn pair_of_two(header: u32, times: &[u64]) -> Vec<TraceEvent> {
+        use tt_isa::dataflow::{Action::*, Stream::*};
         let mut v = vec![e(ev::LIST_BEGIN, 1, 100)];
         v.extend(entry(op::LAUNCH, 101, 103));
-        v.extend(entry(op::CB, 104, 108));
-        v.extend(entry(op::CB, 140, 170));
-        v.extend(entry(op::CB, 172, 224));
-        v.extend(entry(op::CB, 260, 290));
+        v.extend(cb(Input, Reserve, 104, 108));
+        v.extend(cb(Input, Push, 140, 170));
+        v.extend(cb(Input, Reserve, 172, 224));
+        v.extend(cb(Input, Push, 260, 290));
         v.push(e(ev::ENTRY_BEGIN, op::KERNEL_WAIT, 291));
         v.push(e(ev::ROLES_DONE, 7, 410));
         v.push(e(ev::BATCH_TABLE, header, 416));
@@ -3254,6 +3788,215 @@ mod tests {
         v.extend(entry(op::BARRIER, 430, 440));
         v.push(e(ev::LIST_END, 1, 441));
         v
+    }
+
+    /// A multicast sender's pair (`tile_op::multicast`): each batch's input reserve, its transfer
+    /// reserve and push around the gather, a credit (a wait for `B`'s strip, or a free), its input
+    /// push; NC's log between the kernel and the barrier. `args` false stamps every `CB` with its
+    /// op alone, as the meter's stamps were before they named their stream.
+    fn sender_pair(args: bool, transfer_push: bool) -> Vec<TraceEvent> {
+        use tt_isa::dataflow::{Action::*, Stream::*};
+        let cb = |s, a, t0, t1| {
+            if args {
+                cb(s, a, t0, t1)
+            } else {
+                entry(op::CB, t0, t1)
+            }
+        };
+        let mut v = vec![e(ev::LIST_BEGIN, 1, 100)];
+        v.extend(entry(op::LAUNCH, 101, 103));
+        v.extend(cb(Input, Reserve, 104, 108));
+        v.extend(cb(Transfer, Reserve, 110, 112));
+        if transfer_push {
+            v.extend(cb(Transfer, Push, 130, 135));
+        }
+        v.extend(credit_entry(op::WAIT_CREDIT, 3, 136, 138));
+        v.extend(cb(Input, Push, 140, 170));
+        v.extend(cb(Input, Reserve, 172, 224));
+        v.extend(cb(Transfer, Reserve, 226, 228));
+        v.extend(credit_entry(op::CREDIT, 4, 229, 230));
+        v.extend(cb(Transfer, Push, 250, 255));
+        v.extend(cb(Input, Push, 260, 290));
+        v.push(e(ev::ENTRY_BEGIN, op::KERNEL_WAIT, 291));
+        v.push(e(ev::ROLES_DONE, 7, 410));
+        v.push(e(ev::BATCH_TABLE, 2, 416));
+        v.extend(ROLE_TIMES.iter().map(|&t| e(ev::BATCH_TIME, 0, t)));
+        v.push(e(ev::ENTRY_END, op::KERNEL_WAIT, 420));
+        v.extend(entry(op::BARRIER, 430, 440));
+        v.push(e(ev::LIST_END, 1, 441));
+        // Each NC record before the first stamp later than it, as `splice_nc_log` merges them (a
+        // batch table's back-dated times stay after their table).
+        let mut nc: Vec<TraceEvent> = NC_RECORDS
+            .iter()
+            .map(|&(tag, t)| e(ev::NC_RECORD, tag, t))
+            .collect();
+        nc.push(e(ev::NC_LOST, 2, 424));
+        let mut out = Vec::new();
+        let mut nc = nc.into_iter().peekable();
+        for x in v {
+            while let Some(r) = nc.next_if(|r| r.cycles < x.cycles) {
+                out.push(r);
+            }
+            out.push(x);
+        }
+        out
+    }
+
+    /// A sender NC's log over one strip and its output: `(tag, time)`.
+    const NC_RECORDS: [(u32, u64); 12] = {
+        use tt_isa::dm::nc_log::*;
+        const T: u32 = 2 << 2;
+        const O: u32 = 1 << 2;
+        [
+            (tag(ANCHOR, 0), 200),
+            (tag(CB, T | 1), 202),
+            (tag(WAIT_CREDIT, 1), 236),
+            (tag(MCAST, 0), 240),
+            (tag(SETTLE, 0), 262),
+            (tag(CREDIT, 0), 270),
+            (tag(MCAST, 1), 276),
+            (tag(CB, T | 3), 280),
+            (tag(CB, O | 1), 284),
+            (tag(WRITE, 0), 390),
+            (tag(CB, O | 3), 420),
+            (tag(END, 0), 424),
+        ]
+    };
+
+    /// NC's records split its time by the entry each began, until the next: a strip's transfer
+    /// wait, its readers' frees, the multicast and its acknowledgements, the ready word, the pop;
+    /// then its own output's wait, write and pop.
+    #[test]
+    fn nc_records_split_its_time_by_what_it_waited_for() {
+        let s = NcStats::of(&NC_RECORDS, 2);
+        assert_eq!(
+            s,
+            NcStats {
+                records: 12,
+                lost: 2,
+                strips: 1,
+                outputs: 1,
+                transfer_wait: 34,
+                transfer_pop: 4,
+                output_wait: 106,
+                output_pop: 4,
+                credit_wait: 4,
+                credit: 6,
+                multicast: 22,
+                settle: 8,
+                copy: 4,
+                write: 30,
+                other: 2,
+                idle: 0,
+            }
+        );
+        assert_eq!(s.busy(), 424 - 200);
+        // A gap from a list's end to the next list's anchor is idle, not NC's work.
+        let mut two = NC_RECORDS.to_vec();
+        two.push((tt_isa::dm::nc_log::tag(tt_isa::dm::nc_log::ANCHOR, 0), 500));
+        let t = NcStats::of(&two, 0);
+        assert_eq!((t.idle, t.busy(), t.records), (76, 224, 13));
+    }
+
+    /// A sender's B stamps a transfer reserve and push inside each input batch, and credits: told
+    /// apart by the stream the stamp names, the pair joins its tables as a reader's does, each
+    /// batch carrying its transfer's times and credits, and its NC's log rides with the op. With
+    /// every `CB` stamped as its op alone (the meter before), the pair has twice the credits its
+    /// tables want and is dropped; and a batch whose transfer push was not stamped breaks the
+    /// protocol's order and is dropped as such.
+    #[test]
+    fn a_senders_transfers_join_beside_its_input_credits() {
+        let seq = [UnitBarrier {
+            arrival_of: Some(0),
+            counts: 1,
+        }];
+        let found = unit_pipes(&sender_pair(true, true), &seq, 0, 0).unwrap();
+        assert_eq!(found.dropped, [0; DROP_REASONS.len()]);
+        assert_eq!(found.told, 1);
+        let (k, since, arrive, batches, nc) = &found.ops[0];
+        assert_eq!((*k, *since, *arrive), (0, 100, 430));
+        assert_eq!(*nc, NcStats::of(&NC_RECORDS, 2));
+        assert_eq!(batches[0].transfer, [110, 112, 130, 135]);
+        assert_eq!((batches[0].credit_wait, batches[0].credit), (2, 0));
+        assert_eq!(batches[1].transfer, [226, 228, 250, 255]);
+        assert_eq!((batches[1].credit_wait, batches[1].credit), (0, 1));
+        assert_eq!(
+            (batches[1].reserve, batches[1].landed),
+            (172, 290),
+            "the transfer credits are not the input's"
+        );
+        let p = PipeStats::of(*since, *arrive, batches).with_nc(*nc);
+        assert!(p.sender());
+        assert_eq!(
+            (p.sent, p.transfer_ring, p.gather, p.transfer_land),
+            (2, 2 + 2, 18 + 22, 5 + 5)
+        );
+        assert_eq!((p.credit_wait, p.credit), (2, 1));
+
+        let dropped = |v: Vec<TraceEvent>| {
+            let found = unit_pipes(&v, &seq, 0, 0).unwrap();
+            DROP_REASONS
+                .iter()
+                .zip(found.dropped)
+                .find(|(_, n)| *n > 0)
+                .map(|(why, _)| *why)
+        };
+        assert_eq!(dropped(sender_pair(false, true)), Some("more credits"));
+        assert_eq!(dropped(sender_pair(true, false)), Some("disordered"));
+    }
+
+    /// NC's log, merged into a unit's stamps: an anchor's word placed as the full counter nearest
+    /// before the read, across a 2^32 boundary too; each record from the one before, across its
+    /// field's wrap; records before any anchor left out; and what was lost after the last.
+    #[test]
+    fn the_nc_log_is_placed_on_the_counter_and_merged_by_time() {
+        use tt_isa::dm::nc_log::*;
+        let ev_at = |cycles: u64| e(ev::LIST_BEGIN, 1, cycles);
+        let low = 0x03FF_FFF0u32;
+        let log = vec![
+            // Before any anchor: left out.
+            record(tag(OTHER, 0), 5),
+            record(tag(ANCHOR, 0), low),
+            low,
+            record(tag(CB, 9), low.wrapping_add(0x20)),
+            record(tag(END, 0), low.wrapping_add(0x41)),
+        ];
+        let now = (1u64 << 32) + 0x0400_1000;
+        let base = (1u64 << 32) + u64::from(low);
+        let events = vec![ev_at(base - 1), ev_at(base + 0x30), ev_at(now)];
+        let out = splice_nc_log(events, &log, 3, now);
+        let got: Vec<(u32, u64)> = out
+            .iter()
+            .map(|x| (ev::split(x.token).1, x.cycles))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (ev::LIST_BEGIN, base - 1),
+                (ev::NC_RECORD, base),
+                (ev::NC_RECORD, base + 0x20),
+                (ev::LIST_BEGIN, base + 0x30),
+                // 0x41 past the anchor, to within the bits a record drops.
+                (ev::NC_RECORD, base + 0x40),
+                (ev::NC_LOST, base + 0x40),
+                (ev::LIST_BEGIN, now),
+            ]
+        );
+        assert_eq!(
+            Event::decode(out[2].token),
+            Event::NcRecord { tag: tag(CB, 9) }
+        );
+        assert_eq!(Event::decode(out[5].token), Event::NcLost { records: 3 });
+        // An anchor whose low word is past the counter's now is from before its last wrap.
+        let late = splice_nc_log(
+            Vec::new(),
+            &[record(tag(ANCHOR, 0), 0xFFFF_FF00), 0xFFFF_FF00],
+            0,
+            (2 << 32) + 0x100,
+        );
+        assert_eq!(late[0].cycles, (1 << 32) + 0xFFFF_FF00);
+        // An empty log leaves the stamps as they were.
+        assert_eq!(splice_nc_log(vec![ev_at(7)], &[], 0, 9), vec![ev_at(7)]);
     }
 
     /// The two batches' role times: T0's wait, ready and pop, then T2's wait, reserved and push.
@@ -3278,6 +4021,7 @@ mod tests {
                 landed: 170,
                 t0: [128, 192, 224],
                 t2: [128, 160, 256],
+                ..Batch::default()
             },
             Batch {
                 reserve: 172,
@@ -3286,9 +4030,13 @@ mod tests {
                 landed: 290,
                 t0: [256, 320, 352],
                 t2: [256, 288, 384],
+                ..Batch::default()
             },
         ];
-        assert_eq!(found.ops, vec![(0, 100, 430, batches.clone())]);
+        assert_eq!(
+            found.ops,
+            vec![(0, 100, 430, batches.clone(), NcStats::default())]
+        );
         // The credit protocol's own order holds in them: a batch lands before T0 sees it, and with
         // a ring of one batch, the next batch's grant comes after T0's pop of this one.
         assert!(batches.iter().all(|b| b.landed <= b.t0[1]));
@@ -3311,6 +4059,7 @@ mod tests {
                 pipe: 384 - 108,
                 // 62 for batch 0's reads, then max(66, 64), then batch 1's kernel.
                 ideal: 62 + 66 + 64,
+                ..PipeStats::default()
             }
         );
     }
@@ -3406,10 +4155,11 @@ mod tests {
             dropped(pair_of_two(2 | ev::BATCH_TRUNCATED, &ROLE_TIMES)),
             Some("truncated")
         );
-        // A join out of the protocol's order: T2 pushing batch 0 (at 96) before T0 saw it (192),
-        // further apart than the stamps' resolution.
+        // A join out of the protocol's order: T2 pushing batch 0 (at 40) before T0 saw it (192),
+        // further apart than the stamps' resolution (`CROSS_CORE_SLACK`).
         let mut early = ROLE_TIMES;
-        early[3..6].copy_from_slice(&[64, 96, 96]);
+        early[3..6].copy_from_slice(&[16, 32, 40]);
+        const { assert!(40 + CROSS_CORE_SLACK < 192) };
         assert_eq!(dropped(pair_of_two(2, &early)), Some("disordered"));
         // Three batches' tables against the pair's two batches of credits.
         let three: Vec<u64> = ROLE_TIMES.iter().chain(&ROLE_TIMES[..6]).copied().collect();
@@ -3419,7 +4169,8 @@ mod tests {
         assert_eq!(unit_pipes(&pair_of_two(2, &ROLE_TIMES), &two, 0, 0), None);
     }
 
-    /// The pipeline detail stamps as `Ops` does, and one base more after each kernel's wait.
+    /// The pipeline detail stamps as `Ops` does, one base more after each kernel's wait, and B's
+    /// credits.
     #[test]
     fn the_pipeline_detail_adds_a_base_to_each_wait() {
         let (ops, pipeline) = (
@@ -3429,13 +4180,23 @@ mod tests {
                 ..ProfileOptions::default()
             },
         );
-        assert_eq!(pipeline.trace_mode(), tt_isa::dm::trace_mode::OPS);
+        assert_eq!(
+            pipeline.trace_mode() & tt_isa::dm::trace_mode::MODE,
+            tt_isa::dm::trace_mode::OPS
+        );
         for o in [op::KERNEL, op::KERNEL_WAIT] {
             assert_eq!(pipeline.stamps(o), ops.stamps(o) + 1);
         }
         for o in [op::BARRIER, op::CB, op::LAUNCH, op::READ] {
             assert_eq!(pipeline.stamps(o), ops.stamps(o));
         }
+        // And B's credits, which `Ops` does not stamp.
+        for o in [op::WAIT_CREDIT, op::CREDIT] {
+            assert_eq!((ops.stamps(o), pipeline.stamps(o)), (0, 3));
+        }
+        let m = tt_isa::dm::trace_mode::CREDITS | tt_isa::dm::trace_mode::NC_LOG;
+        assert_eq!(pipeline.trace_mode() & m, m);
+        assert_eq!(ops.trace_mode() & m, 0);
     }
 
     #[test]

@@ -549,6 +549,86 @@ fn issue_via<const NOC1: bool>(me: (u8, u8), d: Descriptor, port: u8) -> Result<
     Ok(())
 }
 
+/// RISCV B's record expansion ([`record::expand_reads_into`]): a plain read of one request (each of
+/// a gather's tiles, which arrive as their words, [`record::Sink::read`]) goes straight to the NoC
+/// ([`dm::ReadPlan`]: the general path's checks and request, made from values the record's reads
+/// share); every other entry runs as an entry. On the fast read path a run of them is one
+/// [`noc::ReadBatch`] (the in-flight room and the initiator's key held for the run, one fence at
+/// its end), ended before any other entry runs and when the record ends ([`PlannedReads::end`]).
+struct PlannedReads {
+    me: (u8, u8),
+    usable: u32,
+    txn: TxnId,
+    plan: dm::ReadPlan,
+    batch: Option<noc::ReadBatch>,
+}
+
+impl PlannedReads {
+    #[inline(always)]
+    fn issue(&mut self, r: tt_isa::noc::niu::DramRequest) {
+        if noc::read_fast() {
+            let txn = self.txn;
+            self.batch
+                .get_or_insert_with(|| noc::ReadBatch::begin(txn))
+                .issue(r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len);
+        } else {
+            issue_request(r, self.txn);
+        }
+    }
+
+    /// End the batch, if one is open: before any other entry, and at the record's end.
+    #[inline(always)]
+    fn end(&mut self) {
+        if let Some(b) = self.batch.take() {
+            b.end();
+        }
+    }
+}
+
+impl record::Sink for PlannedReads {
+    /// Out of line: every one of a record's entries but a gather's tile reads comes here, from
+    /// some thirty places in the expansion, which inlined copies of it grew by ~5 KiB -- moving
+    /// the per-chunk code after it, which cost a product with no reads at all 14% (B's
+    /// instruction cache is ~4 KiB, `sections.x`).
+    #[inline(never)]
+    fn entry(&mut self, e: [u32; 8]) -> Result<(), u32> {
+        match self.plan.request(&e)? {
+            Some(r) => {
+                self.issue(r);
+                Ok(())
+            }
+            None => {
+                self.end();
+                record_entry(self.me, self.usable, e)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn read(&mut self, channel: u32, port: u32, offset: u32, to: u32, len: u32) -> Result<(), u32> {
+        match self.plan.read(channel, port, offset, to, len)? {
+            Some(r) => {
+                self.issue(r);
+                Ok(())
+            }
+            None => self.entry([op::READ, channel, port, offset, to, len, 0, 0]),
+        }
+    }
+
+}
+
+/// One GDDR read request on NoC #0 under `txn`, made and checked already ([`dm::ReadPlan`]):
+/// through the fast read path when the host chose it, as [`issue_via`] issues each of a move's.
+#[inline(always)]
+fn issue_request(r: tt_isa::noc::niu::DramRequest, txn: TxnId) {
+    if noc::read_fast() {
+        noc::room_for_read(txn);
+        noc::issue_read(r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, txn);
+    } else {
+        noc::issue_dram_on::<false>(r.targ, r.targ_hi, r.ret, r.ret_hi, r.tag, r.ctrl, r.len, txn);
+    }
+}
+
 /// The prefetch ID's cap the host set (`dm::PREFETCH_CAP`, 0 for `dm::TILE_IN_FLIGHT_CAP`).
 fn prefetch_cap() -> u32 {
     match rd(M.at(dm::PREFETCH_CAP)) {
@@ -1057,12 +1137,100 @@ const ENCODED_GUARD: bool = FAST_READS && cfg!(feature = "encoded-guard");
 /// and every read of [`dm::TRACE`], is compiled out.
 const STAMPS: bool = cfg!(feature = "profile");
 
-/// [`dm::TRACE`], or 0 in an image that cannot stamp (no read).
-fn trace_mode() -> u32 {
+/// [`dm::TRACE`], its flags included, or 0 in an image that cannot stamp (no read).
+fn trace_word() -> u32 {
     if STAMPS {
         rd(M.at(dm::TRACE))
     } else {
         0
+    }
+}
+
+/// [`dm::TRACE`]'s mode (`dm::trace_mode::MODE`), or 0 in an image that cannot stamp. NC's word
+/// holds at most a flag ([`dm::trace_mode::NC_LOG`]), so its mode is always 0.
+fn trace_mode() -> u32 {
+    trace_word() & dm::trace_mode::MODE
+}
+
+/// Whether RISCV NC logs the list it is about to run ([`dm::nc_log`]): B armed the log for the pair
+/// ([`arm_nc_log`]). Never on B, nor in an image that cannot stamp.
+#[inline(always)]
+fn nc_log_armed() -> bool {
+    STAMPS && IS_NC && trace_word() & dm::trace_mode::NC_LOG != 0
+}
+
+/// On B, before handing NC a pair's writer section: arm NC's entry log for it if the host asked
+/// ([`dm::trace_mode::NC_LOG`]) and the pair falls inside the window (with no mode, B keeps no
+/// window: every pair), or disarm it. Cold: a store a pair, in an image that can stamp.
+#[cold]
+#[inline(never)]
+fn arm_nc_log() {
+    let word = trace_word();
+    let on = word & dm::trace_mode::NC_LOG != 0
+        && (word & dm::trace_mode::MODE == 0 || in_window());
+    wr(
+        dm::Mover::NC.at(dm::TRACE),
+        if on { dm::trace_mode::NC_LOG } else { 0 },
+    );
+}
+
+/// NC's entry log's state, in local data RAM: the words used and the records lost (each also in
+/// the log's header), and the tag and clock of the last record.
+#[link_section = ".local"]
+static mut NC_LOG: [u32; 4] = [0; 4];
+
+/// Begin a logged list on NC: the header's counts read through a fence (the host zeroes them when
+/// it reads the log, past this core's L0 cache), and an anchor.
+#[cold]
+#[inline(never)]
+fn nc_log_begin() {
+    publish();
+    let used = rd(dm::nc::LOG);
+    let lost = rd(dm::nc::LOG + 4);
+    unsafe {
+        NC_LOG = [used, lost, u32::MAX, 0];
+    }
+    nc_log(dm::nc_log::tag(dm::nc_log::ANCHOR, 0));
+}
+
+/// Log `tag` at the counter's present value ([`dm::nc_log`]): an `ANCHOR` with argument 0 is a
+/// list's begin, followed by the counter's low word; a record too long after the last is preceded
+/// by a fresh anchor; a record of the tag before it that coalesces is left out; one that does not
+/// fit is counted as lost.
+#[cold]
+#[inline(never)]
+fn nc_log(tag: u32) {
+    use dm::nc_log as l;
+    let now = wall_clock();
+    let [used, lost, last_tag, last] = unsafe { NC_LOG };
+    let begin = tag == l::tag(l::ANCHOR, 0);
+    let late = !begin && now.wrapping_sub(last) >= l::REANCHOR_CYCLES;
+    if !begin && !late && tag == last_tag && l::coalesces(tag) {
+        return;
+    }
+    let words = 1 + begin as u32 + 2 * late as u32;
+    if l::HEADER_WORDS + used + words > dm::nc::LOG_WORDS {
+        unsafe {
+            NC_LOG[1] = lost + 1;
+            // The next record is not of this one's run.
+            NC_LOG[2] = u32::MAX;
+        }
+        wr(dm::nc::LOG + 4, lost + 1);
+        return;
+    }
+    let mut at = dm::nc::LOG + 4 * (l::HEADER_WORDS + used) as u64;
+    if late {
+        wr(at, l::record(l::tag(l::ANCHOR, 1), now));
+        wr(at + 4, now);
+        at += 8;
+    }
+    wr(at, l::record(tag, now));
+    if begin {
+        wr(at + 4, now);
+    }
+    wr(dm::nc::LOG, used + words);
+    unsafe {
+        NC_LOG = [used + words, lost, tag, now];
     }
 }
 
@@ -1668,6 +1836,9 @@ fn begin_pair() -> Result<u32, u32> {
     unsafe {
         PAIR_ACTIVE = true;
     }
+    if STAMPS {
+        arm_nc_log();
+    }
     tt_firmware::dataflow::initialize();
     Ok(rd(dm::Mover::NC.at(dm::DONE)).wrapping_add(1).max(1))
 }
@@ -1770,8 +1941,14 @@ fn pair_call(
 #[inline(never)]
 fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u32> {
     use tt_isa::mailbox::trace as ev;
-    let mode = trace_mode();
+    let word = trace_word();
+    let mode = word & dm::trace_mode::MODE;
+    let credits = word & dm::trace_mode::CREDITS != 0;
     let traced = mode != 0;
+    let logged = nc_log_armed();
+    if logged {
+        nc_log_begin();
+    }
     // A replay's chunks are not outermost: the replay is ([`call`]).
     let outer = traced && unsafe { TRACE_DEPTH == 0 && !IN_CALL };
     if outer {
@@ -1798,11 +1975,17 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
             let entry_traced = traced
                 && head[0] != op::PAIR_CALL
                 && !(mode == dm::trace_mode::LISTS && (head[0] == op::READ || head[0] == op::READ_ENCODED))
-                && (mode != dm::trace_mode::OPS || dm::trace_mode::ops_stamped(head[0]))
+                && (mode != dm::trace_mode::OPS || dm::trace_mode::ops_stamped_with(head[0], credits))
                 && in_window();
-            trace(entry_traced, ev::ENTRY_BEGIN, head[0]);
+            trace(entry_traced, ev::ENTRY_BEGIN, dm::entry_detail(&head));
             if IS_NC && !(head[0] == op::WRITE_L1_MCAST && head[6] == dm::MCAST_RUN_ACKS) {
+                if logged && mcast_run().acks != 0 {
+                    nc_log(dm::nc_log::tag(dm::nc_log::SETTLE, 0));
+                }
                 settle_multicasts();
+            }
+            if logged {
+                nc_log(dm::nc_log::tag_for(&head));
             }
             if n == 1 {
                 // A run of host-encoded reads is one loop (`run_encoded_reads`), untraced, on the
@@ -1836,7 +2019,7 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
                     return Err(code);
                 }
             }
-            trace(entry_traced, ev::ENTRY_END, head[0]);
+            trace(entry_traced, ev::ENTRY_END, dm::entry_detail(&head));
             if traced && head[0] == op::BARRIER {
                 // An arrival is one of the trace's barriers; a wait stands for those the unit
                 // sat out (`dm::BARRIER_STANDS_FOR`), so the window counts ops on every unit.
@@ -1851,8 +2034,14 @@ fn run_entries(me: (u8, u8), usable: u32, base: u64, count: u32) -> Result<(), u
             }
             i += n;
         }
+        if logged && mcast_run().acks != 0 {
+            nc_log(dm::nc_log::tag(dm::nc_log::SETTLE, 0));
+        }
         settle_multicasts();
         noc::wait(TXN);
+        if logged {
+            nc_log(dm::nc_log::tag(dm::nc_log::END, 0));
+        }
         Ok(())
     })();
     if traced {
@@ -1941,8 +2130,19 @@ fn run_record(me: (u8, u8), usable: u32, at: u64, n: usize) -> Result<(), u32> {
                 ),
             );
         }
-        let result =
-            record::expand_reads(&rec[..n], |at| rd(at.into()), |e| record_entry(me, usable, e));
+        // A plain read of one request (each of a gather's tiles) goes from its entry straight to
+        // the NoC (`dm::ReadPlan`, the general path's checks and request); the rest as entries.
+        // On the fast read path a run of them is one `noc::ReadBatch` (the in-flight room and the
+        // initiator's key held for the run, one fence at its end), ended before any other entry.
+        let mut sink = PlannedReads {
+            me,
+            usable,
+            txn: read_txn(),
+            plan: dm::ReadPlan::new(usable, me, read_txn()),
+            batch: None,
+        };
+        let result = record::expand_reads_into(&rec[..n], |at| rd(at.into()), &mut sink);
+        sink.end();
         if stream {
             noc::set_cap_in_flight(TXN, own);
         }

@@ -32,6 +32,7 @@ pub mod distribute;
 pub mod dst;
 pub mod lower;
 pub(crate) mod matmul;
+pub mod multicast;
 mod reduce;
 pub mod reuse;
 mod sfpu;
@@ -331,6 +332,9 @@ pub struct Share {
     pub b_holders: Option<usize>,
     /// Each unit's tile, as the session names it: where a copy reads and a credit goes.
     pub tiles: std::sync::Arc<[(u8, u8)]>,
+    /// Shared by multicast over the units' grid instead of pulled, `(A, B)`
+    /// ([`crate::tensor::Reuse::Multicast`], [`multicast`]); `None`: pulled ([`reuse`]).
+    pub multicast: Option<(bool, bool)>,
 }
 
 impl TileOp {
@@ -423,7 +427,10 @@ impl TileOp {
         let depth = channels::check(self, &deal)?;
         let mut jobs = lower::jobs(self, &deal, units, first)?;
         if let (Some(shared), Some(share)) = (&deal.shared, &self.share) {
-            reuse::pull(&mut jobs, units, first, shared, &share.tiles)?;
+            match share.multicast {
+                Some(_) => multicast::push(&mut jobs, units, first, shared, &share.tiles)?,
+                None => reuse::pull(&mut jobs, units, first, shared, &share.tiles)?,
+            }
         }
         // The streams are as deep as the session will make them: two where a job's kernels are
         // staged in halves (`session::streaming_segments`).

@@ -19,7 +19,10 @@
 //!   predicted step: `TT_CONTRACT_STEP_MS` (9.90) less the reference row's sum plus its own.
 //! - **`prefill_products`:** tt-metal's `prefill_mm.py` shapes and H13's 512-row chunk of the 1.7B,
 //!   in TFLOPS, under a shorter list of configurations (`PREFILL_CONFIGS`), and each again with
-//!   `A`'s gathers skipped (`tensor::probe_skip_a_reads`: what `A`'s reads cost).
+//!   `A`'s gathers skipped (`tensor::probe_skip_a_reads`: what `A`'s reads cost) and with every
+//!   gather skipped (`tensor::probe_skip_block_gathers`: the kernel's own ceiling, roadmap W2's
+//!   "reads-free ceiling"). Each product's GDDR reads (`A`, `B`) and units are printed from a
+//!   trace of one, and its time a K-tile pair on each unit.
 //! - **`prefill_products_without_the_reload`** (its own process: the hook is read when programs
 //!   are built): each continuing K chunk without reloading its priors into `Dst`
 //!   (`matmul::probe_skip_reload`): the most packer L1 accumulation could save.
@@ -35,14 +38,17 @@
 //! Knobs: `TT_CONTRACT_ROWS` (`1,32`), `TT_CONTRACT_A` (`fp32,bf16`), `TT_CONTRACT_B`
 //! (`bf16,bfp8,bfp4`), `TT_CONTRACT_FIDELITIES` (`hifi4,hifi2,lo`), `TT_CONTRACT_STEP_MS`
 //! (`9.90`), `TT_CONTRACT_PREFILL` (`m,k,n;...`), `TT_CONTRACT_PREFILL_CONFIGS`
-//! (`a:b:fidelity,...`). Silicon only, a probe:
+//! (`a:b:fidelity,...`), `TT_CONTRACT_UNITS` (at most this many units a product,
+//! `Spread::Fixed`; every unit by default), `TT_CONTRACT_GRID` (`<rows>x<cols>`: the session's
+//! tiles a rectangle of the grid, `TileChoice::Rect`, for roadmap W2's multicast products with
+//! `TT_OPERAND_REUSE=mcast`). Silicon only, a probe:
 //! `cargo xtask bench --device 1 --filter silicon_probe_performance_contract`.
 #![cfg(feature = "silicon")]
 
 use tt_isa::format::TileFormat;
 use tt_kernels::bfp::BfpFormat;
 use tt_kernels::matmul::{Fidelity, SrcRoute};
-use tt_kernels::session::{Session, TileChoice};
+use tt_kernels::session::{Session, Spread, TileChoice};
 use tt_kernels::tensor::{DramTensor, Pad};
 use tt_tests::backend::device_index;
 use tt_tests::bench::trace_slope_us;
@@ -303,12 +309,80 @@ fn accuracy(
 }
 
 fn open() -> Card {
-    let mut s = Session::open_card(device_index(), tt_firmware_images::ROLES, TileChoice::All)
+    let choice = match std::env::var("TT_CONTRACT_GRID") {
+        Err(_) => TileChoice::All,
+        Ok(v) => {
+            let (rows, cols) = v
+                .split_once('x')
+                .and_then(|(r, c)| Some((r.trim().parse().ok()?, c.trim().parse().ok()?)))
+                .unwrap_or_else(|| panic!("TT_CONTRACT_GRID: <rows>x<cols>, not {v:?}"));
+            TileChoice::Rect { cols, rows }
+        }
+    };
+    let mut s = Session::open_card(device_index(), tt_firmware_images::ROLES, choice)
         .unwrap_or_else(|e| panic!("{e}"));
     s.enable_dram(tt_firmware_images::DM_B.1, tt_firmware_images::DM_NC.1)
         .unwrap();
     s.set_batching(true).unwrap();
+    if let Ok(v) = std::env::var("TT_CONTRACT_UNITS") {
+        let n: usize = v
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("TT_CONTRACT_UNITS: a unit count, not {v:?}"));
+        assert!(n > 0, "TT_CONTRACT_UNITS: at least one unit");
+        s.set_spread(Spread::Fixed(n));
+    }
     s
+}
+
+/// What a prefill product's gathers skip: nothing, `A`'s, or every one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    None,
+    /// Every gather reads no `A`: under multicast no `A` strip is sent either (a reader that reads
+    /// no `A` waits for none), so it is `A`'s traffic that goes, not only its reads.
+    A,
+    /// Under multicast only: `A`'s senders read none of their strips from GDDR and still multicast
+    /// them, credits and all (`multicast::probe_skip_sender_reads`).
+    ASenders,
+    /// Under multicast only: every sender, of `A` and of `B`, reads none of its strips and still
+    /// multicasts them: the bound on a sender's gather made free.
+    Senders,
+    All,
+}
+
+impl Skip {
+    fn set(self) {
+        tt_kernels::tensor::probe_skip_a_reads(self == Skip::A);
+        let senders = self == Skip::Senders;
+        tt_kernels::tile_op::multicast::probe_skip_sender_reads(
+            0,
+            self == Skip::ASenders || senders,
+        );
+        tt_kernels::tile_op::multicast::probe_skip_sender_reads(1, senders);
+        tt_kernels::tensor::probe_skip_block_gathers(self == Skip::All);
+    }
+}
+
+/// One product traced alone: `(units it ran on, GDDR read, of it A's and B's, in MB)`.
+fn traced_reads(s: &mut Card, op: impl FnOnce(&mut Card) -> DramTensor) -> (usize, [f64; 3]) {
+    s.set_count_trace_bytes(true);
+    s.begin_trace().unwrap();
+    let out = op(s);
+    let id = s.end_trace().unwrap();
+    let ops = s.trace_ops(id).unwrap();
+    let mut moved = tt_kernels::profile_mode::OpBytes::default();
+    for op in ops {
+        moved.add(&op.bytes);
+    }
+    let units = (0..ops.first().map_or(0, |op| op.entries.len()))
+        .filter(|&u| ops.iter().any(|op| !op.entries[u].is_empty()))
+        .count();
+    s.release_trace(id).unwrap();
+    s.set_count_trace_bytes(false);
+    s.free(out).unwrap();
+    let mb = |b: u64| b as f64 / 1e6;
+    (units, [mb(moved.read), mb(moved.a), mb(moved.b)])
 }
 
 fn conditions(what: &str, reps: usize) {
@@ -460,6 +534,147 @@ fn decode_products() {
     .unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// `TT_CONTRACT_PIPELINE=1` (a `--profile` build): one product captured and replayed in the
+/// profile mode's pipeline detail, its slowest unit's streamed batches and the mean unit's, in
+/// microseconds: what its units wait for (`tt_kernels::profile_mode::PipeStats`). Under multicast
+/// (`TT_OPERAND_REUSE=mcast`) also the slowest and the mean sender's, and every line's NC from its
+/// entry log (`NcStats`): what a sender's strips wait for between its reads and its readers.
+/// `TT_CONTRACT_PIPELINE_SKIP` meters a variant instead (its gathers skipped as named).
+fn pipeline(s: &mut Card, what: &str, op: impl Fn(&mut Card) -> DramTensor) {
+    use tt_kernels::profile_mode::{Detail, NcStats, PipeStats, ProfileOptions};
+    let options = ProfileOptions {
+        detail: Detail::Pipeline,
+        ..ProfileOptions::default()
+    };
+    s.profile_mode(Some(options)).unwrap();
+    s.begin_trace().unwrap();
+    let out = op(s);
+    let id = s.end_trace().unwrap();
+    s.profile_mode(None).unwrap();
+    s.profile_mode(Some(options)).unwrap();
+    for _ in 0..3 {
+        s.replay(id).unwrap();
+    }
+    s.sync().unwrap();
+    let report = s.profile_mode(None).unwrap().expect("the mode was on");
+    s.release_trace(id).unwrap();
+    s.free(out).unwrap();
+    let us = |c: u64| c as f64 / report.ticks_per_us;
+    for t in report.traces.values() {
+        println!(
+            "MEASURE pipeline {what}: dropped {:?}, overflowed {}",
+            t.pipe_dropped, t.overflowed
+        );
+        let line = |name: &str, p: &PipeStats, n: u64| {
+            let n = n.max(1) as f64;
+            println!(
+                "MEASURE pipeline {what} {name}: {} batches, work {:.0} us, head {:.0}, ring \
+                 {:.0}, issue {:.0}, land {:.0}, starve {:.0}, kernel {:.0}, out_wait {:.0}, \
+                 tail {:.0}, pipe {:.0}, ideal {:.0}",
+                p.batches as f64 / n,
+                us(p.work) / n,
+                us(p.head) / n,
+                us(p.ring) / n,
+                us(p.issue) / n,
+                us(p.land) / n,
+                us(p.starve) / n,
+                us(p.kernel) / n,
+                us(p.out_wait) / n,
+                us(p.tail) / n,
+                us(p.pipe) / n,
+                us(p.ideal) / n,
+            );
+            println!(
+                "MEASURE pipeline {what} {name} B: sent {:.1}, gather {:.0} us, transfer ring {:.0}, \
+                 transfer land {:.0}, credit wait {:.0}, credit {:.0}",
+                p.sent as f64 / n,
+                us(p.gather) / n,
+                us(p.transfer_ring) / n,
+                us(p.transfer_land) / n,
+                us(p.credit_wait) / n,
+                us(p.credit) / n,
+            );
+            let c: &NcStats = &p.nc;
+            println!(
+                "MEASURE pipeline {what} {name} NC: {:.0} records ({} lost), strips {:.1}, outputs \
+                 {:.1}; transfer wait {:.0} us, credit wait {:.0}, multicast {:.0}, settle {:.0}, \
+                 credit {:.0}, copy {:.0}, transfer pop {:.0}, output wait {:.0}, write {:.0}, \
+                 output pop {:.0}, other {:.0}, idle {:.0}",
+                c.records as f64 / n,
+                c.lost,
+                c.strips as f64 / n,
+                c.outputs as f64 / n,
+                us(c.transfer_wait) / n,
+                us(c.credit_wait) / n,
+                us(c.multicast) / n,
+                us(c.settle) / n,
+                us(c.credit) / n,
+                us(c.copy) / n,
+                us(c.transfer_pop) / n,
+                us(c.output_wait) / n,
+                us(c.write) / n,
+                us(c.output_pop) / n,
+                us(c.other) / n,
+                us(c.idle) / n,
+            );
+        };
+        for samples in &t.pipes {
+            let Some(sample) = samples.first() else {
+                continue;
+            };
+            line("slowest unit", &sample.slowest, 1);
+            line(
+                &format!("mean of {} units", sample.units),
+                &sample.sum,
+                sample.units,
+            );
+            if sample.sender_units > 0 {
+                line("slowest sender", &sample.slowest_sender, 1);
+                line(
+                    &format!("mean of {} senders", sample.sender_units),
+                    &sample.senders,
+                    sample.sender_units,
+                );
+                let mut readers = sample.sum;
+                for (a, b) in [
+                    (&mut readers.work, sample.senders.work),
+                    (&mut readers.starve, sample.senders.starve),
+                    (&mut readers.kernel, sample.senders.kernel),
+                    (&mut readers.issue, sample.senders.issue),
+                    (&mut readers.credit_wait, sample.senders.credit_wait),
+                    (&mut readers.credit, sample.senders.credit),
+                ] {
+                    *a -= b;
+                }
+                let n = (sample.units - sample.sender_units).max(1) as f64;
+                println!(
+                    "MEASURE pipeline {what} mean of {} readers: work {:.0} us, starve {:.0}, \
+                     kernel {:.0}, issue {:.0}, credit wait {:.0}, credit {:.0}",
+                    sample.units - sample.sender_units,
+                    us(readers.work) / n,
+                    us(readers.starve) / n,
+                    us(readers.kernel) / n,
+                    us(readers.issue) / n,
+                    us(readers.credit_wait) / n,
+                    us(readers.credit) / n,
+                );
+            }
+        }
+        // `TT_CONTRACT_PIPELINE_UNITS=0,1,12`: those units' own batches.
+        let picked: Vec<usize> = std::env::var("TT_CONTRACT_PIPELINE_UNITS")
+            .map(|v| v.split(',').filter_map(|u| u.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        for op in &t.pipe_batches {
+            for (u, since, arrive, batches, nc) in op {
+                if picked.contains(&(*u as usize)) {
+                    let p = PipeStats::of(*since, *arrive, batches).with_nc(*nc);
+                    line(&format!("unit {u}"), &p, 1);
+                }
+            }
+        }
+    }
+}
+
 fn prefill_shapes() -> Vec<[usize; 3]> {
     std::env::var("TT_CONTRACT_PREFILL").map_or(PREFILL_SHAPES.to_vec(), |v| {
         v.split(';')
@@ -516,23 +731,37 @@ fn prefill(skip_reload: bool) {
                 let (b, b_dec) = operand(&mut s, fb, true, &bv, k, n);
                 use tt_kernels::tensor::Elem;
                 // A BF16 result (roadmap W1): each output rounded in `Dst`, packed as BF16.
-                let variants: &[(bool, Elem, &str)] = if skip_reload {
-                    &[(false, Elem::F32, ", without the reload")]
+                let multicast = std::env::var("TT_OPERAND_REUSE")
+                    .is_ok_and(|v| v.starts_with("mcast"));
+                let variants: &[(Skip, Elem, &str)] = if skip_reload {
+                    &[(Skip::None, Elem::F32, ", without the reload")]
+                } else if multicast {
+                    &[
+                        (Skip::None, Elem::F32, ""),
+                        (Skip::A, Elem::F32, ", without A's traffic"),
+                        (Skip::ASenders, Elem::F32, ", without A senders' reads"),
+                        (Skip::Senders, Elem::F32, ", without any sender's reads"),
+                        (Skip::All, Elem::F32, ", without any gathers"),
+                        (Skip::None, Elem::BF16, ", a BF16 result"),
+                    ]
                 } else {
                     &[
-                        (false, Elem::F32, ""),
-                        (true, Elem::F32, ", without A's gathers"),
-                        (false, Elem::BF16, ", a BF16 result"),
+                        (Skip::None, Elem::F32, ""),
+                        (Skip::A, Elem::F32, ", without A's gathers"),
+                        (Skip::All, Elem::F32, ", without any gathers"),
+                        (Skip::None, Elem::BF16, ", a BF16 result"),
                     ]
                 };
-                for &(skip_a, out, variant) in variants {
-                    tt_kernels::tensor::probe_skip_a_reads(skip_a);
+                for &(skip, out, variant) in variants {
+                    skip.set();
                     let mut outs = Vec::new();
                     let us = trace_slope_us(&mut s, PREFILL_REPS, 1, SAMPLES, |s| {
                         outs.push(product_as(s, &a, &b, fidelity, out))
                     });
-                    tt_kernels::tensor::probe_skip_a_reads(false);
-                    if !skip_a && !skip_reload && out == Elem::F32 {
+                    let (units, [read, read_a, read_b]) =
+                        traced_reads(&mut s, |s| product_as(s, &a, &b, fidelity, out));
+                    Skip::None.set();
+                    if skip == Skip::None && !skip_reload && out == Elem::F32 {
                         let got = s.download(outs.last().unwrap()).unwrap();
                         check_exact(&what, &got, &a_dec, &b_dec, [m, k, n]);
                     }
@@ -540,8 +769,29 @@ fn prefill(skip_reload: bool) {
                         s.free(t).unwrap();
                     }
                     let tflops = flops / us / 1e6;
-                    println!("MEASURE contract {what}{variant}: {us:.1} us, {tflops:.2} TFLOPS");
+                    // A K-tile pair is 2 * 32^3 flops; each unit's share of the product's pairs.
+                    let pairs = (m * k * n) as f64 / 32768.0;
+                    let ns_a_pair = us * 1e3 * units.max(1) as f64 / pairs;
+                    println!(
+                        "MEASURE contract {what}{variant}: {us:.1} us, {tflops:.2} TFLOPS on {units} \
+                         units ({ns_a_pair:.1} ns a K-tile pair a unit); GDDR read {read:.1} MB \
+                         (A {read_a:.1}, B {read_b:.1})"
+                    );
                     bench(&format!("contract {what}{variant}"), "TFLOPS", tflops);
+                }
+                if !skip_reload && std::env::var("TT_CONTRACT_PIPELINE").as_deref() == Ok("1") {
+                    // `TT_CONTRACT_PIPELINE_SKIP=a|a-senders|senders|all`: the meter on that variant.
+                    let skip = match std::env::var("TT_CONTRACT_PIPELINE_SKIP").as_deref() {
+                        Err(_) => Skip::None,
+                        Ok("a") => Skip::A,
+                        Ok("a-senders") => Skip::ASenders,
+                        Ok("senders") => Skip::Senders,
+                        Ok("all") => Skip::All,
+                        Ok(v) => panic!("TT_CONTRACT_PIPELINE_SKIP: a, a-senders, senders or all, not {v:?}"),
+                    };
+                    skip.set();
+                    pipeline(&mut s, &what, |s| product(s, &a, &b, fidelity));
+                    Skip::None.set();
                 }
                 for t in [a, b] {
                     s.free(t).unwrap();
@@ -554,6 +804,14 @@ fn prefill(skip_reload: bool) {
                     );
                 }
             }
+        }
+        // The blocks this process measured and chose (`BlockStream::Measured`): a choice among
+        // blocks timed alike can differ from one process to the next, and moves a product's
+        // TFLOPS with it, so each run says which it ran.
+        let mut chosen = tt_kernels::tensor::measured();
+        chosen.sort_by_key(|(q, _, _)| format!("{q:?}"));
+        for (q, choice, times) in chosen {
+            println!("MEASURE contract block {q:?}: {choice:?}, [Auto, chosen] us {times:?}");
         }
     })
     .unwrap_or_else(|e| panic!("{e}"));

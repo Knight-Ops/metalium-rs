@@ -49,6 +49,8 @@ fn main() {
     link("noc_probe_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
     link("read_loop_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
     link("icache_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
+    link("icache_alias_b", "link_b.x", tt_isa::mailbox::MAILBOX_BASE);
+    link("icache_alias_nc", "link_nc.x", tt_isa::dm::nc::MAILBOX_BASE);
     for (bin, script, t) in [
         ("icache_t0", "link.x", 0),
         ("icache_t1", "link_t1.x", 1),

@@ -956,6 +956,41 @@ to `|x| <= 2^64`; a subnormal is zero. **Cost on silicon (run `1791818553`): 19x
 faster than the exact mode; the time is mostly the element-wise scaling, slicing and NaN/infinity classification around the
 matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-matmul-cost-2026-10-12-card-0)).
 
+## Every baby core's instruction cache: 4 KiB, 2-way, 16-byte lines (2026-11-14, card 0)
+
+Measured on B and NC by `probe_icache::instruction_cache_geometry_by_aliasing` (run `1794619199`), and assumed to
+hold for T0-T2, whose capacity curve is the same:
+- 128 sets of two 16-byte lines, with a set stride of 2 KiB and LRU-like replacement;
+- a miss costs ~6.9 cycles a line;
+- a sequential prefetcher hides misses on straight-line code and on forward steps of up to ~32 bytes.
+
+So **hot code fits when no set holds more than two of its lines**. Addresses `a` and `b` share a set when
+`a / 16 % 128 == b / 16 % 128`. A third hot line in a set makes all three miss every time round. Count the hot lines
+per set before and after any change to B's or NC's code, not only the bytes
+([performance-log.md](performance-log.md#instruction-caches-about-4-kib-on-every-baby-core)).
+
+## RISCV B's code placement moves a product by up to 20% (2026-11-14, card 0) -- refuted the same day
+
+**Refuted:** the three values below were the measured block choice (`BlockStream::Measured`), which differs from
+one process to the next (LoFi `[8,4,9]` ~93 TFLOPS, `[6,4,12]` ~81), not B's code. Old and new images in one tree
+(`TT_FIRMWARE_OVERRIDE`) give the same TFLOPS for the same block, within 1%
+([performance-log.md](performance-log.md#the-movers-per-chunk-code-placement-tried-and-reverted-what-moved-the-plain-product-2026-11-14-card-0)).
+**Compare a product across images only at the same chosen block** (`silicon_probe_performance_contract` prints it),
+or over enough processes to see both. Placing B's per-chunk code on purpose was then tried: 1.5-2.1% on the 1.7B
+decode step for ~3.1 KiB of B's image, reverted ([failed-approaches.md](failed-approaches.md)). As first written:
+
+
+Three B images that differ only in the size of the record expansion (`run_record`), which a product with its gathers
+skipped never runs, give that product's BF16-HiFi2 132.4 / 113.6 / 113.1 TFLOPS and its plain BF16 x BFP8 LoFi 76.5 /
+92.6 / 81.4 (every unit, `[2048,2048]@[2048,16384]`, `1794614097`, `1794614207`, `1794614376`; the performance log, "W2:
+a cheaper gather"). Growing `run_record` moves every function linked after it, among them what B runs and polls each
+chunk (`kernel`, `launch`, `release`, `pair_shared`, `finish_pair`, `await_roles`, `dataflow::buffer`). B's
+instruction cache is ~4 KiB and only the per-entry stretch (`.text.hot`) is placed on purpose (`sections.x`). So:
+**a change to B's code is measured on a plain product with and without its gathers, not only on what it changed**, and
+a product's number across two B images is not comparable until the per-chunk code is placed (roadmap W2's next).
+Image sizes after the change (`cargo xtask fw-size`): `dm_b` safe 43,140 bytes of 52,224, `profile` + `encoded-guard`
+47,800 (room 4,424); `run_record` 10,524 bytes at `0x27cc`.
+
 ## RISCV B's image budget (2026-10-13, ttsim and card 0)
 
 **Update 2026-11-06: the firmware diet; B's slot is 52,224 bytes, the role slots 7,168 (`0x1C00`).** Measured with
@@ -1627,6 +1662,12 @@ from NC's L1 into a peer Tensix tile's L1 (gate `step218_l1_write_records`; card
   drained and counted to the rectangle's tiles before the next entry. NoC #1's counter is NC's alone: B, on the same
   NIUs, never writes through NoC #1, where NoC #0's counts B's barrier release too. With the multicast, B 30,996 and NC
   17,872 bytes (6,704 left).
+- **Many senders' multicasts at once, rows across columns** (2026-11-13, card 0, `step274`, roadmap W2): one sender a
+  grid row multicasting `A` strips (up to 64 KiB a chunk, in 16 KiB requests, a row split into rectangles at columns 8
+  and 9) while one sender a column multicasts `B` down it, all on NoC #1, 22 senders over a 10x12 grid with every tile a
+  receiver of two: every product bit for bit, no hang, and the multicasts do not bind the product (a sender's own GDDR
+  reads do). A 16-byte multicast from one op-level credit word to the same word in a rectangle (a ready count) lands as
+  a plain write; the words are L1 like any other to the NoC.
 
 ## A region at the top of L1 costs a product only past its plan's floor (2026-10-21, card 0)
 

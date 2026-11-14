@@ -483,11 +483,29 @@ fn a_streamed_pairs_batches_keep_the_credit_protocols_order() {
         let what = format!("[1, {k}] @ [{k}, {n}], a ring of {ring}");
         assert_eq!((t.overflowed, t.unit_mismatches), (0, 0), "{what}");
         assert_eq!(t.pipe_dropped, [0; 7], "{what}: a pair's batches not told");
-        let units: Vec<_> = t.pipe_batches.iter().flatten().collect();
+        // The units that streamed the product's batches (NC's log also keeps the trace's other
+        // ops, its plain transfers).
+        let units: Vec<_> = t
+            .pipe_batches
+            .iter()
+            .flatten()
+            .filter(|u| !u.3.is_empty())
+            .collect();
         assert!(units.len() > 8, "{what}: {} units told", units.len());
         let (mut batches, mut ahead) = (0, 0);
-        for (u, since, arrive, b) in &units {
+        for (u, since, arrive, b, nc) in &units {
             let at = |i: usize| format!("{what}: unit {u} batch {i} of {}", b.len());
+            // NC's entry log: kept whole, its output batches taken, no strips sent on (no
+            // multicast here), its lists inside the unit's work on the op.
+            assert!(
+                nc.records > 0 && nc.lost == 0,
+                "{what}: unit {u}'s NC log {nc:?}"
+            );
+            assert!(nc.outputs > 0 && nc.strips == 0, "{what}: unit {u} {nc:?}");
+            assert!(
+                nc.busy() + nc.idle <= arrive - since,
+                "{what}: unit {u}'s NC log outlasts its work {nc:?}"
+            );
             for (i, x) in b.iter().enumerate() {
                 assert!(
                     since <= &x.reserve

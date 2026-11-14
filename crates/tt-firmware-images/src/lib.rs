@@ -128,6 +128,19 @@ pub const ICACHE_NC: Image = (
     tt_isa::dm::nc::IMAGE_BASE,
 );
 
+/// The instruction-cache geometry probes (`tt-firmware/src/icache_alias.rs`): B's at
+/// L1 0, NC's at NC's image base.
+pub const ICACHE_ALIAS_B: Image = (
+    Core::B,
+    include_bytes!(env!("FIRMWARE_ICACHE_ALIAS_B")),
+    tt_isa::dm::IMAGE_BASE,
+);
+pub const ICACHE_ALIAS_NC: Image = (
+    Core::NC,
+    include_bytes!(env!("FIRMWARE_ICACHE_ALIAS_NC")),
+    tt_isa::dm::nc::IMAGE_BASE,
+);
+
 /// The L1 Cache Tag Search Accelerator probe (`tt-firmware/src/bin/tag_search_b.rs`)
 /// for RISCV B, at L1 0: the block is usable by B only.
 pub const TAG_SEARCH_B: Image = (
@@ -184,7 +197,7 @@ pub const TTINSN_T1: Image = (
 );
 
 /// The ELF entry points `build.rs` read, by image name.
-const ENTRIES: [(&str, &str); 23] = [
+const ENTRIES: [(&str, &str); 25] = [
     ("heartbeat", env!("FIRMWARE_HEARTBEAT_ENTRY")),
     ("sfpu_mul", env!("FIRMWARE_SFPU_MUL_ENTRY")),
     ("prng_seed", env!("FIRMWARE_PRNG_SEED_ENTRY")),
@@ -202,6 +215,8 @@ const ENTRIES: [(&str, &str); 23] = [
     ("dm_nc", env!("FIRMWARE_DM_NC_ENTRY")),
     ("icache_b", env!("FIRMWARE_ICACHE_B_ENTRY")),
     ("icache_nc", env!("FIRMWARE_ICACHE_NC_ENTRY")),
+    ("icache_alias_b", env!("FIRMWARE_ICACHE_ALIAS_B_ENTRY")),
+    ("icache_alias_nc", env!("FIRMWARE_ICACHE_ALIAS_NC_ENTRY")),
     ("icache_t0", env!("FIRMWARE_ICACHE_T0_ENTRY")),
     ("icache_t1", env!("FIRMWARE_ICACHE_T1_ENTRY")),
     ("icache_t2", env!("FIRMWARE_ICACHE_T2_ENTRY")),
@@ -302,6 +317,7 @@ mod tests {
             ("tag_search_b", TAG_SEARCH_B),
             ("noc_probe_b", NOC_PROBE_B),
             ("read_loop_b", READ_LOOP_B),
+            ("icache_alias_b", ICACHE_ALIAS_B),
         ] {
             assert_eq!(entry(name).map(u64::from), Some(at));
             assert_eq!(at, core.default_reset_pc() as u64);
@@ -317,6 +333,7 @@ mod tests {
             ("nc_probe", NC_PROBE),
             ("dm_nc", DM_NC),
             ("icache_nc", ICACHE_NC),
+            ("icache_alias_nc", ICACHE_ALIAS_NC),
         ] {
             assert_eq!(core, Core::NC, "{name}");
             assert_eq!(entry(name).map(u64::from), Some(at), "{name}");

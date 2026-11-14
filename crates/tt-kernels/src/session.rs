@@ -492,6 +492,11 @@ pub enum TileChoice {
     Count(usize),
     /// Every surviving tile.
     All,
+    /// A rectangle of the grid: the first `cols` surviving tiles of each of the first `rows` tile
+    /// rows, row by row, so the session's units are a `rows x cols` grid
+    /// (`crate::tile_op::distribute::grid_of`; roadmap W2's multicast products). An error if the
+    /// chip has fewer, or if any of them is wedged: a hole would break the grid.
+    Rect { cols: usize, rows: usize },
 }
 
 /// Why a session could not be opened.
@@ -1967,6 +1972,12 @@ fn l1_footprint(entries: &[[u32; 8]], gather: bool) -> Option<Vec<std::ops::Rang
                     ranges.push(to as u64..to as u64 + len as u64)
                 }
                 Entry::Credit { .. } | Entry::WaitCredit { .. } => {}
+                // A stream's credit touches its counters, no slot; a multicast sender's writes
+                // read its own slots (`tile_op::multicast`).
+                Entry::Buffer { .. } => {}
+                Entry::L1Multicast { from, len, .. } if !gather => {
+                    ranges.push(from as u64..from as u64 + len as u64)
+                }
                 _ => return None,
             }
         }
@@ -2198,7 +2209,7 @@ fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, Tens
             ..Default::default()
         };
         let mut reader = vec![[op::LAUNCH, 0, 0, 0, 0, 0, 0, 0]];
-        let mut writer = Vec::new();
+        let mut sections = Vec::with_capacity(blocks.len());
         let depth = capacity as usize;
         // Only a gather at least `depth` batches in reuses a slot, against a
         // scatter at least `depth` batches before the end: a region of
@@ -2250,20 +2261,27 @@ fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, Tens
             reader.push(input.credit(Action::Reserve));
             reader.extend(block.gather.1);
             reader.push(input.credit(Action::Push));
-            writer.push(output.credit(Action::Wait));
             // A planned capture keeps a list whose every write it dropped as a `WAIT`
             // (`Session::apply_plan`); NC's section only writes, and its credits keep the
             // batch's place.
-            writer.extend(
+            sections.push(
                 block
                     .scatter
                     .1
                     .into_iter()
-                    .filter(|e| *e != [op::WAIT, 0, 0, 0, 0, 0, 0, 0]),
+                    .filter(|e| *e != [op::WAIT, 0, 0, 0, 0, 0, 0, 0])
+                    .collect(),
             );
-            writer.push(output.credit(Action::Pop));
             segment.steps += 3;
         }
+        // A multicast sender's entries for a chunk (`tile_op::multicast`), up to its transfer
+        // pop, run a chunk ahead of the results: strip `c + 1` goes out before NC waits for chunk
+        // `c`'s output.
+        let writer = crate::tile_op::multicast::writer_list(
+            sections,
+            output.credit(Action::Wait),
+            output.credit(Action::Pop),
+        );
         segment.roles = segment.kernel_roles.first().cloned();
         segment.kernels.push(1);
         segment.waits.push((reader.len() + 1, 0));
@@ -2619,6 +2637,46 @@ fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
 /// ([`crate::profile_mode::ProfileOptions::stamps`]), and logs its batch tables in B's batch log:
 /// a header and six words a batch, one input `CB` reserve each, charged to the window at the log's
 /// rate ([`crate::profile_mode::batch_log_cost`]).
+/// Empty RISCV NC's entry log (`tt_isa::dm::nc_log`) on `tile` and disarm it.
+fn clear_nc_log<T: Transport>(
+    dev: &mut Device<T>,
+    window: &tt_device::Window,
+    tile: NocCoord<Noc0>,
+) -> Result<(), TransportError> {
+    dev.write32(window, tile, tt_isa::dm::nc::LOG, 0)?;
+    dev.write32(window, tile, tt_isa::dm::nc::LOG + 4, 0)?;
+    dev.write32(window, tile, tt_isa::dm::Mover::NC.at(tt_isa::dm::TRACE), 0)
+}
+
+/// RISCV NC's entry log on `tile` (`tt_isa::dm::nc_log`): its record words and the records it
+/// lost, read and emptied for the next. Read while NC is between lists (after a sync).
+fn take_nc_log<T: Transport>(
+    dev: &mut Device<T>,
+    window: &tt_device::Window,
+    tile: NocCoord<Noc0>,
+) -> Result<(Vec<u32>, u32), TransportError> {
+    use tt_isa::dm::{nc, nc_log};
+    let used = dev
+        .read32(window, tile, nc::LOG)?
+        .min(nc::LOG_WORDS - nc_log::HEADER_WORDS);
+    let lost = dev.read32(window, tile, nc::LOG + 4)?;
+    if used == 0 && lost == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let mut bytes = vec![0u8; used as usize * 4];
+    if used > 0 {
+        let at = nc::LOG + 4 * u64::from(nc_log::HEADER_WORDS);
+        dev.read(window, tile, at, &mut bytes)?;
+    }
+    dev.write32(window, tile, nc::LOG, 0)?;
+    dev.write32(window, tile, nc::LOG + 4, 0)?;
+    let log = bytes
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+    Ok((log, lost))
+}
+
 fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
@@ -2632,6 +2690,7 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
     ];
     let mut count = [0u32; 3];
     let mut log_words = 0u32;
+    let mut nc_words = 0u32;
     let mut add = |entries: &[[u32; 8]]| {
         let mut i = 0;
         while i < entries.len() {
@@ -2675,6 +2734,9 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
                     waits += chunks(reader.len());
                     add(reader);
                 }
+                if let Some(writer) = uc.pending_sections.get(2 * k + 1) {
+                    nc_words += nc_log_words(writer);
+                }
             }
         } else {
             add(&uc.stream[i..i + 1]);
@@ -2682,7 +2744,40 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
         i += (tt_isa::dm::record::len(head) as usize).max(1);
     }
     count[2] += crate::profile_mode::batch_log_cost(log_words);
+    count[2] += crate::profile_mode::nc_log_cost(nc_words);
     count.map(|c| c + fetches + waits)
+}
+
+/// The words RISCV NC's entry log (`tt_isa::dm::nc_log`) takes for a writer section run as its
+/// trace chunks, as the firmware logs it: a record an entry, but one for a run of a tag that
+/// coalesces; a settle before the first entry after a multicast run; and an anchor (two words), a
+/// settle and an end a chunk.
+fn nc_log_words(writer: &[[u32; 8]]) -> u32 {
+    use tt_isa::dm::{nc_log, op, MCAST_RUN_ACKS, TRACE_CHUNK_ENTRIES};
+    let settle = nc_log::tag(nc_log::SETTLE, 0);
+    let mut words = 0u32;
+    let mut last = None;
+    let mut run = false;
+    let mut i = 0;
+    while i < writer.len() {
+        if i % TRACE_CHUNK_ENTRIES as usize == 0 {
+            words += 4;
+            (last, run) = (None, false);
+        }
+        let w = &writer[i];
+        let tag = nc_log::tag_for(w);
+        let of_run = w[0] == op::WRITE_L1_MCAST && w[6] == MCAST_RUN_ACKS;
+        if run && !of_run {
+            words += 1;
+            last = Some(settle);
+        }
+        if !(last == Some(tag) && nc_log::coalesces(tag)) {
+            words += 1;
+        }
+        (last, run) = (Some(tag), of_run);
+        i += (tt_isa::dm::record::len(w[0])).max(1);
+    }
+    words
 }
 
 /// Unit `u`'s `BARRIER` entries in its stream `uc`, in order: an arrival at the op whose entries
@@ -2821,6 +2916,24 @@ impl<T: Transport> Session<T> {
                 usize::MAX,
                 false,
             ),
+            TileChoice::Rect { cols, rows } => {
+                let all: Vec<(u8, u8)> = grid.tiles::<Noc0>().map(|t| (t.x(), t.y())).collect();
+                let mut ys: Vec<u8> = all.iter().map(|t| t.1).collect();
+                ys.dedup();
+                let picked: Vec<(u8, u8)> = ys
+                    .iter()
+                    .take(rows)
+                    .flat_map(|&y| all.iter().filter(move |t| t.1 == y).take(cols))
+                    .copied()
+                    .collect();
+                if cols == 0 || rows == 0 || picked.len() != cols * rows {
+                    return Err(SessionError::TooFewTiles {
+                        asked: cols * rows,
+                        have: picked.len(),
+                    });
+                }
+                (picked, cols * rows, true)
+            }
         };
         for &(x, y) in &candidates {
             if !grid.contains(x, y) {
@@ -3182,6 +3295,9 @@ impl<T: Transport> Session<T> {
                 dev.write32(r.window(), unit.tile, count, 0)?;
             }
             dev.write32(r.window(), unit.tile, tt_isa::dm::BATCH_LOG, 0)?;
+            // NC's entry log starts empty and disarmed: B arms it pair by pair
+            // (`dm::trace_mode::NC_LOG`).
+            clear_nc_log(dev, r.window(), unit.tile)?;
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, trace_word)?;
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
@@ -3222,6 +3338,8 @@ impl<T: Transport> Session<T> {
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 0)?;
             }
+            let nc_trace = tt_isa::dm::Mover::NC.at(tt_isa::dm::TRACE);
+            dev.write32(r.window(), unit.tile, nc_trace, 0)?;
             if u == 0 {
                 let now = dev.wall_clock(r.window(), unit.tile)?;
                 let us_elapsed = p.host_at_start.elapsed().as_secs_f64() * 1e6;
@@ -3376,7 +3494,15 @@ impl<T: Transport> Session<T> {
                     .chunks_exact(4)
                     .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                     .collect();
-                crate::profile_mode::splice_batch_log(events, &log)
+                let events = crate::profile_mode::splice_batch_log(events, &log);
+                // And NC's entry log, placed on the counter as it reads now.
+                let (log, lost) = take_nc_log(dev, r.window(), tile)?;
+                if log.is_empty() && lost == 0 {
+                    events
+                } else {
+                    let now = dev.wall_clock(r.window(), tile)?;
+                    crate::profile_mode::splice_nc_log(events, &log, lost, now)
+                }
             }
             _ => events,
         };
@@ -10286,13 +10412,18 @@ impl<T: Transport> Session<T> {
             .iter()
             .map(|u| (u.tile.x(), u.tile.y()))
             .collect();
+        // A multicast writes its readers' slots wherever the op's arena placed them.
+        let window = match reuse {
+            tensor::Reuse::Multicast { .. } => listed.base..listed.end,
+            _ => self.l1_writes.window.clone(),
+        };
         self.set_l1_writes(crate::dm::L1Writes {
             tiles,
             reads: match reuse {
                 tensor::Reuse::Off => 0..0,
                 _ => listed.base..listed.end,
             },
-            ..self.l1_writes.clone()
+            window,
         })?;
         self.reuse = reuse;
         Ok(())
@@ -11166,6 +11297,52 @@ impl<T: Transport> Session<T> {
                 _ => [0; 8],
             };
             out.push(waits);
+        }
+        Ok(out)
+    }
+
+    /// Have every started unit's NC log its writer sections (`tt_isa::dm::nc_log`) with no profile
+    /// running, or stop: B's trace word holds only `trace_mode::NC_LOG`, so B stamps nothing and
+    /// arms NC's log for every pair. Each log starts empty. Only a `profile` image logs; refused
+    /// while a profile runs. Dev-facing: the NC log's ttsim gate.
+    #[doc(hidden)]
+    pub fn probe_nc_log(&mut self, on: bool) -> Result<(), TensorError> {
+        self.sync()?;
+        if self.profiling.is_some() {
+            return Err(TensorError::Run(RunError::Transport(
+                TransportError::Hazard {
+                    address: tt_isa::dm::TRACE,
+                    reason: "a profile is running: its detail owns the trace word",
+                },
+            )));
+        }
+        let word = if on {
+            tt_isa::dm::trace_mode::NC_LOG
+        } else {
+            0
+        };
+        let Session { dev, units, .. } = self;
+        for unit in units.iter() {
+            if let (Some(r), Some(_)) = (unit.resident.as_ref(), unit.mover.as_ref()) {
+                clear_nc_log(dev, r.window(), unit.tile)?;
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, word)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every unit's NC entry log since it was last taken (`tt_isa::dm::nc_log`), after what is
+    /// queued: its record words and the records it lost, and emptied. Dev-facing.
+    #[doc(hidden)]
+    pub fn probe_take_nc_logs(&mut self) -> Result<Vec<(Vec<u32>, u32)>, TensorError> {
+        self.sync()?;
+        let mut out = Vec::with_capacity(self.units.len());
+        let Session { dev, units, .. } = self;
+        for unit in units.iter() {
+            out.push(match unit.resident.as_ref() {
+                Some(r) => take_nc_log(dev, r.window(), unit.tile)?,
+                None => (Vec::new(), 0),
+            });
         }
         Ok(out)
     }

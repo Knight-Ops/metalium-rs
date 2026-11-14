@@ -105,6 +105,19 @@ pub mod trace_mode {
     /// every `WAIT`, and the host counts those as data.
     pub const PREFETCH_WAIT: u32 = super::op::WAIT;
 
+    /// The bits of [`super::TRACE`] that hold the mode (`FULL`, `LISTS`, `OPS`); the bits above
+    /// are flags, read by B alone.
+    pub const MODE: u32 = 0xff;
+    /// Flag, with `OPS`: B also stamps its `WAIT_CREDIT` and `CREDIT` entries
+    /// ([`ops_stamped_with`]), each with the credit word it names
+    /// ([`super::entry_detail`]): the profile mode's pipeline detail, which times a reader's
+    /// wait for a multicast strip and its frees.
+    pub const CREDITS: u32 = 1 << 8;
+    /// Flag: B arms RISCV NC's entry log ([`super::nc_log`]) for each pair whose reader section it
+    /// runs inside the window, and disarms it for the others, through NC's own [`super::TRACE`]
+    /// word (`Mover::NC.at(TRACE)`), whose mode bits stay zero: NC never stamps.
+    pub const NC_LOG: u32 = 1 << 9;
+
     /// Is an entry headed by `op` stamped in `OPS` mode?
     pub const fn ops_stamped(op: u32) -> bool {
         matches!(
@@ -117,7 +130,50 @@ pub mod trace_mode {
                 | super::op::POKE
         )
     }
+
+    /// Is an entry headed by `op` stamped in `OPS` mode, with the [`CREDITS`] flag if `credits`?
+    pub const fn ops_stamped_with(op: u32, credits: bool) -> bool {
+        ops_stamped(op) || (credits && matches!(op, super::op::WAIT_CREDIT | super::op::CREDIT))
+    }
 }
+
+/// The detail an entry's `ENTRY_BEGIN` and `ENTRY_END` stamps carry
+/// (`crate::mailbox::trace::ENTRY_BEGIN`): its op in bits 0..8, and in bits 8..12 what the host
+/// needs to tell entries of one op apart ([`entry_arg`]): a `CB`'s stream and action
+/// (`stream << 2 | action`), a `WAIT_CREDIT`'s or `CREDIT`'s credit word ([`credit_index`]). 0
+/// for every other op.
+pub const fn entry_detail(w: &[u32; 8]) -> u32 {
+    let arg = match w[0] {
+        op::CB => (w[1] & 3) << 2 | (w[2] & 3),
+        op::WAIT_CREDIT => credit_index(w[1]),
+        op::CREDIT => credit_index(w[3]),
+        _ => 0,
+    };
+    (w[0] & ENTRY_OP) | arg << 8
+}
+
+/// The op bits of an [`entry_detail`].
+pub const ENTRY_OP: u32 = 0xff;
+
+/// The op of an [`entry_detail`].
+pub const fn entry_op(detail: u32) -> u32 {
+    detail & ENTRY_OP
+}
+
+/// The argument of an [`entry_detail`].
+pub const fn entry_arg(detail: u32) -> u32 {
+    (detail >> 8) & 0xf
+}
+
+/// Which of [`CREDITS`]'s words `addr` is, or 15 for a word elsewhere (in `crate::l1::LISTED`).
+pub const fn credit_index(addr: u32) -> u32 {
+    if addr as u64 >= CREDITS && (addr as u64) < CREDITS_END {
+        ((addr as u64 - CREDITS) / 16) as u32
+    } else {
+        15
+    }
+}
+const _: () = assert!(CREDIT_WORDS < 15);
 /// Mover -> host: how many of the mover's NoC requests had to wait for room
 /// under the in-flight cap (`crate::noc::niu::InFlight`), since the host last
 /// zeroed it. Written only when one did, so the normal path never touches it.
@@ -471,8 +527,10 @@ pub mod op {
     /// rectangle must be one a Tensix tile could have (`crate::noc::grid::is_tensix_geometry`):
     /// no non-memory or DRAM column inside it, which a broadcast would otherwise rely on masks to
     /// skip; the tile running it is never one (no broadcast to itself); the ranges as
-    /// [`WRITE_L1`]'s. The host narrows the rectangle to its session's tiles. NC's only. Only in
-    /// a list entry.
+    /// [`WRITE_L1`]'s, or, with `len` 16, one op-level credit word ([`super::CREDITS`]) to another
+    /// (a count set in other tiles' credit words: `tt_kernels::tile_op::multicast`'s ready
+    /// words). The host narrows the rectangle to its session's tiles. NC's only. Only in a list
+    /// entry.
     ///
     /// Word 6 may be [`super::MCAST_RUN_ACKS`]: a multicast so marked that follows another so
     /// marked neither waits for earlier writes nor counts its own acknowledgements before the
@@ -831,6 +889,12 @@ pub mod nc {
     pub const TRACE_CHUNK: u64 = SCRATCH + super::TILE_SLOT.next_multiple_of(256);
     /// The end of what NC's mover uses.
     pub const END: u64 = TRACE_CHUNK + super::TRACE_CHUNK_ENTRIES as u64 * super::ENTRY_BYTES;
+    /// NC's entry log ([`super::nc_log`]), in a `profile` image: NC's scratch slot, which NC
+    /// never uses (a transform, the slot's one use, is B's alone: `Mover::permits`).
+    pub const LOG: u64 = SCRATCH;
+    /// Words of [`LOG`], its two header words included.
+    pub const LOG_WORDS: u32 = (super::TILE_SLOT.next_multiple_of(256) / 4) as u32;
+    const _: () = assert!(LOG + LOG_WORDS as u64 * 4 <= TRACE_CHUNK);
     /// NC's mover mailbox: B's layout ([`super::SEQ`] and on, offset by
     /// `MAILBOX_BASE - super::MAILBOX_BASE`), one page after B's.
     pub const MAILBOX_BASE: u64 = super::MAILBOX_BASE + 0x1000;
@@ -845,6 +909,96 @@ pub mod nc {
         let lui_t0 = (target as u32) | (5 << 7) | 0x37;
         let jalr_x0_t0 = (5 << 15) | 0x67;
         [lui_t0, jalr_x0_t0]
+    }
+}
+
+/// RISCV NC's entry log, in a `profile` image ([`nc::LOG`]): when B has armed it for a pair
+/// ([`trace_mode::NC_LOG`]), NC records when it began each entry of the pair's writer section, so
+/// the host can tell what a writer waited for, entry by entry, without the timestamper (whose
+/// stream is B's). Word 0 is the record words used after the header, word 1 the records that did
+/// not fit; the host zeroes both when it reads the log (`tt_kernels::session`).
+///
+/// A record is one word, a tag ([`tag`]: a kind in bits 4..8 and an argument in bits 0..4) in bits
+/// 24..32 and bits [`CLOCK_SHIFT`].. of the tile's counter in bits 0..24, so 2^26 cycles (~50 ms)
+/// pass before the field wraps. An [`ANCHOR`] is followed by one more word, the counter's low
+/// word, from which the host places the records after it: one starts each list NC runs with the
+/// log armed, and another comes before any record more than [`REANCHOR_CYCLES`] after the last.
+/// A record's entry ends where the next record begins. Consecutive records of one tag that
+/// [`coalesces`] keep only the first.
+pub mod nc_log {
+    /// The first word of the records.
+    pub const HEADER_WORDS: u32 = 2;
+    /// The counter's bits a record drops.
+    pub const CLOCK_SHIFT: u32 = 2;
+    /// The bits of a record's time.
+    pub const CLOCK_MASK: u32 = (1 << 24) - 1;
+    /// Cycles after the last record past which NC anchors again: half the field's span.
+    pub const REANCHOR_CYCLES: u32 = 1 << (24 + CLOCK_SHIFT - 1);
+
+    /// A list began (argument 0), or a record would have come too long after the last (1): the
+    /// next word is the counter's low word.
+    pub const ANCHOR: u32 = 0;
+    /// A `CB` entry; the argument is `stream << 2 | action` (`crate::dataflow::Stream`, `Action`).
+    pub const CB: u32 = 1;
+    /// A `WAIT_CREDIT`; the argument its word ([`super::credit_index`]).
+    pub const WAIT_CREDIT: u32 = 2;
+    /// A `CREDIT`; the argument its word on the target ([`super::credit_index`]).
+    pub const CREDIT: u32 = 3;
+    /// `WRITE_L1_MCAST` requests: one of a run (`MCAST_RUN_ACKS`), argument 0; a lone one (a
+    /// credit word's copy), 1.
+    pub const MCAST: u32 = 4;
+    /// Counting a multicast run's acknowledgements, before an entry not of it or at a list's end.
+    pub const SETTLE: u32 = 5;
+    /// A write: `WRITE`, `WRITE_L1` or a write record (a scatter).
+    pub const WRITE: u32 = 6;
+    /// Any other entry.
+    pub const OTHER: u32 = 7;
+    /// The list's end: its writes landed.
+    pub const END: u32 = 15;
+
+    /// A record's tag.
+    pub const fn tag(kind: u32, arg: u32) -> u32 {
+        (kind & 0xf) << 4 | (arg & 0xf)
+    }
+
+    /// A record: `tag` at the counter's low word `clock`.
+    pub const fn record(tag: u32, clock: u32) -> u32 {
+        tag << 24 | ((clock >> CLOCK_SHIFT) & CLOCK_MASK)
+    }
+
+    /// A record's tag.
+    pub const fn tag_of(record: u32) -> u32 {
+        record >> 24
+    }
+
+    /// A tag's kind.
+    pub const fn kind(tag: u32) -> u32 {
+        tag >> 4
+    }
+
+    /// A tag's argument.
+    pub const fn arg(tag: u32) -> u32 {
+        tag & 0xf
+    }
+
+    /// Whether a record of `tag` straight after one of the same tag is left out: the requests of
+    /// one multicast or one scatter, and other entries; never a credit or a wait.
+    pub const fn coalesces(tag: u32) -> bool {
+        matches!(kind(tag), MCAST | WRITE | OTHER)
+    }
+
+    /// The tag NC logs for an entry whose first words are `w`.
+    pub const fn tag_for(w: &[u32; 8]) -> u32 {
+        use super::{op, record};
+        match w[0] {
+            op::CB => tag(CB, (w[1] & 3) << 2 | (w[2] & 3)),
+            op::WAIT_CREDIT => tag(WAIT_CREDIT, super::credit_index(w[1])),
+            op::CREDIT => tag(CREDIT, super::credit_index(w[3])),
+            op::WRITE_L1_MCAST => tag(MCAST, (w[6] != super::MCAST_RUN_ACKS) as u32),
+            op::WRITE | op::WRITE_L1 => tag(WRITE, 0),
+            o if matches!(record::direction(o), Some(record::Direction::Write)) => tag(WRITE, 0),
+            _ => tag(OTHER, 0),
+        }
     }
 }
 
@@ -1090,10 +1244,16 @@ impl Entry {
                 }
                 x += 1;
             }
-            if from % 16 != to % 16
-                || !crate::l1::LISTED.contains(from as u64, len as u64)
-                || !crate::l1::LISTED.contains(to as u64, len as u64)
-            {
+            // Or one op-level credit word's 16 bytes to another's ([`CREDITS`]): a sender's count
+            // set in its readers' ready words (`tt_kernels::tile_op::multicast`).
+            let credit = |a: u32| {
+                a as u64 >= CREDITS
+                    && a as u64 + 16 <= CREDITS_END
+                    && (a as u64 - CREDITS) % 16 == 0
+            };
+            let listed = crate::l1::LISTED.contains(from as u64, len as u64)
+                && crate::l1::LISTED.contains(to as u64, len as u64);
+            if from % 16 != to % 16 || !(listed || (len == 16 && credit(from) && credit(to))) {
                 return Err(error::ALIGNMENT);
             }
             return Ok(Entry::L1Multicast {
@@ -1545,8 +1705,189 @@ impl Descriptor {
     }
 }
 
+/// RISCV B's plain GDDR reads of one request each, made into that request in one step from
+/// what a list's reads share: the chip's channels, this tile, and the transaction ID. The checks
+/// are [`Descriptor::decode`]'s and [`crate::noc::niu::DramMove::new`]'s for a read on NoC #0,
+/// with the port B's NoC owns ([`crate::dram::DramChannel::port_for`]); the request is that
+/// move's only one, word for word, and a refusal is the code the mover gives the same entry
+/// (`DramMove`'s refusals are [`error::ALIGNMENT`] there). What it does not make (not a `READ`,
+/// no bytes, or more than one request) it leaves to that path.
+///
+/// A matmul block's gather issues one such read a tile; through the path that decodes each into
+/// a [`Descriptor`] and a `DramMove` first it cost ~386 cycles a 2,112-byte tile on card 0,
+/// against ~99 for a host-encoded read in a tight loop (`silicon_bench_memory::mover_gather_rate`,
+/// roadmap W2: a multicast sender's strip).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ReadPlan {
+    usable: u8,
+    me_hi: u32,
+    tag: u32,
+}
+
+impl ReadPlan {
+    /// The plan for reads issued by the tile at `me` under `txn`, on a chip whose usable channels
+    /// are `usable`'s bits.
+    pub const fn new(usable: u32, me: (u8, u8), txn: crate::noc::niu::TxnId) -> Self {
+        ReadPlan {
+            usable: usable as u8,
+            me_hi: crate::noc::niu::Endpoint {
+                x: me.0,
+                y: me.1,
+                addr: 0,
+            }
+            .hi(),
+            tag: (txn.index() as u32) << 10,
+        }
+    }
+
+    /// `e`'s request, or `None` for an entry this does not make (the general path makes it, or
+    /// refuses it), or the code the mover refuses `e` with.
+    #[inline(always)]
+    pub fn request(&self, e: &[u32; 8]) -> Result<Option<crate::noc::niu::DramRequest>, u32> {
+        let [what, channel, port, offset, l1, len, ..] = *e;
+        if what != op::READ {
+            return Ok(None);
+        }
+        self.read(channel, port, offset, l1, len)
+    }
+
+    /// [`ReadPlan::request`] of `[op::READ, channel, port, offset, l1, len, 0, 0]`, from its words
+    /// (`record::Sink::read`).
+    #[inline(always)]
+    pub fn read(
+        &self,
+        channel: u32,
+        port: u32,
+        offset: u32,
+        l1: u32,
+        len: u32,
+    ) -> Result<Option<crate::noc::niu::DramRequest>, u32> {
+        use crate::noc::niu::{self, Niu};
+        if len == 0 || len > niu::MAX_REQUEST_BYTES {
+            return Ok(None);
+        }
+        // `Descriptor::decode`'s checks, in its order.
+        if port >= crate::dram::PORTS as u32 {
+            return Err(error::PORT);
+        }
+        let channel = match u8::try_from(channel)
+            .ok()
+            .and_then(|c| Dram::from_usable_mask(self.usable).channel(c))
+        {
+            Some(c) if offset as u64 + len as u64 <= crate::dram::CHANNEL_BYTES => c,
+            _ => return Err(error::RANGE),
+        };
+        if (offset ^ l1) as u64 % crate::dram::ALIGN != 0
+            || l1 as u64 + len as u64 > crate::tensix::L1_SIZE
+        {
+            return Err(error::ALIGNMENT);
+        }
+        // `DramMove::new`'s, on the port B's NoC owns: the endpoint always exists, and both
+        // ends lie below `MMIO_START` (a channel's bytes and L1 both do).
+        let at = match channel.endpoint(Niu::Noc0, channel.port_for(Niu::Noc0, port as u8)) {
+            Some(at) => at,
+            None => return Err(error::ALIGNMENT),
+        };
+        Ok(Some(niu::DramRequest {
+            targ: offset,
+            targ_hi: niu::Endpoint {
+                x: at.x(),
+                y: at.y(),
+                addr: 0,
+            }
+            .hi(),
+            ret: l1,
+            ret_hi: self.me_hi,
+            tag: self.tag,
+            ctrl: niu::CMD_RD | niu::RESP_MARKED | niu::STATIC_VC_1,
+            len,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// [`ReadPlan::request`] is the mover's general path for every read of one request: an entry
+    /// decoded ([`Descriptor::decode`]), its port the one B's NoC owns, its move made
+    /// ([`crate::noc::niu::DramMove::new`], a refusal [`error::ALIGNMENT`]) and that move's one
+    /// request -- word for word, refusal for refusal, over entries at and past every edge the
+    /// checks draw (channels the chip lacks, ports, a channel's end, L1's end, congruence,
+    /// request size) on chips with channels missing.
+    #[test]
+    fn a_read_plan_makes_what_the_general_path_makes() {
+        use super::*;
+        use crate::noc::niu::{self, DramMove, Niu, TxnId};
+        let reference = |usable: u32, me: (u8, u8), txn: TxnId, e: [u32; 8]| {
+            if e[0] != op::READ || e[5] == 0 || e[5] > niu::MAX_REQUEST_BYTES {
+                return Ok(None);
+            }
+            let d = Descriptor::decode(usable, e[0], e[1], e[2], e[3], e[4], e[5])?;
+            let port = d.range.channel().port_for(Niu::Noc0, d.port);
+            let mv = DramMove::new(d.range, port, d.l1, false, me, txn, Niu::Noc0)
+                .map_err(|_| error::ALIGNMENT)?;
+            let mut words = mv.words();
+            let r = words
+                .next()
+                .expect("a move of at least one byte has a request");
+            assert!(words.next().is_none(), "one request");
+            Ok(Some(r))
+        };
+        let top = crate::dram::CHANNEL_BYTES as u32;
+        let l1_top = crate::tensix::L1_SIZE as u32;
+        let lens = [0u32, 1, 64, 2112, 4160, 16384, 16385];
+        let offsets = |len: u32| {
+            [
+                0,
+                64,
+                65,
+                64 << 20,
+                top.wrapping_sub(len),
+                top.wrapping_sub(len) + 64,
+                top,
+                u32::MAX - 63,
+            ]
+        };
+        let l1s = |len: u32| {
+            [
+                0u32,
+                0x2_0000,
+                0x2_0001,
+                l1_top - len,
+                l1_top - len + 64,
+                l1_top,
+            ]
+        };
+        let mut seen = [0usize; 3];
+        for usable in [0xFFu32, 0x0F, 0xF1, 0] {
+            for (me, txn) in [((1u8, 2u8), TXN_B), ((16, 11), TXN_PREFETCH)] {
+                let txn = TxnId::new(txn).unwrap();
+                let plan = ReadPlan::new(usable, me, txn);
+                for what in [op::READ, op::WRITE, op::READ_TRANSPOSED] {
+                    for channel in [0u32, 3, 4, 7, 8, 255, 256] {
+                        for port in 0..5u32 {
+                            for len in lens {
+                                for offset in offsets(len) {
+                                    for l1 in l1s(len) {
+                                        let e = [what, channel, port, offset, l1, len, 0, 0];
+                                        let want = reference(usable, me, txn, e);
+                                        assert_eq!(plan.request(&e), want, "{e:x?} on {usable:#x}");
+                                        seen[match want {
+                                            Ok(Some(_)) => 0,
+                                            Ok(None) => 1,
+                                            Err(_) => 2,
+                                        }] += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Every outcome taken, many times.
+        assert!(seen.iter().all(|&n| n > 100), "{seen:?}");
+    }
 
     /// A stream's cap from [`STREAM_CAP`]'s word: the low half for FP32, the high half for BF16
     /// unless it is 0, and 0 the tile cap; an older host's plain word is both.
@@ -1669,6 +2010,47 @@ mod tests {
 
     /// `WRITE_L1_MCAST`: a rectangle of Tensix geometry, `start <= end`, no non-memory or DRAM
     /// column inside it; the ranges as `WRITE_L1`'s; and only NC runs it.
+    #[test]
+    fn a_multicast_sets_a_credit_word_only_whole_and_only_from_one() {
+        use super::*;
+        let mc = |to: u32, from: u32, len: u32| {
+            Entry::decode(
+                0xFF,
+                [
+                    op::WRITE_L1_MCAST,
+                    mcast_corners((1, 2), (3, 2)),
+                    0,
+                    to,
+                    from,
+                    len,
+                    0,
+                    0,
+                ],
+            )
+        };
+        let (w0, w3) = (credit_word(0), credit_word(3));
+        assert_eq!(
+            mc(w0, w0, 16),
+            Ok(Entry::L1Multicast {
+                start: (1, 2),
+                end: (3, 2),
+                to: w0,
+                from: w0,
+                len: 16,
+                run: false,
+            })
+        );
+        assert_eq!(mc(w3, w0, 16).map(|_| ()), Ok(()));
+        // Not a whole word, not word-aligned, from the arena, or past the words: refused.
+        assert_eq!(mc(w0, w0, 32), Err(error::ALIGNMENT));
+        assert_eq!(mc(w0, w0, 4), Err(error::ALIGNMENT));
+        assert_eq!(mc(w0 + 4, w0 + 4, 16), Err(error::ALIGNMENT));
+        assert_eq!(mc(w0, 0x4_0000, 16), Err(error::ALIGNMENT));
+        assert_eq!(mc(0x4_0000, w0, 16), Err(error::ALIGNMENT));
+        let past = credit_word(CREDIT_WORDS - 1) + 16;
+        assert_eq!(mc(past, past, 16), Err(error::ALIGNMENT));
+    }
+
     #[test]
     fn a_multicast_decodes_only_over_tensix_columns() {
         use super::*;

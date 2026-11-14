@@ -318,7 +318,17 @@ They run in this order; W1-W4 can overlap.
 - **Predicted gain:** prefill products at the 1.7B's shapes from ~30 (W1: >= 60) to >= 150 TFLOPS BF16-HiFi2. A 1.7B prefill at 256 tokens goes from 3,827 to >= 10,000 tokens/s (the roofline row's "realistic").
 - **First step:**
   - a probe: one `[2048,2048]@[2048,16384]` product with `A` row-multicast and `B` column-multicast on a 10x11 sub-grid, BF16-HiFi2;
-  - TFLOPS against the reads-free ceiling (`1793224072`: 28-30 with today's kernel), to separate the kernel's own rate from the operand delivery.
+  - TFLOPS against the reads-free ceiling, to separate the kernel's own rate from the operand delivery.
+- **Bounded (2026-11-13,** card 0; [log](../learnings/performance-log.md#w2-bounded-the-kernels-ceiling-at-the-performance-contract-before-multicast-2026-11-13-card-0)):
+  the ceiling at the performance contract is 118-186 TFLOPS on 104-120 units (37-60 ns a K-tile pair a unit, near
+  tt-metal's ~35), against 41-77 with today's gathers; the kill does not fire, and every shape is read-bound. On 64
+  units the ceiling is 74-114, so the probe deals over any grid rectangle (uniform blocks, a unit one job fewer where
+  they do not divide it), 8x8, 8x12 and 10x12, not only 10x11. Predicted: >= 85% of the ceiling on the same units.
+- **The probe, built (2026-11-13,** card 0; [log](../learnings/performance-log.md#w2-the-2-d-operand-multicast-probe-2026-11-13-card-0)):
+  `A` along grid rows and `B` down columns, bit for bit, GDDR reads ~10x fewer; 61.9-67.6 TFLOPS on 10x12 (H1),
+  below today's 70.5-76.9 and 54% of the ceiling; with `A`'s reads free 90-96 TFLOPS, against tt-metal's 122
+  (BF16-HiFi2) and 183 (BF16 x BFP8 LoFi). Two `A` senders a row (by chunk parity, by row halves) lost; `A`'s
+  channels and the mover's entry cost are not the bound.
 - **Kill:** below 60 TFLOPS with operands delivered (the kernel binds). In that case the next item is the kernel's push and unpack, not the dataflow.
 - **Gate:** a GEMM TFLOPS gate at BF16-HiFi2 and BFP8-LoFi beside tt-metal's on the same card (W0).
 

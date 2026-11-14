@@ -725,6 +725,7 @@ impl Cursor<'_> {
         self.next_with_slot(TILE_SLOT)
     }
 
+    #[inline(always)]
     fn next_with_slot(&mut self, stride: u64) -> Result<(u32, u32), u32> {
         let c = self.c as usize;
         let offset = (self.x.base[c] as u64) + self.slot as u64 * stride;
@@ -1180,7 +1181,7 @@ fn extent(v: u32) -> Result<u32, u32> {
 /// The host's expansion, for validation: it has no L1, so a [`SELECT_ROWS`]
 /// or [`SCATTER_ROWS`] index reads as `0` (see there).
 pub fn expand(rec: &[[u32; 8]], emit: impl FnMut([u32; 8]) -> Result<(), u32>) -> Result<(), u32> {
-    expand_for::<true, true>(rec, &mut |_| 0, emit)
+    expand_for::<true, true>(rec, &mut |_| 0, &mut Entries(emit))
 }
 
 /// [`expand`] of the reading records only ([`Direction::Read`]): what RISCV
@@ -1193,7 +1194,17 @@ pub fn expand_reads(
     mut index: impl FnMut(u32) -> u32,
     emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    expand_for::<true, false>(rec, &mut index, emit)
+    expand_for::<true, false>(rec, &mut index, &mut Entries(emit))
+}
+
+/// [`expand_reads`] into a [`Sink`], which may take a gather's whole-tile reads as their words
+/// ([`Sink::read`]) rather than as entries: what RISCV B's firmware calls.
+pub fn expand_reads_into(
+    rec: &[[u32; 8]],
+    mut index: impl FnMut(u32) -> u32,
+    sink: &mut impl Sink,
+) -> Result<(), u32> {
+    expand_for::<true, false>(rec, &mut index, sink)
 }
 
 /// [`expand`] of the writing records only: what RISCV NC's firmware calls.
@@ -1204,14 +1215,38 @@ pub fn expand_writes(
     mut index: impl FnMut(u32) -> u32,
     emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    expand_for::<false, true>(rec, &mut index, emit)
+    expand_for::<false, true>(rec, &mut index, &mut Entries(emit))
+}
+
+/// Where a record's expansion goes ([`expand_reads_into`]): each entry in order, and a
+/// [`GATHER`]'s whole-tile reads as the words of their [`op::READ`] entries, which by default
+/// are those entries ([`Sink::read`]). A sink that takes the words makes the same reads from
+/// them, in the same order among the entries, without the entry between.
+pub trait Sink {
+    fn entry(&mut self, e: [u32; 8]) -> Result<(), u32>;
+
+    /// `[op::READ, channel, port, offset, to, len, 0, 0]`.
+    #[inline(always)]
+    fn read(&mut self, channel: u32, port: u32, offset: u32, to: u32, len: u32) -> Result<(), u32> {
+        self.entry([op::READ, channel, port, offset, to, len, 0, 0])
+    }
+}
+
+/// A closure that takes every entry, a gather's reads among them.
+struct Entries<F>(F);
+
+impl<F: FnMut([u32; 8]) -> Result<(), u32>> Sink for Entries<F> {
+    #[inline(always)]
+    fn entry(&mut self, e: [u32; 8]) -> Result<(), u32> {
+        (self.0)(e)
+    }
 }
 
 #[inline(always)]
 fn expand_for<const READS: bool, const WRITES: bool>(
     rec: &[[u32; 8]],
     index: &mut impl FnMut(u32) -> u32,
-    mut emit: impl FnMut([u32; 8]) -> Result<(), u32>,
+    sink: &mut impl Sink,
 ) -> Result<(), u32> {
     let h = rec[0];
     if rec.len() != len(h[0]) || !is_record(h[0]) {
@@ -1263,20 +1298,9 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     };
                     Ok([op, ch, (i + j) % PORTS, off, to, TILE_SLOT as u32, 0, 0])
                 };
-            // An untransposed operand's row is consecutive tiles: a cursor
-            // steps along it. A transposed one is read down a column.
-            let read = |(ch, off): (u32, u32), i: u32, j: u32, to: u32| {
-                [
-                    op::READ,
-                    ch,
-                    (i + j) % PORTS,
-                    off,
-                    to,
-                    TILE_SLOT as u32,
-                    0,
-                    0,
-                ]
-            };
+            // An untransposed operand's row is consecutive tiles: a cursor steps along it, each
+            // tile a whole read in its slot, port `(i + j) % PORTS` ([`Sink::read`]). A
+            // transposed one is read down a column.
             let thin = (flags >> GATHER_ROWS_SHIFT) & 0x1f;
             if thin > 16 || (thin != 0 && a_t) {
                 return Err(super::error::RANGE);
@@ -1288,7 +1312,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             if a.col_tiles != 0 || b.col_tiles != 0 || l1_by_column(rec, 1) || l1_by_column(rec, 3)
             {
                 let slots = [a_slot as u32, b_slot as u32];
-                return gather_by_column(rec, &a, &b, slots, &mut emit);
+                return gather_by_column(rec, &a, &b, slots, &mut |e| sink.entry(e));
             }
             for i in (0..rows).filter(|_| !resident) {
                 let mut row = if a_t {
@@ -1300,11 +1324,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 for kk in 0..kt {
                     let to = a_at + (i * kt + kk) * a_slot as u32;
                     match row.as_mut() {
-                        // A packed `A` (untransposed, whole tiles): its own slot, read whole.
-                        Some(c) if a_slot != TILE_SLOT => {
-                            let mut e = read(c.next_with_slot(a_slot)?, i0 + i, kk, to);
-                            e[5] = a_slot as u32;
-                            emit(e)?;
+                        // A whole tile in its slot: a packed `A`'s (untransposed, whole tiles)
+                        // its own, an FP32 one's `TILE_SLOT` (unless thin, below).
+                        Some(c) if a_slot != TILE_SLOT || r == 0 => {
+                            let (ch, off) = c.next_with_slot(a_slot)?;
+                            sink.read(ch, (i0 + i + kk) % PORTS, off, to, a_slot as u32)?;
                         }
                         // One read of the datums through row `r - 1` of face 1:
                         // face 0 whole (its rows past `r` reach only the
@@ -1312,11 +1336,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                         // entry a tile, as a whole tile is: the mover's cost is
                         // per entry as much as per byte (two face-row reads a
                         // tile measured slower on small products).
-                        Some(c) if r != 0 => {
+                        Some(c) => {
                             let (ch, off) = c.next()?;
                             const DATA: u32 = TILE_DATA as u32;
                             let port = (i0 + i + kk) % PORTS;
-                            emit([
+                            sink.entry([
                                 op::READ,
                                 ch,
                                 port,
@@ -1327,8 +1351,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                                 0,
                             ])?;
                         }
-                        Some(c) => emit(read(c.next()?, i0 + i, kk, to))?,
-                        None => emit(fetch(&a, a_t, i0 + i, kk, to)?)?,
+                        None => sink.entry(fetch(&a, a_t, i0 + i, kk, to)?)?,
                     }
                 }
             }
@@ -1336,22 +1359,20 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 let mut row = if b_t { None } else { Some(b.cursor(kk, j0)?) };
                 for j in 0..cols {
                     let to = b_at + (kk * cols + j) * b_slot as u32;
-                    emit(match row.as_mut() {
-                        // A BF16 `B` (untransposed): its own slot, read whole.
-                        Some(r) if b_slot != TILE_SLOT => {
-                            let mut e = read(r.next_with_slot(b_slot)?, kk, j0 + j, to);
-                            e[5] = b_slot as u32;
-                            e
+                    let port = (kk + j0 + j) % PORTS;
+                    match row.as_mut() {
+                        // Untransposed: a whole tile in its slot (a packed `B`'s its own).
+                        Some(r) => {
+                            let (ch, off) = r.next_with_slot(b_slot)?;
+                            sink.read(ch, port, off, to, b_slot as u32)?;
                         }
-                        Some(r) => read(r.next()?, kk, j0 + j, to),
                         // The kernel transposes it: the tile as it lies, in its own slot.
                         None if b_unpacked => {
-                            let mut e = read(b.tile_in(j0 + j, kk, b_slot)?, kk, j0 + j, to);
-                            e[5] = b_slot as u32;
-                            e
+                            let (ch, off) = b.tile_in(j0 + j, kk, b_slot)?;
+                            sink.read(ch, port, off, to, b_slot as u32)?;
                         }
-                        None => fetch(&b, b_t, kk, j0 + j, to)?,
-                    })?;
+                        None => sink.entry(fetch(&b, b_t, kk, j0 + j, to)?)?,
+                    }
                 }
             }
         }
@@ -1365,7 +1386,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 for j in 0..cols {
                     let (ch, off) = row.next_with_slot(whole)?;
                     let out = out_at + (i * cols + j) * stride;
-                    emit([
+                    sink.entry([
                         op::WRITE,
                         ch,
                         (i + j) % PORTS,
@@ -1445,7 +1466,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 } else {
                     op::READ
                 };
-                emit(if read {
+                sink.entry(if read {
                     [op, ch, n % PORTS, off, slot, whole, 0, 0]
                 } else {
                     [
@@ -1507,7 +1528,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     &table,
                     index,
                     [idx_at, count, j0, cols, stage_at, flags],
-                    &mut emit,
+                    &mut |e| sink.entry(e),
                 );
             }
             // A tile row's face-row `h` of row `r`: two 64-byte reads a row a
@@ -1522,7 +1543,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     for half in 0..core::hint::black_box(2) {
                         let from = off + face_row(v % 32, half);
                         let to = stage_at + j * TILE_SLOT as u32 + face_row(r, half);
-                        emit([op::READ, ch, port, from, to, 64, 0, 0])?;
+                        sink.entry([op::READ, ch, port, from, to, 64, 0, 0])?;
                         port = if port + 1 == PORTS { 0 } else { port + 1 };
                     }
                 }
@@ -1588,7 +1609,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     for half in 0..core::hint::black_box(2) {
                         let to = off + face_row(v % 32, half);
                         let from = stage_at + j * TILE_SLOT as u32 + face_row(r, half);
-                        emit([op::WRITE, ch, port, to, from, row_bytes, 0, 0])?;
+                        sink.entry([op::WRITE, ch, port, to, from, row_bytes, 0, 0])?;
                         port = if port + 1 == PORTS { 0 } else { port + 1 };
                     }
                 }
@@ -1614,11 +1635,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             for k in 0..count {
                 let at = h[1].checked_add(4 * k as u32).ok_or(super::error::RANGE)?;
                 // Every word through `op::POKE`, which bounds it to one role's mailbox.
-                emit([op::POKE, at, poke_run_word(rec, k), 0, 0, 0, 0, 0])?;
+                sink.entry([op::POKE, at, poke_run_word(rec, k), 0, 0, 0, 0, 0])?;
             }
         }
-        FILL_PAD => pad::<false>(rec, &mut emit)?,
-        PAD_WRITE => pad::<true>(rec, &mut emit)?,
+        FILL_PAD => pad::<false>(rec, &mut |e| sink.entry(e))?,
+        PAD_WRITE => pad::<true>(rec, &mut |e| sink.entry(e))?,
         _ => return Err(super::error::OP),
     }
     Ok(())
