@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W2: a stable measured block choice](#w2-a-stable-measured-block-choice-2026-11-14-card-0) | 2026-11-14 | the noise was path dependence: the climb from the fastest listed candidate missed H1's `[8,4,9]` basin. Three starts and near ties timed again: H1 LoFi `[8,4,9]` in 5 of 5 processes (92.0-92.6 TFLOPS), HiFi2 a 1% tie (68.8-69.5); the 1.7B's decode and prefill unchanged (ABBA) |
 | [The movers' per-chunk code placement, tried and reverted; what moved the plain product](#the-movers-per-chunk-code-placement-tried-and-reverted-what-moved-the-plain-product-2026-11-14-card-0) | 2026-11-14 | the instruction cache is **2-way, 16-byte lines, 128 sets** (`instruction_cache_geometry_by_aliasing`). The 11-14 "placement moves a product by 20%" was **the measured block choice**, which differs from process to process (and once chose a block 14% slower). Placing B's and NC's per-chunk code (`exec` split hot / cold, rare record arms out of line, `.text.chunk`) gave the 1.7B decode step 1.5-2.1% for ~3.1 KiB on B and ~2 KiB on NC (`profile` room 764): **reverted**, not worth the room |
 | [W2: a cheaper gather, the send-ahead kept, and B's code placement](#w2-a-cheaper-gather-the-send-ahead-kept-and-bs-code-placement-2026-11-14-card-0) | 2026-11-14 | a gather's tile read 386 -> **260 cycles** (safe; 374 -> 241 `fast-reads`): `dm::ReadPlan` and `record::Sink`, held to the general path by a host test; multicast product 61.9 / 67.7 -> **65.2 / 70.1 TFLOPS** with the send-ahead kept (`B` alone 90.4 -> 85.0); the 1.7B's prefill +7-11%, its decode unchanged. Found: **B's code placement moves a product by up to 20%** (the plain product's no-gathers HiFi2 132.4 -> 113.1, LoFi 76.5 -> 92.6, with nothing it runs changed) |
 | [W2: what a sender's read costs, and what it is worth](#w2-what-a-senders-read-costs-and-what-it-is-worth-2026-11-13-card-0) | 2026-11-13 | a sender's strip read is bound by B's cost an entry (a `GATHER`'s 2,112-byte tile reads, each decoded and checked, ~330 ns), not GDDR, the in-flight cap (8, 16, 32 alike) or `fast-reads` (which does not reach a `GATHER`); every sender's reads skipped: 64.1 / 71.1 TFLOPS alone, **81.2 with NC sending ahead** (`[2048,8192]`: 59.3 -> 62.1 -> 81.2): the two bounds hide each other |
@@ -438,6 +439,41 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W2: a stable measured block choice (2026-11-14, card 0)
+
+Roadmap W2's "the measured block choice is noisy". Performance contract, release, safe image, card 0.
+
+**What was wrong.** It was not timing noise but path dependence. `Session::measure_product` timed the listed
+candidates once each, climbed from the fastest of them over `tensor::block_stream_neighbours`, and kept the climb's
+end. H1 `[2048,2048]@[2048,16384]` BF16 x BFP8 LoFi has two basins: `[8,4,9]` (~1,470 us) is reached only from the
+second-fastest listed candidate. When one replay put a candidate of the other basin first, the climb ended at
+`[6,4,12]` (1,673 us). Five processes before the change (`1794620093`-`1794620711`) chose `[8,4,9]` four times (92.7-93.8
+TFLOPS) and the other basin once (79.6, `1794620384`).
+
+**Changed** (`measure_product`, `session.rs`; constants beside `MEASURE_MOST`, which rises 40 -> 64):
+- **Several starts** (`MEASURE_STARTS = 3`): a climb from each of the three fastest listed candidates, each stepping to
+  the best of its own timed neighbours. Every candidate is timed at most once.
+- **Near ties timed again** (`MEASURE_TIE = 3%`, `MEASURE_FINALISTS = 3`, `MEASURE_ROUNDS = 3`): the timed candidates
+  within 3% of the best are timed twice more, and the median of the three decides.
+- Host gates (`step245_measured_block`, ttsim 5/5): the climbs' order, timing each neighbour once; a choice reached
+  only from the second listed candidate; and a near tie whose lucky first time loses on the median. Each new test was
+  watched failing on the old code. On silicon: `step245` (`1794627226`) and `step12_mnist`, 8/8.
+
+**H1 after, five processes** (`1794628263`, `1794628413`, `1794628555`, `1794628692`, `1794628816`; both probe tests,
+so ten questions a fidelity):
+- **LoFi:** `[8,4,9]` in 10 of 10 questions, **92.0-92.6 TFLOPS**.
+- **HiFi2:** `[8,3,9]` 5, `[9,3,9]` 3, `[8,2,9]` 1, `[10,4,7]` 1, at 68.8-69.5 TFLOPS. These are a tie within 1%, so the
+  choice among them does not move the product.
+
+**The 1.7B, ABBA** (`TT_GEN_MODEL=smollm2-1.7b-instruct`, new `1794634380` / `1794636512`, parent `a55a6c4`
+`1794635151` / `1794635818`): decode step 7.850 / 7.847 against 7.805 / 7.877 ms at 32 tokens, 8.767 against
+8.743 (mean) at 256. Prefill 4,482 / 4,438 against 4,473 / 4,485 tokens/s at 256. Every difference is inside the
+parent's own spread (its two decode runs differ by 0.9%). Decode's one-row products are not measured, so they
+cannot move. The chunk products' choices still differ between runs; they are near ties, and prefill does not move.
+
+**Its cost.** The bench's first capture takes ~65 s longer (`traced_generation` 554 against 487 s). The H1 probe
+takes ~70 s against ~45 s. Build time is not a target; the cross-process cache of choices stays roadmap W8's box.
 
 ## The movers' per-chunk code placement, tried and reverted; what moved the plain product (2026-11-14, card 0)
 

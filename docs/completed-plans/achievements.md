@@ -408,6 +408,10 @@ Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-con
   below): 1.11x at 64 / 256 tokens. **Program restores on the card** (1a, below): 128 / 256 tokens 2,546 / 2,744 ->
   3,040 / 3,827 tokens/s.
 - As of 2026-11-07 the 1.7B prefills 7,992 tokens in 5.98 s.
+- **A stable measured block choice** (W2, 2026-11-14, gate `step245_measured_block`,
+  [log](../learnings/performance-log.md#w2-a-stable-measured-block-choice-2026-11-14-card-0)): three climbs and near
+  ties timed again. H1 BF16 x BFP8 LoFi chooses `[8,4,9]` in 5 of 5 processes, 92.0-92.6 TFLOPS; before, one process
+  in five chose the other basin at 79.6.
 
 - **No 1.7B prefill regression** (2026-11-09, `1794260351`, [log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1)): `traced_generation` reads 1,098 / 3,084 /
   3,890 tokens/s at 32 / 128 / 256 tokens, against H15's 3,827 at 256. The ~2,090 quoted since 2026-11-03 were

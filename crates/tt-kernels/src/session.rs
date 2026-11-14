@@ -2434,8 +2434,22 @@ const GROUP_MAX: usize = 40;
 pub type BlockScores = fn([usize; 3], tensor::Reuse, f64) -> f64;
 
 /// Candidates [`tensor::BlockStream::Measured`] times for a product's question, at most: the
-/// first ([`tensor::block_stream_candidates`]) and the climb's ([`tensor::block_stream_neighbours`]).
-pub const MEASURE_MOST: usize = 40;
+/// first ([`tensor::block_stream_candidates`]) and the climbs' ([`tensor::block_stream_neighbours`]).
+pub const MEASURE_MOST: usize = 64;
+/// Climbs a measured choice makes, from this many of the listed candidates timed fastest. One
+/// climb from the fastest alone kept whichever peak the first round's order led to: H1's LoFi
+/// product (`[2048,2048]@[2048,16384]`, BF16 x BFP8, 120 units) chose `[8, 4, 9]` (~1,470 us)
+/// in three processes, climbing from `[7, 4, 9]`, and `[6, 4, 12]` (1,673 us) in one, whose
+/// neighbours do not lead there (2026-11-14, card 0, `1794620711` against `1794620526`).
+pub const MEASURE_STARTS: usize = 3;
+/// Candidates within this share of the fastest are timed again ([`MEASURE_ROUNDS`]) before one
+/// is kept: near ties are inside a replay's noise (H1's HiFi2 product chose `[9, 3, 9]`,
+/// `[8, 3, 9]` and `[8, 2, 9]` in four processes, 1,971-2,025 us).
+pub const MEASURE_TIE: f64 = 0.03;
+/// Near ties ([`MEASURE_TIE`]) timed again, at most, the fastest first.
+pub const MEASURE_FINALISTS: usize = 3;
+/// Times each near tie takes in all, in interleaved rounds; the median of its scores decides.
+pub const MEASURE_ROUNDS: usize = 3;
 /// About how long a measured candidate's trace runs, us: copies of a small product enough for it.
 pub const MEASURE_SPAN_US: f64 = 2000.0;
 /// Copies of a product a measured candidate's trace holds, at most.
@@ -10133,9 +10147,10 @@ impl<T: Transport> Session<T> {
     /// Under [`tensor::BlockStream::Measured`], time the candidates of `op(A) @ op(B)`'s question
     /// on `units` units the first time it is planned ([`tensor::block_stream_candidates`], `A`
     /// pulled from [`tile_op::reuse::AUTO_HOLDERS`] under [`tensor::Reuse::Auto`]), climb from
-    /// the fastest one step at a time while a step gains [`MEASURE_GAIN`]
-    /// ([`tensor::block_stream_neighbours`]), at most [`MEASURE_MOST`] timed, and keep the fastest
-    /// for the process ([`tensor::measured_choice`]). Only in a capture, which is paused for it
+    /// each of the [`MEASURE_STARTS`] fastest one step at a time while a step gains
+    /// [`MEASURE_GAIN`] ([`tensor::block_stream_neighbours`]), at most [`MEASURE_MOST`] timed,
+    /// time the near ties again ([`MEASURE_TIE`], [`MEASURE_FINALISTS`], [`MEASURE_ROUNDS`]), and
+    /// keep the one of least median for the process ([`tensor::measured_choice`]). Only in a capture, which is paused for it
     /// ([`Session::paused`]), and not in one applying a plan: its plan pass measured what it
     /// plans. An eager product runs `Auto`'s block ([`tensor::BlockStream::Measured`]). Not on ttsim, whose times say nothing (but see
     /// [`Session::probe_block_scores`]). A measurement that fails keeps `Auto`'s block.
@@ -10195,40 +10210,81 @@ impl<T: Transport> Session<T> {
                 // Each candidate, its score and its time, us.
                 type Timed = Vec<(tensor::BlockChoice, f64, f64)>;
                 let mut timed: Timed = Vec::new();
+                let once = |s: &mut Self, c: tensor::BlockChoice| {
+                    let fixed = tensor::BlockStream::Fixed(c.block);
+                    let us =
+                        s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
+                    Ok::<_, TensorError>((scores.map_or(us, |f| f(c.block, c.reuse, us)), us))
+                };
                 let time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
                     if timed.len() >= MEASURE_MOST || timed.iter().any(|(t, ..)| *t == c) {
                         return Ok(());
                     }
-                    let fixed = tensor::BlockStream::Fixed(c.block);
-                    let us =
-                        s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
-                    timed.push((c, scores.map_or(us, |f| f(c.block, c.reuse, us)), us));
+                    let (score, us) = once(s, c)?;
+                    timed.push((c, score, us));
                     Ok::<(), TensorError>(())
                 };
-                let best = |timed: &[(tensor::BlockChoice, f64, f64)]| {
-                    timed
-                        .iter()
-                        .copied()
-                        .min_by(|x, y| x.1.total_cmp(&y.1))
-                        .expect("one timed")
+                // The fastest first; equal scores in the order timed.
+                let ranked = |timed: &[(tensor::BlockChoice, f64, f64)]| {
+                    let mut r = timed.to_vec();
+                    r.sort_by(|x, y| x.1.total_cmp(&y.1));
+                    r
                 };
                 for &c in &candidates {
                     time(s, &mut timed, c)?;
                 }
-                // Climb: from the fastest so far, one step at a time, while a step gains.
-                let mut at = best(&timed);
-                loop {
-                    for n in tensor::block_stream_neighbours(&q, at.0, pull) {
-                        time(s, &mut timed, n)?;
+                // Climbs: from each of the fastest listed, one step at a time while a step gains.
+                let starts: Vec<_> = ranked(&timed).into_iter().take(MEASURE_STARTS).collect();
+                for mut at in starts {
+                    loop {
+                        let near = tensor::block_stream_neighbours(&q, at.0, pull);
+                        for &n in &near {
+                            time(s, &mut timed, n)?;
+                        }
+                        // This climb's own step: the fastest of its neighbours timed (another
+                        // climb's peak is reached only by stepping there).
+                        let Some(next) = timed
+                            .iter()
+                            .filter(|t| near.contains(&t.0))
+                            .copied()
+                            .min_by(|x, y| x.1.total_cmp(&y.1))
+                        else {
+                            break;
+                        };
+                        if next.1 >= at.1 * (1.0 - MEASURE_GAIN) {
+                            break;
+                        }
+                        at = next;
                     }
-                    let next = best(&timed);
-                    if next.1 >= at.1 * (1.0 - MEASURE_GAIN) {
-                        break;
-                    }
-                    at = next;
                 }
-                let chosen = best(&timed);
-                Ok::<_, TensorError>((chosen.0, [timed[0].2, chosen.2]))
+                // Near ties, timed again in interleaved rounds: the median of each one's scores.
+                let ranked = ranked(&timed);
+                let best = ranked[0];
+                let mut finalists: Vec<(tensor::BlockChoice, Vec<f64>, Vec<f64>)> = ranked
+                    .iter()
+                    .take(MEASURE_FINALISTS)
+                    .filter(|t| t.1 <= best.1 * (1.0 + MEASURE_TIE))
+                    .map(|&(c, score, us)| (c, vec![score], vec![us]))
+                    .collect();
+                if finalists.len() > 1 {
+                    for _ in 1..MEASURE_ROUNDS {
+                        for (c, scored, us) in &mut finalists {
+                            let (score, t) = once(s, *c)?;
+                            scored.push(score);
+                            us.push(t);
+                        }
+                    }
+                }
+                let median = |v: &[f64]| {
+                    let mut v = v.to_vec();
+                    v.sort_by(f64::total_cmp);
+                    v[v.len() / 2]
+                };
+                let chosen = finalists
+                    .iter()
+                    .min_by(|x, y| median(&x.1).total_cmp(&median(&y.1)))
+                    .expect("one finalist");
+                Ok::<_, TensorError>((chosen.0, [timed[0].2, median(&chosen.2)]))
             })
         });
         let (choice, times) = match timed.and_then(|r| r).and_then(|r| r) {
