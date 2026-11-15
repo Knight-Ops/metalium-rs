@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W2: `A`'s reads inline beside a weight read by column](#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0) | 2026-11-15 | the cheaper route chosen over the gather-ahead (deferred): a gather with a `B` span keeps `A`'s tiles in the inline loop. Strip 197.7 -> **191.3 cycles** a tile; H1 default 70.4 / 98.5 -> 70.2 / 99.2, multicast 78.9 / 94.8 -> **79.7 / 96.2**; the 1.7B unchanged. Small, no regression, kept; `A` laid by row is the large share left |
 | [W2: block gathers read a weight a column a request](#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0) | 2026-11-14 | a by-column weight read a column a request costs ~86 cycles a tile against ~248 a tile at a time; block products take weights into L1 by column. H1 default 69.3 / 92.0 -> 70.7 / 98.7 TFLOPS, multicast 74.2 / 89.1 -> 79.3 / 95.3; the 1.7B's prefill +7-13%, decode unchanged |
 | [W2: a stable measured block choice](#w2-a-stable-measured-block-choice-2026-11-14-card-0) | 2026-11-14 | the noise was path dependence: the climb from the fastest listed candidate missed H1's `[8,4,9]` basin. Three starts and near ties timed again: H1 LoFi `[8,4,9]` in 5 of 5 processes (92.0-92.6 TFLOPS), HiFi2 a 1% tie (68.8-69.5); the 1.7B's decode and prefill unchanged (ABBA) |
 | [The movers' per-chunk code placement, tried and reverted; what moved the plain product](#the-movers-per-chunk-code-placement-tried-and-reverted-what-moved-the-plain-product-2026-11-14-card-0) | 2026-11-14 | the instruction cache is **2-way, 16-byte lines, 128 sets** (`instruction_cache_geometry_by_aliasing`). The 11-14 "placement moves a product by 20%" was **the measured block choice**, which differs from process to process (and once chose a block 14% slower). Placing B's and NC's per-chunk code (`exec` split hot / cold, rare record arms out of line, `.text.chunk`) gave the 1.7B decode step 1.5-2.1% for ~3.1 KiB on B and ~2 KiB on NC (`profile` room 764): **reverted**, not worth the room |
@@ -440,6 +441,44 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W2: `A`'s reads inline beside a weight read by column (2026-11-15, card 0)
+
+Roadmap W2, "`A`'s reads inline beside a `B` read by column". The owner chose this, the cheaper route to the senders'
+ceiling, over the gather-ahead (W2 (2), deferred with its prerequisites in the roadmap). Performance contract,
+release, safe image, card 0, against the parent `376d4ad` in the same session.
+
+**Changed** (`record.rs`, `expand_for`'s `GATHER` arm): a record whose `B` is read and marked `REF_L1_BY_COLUMN`,
+beside an interleaved or resident `A` with no mark, no longer goes out of line. Its span is checked first
+(`gather_span`, before any read), `A`'s tiles take the inline loop (`Sink::read`, the planned request), and the
+span's pieces are read after them out of line (`gather_span_reads`). The same entries in the same order: the record
+test `an_a_beside_a_b_laid_by_column_is_read_inline` compares them with `gather_by_column`'s and counts `A`'s reads
+in `Sink::read` (watched failing with the old condition). `dm_b`'s `run_record` grows 264 bytes; its room at the tightest (profile + encoded-guard) is 3,964 bytes, from 4,440. Gates: `step172` / `step173` in all three read modes, `step229` / `step274` on ttsim and card 0, `step12_mnist`, smoke 1,312 / 1,312.
+
+A first version checked the span and then built it again after `A`'s reads (two `BSpan::of_columns` a record): the
+strip got slower, 197.7 -> 206.0 cycles a tile (`1794754413` against `1794754722`). Building it once and holding
+it across `A`'s loop fixed that.
+
+**Measured:**
+- **`mover_gather_rate`** (profile image; strips of 7 x 4 `A` tiles beside 4 x 8 `B` tiles, cycles a tile's bytes):
+  `B` by column read a column a request 197.7 -> **191.3** (`1794754722` -> `1794755732`). The untouched cases
+  moved +0.5% (interleaved 258.8 -> 260.2, resident 302.5 -> 304.3): code placement.
+- **H1 `[2048,2048]@[2048,16384]`, BF16-HiFi2 / BF16 x BFP8 LoFi**, at `[8,4,9]` both:
+  - default (pull, 120 units): 70.4 / 98.5 and 70.5 / 98.1 on the parent (`1794758100`, `1794754743`) -> **70.2 /
+    99.2** (`1794757820`): flat / +0.7-1.1%;
+  - multicast (`TT_OPERAND_REUSE=mcast`, 10x12): 78.9 / 94.8 and 79.1 / 95.2 (`1794758231`, `1794754870`) ->
+    **79.7 / 96.2** (`1794757949`): +0.7-1.0% / +1.1-1.5%. The "every sender's reads skipped" row is 85.6 / 100.7,
+    so 7% / 4% remain.
+- **The 1.7B, BAB** (new `1794755772` / `1794757160`, parent `1794755008` / `1794756462`): decode 7.827 / 8.249 /
+  8.751 -> 7.842 / 8.254 / 8.727 ms (within 0.2%); prefill 1,560 / 3,962 / 4,758 -> 1,566 / 3,960 / 4,767 tokens/s
+  (one new run's 3,098 at 128 tokens, a one-off, left out).
+
+**Against the bound:** predicted ~7% of `A`'s gather, a product's ~2%; measured 0-1.5%. Below the 3% that Parts 2
+and 3 of the plan were held to, but a default with no regression and the owner's chosen route, so it stays.
+
+**What is left of the senders' reads is `A`'s per-tile cost:** without `A`'s gathers the default LoFi runs 125.4
+against 99.2. Reading `A` a row a request, as `B` now is a column, needs `A` laid by row: every activation writer
+changes (backlog).
 
 ## W2: block gathers read a weight a column a request (2026-11-14, card 0)
 

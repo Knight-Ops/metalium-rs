@@ -93,7 +93,7 @@ Re-run it when a W item lands (`crates/tt-tests/bench/ttnn_parity/`).
 | SmolLM2-1.7B decode, batch 32 | not supported | 24.82 ms, 40.3 tokens/s/user, **1,289 tokens/s** | ~13x behind in throughput |
 | SmolLM2-1.7B prefill, ~128 tokens | **4,025 tokens/s** (block gathers read weights a column a request, 2026-11-14, card 0, `1794639138` / `1794641348` against 3,757 on the parent, `1794639831` / `1794640576`; 1,562 / 4,768 at 32 / 256 tokens, [log](performance-log.md#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0)); before, 3,799 tokens/s (the cheaper gather, 2026-11-14, card 0, `1794616637`, against 3,441 on the same build with the old record path, `1794617319`; 1,379 / 4,437 at 32 / 256 tokens, [log](performance-log.md#w2-a-cheaper-gather-the-send-ahead-kept-and-bs-code-placement-2026-11-14-card-0)); before, 3,552 tokens/s (performance contract with BF16 activations, `1794435175`; F32 activations 3,258, `1794435865`; reference 3,091, `1794292593`); 4,266 at 256 tokens (F32 activations 4,007). The "~2,150 since 2026-11-03" was the stream-ceiling probe's row, not a regression | TTFT 18.3 ms, ~6,600 tokens/s (performance) | 1.6x behind |
 | GEMM `2048x8192x2048` | 49.3 TFLOPS F32 `A` x BF16 `B` HiFi4; 55.9 BF16-HiFi4, 56.0 BF16-HiFi2; 68.0 BF16 x BFP8 LoFi (session, slope-timed, a packed `A` whole in `SrcB` since 2026-11-10, card 0 `1794330574`, [log](performance-log.md#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0)); 14.3 through Burn with an FP32 `B` | 204 BF16-HiFi2; 117 BF16-HiFi4; 315 BFP8-LoFi | 2.1-4.6x behind |
-| GEMM `2048x2048x16384` | 55.3 / 69.8 / 77.1 TFLOPS (F32 `A` HiFi4 / BF16-HiFi2 / BF16 x BFP8 LoFi, as above; BF16-HiFi4 69.7); 30.6 through Burn. The performance-contract probe at its measured block (2026-11-14, card 0): **70.7 / 98.7** BF16-HiFi2 / BF16 x BFP8 LoFi with the gathers reading the weight a column a request (`1794638523`, `[8,3,9]` / `[8,4,9]`, [log](performance-log.md#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0)), from 69.0 / 92.3 (the block choice made stable, five processes `1794628263`-`1794628816`, [log](performance-log.md#w2-a-stable-measured-block-choice-2026-11-14-card-0)); the 2-D multicast (opt-in) 79.3 / 95.3 on 10x12 (`1794638654`) | 122 / 74 / 192 (BF16-HiFi2 / BF16-HiFi4 / BFP8-LoFi) | 1.1-2.5x behind |
+| GEMM `2048x2048x16384` | 55.3 / 69.8 / 77.1 TFLOPS (F32 `A` HiFi4 / BF16-HiFi2 / BF16 x BFP8 LoFi, as above; BF16-HiFi4 69.7); 30.6 through Burn. The performance-contract probe at its measured block (2026-11-15, card 0, `[8,4,9]`): **70.2 / 99.2** BF16-HiFi2 / BF16 x BFP8 LoFi with `A`'s reads inline beside the weight's column reads (`1794757820`; the 2-D multicast, opt-in, **79.7 / 96.2** on 10x12, `1794757949`; [log](performance-log.md#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0); against the [roofline](#roofline-a-products-tflops-on-one-p150): 21% / 15% of the Matrix Unit's peak on 120 tiles); before, 70.7 / 98.7 with the gathers reading the weight a column a request (`1794638523`, `[8,3,9]` / `[8,4,9]`, [log](performance-log.md#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0)), from 69.0 / 92.3 (the block choice made stable, five processes `1794628263`-`1794628816`, [log](performance-log.md#w2-a-stable-measured-block-choice-2026-11-14-card-0)); the 2-D multicast (opt-in) 79.3 / 95.3 on 10x12 (`1794638654`) | 122 / 74 / 192 (BF16-HiFi2 / BF16-HiFi4 / BFP8-LoFi) | 1.1-2.5x behind |
 | Decode products, 24 layers + head, M=32, derived | 10.67 ms BF16 x BFP8 HiFi2, 10.68 LoFi, 17.33 the reference (probe sums, no prefetch, a packed `A` whole in `SrcB`, card 0 `1794332034`; 11.9 / 11.0 / 17.4 before, card 1 `1794257871`) | 7.34 ms BF16-HiFi2; 11.61 BF16-HiFi4; 6.41 BFP8-HiFi2; **4.22 BFP8-LoFi** | 1.7-2.5x behind; fidelity no longer binds, what does is not isolated |
 | Decode products, 24 layers + head, M=1, a BF16 `A` (probe sums, no prefetch: each product packs its own row) | **6.99 ms** BF16 x BFP8 HiFi2 (FP32 `A` 7.00), 10.22 BF16 x BF16 HiFi2 (10.15): a BF16 row packed and prefetched since 2026-11-10, was 10.74 / 14.30 (card 0, `1794348097` against `1794332034`, [log](performance-log.md#w1-the-one-row-path-for-a-bf16-a-its-decode-products-at-the-fp32-as-step-2026-11-10-cards-0-and-1)) | — | — |
 | Decode product rate, BF16-HiFi2, best | — | 453-479 GB/s (`down`, `gate\|up`, head) | — |
@@ -152,6 +152,47 @@ assumptions:
 
 - **On 2026-10-17, decode's products alone ran near "realistic"** (22.8 ms at 347 GB/s, F32); the gap was the rest of the step.
 - **On 2026-10-17, prefill's products were ~40x from compute-bound,** GDDR-bound only because they re-read their operands.
+
+### Roofline: a product's TFLOPS on one p150
+
+The compute ceiling the GEMM rows above work toward (2026-11-15). Derived, not measured:
+- **A tile's Matrix Unit:** `MVMUL` multiplies 8x16 by 16x16 a cycle, 4,096 FLOP a cycle at one fidelity phase, one
+  instruction a phase (`vendor/tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/MatrixUnit.md`; Wormhole's
+  figures, whose ratios "broadly apply to Blackhole"). At 1,350 MHz, 5.53 TFLOPS a tile at LoFi. The vendor's 774
+  TFLOPS (FP8) is this on 140 tiles.
+- **A K-tile pair** (32x32 by 32x32, 65,536 FLOP) takes 16 `MVMUL`s a phase: 11.9 ns at LoFi, 23.7 at HiFi2, a unit.
+
+| Fidelity (phases) | A tile | 120 tiles (these cards: 12 of 14 columns x 10) | 110 (tt-metal's compute grid, 11x10) | 140 (the whole die) |
+|---|--:|--:|--:|--:|
+| LoFi (1) | 5.53 | **663.6** | 608.3 | 774.1 |
+| HiFi2 (2) | 2.76 | **331.8** | 304.1 | 387.1 |
+| HiFi3 (3) | 1.84 | 221.2 | 202.8 | 258.0 |
+| HiFi4 (4) | 1.38 | 165.9 | 152.1 | 193.5 |
+
+**Unresolved:** tt-metal's published 168.55 TFLOPS at HiFi4 on 11x10 ([parity](../plans/tt-metal-parity.md) §2.2)
+is above this table's 152.1 for 110 tiles. Either its grid or clock differs from what §2.2 records, or a HiFi4
+phase costs less than an `MVMUL` on Blackhole. Until a probe times `MVMUL` a phase on the card, the per-phase rows
+are a model.
+
+**H1, `[2048,2048]@[2048,16384]`** (137.4 GFLOP; 120 units, card 0, 2026-11-15, `[8,4,9]`; runs `1794757820`,
+`1794757949`, `1794758100`):
+
+| TFLOPS | BF16 x BF16 HiFi2 | BF16 x BFP8 LoFi |
+|---|--:|--:|
+| Matrix Unit peak, 120 tiles | 331.8 | 663.6 |
+| GDDR floor, each operand read once and the F32 result written once (210 / 178 MB at 512 GB/s) | ~335 | ~395 |
+| GDDR floor at today's reads alone (683 / 432 MB at 512 GB/s) | 103 | 163 |
+| tt-metal's best GEMM, 11x10 (§2.2) | 239.5 | 472 |
+| tt-metal, this shape (the GEMM row) | 122 | 192 |
+| Ours with every gather skipped (the kernel's own ceiling) | 112-130 (34-39%) | 141-144 (21-22%) |
+| **Ours, default** | **70.2 (21%)** | **99.2 (15%)** |
+| Ours, 2-D multicast (opt-in, 10x12) | 79.7 (24%) | 96.2 (14.5%) |
+
+- **Past the gathers, the kernel binds.** With its operands free it runs a K-tile pair in 55-70 ns a unit against
+  the Matrix Unit's 11.9-23.7, which is below tt-metal's delivered rate on this shape. Closing the reads alone reaches
+  at most ~112-130 / ~143; tt-metal's 122 / 192 also needs the unpack, push and pack per pair cut.
+- **The shape is compute-bound on paper** (a once-read GDDR floor at or above the peak), so the gap to the
+  peak is the dataflow and the kernel, not bandwidth.
 
 ### Where each row is evidenced
 

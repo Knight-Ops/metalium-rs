@@ -1168,6 +1168,19 @@ fn gather_by_column(
     walk_by_column(b, &walk, emit)
 }
 
+/// A [`GATHER`]'s `B` span ([`gather_span`]) read beside an `A` its arm read in line, each piece
+/// one request, by column. Out of line, so the arm's own code is the interleaved code with one
+/// test between its loops.
+#[cold]
+#[inline(never)]
+fn gather_span_reads(
+    span: &BSpan,
+    b: &TensorRef,
+    emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    (0..span.count()).try_for_each(|n| emit(span.read_by_column(b, n)))
+}
+
 fn extent(v: u32) -> Result<u32, u32> {
     if v == 0 || v > MAX_EXTENT {
         Err(super::error::LENGTH)
@@ -1316,13 +1329,26 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             // every model 2-3%: the movers' code shares L1 with the compute cores' instruction
             // fetches). A resident operand's layout names nothing read: a multicast sender of `A`
             // beside a resident weight reads its `A` here, inline. A mark on `A` is refused there.
-            if l1_by_column(rec, 1)
-                || (!resident && a.col_tiles != 0)
-                || (!b_resident && (b.col_tiles != 0 || l1_by_column(rec, 3)))
+            // A `B` taken into L1 by column ([`BSpan`]) beside an interleaved (or resident) `A`
+            // stays too: `A`'s tiles take the loop below ([`Sink::read`]), and `B`'s span, checked
+            // before anything is read, is read out of line after them ([`gather_span_reads`]).
+            let b_span = !b_resident
+                && l1_by_column(rec, 3)
+                && !l1_by_column(rec, 1)
+                && (resident || a.col_tiles == 0);
+            if !b_span
+                && (l1_by_column(rec, 1)
+                    || (!resident && a.col_tiles != 0)
+                    || (!b_resident && (b.col_tiles != 0 || l1_by_column(rec, 3))))
             {
                 let slots = [a_slot as u32, b_slot as u32];
                 return gather_by_column(rec, &a, &b, slots, &mut |e| sink.entry(e));
             }
+            // Checked before anything is read; `Some` for a `B` read and marked.
+            let span = match b_span {
+                true => gather_span(rec, &b, flags, b_at, kt, j0, cols, b_slot as u32)?,
+                false => None,
+            };
             for i in (0..rows).filter(|_| !resident) {
                 let mut row = if a_t {
                     None
@@ -1363,6 +1389,9 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                         None => sink.entry(fetch(&a, a_t, i0 + i, kk, to)?)?,
                     }
                 }
+            }
+            if let Some(span) = span {
+                return gather_span_reads(&span, &b, &mut |e| sink.entry(e));
             }
             for kk in (0..kt).filter(|_| !b_resident) {
                 let mut row = if b_t { None } else { Some(b.cursor(kk, j0)?) };
@@ -3406,7 +3435,7 @@ mod tests {
     /// that the record does not read leaves it inline, its `A` reads through [`Sink::read`] as an
     /// interleaved `B`'s record's are, entry for entry. Read, the same `B` sends it out of line.
     #[test]
-    fn a_resident_b_laid_by_column_leaves_the_record_inline() {
+    fn an_a_beside_a_b_laid_by_column_is_read_inline() {
         struct Counted(Vec<[u32; 8]>, usize);
         impl Sink for Counted {
             fn entry(&mut self, e: [u32; 8]) -> Result<(), u32> {
@@ -3449,9 +3478,32 @@ mod tests {
             let got = run(GATHER_B_RESIDENT, &by_column(2, 4, kt, 0), mark).unwrap();
             assert_eq!(got.0, want.0, "marked {mark}");
             assert_eq!(got.1, want.1, "marked {mark}: every `A` read inline");
-            // Read, `B` by column goes out of line: no read reaches `Sink::read`.
-            let read = run(0, &by_column(2, 4, kt, 0), mark).unwrap();
-            assert_eq!(read.1, 0, "marked {mark}, read");
+            // Read a tile at a time, `B` by column goes out of line: no read reaches
+            // `Sink::read`. Read by column (marked), `A` stays in line, and the entries are the
+            // out-of-line expansion's.
+            let b = by_column(2, 4, kt, 0);
+            let read = run(0, &b, mark).unwrap();
+            if !mark {
+                assert_eq!(read.1, 0, "read a tile at a time");
+                continue;
+            }
+            assert_eq!(
+                read.1,
+                (rows * kt) as usize,
+                "read by column: every `A` read inline"
+            );
+            let (ar, mut br) = (a.encode(), b.encode());
+            br[0][4] |= REF_L1_BY_COLUMN;
+            let h = [GATHER, kt << 8, 0x8_0000, 0x2_0000, 1, rows, 0, 2];
+            let rec = [h, ar[0], ar[1], br[0], br[1]];
+            let (mut oracle, slot) = (Vec::new(), TILE_SLOT as u32);
+            gather_by_column(&rec, &a, &b, [slot, slot], &mut |e| {
+                oracle.push(e);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(read.0, oracle, "the out-of-line expansion's entries");
+            assert!(read.0.len() > (rows * kt) as usize, "`B`'s span read too");
         }
     }
 

@@ -416,6 +416,9 @@ Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-con
   [log](../learnings/performance-log.md#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0)): a
   by-column weight read a column a request costs ~86 cycles a tile against ~248. H1 70.7 / 98.7 TFLOPS (HiFi2 /
   LoFi) and 79.3 / 95.3 multicast; the 1.7B's prefill 4,025 tokens/s at 128 tokens (+7.1%), 4,768 at 256.
+- **`A`'s reads inline beside a weight read by column** (W2, 2026-11-15, record test, `step229`, `step274`,
+  [log](../learnings/performance-log.md#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0)): H1
+  multicast 79.7 / 96.2 TFLOPS (+1.0 / +1.5%), default 70.2 / 99.2; the 1.7B unchanged.
 
 - **No 1.7B prefill regression** (2026-11-09, `1794260351`, [log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1)): `traced_generation` reads 1,098 / 3,084 /
   3,890 tokens/s at 32 / 128 / 256 tokens, against H15's 3,827 at 256. The ~2,090 quoted since 2026-11-03 were
