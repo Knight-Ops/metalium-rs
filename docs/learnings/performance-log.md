@@ -12,6 +12,8 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Qwen3.5-4B's prefill and decode by op class](#qwen35-4bs-prefill-and-decode-by-op-class-2026-11-16-card-0) | 2026-11-16 | a 16-token chunk is **216 ms** on the card (~74 tokens/s at 128 tokens): the DeltaNets' token-at-a-time recurrence 126 ms (58%, 3,457 small products), barriers 43 ms over 5,688 ops, weight products only 24.5 ms. A decode step 35.5 ms: weight products 13.2 ms at 404 GB/s, the other 945 ops 22.3 ms |
+| [The 1.7B's prefill by op class, at today's contract](#the-17bs-prefill-by-op-class-at-todays-contract-2026-11-16-card-0) | 2026-11-16 | a 128 / 256-token chunk is 29.6 / 50.0 ms on the card: products 55 / 48% (on 32-74 of 120 units, `A` re-read 23-59x: 2.9 GB of `A` a 128-token chunk against 87 MB of activations), **the KV cache's row scatter 16 / 18%** (192 / 377 us a layer for 1 / 2 MB, ~5 GB/s, control-bound), norms 11 / 7%, softmax 7 / 14%, barriers 10 / 6% |
 | [W2: `A`'s reads inline beside a weight read by column](#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0) | 2026-11-15 | the cheaper route chosen over the gather-ahead (deferred): a gather with a `B` span keeps `A`'s tiles in the inline loop. Strip 197.7 -> **191.3 cycles** a tile; H1 default 70.4 / 98.5 -> 70.2 / 99.2, multicast 78.9 / 94.8 -> **79.7 / 96.2**; the 1.7B unchanged. Small, no regression, kept; `A` laid by row is the large share left |
 | [W2: block gathers read a weight a column a request](#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0) | 2026-11-14 | a by-column weight read a column a request costs ~86 cycles a tile against ~248 a tile at a time; block products take weights into L1 by column. H1 default 69.3 / 92.0 -> 70.7 / 98.7 TFLOPS, multicast 74.2 / 89.1 -> 79.3 / 95.3; the 1.7B's prefill +7-13%, decode unchanged |
 | [W2: a stable measured block choice](#w2-a-stable-measured-block-choice-2026-11-14-card-0) | 2026-11-14 | the noise was path dependence: the climb from the fastest listed candidate missed H1's `[8,4,9]` basin. Three starts and near ties timed again: H1 LoFi `[8,4,9]` in 5 of 5 processes (92.0-92.6 TFLOPS), HiFi2 a 1% tie (68.8-69.5); the 1.7B's decode and prefill unchanged (ABBA) |
@@ -441,6 +443,100 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Qwen3.5-4B's prefill and decode by op class (2026-11-16, card 0)
+
+The 1.7B's breakdown (below), for the next model up. `TT_GEN_PROMPTS=128 TT_GEN_NEW=4 TT_GEN_SAMPLES=30 cargo
+xtask bench --profile --device 0 --filter silicon_bench_models::qwen35_traced_generation` (run `1794870651`; safe
+image, performance contract: BFP8 weights, the tied head the BF16 table, BF16 KV cache; chunks of 16, 512-position
+cache, at `3e43e4a`). Every op covered: the chunk trace's 5,688 in 266 replays, the decode step's 1,074. A first run
+with 12 samples (`1794869643`) covered only 3,368 of the chunk's ops; a 16-token chunk needs ~210 replays. Host
+times under the profile image are not comparable; the card's spans are.
+
+**Prefill: a 16-token chunk is 216.0 ms on the card**, so a 128-token prompt is ~1.72 s (~74 tokens/s; the 1.7B
+prefills 4,025). Its trace has 5,688 ops, against the 1.7B's 522 for a 128-token chunk, because the DeltaNet
+recurrence runs a token at a time (`qwen35.rs`, module documentation).
+
+| class | ops | ms | % | barriers, ms | read, MB |
+|---|--:|--:|--:|--:|--:|
+| **the recurrence's small products** (`B` under 4 MB) | 3,457 | **125.6** | 58 | 27.2 | 5,434 |
+| other element-wise | 1,201 | 26.9 | 12 | 3.3 | 1,990 |
+| weight products (`B` over 4 MB) | 129 | 24.5 | 11 | 0.7 | 8,585 (`B` 5,326) |
+| broadcast / expand / repeat | 356 | 14.8 | 7 | 4.3 | 193 |
+| `cat` (96, ~142 us each) | 96 | 13.6 | 6 | 6.3 | 87 |
+| norms | 393 | 9.5 | 4 | 1.0 | 212 |
+| attention (`qk`, `pv`, softmax; 8 layers) | 56 | 1.1 | 1 | 0.2 | 115 |
+| a chunk | 5,688 | **216.0** | | **43.1** | 16,615 |
+
+- **The recurrence is the prefill.** About 9 small products a token a DeltaNet layer, each ~36 us, a fifth of it
+  barriers. The chunk's bytes take 39 ms at 512 GB/s; it runs 5.5x longer.
+- **Bound for a chunked (WY / chunkwise gated delta rule) recurrence:** the 126 ms gone entirely leaves ~90 ms a
+  chunk (2.4x at chunks of 16). A chunkwise form also frees the chunk size, which the token-at-a-time trace holds at
+  16 (5,688 ops already); at 64-128 tokens a chunk the weight products' 24.5 ms is shared by 4-8x the tokens.
+- tt-metal's prefill for this model on the card is not measured.
+
+**Decode: a step is 35.5 ms on the card** (`Step(256)`, 1,074 ops; host-timed unprofiled 34.8 ms, tt-metal 38.0 on
+the card):
+
+| class | ops | ms | barriers, ms |
+|---|--:|--:|--:|
+| weight products (5.3 GB at 404 GB/s; the head 2.9 ms of it, 1.31 GB at 457) | 129 | **13.2** | 2.6 |
+| small products (the recurrence's) | 240 | 7.5 | 1.9 |
+| norms | 306 | 6.2 | 0.5 |
+| other element-wise | 224 | 5.0 | 0.6 |
+| broadcast / expand / repeat, `cat`, attention, the pick | 175 | 3.6 | 0.3 |
+
+- The weights take 10.4 ms at 512 GB/s; the step is 3.4x that. **The 945 ops around the weight products are 22.3 ms**
+  (63%): the DeltaNet chain, ~25 ops a layer (roadmap, Models). Fusing it is the lever toward the bandwidth target,
+  not the products.
+
+## The 1.7B's prefill by op class, at today's contract (2026-11-16, card 0)
+
+The last breakdown of a prefill chunk by op class (2026-10-31, below) predates the performance contract and every W2
+change. Profiled whole: `TT_GEN_MODEL=smollm2-1.7b-instruct TT_GEN_PROMPTS=128,256 TT_GEN_CHUNKS=64,128,256
+TT_GEN_SAMPLES=150 TT_GEN_NEW=2 cargo xtask bench --profile --device 0 --filter
+silicon_bench_models::traced_generation_stream_ceiling` (run `1794868686`, safe image, performance contract: BFP8
+weights, BF16 activations, a BF16 KV cache; 512-position cache, at `3e43e4a`). Every op covered (152 replays a trace,
+none overflowed). The card's spans sum to the host's prefill: `Chunk { c: 128 }` **29.6 ms** a replay against
+31.8 ms host-timed unprofiled (4,025 tokens/s, the scoreboard row); `Chunk { c: 256 }` **50.0 ms** (53.7 ms).
+
+| class (ms, % of the chunk) | 128 tokens | 256 tokens | what binds |
+|---|--:|--:|---|
+| weight products (96 + the head) | 15.1 (51%) | 21.4 (43%) | few units, `A` re-read (below) |
+| attention's products (`qk`, `pv`) | 1.3 (5%) | 2.8 (6%) | |
+| **the KV cache's row scatter** (24, `scatter_nd` x2) | **4.6 (16%)** | **9.1 (18%)** | 192 / 377 us a layer for its keys and values (1 / 2 MB) on 64 units: ~5 GB/s, control 46-70% of it, B waiting for its writer the rest |
+| softmax and its scale | 2.2 (7%) | 7.0 (14%) | 74-284 GB/s; grows with the chunk's scores |
+| norms (`rms_norm`, 97) | 3.1 (11%) | 3.6 (7%) | one `rms_norm` a layer reads at 33 GB/s (44% kernels) |
+| `silu * mul` | 1.2 (4%) | 2.9 (6%) | kernels 60-68% |
+| rope, adds, reshapes, the rest | 2.1 (7%) | 3.3 (7%) | |
+| of which barriers, over all ops | 2.9 (10%) | 3.0 (6%) | 522 ops a chunk |
+
+**The products, a layer at 128 tokens** (`ops.tsv`; BFP8 weight bytes in brackets):
+
+| product | units of 120 | us | `B` read, MB | `A` read, MB |
+|---|--:|--:|--:|--:|
+| `qkv` (13.4) | 48 | 112 | 14.2 | 26.0 (the 0.5 MB `A`, 50x) |
+| `o` (4.5) | 32 | 75 | 9.4 (2.1x) | 17.0 (34x) |
+| `gate\|up` (35.7) | 57 | 210 | 37.7 | 30.8 (59x) |
+| `down` (17.8) | 44 | 210 | 37.7 (2.1x) | 47.6 (the 2.1 MB `A`, 23x) |
+| a layer | | **607** | 99 | 121 |
+
+A layer's weights take 139 us at 512 GB/s, so the products run 4.4x off their bandwidth floor. At 256 tokens they
+use 32-74 units, read `o`'s weight 4.2x and the others' 2.1x, and take 868 us a layer. The head (the BF16 table, the
+last row only) is 0.5 ms at ~417 GB/s.
+
+**What it says:**
+- **The KV cache's write is the cheapest large item.** It writes 1-2 MB a layer through `SCATTER_ROWS` in 32-byte
+  face-rows, a row at a time (`FixedWrite::write`, position-major). A chunk's rows are consecutive positions,
+  tile-aligned when the chunk starts at a multiple of 32, so the same bytes could go as whole tiles: at even 200 GB/s
+  ~10 us a layer. Bound: up to **-4.4 / -8.8 ms**, a 128-token prefill 29.6 -> ~25 ms (1.18x), 256 -> ~41 ms (1.21x).
+- **The products are bound by occupancy and `A`'s re-reads, not by the GEMM kernel.** At `m` = 128-256 a product's
+  blocks fill 32-74 of 120 units, and each column block re-reads the whole `A` (2.9 GB of `A` a 128-token chunk for
+  ~87 MB of activations). Holding `A` once (multicast along rows, or an `A` resident in L1, as W2 does for H1) and
+  spreading the blocks over the grid (split `K`, or narrower column blocks) approach the weights' 139 us a layer:
+  up to -11 ms at 128 tokens.
+- **Together they reach tt-metal's ~18 ms TTFT at 128 tokens** (29.6 - 4.4 - ~7 for products at 2x). The norms,
+  softmax and barriers (~8 ms) are next.
 
 ## W2: `A`'s reads inline beside a weight read by column (2026-11-15, card 0)
 

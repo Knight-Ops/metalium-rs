@@ -130,6 +130,8 @@ A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmet
     3. **`Release::Consumed`** (word 3; firmware `released()` reads `dataflow::INPUT + 4`, which T0 already advances), with a ttsim gate and a negative control that waits on the wrong counter.
     4. **`streaming_segments` emits it only where `l1_footprint` / `footprints_meet` prove the next gather disjoint from the half's output slots**, else `Packed`; the multicast `B` list gathers `c + 1` before `WAIT_CREDIT ready(c)`, the reader's frees still after that wait, the input reserve counting the reserved batch.
     5. **Kill:** under 3% over the then-current multicast product, or any default slower by more than 0.5%.
+- [ ] **The KV cache's chunk write as whole tiles** (found 2026-11-16, [log](../learnings/performance-log.md#the-17bs-prefill-by-op-class-at-todays-contract-2026-11-16-card-0)): a prefill chunk's keys and values go through `SCATTER_ROWS` in 32-byte face-rows, 192 / 377 us a layer for 1 / 2 MB (~5 GB/s), **16 / 18%** of a 128 / 256-token chunk. A chunk's positions are consecutive and tile-aligned from a multiple of 32: the same bytes as whole tiles. Bound: the 1.7B's prefill 1.18x / 1.21x. Cheapest large item on the prefill path.
+- [ ] **Short-chunk products: `A` once, every unit** (found 2026-11-16, same log): at 128-256 tokens a layer's products run on 32-74 of 120 units and re-read `A` 23-59x (2.9 GB of `A` a 128-token chunk for 87 MB of activations), 607 us a layer against the weights' 139 at 512 GB/s. `A` held once (row multicast or L1-resident) and the blocks spread over the grid (split `K`, narrower column blocks). Bound: up to -11 ms of a 29.6 ms 128-token chunk.
 - [ ] **Multicast products as an L2 channel transform** in the dataflow compiler (the old prefill P5 / G7, "each operand out of GDDR about once"; [prefill-operand-reuse.md](prefill-operand-reuse.md)).
 - [ ] **Activations L1-sharded between consecutive ops** where a capture proves the layout: an L2 pass over the op graph.
 - [ ] **A GEMM TFLOPS gate** at BF16-HiFi2 and BFP8-LoFi beside tt-metal's on the same card (F9: fidelity against structure).
@@ -239,10 +241,10 @@ The full text is in `git show 3e4cefd:docs/plans/roadmap.md`, "Track 3".
 ## Models: what is left beyond W5
 
 - [ ] **Qwen3.5-4B** ([new-architectures.md](new-architectures.md)):
-  - The delta-rule step in fewer ops: ~25 non-product ops a DeltaNet layer, 776 at 16.8 ms a step; tt-metal ~10.
+  - The delta-rule step in fewer ops: ~25 non-product ops a DeltaNet layer, 776 at 16.8 ms a step; tt-metal ~10. Re-measured 2026-11-16 ([log](../learnings/performance-log.md#qwen35-4bs-prefill-and-decode-by-op-class-2026-11-16-card-0)): a step is 35.5 ms on the card, the weight products 13.2 of it at 404 GB/s and the 945 other ops 22.3.
   - Deal evenly only where the uneven deal is not already at the card's read rate: ≤ 0.2 ms; bracket under the 0.5% rule.
   - The trace build: 644-1,487 s, host-bound, cause not found.
-  - Chunked (WY) prefill: 3.7 s for 256 tokens today.
+  - Chunked (WY) prefill: 3.7 s for 256 tokens today. Profiled 2026-11-16 (same log): a 16-token chunk is 216 ms, 58% of it the token-at-a-time recurrence's 3,457 small products and 43 ms barriers; the weight products are 24.5 ms. Bound: 2.4x at chunks of 16 with the recurrence gone, more once chunks can grow past 16.
 - [ ] **Gemma 4 E4B (Nemotron-3.5-Bolt) and MOSS-Image traced.**
 - [ ] **Long context** ([long-context.md](long-context.md)):
   - past 32K;
