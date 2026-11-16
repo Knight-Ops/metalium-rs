@@ -133,7 +133,7 @@ assumptions:
 - **Bytes:** F32, 4 bytes a parameter. Decode moves 6.85 GB of weights plus the cache (32 key/value heads, 0.2 GB at
   512 positions).
 - **Bandwidth:** 512 GB/s. Reads measure 469 across 120 tiles, so 14.8 ms is the weights' practical floor.
-- **Compute:** ~166 TFLOPS, HiFi4 on 120 tiles. Derived (774 TFLOPS LoFi / 140 tiles / 1,350 MHz = 4,096 FLOP a cycle
+- **Compute:** ~166 TFLOPS, HiFi4 on 120 tiles, the most any card has usable. Derived (774 TFLOPS LoFi / 140 tiles / 1,350 MHz = 4,096 FLOP a cycle
   a tile, over four phases), not measured.
 - **"Realistic":** 65% of the bandwidth, 45% of the compute.
 - **Target for decode:** 90-95% of the bandwidth over the whole step: ~14.5-15.5 ms a 1.7B step
@@ -158,16 +158,19 @@ assumptions:
 The compute ceiling the GEMM rows above work toward (2026-11-15). Derived, not measured:
 - **A tile's Matrix Unit:** `MVMUL` multiplies 8x16 by 16x16 a cycle, 4,096 FLOP a cycle at one fidelity phase, one
   instruction a phase (`vendor/tt-isa-documentation/WormholeB0/TensixTile/TensixCoprocessor/MatrixUnit.md`; Wormhole's
-  figures, whose ratios "broadly apply to Blackhole"). At 1,350 MHz, 5.53 TFLOPS a tile at LoFi. The vendor's 774
-  TFLOPS (FP8) is this on 140 tiles.
+  figures, whose ratios "broadly apply to Blackhole"). At 1,350 MHz, 5.53 TFLOPS a tile at LoFi.
+- **120 tiles is the ceiling, on any card.** Harvesting always fuses off at least two of the 14 columns, so no
+  Blackhole card has more than 120 usable Tensix tiles (these cards: 12 of 14 columns x 10, the mask `0xfff`). A
+  figure over 140 tiles (the vendor's 774 TFLOPS FP8 is 4,096 FLOP x 1,350 MHz x 140) counts tiles no card can use;
+  it is not a ceiling.
 - **A K-tile pair** (32x32 by 32x32, 65,536 FLOP) takes 16 `MVMUL`s a phase: 11.9 ns at LoFi, 23.7 at HiFi2, a unit.
 
-| Fidelity (phases) | A tile | 120 tiles (these cards: 12 of 14 columns x 10) | 110 (tt-metal's compute grid, 11x10) | 140 (the whole die) |
-|---|--:|--:|--:|--:|
-| LoFi (1) | 5.53 | **663.6** | 608.3 | 774.1 |
-| HiFi2 (2) | 2.76 | **331.8** | 304.1 | 387.1 |
-| HiFi3 (3) | 1.84 | 221.2 | 202.8 | 258.0 |
-| HiFi4 (4) | 1.38 | 165.9 | 152.1 | 193.5 |
+| Fidelity (phases) | A tile | 120 tiles (the most usable on any card; the peak) | 110 (tt-metal's compute grid, 11x10) |
+|---|--:|--:|--:|
+| LoFi (1) | 5.53 | **663.6** | 608.3 |
+| HiFi2 (2) | 2.76 | **331.8** | 304.1 |
+| HiFi3 (3) | 1.84 | 221.2 | 202.8 |
+| HiFi4 (4) | 1.38 | 165.9 | 152.1 |
 
 **Unresolved:** tt-metal's published 168.55 TFLOPS at HiFi4 on 11x10 ([parity](../plans/tt-metal-parity.md) §2.2)
 is above this table's 152.1 for 110 tiles. Either its grid or clock differs from what §2.2 records, or a HiFi4

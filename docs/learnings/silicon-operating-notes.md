@@ -28,6 +28,9 @@ space the survivors are a prefix of `grid::TENSIX_COLUMNS` and the count determi
 set. This matters because the raw firmware bit layout is **not** published — UMD documents
 its own `HarvestingMasks` as logical indices and says nothing about the word. Measured:
 `0xfff` on both cards, contiguous, 12 of 14 columns, harvested at X 15 and 16.
+**120 Tensix tiles is the most any card has usable** (owner, 2026-11-16): harvesting always takes at least two of
+the 14 columns. Per-card ceilings (a compute roofline, a "whole grid") count 120 at most; a figure over 140 tiles,
+such as the vendor's 774 TFLOPS, counts tiles no card can use.
 `Tensix::from_enabled_column_mask` refuses a non-contiguous mask rather than guessing,
 because the cost of a wrong guess is a dead host, not a failed test.
 
