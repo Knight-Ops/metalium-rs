@@ -219,19 +219,8 @@ fn a_stored_bf16_weight_multiplies_as_its_fp32_values() {
             s.download(&want).unwrap(),
             "BF16 storage must round the low bits away"
         );
-        // A stored weight is read as it lies: transposed it is refused, and so is any route
-        // but TF32's.
-        assert!(s
-            .matmul_dram(
-                &a,
-                false,
-                &stored,
-                true,
-                SrcRoute::Tf32FromFp32,
-                Fidelity::HiFi4,
-                1 << 40
-            )
-            .is_err());
+        // A stored weight is read through TF32's route only. (Read transposed, a BF16 one is the
+        // unpacker's to transpose since 2026-11-12: `step272_transposed_bf16_b`.)
         assert!(s
             .matmul_dram(
                 &a,

@@ -503,6 +503,22 @@ performance, ADR 0006) and its predicted gain on the parity workload ([tt-metal-
     `A` re-reads made free save 2.0% of the 1.7B's 7,992-token prefill and 0.4% at 256 (`1793465553` against
     `1793463500`); `pv` reads its `P` once already, so the pull has nothing to share there
     ([log](performance-log.md#f4bs-leftovers-the-batched-pull-bounded-the-eager-slowdown-located-2026-10-31-card-0)).
+  - *W2, the ceiling re-measured at the performance contract (2026-11-13, card 0, `1794535991`, `1794536268`):* with a
+    BF16 `A` (BF16 or BFP8 `B`, HiFi2 or LoFi) and every gather skipped, the kernel runs 118-186 TFLOPS on 104-120 units
+    (37-60 ns a K-tile pair a unit), against 41-77 with its gathers: H1's premise holds again, now at 1.87-3.85x of
+    headroom. On 64 units the ceiling is 74-114, so the multicast deal covers the whole grid.
+    *Prediction for W2's multicast (2-D, one sender a grid row for `A` and a grid column for `B`):* >= 85% of the
+    ceiling on the same units, the headline shape at BF16-HiFi2 70.5 -> >= 112 TFLOPS. *Kills it:* below 60 TFLOPS with
+    the operands delivered, or reads drop and the product does not beat today's 120-unit rate
+    ([log](performance-log.md#w2-bounded-the-kernels-ceiling-at-the-performance-contract-before-multicast-2026-11-13-card-0)).
+  - *W2's multicast, built and measured (2026-11-13, card 0; `tile_op::multicast`, `step274`):* bit for bit, GDDR reads
+    ~10x fewer, the same block 1.3-1.55x faster, but 61.8-67.5 TFLOPS on 10x12 against today's 70.5-76.9: 54% of the
+    ceiling, the prediction missed and the restated clause firing. With the `A` senders' GDDR reads
+    skipped (the multicasts still sent) it runs 90-96 TFLOPS. Neither the ready credits nor
+    the corner sending both operands bound it
+    ([log](performance-log.md#w2-the-2-d-operand-multicast-probe-2026-11-13-card-0)). Then refuted as the bound: two
+    `A` senders a row (by chunk parity: 57.3; by row halves: 57.4, deleted), `A`'s channels (`kq` 8), the mover's
+    entry cost (`fast-reads`, unchanged). What delays a strip between its sender's read and its readers is open.
 - **H2 `Dst` subblocks and half-sync.** Once reads stop binding (after H1), the kernel's math utilization rises from ~41-68% of HiFi4 issue toward ~90%. That range is derived from the 0.14-0.23 µs measured per K-tile pair against 128 cycles of `MVMUL`.
   - *Prediction:* ≥ 1.4× on the same shapes, bit-exact.
   - *Kills it:* < 1.1×.
@@ -822,6 +838,19 @@ performance, ADR 0006) and its predicted gain on the parity workload ([tt-metal-
     - **X10's ring depth is ruled out. The reads-in-flight half is named**: larger entries, which need X9's layout.
     - The "then" step above is unblocked: the `m = 1` product over a relaid weight, with the same kill
       (a span not ≥ 1.2x closer to its stream's time).
+  - *The meter from the senders' side (2026-11-13, card 0, `1794581277`;
+    [log](performance-log.md#w2-a-sender-side-meter-and-what-holds-the-multicast-product-back-2026-11-13-card-0)):
+    a multicast product's senders, which the meter dropped, and what RISCV NC waits for, entry by entry.*
+    - B's credit stamps carry their stream and action (`dm::entry_detail`), so a sender's transfer credits no longer
+      break the join; in the pipeline detail B also times its credit waits and credits.
+    - NC never stamped (its stamps would share B's stream), so it logs each entry's begin to L1 (`dm::nc_log`, one
+      word a record, its scratch slot), armed by B pair by pair inside the window; the host splices the log onto the
+      tile's counter and splits NC's time by kind (`NcStats`).
+    - Found on W2's 10x12 product: a sender's NC runs each chunk's strip section and then its own output wait, so it
+      sends the next strip only after its own kernel's push; sending a strip costs about a kernel batch, and the grid
+      moves at their sum. The `A` senders' reads were not the bound.
+    - Retry the reads-bound reading of any shared-operand schedule against this meter first: a sender's NC time
+      (output wait, multicast, settle, ready word) is now visible, not inferred from readers' starvation.
   - *The "then" step, as a timing probe (2026-11-02, card 1; roadmap item 2b,
     [plan](../plans/decode-bytes-in-flight.md),
     [log](performance-log.md#h11s-then-step-contiguous-weights-in-16-kib-reads-2026-11-02-card-1)): large entries
@@ -992,6 +1021,14 @@ performance, ADR 0006) and its predicted gain on the parity workload ([tt-metal-
       on today's models. Not adopted.
     - What it says: past C1's form (one cold dispatch, the arm byte for byte), B's remaining
       per-tile code size does not show in model time; size is a budget, not a speed lever, now.
+  - *Reopened, measured and reverted (2026-11-14, card 0):* with the cache's geometry measured (2-way, 16-byte lines) and the
+    per-entry path, not only the record code, split: `exec`'s rare arms behind one cold call (7,232 -> 2,552 bytes
+    on B), the rare record arms out of line, and the per-chunk code first in the image (`.text.chunk`). The 1.7B
+    decode step 1.5-2.1% faster, every new run below every old one (ABBA through `TT_FIRMWARE_OVERRIDE`); the plain
+    product unchanged at its chosen block. H16a moved record code only; the decode step's cost was in the list loop's
+    thousands of small entries (`CB`, `READ_L1`, `RELEASED`, `LAUNCH`, `KERNEL_WAIT`, `BARRIER`).
+    Reverted on its cost: ~3.1 KiB of B's image and ~2 KiB of NC's for 1.5-2.1%
+    ([log](performance-log.md#the-movers-per-chunk-code-placement-tried-and-reverted-what-moved-the-plain-product-2026-11-14-card-0)).
 
 - **H17 Bank-affine placement at large entries** (opened 2026-11-06; roadmap Track 2 item 2b's
   first copy-free lever; D3 and F27 decided it at 2 KiB entries only).

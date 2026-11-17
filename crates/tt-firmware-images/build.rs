@@ -31,6 +31,8 @@ const BINARIES: &[&str] = &[
     "dm_nc",
     "icache_b",
     "icache_nc",
+    "icache_alias_b",
+    "icache_alias_nc",
     "icache_t0",
     "icache_t1",
     "icache_t2",
@@ -112,8 +114,27 @@ fn main() {
         .iter()
         .copied()
         .chain(experiment.then_some(TTINSN_IMAGE));
+    // Development A/B only: `TT_FIRMWARE_OVERRIDE=<dir>` embeds the ELFs of the given names found
+    // in `<dir>` (another tree's build, e.g. `target/fw-size/safe/riscv32im-unknown-none-elf/release`)
+    // instead of this tree's, through the same instruction gate. Code placement moves the movers'
+    // speed (silicon-operating-notes, "RISCV B's code placement"), so a layout change is measured
+    // against the old images in one tree and one host build. The old images must speak this
+    // tree's protocol; nothing here checks that.
+    println!("cargo:rerun-if-env-changed=TT_FIRMWARE_OVERRIDE");
+    let over = std::env::var_os("TT_FIRMWARE_OVERRIDE").map(PathBuf::from);
     for name in binaries {
-        let elf = target_dir.join(TARGET).join("release").join(name);
+        let mut elf = target_dir.join(TARGET).join("release").join(name);
+        if let Some(dir) = &over {
+            let old = dir.join(name);
+            if old.exists() {
+                println!(
+                    "cargo:warning=TT_FIRMWARE_OVERRIDE: {name} from {}",
+                    old.display()
+                );
+                println!("cargo:rerun-if-changed={}", old.display());
+                elf = old;
+            }
+        }
         assert!(
             elf.exists(),
             "firmware binary {name} was not produced at {}",

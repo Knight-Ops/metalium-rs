@@ -132,6 +132,43 @@ pub(crate) fn packed_weight_matmul_as(a: &TtTensor, b: &TtTensor, out: DType) ->
     ))
 }
 
+/// `a @ b` over both operands' exact values -- each F32 or BF16, in its own slots -- with an F32
+/// result: one product reading `b` where it lies, a transposed view of a BF16 one included (the
+/// kernel's unpacker transposes it, `step272_transposed_bf16_b`): a tied table's head
+/// `last @ table^T` reads the table that its lookup reads (roadmap W1, one tied table). `None` for
+/// packed storage, a strided view, a `b` of another rank or `k`, or an engine without resident
+/// buffers.
+pub(crate) fn wide_matmul(a: &TtTensor, b: &TtTensor) -> Option<TtTensor> {
+    use crate::storage::StorageFormat;
+    let exact = |t: &TtTensor| {
+        matches!(t.dtype(), DType::F32 | DType::BF16)
+            && t.storage_format() == StorageFormat::F32
+            && !t.is_view()
+    };
+    if !exact(a) || !exact(b) || a.device != b.device || !crate::server::supports_dram(a.device) {
+        return None;
+    }
+    let (ls, rs) = (a.shape().to_vec(), b.shape().to_vec());
+    let [k, n] = rs[..] else { return None };
+    if ls.len() < 2 || ls[ls.len() - 1] != k {
+        return None;
+    }
+    let rows: usize = ls[..ls.len() - 1].iter().product();
+    let mut out = ls[..ls.len() - 1].to_vec();
+    out.push(n);
+    let a = float::float_reshape(a.clone(), burn_backend::Shape::new([rows, k]));
+    let (da, db) = (plain_dram(&a), b.to_dram().clone());
+    let (id, dims) =
+        crate::server::matmul_dram(a.device, da.buffer.id, false, db.buffer.id, db.transposed);
+    Some(device_result_shaped(
+        a.device,
+        id,
+        dims,
+        burn_backend::Shape::from(out),
+        DType::F32,
+    ))
+}
+
 pub(crate) fn bfp_compute_result(
     tensor: TtTensor,
     storage: crate::storage::StorageFormat,
@@ -239,6 +276,84 @@ fn cast_f16(tensor: &TtTensor, dtype: DType) -> Option<TtTensor> {
     }
 }
 
+/// A cast of a view that covers most of its buffer (a quarter of it or more): the whole buffer
+/// cast, and the same view over the result. Every element converts on its own, so the view's
+/// elements are the ones a cast of the view would give, and its layout is kept: a decode step's
+/// keys after RoPE (heads as column blocks of one row) stay one row, which the cache write reads
+/// where it lies, where materialising the view first laid them a head a row and the write then
+/// repacked them (a BF16 KV cache, roadmap W1). `None` for a plain tensor, a transposed buffer,
+/// a broadcast (a stride of zero over more than one element), or a view of a small part.
+///
+/// A view that is a block of its buffer on tile boundaries (a value head's columns of a fused
+/// projection's row) narrows that block alone (`Session::cast_block`): a third of a fused
+/// `qkv`'s tiles, dealt as the cache write that reads them is, so that write needs no barrier
+/// after the cast (the whole buffer's cast dealt the value tiles to other units).
+fn cast_view_in_place(tensor: &TtTensor, dtype: DType) -> Option<TtTensor> {
+    if !tensor.is_view() {
+        return None;
+    }
+    if tensor.dtype() == DType::F32 && dtype == DType::BF16 {
+        if let Some((w, dims)) = block_view(tensor) {
+            let (id, made) = crate::server::cast_block(
+                tensor.device,
+                crate::server::BlockArg {
+                    id: w.src.buffer.id,
+                    at: w.base,
+                    dims,
+                },
+                true,
+            );
+            let src = device_view(tensor.device, id, made, None, dtype)
+                .to_dram()
+                .clone();
+            return Some(TtTensor::view(
+                crate::views::Strided {
+                    src,
+                    base: [0, 0],
+                    strides: w.strides,
+                },
+                tensor.shape(),
+                dtype,
+                tensor.device,
+            ));
+        }
+    }
+    let v = tensor.as_strided()?;
+    let shape = tensor.shape().to_vec();
+    let count: usize = shape.iter().product();
+    let [rows, cols] = [v.src.buffer.rows, v.src.buffer.cols];
+    let broadcast = shape
+        .iter()
+        .zip(&v.strides)
+        .any(|(&n, s)| n > 1 && *s == [0, 0]);
+    if v.src.transposed
+        || broadcast
+        || 4 * count < rows * cols
+        || v.src.buffer.storage != crate::storage::StorageFormat::F32
+    {
+        return None;
+    }
+    let (id, dims) = crate::server::cast_float(
+        tensor.device,
+        v.src.buffer.id,
+        [rows, cols],
+        dtype == DType::BF16,
+    );
+    let src = device_view(tensor.device, id, dims, None, dtype)
+        .to_dram()
+        .clone();
+    Some(TtTensor::view(
+        crate::views::Strided {
+            src,
+            base: v.base,
+            strides: v.strides,
+        },
+        tensor.shape(),
+        dtype,
+        tensor.device,
+    ))
+}
+
 /// Resident conversion used by explicit casts and BF16 arithmetic dispatch.
 /// BF16 and F16 arithmetic widens to F32 on Tensix, computes using the existing native
 /// contract, then rounds its floating-point result once at the operation boundary.
@@ -260,6 +375,14 @@ pub(crate) fn cast_native(tensor: TtTensor, dtype: DType) -> TtTensor {
             "float_cast",
             format_args!("{}, output={dtype:?}", context(&tensor)),
         );
+    }
+    if dtype == DType::F32 {
+        if let Some(widened) = tensor.widened_on_host() {
+            return widened;
+        }
+    }
+    if let Some(cast) = cast_view_in_place(&tensor, dtype) {
+        return cast;
     }
     let source = tensor.to_dram();
     let (id, dims) = crate::server::cast_float(
@@ -360,16 +483,22 @@ pub(crate) fn bf16_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
     if !lhs.is_storable_matrix() || !rhs.is_storable_matrix() {
         return None;
     }
+    // A packed `A` is read untransposed; a transposed BF16 `B` is read as it lies and transposed
+    // by the kernel's unpacker (`step272_transposed_bf16_b`). It was copied plain first, through a
+    // per-element map of 16 bytes an element on the host: 40 GB for Qwen3.5's tied head
+    // `last @ table^T` (roadmap W1, defect 1).
     let a = plain_dram(lhs);
-    let b = plain_dram(rhs);
-    assert_eq!(
-        a.buffer.cols, b.buffer.rows,
-        "BF16 matmul inner dimensions differ"
-    );
+    let b = rhs.to_dram().clone();
+    let inner = if b.transposed {
+        b.buffer.cols
+    } else {
+        b.buffer.rows
+    };
+    assert_eq!(a.buffer.cols, inner, "BF16 matmul inner dimensions differ");
     // A BF16 result: each output rounded once in `Dst` and packed as BF16 (roadmap W1), bit for
     // bit the F32 product narrowed.
     let (id, dims) =
-        crate::server::matmul_dram_bf16(lhs.device, a.buffer.id, false, b.buffer.id, false);
+        crate::server::matmul_dram_bf16(lhs.device, a.buffer.id, false, b.buffer.id, b.transposed);
     Some(device_view(lhs.device, id, dims, None, DType::BF16))
 }
 
@@ -608,9 +737,23 @@ fn pack_axis(tensor: &TtTensor, dim: usize) -> Option<TtTensor> {
 }
 
 /// Retile a matrix's logical sequence into another shape without reading its data.
+/// When `shape` is stored as the matrix the tensor already lies in (`[b, m, k]` and `[b m, k]`), a
+/// view of the same slots, with no job: a BF16 Linear over a rank-3 input once repacked its whole
+/// weight on every call through a 16-byte-a-element host map, and on Qwen3.5 that held host
+/// memory without bound (roadmap W1, defect 2).
 fn repack_shape(tensor: &TtTensor, shape: Vec<usize>) -> TtTensor {
     let dims = crate::tensor::stored_dims(&shape).expect("nonempty output shape");
     let source = plain_dram(tensor);
+    if [source.buffer.rows, source.buffer.cols] == dims
+        && source.buffer.storage == crate::storage::StorageFormat::F32
+    {
+        return TtTensor::on_device(
+            source,
+            burn_backend::Shape::from(shape),
+            tensor.dtype(),
+            tensor.device,
+        );
+    }
     let cols = source.buffer.cols;
     let sources = (0..shape.iter().product())
         .map(|i| [i / cols, i % cols])
@@ -1033,8 +1176,10 @@ fn gather_native(dim: usize, tensor: TtTensor, indices: TtTensor) -> TtTensor {
 /// BFP storage, indices that are not I32, an empty selection.
 fn select_rows_native(tensor: &TtTensor, indices: &TtTensor) -> Option<TtTensor> {
     let n = indices.shape().num_elements();
+    // A BF16 table in its own slots (roadmap W1): its rows moved as they are, with no staging
+    // (`gather_native`'s per-element repack of the table a token, 229 s for `step167`'s BF16 run).
     if tensor.shape().num_dims() != 2
-        || tensor.elem().is_none()
+        || (tensor.elem().is_none() && tensor.dtype() != DType::BF16)
         || indices.dtype() != DType::I32
         || indices.shape().num_dims() != 1
         || n == 0
@@ -1438,7 +1583,7 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
     // Reported apart from the op that broadcasts: a row list a row of the result, which an
     // operand that is a block of whole tile rows avoids (`block_of`).
     let _part = crate::report::part("broadcast/expand");
-    let indices: Vec<_> = (0..rows)
+    let indices: Vec<(usize, usize)> = (0..rows)
         .map(|mut flat| {
             let mut coords = vec![0; rank - 1];
             for d in (0..rank - 1).rev() {
@@ -1452,10 +1597,10 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
             (0, row)
         })
         .collect();
-    let (id, dims) =
-        crate::server::gather_rows(tensor.device, vec![source.buffer.id], indices, input_cols);
-    let gathered = device_view(tensor.device, id, dims, None, tensor.dtype());
     if input_cols == cols {
+        let (id, dims) =
+            crate::server::gather_rows(tensor.device, vec![source.buffer.id], indices, input_cols);
+        let gathered = device_view(tensor.device, id, dims, None, tensor.dtype());
         return TtTensor::on_device(
             gathered.to_dram().clone(),
             shape,
@@ -1463,24 +1608,61 @@ fn expanded(tensor: &TtTensor, shape: burn_backend::Shape, op: &str) -> TtTensor
             tensor.device,
         );
     }
-    // [rows, 1] -> [1, rows] -> [cols, rows] -> [rows, cols].
-    let transposed = swapped_view(&gathered, 0, 1).expect("a gathered matrix");
-    let transposed = plain_dram(&transposed);
+    // A trailing axis of one repeated `cols` times: [rows, 1] -> [1, rows] -> [cols, rows] ->
+    // [rows, cols]. The middle two are one tile row `rows / 32` tiles wide, and a record names at
+    // most `MAX_EXTENT` column tiles (`tt_isa::dm::record::TensorRef::decode`): past that the
+    // copy was refused (`RANGE`, a nearest upsampling of `[1, 384, 64, 64]`, roadmap W1's
+    // defect 5). So the rows go in chunks of at most `EXPAND_CHUNK_ROWS`, joined by one gather.
+    let chunks: Vec<_> = indices
+        .chunks(EXPAND_CHUNK_ROWS)
+        .map(|chunk| {
+            let n = chunk.len();
+            let (id, dims) = crate::server::gather_rows(
+                tensor.device,
+                vec![source.buffer.id],
+                chunk.to_vec(),
+                input_cols,
+            );
+            let gathered = device_view(tensor.device, id, dims, None, tensor.dtype());
+            let transposed = swapped_view(&gathered, 0, 1).expect("a gathered matrix");
+            let transposed = plain_dram(&transposed);
+            let (id, dims) = crate::server::gather_rows(
+                tensor.device,
+                vec![transposed.buffer.id],
+                vec![(0, 0); cols],
+                n,
+            );
+            let repeated = device_view(tensor.device, id, dims, None, tensor.dtype());
+            let transposed = swapped_view(&repeated, 0, 1).expect("a gathered matrix");
+            (plain_dram(&transposed), n)
+        })
+        .collect();
+    if let [(whole, _)] = &chunks[..] {
+        return TtTensor::on_device(whole.clone(), shape, tensor.dtype(), tensor.device);
+    }
+    let joined: Vec<(usize, usize)> = chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &(_, n))| (0..n).map(move |r| (i, r)))
+        .collect();
     let (id, dims) = crate::server::gather_rows(
         tensor.device,
-        vec![transposed.buffer.id],
-        vec![(0, 0); cols],
-        rows,
+        chunks.iter().map(|(d, _)| d.buffer.id).collect(),
+        joined,
+        cols,
     );
-    let repeated = device_view(tensor.device, id, dims, None, tensor.dtype());
-    let transposed = swapped_view(&repeated, 0, 1).expect("a gathered matrix");
+    let result = device_view(tensor.device, id, dims, None, tensor.dtype());
     TtTensor::on_device(
-        plain_dram(&transposed),
+        result.to_dram().clone(),
         shape,
         tensor.dtype(),
         tensor.device,
     )
 }
+
+/// The rows [`expanded`] repeats along a trailing axis at once: `[1, rows]` must be at most
+/// `tt_isa::dm::record::MAX_EXTENT` (65,536) tiles wide; a power of two well inside it.
+const EXPAND_CHUNK_ROWS: usize = 1 << 20;
 
 /// A device result that reads `parent`'s slots, keeping it alive: a view of the contents
 /// `parent` names ([`crate::tensor::DramRef::generation`]).
@@ -2796,7 +2978,7 @@ pub mod float {
     /// from 1, the last two dimensions of an operand are not a block of its
     /// buffer, or its blocks are neither whole tiles nor whole rows of it
     /// (`Strided::matrix_blocks`).
-    fn batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
+    pub(crate) fn batched_matmul(lhs: &TtTensor, rhs: &TtTensor) -> Option<TtTensor> {
         let plan = batched_plan(lhs, rhs)?;
         let (id, dims) =
             crate::server::matmul_dram_batched(lhs.device, plan.a, plan.b, plan.items, plan.mkn);
@@ -2830,7 +3012,12 @@ pub mod float {
         if rank <= 2 || ls.len() < 2 || rs.len() < 2 || !crate::server::supports_dram(device) {
             return None;
         }
-        if !(lhs.is_stored_f32() && rhs.is_stored_f32()) {
+        // A BF16 `B` (a BF16 KV cache's keys or values) is read as it lies, the product over its
+        // exact values with an F32 result: bit for bit the widened `B`'s.
+        let wide_rhs = rhs.dtype() == DType::BF16
+            && rhs.is_storable()
+            && rhs.storage_format() == crate::storage::StorageFormat::F32;
+        if !(lhs.is_stored_f32() && (rhs.is_stored_f32() || wide_rhs)) {
             return None;
         }
         let (m, k, n) = (ls[ls.len() - 2], ls[ls.len() - 1], rs[rs.len() - 1]);
@@ -2873,8 +3060,16 @@ pub mod float {
             t.to_dram();
             t.as_strided()
         })?;
+        // A half operand's blocks are read where they lie, as whole tiles of its buffer: no row
+        // gather moves two-byte rows into padded blocks (`Session::matmul_dram_batched_with`).
+        let whole = |v: &crate::views::Strided, blocks: &[crate::Block]| {
+            !crate::tensor::is_half(t.dtype())
+                || blocks
+                    .iter()
+                    .all(|b| half_block_fits(v, b, &shape[shape.len() - 2..]))
+        };
         if let Some(blocks) = v.matrix_blocks(&shape, batch) {
-            return Some((v.src.buffer.id, blocks));
+            return whole(&v, &blocks).then_some((v.src.buffer.id, blocks));
         }
         if !t.is_view() {
             return None;
@@ -2882,7 +3077,23 @@ pub mod float {
         t.to_dram();
         let v = t.as_strided()?;
         let blocks = v.matrix_blocks(&shape, batch)?;
-        Some((v.src.buffer.id, blocks))
+        whole(&v, &blocks).then_some((v.src.buffer.id, blocks))
+    }
+
+    /// Whether `block` of a `[r, c]` matrix (`dims`) starts on a tile of `v`'s buffer and ends on
+    /// one or at the buffer's edge (`tt_kernels::tensor::block_fits`).
+    fn half_block_fits(v: &crate::views::Strided, block: &crate::Block, dims: &[usize]) -> bool {
+        let [rows, cols] = [v.src.buffer.rows, v.src.buffer.cols];
+        let [er, ec] = if block.transposed {
+            [dims[1], dims[0]]
+        } else {
+            [dims[0], dims[1]]
+        };
+        let [r0, c0] = block.at;
+        let ends = |at: usize, extent: usize, edge: usize| {
+            at + extent <= edge && ((at + extent) % 32 == 0 || at + extent == edge)
+        };
+        r0 % 32 == 0 && c0 % 32 == 0 && ends(r0, er, rows) && ends(c0, ec, cols)
     }
 
     /// `tensor` with dimensions `dim1` and `dim2` swapped, as a view of its
@@ -4228,6 +4439,11 @@ pub mod module {
 
     /// Pinned Burn's attention ordering, with replayable causal geometry.
     /// BF16 inputs widen once; every intermediate remains F32 until the output.
+    ///
+    /// An F32 query over BF16 keys and values (a BF16 KV cache, [`crate::attention_wide`]) is
+    /// computed over the keys' and values' exact values with an F32 result, bit for bit the
+    /// attention of the widened keys and values: the products read them where they lie
+    /// (`SrcRoute::Edges`), and they are widened only where no product does.
     pub fn attention(
         query: TtTensor,
         key: TtTensor,
@@ -4236,7 +4452,13 @@ pub mod module {
         attn_bias: Option<TtTensor>,
         options: burn_backend::ops::AttentionModuleOptions,
     ) -> TtTensor {
-        let dtype = float_compute_dtype(&[&query, &key, &value]);
+        let wide = query.dtype() == DType::F32
+            && key.dtype() == DType::BF16
+            && value.dtype() == DType::BF16;
+        let dtype = match wide {
+            true => DType::F32,
+            false => float_compute_dtype(&[&query, &key, &value]),
+        };
         let qs = query.shape().to_vec();
         let ks = key.shape().to_vec();
         let vs = value.shape().to_vec();
@@ -4260,13 +4482,16 @@ pub mod module {
         // Each stage's jobs are charged to a part of `attention` of its own
         // (`report::part`), so a report says which of them the cost is.
         let part = crate::report::part;
-        let (query, key, value) = {
-            let _part = part("attention/widen");
-            (
-                float_compute_input(query),
-                float_compute_input(key),
-                float_compute_input(value),
-            )
+        let (query, key, value) = match wide {
+            true => (query, key, value),
+            false => {
+                let _part = part("attention/widen");
+                (
+                    float_compute_input(query),
+                    float_compute_input(key),
+                    float_compute_input(value),
+                )
+            }
         };
         if mask.is_none() && attn_bias.is_none() {
             if let Some(out) = padded_attention(&query, &key, &value, &options, scale) {
@@ -4287,7 +4512,7 @@ pub mod module {
         }
         let scores = {
             let _part = part("attention/qk");
-            float::float_matmul(query, float::float_transpose(key))
+            wide_product(query, float::float_transpose(key))
         };
         if let Some(mask) = &mask {
             assert_eq!(device, mask.device, "attention mask device differs");
@@ -4306,7 +4531,7 @@ pub mod module {
             if let Some(probabilities) = probabilities {
                 let out = {
                     let _part = part("attention/pv");
-                    float::float_matmul(probabilities, value)
+                    wide_product(probabilities, value)
                 };
                 let _part = part("attention/narrow");
                 return cast_native(out, dtype);
@@ -4364,10 +4589,27 @@ pub mod module {
         };
         let out = {
             let _part = part("attention/pv");
-            float::float_matmul(probabilities, value)
+            wide_product(probabilities, value)
         };
         let _part = part("attention/narrow");
         cast_native(out, dtype)
+    }
+
+    /// `a @ b` for an F32 `a` and a `b` of F32 or BF16 (attention's keys or values over a BF16
+    /// cache): a BF16 `b` read as it lies by the batched product, else widened once (bit for bit
+    /// the same product).
+    fn wide_product(a: TtTensor, b: TtTensor) -> TtTensor {
+        if b.dtype() != DType::BF16 {
+            return float::float_matmul(a, b);
+        }
+        if let Some(t) = float::batched_matmul(&a, &b) {
+            return t;
+        }
+        let b = {
+            let _part = crate::report::part("attention/widen");
+            cast_native(b, DType::F32)
+        };
+        float::float_matmul(a, b)
     }
 
     /// The bottom-right causal mask of `[b, h, sq, _]` queries over
@@ -4445,8 +4687,16 @@ pub mod module {
         mask: &TtTensor,
         scale: f64,
     ) -> Option<TtTensor> {
-        use tt_kernels::attention::{fits, Item};
+        use tt_kernels::attention::{fits_as, Item};
+        use tt_kernels::tensor::Elem;
         let device = query.device;
+        // F32 keys and values, or BF16 ones (a BF16 KV cache) read as they lie.
+        let kv = match (key.dtype(), value.dtype()) {
+            (DType::F32, DType::F32) => Elem::F32,
+            (DType::BF16, DType::BF16) => Elem::BF16,
+            _ => return None,
+        };
+        let fits = |dims, r0| fits_as(dims, r0, kv);
         if !ATTENTION_ROWS.load(std::sync::atomic::Ordering::Relaxed)
             || crate::matmul_mode::effective(device) != crate::MatmulMode::Fast
             || crate::matmul_mode::fidelity_override().is_some()

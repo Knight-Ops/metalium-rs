@@ -147,5 +147,33 @@ has 64 x 64 output tiles: 8x8 blocks are 64 jobs on 120 units).
   an F32 `B` LoFi is no faster (14.57 against 14.95 TFLOPS), with a BF16 `B` 1.18-1.35x (`silicon_probe_pair_cost`).
   The faster pair is the structural one in P4, which keeps every bit.
 - [ ] **P5. Step 2: each operand out of GDDR about once** (multicast along the grid's rows and columns, or strips held
-  by a few units and pulled): needs a cross-unit ready/free credit, which does not exist. Worth it once P4 makes the
-  products read-bound again: they are (2026-10-26, P4).
+  by a few units and pulled). Cross-unit credits exist since F2 (`op::CREDIT`, `op::WAIT_CREDIT`); the pull is D5
+  (`tile_op::reuse`), the multicast roadmap W2's probe (`tile_op::multicast`, 2026-11-13: reads ~10x fewer, 61.9-67.7
+  TFLOPS on 10x12; [log](../learnings/performance-log.md#w2-the-2-d-operand-multicast-probe-2026-11-13-card-0)).
+  - [x] **A sender-side meter** (2026-11-13; [log](../learnings/performance-log.md#w2-a-sender-side-meter-and-what-holds-the-multicast-product-back-2026-11-13-card-0)):
+    B's credit stamps name their stream (`dm::entry_detail`), so the pipeline detail joins a sender's batches with
+    its transfer's times; NC logs each entry it begins (`dm::nc_log`, in NC's unused scratch slot, armed by B per pair
+    in the window), split by what it waited for (`profile_mode::NcStats`); `step275` on ttsim and card 0. Found: the
+    `A` senders' reads are not the bound (a sender-only skip gains 1-2%; the earlier "reads skipped" hook removed `A`'s
+    multicasts too); **a sender's NC sends strip `c + 1` only after its own kernel pushed chunk `c`**, and a strip's
+    sending costs about a kernel batch, so they add.
+  - [x] **Send ahead of the output wait** (2026-11-13, reverted; [log](../learnings/performance-log.md#w2-sending-ahead-moves-the-wait-to-the-senders-b-2026-11-13-card-0)):
+    NC's list sent strip `c + 1` before chunk `c`'s output wait: 60.6 / 63.9 TFLOPS against 61.9 / 67.7. NC's wait moved
+    to its own B (transfer wait 699 us), whose timeline did not change. B gathering chunk `c + 1` before chunk `c`'s
+    ready wait on top: 53.1 / 56.2 (the slot-reuse guard, chunk `c - 1` packed, then holds chunk `c`'s push). Both in
+    [failed-approaches](../learnings/failed-approaches.md).
+  - The sender's B is the critical path: its own strip's read (~10 us for 59 KB) then its wait for the other
+    operand's strip (~12 us), in series, every chunk.
+  - [x] **(1) Why a sender's strip read is slow** (2026-11-13; [log](../learnings/performance-log.md#w2-what-a-senders-read-costs-and-what-it-is-worth-2026-11-13-card-0)):
+    B's cost an entry, ~330 ns for each of a `GATHER`'s 2,112-byte tile reads (decoded and checked). It is not GDDR,
+    the in-flight cap, or `fast-reads` (which does not reach a `GATHER`). Every sender's reads skipped: 64.1 / 71.1
+    TFLOPS alone, 81.2 with NC sending ahead (`[2048,8192]`, against 59.3).
+  - [x] **A cheaper gather, then the send-ahead again** (2026-11-14; [log](../learnings/performance-log.md#w2-a-cheaper-gather-the-send-ahead-kept-and-bs-code-placement-2026-11-14-card-0)):
+    a gather's tile read 386 -> 260 cycles (`dm::ReadPlan`, `record::Sink`, B's `PlannedReads`), the send-ahead kept
+    (`multicast::writer_list`): 65.2 / 70.1 TFLOPS on 10x12. Still the sender's B list (read, then the other
+    operand's strip) on the path.
+  - [ ] **B's per-chunk code placed on purpose** (products move up to 20% with B's code placement), then a strip's
+    tiles contiguous on a channel (fewer, larger reads).
+  - [ ] **(2) Gather ahead, guarded by consumption**: B gathers chunk `c + 1` before chunk `c`'s ready wait, its
+    guard chunk `c - 1` consumed (T0), not packed (T2), with the batch's output footprint proved disjoint from the
+    next gather's; the frees stay after the wait, and the reserve counts the reserved batch.

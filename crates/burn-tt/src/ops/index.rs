@@ -247,7 +247,7 @@ fn scatter_nd(
 ) -> TtTensor {
     let variant = format!(", reduction={reduction:?}");
     let dtype = data.dtype();
-    if !matches!(dtype, DType::F32 | DType::I32) || values.dtype() != dtype {
+    if !matches!(dtype, DType::F32 | DType::I32 | DType::BF16) || values.dtype() != dtype {
         fail(
             name,
             format_args!(
@@ -280,6 +280,19 @@ fn scatter_nd(
         if let Some(updated) = scatter_rows_native(&data, &indices, &table, &rows, &nd) {
             return restack(&updated, data.shape().to_vec());
         }
+    }
+    // BF16 rows move whole only through the row scatter (a BF16 KV cache's write); anything
+    // else is the F32 op over the widened tensors, narrowed: exact, as each datum is one of
+    // them, or (`Add`) one sum rounded once.
+    if dtype == DType::BF16 {
+        let wide = scatter_nd(
+            crate::ops::float_compute_input(data),
+            indices,
+            crate::ops::float_compute_input(values),
+            reduction,
+            name,
+        );
+        return crate::ops::cast_native(wide, DType::BF16);
     }
     let flat = nd_flat_rows(&data, &indices, &nd);
     let updated = match reduction {

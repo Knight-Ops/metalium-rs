@@ -81,6 +81,19 @@ pub struct WeightOptions {
     /// stream, the attention block and every op's arithmetic stay F32 (`Llama::for_inference`).
     /// Not a weight format: the plan is the contract's either way.
     pub f32_activations: bool,
+    /// A tied model's output head kept as a projection of its own (`Llama::untied`), stored in the
+    /// contract's weight format beside the BF16 table its lookup reads: two copies of the table.
+    /// Opt-in (roadmap, "a default holds a weight's bytes once"; owner, 2026-11-12): by default a
+    /// tied model stores its table once, BF16, which its lookup and its head (`last @ table^T`,
+    /// `burn_tt::matmul_wide`) both read. Its cost on SmolLM2-1.7B: the BFP8 head's 113 MB of GDDR
+    /// more, for the BF16 head's extra bytes a decode step (`performance-log.md`).
+    pub untied_head: bool,
+    /// Under the performance contract, an F32 KV cache: the measurement's baseline. By default
+    /// (since 2026-11-12, roadmap W1) the contract's cache is BF16, each step's keys and values
+    /// rounded once as they are written (after RoPE) and attention reading them as they lie
+    /// (`Llama::for_inference`, `burn_tt::attention_wide`): half the bytes a step attends over and
+    /// half the cache's GDDR. The reference contract's cache is F32 either way.
+    pub f32_kv_cache: bool,
 }
 
 /// The format of each named tensor: the first rule whose pattern is a substring of the name wins,
@@ -125,11 +138,16 @@ impl Plan {
     /// The weight formats of the numeric contract `numerics` (ADR 0006), for a model whose
     /// weights are BF16 values (every checkpoint `tt-models` loads), fused or not:
     ///
-    /// - [`Numerics::Reference`]: [`Plan::bf16_weights`], which holds such weights exactly, so the
-    ///   model computes the F32 model's logits bit for bit.
-    /// - [`Numerics::Performance`]: every matrix but the embedding table BFP8, and with
-    ///   [`WeightOptions::mlp_bfp4`] the MLP's `gate` and `up` (`gate_up` fused) BFP4. Its
-    ///   specification model is the F32 model holding the rounded values ([`Emulated`]).
+    /// - [`Numerics::Reference`]: every matrix stored BF16 ([`Format::Bf16Stored`]), which holds
+    ///   such weights exactly, so the model computes the F32 model's logits bit for bit.
+    /// - [`Numerics::Performance`]: every matrix BFP8, and with [`WeightOptions::mlp_bfp4`] the
+    ///   MLP's `gate` and `up` (`gate_up` fused) BFP4. Its specification model is the F32 model
+    ///   holding the rounded values ([`Emulated`]).
+    ///
+    /// Under both, the embedding table is a BF16 tensor ([`Format::Bf16`], exact for these
+    /// weights): its lookup reads its rows as they lie (roadmap W1, the BF16 lookup), and a tied
+    /// head reads the same table (roadmap W1, one tied table; [`WeightOptions::untied_head`] opts
+    /// out).
     ///
     /// [`Numerics::Reference`]: burn_tt::Numerics::Reference
     /// [`Numerics::Performance`]: burn_tt::Numerics::Performance
@@ -140,10 +158,12 @@ impl Plan {
                     !options.mlp_bfp4,
                     "BFP4 weights are a performance-contract option"
                 );
-                Self::bf16_weights()
+                Self::new()
+                    .rule("embed_tokens", Format::Bf16)
+                    .rule("", Format::Bf16Stored)
             }
             burn_tt::Numerics::Performance => {
-                let mut plan = Self::new().rule("embed_tokens", Format::F32);
+                let mut plan = Self::new().rule("embed_tokens", Format::Bf16);
                 if options.mlp_bfp4 {
                     for part in ["gate_up", "gate_proj", "up_proj"] {
                         plan = plan.rule(part, Format::Bfp4);
@@ -368,17 +388,17 @@ mod tests {
         assert_eq!(
             formats(Numerics::Reference, false),
             [
-                F32, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored,
+                Bf16, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored, Bf16Stored,
                 Bf16Stored
             ]
         );
         assert_eq!(
             formats(Numerics::Performance, false),
-            [F32, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8]
+            [Bf16, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8, Bfp8]
         );
         assert_eq!(
             formats(Numerics::Performance, true),
-            [F32, Bfp8, Bfp8, Bfp4, Bfp4, Bfp4, Bfp8, Bfp8]
+            [Bf16, Bfp8, Bfp8, Bfp4, Bfp4, Bfp4, Bfp8, Bfp8]
         );
     }
 

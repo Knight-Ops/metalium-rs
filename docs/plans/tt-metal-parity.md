@@ -283,6 +283,18 @@ They run in this order; W1-W4 can overlap.
   norm's output, `silu(gate) * up`), the products giving F32. 1.7B decode 7.52 / 8.01 / 8.64 ms (unchanged), prefill
   4,266 tokens/s at 256 (1.065x; 3,552 at 128, 1.09x), `step269` the same 228 of 232. Still open from W1's
   prediction: a BF16 KV cache at long context.
+- **The BF16 defects, the BF16 lookup and one tied table (2026-11-12,** cards 0 and 1;
+  [log](../learnings/performance-log.md#w1-the-bf16-defects-fixed-the-bf16-lookup-and-one-tied-table-2026-11-12-cards-0-and-1)):
+  a transposed BF16 `B` read as it lies (the unpacker transposes it), `SELECT_ROWS_BF16`, and a tied table stored
+  once, BF16, by the owner's decision: the 1.7B 7.52 -> 7.68 ms (0.73x tt-metal's 10.55), Qwen3.5-4B 56.93 -> 54.47.
+  Still open from W1's prediction: a BF16 KV cache at long context, whose two parts (a transposed BF16 `q k^T`, 2-byte
+  rows in B's records) now exist.
+- **A BF16 KV cache, the performance contract's (2026-11-12,** cards 0 and 1;
+  [log](../learnings/performance-log.md#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1)):
+  W1's long-context prediction met: the 1.7B at 2K 19.44 -> 18.89 ms (predicted ~0.9 ms, got 0.55), at 8K 43.44 ->
+  38.67 (predicted ~4.7, got 4.77); short context +1.9% (7.84 ms, 0.74x tt-metal's 10.55), the values' cast a layer;
+  Qwen3.5-4B 54.43 -> 54.71. Half the cache's GDDR, which W3's batch-32 cache needs. The rest of attention's time at 8K
+  (~26 ms) is the scores, not the cache: an attention that keeps them in L1.
 - **First box landed (2026-11-10;** [log](../learnings/performance-log.md#w1-bfp8-weights-the-inference-default-behind-the-contract-switch-and-a-model-gate-2026-11-10-cards-0-and-1)):
   - **The switch:** `burn_tt::Numerics`, recorded in traces.
   - **The default:** tt-models' `for_inference` stores BFP8 weights under the performance contract.
@@ -306,7 +318,17 @@ They run in this order; W1-W4 can overlap.
 - **Predicted gain:** prefill products at the 1.7B's shapes from ~30 (W1: >= 60) to >= 150 TFLOPS BF16-HiFi2. A 1.7B prefill at 256 tokens goes from 3,827 to >= 10,000 tokens/s (the roofline row's "realistic").
 - **First step:**
   - a probe: one `[2048,2048]@[2048,16384]` product with `A` row-multicast and `B` column-multicast on a 10x11 sub-grid, BF16-HiFi2;
-  - TFLOPS against the reads-free ceiling (`1793224072`: 28-30 with today's kernel), to separate the kernel's own rate from the operand delivery.
+  - TFLOPS against the reads-free ceiling, to separate the kernel's own rate from the operand delivery.
+- **Bounded (2026-11-13,** card 0; [log](../learnings/performance-log.md#w2-bounded-the-kernels-ceiling-at-the-performance-contract-before-multicast-2026-11-13-card-0)):
+  the ceiling at the performance contract is 118-186 TFLOPS on 104-120 units (37-60 ns a K-tile pair a unit, near
+  tt-metal's ~35), against 41-77 with today's gathers; the kill does not fire, and every shape is read-bound. On 64
+  units the ceiling is 74-114, so the probe deals over any grid rectangle (uniform blocks, a unit one job fewer where
+  they do not divide it), 8x8, 8x12 and 10x12, not only 10x11. Predicted: >= 85% of the ceiling on the same units.
+- **The probe, built (2026-11-13,** card 0; [log](../learnings/performance-log.md#w2-the-2-d-operand-multicast-probe-2026-11-13-card-0)):
+  `A` along grid rows and `B` down columns, bit for bit, GDDR reads ~10x fewer; 61.9-67.6 TFLOPS on 10x12 (H1),
+  below today's 70.5-76.9 and 54% of the ceiling; with `A`'s reads free 90-96 TFLOPS, against tt-metal's 122
+  (BF16-HiFi2) and 183 (BF16 x BFP8 LoFi). Two `A` senders a row (by chunk parity, by row halves) lost; `A`'s
+  channels and the mover's entry cost are not the bound.
 - **Kill:** below 60 TFLOPS with operands delivered (the kernel binds). In that case the next item is the kernel's push and unpack, not the dataflow.
 - **Gate:** a GEMM TFLOPS gate at BF16-HiFi2 and BFP8-LoFi beside tt-metal's on the same card (W0).
 
@@ -341,6 +363,12 @@ They run in this order; W1-W4 can overlap.
 - **Predicted gain:** Qwen3.5-4B 62.5 -> ~41.5 ms a step (the 21.4 ms greedy pick to < 0.5 ms).
 - **Kill:** the pick above 1 ms after the fix.
 - **Gate:** the pick equals `argmax` over the whole row bit for bit, including ties, NaN and `-inf` padding, on a 248,320 vocabulary.
+- **Items 1 and 2 done (2026-11-12,** cards 0 and 1;
+  [log](../learnings/performance-log.md#w4-the-wide-vocabulary-greedy-pick-one-op-for-any-vocabulary-2026-11-12-cards-0-and-1)):
+  the 21.4 ms were the eight parts' slices (each a ~1.5 ms copy), not the argmax nor one unit. A row's partials fold in
+  levels (`tensor::argmax_fold`), one op for any width: 153 us on the card for 248,320 columns. Qwen3.5-4B 54.71 ->
+  **34.10 ms** a step (predicted ~41.5 from 62.5, i.e. ~33 from 54.5), 0.90x tt-metal's 38.0 on the card. The kill (> 1
+  ms) does not fire. Item 3 (top-k / top-p) is open.
 
 ### W5. An 8B-class model
 
@@ -421,7 +449,7 @@ They run in this order; W1-W4 can overlap.
    - Either the bench's chunking or warm-up differs between those runs (`TT_GEN_CHUNKS`, default 64), or something between `5a1640f` and `f29b104` lost ~45% at 256 tokens.
    - Settle it first: re-run `5a1640f` and `HEAD` with the same command on one card. Bisect if they differ.
    - The scoreboard still quotes 3,827.
-2. **The wide-vocabulary greedy pick reads at ~1.5 GB/s** (W4). The docs and the code disagree on its unit count. Confirm with a profiled run (`TT_PROFILE_DETAIL=pipeline`) of one part before changing the code.
+2. **The wide-vocabulary greedy pick reads at ~1.5 GB/s** (W4). The docs and the code disagree on its unit count. Confirm with a profiled run (`TT_PROFILE_DETAIL=pipeline`) of one part before changing the code. **Settled 2026-11-12:** the parts' slices were the cost, not the units; the parts are gone (W4).
 3. **BF16 is storage only.**
    - `float_matmul` refuses non-F32 operands (`burn-tt/src/ops.rs:2559`).
    - BF16 element-wise arithmetic widens through cast ops (`cast_native`).

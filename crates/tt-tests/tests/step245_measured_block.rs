@@ -34,7 +34,7 @@
 use std::sync::Mutex;
 
 use tt_kernels::matmul::{Fidelity, SrcRoute};
-use tt_kernels::session::{Session, MEASURE_MOST};
+use tt_kernels::session::{Session, MEASURE_MOST, MEASURE_ROUNDS, MEASURE_STARTS};
 use tt_kernels::tensor::{self, BlockChoice, BlockStream, DramTensor, Reuse};
 use tt_kernels::tile_op::reuse::AUTO_HOLDERS;
 use tt_tests::harness::BUDGET;
@@ -264,16 +264,21 @@ fn a_measured_product_runs_its_chosen_candidate_bit_for_bit_and_times_once() {
             if let [auto, .., last] = listed[..] {
                 assert_eq!(choice, Some(last), "{what}: the scores' choice");
                 assert_ne!(choice, Some(auto), "{what}: Auto's unpulled block");
+                // The scores rank the listed last first, so the climbs start from the last
+                // `MEASURE_STARTS` listed, last first; nothing off the list gains, so each climb
+                // is one round of its start's neighbours, and no two scores tie.
                 let mut want_timed = listed.clone();
-                for n in tensor::block_stream_neighbours(&q, last, Some(pulled())) {
-                    if !want_timed.contains(&n) {
-                        want_timed.push(n);
+                for &start in listed.iter().rev().take(MEASURE_STARTS) {
+                    for n in tensor::block_stream_neighbours(&q, start, Some(pulled())) {
+                        if !want_timed.contains(&n) {
+                            want_timed.push(n);
+                        }
                     }
                 }
                 want_timed.truncate(MEASURE_MOST);
                 assert_eq!(
                     timed, want_timed,
-                    "{what}: the list, then one climb, each once"
+                    "{what}: the list, then a climb from each start, each once"
                 );
                 tested += 1;
             }
@@ -288,6 +293,120 @@ fn a_measured_product_runs_its_chosen_candidate_bit_for_bit_and_times_once() {
             s.free(b).unwrap();
         }
         assert!(tested > 0, "no shape had two candidates");
+    });
+}
+
+/// Scores the gate sets for chosen candidates, one a time a candidate is scored (the last
+/// repeated), with how many it has given; any other candidate scores as [`score`] ranks it, x 10.
+static TABLE: Mutex<Vec<(BlockChoice, Vec<f64>, usize)>> = Mutex::new(Vec::new());
+
+fn table_score(block: [usize; 3], reuse: Reuse, us: f64) -> f64 {
+    let c = BlockChoice { block, reuse };
+    let mut table = TABLE.lock().unwrap();
+    if let Some((_, scores, given)) = table.iter_mut().find(|(t, ..)| *t == c) {
+        SCORED.lock().unwrap().push(c);
+        let s = scores[(*given).min(scores.len() - 1)];
+        *given += 1;
+        return s;
+    }
+    drop(table);
+    score(block, reuse, us) * 10.0
+}
+
+/// `a @ b` measured under [`table_score`] with `table`'s scores, checked bit for bit against
+/// `want`: its choice, and what was scored, in order.
+fn measured_under<T: tt_device::Transport>(
+    s: &mut Session<T>,
+    a: &DramTensor,
+    b: &DramTensor,
+    want: &[f32],
+    table: Vec<(BlockChoice, Vec<f64>)>,
+    what: &str,
+) -> (Option<BlockChoice>, Vec<BlockChoice>) {
+    *TABLE.lock().unwrap() = table.into_iter().map(|(c, v)| (c, v, 0)).collect();
+    s.probe_block_scores(Some(table_score));
+    let before = scored().len();
+    same(&traced_product(s, a, b), want, what);
+    let measured = tensor::measured();
+    assert_eq!(measured.len(), 1, "{what}: one question");
+    TABLE.lock().unwrap().clear();
+    (measured[0].1, scored()[before..].to_vec())
+}
+
+/// A peak reached only by climbing from the second fastest listed candidate is the choice: one
+/// climb from the fastest alone kept whichever peak the first round led to (H1's LoFi product
+/// chose `[6, 4, 12]` at 1,673 us in one process of four, the others `[8, 4, 9]` at ~1,470).
+#[test]
+fn a_measured_choice_climbs_from_more_than_the_fastest_listed() {
+    with_session(|s| {
+        let mut tested = 0;
+        for [m, k, n] in SHAPES {
+            let what = format!("[{m},{k}]@[{k},{n}]");
+            let a = s.upload(&values(m * k, m), m, k).unwrap();
+            let b = s.upload(&values(k * n, n), k, n).unwrap();
+            modelled(s);
+            let want = product(s, &a, &b);
+            let (q, listed) = measuring(s, &a, &b).expect("a blocked product");
+            let p = Some(pulled());
+            let far = match listed[..] {
+                [.., second, last] => {
+                    let by_last = tensor::block_stream_neighbours(&q, last, p);
+                    tensor::block_stream_neighbours(&q, second, p)
+                        .into_iter()
+                        .find(|n| !listed.contains(n) && !by_last.contains(n))
+                }
+                _ => None,
+            };
+            if let Some(far) = far {
+                // The fastest listed scores 10, the second 20; `far`, one step from the second
+                // and none from the fastest, 5.
+                let (choice, _) = measured_under(s, &a, &b, &want, vec![(far, vec![5.0])], &what);
+                eprintln!("{what}: chose {choice:?}, the far peak {far:?}");
+                assert_eq!(choice, Some(far), "{what}: the second start's peak");
+                tested += 1;
+            }
+            s.free(a).unwrap();
+            s.free(b).unwrap();
+        }
+        assert!(
+            tested > 0,
+            "no shape had a peak one step from the second start alone"
+        );
+    });
+}
+
+/// Near ties are timed again in interleaved rounds and the median decides: a candidate fastest
+/// in its first time alone (an outlier) is not kept over one steadily a little faster.
+#[test]
+fn a_near_tie_is_timed_again_and_the_median_decides() {
+    with_session(|s| {
+        let [m, k, n] = SHAPES[0];
+        let what = format!("[{m},{k}]@[{k},{n}]");
+        let a = s.upload(&values(m * k, m), m, k).unwrap();
+        let b = s.upload(&values(k * n, n), k, n).unwrap();
+        modelled(s);
+        let want = product(s, &a, &b);
+        let (_, listed) = measuring(s, &a, &b).expect("a blocked product");
+        let [.., steady, lucky] = listed[..] else {
+            panic!("{what}: two candidates wanted: {listed:?}");
+        };
+        // `lucky` 10 once, then 10.6; `steady` 10.2 every time: within 3% of the first round's
+        // fastest, so both are timed again, and `steady`'s median is the lesser.
+        let (choice, timed) = measured_under(
+            s,
+            &a,
+            &b,
+            &want,
+            vec![(lucky, vec![10.0, 10.6]), (steady, vec![10.2])],
+            &what,
+        );
+        assert_eq!(choice, Some(steady), "{what}: the steady near tie");
+        for c in [lucky, steady] {
+            let times = timed.iter().filter(|&&t| t == c).count();
+            assert_eq!(times, MEASURE_ROUNDS, "{what}: {c:?} timed {times} times");
+        }
+        s.free(a).unwrap();
+        s.free(b).unwrap();
     });
 }
 

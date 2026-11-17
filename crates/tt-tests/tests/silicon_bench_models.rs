@@ -1056,7 +1056,9 @@ fn weight_storage_probe() -> Option<Option<tt_models::quant::Format>> {
 /// The numeric contract a model bench runs under (ADR 0006): `TT_NUMERICS` (`reference` or
 /// `performance`), by default `performance`, the inference contract; `TT_MLP_BFP4=1` its named
 /// option, BFP4 for `gate|up`; `TT_F32_ACTIVATIONS=1` its products' activations F32, the
-/// baseline of its BF16 ones (roadmap W1, `WeightOptions::f32_activations`).
+/// baseline of its BF16 ones (roadmap W1, `WeightOptions::f32_activations`); `TT_UNTIED_HEAD=1` a
+/// tied model's head stored apart from its table, the two-copy option
+/// (`WeightOptions::untied_head`).
 fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
     let numerics = burn_tt::Numerics::from_env()
         .unwrap_or(Ok(burn_tt::Numerics::Performance))
@@ -1071,11 +1073,23 @@ fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
         Ok("1") => true,
         Ok(other) => panic!("TT_F32_ACTIVATIONS={other}: expected 0 or 1"),
     };
+    let untied_head = match std::env::var("TT_UNTIED_HEAD").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(other) => panic!("TT_UNTIED_HEAD={other}: expected 0 or 1"),
+    };
+    let f32_kv_cache = match std::env::var("TT_KV_CACHE").as_deref() {
+        Err(_) | Ok("bf16") => false,
+        Ok("f32") => true,
+        Ok(other) => panic!("TT_KV_CACHE={other}: expected bf16 or f32"),
+    };
     (
         numerics,
         tt_models::quant::WeightOptions {
             mlp_bfp4,
             f32_activations,
+            untied_head,
+            f32_kv_cache,
         },
     )
 }
@@ -1111,9 +1125,11 @@ fn bench_model<B: burn_tt::storage::StorageBackend>(m: Llama<B>, fused: bool) ->
     }
     let (numerics, options) = bench_contract();
     println!(
-        "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{}}}",
+        "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"untied_head\":{},\"f32_kv_cache\":{}}}",
         numerics.name(),
-        options.mlp_bfp4
+        options.mlp_bfp4,
+        options.untied_head,
+        options.f32_kv_cache
     );
     m.for_inference(numerics, options)
 }
@@ -1185,7 +1201,7 @@ fn qwen_step_bytes<B: burn::tensor::backend::Backend>(
         }
         fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<B, D>>) {
             let format = match (D, self.1.format(&self.0.join("."))) {
-                (2, Format::Bf16Stored) => TileFormat::BF16,
+                (2, Format::Bf16Stored | Format::Bf16) => TileFormat::BF16,
                 (2, Format::Bfp8) => TileFormat::BFP8,
                 (2, Format::Bfp4) => TileFormat::BFP4,
                 (2, Format::Bfp2) => TileFormat::BFP2,
@@ -1580,6 +1596,11 @@ fn traced_generation_stream_ceiling() {
     let batched_a = std::env::var("TT_PROBE_BATCHED_A").unwrap_or_default();
     tt_kernels::tensor::probe_skip_batched_a_reads(batched_a == "1");
     tt_kernels::tensor::probe_skip_batched_a_rereads(batched_a == "rereads");
+    // The bound on a narrower KV cache (`roadmap.md`, "A BF16 KV cache"): `TT_PROBE_BATCHED_B=1`
+    // skips the batched products' `B` reads, attention's keys and values past `attention_rows`'
+    // lengths, the products wrong.
+    let batched_b = std::env::var("TT_PROBE_BATCHED_B").is_ok_and(|v| v == "1");
+    tt_kernels::tensor::probe_skip_batched_b_reads(batched_b);
     probe_background_stream(background);
     // `TT_PROBE_CONTIGUOUS_B=<entry bytes>`: each one-row product's weight stream read from a
     // contiguous scratch in entries of that size, under B's own cap (`TT_IN_FLIGHT_CAP`), its
@@ -1645,6 +1666,10 @@ fn traced_generation_stream_ceiling() {
         "1" => format!("{tag}, batched A skipped"),
         "rereads" => format!("{tag}, batched A re-reads skipped"),
         _ => tag,
+    };
+    let tag = match batched_b {
+        true => format!("{tag}, batched B skipped"),
+        false => tag,
     };
     let tag = match contiguous {
         Some(entry) => format!("{tag}, contiguous B in {entry}-byte reads"),
@@ -1792,6 +1817,7 @@ fn traced_generation_stream_ceiling() {
     probe_skip_weight_reads(false);
     tt_kernels::tensor::probe_skip_batched_a_reads(false);
     tt_kernels::tensor::probe_skip_batched_a_rereads(false);
+    tt_kernels::tensor::probe_skip_batched_b_reads(false);
     probe_background_stream(None);
     probe_space_report(false);
     tt_models::llama::probe_free_consumers(false, false);
@@ -1849,15 +1875,16 @@ fn qwen35_traced_generation_on<B: tt_models::generate::TracedBackend>(suffix: &s
     with_device(config, |d| {
         conditions(card());
         // The contract's weights (`TT_NUMERICS`, the performance contract by default); the tied
-        // head stays the F32 table under both (`Qwen35::for_inference`).
+        // head is the BF16 table its lookup reads, under both (`Qwen35::for_inference`, since
+        // 2026-11-12; the F32 table before).
         let (numerics, options) = bench_contract();
         println!(
-            "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"head\":\"f32 table\"}}",
+            "BENCH {{\"kind\":\"conditions\",\"numerics\":\"{}\",\"mlp_bfp4\":{},\"head\":\"bf16 table\"}}",
             numerics.name(),
             options.mlp_bfp4
         );
         let (m, _) = Qwen35::<B>::qwen3_5_4b(QWEN3_5_4B.layers, Precision::F32, &d).unwrap();
-        // What a step reads at least: every matrix once in its stored format, the tied head's F32
+        // What a step reads at least: every matrix once in its stored format, the tied head's BF16
         // table once.
         let step_bytes =
             qwen_step_bytes(&m, &tt_models::quant::Plan::for_numerics(numerics, options));

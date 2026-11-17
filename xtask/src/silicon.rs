@@ -374,6 +374,10 @@ pub const SMOKE: &[&str] = &[
     // F4b: operand reuse; a blocked product's readers copy `A` from a holder's L1 under credits,
     // bit for bit the unshared product, eager and replayed, every credit word back at zero.
     "step244_operand_reuse::",
+    // W2: operand multicast over a grid rectangle; a row's sender multicasts `A`, a column's `B`,
+    // credited both ways (a ready word), bit for bit the unshared product, eager and replayed,
+    // misroutes caught, a stall recovered, every credit word back at zero.
+    "step274_operand_multicast::",
     // F4b.2: a measured block choice; the chosen candidate runs bit for bit, a question is
     // timed once, and a capture paused to measure records what it would unpaused.
     "step245_measured_block::",
@@ -391,6 +395,9 @@ pub const SMOKE: &[&str] = &[
     // BF16 tensors in their own slots; element-wise ops on BF16 operands are their widened op
     // rounded once, bit for bit, and without the quantize differ.
     "step270_native_bf16::",
+    // Roadmap W1, defect 5: `expand` of a trailing axis of one past the 65,536 column tiles a
+    // record names (3.1M rows) goes in chunks, every element its source's.
+    "step271_wide_expand::",
     "step167_smollm2::smollm2_in_f32",
     "step168_smollm2_mixed_precision::",
     // ADR 0006, roadmap W1: the performance contract's model gate on its first two prompts

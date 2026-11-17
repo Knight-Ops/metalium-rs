@@ -1788,6 +1788,24 @@ pub(crate) fn probing_skip_a_rereads() -> bool {
         && LOWERING_BATCHED.with(std::cell::Cell::get)
 }
 
+/// [`PROBE_SKIP_BATCHED_A`]'s twin for `B`: a batched product's `B` (attention's keys and values)
+/// not read ([`record::GATHER_B_RESIDENT`]), the bound on what a narrower KV cache can save
+/// (`roadmap.md`, "A BF16 KV cache"). **The products are wrong**; only their time means anything.
+static PROBE_SKIP_BATCHED_B: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn [`PROBE_SKIP_BATCHED_B`] on or off, process-wide. Dev-facing: a timing bound, never a
+/// result.
+#[doc(hidden)]
+pub fn probe_skip_batched_b_reads(on: bool) {
+    PROBE_SKIP_BATCHED_B.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn probing_skip_batched_b() -> bool {
+    PROBE_SKIP_BATCHED_B.load(std::sync::atomic::Ordering::Relaxed)
+        && LOWERING_BATCHED.with(std::cell::Cell::get)
+}
+
 pub(crate) fn probing_skip_a() -> bool {
     PROBE_SKIP_A.load(std::sync::atomic::Ordering::Relaxed)
         || (PROBE_SKIP_BATCHED_A.load(std::sync::atomic::Ordering::Relaxed)
@@ -2035,11 +2053,19 @@ pub enum Reuse {
     /// Where a measurement chose it ([`BlockStream::Measured`]); unmeasured, nothing is shared
     /// (`crate::tile_op::reuse::share`).
     Auto,
+    /// The units are a grid of rows (consecutive units on one tile row, the first row's width),
+    /// each grid row a group of the deal and each column of it a column group: the first unit
+    /// of a grid row reads its strips of `A` from GDDR and multicasts them along the row, the
+    /// first grid row's units read the strips of `B` and multicast them down their columns
+    /// (`op::WRITE_L1_MCAST`, credited both ways; roadmap W2, `crate::tile_op::multicast`).
+    /// `a` and `b` say which operands are shared.
+    Multicast { a: bool, b: bool },
 }
 
 impl Reuse {
-    /// `TT_OPERAND_REUSE`: `off`, `auto`, or `pull`, `pull:<holders>` (one by default) or
-    /// `pull:<holders>,<b_holders>` (`B` shared too); [`Reuse::Auto`] when unset, the session's
+    /// `TT_OPERAND_REUSE`: `off`, `auto`, `pull`, `pull:<holders>` (one by default) or
+    /// `pull:<holders>,<b_holders>` (`B` shared too), or `mcast` / `mcast:a|b|ab`
+    /// ([`Reuse::Multicast`], both operands by default); [`Reuse::Auto`] when unset, the session's
     /// default since F4b.2 (a measured choice pulls `A` where it gains; nothing else shares).
     pub fn from_env() -> Self {
         match std::env::var("TT_OPERAND_REUSE") {
@@ -2062,6 +2088,13 @@ impl std::str::FromStr for Reuse {
                 holders: 1,
                 b_holders: None,
             }),
+            None if s == "mcast" => Ok(Reuse::Multicast { a: true, b: true }),
+            Some(("mcast", which)) => match which {
+                "a" => Ok(Reuse::Multicast { a: true, b: false }),
+                "b" => Ok(Reuse::Multicast { a: false, b: true }),
+                "ab" => Ok(Reuse::Multicast { a: true, b: true }),
+                _ => Err(format!("`mcast:{which}`: expected `a`, `b` or `ab`")),
+            },
             Some(("pull", h)) => {
                 let count = |c: &str| match c.trim().parse::<usize>() {
                     Ok(n) if n > 0 => Ok(n),
@@ -2079,8 +2112,8 @@ impl std::str::FromStr for Reuse {
                 }
             }
             _ => Err(format!(
-                "expected `off`, `auto`, `pull`, `pull:<holders>` or `pull:<holders>,<b_holders>`, \
-                 not `{s}`"
+                "expected `off`, `auto`, `pull`, `pull:<holders>`, `pull:<holders>,<b_holders>`, \
+                 `mcast` or `mcast:a|b|ab`, not `{s}`"
             )),
         }
     }
@@ -2349,9 +2382,16 @@ pub(crate) fn matmul_dram_prefetching(
     let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
     a.expect("a matmul", edge(route.packed_a()))?;
     b.expect("a matmul", edge(route.packed_b()))?;
-    if route.packed_b().is_some() && b_transposed {
+    // A transposed packed `B` only where the kernel's unpacker transposes it (BF16): the mover
+    // transposes FP32 datums alone.
+    if route.packed_b().is_some()
+        && b_transposed
+        && !(reads.unpack_b && route.unpacks_transposed_b())
+    {
         return Err(TensorError::Shape(
-            "a packed `B` is read untransposed: store its transpose".into(),
+            "a packed `B` is read untransposed, but a BF16 one the unpacker transposes: store \
+             its transpose"
+                .into(),
         ));
     }
     // A packed `A` is read untransposed and as whole tiles, or -- BF16 only -- as a packed row
@@ -2433,7 +2473,7 @@ pub(crate) fn matmul_dram_prefetching(
                 [m, k, n],
                 route,
                 fidelity,
-                reads.unpack_b && route == SrcRoute::Tf32FromFp32,
+                reads.unpack_b && route.unpacks_transposed_b(),
                 None,
                 crate::tile_op::matmul::Schedule::BlockStream {
                     tiles: layout.tiles,
@@ -2484,7 +2524,7 @@ pub(crate) fn matmul_dram_prefetching(
         },
         resident_a: reads.resident_a && staging == Staging::Slots,
         col_runs,
-        unpack_b: reads.unpack_b && route == SrcRoute::Tf32FromFp32,
+        unpack_b: reads.unpack_b && route.unpacks_transposed_b(),
         packed_a: reads.packed_a,
         // Only where `K` would be blocked: a whole `K` is one batch a column, and each chunk
         // batch's own reload, pack and retire (~3 us a chunk, profile `1792358552`) cost a unit
@@ -3256,26 +3296,33 @@ fn block_stream_programs_fit(
     fidelity: Fidelity,
 ) -> bool {
     let dst = matmul::dst_row_plan(layout.tiles[2]);
+    // Either `B` order (`BlockStreamLayout::b_by_column`): by column adds a word a subblock.
+    let orders = [false, true].map(|b_by_column| matmul::BlockStreamLayout {
+        b_by_column,
+        ..layout.clone()
+    });
     (0..2).all(|c| {
-        let (roles, loops, _) = matmul::block_stream_programs(
-            layout,
-            c,
-            layout.tiles,
-            route,
-            fidelity,
-            false,
-            matmul::LiveRows::All,
-            dst.as_ref(),
-            crate::matmul::Out::Fp32,
-        );
-        roles.iter().zip(loops.iter()).all(|(p, l)| {
-            let code = crate::code::Code {
-                ins: p.clone(),
-                loops: l.clone(),
-            };
-            code.stored().is_ok_and(|(words, _)| {
-                words.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
-                    && crate::program_cache::admitted(words.len())
+        orders.iter().all(|layout| {
+            let (roles, loops, _) = matmul::block_stream_programs(
+                layout,
+                c,
+                layout.tiles,
+                route,
+                fidelity,
+                false,
+                matmul::LiveRows::All,
+                dst.as_ref(),
+                crate::matmul::Out::Fp32,
+            );
+            roles.iter().zip(loops.iter()).all(|(p, l)| {
+                let code = crate::code::Code {
+                    ins: p.clone(),
+                    loops: l.clone(),
+                };
+                code.stored().is_ok_and(|(words, _)| {
+                    words.len() <= tt_isa::mailbox::PROGRAM_MAX as usize
+                        && crate::program_cache::admitted(words.len())
+                })
             })
         })
     })
@@ -3541,8 +3588,9 @@ pub(crate) fn matmul_dram_batched_limited(
     }
     LOWERING_BATCHED.with(|b| b.set(true));
     let _lowering = Lowering;
-    a.expect("a matmul", Elem::F32)?;
-    b.expect("a matmul", Elem::F32)?;
+    let edge = |packed: Option<TileFormat>| packed.map_or(Elem::F32, Elem::Packed);
+    a.expect("a matmul", edge(route.packed_a()))?;
+    b.expect("a matmul", edge(route.packed_b()))?;
     let batch = items.len();
     if batch == 0 || m == 0 || k == 0 || n == 0 {
         return Err(TensorError::Shape(format!(
@@ -3598,20 +3646,20 @@ pub(crate) fn matmul_dram_batched_limited(
             for (i, (ra, rb, [ta, tb])) in refs.into_iter().enumerate() {
                 let mut rc = c.tensor_ref();
                 rc.first += (i * mt * nt) as u32;
-                let side = |at, transposed| crate::tile_op::matmul::Side {
+                let side = |at, transposed, elem| crate::tile_op::matmul::Side {
                     at,
                     transposed,
-                    elem: Elem::F32,
+                    elem,
                     // Whole tiles: attention's products are not the decode weights' reads.
                     live_rows: false,
                 };
                 let built = crate::tile_op::matmul(
-                    side(ra, ta),
-                    side(rb, tb),
+                    side(ra, ta, edge(route.packed_a())),
+                    side(rb, tb, edge(route.packed_b())),
                     [m, k, n],
                     route,
                     fidelity,
-                    unpack_b && route == SrcRoute::Tf32FromFp32,
+                    unpack_b && route.unpacks_transposed_b(),
                     None,
                     crate::tile_op::matmul::Schedule::BlockStream {
                         tiles: layout.tiles,
@@ -3648,7 +3696,7 @@ pub(crate) fn matmul_dram_batched_limited(
         thin: 0,
         resident_a: false,
         col_runs: None,
-        unpack_b: unpack_b && route == SrcRoute::Tf32FromFp32,
+        unpack_b: unpack_b && route.unpacks_transposed_b(),
         packed_a: None,
         stream_k: false,
         busy: Vec::new(),
@@ -5469,7 +5517,9 @@ pub fn rms_divide(
 /// laid out as `x` is (each head's table row), `sin` carrying `rotate_half`'s sign. `rotate(x)`
 /// is each head's halves swapped, read as `x`'s own tiles at the swapped place: no copy. Each job
 /// is two kernels on its run of tiles, `MUL` then `MUL_ADD` (`c + a b`, two roundings): bit for
-/// bit the product, the product and the sum. `head / 2` must be whole tiles.
+/// bit the product, the product and the sum. `head / 2` must be whole tiles. `out` is the result's
+/// type: `Elem::BF16` rounds the sum once in `Dst` and packs it BF16 (a BF16 KV cache's keys),
+/// bit for bit the F32 result narrowed.
 pub fn rope_blocks(
     alloc: &mut DramAlloc,
     x: BlockOperand<'_>,
@@ -5477,9 +5527,24 @@ pub fn rope_blocks(
     sin: BlockOperand<'_>,
     head: usize,
     units: usize,
+    out: Elem,
 ) -> Result<Work> {
-    use crate::sfpu::kernel::{self as sk, Operands};
-    use crate::sfpu::ops::{code_for_rows, kind_sfpu, Broadcast};
+    use crate::sfpu::kernel::{self as sk, Formats, Operands};
+    use crate::sfpu::ops::{code_for_rows, code_for_rows_as, kind_sfpu, Broadcast};
+    let last = match out {
+        Elem::F32 => Formats::FP32,
+        Elem::BF16 => Formats {
+            bf16_in: false,
+            out: bf16_result(),
+        },
+        other => {
+            return Err(TensorError::Elem {
+                op: "RoPE's result".into(),
+                got: other,
+                wants: Elem::F32,
+            })
+        }
+    };
     let [rows, cols] = x.dims;
     if head == 0 || head % 64 != 0 || cols % head != 0 || [cos.dims, sin.dims] != [x.dims; 2] {
         return Err(TensorError::Shape(format!(
@@ -5502,11 +5567,17 @@ pub fn rope_blocks(
     let live = eltwise_rows(kind_sfpu::MUL_ADD, rows);
     let (_, mul) = code_for_rows(crate::kind::MUL, [0.0, 0.0], Broadcast::None, live)
         .ok_or_else(|| TensorError::Shape("no MUL program".into()))?;
-    let (_, mul_add) = code_for_rows(kind_sfpu::MUL_ADD, [0.0, 0.0], Broadcast::None, live)
-        .ok_or_else(|| TensorError::Shape("no MUL_ADD program".into()))?;
+    let (_, mul_add) = code_for_rows_as(
+        kind_sfpu::MUL_ADD,
+        [0.0, 0.0],
+        Broadcast::None,
+        live,
+        last.out.quantized(),
+    )
+    .ok_or_else(|| TensorError::Shape("no MUL_ADD program".into()))?;
     // A run's slots: `x`, `cos`, `rotate(x)`, `sin`, the product and the result.
     let group = (((crate::l1::arena().len() / TILE_SLOT) as usize) / 6).min(64);
-    let out = DramTensor::alloc(alloc, rows, cols)?;
+    let out = DramTensor::alloc_elem(alloc, rows, cols, result_elem(kind_sfpu::MUL_ADD, last))?;
     let ro = out.tensor_ref();
     let mut jobs = Vec::new();
     for run in runs(rt * ct, units, group) {
@@ -5540,7 +5611,7 @@ pub fn rope_blocks(
             init: pt.init,
         };
         let (product_roles, product_loops) = sk::roles_code(&product, Operands::Binary, &mul);
-        let (sum_roles, sum_loops) = sk::roles_code(&sum, Operands::Ternary, &mul_add);
+        let (sum_roles, sum_loops) = sk::roles_code_as(&sum, Operands::Ternary, &mul_add, last);
         let read_run = |r: &TensorRef, at: u64| {
             [
                 [
@@ -5630,13 +5701,9 @@ pub fn rope_blocks(
 pub const ARGMAX_RUN_MAX: usize = 32;
 
 /// Phase 1 of a row's argmax ([`crate::sfpu::select`]): the `[1, cols]` F32 row `a` dealt in runs
-/// of tiles over `units`, each run's best key and index in a tile of the `[1, 32 runs]` result.
-/// Also each run's first column, which [`argmax_choose`] adds to its index.
-pub fn argmax_partials(
-    alloc: &mut DramAlloc,
-    a: &DramTensor,
-    units: usize,
-) -> Result<(Work, Vec<usize>)> {
+/// of tiles over `units`, each run's best key and its index (the row's own column) in a tile of
+/// the `[1, 32 runs]` result.
+pub fn argmax_partials(alloc: &mut DramAlloc, a: &DramTensor, units: usize) -> Result<Work> {
     use crate::sfpu::{reduce, select};
     a.expect("an argmax", Elem::F32)?;
     if a.rows != 1 || a.cols == 0 {
@@ -5650,7 +5717,6 @@ pub fn argmax_partials(
     let out = DramTensor::alloc(alloc, 1, 32 * all.len())?;
     let (ra, ro) = (a.tensor_ref(), out.tensor_ref());
     let mut jobs = Vec::with_capacity(all.len());
-    let mut starts = Vec::with_capacity(all.len());
     let body = select::accumulate(a.cols - 1);
     let fold = select::fold();
     for (j, run) in all.into_iter().enumerate() {
@@ -5670,7 +5736,6 @@ pub fn argmax_partials(
             &fold,
         );
         let (roles, loops) = (Arc::new(roles), Arc::new(loops));
-        starts.push(32 * run.start);
         let gather = [
             [
                 record::READ_RUN,
@@ -5717,40 +5782,41 @@ pub fn argmax_partials(
             },
         ]);
     }
-    Ok((Work { out, jobs }, starts))
+    Ok(Work { out, jobs })
 }
 
-/// Phase 2 of a row's argmax: one job over [`argmax_partials`]' tiles, in order, each index moved
-/// by its run's first column (`starts`); the chosen index as an I32 `[1, 1]`.
-pub fn argmax_choose(
-    alloc: &mut DramAlloc,
+/// Most partials one job of [`argmax_fold`] or [`argmax_choose`] reads: all of them sit in its L1
+/// at once, and its unpacker's program is a tile's each. A row of up to 2,048 tiles (65,536
+/// columns) has at most this many partials ([`ARGMAX_RUN_MAX`] tiles a run over at most
+/// `ARGMAX_UNITS` units), so its choice is one job; a wider row's partials fold in levels first.
+pub const ARGMAX_FAN_IN: usize = 64;
+
+/// One job of a row's argmax past its partials: `tiles` of `partials` (each a best key in row 0
+/// and its index in row 4) in order, the best kept as [`crate::sfpu::select::combine`] keeps it,
+/// then `finish`, written to tile `at` of `out`.
+fn argmax_combine_job(
     partials: &DramTensor,
-    starts: &[usize],
-) -> Result<Work> {
+    tiles: std::ops::Range<usize>,
+    out: &DramTensor,
+    at: usize,
+    finish: &[tt_isa::isa::Instruction],
+) -> Result<Vec<Step>> {
     use crate::sfpu::{reduce, select};
-    let pt = partials.grid()[1];
-    if pt != starts.len() || partials.rows != 1 {
-        return Err(TensorError::Shape(format!(
-            "an argmax's {pt} partials for {} runs",
-            starts.len()
-        )));
-    }
-    let layout = reduce::plan_layout(1, pt).map_err(|e| TensorError::Shape(e.to_string()))?;
+    let (len, pt) = (tiles.len(), partials.grid()[1]);
+    let layout = reduce::plan_layout(1, len).map_err(|e| TensorError::Shape(e.to_string()))?;
     let (roles, loops) = select::roles(
         &layout,
-        pt,
+        len,
         &select::choice_prologue(),
         &select::combine(),
-        &select::index_out(),
+        finish,
     );
-    let (roles, loops) = (Arc::new(roles), Arc::new(loops));
-    let out = DramTensor::alloc_elem(alloc, 1, 1, Elem::I32)?;
     let (rp, ro) = (partials.tensor_ref(), out.tensor_ref());
     let gather = [
         [
             record::READ_RUN,
-            0,
-            pt as u32,
+            tiles.start as u32,
+            len as u32,
             layout.in_at as u32,
             0,
             pt as u32,
@@ -5761,30 +5827,89 @@ pub fn argmax_choose(
         rp.encode()[1],
     ];
     let scatter = [
-        [record::WRITE_RUN, 0, 1, layout.out_at as u32, 0, 0, 0, 0],
+        [
+            record::WRITE_RUN,
+            at as u32,
+            1,
+            layout.out_at as u32,
+            0,
+            0,
+            0,
+            0,
+        ],
         ro.encode()[0],
         ro.encode()[1],
     ];
-    Ok(Work {
-        out,
-        jobs: vec![vec![
-            Step::List {
-                what: "argmax choice gather",
-                entries: gather.to_vec(),
-            },
-            Step::Kernel {
-                roles,
-                init: layout.init.clone(),
-                mop: Box::new([None; 3]),
-                loops,
-                half: None,
-            },
-            Step::List {
-                what: "argmax choice scatter",
-                entries: scatter.to_vec(),
-            },
-        ]],
-    })
+    Ok(vec![
+        Step::List {
+            what: "argmax choice gather",
+            entries: gather.to_vec(),
+        },
+        Step::Kernel {
+            roles: Arc::new(roles),
+            init: layout.init.clone(),
+            mop: Box::new([None; 3]),
+            loops: Arc::new(loops),
+            half: None,
+        },
+        Step::List {
+            what: "argmax choice scatter",
+            entries: scatter.to_vec(),
+        },
+    ])
+}
+
+/// A middle level of a row's argmax, for more partials than one choice takes
+/// ([`ARGMAX_FAN_IN`]): `partials` in runs of at most that many, each run's best written as a
+/// partial again ([`crate::sfpu::select::partial_out`]), one job a run. The best is a total
+/// order's and every index is the row's own column, so the levels choose what one choice over
+/// every partial would.
+pub fn argmax_fold(alloc: &mut DramAlloc, partials: &DramTensor) -> Result<Work> {
+    let pt = partials.grid()[1];
+    if partials.rows != 1 || pt <= ARGMAX_FAN_IN {
+        return Err(TensorError::Shape(format!(
+            "an argmax level over [{}, {}]: one row of more than {ARGMAX_FAN_IN} partials",
+            partials.rows, partials.cols
+        )));
+    }
+    let all = runs(pt, 1, ARGMAX_FAN_IN);
+    let out = DramTensor::alloc(alloc, 1, 32 * all.len())?;
+    let finish = crate::sfpu::select::partial_out();
+    let jobs = all
+        .into_iter()
+        .enumerate()
+        .map(|(j, run)| argmax_combine_job(partials, run, &out, j, &finish))
+        .collect::<Result<Vec<_>>>();
+    match jobs {
+        Ok(jobs) => Ok(Work { out, jobs }),
+        Err(e) => {
+            alloc.free(&out.placement);
+            Err(e)
+        }
+    }
+}
+
+/// Phase 2 of a row's argmax: one job over the partials' tiles, in order (at most
+/// [`ARGMAX_FAN_IN`]; [`argmax_fold`] makes fewer); the chosen index as an I32 `[1, 1]`.
+pub fn argmax_choose(alloc: &mut DramAlloc, partials: &DramTensor) -> Result<Work> {
+    let pt = partials.grid()[1];
+    if partials.rows != 1 || pt == 0 || pt > ARGMAX_FAN_IN {
+        return Err(TensorError::Shape(format!(
+            "an argmax's choice over [{}, {}]: one row of at most {ARGMAX_FAN_IN} partials",
+            partials.rows, partials.cols
+        )));
+    }
+    let out = DramTensor::alloc_elem(alloc, 1, 1, Elem::I32)?;
+    match argmax_combine_job(partials, 0..pt, &out, 0, &crate::sfpu::select::index_out()) {
+        Ok(job) => Ok(Work {
+            out,
+            jobs: vec![job],
+        }),
+        Err(e) => {
+            alloc.free(&out.placement);
+            Err(e)
+        }
+    }
 }
 
 /// Inclusive scan down matrix rows. Each column tile is a job, so its

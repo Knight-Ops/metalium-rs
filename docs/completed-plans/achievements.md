@@ -349,6 +349,31 @@ The header of the roadmap also cites `1794024534`-`1794025528` for the 9.90 ms. 
   op (`burn_tt::rms_norm_as`, `silu_mul_as`), and read as they lie by products with F32 results
   (`burn_tt::matmul_as`), each bit for bit its composition. 1.7B decode 7.52 / 8.01 / 8.64 ms (F32 activations 7.49 /
   7.99 / 8.67), prefill 1,257 / 3,552 / 4,266 tokens/s (1,190 / 3,258 / 4,007), `step269` 228 of 232 as before.
+- **W1: the BF16 defects fixed, the BF16 lookup, and one tied table** (2026-11-12, gates card 0, benches card 1;
+  [log](../learnings/performance-log.md#w1-the-bf16-defects-fixed-the-bf16-lookup-and-one-tied-table-2026-11-12-cards-0-and-1)).
+  The four BF16 defects of `new-architectures.md`: a host-held BF16 tensor's cast widens on the host and uploads once;
+  a retiling to the matrix a tensor lies in is a view (the whole BF16 Qwen3.5 holds 4.3 GB of host memory flat, where
+  it passed 40 GB); a transposed BF16 `B` is read as it lies and transposed by the unpacker, bit for bit (`step272`);
+  `expand` past 2,097,152 rows goes in chunks (`step271`). The BF16 embedding lookup without staging
+  (`SELECT_ROWS_BF16`, `step171`; `step167`'s BF16 run 229 -> 6.3 s). A tied table stored once, BF16, for its lookup
+  and its head (`burn_tt::matmul_wide`), under both contracts, by the owner's decision (the scaling rule over the
+  0.5% rule): the 1.7B 7.52 -> 7.68 ms a step and 513 -> 201 MB of table and head, `step269` PCC 0.99967 -> 0.99976
+  (top-1 the same 228 of 232); Qwen3.5-4B 56.93 -> 54.47 ms and 1.27 GB less. `WeightOptions::untied_head` keeps the
+  two-copy layout as an option.
+- **W1: a BF16 KV cache, the performance contract's default** (2026-11-12, gates ttsim and card 0, benches card 1;
+  [log](../learnings/performance-log.md#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1)). Bounded first (keys and values not read: 9.3% of
+  the 1.7B's step at 2K, 21.6% at 8K), then built: keys rounded by RoPE itself (`burn_tt::rope_as`), values by a
+  cast of their block alone (`Session::cast_block`, dealt as the cache write reads it), the write in 32-byte face-rows
+  (`SCATTER_ROWS_BF16`), and attention reading BF16 keys and values as they lie, bit for bit their widened values'
+  (`step273`). The 1.7B at 2K 19.44 -> 18.89 ms, at 8K 43.44 -> 38.67, at short context 7.70 -> 7.84 (the values'
+  cast); half the cache's GDDR; `attention_rows` to 1,344 positions; `step269` 228 of 232, PCC 0.99976.
+- **W4: the wide-vocabulary greedy pick, one op for any vocabulary** (2026-11-12, gates ttsim and card 0, benches
+  card 1; [log](../learnings/performance-log.md#w4-the-wide-vocabulary-greedy-pick-one-op-for-any-vocabulary-2026-11-12-cards-0-and-1)).
+  Diagnosed first: Qwen3.5-4B's ~21.4 ms pick was the eight parts' slices (~1.5 ms copy each), not the argmax. A row's
+  partials now fold in levels past 64 (`tensor::argmax_fold`, `select::partial_out`), so `Session::argmax_row` takes
+  any width in one op and `generate::greedy` is `argmax(1)`: 248,320 columns in 153 us on the card, bit for bit
+  (`step211`, widths to 262,144). Qwen3.5-4B decode 54.71 -> **34.10 ms** (0.90x tt-metal's 38.0 on the card); the
+  1.7B unchanged.
 
 ## Prefill and long context
 
@@ -383,6 +408,17 @@ Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-con
   below): 1.11x at 64 / 256 tokens. **Program restores on the card** (1a, below): 128 / 256 tokens 2,546 / 2,744 ->
   3,040 / 3,827 tokens/s.
 - As of 2026-11-07 the 1.7B prefills 7,992 tokens in 5.98 s.
+- **A stable measured block choice** (W2, 2026-11-14, gate `step245_measured_block`,
+  [log](../learnings/performance-log.md#w2-a-stable-measured-block-choice-2026-11-14-card-0)): three climbs and near
+  ties timed again. H1 BF16 x BFP8 LoFi chooses `[8,4,9]` in 5 of 5 processes, 92.0-92.6 TFLOPS; before, one process
+  in five chose the other basin at 79.6.
+- **Block gathers read a weight a column a request** (W2, 2026-11-14, gates `step229`, `step274`, `matmul::order`,
+  [log](../learnings/performance-log.md#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0)): a
+  by-column weight read a column a request costs ~86 cycles a tile against ~248. H1 70.7 / 98.7 TFLOPS (HiFi2 /
+  LoFi) and 79.3 / 95.3 multicast; the 1.7B's prefill 4,025 tokens/s at 128 tokens (+7.1%), 4,768 at 256.
+- **`A`'s reads inline beside a weight read by column** (W2, 2026-11-15, record test, `step229`, `step274`,
+  [log](../learnings/performance-log.md#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0)): H1
+  multicast 79.7 / 96.2 TFLOPS (+1.0 / +1.5%), default 70.2 / 99.2; the 1.7B unchanged.
 
 - **No 1.7B prefill regression** (2026-11-09, `1794260351`, [log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1)): `traced_generation` reads 1,098 / 3,084 /
   3,890 tokens/s at 32 / 128 / 256 tokens, against H15's 3,827 at 256. The ~2,090 quoted since 2026-11-03 were

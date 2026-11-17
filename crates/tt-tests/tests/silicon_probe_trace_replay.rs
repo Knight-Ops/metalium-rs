@@ -132,7 +132,7 @@ fn dump(profile: &DeviceProfile, unit: usize) {
             Event::List { begin, entries } => {
                 format!("LIST_{} {entries}", if begin { "BEGIN" } else { "END" })
             }
-            Event::Entry { begin, op } => {
+            Event::Entry { begin, op, .. } => {
                 format!(
                     "ENTRY_{} {:#x} {}",
                     if begin { "BEGIN" } else { "END" },
@@ -287,7 +287,9 @@ fn account(
                 };
                 *by.entry(part).or_default() += gap;
             }
-            Event::Entry { begin: true, op: y } => {
+            Event::Entry {
+                begin: true, op: y, ..
+            } => {
                 let part = match (prev_was_list_begin, ended) {
                     (true, _) => Part::CallStart,
                     (false, Some(x)) if y == op::LAUNCH => {
@@ -316,6 +318,7 @@ fn account(
             Event::Entry {
                 begin: false,
                 op: x,
+                ..
             } => {
                 let Some((o, t0)) = open.take() else {
                     *by.entry(Part::Other).or_default() += gap;
@@ -338,6 +341,8 @@ fn account(
             | Event::BatchTable { .. }
             | Event::BatchTime
             | Event::BatchRepeat
+            | Event::NcRecord { .. }
+            | Event::NcLost { .. }
             | Event::Role { .. }
             | Event::Unknown(_) => {
                 if open.is_none() {

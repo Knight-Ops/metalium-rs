@@ -51,10 +51,10 @@ pub const READY_B: u32 = 3;
 /// [`FREED`] for `B`.
 pub const FREED_B: [u32; 2] = [4, 5];
 /// The credit words the pass counts in.
-const WORDS: usize = 6;
+pub(super) const WORDS: usize = 6;
 
 /// A `GATHER` record and its two tensor references, two words each.
-const GATHER_ENTRIES: usize = 5;
+pub(super) const GATHER_ENTRIES: usize = 5;
 
 /// Strips the pass has made copies of, in this process: what a gate reads to know an op shared.
 static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -110,13 +110,16 @@ pub const AUTO_HOLDERS: usize = 4;
 /// shapes, ran ResNet-18 and ViT-Tiny 10-11% slower (F4b.2). The deal decides whether two
 /// units share a strip at all ([`super::distribute::shared`]).
 pub fn share(reuse: Reuse, tiles: &[(u8, u8)]) -> Option<Share> {
-    let Reuse::Pull { holders, b_holders } = reuse else {
-        return None;
+    let (holders, b_holders, multicast) = match reuse {
+        Reuse::Pull { holders, b_holders } => (holders, b_holders, None),
+        Reuse::Multicast { a, b } if a || b => (1, b.then_some(1), Some((a, b))),
+        _ => return None,
     };
     (!tiles.is_empty()).then(|| Share {
         holders,
         b_holders,
         tiles: tiles.into(),
+        multicast,
     })
 }
 
@@ -129,14 +132,14 @@ const B_FLAGS: u32 =
 
 /// One of a contraction's two operands, as a `GATHER` names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Operand {
+pub(super) enum Operand {
     A,
     B,
 }
 
 impl Operand {
     /// The flags that say which of its tiles a gather reads and how.
-    fn flags(self) -> u32 {
+    pub(super) fn flags(self) -> u32 {
         match self {
             Operand::A => A_FLAGS,
             Operand::B => B_FLAGS,
@@ -144,7 +147,7 @@ impl Operand {
     }
 
     /// The flag that says a gather does not read it.
-    fn resident(self) -> u32 {
+    pub(super) fn resident(self) -> u32 {
         match self {
             Operand::A => record::GATHER_A_RESIDENT,
             Operand::B => record::GATHER_B_RESIDENT,
@@ -152,7 +155,7 @@ impl Operand {
     }
 
     /// Its ready word and its freed words.
-    fn words(self) -> (u32, [u32; 2]) {
+    pub(super) fn words(self) -> (u32, [u32; 2]) {
         match self {
             Operand::A => (READY, FREED),
             Operand::B => (READY_B, FREED_B),
@@ -161,7 +164,7 @@ impl Operand {
 
     /// The header words of its slots, first tile and extent (rows of `A`, columns of `B`), and
     /// the entry of its tensor reference.
-    fn fields(self) -> ([usize; 3], usize) {
+    pub(super) fn fields(self) -> ([usize; 3], usize) {
         match self {
             Operand::A => ([2, 4, 5], 1),
             Operand::B => ([3, 6, 7], 3),
@@ -169,7 +172,7 @@ impl Operand {
     }
 
     /// Its slot's bytes under `flags`.
-    fn slot(self, flags: u32) -> std::result::Result<u64, u32> {
+    pub(super) fn slot(self, flags: u32) -> std::result::Result<u64, u32> {
         match self {
             Operand::A => record::gather_a_tile_format(flags).map(|f| f.slot_bytes()),
             Operand::B => record::gather_b_tile_format(flags).map(|f| f.slot_bytes()),
@@ -187,22 +190,27 @@ impl Operand {
 
 /// The strip a gather reads of an operand: its flags, slots, first tile, extent and tensor
 /// reference.
-type Strip = (u32, u32, u32, u32, [[u32; 8]; 2]);
+pub(super) type Strip = (u32, u32, u32, u32, [[u32; 8]; 2]);
 
 /// One `GATHER` of a unit: where it is, and the strip it reads.
-struct Gather {
-    job: usize,
-    step: usize,
-    at: usize,
-    strip: Strip,
+pub(super) struct Gather {
+    pub(super) job: usize,
+    pub(super) step: usize,
+    pub(super) at: usize,
+    pub(super) strip: Strip,
     /// The operand's slots, and how many bytes the strip fills from there.
-    slots: u32,
-    bytes: u32,
+    pub(super) slots: u32,
+    pub(super) bytes: u32,
 }
 
 /// Each unit's gathers that read `operand`, in the order it runs them: jobs `j` with
 /// `(first + j) % units == u`.
-fn gathers(jobs: &[Job], units: usize, first: usize, operand: Operand) -> Result<Vec<Vec<Gather>>> {
+pub(super) fn gathers(
+    jobs: &[Job],
+    units: usize,
+    first: usize,
+    operand: Operand,
+) -> Result<Vec<Vec<Gather>>> {
     let ([slots, from, extent], reference) = operand.fields();
     let mut out: Vec<Vec<Gather>> = (0..units).map(|_| Vec::new()).collect();
     for (j, job) in jobs.iter().enumerate() {
@@ -256,10 +264,10 @@ fn gathers(jobs: &[Job], units: usize, first: usize, operand: Operand) -> Result
 /// What the pass adds around one gather: entries before its record and after it, and the
 /// operands the record no longer reads (its resident flags).
 #[derive(Default)]
-struct Edit {
-    before: Vec<[u32; 8]>,
-    after: Vec<[u32; 8]>,
-    resident: u32,
+pub(super) struct Edit {
+    pub(super) before: Vec<[u32; 8]>,
+    pub(super) after: Vec<[u32; 8]>,
+    pub(super) resident: u32,
 }
 
 /// Rewrite `jobs` (job `j` on unit `(first + j) % units`) so that each reader of `shared` copies
@@ -311,6 +319,12 @@ pub fn pull(
             &mut totals,
         )?;
     }
+    apply(jobs, edits);
+    restore(jobs, units, first, tiles, &totals)
+}
+
+/// Splice each edit around its gather record, the last of a list first.
+pub(super) fn apply(jobs: &mut [Job], edits: HashMap<(usize, usize, usize), Edit>) {
     for ((j, s, at), edit) in sorted(edits) {
         let Step::List { entries, .. } = &mut jobs[j][s] else {
             unreachable!("a gather is in a list");
@@ -320,8 +334,19 @@ pub fn pull(
         let replacement = edit.before.into_iter().chain(record).chain(edit.after);
         entries.splice(at..at + GATHER_ENTRIES, replacement);
     }
-    // Each unit's words back to zero, in its last list: the writer's, after its last kernel and
-    // so after its last wait for a strip.
+}
+
+/// Each unit's credit words back to zero, `totals` its count in each, in its last list: the
+/// writer's, after its last kernel and so after its last wait for a strip. A ready word is
+/// counted up to its total by the time its last wait returns; any other word (a holder's or
+/// sender's frees) is waited for first, since other tiles raise it.
+pub(super) fn restore(
+    jobs: &mut [Job],
+    units: usize,
+    first: usize,
+    tiles: &[(u8, u8)],
+    totals: &[[u32; WORDS]],
+) -> Result<()> {
     for (u, total) in totals.iter().enumerate() {
         if total.iter().all(|&t| t == 0) {
             continue;
@@ -366,30 +391,23 @@ pub fn pull(
     Ok(())
 }
 
-/// The edits that share `operand`'s strips among the units `holder_of` pairs, added to `edits`,
-/// and each unit's counts in its words to `totals`.
-#[allow(clippy::too_many_arguments)]
-fn plan(
-    jobs: &[Job],
-    units: usize,
-    first: usize,
+/// Pair each reader's strips of `operand` with its holder's (`holder_of`), in order: each
+/// holder gather's readers, and each reader gather's index among its holder's. Refused where a
+/// reader reads a strip its holder does not, in order.
+#[allow(clippy::type_complexity)]
+pub(super) fn pair(
+    gathers: &[Vec<Gather>],
     holder_of: &[Option<usize>],
-    tiles: &[(u8, u8)],
     operand: Operand,
-    edits: &mut HashMap<(usize, usize, usize), Edit>,
-    totals: &mut [[u32; WORDS]],
-) -> Result<()> {
-    let (ready, freed_words) = operand.words();
-    let gathers = gathers(jobs, units, first, operand)?;
-    // Each holder's gathers' readers, by pairing each reader's strips with its holder's next.
+) -> Result<(Vec<Vec<Vec<usize>>>, Vec<Vec<usize>>)> {
     let mut readers: Vec<Vec<Vec<usize>>> =
         gathers.iter().map(|g| vec![Vec::new(); g.len()]).collect();
     let mut paired: Vec<Vec<usize>> = gathers
         .iter()
         .map(|g| Vec::with_capacity(g.len()))
         .collect();
-    for r in 0..units {
-        let Some(h) = holder_of[r] else {
+    for (r, holder) in holder_of.iter().enumerate().take(gathers.len()) {
+        let Some(h) = *holder else {
             continue;
         };
         let mut next = 0;
@@ -409,6 +427,25 @@ fn plan(
             next += 1;
         }
     }
+    Ok((readers, paired))
+}
+
+/// The edits that share `operand`'s strips among the units `holder_of` pairs, added to `edits`,
+/// and each unit's counts in its words to `totals`.
+#[allow(clippy::too_many_arguments)]
+fn plan(
+    jobs: &[Job],
+    units: usize,
+    first: usize,
+    holder_of: &[Option<usize>],
+    tiles: &[(u8, u8)],
+    operand: Operand,
+    edits: &mut HashMap<(usize, usize, usize), Edit>,
+    totals: &mut [[u32; WORDS]],
+) -> Result<()> {
+    let (ready, freed_words) = operand.words();
+    let gathers = gathers(jobs, units, first, operand)?;
+    let (readers, paired) = pair(&gathers, holder_of, operand)?;
     let mut copied = vec![false; units];
     for h in 0..units {
         if holder_of[h].is_some() || readers[h].iter().all(Vec::is_empty) {

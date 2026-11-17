@@ -130,6 +130,25 @@ impl<B: Backend> Rope<B> {
         if let Some(y) = burn_tt::rope(&x, &self.cos, &self.sin) {
             return y;
         }
+        self.composed(x)
+    }
+
+    /// [`Self::apply`] with its result in `dtype`: rounded once where it is made where the backend
+    /// can (`burn_tt::rope_as`: a BF16 KV cache's keys with no cast op after), else the result cast.
+    /// Bit for bit `self.apply(x).cast(dtype)`.
+    pub fn apply_as(&self, x: Tensor<B, 4>, dtype: burn::tensor::DType) -> Tensor<B, 4> {
+        if let Some(y) = burn_tt::rope_as(&x, &self.cos, &self.sin, dtype) {
+            return y;
+        }
+        let y = self.apply(x);
+        if y.dtype() == dtype {
+            y
+        } else {
+            y.cast(dtype)
+        }
+    }
+
+    fn composed(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let [n, h, t, d] = x.dims();
         let half = d / 2;
         let x1 = x.clone().slice([0..n, 0..h, 0..t, 0..half]);

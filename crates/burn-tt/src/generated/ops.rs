@@ -739,7 +739,7 @@ impl FloatTensorOps<TtBackend> for TtBackend {
             );
         }
         let compute_dtype = crate::ops::float_compute_dtype(&[&_data, &_values]);
-        if crate::tensor::is_half(compute_dtype) {
+        if crate::tensor::is_half(compute_dtype) && compute_dtype != burn_backend::DType::BF16 {
             let _data = crate::ops::float_compute_input(_data);
             let _values = crate::ops::float_compute_input(_values);
             return crate::ops::cast_native(

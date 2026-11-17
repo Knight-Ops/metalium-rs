@@ -261,7 +261,8 @@ pub mod trace {
     /// The data mover finished a list, every move in it landed.
     pub const LIST_END: u32 = 17;
     /// The mover began a list entry or op record; the detail is its op
-    /// (`crate::dm::op`) or record kind (`crate::dm::record`).
+    /// (`crate::dm::op`) or record kind (`crate::dm::record`) in bits 0..8, and what tells
+    /// entries of one op apart in bits 8..12 (`crate::dm::entry_detail`).
     pub const ENTRY_BEGIN: u32 = 18;
     /// The mover finished the entry or record it last began. Moves it issued
     /// may still be in flight: only a `KERNEL`, `WAIT` or `COMPUTE` entry, and
@@ -321,6 +322,12 @@ pub mod trace {
     /// The host's, never stamped: in place of a [`BATCH_BASE`] naming a record an earlier base
     /// of the same drain already named, a copy the timestamper repeated (a record is named once).
     pub const BATCH_REPEAT: u32 = 30;
+    /// The host's, never stamped: one record of RISCV NC's entry log (`crate::dm::nc_log`), placed
+    /// on the tile's counter (`tt_kernels::profile_mode::splice_nc_log`); the detail is its tag.
+    pub const NC_RECORD: u32 = 31;
+    /// The host's, never stamped: NC's entry log lost this many records (it was full), after its
+    /// last [`NC_RECORD`].
+    pub const NC_LOST: u32 = 32;
     /// A batch log record's header flag: the run had more batches than the record holds.
     pub const BATCH_TRUNCATED: u32 = 1 << 15;
     /// A batch log record's header flag: T0's and T2's batch counts differ.
@@ -430,6 +437,11 @@ pub const fn icache_results(i: u64) -> u64 {
 /// The `.ttinsn` experiment's block (`tt-firmware` `bin/ttinsn_t1.rs`).
 pub const TTINSN_SCRATCH: u64 = PROBE_SCRATCH + 0x500;
 const _: () = assert!(icache_results(5) <= TTINSN_SCRATCH);
+/// Where the instruction-cache geometry probe (`icache_alias_b`, `icache_alias_nc`) writes its
+/// rows: over [`icache_results`]' slots, since the probes run one at a time.
+pub const ICACHE_ALIAS_RESULTS: u64 = PROBE_SCRATCH;
+/// [`ICACHE_ALIAS_RESULTS`]' length.
+pub const ICACHE_ALIAS_BYTES: u64 = TTINSN_SCRATCH - PROBE_SCRATCH;
 const _: () = assert!(TTINSN_SCRATCH + 0x100 <= PROBE_SCRATCH + PROBE_SCRATCH_BYTES);
 
 // Compile-time rather than a test: if the mailbox ever moved past the end of L1,

@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use tt_isa::dm::{op, record, TILE_DATA, TILE_SLOT};
+use tt_isa::format::TileFormat;
 use tt_isa::tile::L1Format;
 
 use crate::matmul::{self, Fidelity, LiveRows, OutputTile, SrcRoute, Staging};
@@ -95,45 +96,67 @@ struct Slots {
     o: u64,
 }
 
-/// L1 slots a job of `[kt, nt, dvt]` tiles takes: `q`'s tile row, the keys, the mask, two
-/// score buffers, the maximum and the sum, the values and the output.
-fn slots_needed([kt, nt, dvt]: [usize; 3]) -> usize {
-    kt + kt * nt + nt + 2 * nt + 2 + nt * dvt + dvt
+/// The L1 bytes a job of `[kt, nt, dvt]` tiles takes: `q`'s tile row, the keys, the mask, two
+/// score buffers, the maximum and the sum, the values and the output, the keys and values at
+/// `kv_slot` bytes a tile (their format's slot: half an FP32 tile's for BF16), the rest FP32.
+fn bytes_needed([kt, nt, dvt]: [usize; 3], kv_slot: u64) -> u64 {
+    (kt + nt + 2 * nt + 2 + dvt) as u64 * TILE_SLOT + (kt * nt + nt * dvt) as u64 * kv_slot
 }
 
 fn slot_at(base: u64, n: usize) -> u64 {
     base + n as u64 * TILE_SLOT
 }
 
-fn plan_slots(tiles: [usize; 3]) -> Option<Slots> {
+fn plan_slots(tiles: [usize; 3], kv_slot: u64) -> Option<Slots> {
     let [kt, nt, dvt] = tiles;
     let arena = crate::l1::arena();
-    if slots_needed(tiles) as u64 * TILE_SLOT > arena.len() {
+    if bytes_needed(tiles, kv_slot) > arena.len() {
         return None;
     }
     let mut at = arena.base;
-    let mut take = |n: usize| {
+    let mut take = |n: usize, slot: u64| {
         let here = at;
-        at += n as u64 * TILE_SLOT;
+        at += n as u64 * slot;
         here
     };
     Some(Slots {
-        q: take(kt),
-        k: take(kt * nt),
-        mask: take(nt),
-        s: take(nt),
-        t: take(nt),
-        max: take(1),
-        sum: take(1),
-        v: take(nt * dvt),
-        o: take(dvt),
+        q: take(kt, TILE_SLOT),
+        k: take(kt * nt, kv_slot),
+        mask: take(nt, TILE_SLOT),
+        s: take(nt, TILE_SLOT),
+        t: take(nt, TILE_SLOT),
+        max: take(1, TILE_SLOT),
+        sum: take(1, TILE_SLOT),
+        v: take(nt * dvt, kv_slot),
+        o: take(dvt, TILE_SLOT),
     })
+}
+
+/// The route of a job over keys and values of `kv` (F32 or BF16) and its `kv_slot`: TF32 for F32
+/// ones, a BF16 `B` moved as is otherwise (`SrcRoute::Edges`; its product the widened `B`'s, bit
+/// for bit, gate `step270`).
+fn kv_route(kv: Elem) -> Option<SrcRoute> {
+    match kv {
+        Elem::F32 => Some(SrcRoute::Tf32FromFp32),
+        Elem::BF16 => SrcRoute::edges(TileFormat::FP32, TileFormat::BF16),
+        _ => None,
+    }
 }
 
 /// Whether [`attention_rows`] takes a problem of these dims (`[m, d, l, dv]`) whose query rows
 /// start at row `r0` of their tile: whole tiles along `d`, `l` and `dv`, a head's rows inside
-/// one tile row, and a job inside the data arena and one list.
-pub fn fits([m, d, l, dv]: [usize; 4], r0: usize) -> bool {
+/// one tile row, and a job inside the data arena and one list. For F32 keys and values; BF16 ones
+/// take [`fits_as`].
+pub fn fits(dims: [usize; 4], r0: usize) -> bool {
+    fits_as(dims, r0, Elem::F32)
+}
+
+/// [`fits`] for keys and values of `kv` (F32 or BF16): BF16 ones take half the L1, so longer
+/// heads fit (at head_dim 64, 1,344 positions against 960).
+pub fn fits_as([m, d, l, dv]: [usize; 4], r0: usize, kv: Elem) -> bool {
+    let Some(route) = kv_route(kv) else {
+        return false;
+    };
     let tiles = [d / 32, l / 32, dv / 32];
     m >= 1
         && r0 + m <= 32
@@ -144,7 +167,7 @@ pub fn fits([m, d, l, dv]: [usize; 4], r0: usize) -> bool {
         && l > 0
         && dv > 0
         && 4 * m * tiles[2] <= MAX_ROW_WRITES
-        && plan_slots(tiles).is_some()
+        && plan_slots(tiles, route.b_slot()).is_some()
         && reduce::plan_layout(1, tiles[1]).is_ok()
 }
 
@@ -204,27 +227,26 @@ fn build_kernels(
     fidelity: Fidelity,
     unpack_b: bool,
 ) -> Result<Vec<Step>> {
-    let at = plan_slots([kt, nt, dvt]).ok_or_else(|| shape_error("the job does not fit L1"))?;
+    let kv_slot = route.b_slot();
+    let at =
+        plan_slots([kt, nt, dvt], kv_slot).ok_or_else(|| shape_error("the job does not fit L1"))?;
     // The job's slots, up to its last: what the op reaches in `DATA` (`trace::OpRecord::l1_top`).
     // Its products' and reductions' own layouts note far less, and a busy unit's weight prefetch
     // lands above the highest top the ops before its product noted (`Session::busy_start`): left
     // out, a 1.7B step at 512 positions read `B` over its own `K` and `V` slots and chose other
     // tokens (found 2026-10-26, `silicon_bench_models::traced_generation`, 256-token prompt).
-    crate::l1::note_planned_top(slot_at(
-        crate::l1::arena().base,
-        slots_needed([kt, nt, dvt]),
-    ));
-    let (in_fmt, out_fmt) = route.formats();
+    crate::l1::note_planned_top(crate::l1::arena().base + bytes_needed([kt, nt, dvt], kv_slot));
+    let fmts = route.src_formats();
     let live = LiveRows::for_rows(rows);
     let slot = |base: u64, n: usize| base + n as u64 * TILE_SLOT;
+    let kv = |base: u64, n: usize| base + n as u64 * kv_slot;
     let matmul_step = |outputs: Vec<OutputTile>, shape: [usize; 3], b_transposed: bool| {
         let layout =
             matmul::plan_layout_in(shape, L1Format::Fp32, Staging::Slots).map_err(shape_error)?;
-        let (roles, mop) = matmul::matmul_kernel(
+        let (roles, mop) = matmul::matmul_kernel_with(
             &outputs,
             layout.sems,
-            in_fmt,
-            out_fmt,
+            fmts,
             fidelity,
             false,
             b_transposed,
@@ -243,7 +265,7 @@ fn build_kernels(
     let qk = (0..nt)
         .map(|j| OutputTile {
             pairs: (0..kt)
-                .map(|kk| (slot(at.q, kk), slot(at.k, kk * nt + j)))
+                .map(|kk| (slot(at.q, kk), kv(at.k, kk * nt + j)))
                 .collect(),
             out: slot(at.s, j) + TILE_DATA,
         })
@@ -326,7 +348,7 @@ fn build_kernels(
     let pv = (0..dvt)
         .map(|j| OutputTile {
             pairs: (0..nt)
-                .map(|kk| (slot(at.t, kk), slot(at.v, kk * dvt + j)))
+                .map(|kk| (slot(at.t, kk), kv(at.v, kk * dvt + j)))
                 .collect(),
             out: slot(at.o, j) + TILE_DATA,
         })
@@ -343,7 +365,10 @@ fn build_kernels(
 /// undefined. `twin`, if given (`[items.len() m dv / 32, 32]`), receives the row packed
 /// (`tensor::pack_row`'s layout), as an element-wise op's packed twin.
 ///
-/// Refused unless [`fits`] holds for every head, and for F32 operands on the TF32 route.
+/// Refused unless [`fits_as`] holds for every head, and for F32 queries on the TF32 route. The keys
+/// and values are F32, or BF16 (a BF16 KV cache) read as they lie: their products those of the
+/// widened keys and values, bit for bit (`SrcRoute::Edges`), the keys' transpose the unpacker's
+/// (`unpack_b` must be on).
 #[allow(clippy::too_many_arguments)]
 pub fn attention_rows(
     alloc: &mut DramAlloc,
@@ -359,13 +384,26 @@ pub fn attention_rows(
     unpack_b: bool,
     twin: Option<&DramTensor>,
 ) -> Result<Work> {
-    for (t, what) in [(q, "queries"), (k, "keys"), (v, "values")] {
-        t.expect(&format!("attention rows' {what}"), Elem::F32)?;
-    }
+    q.expect("attention rows' queries", Elem::F32)?;
+    v.expect("attention rows' values", k.elem)?;
     mask.expect("attention rows' mask", Elem::Bool)?;
     if route != SrcRoute::Tf32FromFp32 {
         return Err(shape_error(format!("route {route:?}")));
     }
+    let route = kv_route(k.elem)
+        .ok_or_else(|| shape_error(format!("keys and values of {:?}: F32 or BF16", k.elem)))?;
+    let packed = route.packed_b().is_some();
+    // The mover transposes FP32 datums alone: BF16 keys are transposed by the unpacker.
+    if packed && !unpack_b {
+        return Err(shape_error(
+            "BF16 keys are read transposed by the unpacker, which is off",
+        ));
+    }
+    let b_format = match route.packed_b() {
+        Some(format) => record::gather_b_format(format.l1())
+            .ok_or_else(|| shape_error(format!("no gather reads a {format:?} `B`")))?,
+        None => 0,
+    };
     if items.is_empty() {
         return Err(shape_error("no heads"));
     }
@@ -391,8 +429,10 @@ pub fn attention_rows(
     let runs = probe_runs(l);
     let (l, nt) = (l / runs, nt / runs);
     let result = (|| {
-        let at = plan_slots([kt, nt, dvt]).ok_or_else(|| shape_error("the job does not fit L1"))?;
+        let at = plan_slots([kt, nt, dvt], route.b_slot())
+            .ok_or_else(|| shape_error("the job does not fit L1"))?;
         let rmask = mask.tensor_ref();
+        let rq = q.tensor_ref().encode();
         let mut jobs = Vec::with_capacity(runs * items.len());
         for (run, (i, item)) in
             (0..runs).flat_map(|run| items.iter().enumerate().map(move |e| (run, e)))
@@ -404,7 +444,11 @@ pub fn attention_rows(
             };
             let [qr, qc] = item.q;
             let r0 = qr % 32;
-            if !fits([m, d, l, dv], r0) || qr + m > q.rows || qc % 32 != 0 || qc + d > q.cols {
+            if !fits_as([m, d, l, dv], r0, k.elem)
+                || qr + m > q.rows
+                || qc % 32 != 0
+                || qc + d > q.cols
+            {
                 return Err(shape_error(format!(
                     "head {i}'s [{m}, {d}] query rows at [{qr}, {qc}] of [{}, {}]",
                     q.rows, q.cols
@@ -451,6 +495,7 @@ pub fn attention_rows(
                     record::GATHER,
                     gather_flags(false, true, kt)
                         | record::GATHER_A_RESIDENT
+                        | b_format
                         | if unpack_b {
                             record::GATHER_B_UNPACK_TRANSPOSE
                         } else {
@@ -463,8 +508,10 @@ pub fn attention_rows(
                     0,
                     nt as u32,
                 ],
-                rk.encode()[0],
-                rk.encode()[1],
+                // `A` is resident, so its reference is not read; it is the queries' (FP32), which
+                // agrees with `A`'s slot where the keys' (BF16) would not.
+                rq[0],
+                rq[1],
                 rk.encode()[0],
                 rk.encode()[1],
             ]);
@@ -486,7 +533,7 @@ pub fn attention_rows(
             gather.extend([
                 [
                     record::GATHER,
-                    gather_flags(false, false, nt) | record::GATHER_A_RESIDENT,
+                    gather_flags(false, false, nt) | record::GATHER_A_RESIDENT | b_format,
                     at.t as u32,
                     at.v as u32,
                     0,
@@ -494,8 +541,8 @@ pub fn attention_rows(
                     0,
                     dvt as u32,
                 ],
-                rv.encode()[0],
-                rv.encode()[1],
+                rq[0],
+                rq[1],
                 rv.encode()[0],
                 rv.encode()[1],
             ]);

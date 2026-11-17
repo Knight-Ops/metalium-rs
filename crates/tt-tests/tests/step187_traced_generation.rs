@@ -123,6 +123,47 @@ fn synthetic_llamas_generate_as_eagerly() {
     });
 }
 
+/// The performance contract's Llama (`Llama::for_inference`): BFP8 weights, BF16 activations into
+/// the products, a tied table stored once in BF16, and a BF16 KV cache whose keys and values are
+/// rounded once as they are written and read as they lie by attention. Its traced generation equals
+/// the eager fixed-shape schedule, token for token and bit for bit, on every synthetic shape (the
+/// growing cache is F32, so it is not this contract's). The cache the generator made is BF16.
+#[test]
+#[cfg_attr(
+    not(feature = "silicon"),
+    ignore = "model workload, silicon tier: cargo xtask silicon --release --filter step187_traced_generation"
+)]
+fn a_performance_contract_llama_generates_as_eagerly() {
+    use burn::tensor::DType;
+    with_device(Config::default(), |d| {
+        for (what, config) in synthetic_configs() {
+            let model = Llama::<TtBackend>::new(&config, &d)
+                .for_inference(burn_tt::Numerics::Performance, Default::default());
+            assert_eq!(
+                model.kv_dtype(),
+                DType::BF16,
+                "{what}: the contract's cache"
+            );
+            assert_eq!(
+                model.new_cache(MAX_LEN, &d).state()[0].dtype(),
+                DType::BF16,
+                "{what}: the cache made"
+            );
+            let g = traced(&model, &shapes(), &d);
+            for &len in &LENGTHS {
+                let p = prompt(len, config.vocab);
+                let got = generate(&g, &p, STEPS);
+                let fixed = generate_fixed(&model, &p, STEPS, &shapes(), &d).unwrap();
+                assert_same(
+                    &got,
+                    &fixed,
+                    &format!("{what} (performance contract), prompt {len}, eager fixed schedule"),
+                );
+            }
+        }
+    });
+}
+
 #[test]
 #[cfg_attr(
     not(feature = "silicon"),

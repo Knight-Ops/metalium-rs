@@ -52,8 +52,10 @@ pub enum Event {
     /// The data mover began or ended a list of `entries` entries.
     List { begin: bool, entries: u32 },
     /// The data mover began or ended a list entry or op record whose first
-    /// word is `op` (`tt_isa::dm::op` or `tt_isa::dm::record`).
-    Entry { begin: bool, op: u32 },
+    /// word is `op` (`tt_isa::dm::op` or `tt_isa::dm::record`); `arg` tells entries of one op
+    /// apart (`tt_isa::dm::entry_detail`: a `CB`'s stream and action, a credit's word), 0 for
+    /// most.
+    Entry { begin: bool, op: u32, arg: u32 },
     /// The data mover posted `generation` to the roles (`kick`), or saw all
     /// three acknowledge it.
     Kick { done: bool, generation: u32 },
@@ -82,6 +84,11 @@ pub enum Event {
     BatchTime,
     /// The host's: a repeated copy of an [`Event::BatchBase`] (`tt_isa::mailbox::trace::BATCH_REPEAT`).
     BatchRepeat,
+    /// The host's: one record of RISCV NC's entry log, at its time (`tt_isa::dm::nc_log`,
+    /// `tt_isa::mailbox::trace::NC_RECORD`); `tag` is the record's.
+    NcRecord { tag: u32 },
+    /// The host's: NC's entry log lost `records` records (`tt_isa::mailbox::trace::NC_LOST`).
+    NcLost { records: u32 },
     /// Anything else: a token no firmware of this build writes.
     Unknown(u32),
 }
@@ -144,6 +151,8 @@ impl Event {
                 mismatched: detail & ev::BATCH_MISMATCHED != 0,
             },
             (ev::MOVER, ev::BATCH_TIME) => Event::BatchTime,
+            (ev::MOVER, ev::NC_RECORD) => Event::NcRecord { tag: detail },
+            (ev::MOVER, ev::NC_LOST) => Event::NcLost { records: detail },
             (ev::MOVER, ev::BATCH_REPEAT) => Event::BatchRepeat,
             (ev::MOVER, ev::KICK | ev::ROLES_DONE) => Event::Kick {
                 done: event == ev::ROLES_DONE,
@@ -155,7 +164,8 @@ impl Event {
             },
             (ev::MOVER, ev::ENTRY_BEGIN | ev::ENTRY_END) => Event::Entry {
                 begin: event == ev::ENTRY_BEGIN,
-                op: detail,
+                op: tt_isa::dm::entry_op(detail),
+                arg: tt_isa::dm::entry_arg(detail),
             },
             _ => Event::Unknown(token),
         }
@@ -289,12 +299,16 @@ impl UnitProfile {
                         end: e.cycles,
                     });
                 }
-                Event::Entry { begin: true, op } => {
+                Event::Entry {
+                    begin: true, op, ..
+                } => {
                     if list.is_none() || entry.replace((op, e.cycles)).is_some() {
                         return Err(bad(i, "an entry began outside a list or inside one".into()));
                     }
                 }
-                Event::Entry { begin: false, op } => match entry.take() {
+                Event::Entry {
+                    begin: false, op, ..
+                } => match entry.take() {
                     Some((o, b)) if o == op => out.push(Span {
                         name: op_name(op),
                         track: "mover",
@@ -340,7 +354,9 @@ impl UnitProfile {
                 | Event::BatchBase { .. }
                 | Event::BatchTable { .. }
                 | Event::BatchTime
-                | Event::BatchRepeat => {}
+                | Event::BatchRepeat
+                | Event::NcRecord { .. }
+                | Event::NcLost { .. } => {}
                 Event::Role {
                     thread,
                     what: RoleEvent::Woke,

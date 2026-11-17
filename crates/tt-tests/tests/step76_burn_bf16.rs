@@ -73,6 +73,81 @@ fn raw_bf16_views_preserve_all_payloads_and_use_two_byte_transfers() {
     });
 }
 
+/// A BF16 tensor still on the host is widened there and uploaded once, as F32
+/// -- not uploaded as BF16 and cast on the card, which left a freed hole beside
+/// every widened table (`new-architectures.md`, defect 4). The values are the
+/// card's own widening of every one of the 65,536 patterns, NaN payloads
+/// (signalling ones too) included.
+#[test]
+fn a_host_bf16_tensor_cast_to_f32_is_uploaded_once_widened() {
+    with_device(Config::default(), |d| {
+        let (rows, cols) = (256, 256);
+        let patterns: Vec<u16> = (0..=u16::MAX).collect();
+        let host = || {
+            Tensor::<TtBackend, 2>::from_data(
+                data(patterns.clone(), [rows, cols]),
+                (&d, DType::BF16),
+            )
+        };
+        let before = tensor_traffic();
+        let (widened, report) = burn_tt::with_report(|| host().cast(burn::tensor::FloatDType::F32));
+        let traffic = tensor_traffic() - before;
+        assert_native_model(&report);
+        resident(&widened);
+        assert_eq!(
+            (traffic.uploads, traffic.uploaded),
+            (1, (rows * cols * 4) as u64),
+            "one upload, in F32"
+        );
+        // The card's widening of the same patterns, uploaded as BF16 first.
+        let on_card = host().to_device(&d).cast(burn::tensor::FloatDType::F32);
+        let f32_bits = |t: Tensor<TtBackend, 2>| -> Vec<u32> {
+            let mut data = t.into_data();
+            assert_eq!(data.dtype, DType::F32);
+            data.dtype = DType::U32;
+            data.to_vec().unwrap()
+        };
+        let want: Vec<u32> = patterns.iter().map(|&b| u32::from(b) << 16).collect();
+        assert_eq!(f32_bits(on_card), want, "the card widens by the bits");
+        assert_eq!(f32_bits(widened), want);
+    });
+}
+
+/// Roadmap W1, the BF16 lookup: a BF16 table's rows (an embedding's) are selected on the card as
+/// they lie, one job (`SELECT_ROWS_BF16`), not staged through a per-element repack of the table a
+/// token; bit for bit, every pattern the table holds.
+#[test]
+fn a_bf16_table_s_rows_are_selected_without_staging() {
+    use burn::tensor::Int;
+    with_device(Config::default(), |d| {
+        let (rows, cols) = (300, 2048);
+        let patterns: Vec<u16> = (0..(rows * cols) as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 16) as u16)
+            .collect();
+        let table = Tensor::<TtBackend, 2>::from_data(
+            data(patterns.clone(), [rows, cols]),
+            (&d, DType::BF16),
+        )
+        .to_device(&d);
+        let ids = [0i32, 299, 31, 32, 33, 5, 5, 64, 17];
+        let idx = Tensor::<TtBackend, 1, Int>::from_data(ids, &d).to_device(&d);
+        let (got, report) = burn_tt::with_report(|| table.clone().select(0, idx.clone()));
+        resident(&got);
+        assert_native_model(&report);
+        let queued: u64 = report.0.iter().map(|s| s.jobs).sum();
+        assert_eq!(queued, 1, "one row select: {report:?}");
+        let want: Vec<u16> = ids
+            .iter()
+            .flat_map(|&r| {
+                patterns[r as usize * cols..(r as usize + 1) * cols]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(bits(got.into_data()), want);
+    });
+}
+
 #[cfg(feature = "silicon")]
 fn round(value: f32) -> f32 {
     let bits = value.to_bits();
@@ -121,8 +196,10 @@ fn bf16_ops_run_natively_bit_for_bit_their_widened_composition() {
                 })
                 .collect()
         };
+        // Resident, as a model's activations are: a host tensor's cast to F32 widens on the host
+        // and leaves it there, and each op below would count its upload.
         let tensor = |bits: Vec<u16>, shape: [usize; 2]| {
-            Tensor::<TtBackend, 2>::from_data(data(bits, shape), (&d, DType::BF16))
+            Tensor::<TtBackend, 2>::from_data(data(bits, shape), (&d, DType::BF16)).to_device(&d)
         };
         let (x, y) = (
             tensor(pattern(m * k, 1), [m, k]),
@@ -223,6 +300,44 @@ fn bf16_rms_norm_is_the_module_bit_for_bit() {
                 "[{rows}, {cols}]"
             );
         }
+    });
+}
+
+/// Roadmap W1, defect 1: a BF16 product with a transposed `B` -- a tied head `last @ table^T` --
+/// reads `B` as it lies, the kernel's unpacker transposing it (`step272`): one job, no plain copy
+/// (which went through a per-element host map, 40 GB for Qwen3.5's table), bit for bit the
+/// widened product narrowed.
+#[cfg(feature = "silicon")]
+#[test]
+fn a_bf16_product_reads_a_transposed_b_as_it_lies() {
+    with_device(Config::default(), |d| {
+        let (m, k, n) = (3, 320, 200);
+        let values = |len: usize, salt: u32| -> Vec<f32> {
+            (0..len as u32)
+                .map(|i| {
+                    let h = (i ^ salt.wrapping_mul(0x9e37_79b9)).wrapping_mul(2_654_435_761);
+                    ((h >> 8) % 2001) as f32 / 1000.0 - 1.0
+                })
+                .collect()
+        };
+        let bf16 = |v: Vec<f32>, shape: [usize; 2]| {
+            Tensor::<TtBackend, 2>::from_data(TensorData::new(v, shape), &d).cast(FloatDType::BF16)
+        };
+        let x = bf16(values(m * k, 1), [m, k]);
+        let table = bf16(values(n * k, 2), [n, k]);
+        let (native, report) = burn_tt::with_report(|| x.clone().matmul(table.clone().transpose()));
+        resident(&native);
+        assert_native_model(&report);
+        let queued: u64 = report.0.iter().map(|s| s.jobs).sum();
+        assert_eq!(queued, 1, "one product, no plain copy of B: {report:?}");
+        assert_eq!(native.dtype(), DType::BF16);
+        let want = bits(
+            x.cast(FloatDType::F32)
+                .matmul(table.cast(FloatDType::F32).transpose())
+                .cast(FloatDType::BF16)
+                .into_data(),
+        );
+        assert_eq!(bits(native.into_data()), want);
     });
 }
 

@@ -19,15 +19,15 @@
   - Burn's own suites on silicon: F32/F16 3,001 of 3,025, BF16 1,098 of 1,187, none listed for a missing op.
 - **Models run on the card,** traced:
   - ResNet-18 in 12.7 ms and ViT-Tiny in 7.7 ms;
-  - SmolLM2-1.7B decodes at ~133 tokens/s (7.52 ms a step) under the performance contract, the inference default since 2026-11-10 (BFP8 weights; top-1 98.28% against HuggingFace, `step269`); 9.81 ms under the reference contract (BF16-stored weights, bit for bit the F32 model);
-  - Qwen3.5-4B decodes in 56.9 ms a step under the performance contract (BFP8 weights; no quality gate yet), 62.5 under the reference (~21 of either a greedy pick, W4);
+  - SmolLM2-1.7B decodes at ~130 tokens/s (7.68 ms a step) under the performance contract, the inference default since 2026-11-10 (BFP8 weights, the tied table stored once, BF16, since 2026-11-12; top-1 98.28% against HuggingFace, `step269`; 7.52 with a BFP8 head beside the table, the option); 9.81 ms under the reference contract (BF16-stored weights, bit for bit the F32 model; not re-measured with the one table);
+  - Qwen3.5-4B decodes in 34.1 ms a step under the performance contract (BFP8 weights, the tied head the BF16 table, the greedy pick one op on the grid since 2026-11-12; no quality gate yet), 62.5 under the reference (measured with the old ~21 ms pick);
   - a 7,992-token prompt prefills in 5.98 s.
 
-  All of this is single card and batch 1. The 1.7B's 7.52 ms is under the performance contract; everything else is under the bit-exact reference contract.
+  All of this is single card and batch 1. The 1.7B's 7.68 ms and Qwen3.5's 34.1 are under the performance contract; everything else is under the bit-exact reference contract.
 - **Against tt-metal, same card and model (2026-11-09):**
-  - Our batch-1 decode leads: 7.52 (performance) / 9.81 (reference) against 10.55-12.24 ms.
+  - Our batch-1 decode leads: 7.68 (performance) / 9.81 (reference) against 10.55-12.24 ms.
   - tt-metal batches 32 users at 1,289 tokens/s, prefills 2.2-3.1x faster, and runs prefill-shape products 2.4-22x faster (BF16/BFP8, HiFi2/LoFi, 2-D operand multicast).
-  - Qwen3.5-4B: tt-metal 38.0 ms on the card and 44-46 host-timed, with BFP4/BFP8 weights at LoFi and the argmax on the host; ours 56.9 with BFP8 weights (62.5 with BF16), or ~36 without our 21 ms greedy pick.
+  - Qwen3.5-4B: tt-metal 38.0 ms on the card and 44-46 host-timed, with BFP4/BFP8 weights at LoFi and the argmax on the host; ours 34.1 host-timed with BFP8 weights and the pick on the card (W4, 2026-11-12).
   - Training, since 2026-11-09 traced on every tile by default (`tt-mnist`), beats burn-flex on the CPU: MNIST 1.31 against 2.3-2.6 ms a step, the small transformer 3.75 against 3.9-4.3.
   - [tt-metal-parity.md](tt-metal-parity.md) §1-§3.
 - **Multi-chip** is a proof of concept: matmul, conv and attention split across two cards; no all-reduce.
@@ -82,22 +82,17 @@ BFP8 weights are the inference default since 2026-11-10, behind the contract swi
 - the one-row path for a BF16 `A`: its decode products at the FP32 `A`'s step (BFP8 `B`, HiFi2: 10.74 -> 6.99 ms of products, FP32 `A` 7.00).
 
 A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmetic (below) is what turns it into a gain on a model. Packer L1 accumulation first needs the owner's decision.
-- [ ] **Packer L1 accumulation: below the 3% rule now; the owner decides whether it moves to failed-approaches.**
+- [ ] **Packer L1 accumulation: below the 3% rule now; kept open (owner, 2026-11-12): judge it again at `m` = 32 (W3) or on the W5 model.**
   - Ceiling with a packed `A` whole in `SrcB` (2026-11-10): at most 2.5% of a product, none on the 1.7B's 512-row chunk (`matmul::probe_skip_reload`; [log](../learnings/performance-log.md#w1-a-packed-tile-whole-in-srcb-a-bf16-a-past-the-fp32-as-rate-2026-11-10-card-0)). It was up to 24% only while a packed `A` took faces.
   - Needs a ttsim check of `Pack_L1_Acc` (else an isolated silicon gate and a divergence entry), the partial format stated, and a spec model.
   - Delete `probe_skip_reload` when it lands or is killed.
-- [x] **Native BF16 arithmetic,** through the 1.7B (done 2026-11-11). Bounded 2026-11-11 ([log](../learnings/performance-log.md#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0)): bit for bit today's widen-compute-narrow composition, so no op branches on the contract. Predicted a 256-token prefill ~1.08x (chunk products 1.19-1.24x), decode ~0 at short context and at most ~5% at 2K. Phases: BF16 slots in GDDR (done 2026-11-11, `TensorRef::slot`); SFPU ops with BF16 operands and results (done 2026-11-11, `sfpu::kernel::Formats`: unary, scalar, binary, column and block broadcasts, ternary and comparisons; a row broadcast and kinds taking `Bool`/`I32` still widen); products with a BF16 result (done 2026-11-11, `Session::matmul_dram_as`: quantize on the last K chunk, every schedule but K blocks; its cost 6-9% of a short-K chunk product, not killed) and a BF16 packed twin (done); burn-tt routing without `cast_native` (done 2026-11-11: 21 element-wise ops native, a BF16 product's result BF16, a logical BF16 weight stored BFP; tt-mnist BF16 5.32 -> 5.04 ms a step); the 1.7B on a BF16 residual stream (tried 2026-11-11 and deleted: slower, [failed-approaches](../learnings/failed-approaches.md)), then **BF16 activations into the products, the performance default** (2026-11-11: a norm's output and `silu(gate) * up` rounded once where made, `burn_tt::rms_norm_as`/`silu_mul_as`/`matmul_as`, the residual and the arithmetic F32; decode unchanged, prefill 1.06-1.09x, `step269` the same 228 of 232: [log](../learnings/performance-log.md#w1-bf16-activations-into-the-products-the-performance-default-2026-11-11-cards-0-and-1)). A BF16 KV cache (half the cache's bytes at long context) is a separate lever, unbounded.
+- [x] **Native BF16 arithmetic,** through the 1.7B (done 2026-11-11). Bounded 2026-11-11 ([log](../learnings/performance-log.md#w1-native-bf16-arithmetic-bounded-before-building-2026-11-11-card-0)): bit for bit today's widen-compute-narrow composition, so no op branches on the contract. Predicted a 256-token prefill ~1.08x (chunk products 1.19-1.24x), decode ~0 at short context and at most ~5% at 2K. Phases: BF16 slots in GDDR (done 2026-11-11, `TensorRef::slot`); SFPU ops with BF16 operands and results (done 2026-11-11, `sfpu::kernel::Formats`: unary, scalar, binary, column and block broadcasts, ternary and comparisons; a row broadcast and kinds taking `Bool`/`I32` still widen); products with a BF16 result (done 2026-11-11, `Session::matmul_dram_as`: quantize on the last K chunk, every schedule but K blocks; its cost 6-9% of a short-K chunk product, not killed) and a BF16 packed twin (done); burn-tt routing without `cast_native` (done 2026-11-11: 21 element-wise ops native, a BF16 product's result BF16, a logical BF16 weight stored BFP; tt-mnist BF16 5.32 -> 5.04 ms a step); the 1.7B on a BF16 residual stream (tried 2026-11-11 and deleted: slower, [failed-approaches](../learnings/failed-approaches.md)), then **BF16 activations into the products, the performance default** (2026-11-11: a norm's output and `silu(gate) * up` rounded once where made, `burn_tt::rms_norm_as`/`silu_mul_as`/`matmul_as`, the residual and the arithmetic F32; decode unchanged, prefill 1.06-1.09x, `step269` the same 228 of 232: [log](../learnings/performance-log.md#w1-bf16-activations-into-the-products-the-performance-default-2026-11-11-cards-0-and-1)). A BF16 KV cache (half the cache's bytes at long context) was a separate lever, bounded and built 2026-11-12 (below).
   - BF16 edges unpacked to `Src`, packed to BF16 slots (2 KiB);
   - a one-row BF16 result writes its packed twin in BF16 (`Session::set_packed_twins` writes F32 twins only, so a BF16 `A` is packed again at every product today);
   - `float_matmul` and the element-wise wrappers accept BF16 without `cast_native`;
   - BF16 tensors in BF16 GDDR slots.
-- [ ] **Fix the four BF16 defects left from the new architectures** (worked around, never fixed; [new-architectures.md](new-architectures.md)):
-  - a BF16 product with a transposed `B` copies it plain (> 40 GB of host bookkeeping at 248K x 2,560);
-  - `Precision::Bf16` grows host memory without bound on Qwen3.5;
-  - casting a just-loaded tensor uploads the original first;
-  - the block copier refuses element-interleaving moves past ~400K elements.
-- [ ] **The BF16 embedding lookup without staging** (`gather_indexed_bf16` still stages; `step167` BF16 takes 229 s). B now has the room it lacked (10-14 KiB after the firmware diet). It also ends a second copy in today's defaults: a tied Llama (the 1.7B) keeps its table F32 for the lookup and a stored, untied head beside it.
-- [ ] **A BF16 KV cache, and attention reading it without widening** (`attention/widen` widens every call).
+- [x] **A BF16 KV cache, and attention reading it without widening** (done 2026-11-12, the performance contract's cache; [log](../learnings/performance-log.md#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1)). The 1.7B at 2K 19.44 -> 18.89 ms (-2.8%), at 8K 43.44 -> 38.67 (-11.0%); short context 7.70 -> 7.84 (+1.9%); half the cache's GDDR; `attention_rows` 960 -> 1,344 positions at head_dim 64; `step269` 228 of 232. `TT_KV_CACHE=f32` / `WeightOptions::f32_kv_cache` keeps the F32 cache. The approved plan's kill (2K not improving *and* short context over +0.5%) did not fire.
+  - Backlog (below the 3% rule): the short-context +1.9% is the values' cast, one op a layer. A fused `qkv` whose value columns come out BF16 would remove it; so would RoPE for a partial rotary (Qwen3.5's keys still cast).
 - [ ] **A BFP8 KV cache as a named option** (F8).
 - [ ] **The contract switch's reach.** `burn_tt::Numerics` landed (2026-11-10): attachment, thread scope, frozen into traces. Still open:
   - ops that branch on it, as BF16 activations, fidelity and packer L1 accumulation land;
@@ -108,11 +103,35 @@ A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmet
 - [ ] **The BFP4 `gate|up` option** misses tt-metal's floors on the 1.7B (top-1 86.6%, PCC 0.93); it is recorded only. Judge it again on the W5 model.
 
 ### W2. Prefill: sharded activations and 2-D operand multicast
-- [ ] **A probe.** `[2048,2048]@[2048,16384]` on a 10x11 sub-grid, BF16-HiFi2:
+- [ ] **A probe.** `[2048,2048]@[2048,16384]` and `[2048,8192]@[8192,2048]` on a grid rectangle (8x8, 8x12, 10x12), BF16-HiFi2 and BF16 x BFP8 LoFi:
   - `A` multicast along rows and `B` down columns from one sender per strip (`WRITE_L1_MCAST`, credit-gated);
-  - compare against the reads-free ceiling (`1793224072`).
+  - uniform blocks, a unit running one job fewer where they do not divide the grid;
+  - compare against the reads-free ceiling, re-measured 2026-11-13: 118-186 TFLOPS on 104-120 units, against 41-77 today (`1794535991`; [log](../learnings/performance-log.md#w2-bounded-the-kernels-ceiling-at-the-performance-contract-before-multicast-2026-11-13-card-0)).
 
-  Kill below 60 TFLOPS with operands delivered: then the kernel's push and unpack are next.
+  Predicted >= 85% of the ceiling (the headline shape 70.5 -> >= 112). Kill below 60 TFLOPS with operands delivered (does not fire on the ceiling), or if reads drop and the product does not beat today's 120-unit rate.
+
+  **Built and measured 2026-11-13** (opt-in `TT_OPERAND_REUSE=mcast`, `TileChoice::Rect`, `step274`; [log](../learnings/performance-log.md#w2-the-2-d-operand-multicast-probe-2026-11-13-card-0)): bit for bit, reads ~10x fewer, but 61.8-67.5 TFLOPS on 10x12 against today's 70.5-76.9 (54% of the ceiling); with `A`'s traffic removed, 90-96. Splitting `A`'s reads over two senders (by chunk parity, by row halves) lost and was deleted; neither `A`'s channels nor the mover's entry cost is the bound.
+
+  **Metered from the senders' side 2026-11-13** (the pipeline detail tells senders, NC's entry log `dm::nc_log`, `step275`; [log](../learnings/performance-log.md#w2-a-sender-side-meter-and-what-holds-the-multicast-product-back-2026-11-13-card-0)): the `A` senders' reads are **not** the bound (skipped with the multicasts still sent: 62.7 / 68.8). A sender's NC sends strip `c + 1` only after its own T2 pushed chunk `c` (output wait 688 of 1,271 us on the slowest sender), and a strip's sending (~11 us) costs about a kernel batch, so the two add and the grid moves at their sum.
+  - [x] **Send-ahead tried and reverted 2026-11-13** ([log](../learnings/performance-log.md#w2-sending-ahead-moves-the-wait-to-the-senders-b-2026-11-13-card-0)): NC sending strip `c + 1` before chunk `c`'s output wait lost (60.6 / 63.9 against 61.9 / 67.7); the meter shows NC's output wait was a symptom: it became a wait for its own B (transfer wait 699 us), whose timeline was unchanged (gather 487, wait for the other operand's strips 569). B gathering chunk `c + 1` before waiting for chunk `c`'s strips lost more (53.1 / 56.2): the slot-reuse guard (chunk `c - 1` packed) then holds chunk `c`'s push.
+  - The sender's B list is the critical path: per chunk it reads its own strip (~10 us for 59 KB) and then waits ~12 us for the other operand's strip, in series.
+  - [x] **(1) Why a sender's strip read is slow** (2026-11-13, [log](../learnings/performance-log.md#w2-what-a-senders-read-costs-and-what-it-is-worth-2026-11-13-card-0)): B's cost an entry. A `GATHER`'s 2,112-byte tile reads are each decoded and checked (~330 ns). It is not GDDR, the in-flight cap or `fast-reads`, which does not reach a `GATHER`. It is worth little alone (every sender's reads skipped: 64.1 / 71.1) and much with NC sending ahead (81.2 against 59.3 at `[2048,8192]`).
+  - [x] **A cheaper gather, then the send-ahead again** (2026-11-14, [log](../learnings/performance-log.md#w2-a-cheaper-gather-the-send-ahead-kept-and-bs-code-placement-2026-11-14-card-0)): a gather's tile read 386 -> 260 cycles (`dm::ReadPlan`, `record::Sink`; 374 -> 241 `fast-reads`); the send-ahead kept: **65.2 / 70.1 TFLOPS** (from 61.9 / 67.7; `B` alone 90.4 -> 85.0). Found: B's code placement moves products by up to 20% (the plain product's no-gathers HiFi2 132.4 vs 113.1, LoFi 76.5 vs 92.6, with nothing it runs changed).
+  - [x] **B's per-chunk code placed on purpose: tried and reverted** (2026-11-14, [log](../learnings/performance-log.md#the-movers-per-chunk-code-placement-tried-and-reverted-what-moved-the-plain-product-2026-11-14-card-0)): its premise, "placement moves a product 20%", was the measured block choice differing between processes; the placement gave the 1.7B decode step 1.5-2.1% for ~3.1 KiB of B's image and ~2 KiB of NC's, not worth the room. Kept: the cache's geometry (2-way, 16-byte lines, 128 sets) and its probe, and `TT_FIRMWARE_OVERRIDE` for A/B of firmware images.
+  - [x] **The measured block choice made stable** (2026-11-14, [log](../learnings/performance-log.md#w2-a-stable-measured-block-choice-2026-11-14-card-0)): the noise was path dependence. The climb from the fastest listed candidate missed H1's `[8,4,9]` basin, which only the second-fastest reaches. Now three climbs run, one from each of the three fastest, and candidates within 3% are timed twice more, with the median deciding. H1 LoFi chooses `[8,4,9]` in 5 of 5 processes (92.0-92.6 TFLOPS); HiFi2 is a 1% tie (68.8-69.5). The 1.7B's decode and prefill are unchanged (ABBA). The first capture costs ~65 s more on the 1.7B (W8's box).
+  - [x] **Block gathers read a weight a column a request** (2026-11-14, [log](../learnings/performance-log.md#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0)): `B` needed no new layout. Weights are already stored by column, and block products now take them into L1 by column (`REF_L1_BY_COLUMN`, `BSpan`), with the block kernels stepping `B` so. A by-column `B` costs ~86 cycles a tile against ~248 a tile at a time. H1 default 69.3 / 92.0 -> **70.7 / 98.7** TFLOPS, multicast 74.2 / 89.1 -> **79.3 / 95.3** (HiFi2 multicast now above the default). The 1.7B's prefill +7-13%, decode unchanged.
+  - [x] **`A`'s reads inline beside a `B` read by column** (2026-11-15, chosen over (2) below; [log](../learnings/performance-log.md#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0)): a gather with a `B` span keeps `A`'s tiles in the inline loop, the span checked first and read after them. Strip 197.7 -> 191.3 cycles a tile; H1 default 70.4 / 98.5 -> 70.2 / 99.2, multicast 78.9 / 94.8 -> 79.7 / 96.2 TFLOPS; the 1.7B unchanged. Predicted ~2% of a product, measured 0-1.5%: kept as a default with no regression.
+  - [ ] **`A` laid by row, read a row a request** (backlog; the large share of the senders' reads left): without `A`'s gathers H1 LoFi runs 125.4 against 99.2. Every activation writer changes; bound it first with `mover_gather_rate` (an `A` strip as one request a row, as `BSpan` reads `B`).
+  - [ ] **(2): B gathers chunk `c + 1` before waiting for chunk `c`'s strips**, guarded by chunk `c - 1` *consumed* (T0) rather than packed (T2): needs the batch's output footprint proved disjoint from the next gather's (the slot-reuse `RELEASED` in `streaming_segments` waits for packing because a half also holds its batch's outputs), the frees kept after the wait, and a reserve that counts the reserved batch (the interleaving model caught both; [failed-approaches](../learnings/failed-approaches.md)). **Bounded 2026-11-14** ([log](../learnings/performance-log.md#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0)): at most +7.9% / +6.2% (the "every sender's reads skipped" row against 79.3 / 95.3). The consumed-to-packed tail is unmeasured: the meter's `kernel` spans T0's pop and T2's push, and the reorder makes T0 wait for `gather(c + 1)` after consuming `c - 1`. Before building it, stamp T0's pop in the pipeline detail; and weigh it against cheaper sender reads (the box above), which approach the same ceiling without the hazard.
+
+    **Deferred 2026-11-15 (owner): the cheaper sender reads go first** (the box above). What building it takes, in order, when it is taken up again:
+    1. **Measure the tail first:** stamp T0's input pop beside T2's push in the pipeline detail (`TT_PROFILE_DETAIL=pipeline`), so the consumed-to-packed tail a batch is a number. Predict the gain as that tail times the batches on the slowest sender, against the "every sender's reads skipped" ceiling (+7.9% / +6.2% on 2026-11-14). Build only if the prediction clears 3%.
+    2. **The interleaving model before any code** (`multicast.rs` tests): `RELEASED { Written, Packed, Consumed }` and `KERNEL_WAIT`, the kernel actor split into consume (T0's pop) and pack (T2's push), output slots in the half. It must catch the order that lost on 2026-11-13 (53.1 / 56.2) and the two hazards in failed-approaches before it passes the new order (48+ seeds a case).
+    3. **`Release::Consumed`** (word 3; firmware `released()` reads `dataflow::INPUT + 4`, which T0 already advances), with a ttsim gate and a negative control that waits on the wrong counter.
+    4. **`streaming_segments` emits it only where `l1_footprint` / `footprints_meet` prove the next gather disjoint from the half's output slots**, else `Packed`; the multicast `B` list gathers `c + 1` before `WAIT_CREDIT ready(c)`, the reader's frees still after that wait, the input reserve counting the reserved batch.
+    5. **Kill:** under 3% over the then-current multicast product, or any default slower by more than 0.5%.
+- [ ] **The KV cache's chunk write as whole tiles** (found 2026-11-16, [log](../learnings/performance-log.md#the-17bs-prefill-by-op-class-at-todays-contract-2026-11-16-card-0)): a prefill chunk's keys and values go through `SCATTER_ROWS` in 32-byte face-rows, 192 / 377 us a layer for 1 / 2 MB (~5 GB/s), **16 / 18%** of a 128 / 256-token chunk. A chunk's positions are consecutive and tile-aligned from a multiple of 32: the same bytes as whole tiles. Bound: the 1.7B's prefill 1.18x / 1.21x. Cheapest large item on the prefill path.
+- [ ] **Short-chunk products: `A` once, every unit** (found 2026-11-16, same log): at 128-256 tokens a layer's products run on 32-74 of 120 units and re-read `A` 23-59x (2.9 GB of `A` a 128-token chunk for 87 MB of activations), 607 us a layer against the weights' 139 at 512 GB/s. `A` held once (row multicast or L1-resident) and the blocks spread over the grid (split `K`, narrower column blocks). Bound: up to -11 ms of a 29.6 ms 128-token chunk.
 - [ ] **Multicast products as an L2 channel transform** in the dataflow compiler (the old prefill P5 / G7, "each operand out of GDDR about once"; [prefill-operand-reuse.md](prefill-operand-reuse.md)).
 - [ ] **Activations L1-sharded between consecutive ops** where a capture proves the layout: an L2 pass over the op graph.
 - [ ] **A GEMM TFLOPS gate** at BF16-HiFi2 and BFP8-LoFi beside tt-metal's on the same card (F9: fidelity against structure).
@@ -133,11 +152,7 @@ A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmet
 - [ ] **Later:** bit-exact speculative decode (H12). A draft proposes `k`, the target verifies in one `m = k` step, and greedy acceptance gives plain decode's tokens. Ceiling 2-3x tokens/s.
 
 ### W4. Sampling on the grid
-- [ ] **Diagnose the wide-vocabulary greedy pick.**
-  - Qwen3.5: eight ~2.7 ms parts, ~21.4 ms a step, ~1.5 GB/s; [log](../learnings/performance-log.md#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1).
-  - The code spreads partials over up to 64 units (`Session::argmax_row`); the profile puts each part's gather on unit 0.
-  - Profile one part (`TT_PROFILE_DETAIL=pipeline`) before changing code.
-- [ ] **One grid-wide argmax for any vocabulary.** Retire the 65,536-column split in `tt-models/src/generate.rs`. Bit for bit, including first max, NaN and `-inf` padding.
+The greedy pick is one op for any vocabulary since 2026-11-12: Qwen3.5-4B 54.7 -> 34.1 ms a step (achievements).
 - [ ] **Native top-k / top-p over the grid,** trace-compatible (F7). The current on-card sampler is eager and ~112 ms a token.
 
 ### W5. An 8B-class model
@@ -172,7 +187,7 @@ A BF16 `A` is now no slower than an FP32 one at any `m`, so native BF16 arithmet
 ### W8. Training: LLM fine-tuning
 - [x] **Traced training by default in `tt-mnist`** (2026-11-09; `--eager` opts out): on every tile the step fits the program cache. Traced is faster in every mode measured: MNIST 1.31 ms a step (eager 1.55-1.81), BF16 5.3 (75.6), the CNN 31 (71), the transformer 3.75 (9.4).
 - [ ] **`TracedTrainingStep` for any Burn training loop** (auto-capture, W6) and trace segmentation for steps that overflow the 240 KiB program cache ([traced-execution.md](traced-execution.md) §8.1; one tile overflowed it on 2026-10-21).
-- [ ] **The first traced step costs 0.5-23 s** (MNIST 3.4 s, BF16 23 s): the measured block choice (`9977ad8`) times each product's candidates at capture. Build time is not a target, but a fine-tuning run's first step should not dominate a short run: cache the choices across processes (keyed by shape, route, units).
+- [ ] **The first traced step costs 0.5-23 s** (MNIST 3.4 s, BF16 23 s): the measured block choice (`9977ad8`) times each product's candidates at capture. Since 2026-11-14 it times more candidates: three climbs, and near ties three times, which adds ~65 s to the 1.7B bench's captures. Build time is not a target, but a fine-tuning run's first step should not dominate a short run: cache the choices across processes (keyed by shape, route, units).
 - [ ] **`tt-mnist --fusion` panics** in burn-fusion (`Should have handle for tensor`, `ordering.rs:65` index out of bounds), on one tile and eager too, at `3e4cefd`; no gate runs it. Bisect, fix, and add a smoke entry.
 - [ ] **A fused AdamW** with FP32 master weights and moments.
 - [ ] **Fused forward and backward kernels:** RMSNorm and LayerNorm, softmax/attention, cross-entropy, SwiGLU. This covers B13b (the general SFPU chain fuser) and the reduce/norm fuser ([kernel-fusion.md](kernel-fusion.md) Phases 2 and 4). Bound B13c epilogues per model family (H10's kill was the 1.7B's only).
@@ -226,11 +241,10 @@ The full text is in `git show 3e4cefd:docs/plans/roadmap.md`, "Track 3".
 ## Models: what is left beyond W5
 
 - [ ] **Qwen3.5-4B** ([new-architectures.md](new-architectures.md)):
-  - The delta-rule step in fewer ops: ~25 non-product ops a DeltaNet layer, 776 at 16.8 ms a step; tt-metal ~10.
-  - The tied head stored BF16 as its only copy, once the BF16 lookup lands (W1). A second copy breaks the scaling rule.
+  - The delta-rule step in fewer ops: ~25 non-product ops a DeltaNet layer, 776 at 16.8 ms a step; tt-metal ~10. Re-measured 2026-11-16 ([log](../learnings/performance-log.md#qwen35-4bs-prefill-and-decode-by-op-class-2026-11-16-card-0)): a step is 35.5 ms on the card, the weight products 13.2 of it at 404 GB/s and the 945 other ops 22.3.
   - Deal evenly only where the uneven deal is not already at the card's read rate: ≤ 0.2 ms; bracket under the 0.5% rule.
   - The trace build: 644-1,487 s, host-bound, cause not found.
-  - Chunked (WY) prefill: 3.7 s for 256 tokens today.
+  - Chunked (WY) prefill: 3.7 s for 256 tokens today. Profiled 2026-11-16 (same log): a 16-token chunk is 216 ms, 58% of it the token-at-a-time recurrence's 3,457 small products and 43 ms barriers; the weight products are 24.5 ms. Bound: 2.4x at chunks of 16 with the recurrence gone, more once chunks can grow past 16.
 - [ ] **Gemma 4 E4B (Nemotron-3.5-Bolt) and MOSS-Image traced.**
 - [ ] **Long context** ([long-context.md](long-context.md)):
   - past 32K;
@@ -258,7 +272,7 @@ The full text is in `git show 3e4cefd:docs/plans/roadmap.md`, "Track 3".
   - the exact profile's timeouts on silicon.
 - [ ] **Bool scalars under `Fusion<TtBackend>`** (burn-fusion 0.21.0 `ScalarIr::to_relative` `todo!()`): refuse by name until upstream fixes it.
 - [ ] **Gather without staging:**
-  - packed tables (with W1's BF16 lookup);
+  - BFP and F16 tables (BF16 since 2026-11-12, `SELECT_ROWS_BF16`);
   - rank 3+;
   - `select` on other dimensions;
   - per-element `gather`;

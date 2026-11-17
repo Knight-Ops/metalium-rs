@@ -552,6 +552,44 @@ impl TtTensor {
         }
     }
 
+    /// A BF16 tensor still only on the host, widened to F32 there (exact: a
+    /// BF16 value is an F32 value with the low 16 bits zero) and uploaded
+    /// once, as F32. `None` once it has a device copy, or for a view.
+    ///
+    /// Casting such a tensor on the card would upload the BF16 original
+    /// first, write the F32 copy beside it and free the original, leaving a
+    /// hole beside every widened table: a large one could then find no
+    /// contiguous run (Gemma 4's 11.3 GB table, `new-architectures.md`).
+    pub(crate) fn widened_on_host(&self) -> Option<TtTensor> {
+        if self.cell.dtype != DType::BF16
+            || self.cell.dram.get().is_some()
+            || self.cell.strided.is_some()
+            || !self.is_storable()
+            || !server::supports_dram(self.device)
+        {
+            return None;
+        }
+        // Through the bits, not `TensorData::convert`: `half` quiets a
+        // signalling NaN as it widens, and the card keeps every payload.
+        let mut data = self.cell.host.get()?.clone().into_data();
+        data.dtype = DType::U16;
+        let values: Vec<f32> = data
+            .to_vec::<u16>()
+            .expect("two-byte storage bits")
+            .into_iter()
+            .map(|b| f32::from_bits(u32::from(b) << 16))
+            .collect();
+        let data = TensorData::new(values, self.cell.shape.clone());
+        let widened = TtTensor::new(HostBuffer::from_data(data), self.device);
+        let dram = widened.to_dram().clone();
+        Some(TtTensor::on_device(
+            dram,
+            self.cell.shape.clone(),
+            DType::F32,
+            self.device,
+        ))
+    }
+
     /// Can this view be materialized by native copies or word repacking?
     fn materialises_on_device(&self, _v: &Strided) -> bool {
         self.is_storable() && server::supports_dram(self.device)

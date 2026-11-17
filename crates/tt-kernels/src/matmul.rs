@@ -1194,9 +1194,22 @@ pub(crate) struct BlockStreamLayout {
     pub cleared: Semaphore,
     pub loaded: Semaphore,
     pub init: Vec<crate::runtime::SemaphoreInit>,
+    /// `B`'s order in its half: by column (tile `(kk, j)` of a chunk of `count` `K` tiles at slot
+    /// `j count + kk`), as the gather takes a `B` laid by column a column a request
+    /// (`record::REF_L1_BY_COLUMN`, `record::BSpan`); else by row (`kk cols + j`, a tile a read).
+    pub b_by_column: bool,
 }
 
 impl BlockStreamLayout {
+    /// Where `B` tile `(kk, j)` of a chunk of `count` `K` tiles and `cols` columns sits in its half,
+    /// in slots ([`BlockStreamLayout::b_by_column`]).
+    pub fn b_index(&self, kk: usize, j: usize, count: usize, cols: usize) -> usize {
+        match self.b_by_column {
+            true => j * count + kk,
+            false => kk * cols + j,
+        }
+    }
+
     /// Output tile `(i, j)` of a block `cols` wide: its slot in set `h`, header included, row-major
     /// as `record::SCATTER` writes a block out.
     pub fn out_slot(&self, h: usize, cols: usize, i: usize, j: usize) -> u64 {
@@ -1205,8 +1218,8 @@ impl BlockStreamLayout {
 
     /// Chunk `c` of a block of `rows x cols` output tiles, its `count` `K` tiles, as the
     /// gather stages it (`record::GATHER`: `A` tile `(i, kk)` at `a_at + (i count + kk)`
-    /// slots, `B` tile `(kk, j)` at `b_at + (kk cols + j)`): its layout, its outputs row-major,
-    /// and their priors when it continues.
+    /// slots, `B` tile `(kk, j)` at `b_at` plus [`BlockStreamLayout::b_index`]): its layout, its
+    /// outputs row-major, and their priors when it continues.
     pub fn chunk(&self, c: usize, [rows, count, cols]: [usize; 3]) -> (Layout, Option<Vec<u64>>) {
         use tt_isa::dm::TILE_DATA;
         let [mb, kq, nb] = self.tiles;
@@ -1224,7 +1237,7 @@ impl BlockStreamLayout {
                     .map(|kk| {
                         (
                             a_at + (i * count + kk) as u64 * self.slots.a,
-                            b_at + (kk * cols + j) as u64 * self.slots.b,
+                            b_at + self.b_index(kk, j, count, cols) as u64 * self.slots.b,
                         )
                     })
                     .collect();
@@ -1328,6 +1341,7 @@ impl BlockStreamLayout {
             cleared: l1.semaphore("matmul cleared"),
             loaded: l1.semaphore("matmul loaded"),
             init: l1.semaphore_init(),
+            b_by_column: false,
         }
     }
 }
@@ -1429,12 +1443,13 @@ pub(crate) fn block_stream_kernel_looped(
     // blocks add first).
     let mut unpack = prelude;
     set(&mut unpack, A_STRIDE_GPR, units(layout.slots.a));
-    let b_slot = units(layout.slots.b);
-    set(
-        &mut unpack,
-        B_STRIDE_GPR,
-        units(cols as u64 * layout.slots.b),
-    );
+    // `B`'s step to the next `K` tile and to the next column ([`BlockStreamLayout::b_index`]).
+    let (b_kstep, b_slot) = match layout.b_by_column {
+        true => (1, count as u64),
+        false => (cols as u64, 1),
+    };
+    let b_slot = units(b_slot * layout.slots.b);
+    set(&mut unpack, B_STRIDE_GPR, units(b_kstep * layout.slots.b));
     set(&mut unpack, SLOT_GPR, slot);
     set(&mut unpack, B_SLOT_GPR, b_slot);
     set(&mut unpack, ZERO_GPR, 0);
@@ -1579,6 +1594,10 @@ pub(crate) fn block_stream_kernel_looped(
 const B_COL0_GPR: u32 = 44;
 const B_WIDTH_GPR: [u32; 2] = [45, 46];
 const B_KSTEP_GPR: [u32; 2] = [47, 48];
+/// A `B` by column ([`BlockStreamLayout::b_by_column`]): the subblock's first column at the
+/// current `K` tile, which the next `K` tile's base is a slot past. Its other columns are a column
+/// further each, so no step from the last back to the first is negative.
+const B_KROW_GPR: u32 = 49;
 const PACK_ROW_GPR: u32 = 50;
 
 /// A negative control of the subblocked kernel (`step246_dst_subblocks`), process-wide and set
@@ -1729,22 +1748,24 @@ pub(crate) fn block_stream_kernel_subblocked(
     // Unpack.
     let mut unpack = prelude;
     set(&mut unpack, A_STRIDE_GPR, units(layout.slots.a));
-    let b_slot = units(layout.slots.b);
+    // `B`'s column step, in slots ([`BlockStreamLayout::b_index`]): a subblock's columns are
+    // that far apart, a subblock `w` of them; its next `K` tile is a slot past the current one's
+    // first column (by column, from [`B_KROW_GPR`]) or a row less its `w - 1` columns past its
+    // last (by row).
+    let by_column = layout.b_by_column;
+    let col = if by_column { count as u64 } else { 1 };
     set(&mut unpack, SLOT_GPR, slot);
-    set(&mut unpack, B_SLOT_GPR, b_slot);
+    set(&mut unpack, B_SLOT_GPR, units(col * layout.slots.b));
     set(&mut unpack, ZERO_GPR, 0);
     set(&mut unpack, B_COL0_GPR, units(b_at));
     for (x, &w) in widths.iter().enumerate() {
         set(
             &mut unpack,
             B_WIDTH_GPR[x],
-            units(w as u64 * layout.slots.b),
+            units(w as u64 * col * layout.slots.b),
         );
-        set(
-            &mut unpack,
-            B_KSTEP_GPR[x],
-            units((cols - w + 1) as u64 * layout.slots.b),
-        );
+        let kstep = if by_column { 1 } else { (cols - w + 1) as u64 };
+        set(&mut unpack, B_KSTEP_GPR[x], units(kstep * layout.slots.b));
     }
     let a_row_step = units(count as u64 * layout.slots.a);
     set(&mut unpack, A_ROW_STEP_GPR, a_row_step);
@@ -1790,6 +1811,9 @@ pub(crate) fn block_stream_kernel_subblocked(
             p.push(backend::wait_for_unpacker1(Before::CONFIG).unwrap());
             p.push(encode::adddmareg(A_BASE_GPR, ZERO_GPR, A_ROW_GPR).unwrap());
             p.push(encode::adddmareg(B_BASE_GPR, ZERO_GPR, B_COL_GPR).unwrap());
+            if by_column {
+                p.push(encode::adddmareg(B_KROW_GPR, ZERO_GPR, B_COL_GPR).unwrap());
+            }
             p.push(crate::datapath::gpr_settled());
             p.extend(write_bases());
             p.push(encode::adddmareg(B_COL_GPR, B_WIDTH_GPR[x], B_COL_GPR).unwrap());
@@ -1827,11 +1851,24 @@ pub(crate) fn block_stream_kernel_subblocked(
                     backend::wait_for_unpacker0(Before::CONFIG).unwrap(),
                     backend::wait_for_unpacker1(Before::CONFIG).unwrap(),
                     encode::adddmareg(A_BASE_GPR, A_STRIDE_GPR, A_BASE_GPR).unwrap(),
-                    encode::adddmareg(B_BASE_GPR, B_KSTEP_GPR[x], B_BASE_GPR).unwrap(),
-                    crate::datapath::gpr_settled(),
                 ]
                 .map(Item::I),
             );
+            // By column, both read the `K` row's first column: neither waits on the other's sum.
+            step.extend(
+                match by_column {
+                    true => vec![
+                        encode::adddmareg(B_BASE_GPR, B_KSTEP_GPR[x], B_KROW_GPR).unwrap(),
+                        encode::adddmareg(B_KROW_GPR, B_KSTEP_GPR[x], B_KROW_GPR).unwrap(),
+                    ],
+                    false => {
+                        vec![encode::adddmareg(B_BASE_GPR, B_KSTEP_GPR[x], B_BASE_GPR).unwrap()]
+                    }
+                }
+                .into_iter()
+                .map(Item::I),
+            );
+            step.push(Item::I(crate::datapath::gpr_settled()));
             step.extend(write_bases().map(Item::I));
             p.extend(lowered(vec![Item::Repeat {
                 times: count as u32,
@@ -2234,9 +2271,14 @@ pub(crate) fn block_stream_programs(
             Option<crate::tile_op::dst::RowPlan>,
             DstMutation,
             Out,
+            bool,
         ),
     );
     static CACHE: OnceLock<Mutex<HashMap<Key, BlockPrograms>>> = OnceLock::new();
+    assert!(
+        !(layout.b_by_column && b_transposed),
+        "a transposed `B` is read a tile at a time, by row"
+    );
     let cache = CACHE.get_or_init(Default::default);
     #[cfg(test)]
     let looped = LOOPS_HERE
@@ -2256,7 +2298,13 @@ pub(crate) fn block_stream_programs(
         crate::l1::arena().end,
         layout.sems,
         looped,
-        (pair_order(), dst.cloned(), dst_mutation(), out),
+        (
+            pair_order(),
+            dst.cloned(),
+            dst_mutation(),
+            out,
+            layout.b_by_column,
+        ),
     );
     let count = |v: &BlockPrograms| {
         if v.2.is_some() {
@@ -4165,6 +4213,14 @@ impl SrcRoute {
             SrcRoute::Edges { b, .. } if !is_fp32(b) => Some(b),
             _ => None,
         }
+    }
+
+    /// Whether the kernel's unpacker can transpose this route's `B` as it unpacks it
+    /// (`record::GATHER_B_UNPACK_TRANSPOSE`, [`tt_isa::unpacker::stage_transpose`]): an FP32 `B` on
+    /// the TF32 route, and a BF16 `B` moved to `SrcA` as is, whose faces `Haloize_mode` transposes
+    /// as it does an FP32 one's (roadmap W1; gate `step272_transposed_bf16_b`). A BFP `B` is not.
+    pub fn unpacks_transposed_b(self) -> bool {
+        self == SrcRoute::Tf32FromFp32 || self.packed_b() == Some(TileFormat::BF16)
     }
 
     /// `A`'s format where it is packed ([`SrcRoute::Edges`]).

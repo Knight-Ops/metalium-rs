@@ -12,6 +12,10 @@
 //!   -- bit for bit `x.cast(F32) @ w` (Burn's own `matmul` gives the left operand's dtype, so a
 //!   BF16 `x` would give a rounded BF16 product).
 //!
+//! - [`matmul_wide`]: `x @ w` over both operands' exact values (F32 or BF16), an F32 result -- bit
+//!   for bit `x.cast(F32) @ w.cast(F32)`, `w` read where it lies, a transposed view included (a
+//!   tied table's head, `last @ table^T`, reading the BF16 table its lookup reads).
+//!
 //! Each is exact against its composition, so a schedule's choice (ADR 0005), not a numeric one:
 //! the rounding is the one the composition's cast makes, done in `Dst` before the pack. `None` on
 //! a backend other than `TtBackend` and `Tt`: the caller runs the composition.
@@ -92,6 +96,29 @@ pub(crate) fn matmul_tt_as(x: TtTensor, w: TtTensor, out: DType) -> TtTensor {
     made
 }
 
+/// [`matmul_wide`] on `TtBackend`: one product over both operands' values with an F32 result
+/// ([`wide_matmul`]), else the composition of the widened operands.
+pub(crate) fn matmul_tt_wide(x: TtTensor, w: TtTensor) -> TtTensor {
+    use burn_backend::ops::FloatTensorOps;
+    let _op = crate::report::enter("float_matmul", true);
+    let made = wide_matmul(&x, &w).unwrap_or_else(|| {
+        let widen = |t: TtTensor| {
+            if t.dtype() == DType::F32 {
+                t
+            } else {
+                cast_native(t, DType::F32)
+            }
+        };
+        let rank = x.shape().num_dims();
+        let mut at = vec![1; rank.saturating_sub(2)];
+        at.extend_from_slice(&w.shape().to_vec());
+        let w = TtBackend::float_reshape(widen(w), at.into());
+        TtBackend::float_matmul(widen(x), w)
+    });
+    crate::report::made(true);
+    made
+}
+
 /// What a [`fused::RoundedOp`] computes.
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -99,6 +126,8 @@ enum Kind {
     Norm(f32),
     SiluMul,
     Matmul,
+    /// [`matmul_wide`]: an F32 result over both operands' exact values.
+    MatmulWide,
 }
 
 fn run(kind: Kind, a: TtTensor, b: TtTensor, out: DType) -> TtTensor {
@@ -106,6 +135,7 @@ fn run(kind: Kind, a: TtTensor, b: TtTensor, out: DType) -> TtTensor {
         Kind::Norm(eps) => norm::rms_norm_tt_as(a, b, eps, out),
         Kind::SiluMul => silu_mul_tt_as(a, b, out),
         Kind::Matmul => matmul_tt_as(a, b, out),
+        Kind::MatmulWide => matmul_tt_wide(a, b),
     }
 }
 
@@ -275,4 +305,37 @@ pub fn matmul_as<B: burn_backend::Backend, const D: usize>(
     }
     shape[D - 1] = n;
     dispatch(Kind::Matmul, x, w, shape.into(), dtype)
+}
+
+/// `x @ w` (`x` `[.., m, k]`, `w` `[k, n]`) over both operands' exact values -- each F32 or BF16 --
+/// with an F32 result: bit for bit `x.cast(F32).matmul(w.cast(F32))`, as one product on
+/// `TtBackend` and `Tt` that reads `w` where it lies, a transposed view included. What a tied
+/// table's head is (`last @ table^T`) when the table is stored once, BF16, for its lookup and its
+/// head (roadmap W1). `None` for other dtypes, a `w` of another `k`, and on any other backend.
+pub fn matmul_wide<B: burn_backend::Backend, const D: usize>(
+    x: &burn_tensor::Tensor<B, D>,
+    w: &burn_tensor::Tensor<B, 2>,
+) -> Option<burn_tensor::Tensor<B, D>> {
+    let exact = |d: DType| matches!(d, DType::F32 | DType::BF16);
+    let mut shape = x.shape().to_vec();
+    let [k, n] = w.dims();
+    if D < 2 || shape[D - 1] != k || !exact(x.dtype()) || !exact(w.dtype()) {
+        return None;
+    }
+    shape[D - 1] = n;
+    dispatch(Kind::MatmulWide, x, w, shape.into(), DType::F32)
+}
+
+/// Whether `B`'s attention takes an F32 query over BF16 keys and values (a BF16 KV cache) with an
+/// F32 result, bit for bit the attention of the widened keys and values, reading them where they
+/// lie (`TtBackend` and `Tt`: `burn_tt::ops::module::attention`). Elsewhere a caller widens them
+/// first: Burn's attention takes operands of one dtype.
+pub fn attention_wide<B: burn_backend::Backend>() -> bool {
+    use std::any::TypeId;
+    let b = TypeId::of::<B>();
+    #[cfg(feature = "fusion")]
+    if b == TypeId::of::<crate::Tt>() {
+        return true;
+    }
+    b == TypeId::of::<crate::TtBackend>()
 }

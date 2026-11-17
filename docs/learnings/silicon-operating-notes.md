@@ -28,6 +28,9 @@ space the survivors are a prefix of `grid::TENSIX_COLUMNS` and the count determi
 set. This matters because the raw firmware bit layout is **not** published — UMD documents
 its own `HarvestingMasks` as logical indices and says nothing about the word. Measured:
 `0xfff` on both cards, contiguous, 12 of 14 columns, harvested at X 15 and 16.
+**120 Tensix tiles is the most any card has usable** (owner, 2026-11-16): harvesting always takes at least two of
+the 14 columns. Per-card ceilings (a compute roofline, a "whole grid") count 120 at most; a figure over 140 tiles,
+such as the vendor's 774 TFLOPS, counts tiles no card can use.
 `Tensix::from_enabled_column_mask` refuses a non-contiguous mask rather than guessing,
 because the cost of a wrong guess is a dead host, not a failed test.
 
@@ -956,6 +959,41 @@ to `|x| <= 2^64`; a subnormal is zero. **Cost on silicon (run `1791818553`): 19x
 faster than the exact mode; the time is mostly the element-wise scaling, slicing and NaN/infinity classification around the
 matmuls, not the LoFi matmuls ([performance-log.md](performance-log.md#accurate-matmul-cost-2026-10-12-card-0)).
 
+## Every baby core's instruction cache: 4 KiB, 2-way, 16-byte lines (2026-11-14, card 0)
+
+Measured on B and NC by `probe_icache::instruction_cache_geometry_by_aliasing` (run `1794619199`), and assumed to
+hold for T0-T2, whose capacity curve is the same:
+- 128 sets of two 16-byte lines, with a set stride of 2 KiB and LRU-like replacement;
+- a miss costs ~6.9 cycles a line;
+- a sequential prefetcher hides misses on straight-line code and on forward steps of up to ~32 bytes.
+
+So **hot code fits when no set holds more than two of its lines**. Addresses `a` and `b` share a set when
+`a / 16 % 128 == b / 16 % 128`. A third hot line in a set makes all three miss every time round. Count the hot lines
+per set before and after any change to B's or NC's code, not only the bytes
+([performance-log.md](performance-log.md#instruction-caches-about-4-kib-on-every-baby-core)).
+
+## RISCV B's code placement moves a product by up to 20% (2026-11-14, card 0) -- refuted the same day
+
+**Refuted:** the three values below were the measured block choice (`BlockStream::Measured`), which differs from
+one process to the next (LoFi `[8,4,9]` ~93 TFLOPS, `[6,4,12]` ~81), not B's code. Old and new images in one tree
+(`TT_FIRMWARE_OVERRIDE`) give the same TFLOPS for the same block, within 1%
+([performance-log.md](performance-log.md#the-movers-per-chunk-code-placement-tried-and-reverted-what-moved-the-plain-product-2026-11-14-card-0)).
+**Compare a product across images only at the same chosen block** (`silicon_probe_performance_contract` prints it),
+or over enough processes to see both. Placing B's per-chunk code on purpose was then tried: 1.5-2.1% on the 1.7B
+decode step for ~3.1 KiB of B's image, reverted ([failed-approaches.md](failed-approaches.md)). As first written:
+
+
+Three B images that differ only in the size of the record expansion (`run_record`), which a product with its gathers
+skipped never runs, give that product's BF16-HiFi2 132.4 / 113.6 / 113.1 TFLOPS and its plain BF16 x BFP8 LoFi 76.5 /
+92.6 / 81.4 (every unit, `[2048,2048]@[2048,16384]`, `1794614097`, `1794614207`, `1794614376`; the performance log, "W2:
+a cheaper gather"). Growing `run_record` moves every function linked after it, among them what B runs and polls each
+chunk (`kernel`, `launch`, `release`, `pair_shared`, `finish_pair`, `await_roles`, `dataflow::buffer`). B's
+instruction cache is ~4 KiB and only the per-entry stretch (`.text.hot`) is placed on purpose (`sections.x`). So:
+**a change to B's code is measured on a plain product with and without its gathers, not only on what it changed**, and
+a product's number across two B images is not comparable until the per-chunk code is placed (roadmap W2's next).
+Image sizes after the change (`cargo xtask fw-size`): `dm_b` safe 43,140 bytes of 52,224, `profile` + `encoded-guard`
+47,800 (room 4,424); `run_record` 10,524 bytes at `0x27cc`.
+
 ## RISCV B's image budget (2026-10-13, ttsim and card 0)
 
 **Update 2026-11-06: the firmware diet; B's slot is 52,224 bytes, the role slots 7,168 (`0x1C00`).** Measured with
@@ -1094,6 +1132,23 @@ From [decode-matmul-bandwidth.md](../completed-plans/decode-matmul-bandwidth.md)
   an L1 slot is congruent for any length, since both slots are 64-byte aligned (`TILE_SLOT` and `BF16_TILE_SLOT` are
   multiples of 64). Records expand on the card through `Descriptor::decode` (never `READ_ENCODED`), so the
   fast-reads encoder plays no part. Gates `step190` (both read modes) and `step77` on card 0.
+- **A 32-byte BF16 face-row moves only to a row of its own parity** (2026-11-12, ttsim and card 0, roadmap W1's BF16
+  lookup). A BF16 face-row starts at 16 or 48 mod 64 within its slot (`TILE_DATA` 16, rows 32 bytes apart), so a
+  source row and the output row it goes to are congruent mod 64 only when their face-row indices share their parity.
+  `SELECT_ROWS_BF16` reads such a row straight to its place and every other one into an aside region at its own
+  offset mod 64, then moves it with `COPY_HALFWORDS` (B waits for the reads before its first copy; all of a record's
+  reads are issued first, so one wait a record). Bit for bit, step171 on card 0 (`1794459860`); dropping the copies
+  is caught on ttsim. B's image: +1,772 bytes with the transposed-BF16 `GATHER` arm (safe 38,104 -> 39,876; 10,152
+  left in the tightest build).
+- **A 32-byte BF16 face-row is written to a row of either parity** (2026-11-12, ttsim and card 0, roadmap W1's BF16 KV
+  cache). An L1 -> GDDR write needs only 16-byte congruence, and every BF16 face-row sits at 16 or 48 mod 64, so
+  `SCATTER_ROWS_BF16` writes each staged row straight to its destination row, with no aside region (the read side's
+  `SELECT_ROWS_BF16` needs one). Gates `step273` (a cache write at an even and an odd position) and the record's byte
+  model. NC's image: +116 bytes (19,716 -> 19,832; 4,744 left).
+- **A `GATHER` names a resident operand's reference all the same, and it must agree with that operand's slot.**
+  `attention_rows` passed the keys' (or values') reference as the resident `A`'s placeholder; once they were BF16, the
+  record refused it (`RANGE`, `slot_agrees`) though `A` is never read. A resident operand's placeholder is now an FP32
+  reference (the queries').
 - **The B mover pays per entry as much as per byte.** For an `m = 1` product's `A` tiles (one used row in 32):
   - **Two 64-byte face-row reads a tile** (1/32 of the bytes, twice the entries): a 1.7B decode step 1.5 ms faster,
     but the 135M step ~1 ms *slower* (its products are 18 `A` tiles a job).
@@ -1309,6 +1364,12 @@ From [decode-attention.md](../completed-plans/decode-attention.md) A0b; gate `st
 - **State:** `Haloize_mode` is persistent. Every later unpack configuration writes the whole `SEC0_REG2` word with it
   clear: `unpack_src_config` by construction, `unpack_config` explicitly. So no other kernel unpacks transposed, and
   none unpacks to `Dst` with it set (undefined behaviour).
+- **A BF16 `B` too (2026-11-12, card 0 and ttsim, roadmap W1;** gate `step272_transposed_bf16_b`): a BF16 tile
+  read whole from its 2,112-byte slot and moved to `SrcA` as is (`SrcRoute::Edges`) is transposed by `Haloize_mode`
+  as an FP32 one is. The products are bit for bit those of the same `B` widened to FP32 and transposed the same
+  way: TF32, HiFi4, BF16's special values, whole, ragged with undefined padding, thin, K-blocked, and with a BF16
+  result. Read untransposed, a square `B` gives another product (the negative control); a mover reading the
+  untransposed tile instead is caught on ttsim. BFP formats are not claimed.
 
 ## A one-row product's compute, `A` reads and weight stream (2026-10-18, cards 0 and 1)
 
@@ -1604,6 +1665,12 @@ from NC's L1 into a peer Tensix tile's L1 (gate `step218_l1_write_records`; card
   drained and counted to the rectangle's tiles before the next entry. NoC #1's counter is NC's alone: B, on the same
   NIUs, never writes through NoC #1, where NoC #0's counts B's barrier release too. With the multicast, B 30,996 and NC
   17,872 bytes (6,704 left).
+- **Many senders' multicasts at once, rows across columns** (2026-11-13, card 0, `step274`, roadmap W2): one sender a
+  grid row multicasting `A` strips (up to 64 KiB a chunk, in 16 KiB requests, a row split into rectangles at columns 8
+  and 9) while one sender a column multicasts `B` down it, all on NoC #1, 22 senders over a 10x12 grid with every tile a
+  receiver of two: every product bit for bit, no hang, and the multicasts do not bind the product (a sender's own GDDR
+  reads do). A 16-byte multicast from one op-level credit word to the same word in a rectangle (a ready count) lands as
+  a plain write; the words are L1 like any other to the NoC.
 
 ## A region at the top of L1 costs a product only past its plan's floor (2026-10-21, card 0)
 
@@ -1814,3 +1881,8 @@ hang after "Opening subset of mmio devices" (the first attempt, killed by its 50
   passed 7 of 8 on card 1 (`1794198015`). The eighth, a two-chip test, opens card 0 too whatever `--device` says, and
   failed with "transfer 1 was not acknowledged", the link state above. A `--device 1` filter is not fenced to card 1
   when it selects a mesh test.
+- **2026-11-12, without tt-metal:** after hours of single-card gates and benches on both cards (this repo only), the
+  card-0 smoke's `step147_mesh_trace::product_trace_replays_changed_inputs_equal_to_fresh_runs` failed mid-run with
+  "transfer 206 was not acknowledged (last acknowledged: 205)" (`1794522227`); every `--device all` rerun then failed
+  at "transfer 1". `tt-smi -r 0000:01:00.0 0000:02:00.0`, and step147 passed 6 of 6 with the same build. The link can
+  drop with no tt-metal involved; the remedy is the same.

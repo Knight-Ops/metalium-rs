@@ -1199,7 +1199,8 @@ impl L1Writes {
     /// Whether [`op::WRITE_L1`] or [`op::WRITE_L1_MCAST`] entry `e` writes inside the window of
     /// the tiles (one of them, or a rectangle all of whose tiles are), [`op::READ_L1`] entry
     /// `e` reads inside the window or the read window of one of them, or [`op::CREDIT`] entry
-    /// `e` credits a word inside the window of one of them or of its [`tt_isa::dm::CREDITS`].
+    /// `e` credits a word inside the window of one of them or of its [`tt_isa::dm::CREDITS`] (as
+    /// a 16-byte [`op::WRITE_L1_MCAST`] may set one of those).
     pub fn admits(&self, e: [u32; 8]) -> bool {
         let (to, len) = if e[0] == op::CREDIT {
             (e[3] as u64, 4)
@@ -1219,9 +1220,11 @@ impl L1Writes {
             _ => false,
         };
         // The op-level credit words are no op's L1 (`tt_isa::dm::CREDITS`): a credit to one of a
-        // session tile's is admitted whatever the window.
-        let credits =
-            e[0] == op::CREDIT && to >= tt_isa::dm::CREDITS && to + len <= tt_isa::dm::CREDITS_END;
+        // session tile's is admitted whatever the window, as is a multicast of one word's 16
+        // bytes into them (a sender's ready count, `crate::tile_op::multicast`).
+        let in_credits = to >= tt_isa::dm::CREDITS && to + len <= tt_isa::dm::CREDITS_END;
+        let credits = in_credits
+            && (e[0] == op::CREDIT || (e[0] == op::WRITE_L1_MCAST && len == 16 && to % 16 == 0));
         let inside = |w: &std::ops::Range<u64>| to >= w.start && to + len <= w.end;
         let read = e[0] == op::READ_L1 && inside(&self.reads);
         tiles && (credits || read || inside(&self.window))

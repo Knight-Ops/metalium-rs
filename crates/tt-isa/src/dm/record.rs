@@ -51,7 +51,8 @@ pub const GATHER_A_RESIDENT: u32 = 1 << 25;
 /// [`GATHER`]'s flag for a transposed `B` (bit 1) whose tiles the kernel's unpacker transposes:
 /// tile `(kk, j)` of `op(B)` is `B`'s tile `(j, kk)` read as it lies (`op::READ`, not
 /// `op::READ_TRANSPOSED`), so the mover moves whole tiles and transposes nothing. Refused
-/// without bit 1, and with packed BF16.
+/// without bit 1. With a packed `B` only for BF16, each tile read whole from its own slot
+/// (roadmap W1: a tied table's head `last @ table^T`, a BF16 cache's `q k^T`).
 pub const GATHER_B_UNPACK_TRANSPOSE: u32 = 1 << 26;
 /// [`GATHER`]'s flag for a prefetch: RISCV B issues the record's reads on
 /// [`super::TXN_PREFETCH`], not its own ID, so nothing but an [`super::op::WAIT`] with
@@ -70,8 +71,8 @@ pub const GATHER_STREAM: u32 = 1 << 28;
 /// [`crate::format::TileFormat::slot_bytes`], each read whole into an L1 slot of the same size
 /// (`b_at + (kk * cols + j) * slot`: more tiles in a ring than an FP32 `B`'s,
 /// `docs/completed-plans/bf16-weight-storage.md` A5b), where the kernel unpacks it in its own format
-/// (`tt_kernels::matmul::SrcRoute::Tf32WithB`). A packed `B` is untransposed only (not bit 1,
-/// not [`GATHER_B_UNPACK_TRANSPOSE`]); with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
+/// (`tt_kernels::matmul::SrcRoute::Tf32WithB`). A packed `B` is untransposed only (not bit 1),
+/// but for BF16 transposed by the kernel ([`GATHER_B_UNPACK_TRANSPOSE`]); with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
 /// the writer's (zero for a stored weight): nothing is filled.
 pub const GATHER_B_FORMAT_SHIFT: u32 = 29;
 /// [`GATHER`]'s bits that hold `B`'s format code.
@@ -147,6 +148,14 @@ pub const fn gather_b_packed(flags: u32) -> bool {
 /// Whether [`GATHER`]'s `A` is packed (any format but FP32).
 pub const fn gather_a_packed(flags: u32) -> bool {
     flags & GATHER_A_FORMAT_MASK != 0
+}
+/// Whether `flags` name a transposed packed `B` that a [`GATHER`] refuses: one is read only as
+/// BF16, as it lies, for the kernel's unpacker to transpose ([`GATHER_B_UNPACK_TRANSPOSE`]; a BF16
+/// face is moved to `SrcA` as is and transposed there as an FP32 one is, roadmap W1).
+const fn gather_b_transpose_refused(flags: u32) -> bool {
+    gather_b_packed(flags)
+        && flags & 2 != 0
+        && (flags & GATHER_B_UNPACK_TRANSPOSE == 0 || flags & GATHER_B_FORMAT_MASK != GATHER_B_BF16)
 }
 /// [`GATHER`]'s flags for a `B` stored BF16 (a weight in half the bytes) beside an FP32 `A`:
 /// [`gather_b_format`] of BF16, code 1.
@@ -229,7 +238,7 @@ impl PrefetchCursor {
             return Err(super::error::RANGE);
         }
         let slot = gather_b_slot(flags)? as u32;
-        if gather_b_packed(flags) && b_t {
+        if gather_b_transpose_refused(flags) {
             return Err(super::error::RANGE);
         }
         gather_a_slot(flags)?;
@@ -380,14 +389,15 @@ pub const PAD_WRITE: u32 = 0x17;
 /// the index as `u32`, so a negative one is refused too). Rows `count..32` of
 /// each output tile are left as the slot held them.
 ///
-/// `flags` is `0`: 32-bit datums (F32, I32, Bool). **Packed BF16 is not
-/// implemented.** Its face-rows are 32 bytes, congruent to `TILE_DATA` mod 64
-/// only on an even row, so a read must take the pair a row is half of and the
-/// wanted half be moved; that code, in this record, measured 400 bytes more
-/// in RISCV B's image, which then had 172 of its 24 KiB left (a mover image
-/// may not pass `IMAGE_MAX`, now 52,224 bytes since the role images were
-/// repacked; `cargo xtask fw-size` prints the room left). `docs/plans/roadmap.md`, "Gather without staging", has the
-/// options.
+/// `flags` is `0` for 32-bit datums (F32, I32, Bool), or [`SELECT_ROWS_BF16`] with an aside
+/// region for a table of BF16 slots (roadmap W1, the BF16 embedding lookup). A BF16 face-row is 32
+/// bytes, so a source row and its output row are congruent mod 64 (what a GDDR read needs) only
+/// when their face-rows have the same parity, which the index decides: such a row is read where it
+/// goes, and any other into the aside region, at `aside + ((j * count + r) * 2 + h) * 64 +
+/// from % 64`, then moved to its place by one [`op::COPY_HALFWORDS`] of 16 datums once every read
+/// is issued (B waits for the reads before its first copy). The aside region is
+/// `(flags >> SELECT_ROWS_ASIDE_SHIFT) * 64`, `cols x count x 128` bytes of the data arena.
+/// The output tiles are BF16 tiles at the FP32 slots' stride from `stage_at`.
 ///
 /// The slots are not checked against the data arena here (the mover's image has
 /// no room for it; `tt_kernels::index::select_rows_jobs` places them from its
@@ -399,6 +409,12 @@ pub const PAD_WRITE: u32 = 0x17;
 /// [`expand`] has no L1, reads every index as `0` and so checks the record's
 /// geometry (alignment, range) and nothing about the indices.
 pub const SELECT_ROWS: u32 = 0x18;
+/// [`SELECT_ROWS`]'s flag for a table of BF16 slots: 32-byte face-rows, some moved through the
+/// aside region its flags name ([`SELECT_ROWS_ASIDE_SHIFT`]).
+pub const SELECT_ROWS_BF16: u32 = 1;
+/// [`SELECT_ROWS`]'s flags bits from which the aside region's address, in 64-byte units, is held
+/// (with [`SELECT_ROWS_BF16`]; no other bit is defined).
+pub const SELECT_ROWS_ASIDE_SHIFT: u32 = 8;
 /// A run of consecutive words of one role's mailbox: `[POKE_RUN, address,
 /// count, v0, v1, v2, v3, v4]` + `[v5, ..., v12]`, `count` in
 /// `1..=`[`POKE_RUN_MAX`], the values past `count` zero. The same words
@@ -434,8 +450,12 @@ pub const POKE_RUN_MAX: usize = 13;
 /// repeated row is still written only from the last of all `count` indices,
 /// so records that split one batch's indices between them write each address
 /// once, from the same index one record would (a row's writer is the record
-/// whose range holds its last index). Bit 0 (16-bit datums) is reserved and,
-/// as any other bit, [`super::error::RANGE`]. As with [`SELECT_ROWS`], the
+/// whose range holds its last index). With [`SCATTER_ROWS_BF16`], `X` and the
+/// staged tiles are BF16 (`X` naming its BF16 slots, the staged ones at their
+/// FP32 stride): two 32-byte face-row writes a tile column, which need no
+/// aside region (a write's addresses need only 16-byte congruence, and every
+/// BF16 face-row sits at 16 or 48 mod 64). Any other bit is
+/// [`super::error::RANGE`]. As with [`SELECT_ROWS`], the
 /// slots are not checked against the data arena here
 /// (`tt_kernels::index::scatter_rows_jobs` places them from its plan); each
 /// write's L1 range is checked as any write's is. The host's [`expand`] reads
@@ -444,6 +464,8 @@ pub const SCATTER_ROWS: u32 = 0x1A;
 /// [`SCATTER_ROWS`]'s indices are a column, `(r, 0)` of the slot: an `[n, 1]`
 /// index tensor, read where it is with no repack.
 pub const SCATTER_ROWS_COLUMN: u32 = 1 << 1;
+/// [`SCATTER_ROWS`]'s flag for a tensor of BF16 slots (a BF16 KV cache): 32-byte face-rows.
+pub const SCATTER_ROWS_BF16: u32 = 1;
 /// The bits of a [`SCATTER_ROWS`] index range ([`scatter_rows_range`]).
 const SCATTER_ROWS_RANGE: u32 = 0x3f << 8 | 0x3f << 16;
 
@@ -551,8 +573,8 @@ pub struct TensorRef {
     /// slots of their own size (roadmap W1, native BF16 arithmetic). [`READ_RUN`], [`WRITE_RUN`],
     /// [`SCATTER`] and [`GATHER`] step and size their GDDR accesses by it (a BF16 tile is read
     /// whole, its 2,112 bytes, and written as its 2,048 bytes of data); L1 keeps its
-    /// [`TILE_SLOT`] stride, so a kernel's slots do not move. Every other record, and the moves
-    /// that work on FP32 datums ([`op::READ_TRANSPOSED`], [`op::READ_BROADCAST_COL`]), refuse a
+    /// [`TILE_SLOT`] stride, so a kernel's slots do not move. [`SELECT_ROWS`] reads one with
+    /// [`SELECT_ROWS_BF16`]. Every other record, and the moves that work on FP32 datums ([`op::READ_TRANSPOSED`], [`op::READ_BROADCAST_COL`]), refuse a
     /// BF16 slot ([`super::error::RANGE`]).
     pub slot: u32,
 }
@@ -703,6 +725,7 @@ impl Cursor<'_> {
         self.next_with_slot(TILE_SLOT)
     }
 
+    #[inline(always)]
     fn next_with_slot(&mut self, stride: u64) -> Result<(u32, u32), u32> {
         let c = self.c as usize;
         let offset = (self.x.base[c] as u64) + self.slot as u64 * stride;
@@ -887,7 +910,8 @@ fn tensor_of(rec: &[[u32; 8]], at: usize, any: bool, slotted: bool) -> Result<Te
 }
 
 /// A [`GATHER`]'s `B` span, by its reference's marks: by column ([`BSpan::of_columns`]) where its
-/// reader asks for that order, else none (a tile at a time). Refuses an order its `B` cannot take, a mark beside a layout it does
+/// reader asks for that order, else none (a tile at a time, or resident: a resident `B`'s mark names
+/// the order its slots hold). Refuses an order its `B` cannot take, a mark beside a layout it does
 /// not describe, and a read ahead ([`GATHER_PREFETCH`]) of a `B` laid by column but read a tile
 /// at a time: [`PrefetchCursor`] walks only interleaved tiles, so that its per-read code is the
 /// interleaved code alone (the host reads such a record in place, `tile_op::ahead::split`).
@@ -908,8 +932,12 @@ fn gather_span(
         return Err(super::error::LAYOUT);
     }
     if l1_by_column(rec, 3) {
-        if b.col_tiles == 0 || b_t || b_resident {
+        if b.col_tiles == 0 || b_t {
             return Err(super::error::LAYOUT);
+        }
+        // Resident, the mark names the order its slots already hold: nothing is read.
+        if b_resident {
+            return Ok(None);
         }
         let piece = BSpan::piece(flags, slot);
         return BSpan::of_columns(b, b_at, kt, j0, cols, slot, piece).map(Some);
@@ -940,6 +968,56 @@ struct ColumnWalk {
     thin: u32,
 }
 
+/// [`SELECT_ROWS`] of a BF16 table, its indices checked: each index's two face-rows of every tile
+/// column read where they go when their parity agrees, else into the aside region, then the aside
+/// ones moved to their places (the record's documentation). Out of line, as its own code: the F32
+/// arm's loop is the hot one.
+#[inline(never)]
+fn select_bf16_rows(
+    table: &TensorRef,
+    index: &mut dyn FnMut(u32) -> u32,
+    [idx_at, count, j0, cols, stage_at, flags]: [u32; 6],
+    emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    const DATA: u32 = TILE_DATA as u32;
+    let aside = (flags >> SELECT_ROWS_ASIDE_SHIFT) * 64;
+    let slot = table.slot_bytes();
+    let word = |r: u32| idx_at + DATA + (r / 16 * 256 + r % 16) * 4;
+    // A BF16 tile's face-row `h` of row `r`: 32 bytes, at 16 or 48 mod 64.
+    let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * 32;
+    // Where row `r`'s face-row `h` of tile column `j` lands (`from` its source), and whether that
+    // is the aside region.
+    let at = |from: u32, r: u32, j: u32, h: u32| {
+        let to = stage_at + j * TILE_SLOT as u32 + face_row(r, h);
+        if (from ^ to) % 64 == 0 {
+            (to, to, false)
+        } else {
+            (aside + ((j * count + r) * 2 + h) * 64 + from % 64, to, true)
+        }
+    };
+    let mut port = 0;
+    for copies in [false, true] {
+        for r in 0..count {
+            let v = index(word(r));
+            let mut row = table.cursor(v / 32, j0)?;
+            for j in 0..cols {
+                let (ch, off) = row.next_with_slot(slot)?;
+                for h in 0..2 {
+                    let from = off + face_row(v % 32, h);
+                    let (got, to, aside) = at(from, r, j, h);
+                    if !copies {
+                        emit([op::READ, ch, port, from, got, 32, 0, 0])?;
+                        port = if port + 1 == PORTS { 0 } else { port + 1 };
+                    } else if aside {
+                        emit([super::op::COPY_HALFWORDS, got, to, 16, 2, 2, 0, 0])?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`ColumnWalk`]'s reads of `x`, in a record [`gather_by_column`] took out of line, as every
 /// by-column path is: [`TensorRef::tile`], [`Cursor`] and the [`GATHER`] arm stay the interleaved
 /// code alone. The mover's per-tile loops are hot for every op, and a by-column branch in them, or
@@ -960,7 +1038,9 @@ fn walk_by_column(
         return Err(super::error::RANGE);
     }
     let down = w.transposed.is_some();
-    let slot = if down { size } else { w.slot };
+    // An operand's own slot, read whole: down a column too, where only an FP32 one or a BF16 `B`
+    // the kernel transposes ([`GATHER_B_UNPACK_TRANSPOSE`]) goes.
+    let slot = w.slot;
     // A tile's slot is `(g * per + r) * slot` on channel `c`: by column, `g` its column group,
     // `per` a column's tiles and `r` its row; interleaved, `g` its slot (`per` 1, `r` 0). Each
     // next tile is a step, the channel carrying into `g`: down a column by column, a row; along
@@ -998,7 +1078,7 @@ fn walk_by_column(
             0
         };
         let (op, data, bytes) = match (w.transposed, thin) {
-            (Some(op), _) => (op, 0, size),
+            (Some(op), _) => (op, 0, w.slot),
             (None, 0) => (op::READ, 0, w.slot),
             (None, thin) => (op::READ, TILE_DATA as u32, 1024 + 64 * thin),
         };
@@ -1088,6 +1168,19 @@ fn gather_by_column(
     walk_by_column(b, &walk, emit)
 }
 
+/// A [`GATHER`]'s `B` span ([`gather_span`]) read beside an `A` its arm read in line, each piece
+/// one request, by column. Out of line, so the arm's own code is the interleaved code with one
+/// test between its loops.
+#[cold]
+#[inline(never)]
+fn gather_span_reads(
+    span: &BSpan,
+    b: &TensorRef,
+    emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    (0..span.count()).try_for_each(|n| emit(span.read_by_column(b, n)))
+}
+
 fn extent(v: u32) -> Result<u32, u32> {
     if v == 0 || v > MAX_EXTENT {
         Err(super::error::LENGTH)
@@ -1106,7 +1199,7 @@ fn extent(v: u32) -> Result<u32, u32> {
 /// The host's expansion, for validation: it has no L1, so a [`SELECT_ROWS`]
 /// or [`SCATTER_ROWS`] index reads as `0` (see there).
 pub fn expand(rec: &[[u32; 8]], emit: impl FnMut([u32; 8]) -> Result<(), u32>) -> Result<(), u32> {
-    expand_for::<true, true>(rec, &mut |_| 0, emit)
+    expand_for::<true, true>(rec, &mut |_| 0, &mut Entries(emit))
 }
 
 /// [`expand`] of the reading records only ([`Direction::Read`]): what RISCV
@@ -1119,7 +1212,17 @@ pub fn expand_reads(
     mut index: impl FnMut(u32) -> u32,
     emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    expand_for::<true, false>(rec, &mut index, emit)
+    expand_for::<true, false>(rec, &mut index, &mut Entries(emit))
+}
+
+/// [`expand_reads`] into a [`Sink`], which may take a gather's whole-tile reads as their words
+/// ([`Sink::read`]) rather than as entries: what RISCV B's firmware calls.
+pub fn expand_reads_into(
+    rec: &[[u32; 8]],
+    mut index: impl FnMut(u32) -> u32,
+    sink: &mut impl Sink,
+) -> Result<(), u32> {
+    expand_for::<true, false>(rec, &mut index, sink)
 }
 
 /// [`expand`] of the writing records only: what RISCV NC's firmware calls.
@@ -1130,14 +1233,38 @@ pub fn expand_writes(
     mut index: impl FnMut(u32) -> u32,
     emit: impl FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    expand_for::<false, true>(rec, &mut index, emit)
+    expand_for::<false, true>(rec, &mut index, &mut Entries(emit))
+}
+
+/// Where a record's expansion goes ([`expand_reads_into`]): each entry in order, and a
+/// [`GATHER`]'s whole-tile reads as the words of their [`op::READ`] entries, which by default
+/// are those entries ([`Sink::read`]). A sink that takes the words makes the same reads from
+/// them, in the same order among the entries, without the entry between.
+pub trait Sink {
+    fn entry(&mut self, e: [u32; 8]) -> Result<(), u32>;
+
+    /// `[op::READ, channel, port, offset, to, len, 0, 0]`.
+    #[inline(always)]
+    fn read(&mut self, channel: u32, port: u32, offset: u32, to: u32, len: u32) -> Result<(), u32> {
+        self.entry([op::READ, channel, port, offset, to, len, 0, 0])
+    }
+}
+
+/// A closure that takes every entry, a gather's reads among them.
+struct Entries<F>(F);
+
+impl<F: FnMut([u32; 8]) -> Result<(), u32>> Sink for Entries<F> {
+    #[inline(always)]
+    fn entry(&mut self, e: [u32; 8]) -> Result<(), u32> {
+        (self.0)(e)
+    }
 }
 
 #[inline(always)]
 fn expand_for<const READS: bool, const WRITES: bool>(
     rec: &[[u32; 8]],
     index: &mut impl FnMut(u32) -> u32,
-    mut emit: impl FnMut([u32; 8]) -> Result<(), u32>,
+    sink: &mut impl Sink,
 ) -> Result<(), u32> {
     let h = rec[0];
     if rec.len() != len(h[0]) || !is_record(h[0]) {
@@ -1163,7 +1290,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 return Err(super::error::RANGE);
             }
             let b_slot = gather_b_slot(flags)?;
-            if gather_b_packed(flags) && b_t {
+            if gather_b_transpose_refused(flags) {
                 return Err(super::error::RANGE);
             }
             let a_slot = gather_a_slot(flags)?;
@@ -1189,33 +1316,39 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     };
                     Ok([op, ch, (i + j) % PORTS, off, to, TILE_SLOT as u32, 0, 0])
                 };
-            // An untransposed operand's row is consecutive tiles: a cursor
-            // steps along it. A transposed one is read down a column.
-            let read = |(ch, off): (u32, u32), i: u32, j: u32, to: u32| {
-                [
-                    op::READ,
-                    ch,
-                    (i + j) % PORTS,
-                    off,
-                    to,
-                    TILE_SLOT as u32,
-                    0,
-                    0,
-                ]
-            };
+            // An untransposed operand's row is consecutive tiles: a cursor steps along it, each
+            // tile a whole read in its slot, port `(i + j) % PORTS` ([`Sink::read`]). A
+            // transposed one is read down a column.
             let thin = (flags >> GATHER_ROWS_SHIFT) & 0x1f;
             if thin > 16 || (thin != 0 && a_t) {
                 return Err(super::error::RANGE);
             }
-            // A by-column operand, or a mark of the L1 order, goes out of line once a record: what
-            // follows is the interleaved code as it was before the layout, byte for byte (tests in
-            // its per-tile loops, or its blocks spread apart, cost every model 2-3%: the movers'
-            // code shares L1 with the compute cores' instruction fetches).
-            if a.col_tiles != 0 || b.col_tiles != 0 || l1_by_column(rec, 1) || l1_by_column(rec, 3)
+            // A by-column operand the record reads, or a mark of the L1 order on one, goes out of
+            // line once a record: what follows is the interleaved code as it was before the
+            // layout, byte for byte (tests in its per-tile loops, or its blocks spread apart, cost
+            // every model 2-3%: the movers' code shares L1 with the compute cores' instruction
+            // fetches). A resident operand's layout names nothing read: a multicast sender of `A`
+            // beside a resident weight reads its `A` here, inline. A mark on `A` is refused there.
+            // A `B` taken into L1 by column ([`BSpan`]) beside an interleaved (or resident) `A`
+            // stays too: `A`'s tiles take the loop below ([`Sink::read`]), and `B`'s span, checked
+            // before anything is read, is read out of line after them ([`gather_span_reads`]).
+            let b_span = !b_resident
+                && l1_by_column(rec, 3)
+                && !l1_by_column(rec, 1)
+                && (resident || a.col_tiles == 0);
+            if !b_span
+                && (l1_by_column(rec, 1)
+                    || (!resident && a.col_tiles != 0)
+                    || (!b_resident && (b.col_tiles != 0 || l1_by_column(rec, 3))))
             {
                 let slots = [a_slot as u32, b_slot as u32];
-                return gather_by_column(rec, &a, &b, slots, &mut emit);
+                return gather_by_column(rec, &a, &b, slots, &mut |e| sink.entry(e));
             }
+            // Checked before anything is read; `Some` for a `B` read and marked.
+            let span = match b_span {
+                true => gather_span(rec, &b, flags, b_at, kt, j0, cols, b_slot as u32)?,
+                false => None,
+            };
             for i in (0..rows).filter(|_| !resident) {
                 let mut row = if a_t {
                     None
@@ -1226,11 +1359,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 for kk in 0..kt {
                     let to = a_at + (i * kt + kk) * a_slot as u32;
                     match row.as_mut() {
-                        // A packed `A` (untransposed, whole tiles): its own slot, read whole.
-                        Some(c) if a_slot != TILE_SLOT => {
-                            let mut e = read(c.next_with_slot(a_slot)?, i0 + i, kk, to);
-                            e[5] = a_slot as u32;
-                            emit(e)?;
+                        // A whole tile in its slot: a packed `A`'s (untransposed, whole tiles)
+                        // its own, an FP32 one's `TILE_SLOT` (unless thin, below).
+                        Some(c) if a_slot != TILE_SLOT || r == 0 => {
+                            let (ch, off) = c.next_with_slot(a_slot)?;
+                            sink.read(ch, (i0 + i + kk) % PORTS, off, to, a_slot as u32)?;
                         }
                         // One read of the datums through row `r - 1` of face 1:
                         // face 0 whole (its rows past `r` reach only the
@@ -1238,11 +1371,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                         // entry a tile, as a whole tile is: the mover's cost is
                         // per entry as much as per byte (two face-row reads a
                         // tile measured slower on small products).
-                        Some(c) if r != 0 => {
+                        Some(c) => {
                             let (ch, off) = c.next()?;
                             const DATA: u32 = TILE_DATA as u32;
                             let port = (i0 + i + kk) % PORTS;
-                            emit([
+                            sink.entry([
                                 op::READ,
                                 ch,
                                 port,
@@ -1253,27 +1386,31 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                                 0,
                             ])?;
                         }
-                        Some(c) => emit(read(c.next()?, i0 + i, kk, to))?,
-                        None => emit(fetch(&a, a_t, i0 + i, kk, to)?)?,
+                        None => sink.entry(fetch(&a, a_t, i0 + i, kk, to)?)?,
                     }
                 }
+            }
+            if let Some(span) = span {
+                return gather_span_reads(&span, &b, &mut |e| sink.entry(e));
             }
             for kk in (0..kt).filter(|_| !b_resident) {
                 let mut row = if b_t { None } else { Some(b.cursor(kk, j0)?) };
                 for j in 0..cols {
                     let to = b_at + (kk * cols + j) * b_slot as u32;
-                    emit(match row.as_mut() {
-                        // A BF16 `B` (untransposed): its own slot, read whole.
-                        Some(r) if b_slot != TILE_SLOT => {
-                            let mut e = read(r.next_with_slot(b_slot)?, kk, j0 + j, to);
-                            e[5] = b_slot as u32;
-                            e
+                    let port = (kk + j0 + j) % PORTS;
+                    match row.as_mut() {
+                        // Untransposed: a whole tile in its slot (a packed `B`'s its own).
+                        Some(r) => {
+                            let (ch, off) = r.next_with_slot(b_slot)?;
+                            sink.read(ch, port, off, to, b_slot as u32)?;
                         }
-                        Some(r) => read(r.next()?, kk, j0 + j, to),
-                        // The kernel transposes it: the tile as it lies.
-                        None if b_unpacked => read(b.tile(j0 + j, kk)?, kk, j0 + j, to),
-                        None => fetch(&b, b_t, kk, j0 + j, to)?,
-                    })?;
+                        // The kernel transposes it: the tile as it lies, in its own slot.
+                        None if b_unpacked => {
+                            let (ch, off) = b.tile_in(j0 + j, kk, b_slot)?;
+                            sink.read(ch, port, off, to, b_slot as u32)?;
+                        }
+                        None => sink.entry(fetch(&b, b_t, kk, j0 + j, to)?)?,
+                    }
                 }
             }
         }
@@ -1287,7 +1424,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 for j in 0..cols {
                     let (ch, off) = row.next_with_slot(whole)?;
                     let out = out_at + (i * cols + j) * stride;
-                    emit([
+                    sink.entry([
                         op::WRITE,
                         ch,
                         (i + j) % PORTS,
@@ -1367,7 +1504,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 } else {
                     op::READ
                 };
-                emit(if read {
+                sink.entry(if read {
                     [op, ch, n % PORTS, off, slot, whole, 0, 0]
                 } else {
                     [
@@ -1385,15 +1522,21 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         }
         SELECT_ROWS => {
             let [_, idx_at, count, bound, j0, cols, stage_at, flags] = h;
-            if flags != 0 {
-                // Packed BF16 is not implemented.
+            // A BF16 table names its slots; an FP32 one, and any other flag, none.
+            let half = flags & SELECT_ROWS_BF16 != 0;
+            if flags & ((1 << SELECT_ROWS_ASIDE_SHIFT) - 1) & !SELECT_ROWS_BF16 != 0
+                || (!half && flags != 0)
+            {
                 return Err(super::error::RANGE);
             }
             if count == 0 || count > 32 || bound == 0 || bound > i32::MAX as u32 {
                 return Err(super::error::LENGTH);
             }
             let cols = extent(cols)?;
-            let table = tensor(rec, 1)?;
+            let table = tensor_slotted(rec, 1)?;
+            if half != (table.slot != 0) {
+                return Err(super::error::RANGE);
+            }
             // Every tile number a checked index can name fits a `u32` (the
             // cursor adds without checking: an index comes from L1).
             let tiles = bound
@@ -1418,6 +1561,14 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     return Err(super::error::DOMAIN);
                 }
             }
+            if half {
+                return select_bf16_rows(
+                    &table,
+                    index,
+                    [idx_at, count, j0, cols, stage_at, flags],
+                    &mut |e| sink.entry(e),
+                );
+            }
             // A tile row's face-row `h` of row `r`: two 64-byte reads a row a
             // tile column, each congruent to `TILE_DATA` mod 64 in every slot.
             let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * 64;
@@ -1430,7 +1581,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     for half in 0..core::hint::black_box(2) {
                         let from = off + face_row(v % 32, half);
                         let to = stage_at + j * TILE_SLOT as u32 + face_row(r, half);
-                        emit([op::READ, ch, port, from, to, 64, 0, 0])?;
+                        sink.entry([op::READ, ch, port, from, to, 64, 0, 0])?;
                         port = if port + 1 == PORTS { 0 } else { port + 1 };
                     }
                 }
@@ -1438,8 +1589,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         }
         SCATTER_ROWS if WRITES => {
             let [_, idx_at, count, bound, j0, cols, stage_at, flags] = h;
-            if flags & !(SCATTER_ROWS_COLUMN | SCATTER_ROWS_RANGE) != 0 {
-                // 16-bit datums (bit 0) are not implemented.
+            if flags & !(SCATTER_ROWS_BF16 | SCATTER_ROWS_COLUMN | SCATTER_ROWS_RANGE) != 0 {
                 return Err(super::error::RANGE);
             }
             // The indices written: a range of them, or (none given) all.
@@ -1452,6 +1602,16 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 return Err(super::error::RANGE);
             };
             let (x, cols) = indexed_rows(rec, count, bound, j0, cols)?;
+            // A BF16 tensor names its slots, and only a BF16 one does.
+            let half = flags & SCATTER_ROWS_BF16 != 0;
+            if half != (x.slot != 0) {
+                return Err(super::error::RANGE);
+            }
+            // A face-row's bytes: 64 for FP32, 32 for BF16; a tile's slot in `X` likewise.
+            let (row_bytes, slot) = match half {
+                true => (32, x.slot_bytes()),
+                false => (64, TILE_SLOT),
+            };
             // As `SELECT_ROWS`: every index checked before any write, each
             // read again where it is used, 32-bit arithmetic throughout.
             const DATA: u32 = TILE_DATA as u32;
@@ -1469,7 +1629,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     return Err(super::error::DOMAIN);
                 }
             }
-            let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * 64;
+            let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * row_bytes;
             let mut port = 0;
             for r in first..end.min(count) {
                 let v = index(word(r));
@@ -1483,11 +1643,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 }
                 let mut row = x.cursor(v / 32, j0)?;
                 for j in 0..cols {
-                    let (ch, off) = row.next()?;
+                    let (ch, off) = row.next_with_slot(slot)?;
                     for half in 0..core::hint::black_box(2) {
                         let to = off + face_row(v % 32, half);
                         let from = stage_at + j * TILE_SLOT as u32 + face_row(r, half);
-                        emit([op::WRITE, ch, port, to, from, 64, 0, 0])?;
+                        sink.entry([op::WRITE, ch, port, to, from, row_bytes, 0, 0])?;
                         port = if port + 1 == PORTS { 0 } else { port + 1 };
                     }
                 }
@@ -1513,11 +1673,11 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             for k in 0..count {
                 let at = h[1].checked_add(4 * k as u32).ok_or(super::error::RANGE)?;
                 // Every word through `op::POKE`, which bounds it to one role's mailbox.
-                emit([op::POKE, at, poke_run_word(rec, k), 0, 0, 0, 0, 0])?;
+                sink.entry([op::POKE, at, poke_run_word(rec, k), 0, 0, 0, 0, 0])?;
             }
         }
-        FILL_PAD => pad::<false>(rec, &mut emit)?,
-        PAD_WRITE => pad::<true>(rec, &mut emit)?,
+        FILL_PAD => pad::<false>(rec, &mut |e| sink.entry(e))?,
+        PAD_WRITE => pad::<true>(rec, &mut |e| sink.entry(e))?,
         _ => return Err(super::error::OP),
     }
     Ok(())
@@ -1538,7 +1698,7 @@ fn indexed_rows(
         return Err(super::error::LENGTH);
     }
     let cols = extent(cols)?;
-    let x = tensor(rec, 1)?;
+    let x = tensor_slotted(rec, 1)?;
     // Every tile number a checked index can name fits a `u32` (the cursor
     // adds without checking: an index comes from L1).
     let tiles = bound
@@ -1935,6 +2095,7 @@ mod tests {
                     GATHER_A_RESIDENT | 2 | GATHER_B_UNPACK_TRANSPOSE,
                     GATHER_A_RESIDENT | GATHER_B_BF16,
                     GATHER_A_RESIDENT | gather_rows(5) | GATHER_B_BF16,
+                    GATHER_A_RESIDENT | GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
                 ] {
                     let head = |f: u32| [GATHER, f | kt << 8, 0x2_0000, 0x6_0000, 0, 1, j0, cols];
                     let rec = |f: u32| {
@@ -1990,7 +2151,10 @@ mod tests {
             (GATHER_A_RESIDENT | GATHER_STREAM, t(2, 4)),
             (GATHER_A_RESIDENT | GATHER_B_BF16 | 2, t(2, 4)),
             (
-                GATHER_A_RESIDENT | GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
+                GATHER_A_RESIDENT
+                    | gather_b_format(crate::tile::L1Format::Bfp8).unwrap()
+                    | 2
+                    | GATHER_B_UNPACK_TRANSPOSE,
                 t(2, 4),
             ),
         ] {
@@ -2173,8 +2337,9 @@ mod tests {
     /// A BF16 `B` ([`GATHER_B_BF16`]) is read from its own slots: each tile's whole
     /// [`super::super::BF16_TILE_SLOT`] from where a BF16 tensor keeps it (slot `t / n` of 2,112
     /// bytes on channel `t % n`), into a 2,112-byte L1 slot of its own (an FP32 `B`'s ring holds
-    /// half the tiles in the same bytes), and `A`'s entries are untouched -- whole, thin, transposed, resident, streamed. A transposed `B` and
-    /// packed BF16 are refused.
+    /// half the tiles in the same bytes), and `A`'s entries are untouched -- whole, thin, transposed, resident, streamed. A transposed BF16
+    /// `B` is read as it lies for the kernel's unpacker to transpose ([`GATHER_B_UNPACK_TRANSPOSE`]);
+    /// read transposed by the mover, or in another packed format, it is refused.
     #[test]
     fn a_bf16_b_reads_its_own_slots_whole() {
         use super::super::BF16_TILE_SLOT;
@@ -2211,6 +2376,10 @@ mod tests {
             GATHER_A_RESIDENT,
             GATHER_STREAM,
             GATHER_A_RESIDENT | GATHER_PREFETCH,
+            // Transposed by the kernel's unpacker: tile `(kk, j)` of `op(B)` is `B`'s `(j, kk)`,
+            // read as it lies in its own slot.
+            2 | GATHER_B_UNPACK_TRANSPOSE,
+            GATHER_A_RESIDENT | GATHER_PREFETCH | 2 | GATHER_B_UNPACK_TRANSPOSE,
         ] {
             let f32_b = gather(flags).unwrap();
             let bf16_b = gather(flags | GATHER_B_BF16).unwrap();
@@ -2223,7 +2392,11 @@ mod tests {
             );
             for (n, (got, was)) in bf16_b[first_b..].iter().zip(&f32_b[first_b..]).enumerate() {
                 let (kk, j) = (n as u32 / cols, n as u32 % cols);
-                let tile = b.first + kk * b.ct + j0 + j;
+                let tile = if flags & 2 != 0 {
+                    b.first + (j0 + j) * b.ct + kk
+                } else {
+                    b.first + kk * b.ct + j0 + j
+                };
                 let (slot, c) = (tile / b.n as u32, (tile % b.n as u32) as usize);
                 let want = [
                     op::READ,
@@ -2245,9 +2418,11 @@ mod tests {
             }
         }
         assert!(cases > 50);
+        let bfp8 = gather_b_format(crate::tile::L1Format::Bfp8).unwrap();
         for bad in [
             GATHER_B_BF16 | 2,
-            GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
+            bfp8 | 2,
+            bfp8 | 2 | GATHER_B_UNPACK_TRANSPOSE,
         ] {
             assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
         }
@@ -2369,6 +2544,124 @@ mod tests {
             assert_eq!(e[3] % 64, e[4] % 64);
         }
         assert_eq!(got.len(), values.len() * cols as usize * 2);
+    }
+
+    /// A BF16 table's rows (roadmap W1, the BF16 lookup): what the expansion's reads and copies
+    /// do, run against a GDDR and an L1 of bytes, puts every datum of each index's row in its
+    /// output row, bit for bit, where the face layout (`face_index`) says, independently of
+    /// `expand`'s arithmetic, and touches no row past `count`. Every read is 32 bytes, congruent
+    /// mod 64 at both ends; a row whose parity differs from its source's goes through the aside
+    /// region, so both kinds occur, and every copy comes after every read.
+    #[test]
+    fn select_rows_moves_bf16_rows_whole_through_the_aside_region() {
+        let mut table = t(3, 5);
+        table.first = 2;
+        table.slot = BF16_TILE_SLOT as u32;
+        let bound = 100;
+        let values = [
+            0u32, 99, 31, 32, 33, 5, 5, 64, 17, 16, 63, 95, 1, 2, 3, 4, 5, 6,
+        ];
+        let (j0, cols, count) = (1u32, 3u32, values.len() as u32);
+        let aside = 0x6_0000u32;
+        let [m0, m1] = table.encode();
+        let flags = SELECT_ROWS_BF16 | (aside / 64) << SELECT_ROWS_ASIDE_SHIFT;
+        let rec = [
+            [SELECT_ROWS, IDX, count, bound, j0, cols, STAGE, flags],
+            m0,
+            m1,
+        ];
+        let mut got = Vec::new();
+        expand_reads(&rec, l1_of(&values), |e| {
+            got.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let gddr =
+            |ch: u32, at: u32| (ch.wrapping_mul(7919) ^ at.wrapping_mul(2_654_435_761) >> 7) as u8;
+        let mut l1 = std::collections::HashMap::<u32, u8>::new();
+        let (mut reads, mut copies, mut moved) = (0, 0, 0);
+        for e in &got {
+            match e[0] {
+                op::READ => {
+                    assert_eq!(copies, 0, "a read after a copy");
+                    assert_eq!((e[5], e[3] % 64), (32, e[4] % 64), "{e:x?}");
+                    for b in 0..32 {
+                        l1.insert(e[4] + b, gddr(e[1], e[3] + b));
+                    }
+                    moved += u32::from(e[4] >= aside);
+                    reads += 1;
+                }
+                crate::dm::op::COPY_HALFWORDS => {
+                    assert_eq!(e[3..6], [16, 2, 2]);
+                    assert!(e[1] >= aside && e[2] < aside, "{e:x?}");
+                    for b in 0..32 {
+                        let v = l1[&(e[1] + b)];
+                        l1.insert(e[2] + b, v);
+                    }
+                    copies += 1;
+                }
+                other => panic!("an entry {other:#x}"),
+            }
+        }
+        assert_eq!(reads, count * cols * 2);
+        assert_eq!(copies, moved);
+        assert!(
+            copies > 0 && copies < reads,
+            "both kinds: {copies} of {reads}"
+        );
+        for (r, &v) in values.iter().enumerate() {
+            for j in 0..cols {
+                let (ch, off) = table.tile_in(v / 32, j0 + j, BF16_TILE_SLOT).unwrap();
+                for c in 0..32 {
+                    let from = off
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index((v % 32) as usize, c) as u32;
+                    let to = STAGE
+                        + j * TILE_SLOT as u32
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index(r, c) as u32;
+                    for b in 0..2 {
+                        assert_eq!(
+                            l1.get(&(to + b)),
+                            Some(&gddr(ch, from + b)),
+                            "row {r} (index {v}), tile column {j}, column {c}"
+                        );
+                    }
+                }
+            }
+        }
+        // Rows past `count` are the slot's as it was.
+        for j in 0..cols {
+            for r in count as usize..32 {
+                for c in 0..32 {
+                    let to = STAGE
+                        + j * TILE_SLOT as u32
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index(r, c) as u32;
+                    assert!(!l1.contains_key(&to), "row {r} written");
+                }
+            }
+        }
+        // A BF16 flag with an FP32 table, an FP32 record of a BF16 table, an undefined flag bit.
+        let fp32 = t(3, 5);
+        let [f0, f1] = fp32.encode();
+        for (flags, refs) in [
+            (SELECT_ROWS_BF16, [f0, f1]),
+            (0, [m0, m1]),
+            (SELECT_ROWS_BF16 | 2, [m0, m1]),
+            (aside << 2, [f0, f1]),
+        ] {
+            let rec = [
+                [SELECT_ROWS, IDX, 1, bound, 0, 1, STAGE, flags],
+                refs[0],
+                refs[1],
+            ];
+            assert_eq!(
+                expand_reads(&rec, l1_of(&[0]), |_| Ok(())),
+                Err(crate::dm::error::RANGE),
+                "{flags:#x}"
+            );
+        }
     }
 
     /// An index at or past `bound`, or a negative one, is `DOMAIN` before a
@@ -2542,6 +2835,71 @@ mod tests {
             for e in &got {
                 assert_eq!(e[3] % 64, e[4] % 64);
             }
+        }
+    }
+
+    /// A BF16 tensor's rows (roadmap W1, a BF16 KV cache's write): the expansion's writes, run
+    /// against an L1 and a GDDR of bytes, put every datum of each staged row in its destination
+    /// row, bit for bit, where the face layout (`face_index`) says, independently of `expand`'s
+    /// arithmetic, and write nothing else. Every write is 32 bytes, congruent mod 16 (what a
+    /// write needs); rows of both parities are written straight. A BF16 flag on an FP32 tensor,
+    /// and an FP32 record on a BF16 one, are refused.
+    #[test]
+    fn scatter_rows_writes_bf16_rows_whole() {
+        let mut x = t(3, 5);
+        x.first = 2;
+        x.slot = BF16_TILE_SLOT as u32;
+        let bound = 100;
+        let values = [0u32, 99, 31, 32, 33, 5, 64, 17, 16, 63, 95, 1, 2, 3, 4, 6];
+        let (j0, cols, count) = (1u32, 3u32, values.len() as u32);
+        let rec = scatter(x, bound, count, j0, cols, SCATTER_ROWS_BF16);
+        let mut got = Vec::new();
+        expand_writes(&rec, l1_of(&values), |e| {
+            got.push(e);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got.len() as u32, count * cols * 2);
+        let staged = |at: u32| (at.wrapping_mul(2_654_435_761) >> 11) as u8;
+        let mut gddr = std::collections::HashMap::<(u32, u32), u8>::new();
+        let mut parities = [0; 2];
+        for e in &got {
+            assert_eq!(e[0], op::WRITE);
+            assert_eq!((e[5], e[3] % 16), (32, e[4] % 16), "{e:x?}");
+            parities[usize::from((e[3] ^ e[4]) % 64 != 0)] += 1;
+            for b in 0..32 {
+                assert!(gddr.insert((e[1], e[3] + b), staged(e[4] + b)).is_none());
+            }
+        }
+        assert!(parities[0] > 0 && parities[1] > 0, "{parities:?}");
+        for (r, &v) in values.iter().enumerate() {
+            for j in 0..cols {
+                let (ch, off) = x.tile_in(v / 32, j0 + j, BF16_TILE_SLOT).unwrap();
+                for c in 0..32 {
+                    let to = off
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index((v % 32) as usize, c) as u32;
+                    let from = STAGE
+                        + j * TILE_SLOT as u32
+                        + TILE_DATA as u32
+                        + 2 * crate::dm::face_index(r, c) as u32;
+                    for b in 0..2 {
+                        assert_eq!(gddr[&(ch, to + b)], staged(from + b), "row {v} column {c}");
+                    }
+                }
+            }
+        }
+        // The flag and the tensor's slots agree, or nothing is written.
+        let mut fp32 = x;
+        fp32.slot = 0;
+        for rec in [
+            scatter(fp32, bound, count, j0, cols, SCATTER_ROWS_BF16),
+            scatter(x, bound, count, j0, cols, 0),
+        ] {
+            assert_eq!(
+                expand_writes(&rec, l1_of(&values), |_| Ok(())),
+                Err(crate::dm::error::RANGE)
+            );
         }
     }
 
@@ -3073,6 +3431,82 @@ mod tests {
         }
     }
 
+    /// A multicast sender of `A` beside a resident weight: a `B` laid by column (marked or not)
+    /// that the record does not read leaves it inline, its `A` reads through [`Sink::read`] as an
+    /// interleaved `B`'s record's are, entry for entry. Read, the same `B` sends it out of line.
+    #[test]
+    fn an_a_beside_a_b_laid_by_column_is_read_inline() {
+        struct Counted(Vec<[u32; 8]>, usize);
+        impl Sink for Counted {
+            fn entry(&mut self, e: [u32; 8]) -> Result<(), u32> {
+                self.0.push(e);
+                Ok(())
+            }
+            fn read(&mut self, ch: u32, port: u32, off: u32, to: u32, len: u32) -> Result<(), u32> {
+                self.1 += 1;
+                self.entry([op::READ, ch, port, off, to, len, 0, 0])
+            }
+        }
+        let a = TensorRef {
+            n: 2,
+            ct: 6,
+            channels: [3, 5, 0, 0, 0, 0, 0, 0],
+            base: [0x10_0000, 0x20_0000, 0, 0, 0, 0, 0, 0],
+            ..TensorRef::default()
+        };
+        let interleaved = TensorRef {
+            n: 1,
+            ct: 4,
+            ..TensorRef::default()
+        };
+        let (rows, kt) = (3u32, 6u32);
+        let run = |flags: u32, b: &TensorRef, mark: bool| {
+            let (ar, mut br) = (a.encode(), b.encode());
+            if mark {
+                br[0][4] |= REF_L1_BY_COLUMN;
+            }
+            let h = [GATHER, flags | kt << 8, 0x8_0000, 0x2_0000, 1, rows, 0, 2];
+            let mut sink = Counted(Vec::new(), 0);
+            expand_reads_into(&[h, ar[0], ar[1], br[0], br[1]], |_| 0, &mut sink).map(|_| sink)
+        };
+        let want = run(GATHER_B_RESIDENT, &interleaved, false).unwrap();
+        assert_eq!(
+            (want.0.len(), want.1),
+            ((rows * kt) as usize, (rows * kt) as usize)
+        );
+        for mark in [false, true] {
+            let got = run(GATHER_B_RESIDENT, &by_column(2, 4, kt, 0), mark).unwrap();
+            assert_eq!(got.0, want.0, "marked {mark}");
+            assert_eq!(got.1, want.1, "marked {mark}: every `A` read inline");
+            // Read a tile at a time, `B` by column goes out of line: no read reaches
+            // `Sink::read`. Read by column (marked), `A` stays in line, and the entries are the
+            // out-of-line expansion's.
+            let b = by_column(2, 4, kt, 0);
+            let read = run(0, &b, mark).unwrap();
+            if !mark {
+                assert_eq!(read.1, 0, "read a tile at a time");
+                continue;
+            }
+            assert_eq!(
+                read.1,
+                (rows * kt) as usize,
+                "read by column: every `A` read inline"
+            );
+            let (ar, mut br) = (a.encode(), b.encode());
+            br[0][4] |= REF_L1_BY_COLUMN;
+            let h = [GATHER, kt << 8, 0x8_0000, 0x2_0000, 1, rows, 0, 2];
+            let rec = [h, ar[0], ar[1], br[0], br[1]];
+            let (mut oracle, slot) = (Vec::new(), TILE_SLOT as u32);
+            gather_by_column(&rec, &a, &b, [slot, slot], &mut |e| {
+                oracle.push(e);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(read.0, oracle, "the out-of-line expansion's entries");
+            assert!(read.0.len() > (rows * kt) as usize, "`B`'s span read too");
+        }
+    }
+
     /// A stored weight on a product's left: an `A` laid by column is read as an interleaved `A`
     /// is, a read a tile into `a_at + (i * kt + kk) * slot`, each from where the layout puts it:
     /// whole, packed (its own slot), its last row's first rows alone (`thin`), and transposed
@@ -3305,7 +3739,8 @@ mod tests {
             }),
             Err(LAYOUT)
         );
-        // Transposed, resident, on `A`, or marked laid for its reader too.
+        // Transposed, on `A`, or marked laid for its reader too. Resident, the mark names the
+        // order the slots hold: nothing is read.
         let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
         rec[0][1] |= 2;
         rec[3][4] |= REF_L1_BY_COLUMN;
@@ -3313,7 +3748,16 @@ mod tests {
         let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
         rec[0][1] |= GATHER_B_RESIDENT;
         rec[3][4] |= REF_L1_BY_COLUMN;
-        assert_eq!(read(&rec), Err(LAYOUT));
+        assert_eq!(read(&rec), Ok(()), "resident and marked: nothing read");
+        let mut rec = b_gather(0, 4, 0, 2, &interleaved, false);
+        rec[0][1] |= GATHER_B_RESIDENT;
+        rec[3][4] |= REF_L1_BY_COLUMN;
+        // A `B` the record does not read is not checked: no read can land where the mark says.
+        assert_eq!(
+            read(&rec),
+            Ok(()),
+            "resident, marked over an interleaved `B`"
+        );
         let mut rec = b_gather(0, 4, 0, 2, &by_col, false);
         rec[1][4] |= REF_L1_BY_COLUMN;
         assert_eq!(read(&rec), Err(LAYOUT));

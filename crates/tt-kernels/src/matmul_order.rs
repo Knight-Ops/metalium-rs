@@ -1210,7 +1210,8 @@ mod tests {
     /// The subblocked kernel (`block_stream_kernel_subblocked`): what its packer reads, under an
     /// adversarial schedule of the three roles (`interpret_roles`), is each output's canonical
     /// order -- a first chunk's pairs, a continuing chunk's prior then pairs -- and the looped
-    /// kernel's, for every shape, fidelity, route and `B` transposed or not.
+    /// kernel's, for every shape, fidelity, route and `B` transposed or not, or by column in its
+    /// half (`BlockStreamLayout::b_by_column`, whose pairs `BlockStreamLayout::chunk` names).
     #[test]
     fn the_subblocked_kernel_packs_the_canonical_order() {
         ORDER_HERE.set(Some(PairOrder::Auto));
@@ -1220,16 +1221,18 @@ mod tests {
     fn subblocked_kernel_packs_the_canonical_order() {
         for tiles in SUBBLOCK_SHAPES {
             for fidelity in FIDELITIES {
-                for b_transposed in [false, true] {
+                for (b_transposed, b_by_column) in [(false, false), (true, false), (false, true)] {
                     for route in ROUTES {
-                        let layout = block_stream_layout(tiles, route.slots()).unwrap();
+                        let mut layout = block_stream_layout(tiles, route.slots()).unwrap();
+                        layout.b_by_column = b_by_column;
                         let plan = crate::tile_op::dst::RowPlan::choose(
                             tiles[2],
                             crate::tile_op::dst::DstPlan::HALF,
                         );
                         for c in [0, 1, 2] {
                             let what = format!(
-                                "{tiles:?} {fidelity:?} {route:?} bt {b_transposed} chunk {c}"
+                                "{tiles:?} {fidelity:?} {route:?} bt {b_transposed} by column \
+                                 {b_by_column} chunk {c}"
                             );
                             let want = want(&layout, c, tiles, fidelity.phases(), b_transposed);
                             let ([u, m, p], init) = block_roles(
@@ -1251,6 +1254,36 @@ mod tests {
                             assert_eq!(interpret_roles(&u, &m, &p, &init), want, "looped, {what}");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// The by-column gate's negative control: kernels stepping `B` by row read other pairs than a
+    /// `B` by column's, wherever a chunk has more than one `K` tile and column.
+    #[test]
+    fn kernels_stepping_b_by_row_miss_a_b_by_column() {
+        ORDER_HERE.set(Some(PairOrder::Auto));
+        let (route, fidelity) = (SrcRoute::Tf32FromFp32, Fidelity::HiFi4);
+        for tiles in SUBBLOCK_SHAPES.into_iter().filter(|t| t[1] > 1 && t[2] > 1) {
+            let rows = block_stream_layout(tiles, route.slots()).unwrap();
+            let by_column = BlockStreamLayout {
+                b_by_column: true,
+                ..rows.clone()
+            };
+            let plan =
+                crate::tile_op::dst::RowPlan::choose(tiles[2], crate::tile_op::dst::DstPlan::HALF);
+            for c in [0, 1] {
+                let want = want(&by_column, c, tiles, fidelity.phases(), false);
+                for plan in [Some(&plan), None] {
+                    let ([u, m, p], init) =
+                        block_roles(&rows, c, tiles, route, fidelity, false, plan);
+                    assert_ne!(
+                        interpret_roles(&u, &m, &p, &init),
+                        want,
+                        "{tiles:?} chunk {c} subblocked {}",
+                        plan.is_some()
+                    );
                 }
             }
         }

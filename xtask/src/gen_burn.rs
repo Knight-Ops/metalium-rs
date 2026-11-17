@@ -952,7 +952,10 @@ pub fn render(
                 // lie and rounds its result once (roadmap W1, native BF16 arithmetic): bit for bit
                 // the widened op narrowed, so a BF16 tensor goes to them as it is. F16, and every
                 // other op (a composition would round each of its steps), widen as before.
+                // `float_scatter_nd` moves BF16 rows whole where it can (a BF16 KV cache's write)
+                // and widens itself where it cannot.
                 const NATIVE_BF16: &[&str] = &[
+                    "float_scatter_nd",
                     "float_add",
                     "float_sub",
                     "float_mul",

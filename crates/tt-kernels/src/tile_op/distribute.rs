@@ -170,10 +170,10 @@ fn blocks(op: &TileOp, cut: Blocks<'_>, units: usize) -> Result<Deal> {
         .step_by(mb)
         .flat_map(|i0| cols.iter().map(move |c| [i0..(i0 + mb).min(rt), c.clone()]))
         .collect();
-    let shared = op
-        .share
-        .as_ref()
-        .and_then(|s| shared(rt.div_ceil(mb), cols.len(), units, s.holders, s.b_holders));
+    let shared = op.share.as_ref().and_then(|s| match s.multicast {
+        Some((a, b)) => grid(rt.div_ceil(mb), cols.len(), &s.tiles, units, a, b),
+        None => shared(rt.div_ceil(mb), cols.len(), units, s.holders, s.b_holders),
+    });
     Ok(Deal {
         runs: Vec::new(),
         blocks,
@@ -250,6 +250,112 @@ pub fn shared(
         }
     }
     // Trailing holes run nothing: the last round ends with the last unit that has a block.
+    while order.last() == Some(&None) {
+        order.pop();
+    }
+    Some(Shared {
+        order,
+        holder_of,
+        b_holder_of,
+    })
+}
+
+/// The grid that `units` of `tiles` (the first `units`, in the session's order) make: the width
+/// of the first tile row they start, and how many whole rows of that width follow, each one
+/// tile row further down with the first row's columns. `(width, rows)`.
+pub fn grid_of(tiles: &[(u8, u8)], units: usize) -> (usize, usize) {
+    let tiles = &tiles[..units.min(tiles.len())];
+    let Some(&(_, y0)) = tiles.first() else {
+        return (0, 0);
+    };
+    let width = tiles.iter().take_while(|t| t.1 == y0).count();
+    let first = &tiles[..width];
+    let mut rows = 0;
+    while (rows + 1) * width <= tiles.len() {
+        let row = &tiles[rows * width..(rows + 1) * width];
+        let y = row[0].1;
+        let aligned = row.iter().zip(first).all(|(t, f)| t.1 == y && t.0 == f.0);
+        let below = rows == 0 || y > tiles[(rows - 1) * width].1;
+        if !(aligned && below) {
+            break;
+        }
+        rows += 1;
+    }
+    (width, rows)
+}
+
+/// [`Shared`] for `rows x cols` blocks (rows outer, block `r * cols + c`) over the grid the
+/// units' tiles make ([`grid_of`]; [`crate::tensor::Reuse::Multicast`]): each grid row a group
+/// that takes whole block rows (group `k` rows `k`, `k + G`, ...), its unit in grid column `m`
+/// the row's column blocks `m`, `m + W`, ... in rounds, as [`shared`] deals a group. One unit of
+/// a grid row holds `A` for the row (with `a`), and one unit of each grid column holds `B` for
+/// the column (with `b`): the senders of `crate::tile_op::multicast`, each with a block in every
+/// round its readers have one, and no unit sending both where another choice exists. Blocks are
+/// one size, and a unit with fewer in a row or a column sits that round out. Units past the
+/// grid's whole rows run nothing; `None` where nothing would be shared.
+pub fn grid(
+    rows: usize,
+    cols: usize,
+    tiles: &[(u8, u8)],
+    units: usize,
+    a: bool,
+    b: bool,
+) -> Option<Shared> {
+    let (width, height) = grid_of(tiles, units);
+    let groups = rows.min(height);
+    let shares_a = a && width > 1 && cols > 1;
+    let shares_b = b && groups > 1;
+    if groups == 0 || !(shares_a || shares_b) {
+        return None;
+    }
+    let mut sequences: Vec<Vec<Option<usize>>> = vec![Vec::new(); units];
+    let mut holder_of = vec![None; units];
+    let mut b_holder_of = vec![None; units];
+    let rounds = cols.div_ceil(width);
+    // A sender has a block in every round any of its readers does: a member with every round of
+    // a row (`A`), a group with every row (`B`). Among those, no unit sends both where that can
+    // be helped: a unit sending both reads twice what the others do (roadmap W2's probe).
+    let full_members: Vec<usize> = (0..width.min(cols))
+        .filter(|&m| (cols - m).div_ceil(width) == rounds)
+        .collect();
+    let full_groups: Vec<usize> = (0..groups)
+        .filter(|&k| (rows - k).div_ceil(groups) == rows.div_ceil(groups))
+        .collect();
+    let a_sender = |k: usize| full_members[k % full_members.len()];
+    let b_sender = |m: usize| {
+        let n = full_groups.len();
+        (0..n)
+            .map(|i| full_groups[(m + 1 + i) % n])
+            .find(|&k| !shares_a || a_sender(k) != m)
+            .unwrap_or(full_groups[0])
+    };
+    for k in 0..groups {
+        for m in 0..width {
+            let u = k * width + m;
+            sequences[u] = (k..rows)
+                .step_by(groups)
+                .flat_map(|r| {
+                    (0..rounds).map(move |t| {
+                        let c = m + t * width;
+                        (c < cols).then_some(r * cols + c)
+                    })
+                })
+                .collect();
+            if shares_a && m != a_sender(k) {
+                holder_of[u] = Some(k * width + a_sender(k));
+            }
+            if shares_b && k != b_sender(m) {
+                b_holder_of[u] = Some(b_sender(m) * width + m);
+            }
+        }
+    }
+    let longest = sequences.iter().map(Vec::len).max().unwrap_or(0);
+    let mut order = vec![None; longest * units];
+    for (u, sequence) in sequences.iter().enumerate() {
+        for (t, &b) in sequence.iter().enumerate() {
+            order[t * units + u] = b;
+        }
+    }
     while order.last() == Some(&None) {
         order.pop();
     }

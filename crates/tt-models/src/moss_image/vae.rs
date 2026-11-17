@@ -162,10 +162,11 @@ pub struct Upsampler<B: Backend> {
 }
 
 /// `x` (`[n, c, h, w]`) at twice the resolution, each pixel repeated 2 x 2 (nearest): each row
-/// repeated, then each column as a row of the transpose. Whole rows move as blocks; broadcasting a
-/// trailing axis of one instead (`[.., w, 1] -> [.., w, 2]`) interleaves single elements, which
-/// the card's block copier refuses past ~400 K elements (`silicon_probe_moss_image_ops`,
-/// 2026-10-30).
+/// repeated, then each column as a row of the transpose. Whole rows move as blocks. Broadcasting a
+/// trailing axis of one instead (`[.., w, 1] -> [.., w, 2]`) interleaves single elements through
+/// one-column matrices, each element a 32-wide tile row of its own on the card: it works since
+/// 2026-11-12 at any size (it was refused past 2,097,152 rows, roadmap W1's defect 5,
+/// `step271_wide_expand`), but moves ~32 times the bytes.
 pub fn upsample_nearest<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
     let rows = |x: Tensor<B, 4>| {
         let [n, c, h, w] = x.dims();

@@ -492,6 +492,11 @@ pub enum TileChoice {
     Count(usize),
     /// Every surviving tile.
     All,
+    /// A rectangle of the grid: the first `cols` surviving tiles of each of the first `rows` tile
+    /// rows, row by row, so the session's units are a `rows x cols` grid
+    /// (`crate::tile_op::distribute::grid_of`; roadmap W2's multicast products). An error if the
+    /// chip has fewer, or if any of them is wedged: a hole would break the grid.
+    Rect { cols: usize, rows: usize },
 }
 
 /// Why a session could not be opened.
@@ -1967,6 +1972,12 @@ fn l1_footprint(entries: &[[u32; 8]], gather: bool) -> Option<Vec<std::ops::Rang
                     ranges.push(to as u64..to as u64 + len as u64)
                 }
                 Entry::Credit { .. } | Entry::WaitCredit { .. } => {}
+                // A stream's credit touches its counters, no slot; a multicast sender's writes
+                // read its own slots (`tile_op::multicast`).
+                Entry::Buffer { .. } => {}
+                Entry::L1Multicast { from, len, .. } if !gather => {
+                    ranges.push(from as u64..from as u64 + len as u64)
+                }
                 _ => return None,
             }
         }
@@ -2198,7 +2209,7 @@ fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, Tens
             ..Default::default()
         };
         let mut reader = vec![[op::LAUNCH, 0, 0, 0, 0, 0, 0, 0]];
-        let mut writer = Vec::new();
+        let mut sections = Vec::with_capacity(blocks.len());
         let depth = capacity as usize;
         // Only a gather at least `depth` batches in reuses a slot, against a
         // scatter at least `depth` batches before the end: a region of
@@ -2250,20 +2261,27 @@ fn streaming_segments(steps: Vec<Step>, cache: u64) -> Result<Vec<Segment>, Tens
             reader.push(input.credit(Action::Reserve));
             reader.extend(block.gather.1);
             reader.push(input.credit(Action::Push));
-            writer.push(output.credit(Action::Wait));
             // A planned capture keeps a list whose every write it dropped as a `WAIT`
             // (`Session::apply_plan`); NC's section only writes, and its credits keep the
             // batch's place.
-            writer.extend(
+            sections.push(
                 block
                     .scatter
                     .1
                     .into_iter()
-                    .filter(|e| *e != [op::WAIT, 0, 0, 0, 0, 0, 0, 0]),
+                    .filter(|e| *e != [op::WAIT, 0, 0, 0, 0, 0, 0, 0])
+                    .collect(),
             );
-            writer.push(output.credit(Action::Pop));
             segment.steps += 3;
         }
+        // A multicast sender's entries for a chunk (`tile_op::multicast`), up to its transfer
+        // pop, run a chunk ahead of the results: strip `c + 1` goes out before NC waits for chunk
+        // `c`'s output.
+        let writer = crate::tile_op::multicast::writer_list(
+            sections,
+            output.credit(Action::Wait),
+            output.credit(Action::Pop),
+        );
         segment.roles = segment.kernel_roles.first().cloned();
         segment.kernels.push(1);
         segment.waits.push((reader.len() + 1, 0));
@@ -2416,8 +2434,22 @@ const GROUP_MAX: usize = 40;
 pub type BlockScores = fn([usize; 3], tensor::Reuse, f64) -> f64;
 
 /// Candidates [`tensor::BlockStream::Measured`] times for a product's question, at most: the
-/// first ([`tensor::block_stream_candidates`]) and the climb's ([`tensor::block_stream_neighbours`]).
-pub const MEASURE_MOST: usize = 40;
+/// first ([`tensor::block_stream_candidates`]) and the climbs' ([`tensor::block_stream_neighbours`]).
+pub const MEASURE_MOST: usize = 64;
+/// Climbs a measured choice makes, from this many of the listed candidates timed fastest. One
+/// climb from the fastest alone kept whichever peak the first round's order led to: H1's LoFi
+/// product (`[2048,2048]@[2048,16384]`, BF16 x BFP8, 120 units) chose `[8, 4, 9]` (~1,470 us)
+/// in three processes, climbing from `[7, 4, 9]`, and `[6, 4, 12]` (1,673 us) in one, whose
+/// neighbours do not lead there (2026-11-14, card 0, `1794620711` against `1794620526`).
+pub const MEASURE_STARTS: usize = 3;
+/// Candidates within this share of the fastest are timed again ([`MEASURE_ROUNDS`]) before one
+/// is kept: near ties are inside a replay's noise (H1's HiFi2 product chose `[9, 3, 9]`,
+/// `[8, 3, 9]` and `[8, 2, 9]` in four processes, 1,971-2,025 us).
+pub const MEASURE_TIE: f64 = 0.03;
+/// Near ties ([`MEASURE_TIE`]) timed again, at most, the fastest first.
+pub const MEASURE_FINALISTS: usize = 3;
+/// Times each near tie takes in all, in interleaved rounds; the median of its scores decides.
+pub const MEASURE_ROUNDS: usize = 3;
 /// About how long a measured candidate's trace runs, us: copies of a small product enough for it.
 pub const MEASURE_SPAN_US: f64 = 2000.0;
 /// Copies of a product a measured candidate's trace holds, at most.
@@ -2619,6 +2651,46 @@ fn execution_groups(steps: Vec<Step>, cache: u64) -> Vec<Item> {
 /// ([`crate::profile_mode::ProfileOptions::stamps`]), and logs its batch tables in B's batch log:
 /// a header and six words a batch, one input `CB` reserve each, charged to the window at the log's
 /// rate ([`crate::profile_mode::batch_log_cost`]).
+/// Empty RISCV NC's entry log (`tt_isa::dm::nc_log`) on `tile` and disarm it.
+fn clear_nc_log<T: Transport>(
+    dev: &mut Device<T>,
+    window: &tt_device::Window,
+    tile: NocCoord<Noc0>,
+) -> Result<(), TransportError> {
+    dev.write32(window, tile, tt_isa::dm::nc::LOG, 0)?;
+    dev.write32(window, tile, tt_isa::dm::nc::LOG + 4, 0)?;
+    dev.write32(window, tile, tt_isa::dm::Mover::NC.at(tt_isa::dm::TRACE), 0)
+}
+
+/// RISCV NC's entry log on `tile` (`tt_isa::dm::nc_log`): its record words and the records it
+/// lost, read and emptied for the next. Read while NC is between lists (after a sync).
+fn take_nc_log<T: Transport>(
+    dev: &mut Device<T>,
+    window: &tt_device::Window,
+    tile: NocCoord<Noc0>,
+) -> Result<(Vec<u32>, u32), TransportError> {
+    use tt_isa::dm::{nc, nc_log};
+    let used = dev
+        .read32(window, tile, nc::LOG)?
+        .min(nc::LOG_WORDS - nc_log::HEADER_WORDS);
+    let lost = dev.read32(window, tile, nc::LOG + 4)?;
+    if used == 0 && lost == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let mut bytes = vec![0u8; used as usize * 4];
+    if used > 0 {
+        let at = nc::LOG + 4 * u64::from(nc_log::HEADER_WORDS);
+        dev.read(window, tile, at, &mut bytes)?;
+    }
+    dev.write32(window, tile, nc::LOG, 0)?;
+    dev.write32(window, tile, nc::LOG + 4, 0)?;
+    let log = bytes
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+    Ok((log, lost))
+}
+
 fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
@@ -2632,6 +2704,7 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
     ];
     let mut count = [0u32; 3];
     let mut log_words = 0u32;
+    let mut nc_words = 0u32;
     let mut add = |entries: &[[u32; 8]]| {
         let mut i = 0;
         while i < entries.len() {
@@ -2675,6 +2748,9 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
                     waits += chunks(reader.len());
                     add(reader);
                 }
+                if let Some(writer) = uc.pending_sections.get(2 * k + 1) {
+                    nc_words += nc_log_words(writer);
+                }
             }
         } else {
             add(&uc.stream[i..i + 1]);
@@ -2682,7 +2758,40 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
         i += (tt_isa::dm::record::len(head) as usize).max(1);
     }
     count[2] += crate::profile_mode::batch_log_cost(log_words);
+    count[2] += crate::profile_mode::nc_log_cost(nc_words);
     count.map(|c| c + fetches + waits)
+}
+
+/// The words RISCV NC's entry log (`tt_isa::dm::nc_log`) takes for a writer section run as its
+/// trace chunks, as the firmware logs it: a record an entry, but one for a run of a tag that
+/// coalesces; a settle before the first entry after a multicast run; and an anchor (two words), a
+/// settle and an end a chunk.
+fn nc_log_words(writer: &[[u32; 8]]) -> u32 {
+    use tt_isa::dm::{nc_log, op, MCAST_RUN_ACKS, TRACE_CHUNK_ENTRIES};
+    let settle = nc_log::tag(nc_log::SETTLE, 0);
+    let mut words = 0u32;
+    let mut last = None;
+    let mut run = false;
+    let mut i = 0;
+    while i < writer.len() {
+        if i % TRACE_CHUNK_ENTRIES as usize == 0 {
+            words += 4;
+            (last, run) = (None, false);
+        }
+        let w = &writer[i];
+        let tag = nc_log::tag_for(w);
+        let of_run = w[0] == op::WRITE_L1_MCAST && w[6] == MCAST_RUN_ACKS;
+        if run && !of_run {
+            words += 1;
+            last = Some(settle);
+        }
+        if !(last == Some(tag) && nc_log::coalesces(tag)) {
+            words += 1;
+        }
+        (last, run) = (Some(tag), of_run);
+        i += (tt_isa::dm::record::len(w[0])).max(1);
+    }
+    words
 }
 
 /// Unit `u`'s `BARRIER` entries in its stream `uc`, in order: an arrival at the op whose entries
@@ -2821,6 +2930,24 @@ impl<T: Transport> Session<T> {
                 usize::MAX,
                 false,
             ),
+            TileChoice::Rect { cols, rows } => {
+                let all: Vec<(u8, u8)> = grid.tiles::<Noc0>().map(|t| (t.x(), t.y())).collect();
+                let mut ys: Vec<u8> = all.iter().map(|t| t.1).collect();
+                ys.dedup();
+                let picked: Vec<(u8, u8)> = ys
+                    .iter()
+                    .take(rows)
+                    .flat_map(|&y| all.iter().filter(move |t| t.1 == y).take(cols))
+                    .copied()
+                    .collect();
+                if cols == 0 || rows == 0 || picked.len() != cols * rows {
+                    return Err(SessionError::TooFewTiles {
+                        asked: cols * rows,
+                        have: picked.len(),
+                    });
+                }
+                (picked, cols * rows, true)
+            }
         };
         for &(x, y) in &candidates {
             if !grid.contains(x, y) {
@@ -3182,6 +3309,9 @@ impl<T: Transport> Session<T> {
                 dev.write32(r.window(), unit.tile, count, 0)?;
             }
             dev.write32(r.window(), unit.tile, tt_isa::dm::BATCH_LOG, 0)?;
+            // NC's entry log starts empty and disarmed: B arms it pair by pair
+            // (`dm::trace_mode::NC_LOG`).
+            clear_nc_log(dev, r.window(), unit.tile)?;
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, trace_word)?;
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE_WINDOW, 0)?;
@@ -3222,6 +3352,8 @@ impl<T: Transport> Session<T> {
             if unit.mover.is_some() {
                 dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, 0)?;
             }
+            let nc_trace = tt_isa::dm::Mover::NC.at(tt_isa::dm::TRACE);
+            dev.write32(r.window(), unit.tile, nc_trace, 0)?;
             if u == 0 {
                 let now = dev.wall_clock(r.window(), unit.tile)?;
                 let us_elapsed = p.host_at_start.elapsed().as_secs_f64() * 1e6;
@@ -3376,7 +3508,15 @@ impl<T: Transport> Session<T> {
                     .chunks_exact(4)
                     .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                     .collect();
-                crate::profile_mode::splice_batch_log(events, &log)
+                let events = crate::profile_mode::splice_batch_log(events, &log);
+                // And NC's entry log, placed on the counter as it reads now.
+                let (log, lost) = take_nc_log(dev, r.window(), tile)?;
+                if log.is_empty() && lost == 0 {
+                    events
+                } else {
+                    let now = dev.wall_clock(r.window(), tile)?;
+                    crate::profile_mode::splice_nc_log(events, &log, lost, now)
+                }
             }
             _ => events,
         };
@@ -3580,6 +3720,23 @@ impl<T: Transport> Session<T> {
 
     /// `t` converted to `to` (F32 <-> BF16) over runs of tiles on the product's units
     /// (`tile_op::cast`).
+    /// A block of a tensor converted between F32 and BF16 ([`crate::tile_op::cast`]): a new
+    /// tensor of the block's dims, bit for bit [`Session::bf16_from_f32`]'s conversion of those
+    /// elements. Its tiles are dealt as any block op's over the block's own tiles, so a reader
+    /// of the block dealt the same way (a row scatter of a value head's columns into a cache)
+    /// reads each tile on the unit that wrote it, with no barrier between them.
+    pub fn cast_block(
+        &mut self,
+        block: tensor::BlockOperand<'_>,
+        to: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
+        let units = self.spread_for(block.dims[0].div_ceil(32) * block.dims[1].div_ceil(32));
+        let overlap = self.overlap();
+        let mut op = crate::tile_op::cast(block, to)?;
+        let work = op.build(&mut self.dram_state()?.alloc, units, overlap)?;
+        self.execute_on(work, units, RESET_BUDGET)
+    }
+
     fn cast_runs(&mut self, t: &DramTensor, to: tensor::Elem) -> Result<DramTensor, TensorError> {
         let units = self.spread_for(tiles_of(t));
         let overlap = self.overlap();
@@ -8578,9 +8735,23 @@ impl<T: Transport> Session<T> {
         sin: tensor::BlockOperand<'_>,
         head: usize,
     ) -> Result<DramTensor, TensorError> {
+        self.rope_as(x, cos, sin, head, tensor::Elem::F32)
+    }
+
+    /// [`Session::rope`] with its result `out`: BF16 rounds it once at the pack (a BF16 KV
+    /// cache's keys, written as RoPE leaves them), bit for bit the F32 result narrowed.
+    pub fn rope_as(
+        &mut self,
+        x: tensor::BlockOperand<'_>,
+        cos: tensor::BlockOperand<'_>,
+        sin: tensor::BlockOperand<'_>,
+        head: usize,
+        out: tensor::Elem,
+    ) -> Result<DramTensor, TensorError> {
         let tiles = x.dims[0].div_ceil(32) * x.dims[1].div_ceil(32);
         let units = self.spread_for(tiles);
-        let work = tensor::rope_blocks(&mut self.dram_state()?.alloc, x, cos, sin, head, units)?;
+        let work =
+            tensor::rope_blocks(&mut self.dram_state()?.alloc, x, cos, sin, head, units, out)?;
         let out = self.execute_on(work, units, RESET_BUDGET)?;
         out.set_pad(tensor::Pad::Undefined);
         Ok(out)
@@ -8590,15 +8761,29 @@ impl<T: Transport> Session<T> {
     /// (`crate::sfpu::select`): the first maximum, any NaN above every number (the first NaN),
     /// `-0` and `+0` equal, as `torch.argmax` and burn-tt's argmax choose. Two ops: each unit's
     /// run of tiles to a partial, then one unit's choice among them. A decode step's next token,
-    /// with no download of its logits.
+    /// with no download of its logits. Any width: past [`tensor::ARGMAX_FAN_IN`] partials (a row
+    /// wider than 65,536 columns), they fold in levels first ([`tensor::argmax_fold`]), one op a
+    /// level, so a wide vocabulary's row is never cut into parts.
     pub fn argmax_row(&mut self, a: &DramTensor) -> Result<DramTensor, TensorError> {
         let ct = a.grid()[1];
         let units = self.spread_for(ct).clamp(1, ARGMAX_UNITS);
-        let (work, starts) = tensor::argmax_partials(&mut self.dram_state()?.alloc, a, units)?;
-        let partials = self.execute_on(work, units, RESET_BUDGET)?;
+        let work = tensor::argmax_partials(&mut self.dram_state()?.alloc, a, units)?;
+        let mut partials = self.execute_on(work, units, RESET_BUDGET)?;
+        while partials.grid()[1] > tensor::ARGMAX_FAN_IN {
+            let work = self
+                .dram_state()
+                .and_then(|d| tensor::argmax_fold(&mut d.alloc, &partials));
+            let next = work.and_then(|work| {
+                let jobs = work.jobs.len();
+                let units = self.spread_for(jobs).clamp(1, ARGMAX_UNITS.min(jobs));
+                self.execute_on(work, units, RESET_BUDGET)
+            });
+            self.free(partials)?;
+            partials = next?;
+        }
         let chosen = self
             .dram_state()
-            .and_then(|d| tensor::argmax_choose(&mut d.alloc, &partials, &starts))
+            .and_then(|d| tensor::argmax_choose(&mut d.alloc, &partials))
             .and_then(|work| self.execute_on(work, 1, RESET_BUDGET));
         self.free(partials)?;
         let out = chosen?;
@@ -9260,8 +9445,44 @@ impl<T: Transport> Session<T> {
         layout: BatchedLayout,
     ) -> Result<DramTensor, TensorError> {
         use tensor::OpPadding;
-        a.expect("a matmul", tensor::Elem::F32)?;
-        b.expect("a matmul", tensor::Elem::F32)?;
+        use tt_isa::format::TileFormat;
+        // Each operand read in its own edge format, as [`Session::matmul_dram_as`] reads them: a
+        // BF16 `B` (a BF16 KV cache's keys and values) unpacked as BF16, the product of the values
+        // it widens to, bit for bit the widened `B`'s (`SrcRoute::Edges`, gate `step270`).
+        let packed = a.format() != TileFormat::FP32 || b.format() != TileFormat::FP32;
+        let route = match route {
+            SrcRoute::Tf32FromFp32 | SrcRoute::Edges { .. } if packed => {
+                SrcRoute::edges(a.format(), b.format()).ok_or_else(|| {
+                    TensorError::Shape(format!(
+                        "a batched product of {:?} and {:?} operands: no gather reads them",
+                        a.format(),
+                        b.format()
+                    ))
+                })?
+            }
+            _ if packed => {
+                return Err(TensorError::Shape(format!(
+                    "packed operands ({:?}, {:?}) multiply through TF32 only, not {route:?}",
+                    a.format(),
+                    b.format()
+                )))
+            }
+            _ => route,
+        };
+        // Only `B` may be packed here, and a transposed one only where the unpacker transposes it.
+        if a.format() != TileFormat::FP32 {
+            a.expect("a batched matmul's left operand", tensor::Elem::F32)?;
+        }
+        if route.packed_b().is_some()
+            && items.iter().any(|(_, bb)| bb.transposed)
+            && !(self.unpack_transposed_b && route.unpacks_transposed_b())
+        {
+            return Err(TensorError::Shape(
+                "a batched product's packed `B` is read transposed only where the unpacker \
+                 transposes it (BF16)"
+                    .into(),
+            ));
+        }
         // A block that reaches its tensor's ragged edge reads the tensor's padding: as `K`'s
         // when the edge is along `K`, which must then be zero, the fill `matmul_dram` asks
         // for. Along `M` or `N` it reaches only the output's padding (or rows a stacked output
@@ -9342,6 +9563,10 @@ impl<T: Transport> Session<T> {
                 // (a `K` row, an output kept padded) is read: zero.
                 let zero_tails =
                     !(side == 0 && layout.stacked && items.iter().all(|i| !i.0.transposed));
+                // Row gathers move FP32 rows: a packed operand's blocks are read where they lie.
+                if operands[side].format() != TileFormat::FP32 {
+                    continue;
+                }
                 let Some((p, blocks)) = self.rows_padded(
                     t,
                     &items.iter().map(pick).collect::<Vec<_>>(),
@@ -9922,9 +10147,10 @@ impl<T: Transport> Session<T> {
     /// Under [`tensor::BlockStream::Measured`], time the candidates of `op(A) @ op(B)`'s question
     /// on `units` units the first time it is planned ([`tensor::block_stream_candidates`], `A`
     /// pulled from [`tile_op::reuse::AUTO_HOLDERS`] under [`tensor::Reuse::Auto`]), climb from
-    /// the fastest one step at a time while a step gains [`MEASURE_GAIN`]
-    /// ([`tensor::block_stream_neighbours`]), at most [`MEASURE_MOST`] timed, and keep the fastest
-    /// for the process ([`tensor::measured_choice`]). Only in a capture, which is paused for it
+    /// each of the [`MEASURE_STARTS`] fastest one step at a time while a step gains
+    /// [`MEASURE_GAIN`] ([`tensor::block_stream_neighbours`]), at most [`MEASURE_MOST`] timed,
+    /// time the near ties again ([`MEASURE_TIE`], [`MEASURE_FINALISTS`], [`MEASURE_ROUNDS`]), and
+    /// keep the one of least median for the process ([`tensor::measured_choice`]). Only in a capture, which is paused for it
     /// ([`Session::paused`]), and not in one applying a plan: its plan pass measured what it
     /// plans. An eager product runs `Auto`'s block ([`tensor::BlockStream::Measured`]). Not on ttsim, whose times say nothing (but see
     /// [`Session::probe_block_scores`]). A measurement that fails keeps `Auto`'s block.
@@ -9984,40 +10210,81 @@ impl<T: Transport> Session<T> {
                 // Each candidate, its score and its time, us.
                 type Timed = Vec<(tensor::BlockChoice, f64, f64)>;
                 let mut timed: Timed = Vec::new();
+                let once = |s: &mut Self, c: tensor::BlockChoice| {
+                    let fixed = tensor::BlockStream::Fixed(c.block);
+                    let us =
+                        s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
+                    Ok::<_, TensorError>((scores.map_or(us, |f| f(c.block, c.reuse, us)), us))
+                };
                 let time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
                     if timed.len() >= MEASURE_MOST || timed.iter().any(|(t, ..)| *t == c) {
                         return Ok(());
                     }
-                    let fixed = tensor::BlockStream::Fixed(c.block);
-                    let us =
-                        s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
-                    timed.push((c, scores.map_or(us, |f| f(c.block, c.reuse, us)), us));
+                    let (score, us) = once(s, c)?;
+                    timed.push((c, score, us));
                     Ok::<(), TensorError>(())
                 };
-                let best = |timed: &[(tensor::BlockChoice, f64, f64)]| {
-                    timed
-                        .iter()
-                        .copied()
-                        .min_by(|x, y| x.1.total_cmp(&y.1))
-                        .expect("one timed")
+                // The fastest first; equal scores in the order timed.
+                let ranked = |timed: &[(tensor::BlockChoice, f64, f64)]| {
+                    let mut r = timed.to_vec();
+                    r.sort_by(|x, y| x.1.total_cmp(&y.1));
+                    r
                 };
                 for &c in &candidates {
                     time(s, &mut timed, c)?;
                 }
-                // Climb: from the fastest so far, one step at a time, while a step gains.
-                let mut at = best(&timed);
-                loop {
-                    for n in tensor::block_stream_neighbours(&q, at.0, pull) {
-                        time(s, &mut timed, n)?;
+                // Climbs: from each of the fastest listed, one step at a time while a step gains.
+                let starts: Vec<_> = ranked(&timed).into_iter().take(MEASURE_STARTS).collect();
+                for mut at in starts {
+                    loop {
+                        let near = tensor::block_stream_neighbours(&q, at.0, pull);
+                        for &n in &near {
+                            time(s, &mut timed, n)?;
+                        }
+                        // This climb's own step: the fastest of its neighbours timed (another
+                        // climb's peak is reached only by stepping there).
+                        let Some(next) = timed
+                            .iter()
+                            .filter(|t| near.contains(&t.0))
+                            .copied()
+                            .min_by(|x, y| x.1.total_cmp(&y.1))
+                        else {
+                            break;
+                        };
+                        if next.1 >= at.1 * (1.0 - MEASURE_GAIN) {
+                            break;
+                        }
+                        at = next;
                     }
-                    let next = best(&timed);
-                    if next.1 >= at.1 * (1.0 - MEASURE_GAIN) {
-                        break;
-                    }
-                    at = next;
                 }
-                let chosen = best(&timed);
-                Ok::<_, TensorError>((chosen.0, [timed[0].2, chosen.2]))
+                // Near ties, timed again in interleaved rounds: the median of each one's scores.
+                let ranked = ranked(&timed);
+                let best = ranked[0];
+                let mut finalists: Vec<(tensor::BlockChoice, Vec<f64>, Vec<f64>)> = ranked
+                    .iter()
+                    .take(MEASURE_FINALISTS)
+                    .filter(|t| t.1 <= best.1 * (1.0 + MEASURE_TIE))
+                    .map(|&(c, score, us)| (c, vec![score], vec![us]))
+                    .collect();
+                if finalists.len() > 1 {
+                    for _ in 1..MEASURE_ROUNDS {
+                        for (c, scored, us) in &mut finalists {
+                            let (score, t) = once(s, *c)?;
+                            scored.push(score);
+                            us.push(t);
+                        }
+                    }
+                }
+                let median = |v: &[f64]| {
+                    let mut v = v.to_vec();
+                    v.sort_by(f64::total_cmp);
+                    v[v.len() / 2]
+                };
+                let chosen = finalists
+                    .iter()
+                    .min_by(|x, y| median(&x.1).total_cmp(&median(&y.1)))
+                    .expect("one finalist");
+                Ok::<_, TensorError>((chosen.0, [timed[0].2, median(&chosen.2)]))
             })
         });
         let (choice, times) = match timed.and_then(|r| r).and_then(|r| r) {
@@ -10201,13 +10468,18 @@ impl<T: Transport> Session<T> {
             .iter()
             .map(|u| (u.tile.x(), u.tile.y()))
             .collect();
+        // A multicast writes its readers' slots wherever the op's arena placed them.
+        let window = match reuse {
+            tensor::Reuse::Multicast { .. } => listed.base..listed.end,
+            _ => self.l1_writes.window.clone(),
+        };
         self.set_l1_writes(crate::dm::L1Writes {
             tiles,
             reads: match reuse {
                 tensor::Reuse::Off => 0..0,
                 _ => listed.base..listed.end,
             },
-            ..self.l1_writes.clone()
+            window,
         })?;
         self.reuse = reuse;
         Ok(())
@@ -11081,6 +11353,52 @@ impl<T: Transport> Session<T> {
                 _ => [0; 8],
             };
             out.push(waits);
+        }
+        Ok(out)
+    }
+
+    /// Have every started unit's NC log its writer sections (`tt_isa::dm::nc_log`) with no profile
+    /// running, or stop: B's trace word holds only `trace_mode::NC_LOG`, so B stamps nothing and
+    /// arms NC's log for every pair. Each log starts empty. Only a `profile` image logs; refused
+    /// while a profile runs. Dev-facing: the NC log's ttsim gate.
+    #[doc(hidden)]
+    pub fn probe_nc_log(&mut self, on: bool) -> Result<(), TensorError> {
+        self.sync()?;
+        if self.profiling.is_some() {
+            return Err(TensorError::Run(RunError::Transport(
+                TransportError::Hazard {
+                    address: tt_isa::dm::TRACE,
+                    reason: "a profile is running: its detail owns the trace word",
+                },
+            )));
+        }
+        let word = if on {
+            tt_isa::dm::trace_mode::NC_LOG
+        } else {
+            0
+        };
+        let Session { dev, units, .. } = self;
+        for unit in units.iter() {
+            if let (Some(r), Some(_)) = (unit.resident.as_ref(), unit.mover.as_ref()) {
+                clear_nc_log(dev, r.window(), unit.tile)?;
+                dev.write32(r.window(), unit.tile, tt_isa::dm::TRACE, word)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every unit's NC entry log since it was last taken (`tt_isa::dm::nc_log`), after what is
+    /// queued: its record words and the records it lost, and emptied. Dev-facing.
+    #[doc(hidden)]
+    pub fn probe_take_nc_logs(&mut self) -> Result<Vec<(Vec<u32>, u32)>, TensorError> {
+        self.sync()?;
+        let mut out = Vec::with_capacity(self.units.len());
+        let Session { dev, units, .. } = self;
+        for unit in units.iter() {
+            out.push(match unit.resident.as_ref() {
+                Some(r) => take_nc_log(dev, r.window(), unit.tile)?,
+                None => (Vec::new(), 0),
+            });
         }
         Ok(out)
     }

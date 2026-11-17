@@ -956,6 +956,9 @@ fn main() {
             let tiles = match tile {
                 burn_tt::TileChoice::Count(n) => format!("{n} Tensix tiles"),
                 burn_tt::TileChoice::All => "every Tensix tile".into(),
+                burn_tt::TileChoice::Rect { cols, rows } => {
+                    format!("a {rows} x {cols} rectangle of Tensix tiles")
+                }
                 _ => "one Tensix tile".into(),
             };
             format!("/dev/tenstorrent/{card}, {tiles}, tensors resident in GDDR6")

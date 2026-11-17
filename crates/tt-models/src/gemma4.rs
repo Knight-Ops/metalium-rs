@@ -432,12 +432,12 @@ pub struct Gemma4<B: Backend> {
     config: Gemma4Config,
 }
 
-/// Widens every float parameter to F32, on its data (exact): a freshly loaded burn-tt tensor is
-/// still on the host, and widening it there uploads only the F32 tensor, where a cast on the
-/// device would first upload the BF16 one (then in an F32 tile's slot; BF16 tensors have taken
-/// slots of their own since 2026-11-11, roadmap W1, not re-measured here) and free it after,
-/// leaving GDDR in holes the 11.3 GB per-layer table then finds no run in (`step261_gemma4`,
-/// 2026-10-30).
+/// Widens every float parameter to F32, on its data (exact), lazily: a freshly loaded burn-tt
+/// tensor is still on the host, and the widened one stays there until its first use uploads it, so
+/// a parameter [`Gemma4::with_bf16_weights`] stores BF16 next never reaches the card in F32. (A
+/// `cast` would widen on the host too since 2026-11-12, roadmap W1's defect 4, but uploads its
+/// result at once, every matrix in F32 queued for the card: `step261_gemma4` was killed at its 40 GB
+/// host cap that way, 2026-11-12.)
 struct ToF32;
 
 fn widen<B: Backend, const D: usize>(t: Tensor<B, D>) -> Tensor<B, D> {

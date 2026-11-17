@@ -160,28 +160,40 @@ Results so far (logs under `target/silicon/` of the `models-hybrid` worktree):
   not. Evidence, not a bound: the gate guards at a quarter of the RMS (a wrong block moves an output by its whole
   size). Open: a derived bound, from a Flex run that rounds the products' operands to TF32 as the unpacker does.
 
-What `burn-tt` did that the host could not show (each a roadmap item; none is changed here):
+What `burn-tt` did that the host could not show (each a roadmap item; all five fixed by 2026-11-12, roadmap W1):
 
-1. **A BF16 product with a transposed right operand copies it plain first** (`bf16_matmul` calls `plain_dram`; the
-   F32 path passes the view's `transposed` flag to `matmul_dram` instead). For Qwen3.5's tied head,
+1. **Fixed 2026-11-12.** **A BF16 product with a transposed right operand copied it plain first** (`bf16_matmul`
+   called `plain_dram`, a per-element repack with a 16-byte host map an element). For Qwen3.5's tied head,
    `last @ table^T` over the 248,320 x 2,560 BF16 table, that copy's host bookkeeping passed 40 GB and was killed
-   (`silicon_probe_qwen35_bf16_memory`). Worked around: `qwen35` computes a tied head as `table @ last^T`.
-2. **`Precision::Bf16` (BF16 activations) still holds host memory without bound on the whole 32-layer model**: the
-   probe was killed at a 16 GB cap during the prompt; one layer, and three or four, stay flat over repeated passes,
-   so the cause is not yet located. Not gated; BF16 weights go through `Bf16Stored` storage instead (the shipped
-   1.7B configuration).
+   (`silicon_probe_qwen35_bf16_memory`). Now a BF16 `B` is read as it lies and transposed by the kernel's
+   unpacker (`record::GATHER_B_UNPACK_TRANSPOSE` with a BF16 `B`, `SrcRoute::unpacks_transposed_b`), bit for bit
+   the widened product (gate `step272_transposed_bf16_b`, card 0, every read mode). The workaround (`table @
+   last^T`) is retired: a tied head is `last @ table^T` for every dtype.
+2. **Fixed 2026-11-12.** **`Precision::Bf16` (BF16 activations) held host memory without bound on the whole
+   32-layer model.** The cause: a BF16 `Linear` over a rank-3 input repacked its whole weight on every call
+   (`repack_shape`, a 16-byte host map an element, ~1.8 GB a Qwen layer a forward, queued on the server's unbounded
+   channel). A retiling to the matrix a tensor already lies in is now a view (no job). With (1), the whole BF16
+   model through `forward`, its head included, holds 4.3 GB flat over a prompt and four decode steps
+   (`silicon_probe_qwen35_bf16_memory::where_the_whole_bf16_model_holds_host_memory`, card 0, `1794457685`).
 3. **Fixed 2026-11-11 for `alloc_elem`** (`TensorRef::slot`, roadmap W1; Nemotron's fit not re-run). **A BF16 tensor takes an F32 tile's slot in GDDR** (`DramTensor::alloc_elem` allocates `TILE_SLOT`, the FP32 slot,
    for every element type): BF16 halves bandwidth, not capacity. Nemotron's 5.6 GB BF16 per-layer table needs 11.3
    GB of GDDR, and its model did not fit. (`Bf16Stored` storage has compact slots.)
-4. **A cast of a freshly loaded tensor uploads the original first**: burn-tt holds a loaded tensor on the host until
-   first use; a cast to F32 on the card uploads the BF16 tensor (in an F32 slot), writes the F32 one, frees the
-   first, and the holes left the 11.3 GB F32 table no contiguous run (2.9 GB free, largest run 816 MB in the
-   refusing channel). Worked around: `gemma4` widens on the data (exact) before anything reaches the card.
-5. **The block copier refuses moves that interleave single elements past ~400 K elements** ("descriptor refused
-   before submission (code 2)"): a nearest upsampling written as a broadcast of a trailing axis of one
-   (`[.., w, 1] -> [.., w, 2]`) works at `[1, 384, 32, 32]` and is refused from `[1, 384, 64, 64]` on
-   (`silicon_probe_moss_image_ops`). The refusal is typed but surfaces only at the next download. Worked around:
-   `vae::upsample_nearest` repeats whole rows, then the transpose's.
+4. **Fixed 2026-11-12.** **A cast of a freshly loaded tensor uploaded the original first**: burn-tt holds a loaded
+   tensor on the host until first use; a cast to F32 on the card uploaded the BF16 tensor, wrote the F32 one,
+   freed the first, and the holes left the 11.3 GB F32 table no contiguous run. Now a BF16 tensor still on the
+   host widens there (exactly, by its bits) and is uploaded once, as F32 (`TtTensor::widened_on_host`; gate
+   `step76_burn_bf16::a_host_bf16_tensor_cast_to_f32_is_uploaded_once_widened`, every one of the 65,536
+   patterns). `gemma4` keeps its widening on the data, now for another reason: it stays lazy, so a matrix
+   `with_bf16_weights` stores BF16 next never reaches the card in F32; a `cast` uploads its result at once, and
+   `step261_gemma4` was killed at its 40 GB host cap that way (2026-11-12; with the lazy widening it passes,
+   316 s).
+5. **Fixed 2026-11-12.** **The block copier refused a broadcast of a trailing axis of one past 2,097,152 rows**
+   ("descriptor refused before submission (code 2)"): `expand` repeats such an axis through a `[1, rows]` matrix,
+   and a record names at most 65,536 column tiles (`TensorRef::decode`, `MAX_EXTENT`). The "~400 K elements" was
+   the last size that worked: a 6-D nearest upsampling `[1, 384, 64, 1, 64, 1] -> [1, 384, 64, 2, 64, 2]` is
+   3,145,728 rows. `expand` now goes in chunks of 2^20 rows, joined by one row gather (gate
+   `step271_wide_expand`; with one chunk the same code-2 refusal, card 0). `vae::upsample_nearest` keeps its
+   whole-row form: a one-column matrix holds an element a 32-wide tile row, ~32 times the bytes.
 
 Left:
 - **No `SMOKE` entries, by decision (owner, 2026-10-30)**: `step260`-`step262` stay out of `--smoke`, an exception
@@ -226,15 +238,19 @@ Left:
     inputs (1010880 bytes) does not fit the 917504-byte L1 arena"); `generate::greedy` takes a row past 65,536
     columns in single-row parts (the Llamas' traces unchanged; `step187` and `step188`'s traced test pass on card
     1, `1793344290`, as do `step260`'s BF16-weight test there, largest logit difference 7.79e-2 and eager ~3 s a
-    token on one tile, and `qwen35_host` against `transformers`). (7) A tied
+    token on one tile, and `qwen35_host` against `transformers`). The parts were retired on 2026-11-12 (roadmap W4):
+    `Session::argmax_row` folds a wide row's partials in levels (`tensor::argmax_fold`), one op for any
+    vocabulary. (7) A tied
     head as `table @ last^T` returns a transposed view, which a trace cannot output: an F32 table's head is now
-    `last @ table^T` (the BF16 table keeps the workaround of (1)). (8) **The build is host-bound and
+    `last @ table^T` (a BF16 table's too since 2026-11-12, (1)). (8) **The build is host-bound and
     superlinear in a trace's ops**: 1,487 s for two steps and two chunks (`step263`), 1,108 s for four steps and a
     chunk of 16 (7,056 ops), one core at 100%; the four-layer model builds in seconds.
   - Left, in order of what they buy: the fused delta-rule step (the recurrence, decay and norms of a DeltaNet are
-    ~25 of its ~34 ops a step, a new SFPU op by `new-op-definition-of-done.md`); a BF16 copy of the tied head
-    (2.5 GB of F32 table read a step, ~5 ms at the bandwidth; 1.3 GB more GDDR); the capture's host cost; the
+    ~25 of its ~34 ops a step, a new SFPU op by `new-op-definition-of-done.md`); the capture's host cost; the
     DeltaNet's chunked (WY) prefill (a 256-token prompt takes 5.0 s traced).
+  - **The tied head reads the BF16 table** (2026-11-12, roadmap W1): `Qwen35::for_inference` stores the table once,
+    BF16, for its lookup and its head (`burn_tt::matmul_wide`): 56.93 -> 54.47 ms a step, 1.27 GB less GDDR
+    (`1794463906`).
   - Measured since (2026-10-31, card 1, merged F4a/F5 tree): 64.28 / 64.65 ms (`1793409872`); F4a.1's edge credits
     (`TT_EDGE_CREDITS=4`, opt-in) leave the decode unchanged and make the prefill 1.4% faster (3,709 -> 3,656 ms for 256
     tokens; [log](../learnings/performance-log.md#the-merged-tree-and-edge-credits-on-qwen35-2026-10-31-card-1)).

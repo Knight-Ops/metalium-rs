@@ -132,6 +132,11 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// [`Engine::cast_float`] of a block of a resident buffer: a new buffer of the block's dims
+    /// (`Session::cast_block`).
+    fn cast_block(&mut self, _a: BlockArg, _bf16: bool) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// Explicit physical BFP storage conversion. None widens to F32.
     fn cast_bfp(
         &mut self,
@@ -564,6 +569,7 @@ pub trait Engine {
         _cos: BlockArg,
         _sin: BlockArg,
         _head: usize,
+        _bf16: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -980,6 +986,24 @@ impl DramBuffers {
             .get(&id)
             .ok_or_else(|| TtError::Device(format!("no BF16 buffer {id}")))?;
         s.download_bf16(t).map_err(TtError::from)
+    }
+
+    /// [`DramBuffers::cast_float`] of a block of `a`'s buffer (`Session::cast_block`).
+    pub fn cast_block<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        a: BlockArg,
+        bf16: bool,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let t = self.operand(a.id)?;
+        let to = if bf16 { Elem::BF16 } else { Elem::F32 };
+        let block = tt_kernels::tensor::BlockOperand {
+            tensor: &t,
+            at: a.at,
+            dims: a.dims,
+        };
+        let made = s.cast_block(block, to).map_err(TtError::from)?;
+        Ok(self.insert_any(made))
     }
 
     pub fn cast_float<T: tt_device::Transport>(
@@ -1512,7 +1536,8 @@ impl DramBuffers {
         budget: u64,
         layout: BatchedLayout,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let (ta, tb) = (self.get(a)?.clone(), self.get(b)?.clone());
+        // A BF16 `B` (a BF16 KV cache) is read as it lies, its edge picking the route.
+        let (ta, tb) = (self.get(a)?.clone(), self.operand(b)?);
         let c = s
             .matmul_dram_batched_with(&ta, &tb, items, mkn, route, fidelity, budget, layout)
             .map_err(TtError::from)?;
@@ -1531,8 +1556,9 @@ impl DramBuffers {
         fidelity: Fidelity,
         budget: u64,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        let [tq, tk, tv, tm] = [q, k, v, mask].map(|id| self.get(id).cloned());
-        let (tq, tk, tv, tm) = (tq?, tk?, tv?, tm?);
+        let (tq, tm) = (self.get(q)?.clone(), self.get(mask)?.clone());
+        // BF16 keys and values (a BF16 KV cache) are read as they lie.
+        let (tk, tv) = (self.operand(k)?, self.operand(v)?);
         let c = s
             .attention_rows(
                 &tq, &tk, &tv, &tm, items, dims, scale, route, fidelity, budget,
@@ -1608,7 +1634,8 @@ impl DramBuffers {
         Ok(self.insert(c))
     }
 
-    /// [`Session::scatter_rows`]: a 32-bit table only, a packed one refused.
+    /// [`Session::scatter_rows`]: a 32-bit table, or a two-byte one (a BF16 KV cache) whose
+    /// rows move whole; a BFP one refused.
     pub fn scatter_rows<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1617,22 +1644,25 @@ impl DramBuffers {
         values: BufferId,
         column: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        for b in [table, values] {
-            if self.bf16.contains_key(&b) || self.is_bfp(b) {
-                return Err(TtError::Device(
-                    "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
-                ));
-            }
-        }
+        self.refuse_bfp_scatter([table, values])?;
         let (tt, ti, tv) = (
-            self.get(table)?.clone(),
+            self.operand(table)?,
             self.get(indices)?.clone(),
-            self.get(values)?.clone(),
+            self.operand(values)?,
         );
         let c = s
             .scatter_rows(&tt, &ti, &tv, column)
             .map_err(TtError::from)?;
-        Ok(self.insert(c))
+        Ok(self.insert_any(c))
+    }
+
+    fn refuse_bfp_scatter(&self, buffers: [BufferId; 2]) -> Result<(), TtError> {
+        match buffers.iter().any(|&b| self.is_bfp(b)) {
+            true => Err(TtError::Device(
+                "a row scatter of a BFP table is not implemented".into(),
+            )),
+            false => Ok(()),
+        }
     }
 
     pub fn scatter_rows_into<T: tt_device::Transport>(
@@ -1643,20 +1673,15 @@ impl DramBuffers {
         values: BlockArg,
         column: bool,
     ) -> Result<(), TtError> {
-        for b in [table, values.id] {
-            if self.bf16.contains_key(&b) || self.is_bfp(b) {
-                return Err(TtError::Device(
-                    "a row scatter of a packed (BF16, F16 or BFP) table is not implemented".into(),
-                ));
-            }
-        }
-        let (tt, ti, tv) = (self.get(table)?, self.get(indices)?, self.get(values.id)?);
+        self.refuse_bfp_scatter([table, values.id])?;
+        let (tt, tv) = (self.operand(table)?, self.operand(values.id)?);
+        let ti = self.get(indices)?;
         let block = tt_kernels::tensor::BlockOperand {
-            tensor: tv,
+            tensor: &tv,
             at: values.at,
             dims: values.dims,
         };
-        s.scatter_rows_into_block(tt, ti, block, column)
+        s.scatter_rows_into_block(&tt, ti, block, column)
             .map_err(TtError::from)
     }
 
@@ -1723,16 +1748,18 @@ impl DramBuffers {
         table: BufferId,
         indices: BufferId,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
-        if self.bf16.contains_key(&table) || self.is_bfp(table) {
+        // A BF16 table's rows through `SELECT_ROWS_BF16` (roadmap W1, the BF16 lookup); a BFP
+        // one's rows are not whole face-rows of their own.
+        if self.is_bfp(table) {
             return Err(TtError::Device(
-                "a row select of a packed (BF16, F16 or BFP) table is not implemented".into(),
+                "a row select of a BFP table is not implemented".into(),
             ));
         }
         let indices = self.get(indices)?.clone();
         let out = s
-            .select_rows(self.get(table)?, &indices)
+            .select_rows(&self.operand(table)?, &indices)
             .map_err(TtError::from)?;
-        Ok(self.insert(out))
+        Ok(self.insert_any(out))
     }
 
     /// `table`'s rows for each tap of the resident `[taps, n]` index tensor
@@ -1961,6 +1988,7 @@ impl DramBuffers {
         cos: BlockArg,
         sin: BlockArg,
         head: usize,
+        bf16: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let block = |b: BlockArg| -> Result<tt_kernels::tensor::BlockOperand<'_>, TtError> {
             Ok(tt_kernels::tensor::BlockOperand {
@@ -1969,10 +1997,14 @@ impl DramBuffers {
                 dims: b.dims,
             })
         };
+        let elem = match bf16 {
+            true => tt_kernels::tensor::Elem::BF16,
+            false => tt_kernels::tensor::Elem::F32,
+        };
         let out = s
-            .rope(block(x)?, block(cos)?, block(sin)?, head)
+            .rope_as(block(x)?, block(cos)?, block(sin)?, head, elem)
             .map_err(TtError::from)?;
-        Ok(self.insert(out))
+        Ok(self.insert_any(out))
     }
 
     pub fn sum_rows<T: tt_device::Transport>(
@@ -3198,6 +3230,23 @@ pub(crate) fn cast_float(
     )
 }
 
+/// [`cast_float`] of a block of a resident buffer, without waiting: the block's dims.
+pub(crate) fn cast_block(device: TtDevice, a: BlockArg, bf16: bool) -> (BufferId, [usize; 2]) {
+    submit(
+        "cast_float",
+        device,
+        a.dims,
+        || "native floating-point conversion of a block".into(),
+        move |engine, ids| {
+            let a = BlockArg {
+                id: ids.get(a.id)?,
+                ..a
+            };
+            engine.cast_block(a, bf16)
+        },
+    )
+}
+
 pub(crate) fn cast_bfp(
     device: TtDevice,
     id: BufferId,
@@ -3438,6 +3487,7 @@ pub(crate) fn rope_blocks(
     cos: BlockArg,
     sin: BlockArg,
     head: usize,
+    bf16: bool,
 ) -> (BufferId, [usize; 2]) {
     submit(
         "rope",
@@ -3451,7 +3501,7 @@ pub(crate) fn rope_blocks(
                     ..b
                 })
             };
-            engine.rope_blocks(get(x)?, get(cos)?, get(sin)?, head)
+            engine.rope_blocks(get(x)?, get(cos)?, get(sin)?, head, bf16)
         },
     )
 }
@@ -4089,6 +4139,12 @@ impl Engine for KmdEngine {
             .ok_or_else(unsupported)?
             .cast_float(&mut self.session, id, bf16)
     }
+    fn cast_block(&mut self, a: BlockArg, bf16: bool) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .cast_block(&mut self.session, a, bf16)
+    }
     fn cast_bfp(
         &mut self,
         id: BufferId,
@@ -4291,9 +4347,10 @@ impl Engine for KmdEngine {
         cos: BlockArg,
         sin: BlockArg,
         head: usize,
+        bf16: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
-        bufs.rope_blocks(&mut self.session, x, cos, sin, head)
+        bufs.rope_blocks(&mut self.session, x, cos, sin, head, bf16)
     }
     fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = self.buffers.as_mut().ok_or_else(unsupported)?;
@@ -5285,6 +5342,10 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         self.buffers
             .cast_float(self.fabric.chips[0].session(), id, bf16)
     }
+    fn cast_block(&mut self, a: BlockArg, bf16: bool) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers
+            .cast_block(self.fabric.chips[0].session(), a, bf16)
+    }
     fn pool_bf16(
         &mut self,
         a: BufferId,
@@ -5386,9 +5447,10 @@ impl<T: tt_device::Transport> Engine for MeshEngine<T> {
         cos: BlockArg,
         sin: BlockArg,
         head: usize,
+        bf16: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;
-        bufs.rope_blocks(self.fabric.chips[0].session(), x, cos, sin, head)
+        bufs.rope_blocks(self.fabric.chips[0].session(), x, cos, sin, head, bf16)
     }
     fn pow(&mut self, x: BufferId, y: PowArg) -> Result<(BufferId, [usize; 2]), TtError> {
         let bufs = &mut self.buffers;

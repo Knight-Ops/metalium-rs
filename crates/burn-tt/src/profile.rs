@@ -37,7 +37,11 @@
 //! * `pipeline.tsv` (`TT_PROFILE_DETAIL=pipeline` only): every trace op's streamed batches on each
 //!   unit, from the first replay that stamped it: when B waited for a slot, issued the gather and
 //!   saw it land, and when T0 and T2 waited, got and finished each batch
-//!   (`tt_kernels::profile_mode::unit_pipes`; `summary.md` has a table by label).
+//!   (`tt_kernels::profile_mode::unit_pipes`; `summary.md` has a table by label), the transfer a
+//!   multicast sender's B hands its NC inside each batch, and B's credit waits.
+//! * `nc.tsv` (`TT_PROFILE_DETAIL=pipeline` only): every trace op's units, one per line: whether it
+//!   sent strips on (a multicast sender), B's sent batches and credits, and where its NC's time went,
+//!   from NC's entry log (`tt_kernels::profile_mode::NcStats`; `summary.md` has a table by label).
 //!
 //! `TT_PROFILE_DETAIL=full` stamps every data entry too (fewer ops per replay window);
 //! `TT_PROFILE_DETAIL=pipeline` adds each streamed batch's steps on every unit. A
@@ -152,7 +156,8 @@ impl Profile {
     }
 
     /// Write `summary.md`, `ops.tsv`, `skew.tsv`, `channels.tsv`, `tails.tsv`, `replays.tsv` and `trace.json` into
-    /// `dir`, creating it, and `entries.tsv` and `pipeline.tsv` when their detail recorded them.
+    /// `dir`, creating it, and `entries.tsv`, `pipeline.tsv` and `nc.tsv` when their detail recorded
+    /// them.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         let name = |id: u64| self.name(id);
         std::fs::create_dir_all(dir)?;
@@ -177,6 +182,7 @@ impl Profile {
             .any(|t| t.pipes.iter().any(|p| !p.is_empty()))
         {
             std::fs::write(dir.join("pipeline.tsv"), self.device.pipeline_tsv(&name))?;
+            std::fs::write(dir.join("nc.tsv"), self.device.nc_tsv(&name))?;
         }
         std::fs::write(dir.join("trace.json"), self.device.chrome_trace(&name))
     }

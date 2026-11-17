@@ -214,6 +214,73 @@ fn looped_blocks_are_the_other_paths_bit_for_bit() {
     });
 }
 
+/// A weight laid by column (`tensor::Layout::ByColumn`, the stored weights' default): blocked, its
+/// gathers take it into L1 by column, a column a request (`record::BSpan`), and the block kernels
+/// step it so (`matmul::BlockStreamLayout::b_by_column`). Bit for bit the other paths, with the
+/// runner's loops and without (unrolled, looped and subblocked kernels), ragged in `M` and `K`, a
+/// block's chunk of one `K` tile and of several, `A` transposed or not.
+#[test]
+fn weights_laid_by_column_in_blocks_are_the_other_paths_bit_for_bit() {
+    with_session(2, |s| {
+        let (m, k, n) = (100, 200, 256);
+        let bv = specials(k * n, 23);
+        let bits: Vec<u16> = bv.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+        let b = s.upload_bf16_weight(&bits, k, n).unwrap();
+        assert_eq!(
+            b.placement.layout(),
+            tensor::Layout::ByColumn,
+            "the weight by column"
+        );
+        let av = specials(m * k, 9);
+        for at in [false, true] {
+            let a = match at {
+                false => s.upload(&av, m, k),
+                true => s.upload(&av, k, m),
+            }
+            .unwrap();
+            for fidelity in [Fidelity::Lo, Fidelity::HiFi4] {
+                s.set_block_stream(BlockStream::Off);
+                let want = product(s, &a, at, &b, false, fidelity);
+                for loops in [false, true] {
+                    tt_kernels::matmul::set_block_loops(loops);
+                    for shape in [
+                        [2, 2, 3],
+                        [3, 1, 2],
+                        [4, 3, 5],
+                        [1, 4, 1],
+                        [2, 7, 2],
+                        [4, 4, 8],
+                    ] {
+                        assert!(
+                            tensor::block_stream_choice(
+                                BlockStream::Fixed(shape),
+                                [4, 7, 8],
+                                2,
+                                f64::INFINITY,
+                                SrcRoute::Tf32FromFp32,
+                                fidelity,
+                            )
+                            .is_some(),
+                            "{shape:?} plans no blocked product"
+                        );
+                        s.set_block_stream(BlockStream::Fixed(shape));
+                        let got = product(s, &a, at, &b, false, fidelity);
+                        same(
+                            &got,
+                            &want,
+                            &format!("{shape:?}, loops {loops}, {fidelity:?}, A^T {at}"),
+                        );
+                    }
+                }
+            }
+            tt_kernels::matmul::set_block_loops(false);
+            s.set_block_stream(BlockStream::Off);
+            s.free(a).unwrap();
+        }
+        s.free(b).unwrap();
+    });
+}
+
 #[test]
 fn blocked_products_are_exact_where_the_arithmetic_is() {
     with_session(2, |s| {

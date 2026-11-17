@@ -12,6 +12,22 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [Qwen3.5-4B's prefill and decode by op class](#qwen35-4bs-prefill-and-decode-by-op-class-2026-11-16-card-0) | 2026-11-16 | a 16-token chunk is **216 ms** on the card (~74 tokens/s at 128 tokens): the DeltaNets' token-at-a-time recurrence 126 ms (58%, 3,457 small products), barriers 43 ms over 5,688 ops, weight products only 24.5 ms. A decode step 35.5 ms: weight products 13.2 ms at 404 GB/s, the other 945 ops 22.3 ms |
+| [The 1.7B's prefill by op class, at today's contract](#the-17bs-prefill-by-op-class-at-todays-contract-2026-11-16-card-0) | 2026-11-16 | a 128 / 256-token chunk is 29.6 / 50.0 ms on the card: products 55 / 48% (on 32-74 of 120 units, `A` re-read 23-59x: 2.9 GB of `A` a 128-token chunk against 87 MB of activations), **the KV cache's row scatter 16 / 18%** (192 / 377 us a layer for 1 / 2 MB, ~5 GB/s, control-bound), norms 11 / 7%, softmax 7 / 14%, barriers 10 / 6% |
+| [W2: `A`'s reads inline beside a weight read by column](#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0) | 2026-11-15 | the cheaper route chosen over the gather-ahead (deferred): a gather with a `B` span keeps `A`'s tiles in the inline loop. Strip 197.7 -> **191.3 cycles** a tile; H1 default 70.4 / 98.5 -> 70.2 / 99.2, multicast 78.9 / 94.8 -> **79.7 / 96.2**; the 1.7B unchanged. Small, no regression, kept; `A` laid by row is the large share left |
+| [W2: block gathers read a weight a column a request](#w2-block-gathers-read-a-weight-a-column-a-request-2026-11-14-card-0) | 2026-11-14 | a by-column weight read a column a request costs ~86 cycles a tile against ~248 a tile at a time; block products take weights into L1 by column. H1 default 69.3 / 92.0 -> 70.7 / 98.7 TFLOPS, multicast 74.2 / 89.1 -> 79.3 / 95.3; the 1.7B's prefill +7-13%, decode unchanged |
+| [W2: a stable measured block choice](#w2-a-stable-measured-block-choice-2026-11-14-card-0) | 2026-11-14 | the noise was path dependence: the climb from the fastest listed candidate missed H1's `[8,4,9]` basin. Three starts and near ties timed again: H1 LoFi `[8,4,9]` in 5 of 5 processes (92.0-92.6 TFLOPS), HiFi2 a 1% tie (68.8-69.5); the 1.7B's decode and prefill unchanged (ABBA) |
+| [The movers' per-chunk code placement, tried and reverted; what moved the plain product](#the-movers-per-chunk-code-placement-tried-and-reverted-what-moved-the-plain-product-2026-11-14-card-0) | 2026-11-14 | the instruction cache is **2-way, 16-byte lines, 128 sets** (`instruction_cache_geometry_by_aliasing`). The 11-14 "placement moves a product by 20%" was **the measured block choice**, which differs from process to process (and once chose a block 14% slower). Placing B's and NC's per-chunk code (`exec` split hot / cold, rare record arms out of line, `.text.chunk`) gave the 1.7B decode step 1.5-2.1% for ~3.1 KiB on B and ~2 KiB on NC (`profile` room 764): **reverted**, not worth the room |
+| [W2: a cheaper gather, the send-ahead kept, and B's code placement](#w2-a-cheaper-gather-the-send-ahead-kept-and-bs-code-placement-2026-11-14-card-0) | 2026-11-14 | a gather's tile read 386 -> **260 cycles** (safe; 374 -> 241 `fast-reads`): `dm::ReadPlan` and `record::Sink`, held to the general path by a host test; multicast product 61.9 / 67.7 -> **65.2 / 70.1 TFLOPS** with the send-ahead kept (`B` alone 90.4 -> 85.0); the 1.7B's prefill +7-11%, its decode unchanged. Found: **B's code placement moves a product by up to 20%** (the plain product's no-gathers HiFi2 132.4 -> 113.1, LoFi 76.5 -> 92.6, with nothing it runs changed) |
+| [W2: what a sender's read costs, and what it is worth](#w2-what-a-senders-read-costs-and-what-it-is-worth-2026-11-13-card-0) | 2026-11-13 | a sender's strip read is bound by B's cost an entry (a `GATHER`'s 2,112-byte tile reads, each decoded and checked, ~330 ns), not GDDR, the in-flight cap (8, 16, 32 alike) or `fast-reads` (which does not reach a `GATHER`); every sender's reads skipped: 64.1 / 71.1 TFLOPS alone, **81.2 with NC sending ahead** (`[2048,8192]`: 59.3 -> 62.1 -> 81.2): the two bounds hide each other |
+| [W2: sending ahead moves the wait to the sender's B](#w2-sending-ahead-moves-the-wait-to-the-senders-b-2026-11-13-card-0) | 2026-11-13 | NC sending strip `c + 1` before chunk `c`'s output wait lost (61.9 / 67.7 -> 60.6 / 63.9 TFLOPS), and B gathering ahead too lost more (53.1 / 56.2); both reverted. **The meter: NC's output wait was a symptom; the sender's B list (its own strip's read ~10 us, then ~12 us waiting for the other operand's) is the critical path** |
+| [W2: a sender-side meter, and what holds the multicast product back](#w2-a-sender-side-meter-and-what-holds-the-multicast-product-back-2026-11-13-card-0) | 2026-11-13 | the pipeline detail told every multicast sender (its transfer credits named by stream) and NC logged entry by entry (`dm::nc_log`, `step275`, ttsim and card 0); default image unchanged (61.9 / 67.7 TFLOPS). **The `A` senders' reads are not the bound** (with them skipped and the multicasts still sent: 62.7 / 68.8; the old "reads skipped" 90-96 removed `A`'s traffic altogether). **What binds: a sender's NC sends strip `c + 1` only after its own T2 has pushed chunk `c`** (output wait 688 of 1,271 us on the slowest sender), and sending a strip (~11 us) costs about a kernel batch, so the two add; every reader waits for strips (credit wait 750 of 1,085 us) |
+| [W2: the 2-D operand-multicast probe](#w2-the-2-d-operand-multicast-probe-2026-11-13-card-0) | 2026-11-13 | `TT_OPERAND_REUSE=mcast` over a grid rectangle (`TileChoice::Rect`), bit for bit (`step274`, ttsim and card 0, 8x8 to 10x12 at H1's shape): GDDR reads **~10x fewer** (H1 1,107-1,246 -> 121 MB), the same block 1.3-1.55x faster, but **61.8-67.5 TFLOPS on 10x12 against today's 70.5-76.9** (the measured block, unshared): ~55% of the grid's ceiling. With `A`'s traffic removed 90-96 (not its senders' reads alone: see the sender-side meter above). Refuted as the cause: credits, the corner, two `A` senders by parity or by row halves, `A`'s channels, the mover's entry cost |
+| [W2 bounded: the kernel's ceiling at the performance contract, before multicast](#w2-bounded-the-kernels-ceiling-at-the-performance-contract-before-multicast-2026-11-13-card-0) | 2026-11-13 | roadmap W2's probe, first step: with every gather skipped, BF16 `A` prefill products run **118-186 TFLOPS** on 104-120 units (36.7-59.7 ns a K-tile pair a unit, near tt-metal's ~35), against 41-77 with their gathers: every shape is read-bound, 1.87-3.85x of headroom (the stale 28-30 ceiling was FP32 `A`, HiFi4, before F5). On 64 units the ceiling is 74-114, so an 8x8 grid caps the headline shape at 1.15x: the multicast deal must cover the whole grid |
+| [W4: the wide-vocabulary greedy pick, one op for any vocabulary](#w4-the-wide-vocabulary-greedy-pick-one-op-for-any-vocabulary-2026-11-12-cards-0-and-1) | 2026-11-12 | roadmap W4's first two boxes: the 21.4 ms pick was the eight parts' slices (~1.5 ms a copy each), not the argmax; partials folded in levels (`tensor::argmax_fold`), one op for any width, 153 us on the card for 248,320 columns; **Qwen3.5-4B 54.71 -> 34.10 ms a step** (-37.7%, 0.90x tt-metal's 38.0 on the card), the 1.7B unchanged |
+| [W1: a BF16 KV cache, the performance contract's default](#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1) | 2026-11-12 | the 1.7B's decode with a BF16 cache against an F32 one: **18.89 against 19.44 ms at 2K (-2.8%), 38.67 against 43.44 at 8K (-11.0%)**, 7.84 against 7.70 at 32 tokens (+1.9%, a value cast a layer); prefill at 7,992 tokens 5,481 against 5,605 ms; half the cache's GDDR; `step269` 228 of 232, PCC 0.99976; the default (the plan's kill reads "and") |
+| [W1: a BF16 KV cache bounded before building](#w1-a-bf16-kv-cache-bounded-before-building-2026-11-12-card-1) | 2026-11-12 | the 1.7B's decode with the batched products' keys and values not read: 19.54 -> 17.72 ms at 2,000 tokens, 43.48 -> 34.10 at 7,992; a BF16 cache predicted **~0.9 ms (4.7%) at 2K, ~4.7 ms (10.8%) at 8K**, ~0 at short context; built. The other ~26 ms of attention at 8K is not the cache |
+| [W1: the BF16 defects fixed, the BF16 lookup, and one tied table](#w1-the-bf16-defects-fixed-the-bf16-lookup-and-one-tied-table-2026-11-12-cards-0-and-1) | 2026-11-12 | W1's leftovers: a cast widens a host BF16 tensor on the host; a retiling to the same matrix is a view (the BF16 Qwen3.5 holds 4.3 GB of host memory flat, not 40+); `expand` past 2,097,152 rows in chunks; a transposed BF16 `B` transposed by the unpacker; `SELECT_ROWS_BF16`; a tied table stored once, BF16 (owner's call): the 1.7B 7.52 -> 7.68 ms (+2.1%, 312 MB of GDDR less), Qwen3.5-4B 56.93 -> **54.47 ms**; `step167` BF16 229 -> 6.3 s |
 | [W1: BF16 activations into the products, the performance default](#w1-bf16-activations-into-the-products-the-performance-default-2026-11-11-cards-0-and-1) | 2026-11-11 | the BF16 stream replaced: the residual and every op's arithmetic F32, a norm's output and `silu(gate) * up` rounded once to BF16 where made (one op each), products reading them as they lie with F32 results; decode unchanged (7.52 / 8.01 / 8.64 against 7.49 / 7.99 / 8.67 ms), prefill 1.06-1.09x (4,266 against 4,007 tokens/s at 256), `step269` the same 228 of 232: the performance contract's default; the BF16 stream deleted |
 | [W1: burn-tt on BF16, and the 1.7B on a BF16 stream (an option)](#w1-burn-tt-on-bf16-and-the-17b-on-a-bf16-stream-an-option-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's routing phase and a first model run: 21 Burn ops, products, BFP storage of BF16, casts over runs of tiles, RMSNorm on BF16; the 1.7B on a BF16 stream works but runs behind the FP32 stream (decode 9.20 against 7.51 ms at 32 tokens, prefill 2,936 against 4,004 tokens/s at 256) and trips step269's top-1 threshold by one position: the default stays the FP32 stream, the BF16 one an option; what it lacks, measured |
 | [W1: products with a BF16 result, and a BF16 packed twin](#w1-products-with-a-bf16-result-and-a-bf16-packed-twin-2026-11-11-cards-0-and-1) | 2026-11-11 | native BF16's third phase: each output rounded in `Dst` once its `K` chain is done (the last `K` chunk's run), packed as BF16; every schedule but `K` blocks; the quantize costs 6-9% of a short-`K` chunk product and ~0 of `down` (BF16 x BFP8, card 1), below the BF16 `A`'s gain: not killed |
@@ -427,6 +443,881 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## Qwen3.5-4B's prefill and decode by op class (2026-11-16, card 0)
+
+The 1.7B's breakdown (below), for the next model up. `TT_GEN_PROMPTS=128 TT_GEN_NEW=4 TT_GEN_SAMPLES=30 cargo
+xtask bench --profile --device 0 --filter silicon_bench_models::qwen35_traced_generation` (run `1794870651`; safe
+image, performance contract: BFP8 weights, the tied head the BF16 table, BF16 KV cache; chunks of 16, 512-position
+cache, at `3e43e4a`). Every op covered: the chunk trace's 5,688 in 266 replays, the decode step's 1,074. A first run
+with 12 samples (`1794869643`) covered only 3,368 of the chunk's ops; a 16-token chunk needs ~210 replays. Host
+times under the profile image are not comparable; the card's spans are.
+
+**Prefill: a 16-token chunk is 216.0 ms on the card**, so a 128-token prompt is ~1.72 s (~74 tokens/s; the 1.7B
+prefills 4,025). Its trace has 5,688 ops, against the 1.7B's 522 for a 128-token chunk, because the DeltaNet
+recurrence runs a token at a time (`qwen35.rs`, module documentation).
+
+| class | ops | ms | % | barriers, ms | read, MB |
+|---|--:|--:|--:|--:|--:|
+| **the recurrence's small products** (`B` under 4 MB) | 3,457 | **125.6** | 58 | 27.2 | 5,434 |
+| other element-wise | 1,201 | 26.9 | 12 | 3.3 | 1,990 |
+| weight products (`B` over 4 MB) | 129 | 24.5 | 11 | 0.7 | 8,585 (`B` 5,326) |
+| broadcast / expand / repeat | 356 | 14.8 | 7 | 4.3 | 193 |
+| `cat` (96, ~142 us each) | 96 | 13.6 | 6 | 6.3 | 87 |
+| norms | 393 | 9.5 | 4 | 1.0 | 212 |
+| attention (`qk`, `pv`, softmax; 8 layers) | 56 | 1.1 | 1 | 0.2 | 115 |
+| a chunk | 5,688 | **216.0** | | **43.1** | 16,615 |
+
+- **The recurrence is the prefill.** About 9 small products a token a DeltaNet layer, each ~36 us, a fifth of it
+  barriers. The chunk's bytes take 39 ms at 512 GB/s; it runs 5.5x longer.
+- **Bound for a chunked (WY / chunkwise gated delta rule) recurrence:** the 126 ms gone entirely leaves ~90 ms a
+  chunk (2.4x at chunks of 16). A chunkwise form also frees the chunk size, which the token-at-a-time trace holds at
+  16 (5,688 ops already); at 64-128 tokens a chunk the weight products' 24.5 ms is shared by 4-8x the tokens.
+- tt-metal's prefill for this model on the card is not measured.
+
+**Decode: a step is 35.5 ms on the card** (`Step(256)`, 1,074 ops; host-timed unprofiled 34.8 ms, tt-metal 38.0 on
+the card):
+
+| class | ops | ms | barriers, ms |
+|---|--:|--:|--:|
+| weight products (5.3 GB at 404 GB/s; the head 2.9 ms of it, 1.31 GB at 457) | 129 | **13.2** | 2.6 |
+| small products (the recurrence's) | 240 | 7.5 | 1.9 |
+| norms | 306 | 6.2 | 0.5 |
+| other element-wise | 224 | 5.0 | 0.6 |
+| broadcast / expand / repeat, `cat`, attention, the pick | 175 | 3.6 | 0.3 |
+
+- The weights take 10.4 ms at 512 GB/s; the step is 3.4x that. **The 945 ops around the weight products are 22.3 ms**
+  (63%): the DeltaNet chain, ~25 ops a layer (roadmap, Models). Fusing it is the lever toward the bandwidth target,
+  not the products.
+
+## The 1.7B's prefill by op class, at today's contract (2026-11-16, card 0)
+
+The last breakdown of a prefill chunk by op class (2026-10-31, below) predates the performance contract and every W2
+change. Profiled whole: `TT_GEN_MODEL=smollm2-1.7b-instruct TT_GEN_PROMPTS=128,256 TT_GEN_CHUNKS=64,128,256
+TT_GEN_SAMPLES=150 TT_GEN_NEW=2 cargo xtask bench --profile --device 0 --filter
+silicon_bench_models::traced_generation_stream_ceiling` (run `1794868686`, safe image, performance contract: BFP8
+weights, BF16 activations, a BF16 KV cache; 512-position cache, at `3e43e4a`). Every op covered (152 replays a trace,
+none overflowed). The card's spans sum to the host's prefill: `Chunk { c: 128 }` **29.6 ms** a replay against
+31.8 ms host-timed unprofiled (4,025 tokens/s, the scoreboard row); `Chunk { c: 256 }` **50.0 ms** (53.7 ms).
+
+| class (ms, % of the chunk) | 128 tokens | 256 tokens | what binds |
+|---|--:|--:|---|
+| weight products (96 + the head) | 15.1 (51%) | 21.4 (43%) | few units, `A` re-read (below) |
+| attention's products (`qk`, `pv`) | 1.3 (5%) | 2.8 (6%) | |
+| **the KV cache's row scatter** (24, `scatter_nd` x2) | **4.6 (16%)** | **9.1 (18%)** | 192 / 377 us a layer for its keys and values (1 / 2 MB) on 64 units: ~5 GB/s, control 46-70% of it, B waiting for its writer the rest |
+| softmax and its scale | 2.2 (7%) | 7.0 (14%) | 74-284 GB/s; grows with the chunk's scores |
+| norms (`rms_norm`, 97) | 3.1 (11%) | 3.6 (7%) | one `rms_norm` a layer reads at 33 GB/s (44% kernels) |
+| `silu * mul` | 1.2 (4%) | 2.9 (6%) | kernels 60-68% |
+| rope, adds, reshapes, the rest | 2.1 (7%) | 3.3 (7%) | |
+| of which barriers, over all ops | 2.9 (10%) | 3.0 (6%) | 522 ops a chunk |
+
+**The products, a layer at 128 tokens** (`ops.tsv`; BFP8 weight bytes in brackets):
+
+| product | units of 120 | us | `B` read, MB | `A` read, MB |
+|---|--:|--:|--:|--:|
+| `qkv` (13.4) | 48 | 112 | 14.2 | 26.0 (the 0.5 MB `A`, 50x) |
+| `o` (4.5) | 32 | 75 | 9.4 (2.1x) | 17.0 (34x) |
+| `gate\|up` (35.7) | 57 | 210 | 37.7 | 30.8 (59x) |
+| `down` (17.8) | 44 | 210 | 37.7 (2.1x) | 47.6 (the 2.1 MB `A`, 23x) |
+| a layer | | **607** | 99 | 121 |
+
+A layer's weights take 139 us at 512 GB/s, so the products run 4.4x off their bandwidth floor. At 256 tokens they
+use 32-74 units, read `o`'s weight 4.2x and the others' 2.1x, and take 868 us a layer. The head (the BF16 table, the
+last row only) is 0.5 ms at ~417 GB/s.
+
+**What it says:**
+- **The KV cache's write is the cheapest large item.** It writes 1-2 MB a layer through `SCATTER_ROWS` in 32-byte
+  face-rows, a row at a time (`FixedWrite::write`, position-major). A chunk's rows are consecutive positions,
+  tile-aligned when the chunk starts at a multiple of 32, so the same bytes could go as whole tiles: at even 200 GB/s
+  ~10 us a layer. Bound: up to **-4.4 / -8.8 ms**, a 128-token prefill 29.6 -> ~25 ms (1.18x), 256 -> ~41 ms (1.21x).
+- **The products are bound by occupancy and `A`'s re-reads, not by the GEMM kernel.** At `m` = 128-256 a product's
+  blocks fill 32-74 of 120 units, and each column block re-reads the whole `A` (2.9 GB of `A` a 128-token chunk for
+  ~87 MB of activations). Holding `A` once (multicast along rows, or an `A` resident in L1, as W2 does for H1) and
+  spreading the blocks over the grid (split `K`, or narrower column blocks) approach the weights' 139 us a layer:
+  up to -11 ms at 128 tokens.
+- **Together they reach tt-metal's ~18 ms TTFT at 128 tokens** (29.6 - 4.4 - ~7 for products at 2x). The norms,
+  softmax and barriers (~8 ms) are next.
+
+## W2: `A`'s reads inline beside a weight read by column (2026-11-15, card 0)
+
+Roadmap W2, "`A`'s reads inline beside a `B` read by column". The owner chose this, the cheaper route to the senders'
+ceiling, over the gather-ahead (W2 (2), deferred with its prerequisites in the roadmap). Performance contract,
+release, safe image, card 0, against the parent `376d4ad` in the same session.
+
+**Changed** (`record.rs`, `expand_for`'s `GATHER` arm): a record whose `B` is read and marked `REF_L1_BY_COLUMN`,
+beside an interleaved or resident `A` with no mark, no longer goes out of line. Its span is checked first
+(`gather_span`, before any read), `A`'s tiles take the inline loop (`Sink::read`, the planned request), and the
+span's pieces are read after them out of line (`gather_span_reads`). The same entries in the same order: the record
+test `an_a_beside_a_b_laid_by_column_is_read_inline` compares them with `gather_by_column`'s and counts `A`'s reads
+in `Sink::read` (watched failing with the old condition). `dm_b`'s `run_record` grows 264 bytes; its room at the tightest (profile + encoded-guard) is 3,964 bytes, from 4,440. Gates: `step172` / `step173` in all three read modes, `step229` / `step274` on ttsim and card 0, `step12_mnist`, smoke 1,312 / 1,312.
+
+A first version checked the span and then built it again after `A`'s reads (two `BSpan::of_columns` a record): the
+strip got slower, 197.7 -> 206.0 cycles a tile (`1794754413` against `1794754722`). Building it once and holding
+it across `A`'s loop fixed that.
+
+**Measured:**
+- **`mover_gather_rate`** (profile image; strips of 7 x 4 `A` tiles beside 4 x 8 `B` tiles, cycles a tile's bytes):
+  `B` by column read a column a request 197.7 -> **191.3** (`1794754722` -> `1794755732`). The untouched cases
+  moved +0.5% (interleaved 258.8 -> 260.2, resident 302.5 -> 304.3): code placement.
+- **H1 `[2048,2048]@[2048,16384]`, BF16-HiFi2 / BF16 x BFP8 LoFi**, at `[8,4,9]` both:
+  - default (pull, 120 units): 70.4 / 98.5 and 70.5 / 98.1 on the parent (`1794758100`, `1794754743`) -> **70.2 /
+    99.2** (`1794757820`): flat / +0.7-1.1%;
+  - multicast (`TT_OPERAND_REUSE=mcast`, 10x12): 78.9 / 94.8 and 79.1 / 95.2 (`1794758231`, `1794754870`) ->
+    **79.7 / 96.2** (`1794757949`): +0.7-1.0% / +1.1-1.5%. The "every sender's reads skipped" row is 85.6 / 100.7,
+    so 7% / 4% remain.
+- **The 1.7B, BAB** (new `1794755772` / `1794757160`, parent `1794755008` / `1794756462`): decode 7.827 / 8.249 /
+  8.751 -> 7.842 / 8.254 / 8.727 ms (within 0.2%); prefill 1,560 / 3,962 / 4,758 -> 1,566 / 3,960 / 4,767 tokens/s
+  (one new run's 3,098 at 128 tokens, a one-off, left out).
+
+**Against the bound:** predicted ~7% of `A`'s gather, a product's ~2%; measured 0-1.5%. Below the 3% that Parts 2
+and 3 of the plan were held to, but a default with no regression and the owner's chosen route, so it stays.
+
+**What is left of the senders' reads is `A`'s per-tile cost:** without `A`'s gathers the default LoFi runs 125.4
+against 99.2. Reading `A` a row a request, as `B` now is a column, needs `A` laid by row: every activation writer
+changes (backlog).
+
+## W2: block gathers read a weight a column a request (2026-11-14, card 0)
+
+Roadmap W2's "the gather's remaining ~160 cycles a tile". Performance contract, release, safe image, card 0.
+
+**Bound first** (`silicon_bench_memory::mover_gather_rate`, profile image, `1794637454`; strips of 7 x 4 `A` tiles
+and 4 x 8 `B` tiles, cycles a tile's worth of bytes):
+
+| case | cycles |
+|---|---|
+| both interleaved, inline (the plain product's) | 259.9 |
+| `B` by column, a tile a read (block products on a weight, out of line) | 283.9 |
+| `B` by column, a column a request (`BSpan`) | 197.6 |
+| `B` resident and by column (an `A` sender beside a weight; out of line) | 325.5 |
+| `B` resident and interleaved (inline) | 304.4 |
+
+Less `A`'s share, `B` costs ~248 cycles a tile read a tile at a time, ~221 interleaved inline, and **~86** by
+column. `B` needed no new layout: weights are already stored by column (`TT_WEIGHT_COLUMNS`); only one-row products
+read them so.
+
+**Built:**
+- **Block products take a by-column weight into L1 by column.** `Microkernel::by_column` (new) tells the lowering
+  which operand the body takes so, and the lowering marks only those gathers `REF_L1_BY_COLUMN`, so the kernels and
+  the mover cannot disagree. `Mma` says so for a one-row product (as before) and now for `Schedule::BlockStream`.
+- **The block kernels step `B` by column** (`BlockStreamLayout::b_by_column`, `b_index`; `chunk` names the pairs):
+  - unrolled: through `chunk`;
+  - looped: its two strides swapped;
+  - subblocked: a `K` row's first column in GPR 49, so each `K` step is two independent adds and none negative.
+    `SUBDMAREG` would be one add, but ttsim refuses it, and `ADDDMAREG`'s wraparound is unverified.
+- **A record reads its operands' layouts only where it reads them** (`record.rs`): a resident by-column operand no
+  longer sends the record out of line (a multicast `A` sender beside a weight reads `A` inline), and a resident `B`
+  may carry the mark, which names the order its slots hold.
+- **Gates:**
+  - `matmul::order`: the subblocked and looped kernels pack the by-column chunk's canonical order under the
+    adversarial interpreter, and row-stepping kernels miss it;
+  - `step229`'s and `step274`'s new by-column tests, bit for bit against the unblocked path, on ttsim and card 0.
+    Each was watched failing with the kernels stepping by row; step274 first did not fail, because it compared
+    two blocked products, so it now compares against the unblocked path too;
+  - a record test that a resident by-column `B` keeps `A`'s reads in `Sink::read` (watched failing on the old
+    condition);
+  - `step172` / `step173` in safe, `fast-reads` and `encoded-guard`;
+  - `step12_mnist`, 8/8;
+  - `dm_b`'s room at its tightest (profile + encoded-guard) is 4,440 bytes.
+
+**H1 `[2048,2048]@[2048,16384]`**, against the parent `231aaf2` in the same session, BF16-HiFi2 / BF16 x BFP8 LoFi:
+- **Default (pull, 120 units):** 69.3 / 92.0 (`1794638828`) -> **70.7 / 98.7 TFLOPS** (`1794638523`). Without `A`'s
+  gathers 72.7 / 126.8: `A` is now the larger share of the gathers.
+- **Multicast** (`TT_OPERAND_REUSE=mcast`, 10x12): 74.2 / 89.1 (`1794638976`) -> **79.3 / 95.3** (`1794638654`), at
+  `[7,4,9]` / `[7,4,11]` both times. HiFi2 multicast is above the default for the first time. The 65.2 / 70.1
+  quoted before were at the unstable block choice (the entry below). The "every sender's reads skipped" row is
+  86.5 / 101.9 against 85.6 / 101.2: the product is now within 8% / 6% of it.
+
+**The 1.7B, ABBA** (new `1794639138` / `1794641348`, parent `1794639831` / `1794640576`): prefill 1,377 / 3,757 /
+4,451 -> **1,562 / 4,025 / 4,768 tokens/s** at 32 / 128 / 256 tokens (+13.4 / +7.1 / +7.1%); decode step 7.864 /
+8.253 / 8.739 -> 7.833 / 8.253 / 8.737 ms (unchanged). The bench's captures are ~60 s faster (489 against 550 s).
+
+**Next:** `A`'s reads. A gather that reads both operands still goes out of line for `B`'s mark, so `A` takes the
+per-entry path (325 against 304 cycles a tile alone). Then `A` laid by row.
+
+**The gather-ahead's bound, after this** (roadmap W2 (2); `TT_CONTRACT_PIPELINE=1`, `--profile`, multicast on 10x12,
+`1794644501`; LoFi only, since HiFi2's log overflowed):
+- The slowest sender, per batch of 64: its strip read 7.3 us (467 us), then its wait for the other operand's strips
+  11.2 us (716 us), in series. The kernel takes 14.5 us (929 us) and T0 starves 9.0 us (577 us). Over all units:
+  `pipe` 1,515 us against an `ideal` of 1,221.
+- Hiding every sender's read behind its wait is worth at most the "every sender's reads skipped" row: 85.6 / 101.2
+  against 79.3 / 95.3, so **+7.9% / +6.2%**.
+- The meter cannot isolate T0's pop from T2's push (`kernel` spans both), so the consumed-to-packed tail the guard
+  would recover is unmeasured. Reordering puts `push(c)` behind `gather(c + 1)`, which starts only once chunk
+  `c - 1` is consumed, so T0 may wait a strip read a batch: the hazard that lost 53.1 / 56.2 under the packed guard.
+- The same ceiling is also reachable without the reorder, by making the senders' reads cheaper: `A`'s reads
+  inline beside a `B` span, then `A` laid by row.
+
+## W2: a stable measured block choice (2026-11-14, card 0)
+
+Roadmap W2's "the measured block choice is noisy". Performance contract, release, safe image, card 0.
+
+**What was wrong.** It was not timing noise but path dependence. `Session::measure_product` timed the listed
+candidates once each, climbed from the fastest of them over `tensor::block_stream_neighbours`, and kept the climb's
+end. H1 `[2048,2048]@[2048,16384]` BF16 x BFP8 LoFi has two basins: `[8,4,9]` (~1,470 us) is reached only from the
+second-fastest listed candidate. When one replay put a candidate of the other basin first, the climb ended at
+`[6,4,12]` (1,673 us). Five processes before the change (`1794620093`-`1794620711`) chose `[8,4,9]` four times (92.7-93.8
+TFLOPS) and the other basin once (79.6, `1794620384`).
+
+**Changed** (`measure_product`, `session.rs`; constants beside `MEASURE_MOST`, which rises 40 -> 64):
+- **Several starts** (`MEASURE_STARTS = 3`): a climb from each of the three fastest listed candidates, each stepping to
+  the best of its own timed neighbours. Every candidate is timed at most once.
+- **Near ties timed again** (`MEASURE_TIE = 3%`, `MEASURE_FINALISTS = 3`, `MEASURE_ROUNDS = 3`): the timed candidates
+  within 3% of the best are timed twice more, and the median of the three decides.
+- Host gates (`step245_measured_block`, ttsim 5/5): the climbs' order, timing each neighbour once; a choice reached
+  only from the second listed candidate; and a near tie whose lucky first time loses on the median. Each new test was
+  watched failing on the old code. On silicon: `step245` (`1794627226`) and `step12_mnist`, 8/8.
+
+**H1 after, five processes** (`1794628263`, `1794628413`, `1794628555`, `1794628692`, `1794628816`; both probe tests,
+so ten questions a fidelity):
+- **LoFi:** `[8,4,9]` in 10 of 10 questions, **92.0-92.6 TFLOPS**.
+- **HiFi2:** `[8,3,9]` 5, `[9,3,9]` 3, `[8,2,9]` 1, `[10,4,7]` 1, at 68.8-69.5 TFLOPS. These are a tie within 1%, so the
+  choice among them does not move the product.
+
+**The 1.7B, ABBA** (`TT_GEN_MODEL=smollm2-1.7b-instruct`, new `1794634380` / `1794636512`, parent `a55a6c4`
+`1794635151` / `1794635818`): decode step 7.850 / 7.847 against 7.805 / 7.877 ms at 32 tokens, 8.767 against
+8.743 (mean) at 256. Prefill 4,482 / 4,438 against 4,473 / 4,485 tokens/s at 256. Every difference is inside the
+parent's own spread (its two decode runs differ by 0.9%). Decode's one-row products are not measured, so they
+cannot move. The chunk products' choices still differ between runs; they are near ties, and prefill does not move.
+
+**Its cost.** The bench's first capture takes ~65 s longer (`traced_generation` 554 against 487 s). The H1 probe
+takes ~70 s against ~45 s. Build time is not a target; the cross-process cache of choices stays roadmap W8's box.
+
+## The movers' per-chunk code placement, tried and reverted; what moved the plain product (2026-11-14, card 0)
+
+**Reverted the same day:** the code below was removed (the images are again the entry below's, `dm_b` checked byte
+for byte); the cache geometry probe, `TT_FIRMWARE_OVERRIDE` and the probe's printed block choice stay. The premise,
+the entry below's "placement moves a product by 20%", was the measured block choice, and the decode step's 1.5-2.1%
+did not pay for ~3.1 KiB of B's image and ~2 KiB of NC's ([failed-approaches](failed-approaches.md)).
+
+The entry below's "next": place B's per-chunk code on purpose. Release, performance contract, safe images, card 0.
+Old images in the same tree and host build through `TT_FIRMWARE_OVERRIDE` (new, development only: the ELFs in a
+directory replace this tree's, through the same instruction gate; checked byte for byte), the old ones being
+`target/fw-size/safe`, the image the entry below kept.
+
+**The cache's geometry first** (`probe_icache::instruction_cache_geometry_by_aliasing`, `1794619199`): 2-way,
+16-byte lines, 128 sets, a miss ~6.9 cycles a line, a sequential prefetcher ("Instruction caches" below). Code fits
+when no set holds more than two of its hot lines.
+
+**Which entries run every chunk** (B's unit 0 over the 1.7B's decode steps at 64 / 256 / 512 positions,
+`TT_PROFILE_DETAIL=full`, `1794619430`): `CB` 4,436, `READ_L1` 2,079, `RELEASED` 1,101, `LAUNCH` and
+`KERNEL_WAIT` 954 each, `BARRIER` 819, `GATHER` 738, `READ_RUN` 423, `WAIT` 247, `READ` 171, `KERNEL` 150; the rest
+under 30 (`POKE_RUN`, `SELECT_ROWS`, `FILL`).
+
+**Built (and reverted):**
+- **`exec` split** (mover.rs): the entries above (and NC's `WRITE`, `WRITE_L1`, `WRITE_L1_MCAST`, `CREDIT`) decode
+  through per-op decoders (`Entry::decode_buffer`, `decode_kernel`, ...; `Entry::decode` delegates to the same ones)
+  and run inline; every other entry leaves through one out-of-line call, `exec_cold`. B's `exec` 7,232 -> 2,552
+  bytes, NC's 5,184 -> 1,980. Host test `the_per_op_decoders_make_what_the_general_decoder_makes` (each pairing
+  against the general decoder over ~40,000 entries, a wrong pairing watched to disagree).
+- **Record arms out of line** (`record::expand_for`): `SELECT_ROWS`, `SCATTER_ROWS`, `POKE_RUN`, and on B
+  `READ_RUN`/`WRITE_RUN` and the pads, each its own function; each arm guarded to its direction, so B carries no
+  write arm. B's `run_record` (now the `GATHER` arm) 10,524 -> 6,544 bytes.
+- **`.text.chunk`** (`sections.x`): after the per-entry stretch, by subsection: the `dataflow` polls; a kernel's
+  launch and wait, a pair's start and end, barriers and releases; the pump; then `run_record`, last. On the roles,
+  `run_stream` and the pusher, so a streamed batch's code is the slot's first ~3.1 KiB (`role_t0` 3,164 bytes),
+  checked at build time against the cache (`tt-firmware-images/build.rs`, watched failing at a 2,048-byte limit).
+  `cargo xtask fw-size` printed every image's window and its fullest set.
+
+**The plain product does not move** (`[2048,2048]@[2048,16384]`, every unit, TFLOPS, old A / new B):
+
+| run | block chosen (HiFi2 / LoFi) | HiFi2 | LoFi | no gathers HiFi2 | no gathers LoFi |
+|---|---|--:|--:|--:|--:|
+| A `1794620093` | | 68.96 | 92.32 | 102.13 | 141.86 |
+| B `1794620198` | | 68.79 | 93.43 | 113.47 | 143.96 |
+| B `1794620287` | | 68.45 | 80.88 | 102.37 | 152.45 |
+| A `1794620384` | | 68.88 | 82.30 | 102.28 | 152.61 |
+| B `1794620526` | `[8,3,9]` / `[8,4,9]` | 69.09 | 93.46 | 113.32 | 145.65 |
+| B `1794620611` | `[8,3,9]` / `[8,4,9]` | 68.42 | 93.25 | 113.41 | 145.54 |
+| A `1794620711` | `[9,3,9]` / `[6,4,12]` | 69.11 | 80.94 | 102.40 | 152.54 |
+| B `1794620812` | `[8,2,9]` / `[8,4,9]` | 67.80 | 93.35 | 92.35 | 146.58 |
+
+The same image gives either of two values a column, and the value follows the block the process measured and chose
+(the probe now prints it), not the image: LoFi `[8,4,9]` ~93, `[6,4,12]` ~81; no gathers HiFi2 `[8,3,9]` ~113,
+`[9,3,9]` ~102, `[8,2,9]` ~92. Like for like, old and new are within 1%. **So the entry below's "B's code placement
+moves products by up to 20%" was this choice, not placement.** And the choice itself is noisy: `1794620711` timed
+`[6,4,12]` at 1,673 us and kept it, where `[8,4,9]` runs ~1,470 (roadmap W2).
+
+**The 1.7B decode step is faster** (`traced_generation`, ms a step at 32 / 128 / 256-token prompts, ABBA, each its
+own process; prefill tokens/s at 32 / 128 / 256):
+
+| run | decode | prefill |
+|---|--:|--:|
+| A `1794620981` | 7.802 / 8.254 / 8.735 | 1,380 / 3,836 / 4,487 |
+| B `1794621759` | 7.694 / 8.140 / 8.629 | |
+| B `1794622467` | 7.615 / 8.112 / 8.598 | 1,410 / 3,895 / 4,515 |
+| A `1794622987` | 7.842 / 8.277 / 8.758 | 1,392 / 3,841 / 4,491 |
+| mean change | **-2.1% / -1.7% / -1.5%** | +1-2% |
+| final tree, with the roles' batch code placed (`1794623768`) | 7.686 / 8.137 / 8.618 | 1,410 / 3,886 / 4,548 |
+
+Every new run is below every old one. The roles' placement (the last row, built after the ABBA) moves decode by no more than the new runs differ from each other: it holds their batch code to the cache from now on rather than speeding today's. The decode step runs thousands of small entries a step on each unit (the count
+above), and those are what the split shortened. Kill rule (under 2% on the plain product and under 0.5% on decode):
+did not fire; reverted on its cost instead (below). `step12_mnist` 8 of 8 (card 0); `step172`, `step173` in both read modes and with `encoded-guard`
+(ttsim).
+
+**Image budget** (`cargo xtask fw-size`): `dm_b` safe 43,140 -> 46,260 bytes, the tightest (`profile` +
+`encoded-guard`) 47,800 -> 50,980 (room 1,244); `dm_nc` `profile` 22,492 -> 23,812 (room 764); the roles
+`profile` <= 6,480 (room 688). The out-of-line arms each carry their own copies of the helpers they share. Judged not worth
+1.5-2.1% of the decode step, and reverted.
+
+## W2: a cheaper gather, the send-ahead kept, and B's code placement (2026-11-14, card 0)
+
+The entry below's "next", built. Performance contract, release, safe image unless named, card 0.
+
+**Built:**
+- **`dm::ReadPlan`** (tt-isa): a plain read of one request made into its NoC request in one step, with
+  `Descriptor::decode`'s and `DramMove::new`'s checks, from what a record's reads share (the chip's channels, the
+  tile, the ID). A host test holds it to that general path entry for entry, request for request and refusal for
+  refusal (`a_read_plan_makes_what_the_general_path_makes`; the L1-end check removed, it fails).
+- **`record::Sink`** (`expand_reads_into`): a `GATHER`'s whole-tile reads reach the sink as their words
+  (`Sink::read`), not as entries; the default makes the same entries, so the host's expansion is unchanged
+  (`tt-kernels`' tensor tests, entry for entry).
+- **B's `PlannedReads`** (mover.rs `run_record`): each such read straight to the NoC; on the fast read path a run of
+  them is one `noc::ReadBatch`, ended before any other entry and at the record's end. `Sink::entry` is out of line
+  (below).
+- **`silicon_bench_memory::mover_gather_rate`**: one tile, four records of a sender's strip pair (BF16 `A` 7 x 4 and
+  `B` 4 x 8, every channel), against the same reads as plain entries, `LISTS` tracing, B's cap swept 8-64.
+- **The send-ahead** (`multicast::writer_list`, the interleaving model on it): kept, now that the gather is cheaper.
+- **The meter's cross-core allowance** (`profile_mode::CROSS_CORE_SLACK`) 64 -> 128 cycles: with the new read path a
+  pair's first input push stamps its end 65-70 cycles after T0 saw it (`1794613736`), which dropped the batch as
+  disordered (`silicon_profile_mode`); a join off by a batch is ~5,000 cycles off.
+
+**A gather's tile read on one tile** (cycles a 2,112-byte tile; cap 8, the cap changes it by < 3%):
+
+| Path | safe | `fast-reads` |
+|---|--:|--:|
+| before (`1794609313`, `1794609316`) | 386 | 374 |
+| `ReadPlan` per entry | 298 | 279 |
+| + `ReadBatch` (fast path) | | 272 |
+| + `Sink::read` (no entry between) (`1794613522`, `1794613541`) | **260** | **241** |
+| host-encoded plain reads, tight loop (for scale) | | 99 |
+
+Taken apart on the fast image: making the requests without issuing them costs 136-220 cycles a tile, issuing ~50-100.
+A row of a tensor's tiles as one tight loop of its own (`Sink::row`) measured 253-264 (no better: an `A` row is four
+tiles, and the loop's call and cursor cost it back) and was reverted. What is left is per tile; fewer, larger reads
+(a strip's tiles contiguous on a channel) are the next order of magnitude, a layout change.
+
+**The multicast product** (10x12, `[7,4,8]`, H1 `[2048,2048]@[2048,16384]`, TFLOPS):
+
+| | HiFi2 | LoFi |
+|---|--:|--:|
+| before (`1794581327`) | 61.9 | 67.7 |
+| cheaper gather alone (`1794610158`) | 62.5 | 69.1 |
+| cheaper gather + send-ahead (`1794614637`) | **65.2** | **70.1** |
+| the same, every sender's reads skipped | 79.6 | 87.2 |
+| no gathers | 114.7 | 127.2 |
+| `B` alone (no `A` traffic): before -> now | 90.4 -> 85.0 | 97.8 -> 90.9 |
+
+The meter (`[2048,8192]`, `1794610456`, with the gather at 260 and the send-ahead): the slowest sender's gather 487 ->
+371 us, NC waiting on its own B 580 us, its B waiting for the other operand's strips 571. The sender's B list (its own
+read, then its wait for the other operand's strip) is still the path. With `B` alone the sender's scatter of chunk `c`
+now waits for its readers' frees of `c + 1` (the send-ahead), which costs that shape 6-7%.
+
+**The 1.7B** (`traced_generation`, every unit, performance contract; the same build with the old record path, `1794617319`,
+against the new, `1794616637`): prefill at 32 / 128 / 256 tokens 1,240 / 3,441 / 4,147 -> **1,379 / 3,799 / 4,437
+tokens/s (+11% / +10% / +7%)**; the decode step 7.843 / 8.343 / 8.879 -> 7.866 / 8.300 / 8.788 ms (+0.3% / -0.5% /
+-1.0%).
+
+**Corrected 2026-11-14 (the entry above): what follows was the measured block choice, which differs from one
+process to the next, not B's code placement.** As first written:
+
+**B's code placement moves products by up to 20%.** The plain product (every unit, the measured block, same GDDR
+bytes) on three B images that differ only in the record code's size, not in what the product runs:
+
+| B image | HiFi2 | LoFi | no gathers HiFi2 | no gathers LoFi |
+|---|--:|--:|--:|--:|
+| the old record path (`1794614097`) | 70.3 | 76.5 | **132.4** | 152.9 |
+| `PlannedReads`, `Sink::entry` inlined: `run_record` +5 KiB (`1794614207`) | 69.4 | **92.6** | 113.6 | 145.7 |
+| `Sink::entry` out of line: `run_record` +1.5 KiB (`1794614376`) | 69.4 | 81.4 | 113.1 | 152.9 |
+
+With every gather skipped the record code does not run at all (each gather is a `WAIT`), yet that variant moves 14%:
+growing `run_record` moves every function linked after it, among them what B runs and polls each chunk (`kernel`,
+`launch`, `release`, `pair_shared`, `finish_pair`, `await_roles`, and `dataflow::buffer`, where B waits on its
+credits). B's instruction cache is ~4 KiB (`sections.x`); only the per-entry stretch is placed on purpose. The kept
+image is the third row. **Next:** place B's per-chunk and polling code on purpose (a section of its own beside
+`.text.hot`), measured against these rows; then the remaining gather cost (contiguous strips), and roadmap W2's (2).
+
+## W2: what a sender's read costs, and what it is worth (2026-11-13, card 0)
+
+The roadmap's W2 item (1) after the send-ahead (the entry below): why a sender's strip read takes ~10 us. Performance
+contract, release, 10x12, `[7,4,8]`, H1 BF16-HiFi2 (the 8192-wide product under the meter, `--feature profile`; the
+16384-wide one for TFLOPS).
+
+**What bounds the read: B's cost an entry.** A `GATHER` expands on the card into one 2,112-byte read a tile, and each
+goes through the mover's safe decode and check (`record_entry`: `Descriptor::decode`, then `issue`), ~330 ns a read:
+59 KB in ~10 us, ~5.9 GB/s, as F27 measured one tile reading 2,112-byte entries (~6.5 GB/s safe, ~359 cycles an entry).
+Ruled out, each measured:
+- **Not GDDR.** The multicast product reads ~51 GB/s card-wide. (A plain product at this block and grid reads 374 GB/s and
+  runs at 41.2 TFLOPS, `1794608213`: its units read at the same ~5.2 GB/s each, GDDR-bound together.)
+- **Not the in-flight cap.** `TT_IN_FLIGHT_CAP` 16 and 32 (B's cap, 8 by default): 61.9 / 68.0 and 62.0 / 67.8 TFLOPS
+  (`1794608262`, `1794608282`); with 32 the slowest sender's gather is 480 us against 488 (`1794608311`).
+- **Not helped by `fast-reads`.** That image encodes plain `READ` entries only. A `GATHER`'s reads still expand on the
+  card (gather 453 us against 487, `1794608393`), so the earlier "not the mover's entries" (`1794545842`, the probe entry
+  below) never tested the gather path.
+
+**What it is worth: only with the sends ahead.** A new probe variant, `, without any sender's reads`
+(`multicast::probe_skip_sender_reads` on both operands): every sender reads nothing and still multicasts. The meter
+runs on a variant with `TT_CONTRACT_PIPELINE_SKIP`.
+
+| 10x12 | HiFi2 | LoFi |
+|---|--:|--:|
+| `[2048,16384]` multicast (`1794608472`) | 61.9 | 67.7 |
+| every sender's reads skipped (no GDDR read at all) | 64.1 | 71.1 |
+| no gathers (the ceiling) | 115.1 | 126.9 |
+| `[2048,8192]` multicast (`1794608525`) | 59.3 | |
+| every sender's reads skipped | 62.1 | |
+| every sender's reads skipped, NC sending ahead (an experiment, reverted; `1794608587`) | **81.2** | |
+| no gathers | 113.7 | |
+
+- Reads free alone: the slowest sender's gather falls from 487 us to 112, and its B's wait for the other operand's
+  strips rises from 569 to 878 to match: work 1,214 us against 1,271. NC still sends strip `c + 1` only after its own
+  kernel pushed chunk `c`.
+- With NC also sending ahead, the slowest sender works 964 us (NC's output wait 98, its transfer wait 226, its wait for
+  frees 217) and readers starve 244 us against 469.
+- So the two bounds are coupled. A sender's NC waiting for its own kernel, and its B's per-entry reads, each hide the
+  other: either alone gains 0-5%, both 37% at this shape.
+
+**Next:** a gather whose reads cost less on B (the record's tensors checked once, its tile reads issued without a decode
+each; `fast-reads`' encoded reads reach ~35 GB/s at this entry size), then the send-ahead again, on the meter.
+
+## W2: sending ahead moves the wait to the sender's B (2026-11-13, card 0)
+
+The sender-side meter's "next" (the entry below), built, measured and reverted. Performance contract, release, safe
+image, 10x12, `[7,4,8]`, H1 `[2048,2048]@[2048,16384]`, TFLOPS; the meter on `[2048,2048]@[2048,8192]` HiFi2 with
+`--feature profile`.
+
+**Tried:**
+1. **NC sends a chunk ahead.** `streaming_segments`' writer list for a region ran each sender's strip section for chunk
+   `c + 1` before chunk `c`'s output wait (`lead 0, lead 1, wait 0, scatter 0, pop 0, lead 2, ...`). Correct: the
+   multicast interleaving model (no stall, every kernel reads its strips, negative controls caught), `step274` and
+   `step275` on ttsim and card 0 (`1794603860`, `1794603901`).
+2. **B gathers a chunk ahead** (on top of 1). B's list ran chunk `c + 1`'s reserve and gather before chunk `c`'s ready
+   wait and push. The interleaving model caught two hazards on the way, both fixed before silicon: a reader's frees
+   moved ahead let a fast reader stand in for a slow one on the summed freed word (so they stay after the wait), and the
+   input reserve counts only pushed batches, so with chunk `c` reserved it no longer waits for chunk `c - 1`'s half (the
+   real lists' slot-reuse `RELEASED` covers it from the third chunk on; the model had to be given it, and each region's
+   closing `KERNEL_WAIT`). `step274` 8 of 8 on card 0 (`1794604572`).
+
+| Layout | BF16-HiFi2 | BF16 x BFP8 LoFi | no `A` traffic (HiFi2 / LoFi) | `A` senders' reads skipped |
+|---|--:|--:|--:|--:|
+| before (`1794581327`) | 61.9 | 67.7 | 90.4 / 97.8 | 62.7 / 68.8 |
+| 1, NC sends ahead (`1794603914`) | 60.6 | 63.9 | 75.8 / 80.2 | 66.1 / 70.6 |
+| 1 + 2, B gathers ahead too (`1794604602`) | 53.1 | 56.2 | 75.6 / 80.4 | 53.9 / 57.2 |
+
+**The meter** (slowest sender, us; `1794581277` before, `1794603949` with 1):
+
+| | work | B gather | B credit wait | NC output wait | NC transfer wait | NC credit wait (frees) |
+|---|--:|--:|--:|--:|--:|--:|
+| before | 1,271 | 488 | 558 | 688 | 89 | 94 |
+| NC sends ahead | 1,313 | 487 | 569 | 96 | **699** | 106 |
+
+**What it shows:**
+- **NC's output wait was a symptom.** Sent ahead, NC waits instead for its own B's transfer push; the sender's B is
+  unchanged: it reads its own strip (~10 us for 59 KB) and then waits ~12 us for the other operand's strip, in
+  series, every chunk. That is the critical path, and every unit inherits it.
+- Sending ahead also ties the sender's scatter of `c` to its readers' frees of `c + 1`, so a unit sending only `B` (no
+  `A` traffic) loses most (90.4 -> 75.8).
+- With the sends ahead the senders' reads do matter (skipped: 60.6 -> 66.1), so the read is now on the path.
+- Gathering ahead cannot overlap them as the lists stand: chunk `c + 1` lands on chunk `c - 1`'s half, whose slot-reuse
+  guard waits for that batch **packed** (`op::RELEASED`, T2: a half also holds its batch's outputs), so chunk `c`'s push
+  waits for the batch before to pack and the kernel loses its overlap (with 1 + 2, `1794604645`: mean starve 554 ->
+  649 us, sender NC waiting for frees 106 -> 260). The B-side join also miscounts that layout (`sent 6`), since a batch's
+  reserve no longer follows the push before.
+
+Both reverted ([failed-approaches](failed-approaches.md)). **Next:** why a sender's gather of one strip takes ~10 us
+(a plain product's unit reads two strips a batch inside its kernel time), and a gather-ahead whose guard is chunk
+`c - 1` *consumed*, with the batch's output footprint proved disjoint from the next gather's.
+
+## W2: a sender-side meter, and what holds the multicast product back (2026-11-13, card 0)
+
+The owner's call on the W2 probe below: measure why a strip is late, not guess. Plan:
+[prefill-operand-reuse.md](../plans/prefill-operand-reuse.md) (P5); design reference
+[dataflow-compiler.md](dataflow-compiler.md) (the meter's section).
+
+**Built** (profiling only, compiled in with the firmware's `profile` feature, on with the profile mode's pipeline
+detail; nothing in a default image):
+- **B's credit stamps name their stream and action** (`tt_isa::dm::entry_detail`: a `CB`'s `stream << 2 | action`, a
+  credit's word, in the stamp's detail bits 8..12). The pipeline meter joined every `CB` it saw, so a sender's four a
+  batch (input and transfer) failed the join and every sender was dropped as "more credits". Now the input credits join
+  as before and a sender's transfer reserve and push ride in its batch (`Batch::transfer`); in the pipeline detail B also
+  stamps its `WAIT_CREDIT` and `CREDIT` entries (`trace_mode::CREDITS`), so a reader's wait for strips is timed.
+- **NC's entry log** (`tt_isa::dm::nc_log`, `dm::nc::LOG`: NC's scratch slot, which NC never uses): B arms it per pair
+  inside the window (`trace_mode::NC_LOG`, through NC's own trace word); NC records each entry's begin (one word: a tag and
+  the counter's bits 2..26, an anchor a list), coalescing a multicast's or scatter's requests; the host splices it into
+  the unit's stamps (`profile_mode::splice_nc_log`) and splits NC's time by what it waited for (`NcStats`). The window
+  budget counts it (`session::nc_log_words`). Reports: `summary.md`'s senders-and-NC table, `nc.tsv`, the contract
+  probe's `MEASURE pipeline ... sender / readers / NC` lines.
+- **A sender-only skip** (`multicast::probe_skip_sender_reads`, the probe's `, without A senders' reads`): `A`'s senders
+  gather their strips resident (no GDDR read) and still multicast them, credits and all.
+
+**Gates:** `profile_mode` unit tests (a sender's four credits join, and with every `CB` stamped as its op alone the pair
+is dropped as before; a missing transfer push is dropped as disordered; NC's records split by kind; the splice across a
+2^32 and a field wrap); `step275_nc_entry_log` on ttsim and card 0 (every strip logged once in the multicast's order, the
+ready words raised over every unit equal the strips multicast, nothing lost, disarmed logs stay empty; on card 0 the
+pipeline detail tells every pair of a traced 2x3 multicast product and each sender's NC took the strips its B handed it,
+`1794581208`); `silicon_profile_mode` 6 of 6 with NC's log checked (`1794581208`); `step274` 8 of 8 (`1794581057`);
+`step172`/`step173` in the safe, `fast-reads` and `encoded-guard` images (ttsim).
+
+**Measured** (10x12, `[7,4,8]`, H1 `[2048,2048]@[2048,16384]`, performance contract, release, safe image, TFLOPS;
+default image `1794581327`, unchanged from `1794546268`'s 61.8 / 67.5):
+
+| Variant | BF16-HiFi2 | BF16 x BFP8 LoFi |
+|---|--:|--:|
+| multicast | 61.9 | 67.7 |
+| `A`'s senders read nothing, multicasts still sent | **62.7** | **68.8** |
+| no `A` traffic (every gather `A`-resident: no `A` strip sent; the old "without `A`'s gathers") | 90.4 | 97.8 |
+| no gathers | 114.6 | 126.8 |
+
+So **the `A` senders' GDDR reads are not the bound** (item 3 of the entry below is corrected): making them free gains
+1-2%; removing `A`'s multicasts with them gains 46%.
+
+**The meter** (`TT_CONTRACT_PIPELINE=1`, `--feature profile`, `[2048,2048]@[2048,8192]` H1 HiFi2, `1794581277`; 120
+units, 22 senders, nothing dropped or lost; the `16384`-wide product overflows a unit's 1,024-event buffer in one op,
+`1794581242`), in us:
+
+| | work | kernel | T0 starve | B gather | B credit wait | NC output wait | NC multicast + settle | NC ready (credit + copy) | NC credit wait (frees) | NC transfer wait |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| slowest unit (a sender, 48 strips) | 1,271 | 570 | 626 | 488 | 558 | **688** | 183 | 99 | 94 | 89 |
+| mean sender (45 strips) | 1,159 | 502 | 530 | 464 | 432 | 503 | 201 | 103 | 88 | 98 |
+| mean reader (98) | 1,085 | 455 | 512 | | **750** | | | | | |
+
+**What binds:**
+1. **A sender's NC sends strip `c + 1` only after its own kernel has pushed chunk `c`.** The writer list for a chunk is
+   the strip's section (transfer wait, frees, multicast, ready word, transfer pop), then the chunk's output wait and pop
+   (`session::streaming_segments`, `multicast::push`); NC runs it in order, so its output wait (503-688 us) sits between
+   every two strips. ttsim's log shows the same order (`step275`, `TT_DUMP_NC_LOG=1`).
+2. **Sending a strip costs about a kernel batch**: per strip the mean sender spends ~4.5 us multicasting and settling
+   (a 59 KB strip into 2-3 rectangles, ~35 GB/s a sender), ~2.3 us raising and copying the ready word (the copy alone
+   1.75 us: one lone multicast a rectangle), ~2 us waiting for frees and ~2 us for its B, ~11 us in all, against ~11 us
+   of kernel a batch. Serialized with the kernel, they add.
+3. **Every unit inherits it**: readers' B wait for strips 750 of 1,085 us, and a sender's B waits 432 us for the other
+   operand's strips from senders held the same way; the grid moves in lockstep at the senders' send-plus-compute rate.
+   That is the ~2x between the multicast product and its ceiling.
+
+**Next** (built and reverted, [the entry above](#w2-sending-ahead-moves-the-wait-to-the-senders-b-2026-11-13-card-0)):
+take the strip's sends off the output wait. It moved NC's wait to its own B: item 1 was a symptom of the sender's B
+list.
+
+## W2: the 2-D operand-multicast probe (2026-11-13, card 0)
+
+Roadmap W2's first box ([tt-metal-parity.md](../plans/tt-metal-parity.md) §5 W2), after its ceiling (the entry below):
+`A` multicast along grid rows and `B` down grid columns, one sender a strip, credit-gated. Performance contract, release,
+safe image, slope-timed traced replays (`silicon_probe_performance_contract::prefill_products`, every plain product
+checked bit for bit against exact integer sums).
+
+**Built** (opt-in, `TT_OPERAND_REUSE=mcast|mcast:a|mcast:b`, `tensor::Reuse::Multicast`):
+- `TileChoice::Rect { cols, rows }`: the session's units a rectangle of the grid (the probe's `TT_CONTRACT_GRID`).
+- `tile_op::distribute::grid`: blocks dealt by grid row and column, uniform blocks, a unit one round fewer where they
+  do not divide the grid; senders chosen with a block in every round of their readers, and no unit sending both
+  operands where another choice exists.
+- `tile_op::multicast::push`: a sender's B gathers each chunk inside a transfer-stream token
+  (`dataflow::Stream::Transfer`, two deep); its NC, before waiting for the chunk's results, waits for the token and for
+  its readers' frees, multicasts the strip into each rectangle of readers (`op::WRITE_L1_MCAST`, `MCAST_RUN_ACKS`), raises
+  its own ready word and multicasts it into theirs. Readers free their half (two words, by the parity of the sender's
+  block: a reader that sits a block out may free the next one early), gather only what they do not receive, and wait for
+  the strip's rank. Words back to zero at the end.
+- `tt_isa::dm`: a 16-byte `WRITE_L1_MCAST` from one op-level credit word to another (the ready word), on the card and
+  in `L1Writes`.
+- `session::streaming_segments` runs a writer prefix ending at a transfer pop before the output wait.
+
+**Gates:** `tile_op::multicast::tests` (a model of every unit's B, kernel and NC interleaved at random; negative
+controls: no freed waits, no transfer reserves, no ready waits, a misroute, an overwait; it caught two protocol bugs on
+the way, below); `step274_operand_multicast` on ttsim and card 0, 8 of 8 at each stage (`1794541347` with credits, `1794542084` with
+the ready word, `1794543015` with the senders placed): grids 2x3 and 3x3, ragged, transposed, `A`/`B`/both, sat-out
+rounds, replays, both misroutes, a stalled product recovered, and H1 and `down` on 8x8, 8x12 and 10x12 bit for bit;
+`step218`, `step242`, `step244`, `step229` on card 0, 35 of 35 (`1794542115`).
+
+**Measured** (TFLOPS; "unshared" is the same grid and block with `off`; "ceiling" every gather skipped on that deal;
+"today" the session's default, the measured block on 120 units, from `1794535991`):
+
+| Grid, block | Product, config | Multicast | Unshared | Ceiling | Today | GDDR read (multicast / unshared), MB |
+|---|---|--:|--:|--:|--:|---|
+| 10x12, `[7,4,8]` | H1 BF16-HiFi2 | **61.9** | 40.6 | 114.3 | 70.5 | 121 / 1,246 |
+| | H1 BF16 x BFP8 LoFi | **67.6** | 48.4 | 127.3 | 76.9 | 90 / 931 |
+| 10x12 (80 units) | `down` BF16-HiFi2 | **52.6** | 50.8 | 86.8 | 56.3 | 69 / 623 |
+| | `down` BF16 x BFP8 LoFi | **58.0** | 54.3 | 96.3 | 68.3 | 54 / 466 |
+| 8x12, `[8,4,8]` | H1 BF16-HiFi2 | 57.2 | 42.6 | 101.8 | | 121 / 1,107 |
+| 8x8, `[8,4,8]` | H1 BF16-HiFi2 | 45.2 | | 76.4 | | 138 / |
+
+Runs: 10x12 multicast `1794543049`, unshared `1794542264`; 8x12 `1794543078`, `1794541520`; 8x8 `1794542210`; the
+block sweep `1794541520`-`1794541580` (`[8,2,16]` does not fit; `kq` 4 blocks reach 101-110 on 8x12, `kq` 2 72).
+
+**What binds, measured in turn:**
+1. **Not the ready credits.** The first build credited each reader (`op::CREDIT`, ~1 us of the sender's NC each; 11 a
+   strip along a row of 12): 61.1 TFLOPS on 8x12 (`1794541609`). One multicast ready word a rectangle instead: 59.9
+   (`1794542184`). Replaced (no knob kept).
+2. **Not the corner.** With unit (0, 0) sending both operands, it reads two strips a chunk; senders placed so that no unit
+   sends both: 10x12 61.9-67.6 against 63.0-64.3, `down` 52.6-58.0 against 49.3-50.2 (`1794542236` -> `1794543049`).
+3. **The `A` senders' reads** (**corrected** by the sender-side meter, [above](#w2-a-sender-side-meter-and-what-holds-the-multicast-product-back-2026-11-13-card-0):
+   the probe hook below removed `A`'s multicasts along with its reads, `Skip::A` making every gather `A`-resident, so no
+   `A` strip was sent at all; with only the senders' reads skipped the product runs 62.7 / 68.8). The pipeline meter (`TT_CONTRACT_PIPELINE=1`, `--profile`, `[2048,2048]@[2048,8192]`,
+   `1794542478`, `1794542524`): a reader's kernels take 567 of 1,114 us, its T0 starves 432-467, and its B waits for
+   the strips (issue 840-925 us, of which GDDR lands 17); unshared on the same deal it starves for its own reads (1,108
+   of 1,708). With every gather `A`-resident (`without A's gathers`; first read as the senders' reads skipped with the multicasts still sent, which it is not), 10x12 runs
+   **90.2 / 96.0** TFLOPS (H1) and 74.1 / 79.8 (`down`). Ten `A` senders read 51.9 MB in 2.2 ms, ~2.4 GB/s a sender on
+   average (items 4-5 show a sender's read rate is not itself the bound). The NoC multicasts themselves (22 senders,
+   overlapping row and column rectangles on NoC #1) do not bind.
+
+**Then, at the owner's call, `A`'s reads split** (the bound above), each refuted (10x12, `[7,4,8]`, H1 BF16-HiFi2 /
+BFP8 LoFi, `down` BF16-HiFi2):
+4. **Two `A` senders a row by chunk parity** (each reads every other strip, one half each, a second ready word):
+   57.3 / 62.5 / 46.8 (`1794544860`), and with `A`'s reads skipped 68.5 against 90.2: each sender also waits for the
+   other's strips, which locks more units in step. Deleted.
+5. **Two `A` senders a row, each half of every strip's rows** (each reads and multicasts its half; a sender's own
+   gather reads only its rows, `a_at` and `i0` moved): 57.4 / 63.2 / 47.6 (`1794545439`), reads skipped 90.1: half
+   the reads a sender is no faster, so one unit's read rate is not the bound. Deleted.
+6. **Not `A`'s channels.** At `kq` 4 every row reads the same four `K` tiles at once, and a tile's channel follows its
+   `K` index (`kt` 64): `[7,8,4]` spreads them over all eight; 56.4 / 58.4 (`1794545747`), its ceiling 151 / 170 (more
+   rounds of `A`'s strips: 95 MB).
+7. **Not the mover's entries.** The `fast-reads` image (91-175 cycles an entry against 359): 62.9 / 69.1 / 52.3
+   (`1794545842`), unchanged.
+
+With one sender a row and a column, placed apart, re-measured after the deletions: 61.8 / 67.5 / 52.2 / 58.1
+(`1794546268`). What delays a strip between its sender's read and its readers' kernels is not found: the readers
+starve ~45% of their time, and making `A`'s reads free (the probe hook) is the only change that moves it.
+
+**Against the prediction and the kill:** the prediction (>= 85% of the ceiling, the headline shape >= 112 TFLOPS) is
+missed: 54%. The roadmap's kill (below 60 TFLOPS with the operands delivered) does not fire on H1 (61.9-67.6) and does on
+`down` at BF16-HiFi2 (52.6); the restated clause (reads drop and the product does not beat today's 120-unit rate) fires
+on every row. Found on the way, by the model: (a) a reader that sits a block out frees the next block's half before
+the sender has sent the block it skipped, so one summed freed count is unsound (two words by block parity); (b) a
+sender's B must take the transfer token on every chunk, those without readers too, or it gathers into a half its NC is
+still multicasting from.
+
+## W2 bounded: the kernel's ceiling at the performance contract, before multicast (2026-11-13, card 0)
+
+Roadmap W2's first box ([tt-metal-parity.md](../plans/tt-metal-parity.md) §5 W2): before any multicast is built, what
+the products would run at with their operands delivered for free. `silicon_probe_performance_contract::prefill_products`
+gained a third variant, every gather skipped (`tensor::probe_skip_block_gathers`), each product's GDDR reads and units
+from a trace of one, and its time a K-tile pair a unit; `TT_CONTRACT_UNITS` caps a product's units (`Spread::Fixed`).
+Release, safe image, slope-timed traced replays, every plain product checked bit for bit against exact integer sums.
+Runs: every unit `1794535991`, 64 units `1794536268`.
+
+TFLOPS; "today" with its gathers, "no A" with `A`'s skipped, "ceiling" with every gather skipped:
+
+| Product | Config | Units | Today | No A | Ceiling | Headroom | GDDR read (A / B), MB | ns a pair a unit (today / ceiling) |
+|---|---|--:|--:|--:|--:|--:|---|---|
+| `[2048,2048]@[2048,16384]` | BF16 x BF16 HiFi2 | 120 | 70.5 | 69.6 | **131.8** | 1.87x | 683 (130 / 554) | 111.6 / 59.7 |
+| | BF16 x BFP8 LoFi | 120 | 76.9 | 93.7 | **152.3** | 1.98x | 554 (139 / 415) | 102.3 / 51.6 |
+| `[2048,8192]@[8192,2048]` | BF16 x BF16 HiFi2 | 104 | 56.3 | 110.4 | **118.3** | 2.10x | 415 (138 / 277) | 121.1 / 57.6 |
+| | BF16 x BFP8 LoFi | 104 | 68.3 | 113.1 | **185.6** | 2.72x | 376 (130 / 245) | 99.8 / 36.7 |
+| `[1024,8192]@[8192,2048]` | BF16 x BF16 HiFi2 | 104 | 41.1 | 47.0 | **129.9** | 3.17x | 346 (69 / 277) | 166.0 / 52.5 |
+| | BF16 x BFP8 LoFi | 104 | 47.1 | 89.7 | **181.4** | 3.85x | 220 (69 / 151) | 144.6 / 37.6 |
+
+On 64 units (`TT_CONTRACT_UNITS=64`; the third shape at BF16 x BF16 took 52), the same rows' ceilings are 81.3, 103.0,
+76.8, 93.7, 74.2 and 114.0 TFLOPS (today 43.3, 53.3, 52.9, 55.4, 36.7, 39.7).
+
+What it says:
+- **The kernel is no longer the bound.** With its operands free it runs a K-tile pair in 37-60 ns a unit; tt-metal's
+  BF16-HiFi2 122-204 TFLOPS on 64-110 cores is ~35 ns a pair a core. The roadmap's ceiling (`1793224072`, 28-30
+  TFLOPS) was an FP32 `A` at HiFi4 before F5 and W1, and is retired.
+- **Every shape is read-bound:** today's products read their operands 5-9 times (`[2048,2048]@[2048,16384]`: 683 MB
+  for 75.5 MB of operands) at 230-350 GB/s, and run at 26-54% of their ceiling. W2's kill (below 60 TFLOPS with the
+  operands delivered) does not fire on any shape.
+- **Which operand binds depends on the shape:** `A` on `[2048,8192]@[8192,2048]` at BF16 x BF16 (skipping it alone
+  gives 110 of 118); `B` on `[2048,2048]@[2048,16384]` (skipping `A` gives nothing at BF16 x BF16); both on the rest.
+  Multicasting both is the scheme.
+- **The grid must be whole.** An 8x8 rectangle's ceiling (64 units) is 81 TFLOPS on the headline shape, 1.15x today's
+  120-unit product; on the whole grid it is 1.87x. So the multicast deal covers any `R x C` rectangle with uniform
+  blocks, units running one job fewer where the blocks do not divide the grid (owner, 2026-11-13).
+
+**W2's prediction, restated before the build:** with each operand out of GDDR about once per grid row or column,
+a product reaches at least 85% of its own ceiling on the same units (the 120-unit rows above: 112 / 129 / 101 / 158 /
+110 / 154 TFLOPS); the BF16-HiFi2 headline shape from 70.5 to >= 112. The kill stands as written (below 60 with the
+operands delivered), and a scheme that reads less but does not beat today's 120-unit product is killed too.
+
+## W1: a BF16 KV cache bounded before building (2026-11-12, card 1)
+
+Roadmap W1, "A BF16 KV cache" (the big-bet rule: bound it first). The 1.7B, the performance contract (BFP8 weights,
+BF16 activations into the products, one BF16 tied table), an F32 cache, card 1, at `8d3bc34`:
+`traced_generation_stream_ceiling` with `TT_GEN_MAX_LEN=8192 TT_GEN_CHUNKS=512 TT_GEN_PROMPTS=32,2000,7992
+TT_GEN_NEW=16 TT_GEN_SAMPLES=3`. The bound is the new probe `TT_PROBE_BATCHED_B=1`
+(`tt_kernels::tensor::probe_skip_batched_b_reads`): every batched product's `B` gathered
+`GATHER_B_RESIDENT`, so attention's keys (`q k^T`) and values (`P V`) past `attention_rows`' lengths are not read and
+the products are wrong. It is what a zero-byte cache would save; a BF16 one moves half the bytes.
+
+| ms | decode step, F32 cache (`1794492200`) | keys and values not read (`1794493259`) | their reads | a BF16 cache, predicted |
+|---|--:|--:|--:|--:|
+| 32-token prompt (attends to 64) | 7.80 | 7.68 | (`attention_rows`; not probed) | ~0 |
+| 2,000-token prompt (2,048) | 19.54 | 17.72 | 1.82 (9.3%) | **~0.9 (4.7%)** |
+| 7,992-token prompt (8,192) | 43.48 | 34.10 | 9.38 (21.6%) | **~4.7 (10.8%)** |
+| 7,992-token prefill | 5,602 | 5,250 | 352 (6.3%) | ~175 (3%) |
+
+- **The cache's reads are a fifth of attention's time at 8K.** A position costs 5.9 us at 2K and 4.4 us at 8K above
+  short context; its keys and values (393 KB F32) take 1.1 us of it. The rest is the scores and `P`: one query row a
+  head, each a padded tile row, written by `q k^T`, read three times by the softmax, written, read by `P V`. That is
+  ~26 ms of the 8K step, the larger lever, which only an attention that keeps the scores in L1 removes (a split of
+  `attention_rows` over positions).
+- **`attention_rows` fits 960 positions at head_dim 64** (the 896 KB arena, 7 `nt` + 6 slots); BF16 keys and values
+  at their own stride fit 1,344, so the 1,024-position step moves onto it.
+- **Capacity:** a 2,048-position cache for 32 sequences (W3) is 25.8 GB in F32 and 12.9 in BF16.
+- **Decision:** above the big-bet rule's 3% at 2K and past, and needed for W3's capacity: built. The kill stands:
+  if 2K decode does not improve, or short-context decode slows by more than 0.5%, BF16 stays an option for capacity.
+  (Amended after the results: the approved plan's kill reads "and", not "or": kill if 2K does not improve *and* short
+  context slows by more than 0.5%. This line restated it wrongly. The result is judged against the plan's wording, in
+  the [next section](#w1-a-bf16-kv-cache-the-performance-contracts-default-2026-11-12-cards-0-and-1).)
+- Builds at 8,192 positions: 695 s first, 170 s second (each block choice measured; build time is not a target).
+  The default 900 s silicon timeout cut the first attempt (`1794491283`): such runs take `--timeout-secs 3600`.
+
+## W4: the wide-vocabulary greedy pick, one op for any vocabulary (2026-11-12, cards 0 and 1)
+
+Roadmap W4's first two boxes. Qwen3.5-4B's greedy pick was ~21.4 ms of its step
+([2026-11-08](#qwen35-4bs-step-on-the-card-a-third-of-it-is-the-greedy-pick-the-even-deals-04-is-the-head-2026-11-08-cards-0-and-1)):
+`generate::greedy` cut a row past 65,536 columns into parts (248,320 = 8 x 31,040), because one `Session::argmax_row`
+choice holds all of a row's partials in L1, and a 248,320-column row has at least 243 (1 MB; the arena is 896 KiB).
+
+**Diagnosed before any change** (`silicon_probe_sampling::a_wide_vocabulary_s_greedy_pick`, card 0, every tile,
+traced, each alone, host-timed replay, `1794519649`):
+
+| trace | replay, us |
+|---|--:|
+| one 31,040-column part, on a row of its own | 401 |
+| the same part sliced from the 248,320-column row, then `argmax` | 1,873 / 1,913 (first / last part) |
+| the last part's slice alone (`x 1`) | 1,833 |
+| `greedy` over the whole row (eight parts) | **22,556** |
+
+The time was the split itself: each part's `slice` copies its ~4 MB of tiles (~1.5 ms a part), not the argmax.
+The 2026-11-08 reading (each part on one unit) was the profile's: a part's stamps overflowed every window, so no
+replay stamped it.
+
+**Built:** a middle level (`tensor::argmax_fold`, `select::partial_out`) folds more partials than one choice takes
+(`ARGMAX_FAN_IN` = 64, what a 65,536-column row has) in runs of 64, each run's best written as a partial again (its key
+in row 0, its index, the row's own column, in row 4); `Session::argmax_row` folds until one choice remains. The order
+is total and every index is the row's own column, so the levels choose what one choice over every partial would: the
+first maximum, NaN above every number. A row of up to 65,536 columns runs the same programs as before (the 1.7B's
+49,152). `generate::greedy` is `argmax(1)`; the parts, `GREEDY_WHOLE` and `GREEDY_PART` are gone.
+
+**After** (`1794520063`, the probe again; profile `1794520100`, `TT_PROFILE_DETAIL=pipeline`): `greedy` over the
+whole row **1,808 us** host-timed, **153 us on the card** (three ops: partials over 64 units, one level of 4 jobs, the
+choice; 18 replays, none overflowed). The host-timed replay is mostly the probe's own 31.8 MB tilized input landing
+(the one-part trace: 100 us on the card against 401 host-timed); in a model the logits are already on the card.
+The kill (the pick above 1 ms) does not fire; the prediction (under 0.5 ms) is met.
+
+| card 1, performance contract, tree at `b35fc7a` + this change | before | after | |
+|---|--:|--:|--:|
+| Qwen3.5-4B decode, 32 / 256-token prompt, ms (`qwen35_traced_generation`) | 54.71 / 55.40 (`1794508679`) | **34.10 / 34.78** (`1794520159`) | **-37.7% / -37.2%** |
+| Qwen3.5-4B, tokens/s at 32 | 18.3 | **29.3** | |
+| the 1.7B decode, 32 / 128 / 256-token prompt, ms (`traced_generation`, `TT_GEN_MODEL=smollm2-1.7b-instruct`) | 7.842 / 8.307 / 8.853 (`1794506197`) | 7.804 / 8.293 / 8.843 (`1794521323`) | -0.5% / -0.2% / -0.1% |
+
+- Against tt-metal on the same card (§2.3, 2026-11-09): 38.0 ms a step on the card, 44-46 host-timed. Ours, host-timed,
+  is now 0.90x its card time and 0.74-0.77x its host time.
+- Qwen3.5's run checks its traced tokens against the eager schedule and against the logits path, bit for bit.
+- Prefill is unchanged (Qwen3.5 407 ms at 32 tokens; the 1.7B 1,241 / 3,513 / 4,148 tokens/s).
+- What is left of Qwen3.5's step is the DeltaNet layers' small ops, the head and the products (2026-11-08: head
+  5.4-5.6 ms, weight products ~19.5).
+
+Gates: `select::tests::the_programs_choose_the_host_s_index` (the interpreter, widths to 248,320 and fan-ins of 2-64,
+equal maxima on both sides of a level's boundary; a `partial_out` writing its index to the wrong row fails it);
+`step211_argmax_row` (ttsim and card 0, `1794520054`): rows of 49,152, 65,601, 151,936, 248,320 and 262,144 columns
+(ttsim: 65,601, the narrowest that folds) against `select::host`, one native op, and a negative control (the larger
+value on either side of a level's boundary, swapped, gives the other index).
+
+## W1: a BF16 KV cache, the performance contract's default (2026-11-12, cards 0 and 1)
+
+Roadmap W1, "A BF16 KV cache", built after its [bound](#w1-a-bf16-kv-cache-bounded-before-building-2026-11-12-card-1).
+The performance contract's cache is BF16 (`Llama::for_inference`, `Qwen35::for_inference`; `WeightOptions::f32_kv_cache`,
+`TT_KV_CACHE=f32` in the benches, keeps it F32); the reference contract's stays F32. Keys and values are rounded once,
+where they are made, and attention reads them as they lie:
+
+- **The cache's dtype is not the stream's** (`LlamaCache`/`hybrid_cache_as`): the stream and the rope table stay F32.
+- **Keys:** RoPE rounds its own result (`burn_tt::rope_as`, `Rope::apply_as`; `rope_blocks` packs BF16), one job, no cast.
+  Qwen3.5's partial rotary still casts after it.
+- **Values:** a column block of the fused `qkv` row narrows that block alone (`Session::cast_block`, from
+  `ops::cast_view_in_place`), dealt as the cache write that reads it. The first build cast the whole `qkv` buffer and
+  dealt the value tiles to other units, so the barrier probe (`TT_PROBE_BARRIERS`) found the write depending on them and
+  the write ran as its own op: 129 us a step (profile `1794505431`).
+- **The cache write:** `SCATTER_ROWS_BF16` (32-byte face-rows, either parity; `record::SCATTER_ROWS`), NC +116 bytes.
+- **Attention without widening:** `attention_rows` with BF16 keys and values at `BF16_TILE_SLOT` (`fits_as`: 1,344
+  positions at head_dim 64 against 960); past it the composition's `q k^T` and `P V` read the BF16 cache as their `B`
+  (`burn_tt::attention_wide`), a transposed BF16 `B` through the unpacker. The resident `A`'s placeholder reference is
+  the query's (a BF16 one failed the record's slot check: code 2, `RANGE`).
+
+Gates: `step273_bf16_kv_cache` (attention over BF16 keys and values bit for bit their widened values' at 64-2,048
+positions, causal and not, on and off `attention_rows`, nothing widened, and unrounded values differing; a cache write
+one job a head's row; a view and RoPE narrowing in one job each), `step187` (a performance-contract Llama generates as
+eagerly), `step185`, `step199`, `step209`, `step189` (ttsim and card 0); `step269` (card 0, `1794506203`, the tree as built): **228 of 232
+top-1, PCC 0.999762** (F32 cache 0.999765). Conformance: ttsim 2,973 passed, 52 expected; the BF16 suites on silicon
+1,115 passed, 72 expected. `step12_mnist` on card 0 and, sharded, both cards.
+
+The 1.7B, card 1, every run at the tree's tip (`8d3bc34+dirty`), the cache's dtype the only difference:
+
+| ms | F32 cache | BF16 cache | |
+|---|--:|--:|--:|
+| decode, 32 / 128 / 256-token prompt (512-position cache) | 7.695 / 8.238 / 8.846 (`1794501712`) | 7.842 / 8.307 / 8.853 (`1794506197`) | +1.9% / +0.8% / +0.1% |
+| prefill, the same, tokens/s | 1,246 / 3,428 / 4,219 | 1,234 / 3,415 / 4,125 | -1.0% / -0.4% / -2.2% |
+| decode, 32 / 2,000 / 7,992-token prompt (8,192 positions) | 7.71 / 19.44 / 43.44 (`1794504384`) | 7.85 / **18.89** / **38.67** (`1794507634`) | +1.8% / **-2.8%** / **-11.0%** |
+| prefill, 7,992 tokens | 5,605 | 5,481 | -2.2% |
+| Qwen3.5-4B decode, 32 / 256-token prompt | 54.43 / 54.83 (`1794503679`) | 54.71 / 55.40 (`1794508679`) | +0.5% / +1.0% |
+
+- **Against the bound:** 2K saved 0.55 ms (predicted ~0.9), 8K 4.77 (predicted ~4.7). 2K saves less than half the
+  probe's reads because the probe also dropped `attention_rows`' reads up to 960 positions and the scores'
+  composition is unchanged.
+- **The short-context cost is the value cast,** one element-wise op a layer inside the rope-and-write run: 31.0 against
+  27.0 us a layer, 7,396 against 7,267 us a step on the card (profiles `1794509472`, `1794509821`). Without it, a
+  BF16 value from `qkv` itself (a product whose result is BF16 in some columns) would remove it; not built. Qwen3.5
+  pays the same, plus its keys' cast (partial rotary), over 8 attention layers.
+- **Decision:** the approved plan kills BF16 as the default only if 2K does not improve *and* short context slows by
+  more than 0.5%. 2K improves 2.8% and 8K 11%, the cache's GDDR halves (a 2,048-position cache for 32 sequences
+  12.9 GB against 25.8), and the owner's tied-table decision put the scaling rule before the 0.5% rule. So BF16 is
+  the performance contract's cache. Short context pays +0.15 ms on the 1.7B (+1.9%), and `TT_KV_CACHE=f32` /
+  `WeightOptions::f32_kv_cache` keeps the F32 cache.
+- Earlier builds on the way: the cast of a view made plain first, then repacked by the write, 11.11 ms at 32 tokens
+  (`1794495735`; four casts a layer, 88 us each, profile `1794497018`); the whole buffer cast in place, 8.07
+  (`1794498272`); with `rope_as`, 7.96 (`1794499363`).
+
+## W1: the BF16 defects fixed, the BF16 lookup, and one tied table (2026-11-12, cards 0 and 1)
+
+Roadmap W1's leftovers, in the order the plan built them. Gates on card 0, benches on card 1, the performance
+contract unless named.
+
+**The defects** (`new-architectures.md`, items 1, 2, 4, 5):
+
+- *A cast of a host-held BF16 tensor* widens it on the host by its bits and uploads it once, as F32
+  (`TtTensor::widened_on_host`). Gate `step76::a_host_bf16_tensor_cast_to_f32_is_uploaded_once_widened` (ttsim and
+  card 0, all 65,536 patterns): one upload of `4 n` bytes, where the card's cast made two (393,216 against 262,144
+  bytes for `n` = 65,536). Gemma 4 keeps its lazy widening on the data: with a `cast`, every matrix went to the card in
+  F32 at load and `step261_gemma4` was OOM-killed at 40 GB; lazily it passes (316 s).
+- *`Precision::Bf16`'s unbounded host memory* was a BF16 `Linear` over a rank-3 input repacking its whole weight a
+  call (`repack_shape`, a 16-byte host map an element). A retiling to the matrix a tensor lies in is now a view.
+  With the next item, the whole BF16 Qwen3.5 through `forward` holds **4.3 GB flat** (loaded 4.05, prompt 4.28, four
+  decode steps 4.29-4.30; `silicon_probe_qwen35_bf16_memory`, `1794457685`), where it passed 40 GB.
+- *A transposed BF16 `B`*: `GATHER_B_UNPACK_TRANSPOSE` reads a BF16 tile whole from its slot as it lies and the
+  unpacker transposes it (`SrcRoute::unpacks_transposed_b`). Gate `step272_transposed_bf16_b` (ttsim, card 0 in all
+  three read modes; a mover reading the untransposed tile caught on ttsim); `step76::a_bf16_product_reads_a_transposed_b_as_it_lies`
+  (one job, no plain copy). Qwen3.5's `table @ last^T` workaround retired.
+- *`expand` past 2,097,152 rows* goes in chunks of 2^20 (`step271_wide_expand`, 3.1M rows in 10.2 s; one chunk gives
+  the old "descriptor refused before submission (code 2)").
+
+**The BF16 lookup**: `SELECT_ROWS_BF16` (32-byte face-rows; a row of the other parity read into an aside region and
+moved by `COPY_HALFWORDS`, one wait a record). Gates `tt_isa` `select_rows_moves_bf16_rows_whole_through_the_aside_region`
+(a byte model of the entries against `face_index`), `step171::a_bf16_table_selects_its_rows_bit_for_bit` (ttsim, card 0
+`1794459860`; without the copies it fails), `step76::a_bf16_table_s_rows_are_selected_without_staging` (one job).
+`step167`'s BF16 SmolLM2 **229 -> 6.3 s**. B's image +1,772 bytes with the `GATHER` arm (10,152 left, tightest build).
+
+**One tied table** (the owner's decision, 2026-11-12: the scaling rule over the 0.5% rule). Both contracts store the
+embedding table once, BF16 (`Plan::for_numerics`, exact for BF16 checkpoints); its rows are widened to the F32 stream
+(`Llama::stream`, `Qwen35::stream`: the cache's dtype is the stream's, not the table's), and a tied head is
+`last @ table^T` with an F32 result over the exact values (`burn_tt::matmul_wide`, the table read where it lies).
+`WeightOptions::untied_head` (`TT_UNTIED_HEAD=1`) keeps a BFP8 head beside it, the old layout.
+
+| | 1.7B decode, ms (32 / 128 / 256) | 1.7B prefill, tokens/s (32 / 128 / 256) | 1.7B table and head, GDDR |
+|---|--:|--:|--:|
+| one BF16 table, the default (`1794462559`) | 7.677 / 8.209 / 8.850 | 1,261 / 3,471 / 4,219 | 201 MB |
+| untied BFP8 head, the option (`1794463218`) | 7.518 / 8.034 / 8.700 | 1,262 / 3,580 / 4,236 | 314 MB |
+| before: F32 table and BFP8 head (2026-11-11, `1794435175`) | 7.520 / 8.006 / 8.641 | 1,257 / 3,552 / 4,266 | 513 MB |
+
+The one table costs +0.15-0.18 ms a step (+2.1%), the BF16 head's extra 88 MB at ~550 GB/s; predicted +0.2. The
+lookup's change costs nothing (the untied run is the old default's step). The 128-token prefill's -3% is one sample
+each, not explained by the head (0.15 ms of ~37); re-measure before reading it.
+
+Quality (`step269`, all 232 positions, `1794459860`): reference 100% / 100% / PCC 0.999998 as before; performance top-1
+98.28% (the same 228), top-5 100%, PCC mean **0.999765** (least 0.999354), against the untied BFP8 head's 0.999669.
+
+**Qwen3.5-4B** (`qwen35_traced_generation`, card 1, `1794463906`): **54.47 / 54.86 ms** at 32 / 256 tokens, against
+56.93 / 57.29 with the F32 table (`1794293972`): the head reads 1.27 GB, not 2.54, and the card holds 1.27 GB less.
+Its gates on card 0 (`1794457685`): `step260` both, `step263` both (traced equals eager, 1,368 s).
+
+Conformance (ttsim, 3,025): no unexpected result. MNIST (`step12_mnist`), the mover gates in both read modes, and
+`step187`/`step188`/`step240` pass on card 0.
 
 ## W1: BF16 activations into the products, the performance default (2026-11-11, cards 0 and 1)
 
@@ -7689,6 +8580,43 @@ straight-line `nop`s, and a chain of jumps 32 bytes apart.
     overflows the cache, and where the code sits changes how many lines
     collide.
 - **A taken jump costs ~5 cycles even when cached.**
+
+**Update 2026-11-14: the geometry, measured** (`probe_icache::instruction_cache_geometry_by_aliasing`,
+`tt-firmware/src/icache_alias.rs`, card 0, run `1794619199`; B and NC identical). The probe calls single `ret`
+instructions at chosen addresses, so each call touches exactly one line:
+
+- **2-way set-associative, 16-byte lines, 128 sets: the set stride is 2 KiB.** In cycles per call:
+
+  | addresses `k` apart | n=1 | 2 | 3 | 4 | 5 | 8 |
+  |---|--:|--:|--:|--:|--:|--:|
+  | 256 B | 9.3 | 19.1 | 17.1 | 16.0 | 15.4 | 14.5 |
+  | 1 KiB | 9.3 | 19.1 | 17.1 | 16.0 | 19.6 | 22.2 |
+  | 2 KiB | 9.3 | 19.1 | 22.9 | 22.3 | 23.0 | 22.3 |
+  | 4 KiB | 9.3 | 19.1 | 23.0 | 22.3 | 23.0 | 22.3 |
+
+  Two addresses 4 KiB apart share a set and both hit. A third address in the same set makes every one of them
+  miss, which is LRU behaviour: at 1 KiB apart, 5 addresses put 3 lines in one set and miss partly (19.6).
+- **A miss costs ~6.9 cycles a line.** Calls one every `step` bytes, descending, over 8 KiB:
+
+  | step | 4 | 8 | 16 | 32 | 64 |
+  |---|--:|--:|--:|--:|--:|
+  | extra cycles a call | 1.7 | 3.4 | 6.9 | 6.7 | 6.4 |
+
+  The cost stops rising at a 16-byte step, which is the line.
+- **A sequential prefetcher.** Calls one every `step` bytes, ascending:
+
+  | step | 4 | 8 | 16 | 32 | 64 |
+  |---|--:|--:|--:|--:|--:|
+  | extra cycles a call | 0 | 0.4 | 3.1 | 4.1 | 6.6 |
+
+  Straight-line code hides its misses, as the straight-line column above showed. Jumps forward of 64 bytes or more
+  don't.
+- Calling the same target each time costs 9.3 cycles a call. A target that changes from call to call costs 14.5-19,
+  with no miss at all.
+- **What this means for placement:** code fits when **no set holds more than two hot lines**, not when it fits in some
+  4 KiB window. A third hot line anywhere in the image, landing in an already-full set, makes all three lines of
+  that set miss every time round. Moving cold code moves hot functions into and out of such collisions, which is how
+  `run_record`'s size can move a product it never runs (silicon-operating-notes, "RISCV B's code placement").
 
 ### RISCV NC's mover costs what B's does
 

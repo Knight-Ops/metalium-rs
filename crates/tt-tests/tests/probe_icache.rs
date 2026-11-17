@@ -92,3 +92,93 @@ fn instruction_cache_size_by_timing() {
         }
     });
 }
+
+/// How the cache is organised, which decides how hot code must be placed
+/// (`tt-firmware/src/icache_alias.rs`): calls at `n` addresses `k` bytes apart, then
+/// every `step` bytes over a footprint, ascending and descending, each address one
+/// `ret`. Printed per call; a step up of ~5 cycles a call is a miss.
+///
+/// * Ways: the largest `n` that stays cheap at `k` = the set stride (capacity / ways).
+///   Direct-mapped: two addresses 4 KiB apart already miss.
+/// * Line: over the 8 KiB footprint the cost per call stops rising at `step` = the line.
+/// * Prefetch: ascending cheaper than descending at small steps.
+#[test]
+#[ignore = "exploratory: prints the instruction cache's geometry"]
+fn instruction_cache_geometry_by_aliasing() {
+    // As `icache_alias.rs`.
+    const WAY_ROUNDS: f64 = 64.0;
+    const LINE_ROUNDS: f64 = 8.0;
+    const ROWS: u64 = 6 * 8 + 2 * 7 * 2;
+    in_device(|d| {
+        let w = d.alloc_window(WindowKind::TwoMib).unwrap();
+        let t = tile(d, GATE_TILE.0, GATE_TILE.1);
+        let results = tt_isa::mailbox::ICACHE_ALIAS_RESULTS;
+        for (core, image, mailbox) in [
+            (Core::B, tt_firmware_images::ICACHE_ALIAS_B, MAILBOX_BASE),
+            (
+                Core::NC,
+                tt_firmware_images::ICACHE_ALIAS_NC,
+                tt_isa::dm::nc::MAILBOX_BASE,
+            ),
+        ] {
+            for k in 0..ROWS {
+                d.write32(&w, t, results + k * 12 + 8, 0).unwrap();
+            }
+            d.write32(&w, t, mailbox + offset::STATUS, 0).unwrap();
+            let (_, bytes, at) = image;
+            match core {
+                Core::NC => d.load_and_start_nc(&w, t, bytes, at).unwrap(),
+                _ => d.load_and_start(&w, t, core, bytes, at).unwrap(),
+            }
+            let done = d
+                .wait_for_mailbox(
+                    &w,
+                    t,
+                    mailbox + offset::STATUS,
+                    mailbox + offset::PANIC_CODE,
+                    50_000_000,
+                    |s| s == status::DONE,
+                )
+                .unwrap();
+            assert!(done.is_ok(), "{core:?}'s probe did not finish: {done:?}");
+            let mut row = |k: u64| {
+                let mut r = |i: u64| d.read32(&w, t, results + k * 12 + i * 4).unwrap();
+                (r(0), r(1), r(2))
+            };
+            println!("MEASURE icache-ways {core:?}: cycles a call at n addresses k bytes apart");
+            for kk in 0..6u64 {
+                let mut line = String::new();
+                let mut k_bytes = 0;
+                for n in 0..8u64 {
+                    let (k, nn, cycles) = row(kk * 8 + n);
+                    assert_eq!(nn as u64, n + 1);
+                    k_bytes = k;
+                    if cycles == 0 {
+                        line.push_str("      -");
+                    } else {
+                        line.push_str(&format!(
+                            " {:6.2}",
+                            cycles as f64 / (WAY_ROUNDS * nn as f64)
+                        ));
+                    }
+                }
+                println!("MEASURE icache-ways {core:?} k {k_bytes:>5}: n=1..8 {line}");
+            }
+            println!("MEASURE icache-line {core:?}: cycles a call every `step` bytes");
+            for k in 48..ROWS {
+                let (a, step, cycles) = row(k);
+                let (footprint, down) = (a & 0x7fff_ffff, a >> 31 != 0);
+                if cycles == 0 {
+                    continue;
+                }
+                let calls = (footprint / step) as f64 * LINE_ROUNDS;
+                println!(
+                    "MEASURE icache-line {core:?} footprint {footprint:>5} step {step:>3} {}: {:6.2}",
+                    if down { "down" } else { "up  " },
+                    cycles as f64 / calls
+                );
+            }
+            d.set_core_reset(&w, t, core, true).unwrap();
+        }
+    });
+}

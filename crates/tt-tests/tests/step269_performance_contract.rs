@@ -31,6 +31,9 @@
 //! 4. **F32 activations** (`WeightOptions::f32_activations`, the contract before 2026-11-11): its
 //!    agreement recorded, the baseline of the BF16 activations' rounding; that rounding must show
 //!    in the correlation (a contract that ignored it would agree with this run exactly).
+//! 5. **An untied head** (`WeightOptions::untied_head`, the default before 2026-11-12): the tied
+//!    head stored BFP8 beside the table, recorded. By default both contracts store the table once,
+//!    BF16, for its lookup and its head (roadmap W1).
 //!
 //! Negative control: the correlation falls strictly from BF16 to BFP8 to BFP4 weights, so each
 //! run really computed with its contract's formats (a `for_inference` that ignored its contract
@@ -217,6 +220,31 @@ fn run(cases: &[Case]) {
             f32.pcc_mean != bfp8.pcc_mean,
             "F32 activations agree exactly with the contract's BF16 ones ({f32}): the BF16 \
              activations did not apply"
+        );
+
+        // The two-copy option (`WeightOptions::untied_head`): the tied head stored BFP8 beside
+        // the BF16 table, as the contract stored it before 2026-11-12. Recorded.
+        let untied = WeightOptions {
+            untied_head: true,
+            ..Default::default()
+        };
+        let untied = device_logits(&model, Numerics::Performance, untied, cases, &d);
+        let untied = agreement(cases, &untied, &flex);
+        report("performance contract, untied BFP8 head", &untied);
+
+        // An F32 KV cache (the contract before 2026-11-12): recorded. Its control: the default's
+        // BF16 cache shows in the correlation.
+        let f32_cache = WeightOptions {
+            f32_kv_cache: true,
+            ..Default::default()
+        };
+        let f32_cache = device_logits(&model, Numerics::Performance, f32_cache, cases, &d);
+        let f32_cache = agreement(cases, &f32_cache, &flex);
+        report("performance contract, F32 KV cache", &f32_cache);
+        assert!(
+            f32_cache.pcc_mean != bfp8.pcc_mean,
+            "an F32 KV cache agrees exactly with the contract's BF16 one ({f32_cache}): the BF16 \
+             cache did not apply"
         );
     });
 }

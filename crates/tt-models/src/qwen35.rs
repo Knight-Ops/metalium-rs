@@ -487,13 +487,31 @@ impl<B: Backend> GatedAttention<B> {
         let k = k.reshape([n, t, kv_heads, d]);
         let v = v.reshape([n, t, kv_heads, d]);
         let q = Self::rotate(cfg, self.q_norm.forward(q).swap_dims(1, 2), rope);
-        let k = Self::rotate(cfg, self.k_norm.forward(k).swap_dims(1, 2), rope);
-        let v = v.swap_dims(1, 2);
+        // The keys and values in the cache's dtype: rounded once here, after RoPE, where the
+        // cache is narrower than the stream (a BF16 cache, `Qwen35::for_inference`).
+        let kv_dtype = cache_k.dtype();
+        let in_cache = |t: Tensor<B, 4>| match t.dtype() == kv_dtype {
+            true => t,
+            false => t.cast(kv_dtype),
+        };
+        let k = in_cache(Self::rotate(
+            cfg,
+            self.k_norm.forward(k).swap_dims(1, 2),
+            rope,
+        ));
+        let v = in_cache(v.swap_dims(1, 2));
 
         let new_k = write.write(cache_k, k);
         let new_v = write.write(cache_v, v);
         let q = q.reshape([n, kv_heads, groups * t, d]);
         let (keys, values) = (write.attended(new_k.clone()), write.attended(new_v.clone()));
+        // A narrower cache is read as it lies where the backend's attention takes it
+        // (`burn_tt::attention_wide`), else widened.
+        let (keys, values) = if keys.dtype() == q.dtype() || burn_tt::attention_wide::<B>() {
+            (keys, values)
+        } else {
+            (keys.cast(q.dtype()), values.cast(q.dtype()))
+        };
         let out = attention(
             q,
             keys,
@@ -961,6 +979,13 @@ pub struct Qwen35<B: Backend> {
     /// The numeric contract the model was made for ([`Qwen35::for_inference`]), or `None`. Not a
     /// parameter.
     numerics: Option<burn_tt::Numerics>,
+    /// The residual stream's dtype where it is not the embedding table's ([`Qwen35::for_inference`]
+    /// keeps the stream F32 and stores the table BF16): the looked-up rows are widened to it
+    /// (exactly), and the cache is made in it. `None`: the table's. Not a parameter.
+    stream: Option<DType>,
+    /// The full-attention layers' KV cache dtype where it is not the stream's: BF16 under the
+    /// performance contract ([`Qwen35::for_inference`], as `Llama`'s). Not a parameter.
+    kv: Option<DType>,
 }
 
 /// Widens every float parameter to F32.
@@ -991,6 +1016,8 @@ impl<B: Backend> Qwen35<B> {
             lm_head: (!config.tied_head).then(|| linear(config.hidden, config.vocab, device)),
             config: *config,
             numerics: None,
+            stream: None,
+            kv: None,
         }
     }
 
@@ -1116,9 +1143,27 @@ impl<B: Backend> Qwen35<B> {
         )
     }
 
-    /// The embedding rows of `tokens` `[1, t]`, as `[1, t, hidden]`.
+    /// The embedding rows of `tokens` `[1, t]`, as `[1, t, hidden]`, in the stream's dtype: a BF16
+    /// table's rows widened (exactly) to an F32 stream ([`Qwen35::for_inference`]).
     pub fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        self.embed_tokens.forward(tokens)
+        let rows = self.embed_tokens.forward(tokens);
+        match self.stream {
+            Some(stream) if rows.dtype() != stream => rows.cast(stream),
+            _ => rows,
+        }
+    }
+
+    /// The residual stream's dtype: the embedding table's, unless [`Qwen35::for_inference`] stored
+    /// the table in another.
+    fn stream_dtype(&self) -> DType {
+        self.stream
+            .unwrap_or_else(|| self.embed_tokens.weight.val().dtype())
+    }
+
+    /// The full-attention layers' KV cache dtype: [`Qwen35::for_inference`]'s choice, else the
+    /// stream's.
+    pub fn kv_dtype(&self) -> DType {
+        self.kv.unwrap_or_else(|| self.stream_dtype())
     }
 
     /// An empty state for `max_len` positions of one sequence: keys and values in `dtype`, the
@@ -1184,19 +1229,17 @@ impl<B: Backend> Qwen35<B> {
     ) -> Tensor<B, 2> {
         let [_, t] = tokens.dims();
         let hidden = self.config.hidden;
-        let x = self.hidden(self.embed_tokens.forward(tokens), state, dtype);
+        let x = self.hidden(self.embed(tokens), state, dtype);
         let last = x.slice([0..1, t - 1..t, 0..hidden]).reshape([1, hidden]);
         self.project_out(last)
     }
 
-    /// The logits `[1, vocab]` of a normed hidden row `[1, hidden]`, in the head's dtype. A tied
-    /// head with a BF16 table is computed as `table @ last^T` (then laid out as a row), the table a
-    /// plain left operand: `last @ table^T` would hand burn-tt a transposed BF16 right operand,
-    /// which its BF16 product first copies plain, and for a 248,320 x 2,560 table that copy's host
-    /// bookkeeping exceeds 40 GB (`silicon_probe_qwen35_bf16_memory`, 2026-10-30). An F32 table
-    /// (the F32 model, and the BF16-stored weights', whose table stays F32) is `last @ table^T`,
-    /// whose F32 product reads the transposed table where it lies: its row is a plain one, which a
-    /// trace can return (the row laid out from `[vocab, 1]` is a transposed view, which it cannot).
+    /// The logits `[1, vocab]` of a normed hidden row `[1, hidden]`, in the head's dtype: a tied
+    /// head is `last @ table^T`, the table read where it lies (transposed by the product's
+    /// unpacker, F32 or BF16 alike), so its row is a plain one, which a trace can return. A BF16
+    /// table was once computed as `table @ last^T`: burn-tt copied a transposed BF16 right operand
+    /// plain first, and for this 248,320 x 2,560 table that copy's host bookkeeping passed 40 GB
+    /// (roadmap W1's defect 1, read as it lies since 2026-11-12, `step272_transposed_bf16_b`).
     fn project_out(&self, last: Tensor<B, 2>) -> Tensor<B, 2> {
         let to = |x: Tensor<B, 2>, dtype: DType| if x.dtype() == dtype { x } else { x.cast(dtype) };
         match &self.lm_head {
@@ -1205,14 +1248,16 @@ impl<B: Backend> Qwen35<B> {
                 to(last, weight.dtype()).matmul(weight)
             }
             None => {
+                // A BF16 table under an F32 stream ([`Qwen35::for_inference`]: the table stored
+                // once, for its lookup and this head) is multiplied as its values are, with an F32
+                // result, one product reading it where it lies (`burn_tt::matmul_wide`).
                 let table = self.embed_tokens.weight.val();
-                let [vocab, _] = table.dims();
-                let last = to(last, table.dtype());
-                if table.dtype() == DType::F32 {
-                    last.matmul(table.transpose())
-                } else {
-                    table.matmul(last.transpose()).reshape([1, vocab])
+                if last.dtype() == DType::F32 && table.dtype() == DType::BF16 {
+                    let t = table.transpose();
+                    return burn_tt::matmul_wide(&last, &t)
+                        .unwrap_or_else(|| last.matmul(t.cast(DType::F32)));
                 }
+                to(last, table.dtype()).matmul(table.transpose())
             }
         }
     }
@@ -1220,12 +1265,12 @@ impl<B: Backend> Qwen35<B> {
 
 impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
     /// The model as inference runs it under the numeric contract `numerics` (ADR 0006): every
-    /// matrix but the embedding table in the contract's format ([`crate::quant::Plan::for_numerics`]:
-    /// BF16 under the reference contract, BFP8 under the performance one, BFP4 `gate|up` with
-    /// [`WeightOptions::mlp_bfp4`]). Every matrix here is a product's weight, read where it lies.
-    /// A tied head stays the F32 table: a head of its own would be a second copy of the table
-    /// (roadmap, "a default holds a weight's bytes once"), until the table itself can be stored
-    /// packed and still looked up. For a loaded (prepared) model of BF16 values.
+    /// matrix in the contract's format ([`crate::quant::Plan::for_numerics`]: BF16 under the
+    /// reference contract, BFP8 under the performance one, BFP4 `gate|up` with
+    /// [`WeightOptions::mlp_bfp4`]), each a product's weight read where it lies, and the embedding
+    /// table a BF16 tensor, its rows widened to the F32 stream. A tied head reads that table,
+    /// stored once (roadmap W1: half the F32 table's bytes a step, and no head of its own beside
+    /// it). For a loaded (prepared) model of BF16 values.
     ///
     /// [`WeightOptions::mlp_bfp4`]: crate::quant::WeightOptions::mlp_bfp4
     pub fn for_inference(
@@ -1233,12 +1278,19 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
         numerics: burn_tt::Numerics,
         options: crate::quant::WeightOptions,
     ) -> Self {
+        let stream = self.stream_dtype();
         let mut model = crate::quant::apply(
             self,
             &crate::quant::Plan::for_numerics(numerics, options),
             &crate::quant::Native,
         );
         model.numerics = Some(numerics);
+        model.stream = Some(stream);
+        // The performance contract's KV cache is BF16, as `Llama`'s
+        // ([`crate::quant::WeightOptions::f32_kv_cache`] opts out).
+        if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
+            model.kv = Some(DType::BF16);
+        }
         model
     }
 
@@ -1373,6 +1425,18 @@ impl<B: Backend> Qwen35<B> {
     /// [`CacheLayout::for_heads`] says), the convolutions' inputs in their taps' dtype, the
     /// recurrent states in F32.
     pub fn hybrid_cache(&self, max_len: usize, dtype: DType, device: &B::Device) -> HybridCache<B> {
+        self.hybrid_cache_as(max_len, dtype, dtype, device)
+    }
+
+    /// [`Self::hybrid_cache`] with the keys and values in `kv` and the rotary table in the
+    /// stream's `dtype` (a BF16 cache beside an F32 stream: the performance contract's).
+    pub fn hybrid_cache_as(
+        &self,
+        max_len: usize,
+        dtype: DType,
+        kv: DType,
+        device: &B::Device,
+    ) -> HybridCache<B> {
         let cfg = &self.config;
         let full = (0..cfg.layers).filter(|&i| cfg.is_full(i)).count();
         assert!(max_len >= cfg.conv_kernel, "a cache of {max_len} positions");
@@ -1381,7 +1445,7 @@ impl<B: Backend> Qwen35<B> {
                 full,
                 CacheLayout::for_heads(cfg.kv_heads, cfg.head_dim),
                 max_len,
-                dtype,
+                kv,
                 device,
             )
         });
@@ -1549,9 +1613,10 @@ impl<B: Backend> FixedShapeDecoder<B> for Qwen35<B> {
         self.numerics
     }
 
-    /// A cache whose keys and values are in the embedding table's dtype.
+    /// A cache whose keys and values are in the contract's dtype ([`Qwen35::kv_dtype`]), its
+    /// rotary table in the stream's.
     fn new_cache(&self, max_len: usize, device: &B::Device) -> HybridCache<B> {
-        self.hybrid_cache(max_len, self.embed_tokens.weight.val().dtype(), device)
+        self.hybrid_cache_as(max_len, self.stream_dtype(), self.kv_dtype(), device)
     }
 
     fn chunk(
