@@ -558,6 +558,105 @@ fn a_trace_replays_a_row_scatter_at_the_indices_it_finds() {
     );
 }
 
+/// A prefill chunk's cache write (roadmap W2): `n` consecutive rows from a start the card
+/// computes, F32 and BF16. A batch of 32 consecutive indices from a multiple of 32 is written as
+/// whole tiles (`record::SCATTER_ROWS`, decided on the card from the indices), any other as face
+/// rows, so one capture replayed at starts of both kinds -- 0, 32, 64, 96 and 16, 48, 80, 96 + 16
+/// for 32 rows; one or two batches; on one tile and on four -- must leave the host's writes, bit
+/// for bit, every time. The record's unit gate (`scatter_rows_writes_a_whole_tile_row_as_tiles`)
+/// checks which form each start takes; this checks that both land on the card.
+#[test]
+fn a_chunk_s_rows_land_whole_at_any_start_a_replay_finds() {
+    const STEP: usize = 16;
+    let (rows, cols) = (160usize, 96usize);
+    for (tiles, half, n) in [
+        (1usize, false, 32usize),
+        (4, false, 64),
+        (4, true, 32),
+        (1, true, 64),
+    ] {
+        with_device(
+            Config {
+                tiles: Some(burn_tt::TileChoice::Count(tiles)),
+                ..Config::default()
+            },
+            |d| {
+                // Values whose BF16 rounding is exact (low halves zero), so both kinds compare
+                // as F32 bits after the widening the trace's output takes.
+                let exact = |seed: u64, len: usize| -> Vec<f32> {
+                    raw_bits(seed, len)
+                        .into_iter()
+                        .map(|b| f32::from_bits(if half { b & 0xffff_0000 } else { b }))
+                        .collect()
+                };
+                let dtype = if half {
+                    burn::tensor::DType::BF16
+                } else {
+                    burn::tensor::DType::F32
+                };
+                // Stored in its own type from the host (ttsim does not narrow at the pack).
+                let stored = |x: &[f32], shape: [usize; 2]| {
+                    let data = if half {
+                        let bits: Vec<u16> = x.iter().map(|x| (x.to_bits() >> 16) as u16).collect();
+                        let mut data = TensorData::new(bits, shape);
+                        data.dtype = dtype;
+                        data
+                    } else {
+                        TensorData::new(x.to_vec(), shape)
+                    };
+                    Tensor::<TtBackend, 2>::from_data(data, (&d, dtype)).to_device(&d)
+                };
+                let table = exact(5, rows * cols);
+                let cache = stored(&table, [rows, cols]);
+                let values = exact(6, n * cols);
+                let v = stored(&values, [n, cols]);
+                let starts = (rows - n) / STEP + 1;
+                let x = Tensor::<TtBackend, 2>::zeros([1, starts], &d).add_scalar(0.0);
+                let TensorPrimitive::Float(input) = x.clone().into_primitive() else {
+                    unreachable!()
+                };
+                let (trace, _) = burn_tt::Trace::capture(&input, || {
+                    let start = x.clone().argmax(1).reshape([1]).mul_scalar(STEP as i64);
+                    let at = (start.expand([n])
+                        + Tensor::<TtBackend, 1, Int>::arange(0..n as i64, &d))
+                    .reshape([n, 1]);
+                    let out = cache
+                        .clone()
+                        .scatter_nd(at, v.clone(), IndexingUpdateOp::Assign)
+                        .cast(burn::tensor::DType::F32);
+                    let TensorPrimitive::Float(out) = out.into_primitive() else {
+                        unreachable!()
+                    };
+                    out
+                })
+                .unwrap();
+                for k in (0..starts).rev().chain(0..starts) {
+                    let mut one_hot = vec![0.0f32; starts];
+                    one_hot[k] = 1.0;
+                    let idx: Vec<u32> = (0..n).map(|i| (k * STEP + i) as u32).collect();
+                    let want = expected(
+                        &table.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        cols,
+                        &idx,
+                        &values.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    );
+                    let got: Vec<u32> = trace
+                        .run(one_hot)
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect();
+                    assert_bits(
+                        &got,
+                        &want,
+                        &format!("{n} rows from {} ({dtype:?}, {tiles} tiles)", k * STEP),
+                    );
+                }
+            },
+        );
+    }
+}
+
 /// Padding: a scatter into a table whose rows and columns are ragged (33 x 40)
 /// is followed by a column sum and a matmul with a row of ones, which read the
 /// tile's rows past the 33rd and columns past the 40th -- exact on small

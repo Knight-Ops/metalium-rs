@@ -823,6 +823,89 @@ fn prefill_products() {
     prefill(false);
 }
 
+/// Every block a measured choice can reach for each prefill shape and configuration (its
+/// candidates, then their neighbours until none is new: every climb's path), each timed as the
+/// measurement times a candidate (`Session::time_product`, at the copies it would take). A block
+/// that does not capture is skipped by the measurement (it once ended it, leaving the product on
+/// `Auto`'s block in some processes, 2026-11-17); this lists each, with the cause. Lines:
+/// `CAPTURE <what> <block> <reuse>: <error>`, then `MEASURE capture <what>: ...`.
+/// Alone, all 3,310 blocks of the 1.7B's `down` at 128 / 256 rows and `gate|up` at 128 captured
+/// (`1794882561`, ~20 minutes a shape; give one or two shapes an hour): a refusal depends on what
+/// the model holds while it measures, not on the block.
+#[test]
+#[ignore = "a probe: cargo xtask bench --filter silicon_probe_performance_contract::prefill_blocks_capture"]
+fn prefill_blocks_capture() {
+    use tt_kernels::session::{MEASURE_COPIES_MOST, MEASURE_SPAN_US};
+    use tt_kernels::tensor::{self, BlockStream, Reuse};
+    fork_scope(|| {
+        let mut s = open();
+        let pull = Some(Reuse::Pull {
+            holders: tt_kernels::tile_op::reuse::AUTO_HOLDERS,
+            b_holders: None,
+        });
+        for [m, k, n] in prefill_shapes() {
+            let (av, bv) = (integers(m * k, 1), integers(k * n, 3));
+            for &(fa, fb, fidelity) in &prefill_configs() {
+                let what = format!(
+                    "[{m},{k}]@[{k},{n}] A {} B {} {}",
+                    name(fa),
+                    name(fb),
+                    fid(fidelity)
+                );
+                let (a, _) = operand(&mut s, fa, false, &av, m, k);
+                let (b, _) = operand(&mut s, fb, true, &bv, k, n);
+                let Some(q) = s
+                    .block_question_of((&a, false), (&b, false), fidelity)
+                    .unwrap()
+                else {
+                    println!("MEASURE capture {what}: not a blocked product");
+                    continue;
+                };
+                let mut reach = tensor::block_stream_candidates(&q, pull);
+                let mut i = 0;
+                while i < reach.len() {
+                    for c in tensor::block_stream_neighbours(&q, reach[i], pull) {
+                        if !reach.contains(&c) {
+                            reach.push(c);
+                        }
+                    }
+                    i += 1;
+                }
+                let time = |s: &mut Card, c: tensor::BlockChoice, copies: usize| {
+                    s.time_product(
+                        (&a, false),
+                        (&b, false),
+                        SrcRoute::Tf32FromFp32,
+                        fidelity,
+                        BUDGET,
+                        BlockStream::Fixed(c.block),
+                        c.reuse,
+                        copies,
+                    )
+                };
+                let copies = time(&mut s, reach[0], 1).map_or(1, |us| {
+                    ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
+                });
+                let mut failed = 0;
+                for &c in &reach {
+                    if let Err(e) = time(&mut s, c, copies) {
+                        failed += 1;
+                        println!("CAPTURE {what} {:?} {:?}: {e}", c.block, c.reuse);
+                    }
+                }
+                println!(
+                    "MEASURE capture {what}: {} blocks reachable, {failed} did not capture \
+                     ({copies} copies; {q:?})",
+                    reach.len()
+                );
+                s.free(a).unwrap();
+                s.free(b).unwrap();
+            }
+        }
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
 #[test]
 #[ignore = "a probe: cargo xtask bench --filter silicon_probe_performance_contract"]
 fn prefill_products_without_the_reload() {

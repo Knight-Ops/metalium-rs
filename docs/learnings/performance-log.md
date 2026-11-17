@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W2: the KV cache's chunk write as whole tiles](#w2-the-kv-caches-chunk-write-as-whole-tiles-2026-11-17-card-0) | 2026-11-17 | a 32-index batch that is one tile row is written as tiles, decided on the card: a layer's write 192.6 / 377.3 -> **29.3 / 48.8 us** at 128 / 256 tokens; the 1.7B's prefill **1.11 / 1.15 / 1.18x** at 32 / 128 / 256 tokens (4,573 tokens/s at 128), decode unchanged. Also: a measured choice skips a candidate that does not capture instead of falling back to `Auto` for the whole product |
 | [Qwen3.5-4B's prefill and decode by op class](#qwen35-4bs-prefill-and-decode-by-op-class-2026-11-16-card-0) | 2026-11-16 | a 16-token chunk is **216 ms** on the card (~74 tokens/s at 128 tokens): the DeltaNets' token-at-a-time recurrence 126 ms (58%, 3,457 small products), barriers 43 ms over 5,688 ops, weight products only 24.5 ms. A decode step 35.5 ms: weight products 13.2 ms at 404 GB/s, the other 945 ops 22.3 ms |
 | [The 1.7B's prefill by op class, at today's contract](#the-17bs-prefill-by-op-class-at-todays-contract-2026-11-16-card-0) | 2026-11-16 | a 128 / 256-token chunk is 29.6 / 50.0 ms on the card: products 55 / 48% (on 32-74 of 120 units, `A` re-read 23-59x: 2.9 GB of `A` a 128-token chunk against 87 MB of activations), **the KV cache's row scatter 16 / 18%** (192 / 377 us a layer for 1 / 2 MB, ~5 GB/s, control-bound), norms 11 / 7%, softmax 7 / 14%, barriers 10 / 6% |
 | [W2: `A`'s reads inline beside a weight read by column](#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0) | 2026-11-15 | the cheaper route chosen over the gather-ahead (deferred): a gather with a `B` span keeps `A`'s tiles in the inline loop. Strip 197.7 -> **191.3 cycles** a tile; H1 default 70.4 / 98.5 -> 70.2 / 99.2, multicast 78.9 / 94.8 -> **79.7 / 96.2**; the 1.7B unchanged. Small, no regression, kept; `A` laid by row is the large share left |
@@ -443,6 +444,61 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W2: the KV cache's chunk write as whole tiles (2026-11-17, card 0)
+
+Roadmap W2's box from the 1.7B's profile (below): a prefill chunk's keys and values went through `SCATTER_ROWS` as
+32-byte face-row writes, 192 / 377 us a layer at 128 / 256 tokens. **The change** is in the record's write expansion
+alone (`record::expand_for`, shared by NC's firmware): a 32-index batch that is one whole tile row (32 consecutive
+indices from a multiple of 32, each written by this record) goes as one `op::WRITE` of the tile's data per column,
+from the staged value tile (already the destination's bytes in face order) to the cache tile. Anything else (decode's
+one index, 16-token buckets, a misaligned start, a gap, a repeat) takes the row path as before. The decision is made
+on the card from the indices in L1, because a replay's start position is a trace input. There is no new record and
+no host change.
+
+**Gates:** the record test `scatter_rows_writes_a_whole_tile_row_as_tiles` applies the writes to a byte model of
+GDDR. It covers aligned starts 0-96 in F32 and BF16, with and without a range; row-path cases at starts 36 and 48,
+31 indices, a gap, a swapped pair and a split batch; and, as a negative control, tile writes forced at start 36 that
+fail the byte check. A 16-aligned bug got past the first version, and start 48 was added to catch it. `step189`'s
+`a_chunk_s_rows_land_whole_at_any_start_a_replay_finds` replays one trace at every aligned and 16-misaligned start,
+for F32 and BF16 caches of 1 and 4 tile columns, bit for bit, on ttsim and card 0. Silicon `1794879638`: 43 of 43
+(`step189`, `step199`, `step273`, `step187`, the `step269` smoke, `step12_mnist`). `dm_nc` has 1,652 bytes free in
+the tightest build.
+
+**Prediction (stated before building):** a layer's write 192 / 377 -> at most 40 / 70 us, and the prefill at least
+1.12x / 1.15x at 128 / 256 tokens. Kill if a layer's write is not under 100 us or the gain is under 3%.
+
+**ABBA, end to end** (`traced_generation_stream_ceiling`, `TT_GEN_PROMPTS=32,128,256 TT_GEN_CHUNKS=64,128,256`,
+performance contract, card 0). The firmware was swapped with `TT_FIRMWARE_OVERRIDE` from two worktrees at paths of
+equal length (the embedded source path moves the images' layout otherwise):
+
+| ms, host-timed | 32 tokens | 128 | 256 | decode step 32 / 128 / 256 |
+|---|--:|--:|--:|---|
+| parent (A) `1794880224` / `1794881482` | 20.49 / 20.38 | 31.68 / 32.67 | 53.51 / 53.42 | 7.87 / 8.30 / 8.75; 7.79 / 8.23 / 8.71 |
+| tile write, host and firmware `1794882068` | **18.48** | **27.99** | **45.31** | 7.81 / 8.26 / 8.72 |
+| speedup | 1.11x | 1.15x | 1.18x | unchanged |
+
+That is **4,573 tokens/s at 128 tokens** (3,978 on the parent), 1,732 at 32 and 5,650 at 256. The two firmware-only
+B arms (`1794880649`, `1794881055`) agree on every cell whose products were fully measured: 18.46 / 18.50 at 32,
+27.76 at 128, 45.94 at 256. Their other cells ran some products on `Auto`'s block (below).
+
+**Profiled** (`1794886832`, the 2026-11-16 command): a layer's write **192.6 -> 29.3 us** at 128 tokens and
+**377.3 -> 48.8** at 256 (6.6x / 7.7x; 36 / 43 GB/s for 1 / 2 MB, still on 64 units). Its control time went 2,108 ->
+165 us a chunk and the writer's wait 2,063 -> 109. The chunk on the card is **29.6 -> 25.9 ms** and **50.0 -> 42.1**.
+The whole difference is the write's; nothing else moved. The prediction is met and the kill does not fire. Qwen3.5's
+16-token chunks and every decode step never qualify: they test the batch and take the row path unchanged. The
+Qwen3.5 A/B was not run.
+
+**A measured choice no longer ends at a candidate that does not capture.** Two of the B arms' cells were slow
+because `Session::measure_product` returned at the first candidate whose timing trace failed to capture ("a
+measured candidate did not capture"), leaving the whole product on `Auto`'s block for that process. In those cells
+that was `down` at 128 and 256 rows and `gate|up` at 128: `down` at 128 rows ran `[2,2,3]` for `[2,12,3]`. The same
+line is in earlier runs (`1794639138`, `1794641348`, `1794755772`, `1794757160`), so some past prefill numbers carry
+it. The measurement now skips such a candidate, says which and why on stderr, and fails only if no candidate
+captures. The probe `silicon_probe_performance_contract::prefill_blocks_capture` timed every block a climb can reach
+alone (`1794882561`): all 3,310 blocks of `down` at 128 / 256 rows and `gate|up` at 128 captured. A refusal
+therefore depends on what the model holds while it measures, not on the block. `step245_measured_block` passes on
+ttsim (5 of 5) and card 0 (4 of 4, `1794887658`).
 
 ## Qwen3.5-4B's prefill and decode by op class (2026-11-16, card 0)
 

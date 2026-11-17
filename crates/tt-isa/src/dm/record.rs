@@ -455,7 +455,17 @@ pub const POKE_RUN_MAX: usize = 13;
 /// FP32 stride): two 32-byte face-row writes a tile column, which need no
 /// aside region (a write's addresses need only 16-byte congruence, and every
 /// BF16 face-row sits at 16 or 48 mod 64). Any other bit is
-/// [`super::error::RANGE`]. As with [`SELECT_ROWS`], the
+/// [`super::error::RANGE`].
+///
+/// **A whole tile row:** when all 32 indices are written by this record (32 of
+/// them and no range short of all) and they are `v0, v0 + 1, ..., v0 + 31`
+/// with `v0` a multiple of 32, the staged tiles are the destination tiles of
+/// tile row `v0 / 32` row for row, so each tile column is one write of its data
+/// (4,096 bytes, or 2,048 BF16) instead of 64 face-row writes: the same bytes
+/// to the same addresses (a prefill chunk's keys or values into a
+/// position-major cache, whose start the card holds). Decided per record from
+/// the indices read here, so a trace replayed at other indices takes whichever
+/// form those make. As with [`SELECT_ROWS`], the
 /// slots are not checked against the data arena here
 /// (`tt_kernels::index::scatter_rows_jobs` places them from its plan); each
 /// write's L1 range is checked as any write's is. The host's [`expand`] reads
@@ -1629,8 +1639,29 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     return Err(super::error::DOMAIN);
                 }
             }
-            let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * row_bytes;
             let mut port = 0;
+            // A whole tile row: 32 consecutive indices from a multiple of 32, each written by
+            // this record (a prefill chunk's keys or values into a position-major cache). The
+            // staged tile is then the destination tile's data, row for row, so each tile column
+            // is one write of it, decided here from the indices the card holds.
+            if count == 32 && (first, end) == (0, 32) {
+                let v0 = index(word(0));
+                let mut r = 1;
+                while r < 32 && index(word(r)) == v0 + r {
+                    r += 1;
+                }
+                if r == 32 && v0 % 32 == 0 {
+                    let mut row = x.cursor(v0 / 32, j0)?;
+                    for j in 0..cols {
+                        let (ch, off) = row.next_with_slot(slot)?;
+                        let from = stage_at + j * TILE_SLOT as u32 + DATA;
+                        sink.entry([op::WRITE, ch, port, off + DATA, from, x.data_bytes(), 0, 0])?;
+                        port = if port + 1 == PORTS { 0 } else { port + 1 };
+                    }
+                    return Ok(());
+                }
+            }
+            let face_row = |r: u32, h: u32| DATA + ((r / 16 * 2 + h) * 16 + r % 16) * row_bytes;
             for r in first..end.min(count) {
                 let v = index(word(r));
                 // A later index naming the same row is the one written.
@@ -2978,6 +3009,137 @@ mod tests {
                 Err(crate::dm::error::RANGE),
                 "{bad:?}"
             );
+        }
+    }
+
+    /// What a `SCATTER_ROWS` of distinct `values` must leave in GDDR, datum by datum, from the
+    /// face layout (`face_index`) and `TensorRef::tile_in` alone: each staged row's datums of
+    /// every tile column at its index's row. `writes`, run against an L1 of patterned bytes and
+    /// a GDDR of bytes, must put exactly those bytes there, write nothing else, and write no
+    /// address twice. An `Err` names the first datum that differs.
+    fn check_scatter_bytes(
+        x: &TensorRef,
+        values: &[u32],
+        j0: u32,
+        cols: u32,
+        writes: &[[u32; 8]],
+    ) -> Result<(), std::string::String> {
+        let (elem, slot) = match x.slot {
+            0 => (4u32, TILE_SLOT),
+            s => (2, s as u64),
+        };
+        let staged = |at: u32| (at.wrapping_mul(2_654_435_761) >> 11) as u8;
+        let mut gddr = std::collections::HashMap::<(u32, u32), u8>::new();
+        for e in writes {
+            if e[0] != op::WRITE || e[3] % 16 != e[4] % 16 {
+                return Err(std::format!("not a congruent write: {e:x?}"));
+            }
+            for b in 0..e[5] {
+                if gddr.insert((e[1], e[3] + b), staged(e[4] + b)).is_some() {
+                    return Err(std::format!("{:x?} written twice", (e[1], e[3] + b)));
+                }
+            }
+        }
+        let mut want = 0;
+        for (r, &v) in values.iter().enumerate() {
+            for j in 0..cols {
+                let (ch, off) = x.tile_in(v / 32, j0 + j, slot).unwrap();
+                for c in 0..32 {
+                    let to = off
+                        + TILE_DATA as u32
+                        + elem * crate::dm::face_index((v % 32) as usize, c) as u32;
+                    let from = STAGE
+                        + j * TILE_SLOT as u32
+                        + TILE_DATA as u32
+                        + elem * crate::dm::face_index(r, c) as u32;
+                    for b in 0..elem {
+                        want += 1;
+                        if gddr.get(&(ch, to + b)) != Some(&staged(from + b)) {
+                            return Err(std::format!("row {v} tile column {j} datum {c}"));
+                        }
+                    }
+                }
+            }
+        }
+        match gddr.len() == want {
+            true => Ok(()),
+            false => Err(std::format!("{} bytes written, {want} wanted", gddr.len())),
+        }
+    }
+
+    /// A whole tile row (roadmap W2, a prefill chunk's cache write): 32 consecutive indices
+    /// from a multiple of 32 are one write of each tile column's data, FP32 or BF16, across a
+    /// channel wrap and from a view that starts mid-grid, and leave GDDR exactly as the face-row
+    /// writes would. Indices that are not such a row -- misaligned, 31 of them, a gap, out of
+    /// order, or a range short of all 32 -- keep the face-row writes, with the same bytes.
+    #[test]
+    fn scatter_rows_writes_a_whole_tile_row_as_tiles() {
+        let (bound, j0, cols) = (128u32, 1u32, 4u32);
+        let run = |x: TensorRef, values: &[u32], flags: u32| {
+            let mut got = Vec::new();
+            expand_writes(
+                &scatter(x, bound, values.len() as u32, j0, cols, flags),
+                l1_of(values),
+                |e| {
+                    got.push(e);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            got
+        };
+        let from = |v0: u32, n: u32| (v0..v0 + n).collect::<Vec<_>>();
+        let mut gap = from(32, 32);
+        gap[31] = 0;
+        let mut swapped = from(64, 32);
+        swapped.swap(3, 4);
+        for (half, data) in [(false, 4096), (true, 2048)] {
+            let mut x = t(3, 6);
+            x.first = 2;
+            let flag = if half {
+                x.slot = BF16_TILE_SLOT as u32;
+                SCATTER_ROWS_BF16
+            } else {
+                0
+            };
+            for v0 in [0u32, 32, 64, 96] {
+                let values = from(v0, 32);
+                for flags in [flag, flag | scatter_rows_range(0..32)] {
+                    let got = run(x, &values, flags);
+                    assert_eq!(got.len() as u32, cols, "{v0} {flags:#x}");
+                    assert!(got.iter().all(|e| e[5] == data), "{got:x?}");
+                    check_scatter_bytes(&x, &values, j0, cols, &got).unwrap();
+                }
+            }
+            for values in [
+                from(36, 32),
+                from(48, 32),
+                from(32, 31),
+                gap.clone(),
+                swapped.clone(),
+            ] {
+                let got = run(x, &values, flag);
+                assert_eq!(got.len(), values.len() * cols as usize * 2, "{values:?}");
+                check_scatter_bytes(&x, &values, j0, cols, &got).unwrap();
+            }
+            // A batch split between records keeps its face-rows, and the parts make the whole.
+            let values = from(32, 32);
+            let mut split = run(x, &values, flag | scatter_rows_range(0..16));
+            split.extend(run(x, &values, flag | scatter_rows_range(16..32)));
+            assert_eq!(split.len(), 32 * cols as usize * 2);
+            check_scatter_bytes(&x, &values, j0, cols, &split).unwrap();
+            // The check sees a tile write in the wrong place: misaligned indices written as
+            // tile row 36 / 32 is the negative control.
+            let values = from(36, 32);
+            let wrong: Vec<_> = (0..cols)
+                .map(|j| {
+                    let slot = if half { BF16_TILE_SLOT } else { TILE_SLOT };
+                    let (ch, off) = x.tile_in(1, j0 + j, slot).unwrap();
+                    let from = STAGE + j * TILE_SLOT as u32 + TILE_DATA as u32;
+                    [op::WRITE, ch, 0, off + TILE_DATA as u32, from, data, 0, 0]
+                })
+                .collect();
+            assert!(check_scatter_bytes(&x, &values, j0, cols, &wrong).is_err());
         }
     }
 

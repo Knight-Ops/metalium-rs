@@ -10071,13 +10071,40 @@ impl<T: Transport> Session<T> {
         reuse: tensor::Reuse,
         copies: usize,
     ) -> Result<f64, TensorError> {
+        self.time_candidate(a, b, route, fidelity, budget, block, reuse, copies)?
+            .map_err(|cause| {
+                TensorError::Shape(format!("a measured candidate did not capture: {cause}"))
+            })
+    }
+
+    /// [`Session::time_product`], with a candidate that does not capture (`Err(cause)` inside:
+    /// its programs or buffers do not fit, say) told apart from a failure of the card or the
+    /// session (`Err` outside), so a measurement can skip the one and stop for the other.
+    #[allow(clippy::too_many_arguments)]
+    fn time_candidate(
+        &mut self,
+        a: (&DramTensor, bool),
+        b: (&DramTensor, bool),
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        block: tensor::BlockStream,
+        reuse: tensor::Reuse,
+        copies: usize,
+    ) -> Result<Result<f64, String>, TensorError> {
         let kept = (self.block_stream, self.reuse);
         self.block_stream = block;
         let copies = copies.max(1);
         let r = self.set_operand_reuse(reuse).and_then(|()| {
-            let once = self.replay_time(a, b, route, fidelity, budget, copies)?;
-            let twice = self.replay_time(a, b, route, fidelity, budget, 2 * copies)?;
-            Ok(((twice - once) / copies as f64).max(f64::MIN_POSITIVE))
+            let once = match self.replay_time(a, b, route, fidelity, budget, copies)? {
+                Ok(us) => us,
+                Err(cause) => return Ok(Err(cause)),
+            };
+            let twice = match self.replay_time(a, b, route, fidelity, budget, 2 * copies)? {
+                Ok(us) => us,
+                Err(cause) => return Ok(Err(cause)),
+            };
+            Ok(Ok(((twice - once) / copies as f64).max(f64::MIN_POSITIVE)))
         });
         self.block_stream = kept.0;
         self.set_operand_reuse(kept.1)?;
@@ -10085,7 +10112,7 @@ impl<T: Transport> Session<T> {
     }
 
     /// The median replay of a trace of `copies` products `op(A) @ op(B)` back to back, us
-    /// ([`Session::time_product`]).
+    /// ([`Session::time_product`]); `Err(cause)` inside when the products did not capture.
     fn replay_time(
         &mut self,
         (a, a_transposed): (&DramTensor, bool),
@@ -10094,7 +10121,7 @@ impl<T: Transport> Session<T> {
         fidelity: Fidelity,
         budget: u64,
         copies: usize,
-    ) -> Result<f64, TensorError> {
+    ) -> Result<Result<f64, String>, TensorError> {
         let arena_end = crate::l1::arena().end;
         self.begin_trace()?;
         // Its own capture plans in the whole arena; the products, where they would.
@@ -10113,16 +10140,18 @@ impl<T: Transport> Session<T> {
         let id = self.end_trace();
         let id = match (made, id) {
             (Ok(()), Ok(id)) => id,
-            (_, id) => {
+            (made, id) => {
+                let cause = match (&made, &id) {
+                    (Err(e), _) | (Ok(()), Err(e)) => e.to_string(),
+                    (Ok(()), Ok(_)) => unreachable!(),
+                };
                 if let Ok(id) = id {
                     let _ = self.release_trace(id);
                 }
                 for out in outs {
                     let _ = self.free(out);
                 }
-                return Err(TensorError::Shape(
-                    "a measured candidate did not capture".into(),
-                ));
+                return Ok(Err(cause));
             }
         };
         let mut times = Vec::with_capacity(MEASURE_RUNS);
@@ -10141,7 +10170,7 @@ impl<T: Transport> Session<T> {
         let released = self.release_trace(id);
         ran.and(released)?;
         times.sort_by(f64::total_cmp);
-        Ok(times[times.len() / 2])
+        Ok(Ok(times[times.len() / 2]))
     }
 
     /// Under [`tensor::BlockStream::Measured`], time the candidates of `op(A) @ op(B)`'s question
@@ -10204,24 +10233,39 @@ impl<T: Transport> Session<T> {
                     .and_then(|()| s.replay_time(a, b, route, fidelity, budget, 1));
                 s.block_stream = kept.0;
                 s.set_operand_reuse(kept.1)?;
-                let copies = single.map_or(1, |us| {
-                    ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
-                });
+                let copies = match single {
+                    Ok(Ok(us)) => {
+                        ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
+                    }
+                    _ => 1,
+                };
                 // Each candidate, its score and its time, us.
                 type Timed = Vec<(tensor::BlockChoice, f64, f64)>;
                 let mut timed: Timed = Vec::new();
+                // The candidates that did not capture, and why: skipped, not the measurement's
+                // end. Which candidates a climb reaches depends on the times, so stopping at the
+                // first that does not fit left a product on `Auto`'s block in some processes
+                // and not others (the 1.7B's 128-row `down`: [2,2,3] for [2,12,3], 2026-11-17).
+                let mut refused: Vec<(tensor::BlockChoice, String)> = Vec::new();
                 let once = |s: &mut Self, c: tensor::BlockChoice| {
                     let fixed = tensor::BlockStream::Fixed(c.block);
                     let us =
-                        s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
-                    Ok::<_, TensorError>((scores.map_or(us, |f| f(c.block, c.reuse, us)), us))
+                        s.time_candidate(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
+                    Ok::<_, TensorError>(
+                        us.map(|us| (scores.map_or(us, |f| f(c.block, c.reuse, us)), us)),
+                    )
                 };
-                let time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
-                    if timed.len() >= MEASURE_MOST || timed.iter().any(|(t, ..)| *t == c) {
+                let mut time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
+                    if timed.len() + refused.len() >= MEASURE_MOST
+                        || timed.iter().any(|(t, ..)| *t == c)
+                        || refused.iter().any(|(t, _)| *t == c)
+                    {
                         return Ok(());
                     }
-                    let (score, us) = once(s, c)?;
-                    timed.push((c, score, us));
+                    match once(s, c)? {
+                        Ok((score, us)) => timed.push((c, score, us)),
+                        Err(cause) => refused.push((c, cause)),
+                    }
                     Ok::<(), TensorError>(())
                 };
                 // The fastest first; equal scores in the order timed.
@@ -10232,6 +10276,13 @@ impl<T: Transport> Session<T> {
                 };
                 for &c in &candidates {
                     time(s, &mut timed, c)?;
+                }
+                if timed.is_empty() {
+                    let (c, cause) = &refused[0];
+                    return Err(TensorError::Shape(format!(
+                        "no candidate captured ({:?} did not: {cause})",
+                        c.block
+                    )));
                 }
                 // Climbs: from each of the fastest listed, one step at a time while a step gains.
                 let starts: Vec<_> = ranked(&timed).into_iter().take(MEASURE_STARTS).collect();
@@ -10269,7 +10320,13 @@ impl<T: Transport> Session<T> {
                 if finalists.len() > 1 {
                     for _ in 1..MEASURE_ROUNDS {
                         for (c, scored, us) in &mut finalists {
-                            let (score, t) = once(s, *c)?;
+                            // It captured once; not again would be the session's fault.
+                            let (score, t) = once(s, *c)?.map_err(|cause| {
+                                TensorError::Shape(format!(
+                                    "{:?} captured, then did not: {cause}",
+                                    c.block
+                                ))
+                            })?;
                             scored.push(score);
                             us.push(t);
                         }
@@ -10284,7 +10341,22 @@ impl<T: Transport> Session<T> {
                     .iter()
                     .min_by(|x, y| median(&x.1).total_cmp(&median(&y.1)))
                     .expect("one finalist");
-                Ok::<_, TensorError>((chosen.0, [timed[0].2, median(&chosen.2)]))
+                if let Some((c, cause)) = refused.first() {
+                    eprintln!(
+                        "TT_MATMUL_BLOCK=measured: {:?} on {} units: {} candidate(s) did not \
+                         capture and were skipped ({:?}: {cause})",
+                        q.tiles,
+                        q.units,
+                        refused.len(),
+                        c.block
+                    );
+                }
+                // `Auto`'s own time, if it captured (it is the first listed).
+                let auto = timed
+                    .iter()
+                    .find(|t| t.0 == first)
+                    .map_or(f64::NAN, |t| t.2);
+                Ok::<_, TensorError>((chosen.0, [auto, median(&chosen.2)]))
             })
         });
         let (choice, times) = match timed.and_then(|r| r).and_then(|r| r) {
