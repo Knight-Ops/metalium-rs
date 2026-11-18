@@ -10341,14 +10341,16 @@ impl<T: Transport> Session<T> {
                     .iter()
                     .min_by(|x, y| median(&x.1).total_cmp(&median(&y.1)))
                     .expect("one finalist");
-                if let Some((c, cause)) = refused.first() {
+                for (i, (c, cause)) in refused.iter().enumerate() {
                     eprintln!(
-                        "TT_MATMUL_BLOCK=measured: {:?} on {} units: {} candidate(s) did not \
-                         capture and were skipped ({:?}: {cause})",
+                        "TT_MATMUL_BLOCK=measured: {:?} on {} units: candidate {} of {} that did \
+                         not capture, skipped: {:?} {:?}: {cause}",
                         q.tiles,
                         q.units,
+                        i + 1,
                         refused.len(),
-                        c.block
+                        c.block,
+                        c.reuse
                     );
                 }
                 // `Auto`'s own time, if it captured (it is the first listed).
@@ -10356,6 +10358,13 @@ impl<T: Transport> Session<T> {
                     .iter()
                     .find(|t| t.0 == first)
                     .map_or(f64::NAN, |t| t.2);
+                tensor::note_trials(
+                    q,
+                    (
+                        timed.iter().map(|t| (t.0, t.2)).collect(),
+                        refused.iter().map(|r| r.0).collect(),
+                    ),
+                );
                 Ok::<_, TensorError>((chosen.0, [auto, median(&chosen.2)]))
             })
         });

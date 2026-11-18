@@ -906,6 +906,273 @@ fn prefill_blocks_capture() {
     .unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// The units a block of `[mb, kq, nb]` tiles runs on for a question's `[mt, kt, nt]`: one
+/// block a unit, as many as there are, at most the question's units.
+fn block_units(q: &tt_kernels::tensor::BlockQuestion, [mb, _, nb]: [usize; 3]) -> usize {
+    (q.tiles[0].div_ceil(mb) * q.tiles[2].div_ceil(nb)).min(q.units)
+}
+
+/// A product's span in a trace of `copies` of it, on the card (the profile mode, a `--profile`
+/// build): `(the first copy's, the median of the others')`, us, each the median over replays. A
+/// later copy pays its own fill and barrier after another op, as a product does in a model's
+/// chunk; the first also pays the replay's start. `None` without the profile feature.
+fn copy_spans(
+    s: &mut Card,
+    copies: usize,
+    op: impl Fn(&mut Card) -> DramTensor,
+) -> Option<(f64, f64)> {
+    use tt_kernels::profile_mode::ProfileOptions;
+    let options = ProfileOptions::default();
+    s.profile_mode(Some(options)).ok()?;
+    // Copies that do not depend on each other would be one op of the trace, no barrier between
+    // them (`Session::set_barrier_prune`): a chunk's products follow ops they depend on.
+    s.set_barrier_prune(false);
+    s.begin_trace().unwrap();
+    let outs: Vec<DramTensor> = (0..copies).map(|_| op(s)).collect();
+    let id = s.end_trace().unwrap();
+    s.set_barrier_prune(std::env::var("TT_BARRIER_PRUNE").as_deref() != Ok("0"));
+    // The capture's own stamps are not a replay's.
+    s.profile_mode(None).unwrap();
+    s.profile_mode(Some(options)).unwrap();
+    for _ in 0..5 {
+        s.replay(id).unwrap();
+    }
+    s.sync().unwrap();
+    let report = s.profile_mode(None).unwrap().expect("the mode was on");
+    s.release_trace(id).unwrap();
+    for t in outs {
+        s.free(t).unwrap();
+    }
+    let t = report.traces.values().next()?;
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+    };
+    let spans: Vec<f64> = t
+        .samples
+        .iter()
+        .map(|reps| {
+            median(
+                reps.iter()
+                    .map(|r| r.span as f64 / report.ticks_per_us)
+                    .collect(),
+            )
+        })
+        .collect();
+    let first = *spans.first()?;
+    Some((first, median(spans[1..].to_vec())))
+}
+
+/// Roadmap W2's short-chunk products, P0 (bounded before anything is built): what holds a
+/// prefill chunk's products back at 128-256 rows. For each shape (`TT_CONTRACT_PREFILL`) at the
+/// performance contract (`TT_CONTRACT_PREFILL_CONFIGS`, BF16 `A` x BFP8 `B` at HiFi2 by
+/// default):
+/// - **every block a measured choice can reach**, each timed as the measurement times it (the
+///   slope of `Session::time_product`): `MAP <what> reach ...`, the best of them, and the best
+///   on at least `TT_CONTRACT_WIDE` units (88): whether the candidate set misses a block;
+/// - **a shortlist** (the session's own measured choice, the best reachable, the best three
+///   wide, and `TT_CONTRACT_MAP_BLOCKS=mb,kq,nb;...`), each with nothing, `A`'s gathers and
+///   every gather skipped (`Skip`): its slope; the span of a later copy in a trace of
+///   `MAP_COPIES` (a `--profile` build: a product's cost after another op, as in a chunk, which
+///   the slope leaves out); and its GDDR reads (`A`, `B`), which show each skip removes what it
+///   claims. `MAP <what> <tag> [mb,kq,nb] <units>u <skip>: slope .. us, first .. later .. us, A
+///   .. MB, B .. MB`.
+///
+/// `cargo xtask bench --profile --device 0 --timeout-secs 3600 --filter
+/// silicon_probe_performance_contract::prefill_map` with one or two shapes a run (a shape's
+/// reach is ~1,000-1,600 blocks, ~1.3 s each).
+#[test]
+#[ignore = "a probe: cargo xtask bench --profile --filter silicon_probe_performance_contract::prefill_map"]
+fn prefill_map() {
+    use tt_kernels::session::{MEASURE_COPIES_MOST, MEASURE_SPAN_US};
+    use tt_kernels::tensor::{self, BlockChoice, BlockStream, Reuse};
+    const MAP_COPIES: usize = 4;
+    let wide: usize = std::env::var("TT_CONTRACT_WIDE").map_or(88, |v| v.parse().unwrap());
+    let named: Vec<[usize; 3]> = std::env::var("TT_CONTRACT_MAP_BLOCKS").map_or(vec![], |v| {
+        v.split(';')
+            .map(|b| {
+                let d: Vec<usize> = b.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                [d[0], d[1], d[2]]
+            })
+            .collect()
+    });
+    let configs = if std::env::var("TT_CONTRACT_PREFILL_CONFIGS").is_ok() {
+        prefill_configs()
+    } else {
+        vec![(TileFormat::BF16, TileFormat::BFP8, Fidelity::HiFi2)]
+    };
+    fork_scope(|| {
+        let mut s = open();
+        let pull = Some(Reuse::Pull {
+            holders: tt_kernels::tile_op::reuse::AUTO_HOLDERS,
+            b_holders: None,
+        });
+        for [m, k, n] in prefill_shapes() {
+            let (av, bv) = (integers(m * k, 1), integers(k * n, 3));
+            for &(fa, fb, fidelity) in &configs {
+                let what = format!(
+                    "[{m},{k}]@[{k},{n}] A {} B {} {}",
+                    name(fa),
+                    name(fb),
+                    fid(fidelity)
+                );
+                let (a, a_dec) = operand(&mut s, fa, false, &av, m, k);
+                let (b, b_dec) = operand(&mut s, fb, true, &bv, k, n);
+                let Some(q) = s
+                    .block_question_of((&a, false), (&b, false), fidelity)
+                    .unwrap()
+                else {
+                    println!("MAP {what}: not a blocked product");
+                    continue;
+                };
+                // The session's own choice, as a model's capture makes it.
+                s.set_block_stream(BlockStream::Measured);
+                s.begin_trace().unwrap();
+                let out = product(&mut s, &a, &b, fidelity);
+                let id = s.end_trace().unwrap();
+                s.release_trace(id).unwrap();
+                s.free(out).unwrap();
+                let today = tensor::measured()
+                    .into_iter()
+                    .find(|(asked, _, _)| *asked == q)
+                    .and_then(|(_, c, times)| c.map(|c| (c, times)));
+                println!("MAP {what}: {q:?}; measured {today:?}");
+
+                let time = |s: &mut Card, c: BlockChoice, copies: usize| {
+                    s.time_product(
+                        (&a, false),
+                        (&b, false),
+                        SrcRoute::Tf32FromFp32,
+                        fidelity,
+                        BUDGET,
+                        BlockStream::Fixed(c.block),
+                        c.reuse,
+                        copies,
+                    )
+                };
+                let mut reach = tensor::block_stream_candidates(&q, pull);
+                let mut i = 0;
+                while i < reach.len() {
+                    for c in tensor::block_stream_neighbours(&q, reach[i], pull) {
+                        if !reach.contains(&c) {
+                            reach.push(c);
+                        }
+                    }
+                    i += 1;
+                }
+                let copies = time(&mut s, reach[0], 1).map_or(1, |us| {
+                    ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
+                });
+                let mut timed: Vec<(BlockChoice, f64)> = reach
+                    .iter()
+                    .filter_map(|&c| time(&mut s, c, copies).ok().map(|us| (c, us)))
+                    .collect();
+                timed.sort_by(|x, y| x.1.total_cmp(&y.1));
+                let line = |tag: &str, (c, us): (BlockChoice, f64)| {
+                    println!(
+                        "MAP {what} reach {tag}: {:?} {:?} on {} units, slope {us:.1} us",
+                        c.block,
+                        c.reuse,
+                        block_units(&q, c.block)
+                    )
+                };
+                println!(
+                    "MAP {what} reach: {} blocks, {} timed ({copies} copies)",
+                    reach.len(),
+                    timed.len()
+                );
+                for &t in timed.iter().take(5) {
+                    line("best", t);
+                }
+                let widest: Vec<(BlockChoice, f64)> = timed
+                    .iter()
+                    .copied()
+                    .filter(|(c, _)| block_units(&q, c.block) >= wide)
+                    .collect();
+                for &t in widest.iter().take(5) {
+                    line(&format!("best on {wide}+ units"), t);
+                }
+                // By occupancy: the best block at each count of units.
+                let mut by_units: Vec<(usize, BlockChoice, f64)> = vec![];
+                for &(c, us) in &timed {
+                    let u = block_units(&q, c.block);
+                    if !by_units.iter().any(|(v, _, _)| *v == u) {
+                        by_units.push((u, c, us));
+                    }
+                }
+                by_units.sort_by_key(|t| t.0);
+                for (u, c, us) in by_units {
+                    println!(
+                        "MAP {what} reach by units: {u} units, best {:?} {:?}, slope {us:.1} us",
+                        c.block, c.reuse
+                    );
+                }
+
+                let mut short: Vec<(String, BlockChoice)> = vec![];
+                let mut add = |tag: &str, c: BlockChoice| {
+                    if !short.iter().any(|(_, d)| *d == c) {
+                        short.push((tag.to_string(), c));
+                    }
+                };
+                if let Some((c, _)) = today {
+                    add("today", c);
+                }
+                if let Some(&(c, _)) = timed.first() {
+                    add("best", c);
+                }
+                for &(c, _) in widest.iter().take(3) {
+                    add("wide", c);
+                }
+                for &block in &named {
+                    add(
+                        "named",
+                        BlockChoice {
+                            block,
+                            reuse: Reuse::Off,
+                        },
+                    );
+                }
+                for (tag, c) in short {
+                    for (skip, label) in
+                        [(Skip::None, "all"), (Skip::A, "no A"), (Skip::All, "none")]
+                    {
+                        skip.set();
+                        let slope = time(&mut s, c, copies);
+                        s.set_block_stream(BlockStream::Fixed(c.block));
+                        s.set_operand_reuse(c.reuse).unwrap();
+                        let spans =
+                            copy_spans(&mut s, MAP_COPIES, |s| product(s, &a, &b, fidelity));
+                        let (units, [_, read_a, read_b]) =
+                            traced_reads(&mut s, |s| product(s, &a, &b, fidelity));
+                        if skip == Skip::None {
+                            let out = product(&mut s, &a, &b, fidelity);
+                            let got = s.download(&out).unwrap();
+                            s.free(out).unwrap();
+                            check_exact(&what, &got, &a_dec, &b_dec, [m, k, n]);
+                        }
+                        s.set_operand_reuse(Reuse::Off).unwrap();
+                        s.set_block_stream(BlockStream::Measured);
+                        Skip::None.set();
+                        let slope =
+                            slope.map_or_else(|e| format!("({e})"), |us| format!("{us:.1}"));
+                        let spans = spans.map_or("(no profile)".to_string(), |(f, l)| {
+                            format!("first {f:.1} later {l:.1}")
+                        });
+                        println!(
+                            "MAP {what} {tag} {:?} {:?} {units}u {label}: slope {slope} us, \
+                             {spans} us, A {read_a:.1} MB, B {read_b:.1} MB",
+                            c.block, c.reuse
+                        );
+                    }
+                }
+                s.free(a).unwrap();
+                s.free(b).unwrap();
+            }
+        }
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
 #[test]
 #[ignore = "a probe: cargo xtask bench --filter silicon_probe_performance_contract"]
 fn prefill_products_without_the_reload() {

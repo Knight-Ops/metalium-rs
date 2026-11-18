@@ -362,6 +362,32 @@ fn print_measured(key: &str) {
             "MEASURE {key}: measured {:?} {:?} on {}: {choice:?}; {times}",
             q.tiles, q.transposed, q.units
         );
+        // `TT_GEN_MEASURED_TRIALS=1`: every candidate the measurement timed, fastest first.
+        if std::env::var("TT_GEN_MEASURED_TRIALS").is_ok_and(|v| v == "1") {
+            if let Some((mut timed, refused)) = tt_kernels::tensor::measured_trials(&q) {
+                timed.sort_by(|x, y| x.1.total_cmp(&y.1));
+                let list: Vec<String> = timed
+                    .iter()
+                    .map(|(c, us)| format!("{:?}{} {us:.1}", c.block, reuse_tag(c.reuse)))
+                    .collect();
+                println!(
+                    "MEASURE {key}: trials {:?}: {} timed: {}; {} refused",
+                    q.tiles,
+                    timed.len(),
+                    list.join(", "),
+                    refused.len()
+                );
+            }
+        }
+    }
+}
+
+/// A candidate's operand reuse, short: empty for none.
+fn reuse_tag(r: tt_kernels::tensor::Reuse) -> &'static str {
+    match r {
+        tt_kernels::tensor::Reuse::Off => "",
+        tt_kernels::tensor::Reuse::Pull { .. } => " pull",
+        _ => " other",
     }
 }
 

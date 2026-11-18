@@ -280,6 +280,12 @@ fn a_measured_product_runs_its_chosen_candidate_bit_for_bit_and_times_once() {
                     timed, want_timed,
                     "{what}: the list, then a climb from each start, each once"
                 );
+                // What the choice was made from is kept: each candidate timed, in order.
+                let (trials, refused) = tensor::measured_trials(&q).expect("its trials");
+                let blocks: Vec<BlockChoice> = trials.iter().map(|t| t.0).collect();
+                assert_eq!(blocks, want_timed, "{what}: the trials kept");
+                assert!(trials.iter().all(|t| t.1 > 0.0), "{what}: a time each");
+                assert!(refused.is_empty(), "{what}: nothing refused");
                 tested += 1;
             }
             let before = scored().len();
