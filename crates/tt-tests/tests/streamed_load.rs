@@ -46,11 +46,18 @@ fn streamed_load_equals_the_whole_model_load_bit_for_bit() {
                 Qwen35::<TtBackend>::streamed(&config, &paths, Numerics::Performance, options, &d)
                     .unwrap();
             eprintln!("streamed: {} parameters applied", loaded.applied);
-            // Skipped by the first pass, loaded by its own: not reported as ignored.
+            // Skipped by the first pass, loaded by its own: not reported as ignored (the MTP
+            // head's `mtp.layers.0.` is ignored and stays listed).
+            let decoder_layer_0 = |n: &str| {
+                n.trim_start_matches("model.")
+                    .trim_start_matches("language_model.")
+                    .starts_with("layers.0.")
+            };
             assert!(
-                !loaded.ignored.iter().any(|n| n.contains("layers.0.")),
+                !loaded.ignored.iter().any(|n| decoder_layer_0(n)),
                 "a loaded layer is listed as ignored"
             );
+            assert!(loaded.ignored.iter().any(|n| n.starts_with("mtp.")));
             model.forced(&prompt, &continuation, Precision::F32, &d)
         };
         ladder_support::assert_same(&streamed, &whole, "streamed against whole-model load");

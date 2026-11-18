@@ -113,6 +113,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Opts, String> {
 /// Gates that need longer than the default limit, by `binary::test`, with the least time each
 /// is given unless `--timeout-secs` says otherwise: about 1.7x its last measured run.
 const LONG: &[(&str, u64)] = &[
+    // 184 s on card 0 (`1795030814`): Qwen3.5-4B (8 layers) loaded twice, whole and streamed.
+    (
+        "streamed_load::streamed_load_equals_the_whole_model_load_bit_for_bit",
+        320,
+    ),
     // 2,138 s on card 0, 1,472 of it burn-flex's 8,192-position reference (`1792941361`).
     (
         "step188_smollm2_1_7b::the_native_context_agrees_with_flex",
