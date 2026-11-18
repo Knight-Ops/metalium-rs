@@ -1115,8 +1115,10 @@ impl DramTensor {
     ) -> Result<()> {
         let t = self;
         let img = matmul::TILE_IMAGE_BYTES;
-        // Laid by column: each tile to its own slot (a weight's, written once).
-        if t.placement.by_column.is_some() {
+        // Laid by column or by row: each tile to its own slot ([`Placement::slot`]). The bulk
+        // write below lays tiles interleaved (an activation laid by row went there, and the
+        // card's reads of it disagreed with the host's round trip, which agreed with itself).
+        if t.placement.layout() != Layout::Interleaved {
             for (tile, image) in images.chunks_exact(img).enumerate() {
                 let s = t.placement.slot(tile);
                 let r = s
@@ -1223,7 +1225,7 @@ impl DramTensor {
         // from each of two faces, not 4 KiB per tile.
         if self.placement.first != 0
             || self.placement.tiles < 2 * self.placement.channels.len()
-            || self.placement.by_column.is_some()
+            || self.placement.layout() != Layout::Interleaved
         {
             let [rt, ct] = self.grid();
             let mut packed = vec![0u8; self.placement.tiles * 4096];

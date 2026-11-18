@@ -3827,6 +3827,16 @@ impl<T: Transport> Session<T> {
         }
     }
 
+    /// [`Session::set_row_activations`] in a gate's mode: every grid of two tile columns laid by
+    /// row, however short (`TT_ACT_ROWS=all`), so every op meets the layout. Not for speed.
+    #[doc(hidden)]
+    pub fn set_row_activations_everywhere(&mut self, on: bool) {
+        self.row_everywhere = on;
+        if let Some(d) = self.dram.as_mut() {
+            d.alloc.set_row_activations_everywhere(on);
+        }
+    }
+
     /// Deal a one-row product's in-span columns over its prefetching units too (X10;
     /// `docs/plans/decode-bytes-in-flight.md`, "X10: evenness"). Where a one-row product with `K`
     /// whole has units reading their first columns ahead (`Session::set_weight_prefetch`), each of

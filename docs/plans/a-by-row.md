@@ -56,11 +56,25 @@ pieces in turn).
     `SCATTER_ROWS` (face rows, a whole tile row), `FILL_PAD`, `PAD_WRITE`, FP32 and BF16, each entry's tile and byte
     equal to its interleaved twin's (each layout's inverse from its definition). Three mutations each caught.
   - Room at the tightest (profile + encoded-guard): `dm_b` 1,596 bytes, `dm_nc` 604 (from 2,640 / 1,560).
-- [ ] **P2: host placement.** `tensor::Layout::ByRow`; `Placement` keeps a layout rather than `by_column`; `slot`,
+- [x] **P2: host placement** (2026-11-18; opt-in `TT_ACT_ROWS=1`, the gate's `=all`). Rule as built: grids of at
+  least `n` tile rows **and two tile columns** (a one-column grid laid by row is interleaved, and its `[r, 1]` <->
+  `[1, r]` view names another width). **The 128-token chunk's `A` (`[4, 64]` tiles) stays interleaved:** on 4 of 8
+  channels its rows would carry ~68 GB/s a channel under the products' re-reads, past a channel's ~64; splitting a
+  short row over several channels needs a per-tile test in the cursor (the 2-3% lesson). So this build reaches
+  256-token and longer chunks (the 512 / 1,024 buckets). Also: a `GATHER`'s by-row `B` (the KV cache) and transposed
+  `A` stay in line (the cursor and `tile_in` address the layout), not the out-of-line walk.
+  **Defect found by P3's gate, not P2's tests:** `write_images` / `download_any` special-cased only by-column
+  placements, so a by-row tensor's upload and download laid tiles interleaved, consistently with each other; the
+  card's reads disagreed. Every non-interleaved placement now goes tile by tile.
+- [ ] **P2 as planned:** `tensor::Layout::ByRow`; `Placement` keeps a layout rather than `by_column`; `slot`,
   `tensor_ref`, `alloc_laid`; `alloc_elem` lays by row under the session's switch for `rows >= n`. Views keep their
   parent's layout. The DMA fast paths skip by-row tensors as they do by-column ones. Placement test (every tile its
   own slot, full and harvested grids) and the rotated-channel control. Opt-in `TT_ACT_ROWS=1` during the build.
-- [ ] **P3: gates.** A ttsim gate (safe, `fast-reads`, `fast-reads` + `encoded-guard`): every op class writing and
+- [ ] **P3: gates.** Done on ttsim: `step276_rows_activations` (eltwise, product with `A` by row and `B` by row, both
+  reductions, a chained product, a row view, a transposed `A`; `m` 64 / 128 / 200 / 256; the session's rule and every
+  grid; the rotated control) in the safe, `fast-reads` and `fast-reads` + `encoded-guard` images, with `step172` /
+  `step173`. Left: card 0 (with the BF16 casts, silicon only), conformance under `TT_ACT_ROWS=all`, `step12_mnist`.
+  Planned: A ttsim gate (safe, `fast-reads`, `fast-reads` + `encoded-guard`): every op class writing and
   reading a by-row tensor, products at `m` = 64 / 128 / 256 with ragged rows followed by a reduction and a matmul,
   bit for bit against interleaved; the rotated control gives other bits. Card 0. `step172` / `step173` in all three
   read modes, firmware lints with and without `profile`, `step12_mnist`, conformance.
