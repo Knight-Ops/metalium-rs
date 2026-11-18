@@ -40,6 +40,7 @@ use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Bool, DType, Distribution, Int, Tensor, TensorData};
 
+use crate::delta_rule;
 use crate::generate::{eager, EagerDecoder, FixedShapeCache, FixedShapeDecoder, Generation};
 use crate::host_embed::HostEmbedding;
 use crate::kv_cache::{CacheLayout, FixedCache, FixedWrite};
@@ -736,6 +737,9 @@ impl<B: Backend> GatedDeltaNet<B> {
     /// A chunk's padding rows (`padding`) leave `conv` and `s` as the prompt's last row left them:
     /// their decay is 1 and their write strength 0, so the recurrence carries the state through
     /// them unchanged, and the convolution keeps the inputs that end at the prompt's last token.
+    /// `chunked` (positions `0, 1, …` on the device) computes a chunk of tokens by
+    /// [`delta_rule::chunked`] instead of token by token ([`delta_rule::by_token`]): the
+    /// performance contract's choice ([`Qwen35::chunked_delta`]).
     fn forward(
         &self,
         cfg: &Qwen35Config,
@@ -743,6 +747,7 @@ impl<B: Backend> GatedDeltaNet<B> {
         conv: &mut Tensor<B, 3>,
         s: &mut Tensor<B, 4>,
         padding: Option<&Padding<B>>,
+        chunked: Option<&Tensor<B, 1, Int>>,
     ) -> Tensor<B, 3> {
         let [n, t, _] = x.dims();
         let stream = x.dtype();
@@ -767,6 +772,15 @@ impl<B: Backend> GatedDeltaNet<B> {
         // The decay, in log space, `[1, t, v_heads]`: `-(exp(A_log) softplus)`, the negation on
         // the rate (the same bits).
         let g = neg_rate * softplus(a + bias);
+        // The chunked rule's log decay, `[1, v_heads, t, 1]`, a padding row's 0.
+        let log_decay = || {
+            let g = match padding {
+                None => g.clone(),
+                Some(p) => g.clone().mask_fill(p.rows.clone(), 0.0),
+            };
+            g.swap_dims(1, 2).unsqueeze_dim::<4>(3)
+        };
+        let log_decay = (t > 1 && chunked.is_some()).then(log_decay);
         // Per token and head, `[1, t, v_heads]`: the decay factor and the write strength, a
         // padding row's 1 and 0 (exact: `s 1 = s`, and the update it adds is zeros).
         let (decay, beta) = match padding {
@@ -811,28 +825,15 @@ impl<B: Backend> GatedDeltaNet<B> {
         // Each token's decay as a column of the state's `[v_heads k_dim, v_dim]` matrix, `[1, t,
         // v_heads, k_dim]`: the card multiplies the state by a column where it lies, where a
         // scalar a head would first be expanded to the state's whole size.
-        let decay = decay.unsqueeze_dim::<4>(3).expand([n, t, vh, kd]);
         let beta = beta.swap_dims(1, 2).unsqueeze_dim::<4>(3);
-
-        let mut outs = Vec::with_capacity(t);
-        for i in 0..t {
-            let row =
-                |x: &Tensor<B, 4>, width: usize| x.clone().slice([0..n, 0..vh, i..i + 1, 0..width]);
-            let (q_i, k_i, v_i) = (row(&q, kd), row(&k, kd), row(&v, vd));
-            let decay_i = decay
-                .clone()
-                .slice([0..n, i..i + 1, 0..vh, 0..kd])
-                .reshape([n, vh, kd, 1]);
-            let state = s.clone() * decay_i;
-            // What the state already predicts for this key, and the correction written for it
-            // (the key as a column: `k^T`, the same values).
-            let predicted = k_i.clone().matmul(state.clone());
-            let delta = (v_i - predicted) * row(&beta, 1);
-            let state = state + k_i.reshape([n, vh, kd, 1]).matmul(delta);
-            outs.push(q_i.matmul(state.clone()));
-            *s = state;
-        }
-        let out = Tensor::cat(outs, 2).swap_dims(1, 2).cast(stream);
+        let out = match (log_decay, chunked) {
+            (Some(g), Some(positions)) => delta_rule::chunked(q, k, v, g, beta, s, positions),
+            _ => {
+                let decay = decay.unsqueeze_dim::<4>(3).expand([n, t, vh, kd]);
+                delta_rule::by_token(q, k, v, decay, beta, s)
+            }
+        };
+        let out = out.swap_dims(1, 2).cast(stream);
         let out = self.norm.forward(out, z).reshape([n, t, value_dim]);
         project(out, &self.out_proj)
     }
@@ -948,11 +949,12 @@ impl<B: Backend> Layer<B> {
         rope: &Rope<B>,
         start: usize,
         state: &mut LayerState<B>,
+        chunked: Option<&Tensor<B, 1, Int>>,
     ) -> Tensor<B, 3> {
         let h = self.input_layernorm.forward(x.clone());
         let mixed = match (state, &self.linear_attn, &self.self_attn) {
             (LayerState::Recurrent { conv, s }, Some(net), None) => {
-                net.forward(cfg, h, conv, s, None)
+                net.forward(cfg, h, conv, s, None, chunked)
             }
             (LayerState::Attention { k, v }, None, Some(attn)) => {
                 attn.forward(cfg, h, rope, start, k, v)
@@ -981,7 +983,14 @@ impl<B: Backend> Layer<B> {
                 let [_, _, past, c] = a.dims();
                 let mut conv = a.reshape([1, past, c]);
                 let mut s = b;
-                let y = net.forward(cfg, h, &mut conv, &mut s, at.padding.as_ref());
+                let y = net.forward(
+                    cfg,
+                    h,
+                    &mut conv,
+                    &mut s,
+                    at.padding.as_ref(),
+                    at.chunked.as_ref(),
+                );
                 (y, [conv.reshape([1, 1, past, c]), s])
             }
             (None, Some(attn)) => {
@@ -1009,6 +1018,8 @@ struct Padding<B: Backend> {
 /// What every layer of a fixed-shape step shares: where an attention layer writes and what it
 /// attends to, the rotary rows of the step's positions, and a chunk's padding.
 struct FixedAt<B: Backend> {
+    /// The cache's positions when the DeltaNets run a chunk at a time ([`Qwen35::chunked_delta`]).
+    chunked: Option<Tensor<B, 1, Int>>,
     /// Where the keys and values go, and that write's mask with each row repeated for the query
     /// heads folded into it (`None` for a model without attention layers).
     attend: Option<(FixedWrite<B>, Tensor<B, 4, Bool>)>,
@@ -1261,6 +1272,13 @@ impl<B: Backend> Qwen35<B> {
         }
     }
 
+    /// Whether the DeltaNets compute a chunk of tokens at once ([`delta_rule::chunked`]): under
+    /// the performance contract. The reference contract keeps the token-by-token recurrence, bit
+    /// for bit, so a prompt fed at once and in chunks agree exactly there.
+    fn chunked_delta(&self) -> bool {
+        self.numerics == Some(burn_tt::Numerics::Performance)
+    }
+
     /// The residual stream's dtype: the embedding table's, unless [`Qwen35::for_inference`] stored
     /// the table in another.
     fn stream_dtype(&self) -> DType {
@@ -1324,8 +1342,10 @@ impl<B: Backend> Qwen35<B> {
         }
         let cfg = &self.config;
         let rope = cfg.rope(start, t, dtype, &x.device());
+        let chunked = (self.chunked_delta() && t > 1)
+            .then(|| Tensor::arange(0..t as i64, &x.device()));
         for (layer, s) in self.layers.iter().zip(state.layers.iter_mut()) {
-            x = layer.forward(cfg, x, &rope, start, s);
+            x = layer.forward(cfg, x, &rope, start, s, chunked.as_ref());
         }
         state.len += t;
         self.norm.forward(x)
@@ -1782,6 +1802,7 @@ impl<B: Backend> Qwen35<B> {
             }
         };
         let at_all = FixedAt {
+            chunked: self.chunked_delta().then(|| cache.positions.clone()),
             attend,
             rope,
             padding,
@@ -2139,6 +2160,32 @@ mod tests {
         let unscaled = plain.generate(&prompt, 4, Precision::F32, &FlexDevice);
         let d = worst(&growing.logits, &unscaled.logits);
         assert!(d > 1e-3, "YaRN left the logits as they were: {d}");
+    }
+
+    /// The chunked delta rule (the performance contract's) predicts what the token-by-token
+    /// recurrence does, to rounding: eagerly (a prompt at once) and through the fixed-shape
+    /// chunks with padding.
+    #[test]
+    fn the_chunked_delta_rule_predicts_what_the_recurrence_does() {
+        use crate::generate::{generate_fixed, Shapes};
+        // Initialised before the clone (a lazy parameter's clone would draw its own values).
+        let by_token = Qwen35::<Flex>::new(&TINY, &FlexDevice).map(&mut ToF32);
+        let mut chunked = by_token.clone();
+        chunked.numerics = Some(burn_tt::Numerics::Performance);
+        let shapes = Shapes::new(16, &[4, 8]);
+        for len in [3, 9] {
+            let prompt: Vec<i32> = (0..len).map(|i| (5 + 11 * i * i) % 64).collect();
+            let want = by_token.generate(&prompt, 4, Precision::F32, &FlexDevice);
+            let got = chunked.generate(&prompt, 4, Precision::F32, &FlexDevice);
+            let w = worst(&got.logits, &want.logits);
+            assert!(w < 1e-4, "eager, prompt {len}: {w}");
+            assert_eq!(got.tokens, want.tokens, "eager, prompt {len}");
+            let fixed = generate_fixed(&chunked, &prompt, 4, &shapes, &FlexDevice).unwrap();
+            let w = worst(&fixed.logits, &want.logits);
+            eprintln!("prompt {len}: fixed chunked against the recurrence {w:e}");
+            assert!(w < 1e-4, "fixed, prompt {len}: {w}");
+            assert_eq!(fixed.tokens, want.tokens, "fixed, prompt {len}");
+        }
     }
 
     /// A model whose table is on the host gives the device lookup's logits bit for bit, a chunk

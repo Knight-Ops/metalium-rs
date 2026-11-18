@@ -719,6 +719,18 @@ fn input<B: TracedBackend, const D: usize>(t: &Tensor<B, D, Int>) -> TtTensor {
     t
 }
 
+/// `TT_BUILD_TIMES=1`: how long a generator's warm-up run or capture of one key took, and how
+/// many times the capture ran the model (a residency plan runs it two or three times).
+fn build_time(what: std::fmt::Arguments, since: Instant, runs: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("TT_BUILD_TIMES").as_deref() == Ok("1")) {
+        eprintln!(
+            "tt-models build: {what}: {:.1} s, {runs} run(s)",
+            since.elapsed().as_secs_f64()
+        );
+    }
+}
+
 /// A chunk's three inputs: its tokens ([`feed_payload`]), its first position and its last row.
 fn chunk_inputs(tokens: InputPayload, chunk: Chunk) -> Vec<InputPayload> {
     vec![
@@ -916,16 +928,20 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             // between calls (a weight transposed once for its product, a zero row) is in place
             // before the captures, which then read it rather than make it.
             for &len in &shapes.steps {
+                let t0 = Instant::now();
                 let feed = Feed::<B>::zeros(model, 1, device);
                 let (l, state) = feed.step(model, index(0, device), len, cache);
                 cache.set_state(state);
                 let _ = read(l);
+                build_time(format_args!("warm-up Step({len})"), t0, 1);
             }
             for (c, len) in shapes.chunk_keys() {
+                let t0 = Instant::now();
                 let feed = Feed::<B>::zeros(model, c, device);
                 let (l, state) = feed.chunk(model, index(0, device), index(0, device), len, cache);
                 cache.set_state(state);
                 let _ = read(l);
+                build_time(format_args!("warm-up Chunk {{ c: {c}, len: {len} }}"), t0, 1);
             }
         }
         let mut sets = Vec::with_capacity(caches.len());
@@ -959,7 +975,9 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             let (tp, pp) = (token.input(), input(&position));
             // The step may be captured twice (a residency plan, then the plan applied: `burn_tt::
             // set_residency`), each run over the same inputs.
+            let (t0, runs) = (Instant::now(), std::cell::Cell::new(0));
             sets[0].capture(Key::Step(len), &[&tp, &pp], || {
+                runs.set(runs.get() + 1);
                 let (y, state) = token.step(model, position.clone(), len, cache);
                 let next = greedy(y.clone());
                 (
@@ -967,6 +985,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                     state.into_iter().map(float).collect(),
                 )
             })?;
+            build_time(format_args!("capture Step({len})"), t0, runs.get());
         }
 
         let prefill = caches.len() - 1;
@@ -1014,7 +1033,9 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             let start = index::<B>(0, device);
             let last = index::<B>(0, device);
             let (tp, sp, lp) = (tokens.input(), input(&start), input(&last));
+            let (t0, runs) = (Instant::now(), std::cell::Cell::new(0));
             set.capture(Key::Chunk { c, len }, &[&tp, &sp, &lp], || {
+                runs.set(runs.get() + 1);
                 let (y, state) = tokens.chunk(model, start.clone(), last.clone(), len, cache);
                 let next = greedy(y.clone());
                 (
@@ -1022,6 +1043,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                     state.into_iter().map(float).collect(),
                 )
             })?;
+            build_time(format_args!("capture Chunk {{ c: {c}, len: {len} }}"), t0, runs.get());
         }
         Ok(())
     }
