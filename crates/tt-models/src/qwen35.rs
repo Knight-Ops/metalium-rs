@@ -875,6 +875,21 @@ fn split_columns<B: Backend, const N: usize>(y: Tensor<B, 3>, at: [usize; N]) ->
 }
 
 impl<B: Backend> Layer<B> {
+    /// [`Qwen35::prepared`] for this layer alone: the same arithmetic, one layer at a time.
+    fn prepare(&mut self, cfg: &Qwen35Config) {
+        self.input_layernorm.shift();
+        self.post_attention_layernorm.shift();
+        if let Some(attn) = &mut self.self_attn {
+            attn.q_norm.shift();
+            attn.k_norm.shift();
+            attn.fuse();
+        }
+        if let Some(net) = &mut self.linear_attn {
+            net.prepare(cfg);
+        }
+        self.mlp.fuse();
+    }
+
     fn new(cfg: &Qwen35Config, index: usize, device: &B::Device) -> Self {
         let full = cfg.is_full(index);
         Self {
@@ -1111,17 +1126,7 @@ impl<B: Backend> Qwen35<B> {
     pub fn prepared(mut self) -> Self {
         let cfg = self.config;
         for layer in &mut self.layers {
-            layer.input_layernorm.shift();
-            layer.post_attention_layernorm.shift();
-            if let Some(attn) = &mut layer.self_attn {
-                attn.q_norm.shift();
-                attn.k_norm.shift();
-                attn.fuse();
-            }
-            if let Some(net) = &mut layer.linear_attn {
-                net.prepare(&cfg);
-            }
-            layer.mlp.fuse();
+            layer.prepare(&cfg);
         }
         self.norm.shift();
         self
@@ -1305,6 +1310,96 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
             &crate::quant::Plan::bf16_weights(),
             &crate::quant::Native,
         )
+    }
+
+    /// [`Qwen35::pretrained`] in F32, [`Qwen35::prepared`] and [`Qwen35::for_inference`] under
+    /// `numerics` with the weight formats `plan`, done **one layer at a time**: each layer is read
+    /// from `paths`, widened, prepared and stored in its format before the next is read, so the
+    /// card never holds more than one layer in F32 beside the stored ones. The same arithmetic as
+    /// the three steps on the whole model, for a model whose F32 or BF16 form does not fit in GDDR
+    /// (a 27B checkpoint is 54 GB in BF16). The output head and the final norm are loaded first,
+    /// with the embedding table, which the plan keeps BF16 as `for_inference` does.
+    ///
+    /// `paths` are the checkpoint's shards, absolute (the model need not be in `vendor/weights`).
+    pub fn streamed(
+        config: &Qwen35Config,
+        paths: &[std::path::PathBuf],
+        numerics: burn_tt::Numerics,
+        plan: &crate::quant::Plan,
+        device: &B::Device,
+    ) -> Result<(Self, Loaded), LoadError> {
+        if let Some(absent) = paths.iter().find(|p| !p.exists()) {
+            return Err(LoadError::NotFetched(absent.clone()));
+        }
+        let cfg = *config;
+        let mut model = Self::new(config, device);
+        let layers = std::mem::take(&mut model.layers);
+
+        // The embedding table, the final norm and the output head.
+        let top_ignore = |name: &str| {
+            name.contains("layers.") || name.contains("visual.") || name.starts_with("mtp.")
+        };
+        let top = load_safetensors_shards(
+            &mut model,
+            paths,
+            &Layout {
+                remaps: &[(r"^(model\.)?language_model\.", "")],
+                pytorch: true,
+                ignore: &top_ignore,
+            },
+        )?;
+        let mut applied = top.applied;
+        let mut model = model.map(&mut ToF32);
+        model.norm.shift();
+        let mut model = crate::quant::apply(model, plan, &crate::quant::Native);
+
+        // A layer's own tensors reach the bare module paths; everything else in the files is
+        // another layer's, the vision tower's or the MTP head's.
+        const ROOTS: [&str; 5] = [
+            "input_layernorm.",
+            "post_attention_layernorm.",
+            "linear_attn.",
+            "self_attn.",
+            "mlp.",
+        ];
+        let layer_ignore = |name: &str| !ROOTS.iter().any(|r| name.starts_with(r));
+        for (i, layer) in layers.into_iter().enumerate() {
+            let prefix = format!(r"^(model\.)?language_model\.layers\.{i}\.");
+            let mut layer = layer;
+            let loaded = load_safetensors_shards(
+                &mut layer,
+                paths,
+                &Layout {
+                    // The renames match the full name, so they come before the prefix is cut.
+                    remaps: &[
+                        (r"\.linear_attn\.A_log$", ".linear_attn.a_log"),
+                        (r"\.linear_attn\.conv1d\.weight$", ".linear_attn.conv1d"),
+                        (prefix.as_str(), ""),
+                    ],
+                    pytorch: true,
+                    ignore: &layer_ignore,
+                },
+            )?;
+            applied += loaded.applied;
+            let mut layer = layer.map(&mut ToF32);
+            layer.prepare(&cfg);
+            model
+                .layers
+                .push(crate::quant::apply(layer, plan, &crate::quant::Native));
+        }
+
+        model.numerics = Some(numerics);
+        model.stream = Some(DType::F32);
+        if numerics == burn_tt::Numerics::Performance {
+            model.kv = Some(DType::BF16);
+        }
+        Ok((
+            model,
+            Loaded {
+                applied,
+                ignored: top.ignored,
+            },
+        ))
     }
 }
 
