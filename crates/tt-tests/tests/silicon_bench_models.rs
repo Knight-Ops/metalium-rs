@@ -1722,6 +1722,39 @@ fn traced_generation_stream_ceiling() {
         if program_log.is_some() {
             burn_tt::probe_program_log(d, true).unwrap();
         }
+        // Written at the end, and where a build fails (a refusal the replay is to reproduce).
+        let write_log = || {
+            let Some(path) = &program_log else {
+                return;
+            };
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            for (u, events) in burn_tt::probe_program_log(d, false)
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
+                for e in events {
+                    let _ = writeln!(out, "{u}\t{}", e.line());
+                }
+            }
+            std::fs::write(path, out).unwrap();
+            println!("PROGRAM LOG written to {path}");
+        };
+        // `TT_GEN_PROGRAM_POLICY=first|best|top|packed`: where every unit's program cache places
+        // programs (`tt_kernels::program_cache::Policy`; default first fit).
+        if let Ok(v) = std::env::var("TT_GEN_PROGRAM_POLICY") {
+            use tt_kernels::program_cache::Policy;
+            let policy = match v.as_str() {
+                "first" => Policy::FirstFit,
+                "best" => Policy::BestFit,
+                "top" => Policy::TopDown,
+                "packed" => Policy::Packed,
+                other => panic!("TT_GEN_PROGRAM_POLICY={other}: first, best, top or packed"),
+            };
+            burn_tt::set_program_policy(d, policy).unwrap();
+            println!("BENCH {{\"kind\":\"conditions\",\"program_policy\":\"{v}\"}}");
+        }
         // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
         let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
             v.split(',').map(|n| n.trim().parse().unwrap()).collect()
@@ -1741,7 +1774,13 @@ fn traced_generation_stream_ceiling() {
         // `docs/completed-plans/planned-l1-residency.md` 2h).
         let build = |what: &str| {
             let t = std::time::Instant::now();
-            let g = TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap();
+            let g = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap()
+            }))
+            .unwrap_or_else(|p| {
+                write_log();
+                std::panic::resume_unwind(p)
+            });
             report(
                 &format!("{name} stream ceiling ({tag}), {what} build"),
                 "ms",
@@ -1834,21 +1873,7 @@ fn traced_generation_stream_ceiling() {
                 Stats::of(step),
             );
         }
-        if let Some(path) = &program_log {
-            use std::fmt::Write as _;
-            let mut out = String::new();
-            for (u, events) in burn_tt::probe_program_log(d, false)
-                .unwrap()
-                .iter()
-                .enumerate()
-            {
-                for e in events {
-                    let _ = writeln!(out, "{u}\t{}", e.line());
-                }
-            }
-            std::fs::write(path, out).unwrap();
-            println!("PROGRAM LOG written to {path}");
-        }
+        write_log();
         // In the device's process (a fork), where the probe counted.
         if contiguous.is_some() {
             let [moved, ahead] = tt_kernels::tensor::probe_contiguous_b_bytes();
