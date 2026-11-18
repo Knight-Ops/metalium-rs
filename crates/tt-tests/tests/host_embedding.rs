@@ -34,7 +34,13 @@ fn a_host_table_generates_what_the_device_table_does() {
     let prompts = [5, 16, 70].map(|n| ladder_support::prompt(n, CONFIG.vocab));
     let shapes = Shapes::new(128, &[8, 16]).with_prefixes(&[]);
     let steps = 6;
-    with_device(Config::default(), |d| {
+    // Every tile, as `step263`'s Qwen3.5 gates: a chunk's capture on the 12-tile gate default
+    // holds nearly a unit's whole program cache.
+    let config = Config {
+        tiles: Some(burn_tt::TileChoice::All),
+        ..Config::default()
+    };
+    with_device(config, |d| {
         // Every parameter is made by `for_inference`'s pass, so the clone below shares them.
         let device_table = Qwen35::<TtBackend>::new(&CONFIG, &d)
             .for_inference(Numerics::Performance, WeightOptions::default());
