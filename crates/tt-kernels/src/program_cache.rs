@@ -130,6 +130,14 @@ pub enum Event {
     UnpinAll,
     ClearUnheld,
     Clear,
+    /// A program resident when logging began, as it was: the state a [`replay`] starts from.
+    Resident {
+        hash: u64,
+        words: u32,
+        at: u64,
+        held: u32,
+        protected: bool,
+    },
 }
 
 impl Event {
@@ -172,6 +180,16 @@ impl Event {
             Event::UnpinAll => "unpin_all".into(),
             Event::ClearUnheld => "clear_unheld".into(),
             Event::Clear => "clear".into(),
+            Event::Resident {
+                hash,
+                words,
+                at,
+                held,
+                protected,
+            } => format!(
+                "resident\t{hash}\t{words}\t{at}\t{held}\t{}",
+                *protected as u8
+            ),
         }
     }
 
@@ -221,6 +239,13 @@ impl Event {
             "unpin_all" => Event::UnpinAll,
             "clear_unheld" => Event::ClearUnheld,
             "clear" => Event::Clear,
+            "resident" => Event::Resident {
+                hash: n(1)?,
+                words: n(2)? as u32,
+                at: n(3)?,
+                held: n(4)? as u32,
+                protected: b(5)?,
+            },
             _ => return None,
         })
     }
@@ -331,9 +356,33 @@ impl ProgramCache {
         self.capturing = capturing;
     }
 
-    /// Record every call from now on ([`Event`]), or stop and drop what was recorded.
+    /// Record every call from now on ([`Event`]), or stop and drop what was recorded. A log
+    /// begun on a cache that holds programs starts with them ([`Event::Resident`]).
     pub fn set_log(&mut self, on: bool) {
-        self.log = on.then(|| self.log.take().unwrap_or_default());
+        self.log = match (on, self.log.take()) {
+            (false, _) => None,
+            (true, Some(log)) => Some(log),
+            (true, None) => Some(
+                self.resident
+                    .iter()
+                    .map(|r| Event::Resident {
+                        hash: r.hash,
+                        words: r.words.len() as u32,
+                        at: r.at,
+                        held: r.held,
+                        protected: r.protected,
+                    })
+                    .collect(),
+            ),
+        };
+    }
+
+    /// Put a program at `at` as a log's [`Event::Resident`] names it ([`replay`]'s start).
+    fn seed(&mut self, words: &Arc<[u32]>, h: u64, at: u64, held: u32, protected: bool) {
+        self.restore(words, h, at, true)
+            .expect("a log's residents do not overlap");
+        let r = self.resident.last_mut().expect("just placed");
+        (r.held, r.protected, r.pinned) = (held, protected, false);
     }
 
     /// What was recorded since the last take, emptied (logging stays as it was).
@@ -963,6 +1012,16 @@ pub fn replay(region: Region, events: &[Event], policy: Policy) -> Replayed {
                 c.clear();
                 map.clear();
             }
+            Event::Resident {
+                hash,
+                words: n,
+                at,
+                held,
+                protected,
+            } => {
+                c.seed(&words(hash, n), hash, at, held, protected);
+                map.insert((at, hash), at);
+            }
         }
     }
     out.held_evicted_bytes = c.stats().held_evicted_bytes;
@@ -1323,6 +1382,44 @@ mod tests {
         assert_eq!((s.held_evictions, s.held_evicted_bytes), (4, 1024));
     }
 
+    /// A log begun on a cache that already holds programs starts with them: a replay under the
+    /// recording's own policy then does exactly what the cache did (watched failing without
+    /// [`Event::Resident`]: the replay, starting empty, evicted none of the held bytes the
+    /// recording did).
+    #[test]
+    fn a_log_begun_mid_life_replays_as_recorded() {
+        let mut c = fragmented_capture(Policy::FirstFit, false);
+        c.set_capturing(false);
+        c.unprotect_all();
+        c.unpin_all();
+        c.set_log(true);
+        // Hits on what was there, a hold of one, and new programs into what is left.
+        let old: Arc<[u32]> = prog(0, 64).into();
+        assert!(matches!(
+            c.place_hashed(&old, hash(&old)),
+            Ok(Placed::Hit(_))
+        ));
+        for t in 200..203 {
+            let w: Arc<[u32]> = prog(t, 32).into();
+            if let Ok(Placed::Upload(at)) = c.place_hashed_evicting(&w, hash(&w), true) {
+                c.hold(at);
+            }
+        }
+        let log = c.take_log();
+        assert!(matches!(log[0], Event::Resident { .. }));
+        let r = replay(region(0x1000), &log, Policy::FirstFit);
+        assert_eq!(
+            (
+                r.refused,
+                r.refused_now_placed,
+                r.placed_now_refused,
+                r.unmapped
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(r.held_evicted_bytes, c.stats().held_evicted_bytes);
+    }
+
     #[test]
     fn a_log_reads_back_and_replays_as_recorded() {
         let mut c = fragmented_capture(Policy::FirstFit, true);
@@ -1483,6 +1580,12 @@ mod log_probe {
             units += 1;
         }
         println!("{path}: {total} events on {units} units");
+        // The replay is a bound only if the recording's own policy reproduces the recording.
+        let own = &sums[0].0;
+        println!(
+            "FirstFit reproduces the recording: {}",
+            own.refused_now_placed == 0 && own.placed_now_refused == 0 && own.unmapped == 0
+        );
         println!(
             "policy     refused  now-placed  newly-refused  restored-MB  recorded-MB  held-evicted-MB  tightest-room  (unit)  unmapped"
         );
