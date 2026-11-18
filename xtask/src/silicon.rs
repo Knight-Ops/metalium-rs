@@ -118,6 +118,12 @@ const LONG: &[(&str, u64)] = &[
         "streamed_load::streamed_load_equals_the_whole_model_load_bit_for_bit",
         320,
     ),
+    // 134 s on card 0 (`1795040827`): two traced generators of a 4-layer Qwen3.5, table on the
+    // card and on the host.
+    (
+        "host_embedding::a_host_table_generates_what_the_device_table_does",
+        320,
+    ),
     // 2,138 s on card 0, 1,472 of it burn-flex's 8,192-position reference (`1792941361`).
     (
         "step188_smollm2_1_7b::the_native_context_agrees_with_flex",

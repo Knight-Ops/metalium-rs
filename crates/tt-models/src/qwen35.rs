@@ -1019,7 +1019,8 @@ struct FixedAt<B: Backend> {
 /// The Qwen3.5 text model.
 #[derive(Module, Debug)]
 pub struct Qwen35<B: Backend> {
-    embed_tokens: Embedding<B>,
+    /// The embedding table, `None` when it is kept on the host (`host`).
+    embed_tokens: Option<Embedding<B>>,
     layers: Vec<Layer<B>>,
     norm: CenteredNorm<B>,
     /// The output projection, absent when it is the embedding table ([`Qwen35Config::tied_head`]).
@@ -1037,7 +1038,7 @@ pub struct Qwen35<B: Backend> {
     /// performance contract ([`Qwen35::for_inference`], as `Llama`'s). Not a parameter.
     kv: Option<DType>,
     /// The embedding table in host memory ([`crate::quant::WeightOptions::host_embedding`]):
-    /// `embed_tokens` is then a one-row placeholder. Not a parameter.
+    /// `embed_tokens` is then `None`. Not a parameter.
     host: Option<std::sync::Arc<HostEmbedding>>,
 }
 
@@ -1068,7 +1069,7 @@ impl<B: Backend> Qwen35<B> {
     pub fn new(config: &Qwen35Config, device: &B::Device) -> Self {
         config.check();
         Self {
-            embed_tokens: EmbeddingConfig::new(config.vocab, config.hidden).init(device),
+            embed_tokens: Some(EmbeddingConfig::new(config.vocab, config.hidden).init(device)),
             layers: (0..config.layers)
                 .map(|i| Layer::new(config, i, device))
                 .collect(),
@@ -1087,7 +1088,7 @@ impl<B: Backend> Qwen35<B> {
     }
 
     /// The model with its embedding table in host memory: `table` (the device table's values)
-    /// replaces it, and GDDR keeps a one-row placeholder. Refused for a tied head, whose
+    /// replaces it, and GDDR keeps nothing of it. Refused for a tied head, whose
     /// product reads the table on the card.
     pub fn with_host_embedding(mut self, table: HostEmbedding) -> Result<Self, LoadError> {
         let cfg = &self.config;
@@ -1105,21 +1106,28 @@ impl<B: Backend> Qwen35<B> {
                 cfg.hidden
             )]));
         }
-        // The final norm's device: reading the table's would initialise a lazy table first.
-        let device = self.norm.weight.val().device();
-        self.embed_tokens = EmbeddingConfig::new(1, cfg.hidden).init(&device);
+        self.embed_tokens = None;
         self.host = Some(std::sync::Arc::new(table));
         Ok(self)
     }
 
     /// The embedding table, `[vocab, hidden]` (also the output head when it is tied).
+    /// Panics for a model whose table is on the host ([`Self::with_host_embedding`]).
     pub fn embed_table(&self) -> Tensor<B, 2> {
-        self.embed_tokens.weight.val()
+        self.device_table().weight.val()
+    }
+
+    fn device_table(&self) -> &Embedding<B> {
+        self.embed_tokens
+            .as_ref()
+            .expect("the embedding table is on the host")
     }
 
     /// The device the parameters are on.
     pub fn device(&self) -> B::Device {
-        self.embed_tokens.weight.val().device()
+        // The final norm's: the table may be on the host, and reading a lazy table's device
+        // would make it.
+        self.norm.weight.val().device()
     }
 
     /// A pretrained Qwen3.5 checkpoint in `files` of `vendor/weights/<weights>/` whose text shape
@@ -1226,7 +1234,7 @@ impl<B: Backend> Qwen35<B> {
     /// takes the rows as its input, [`FixedShapeDecoder::step_rows`]).
     pub fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let rows = match &self.host {
-            None => self.embed_tokens.forward(tokens),
+            None => self.device_table().forward(tokens),
             Some(table) => {
                 let device = tokens.device();
                 let ids: Vec<u32> = tokens
@@ -1257,7 +1265,11 @@ impl<B: Backend> Qwen35<B> {
     /// the table in another.
     fn stream_dtype(&self) -> DType {
         self.stream
-            .unwrap_or_else(|| self.embed_tokens.weight.val().dtype())
+            .unwrap_or_else(|| match &self.embed_tokens {
+                Some(table) => table.weight.val().dtype(),
+                // The host table's rows are F32.
+                None => DType::F32,
+            })
     }
 
     /// The full-attention layers' KV cache dtype: [`Qwen35::for_inference`]'s choice, else the
@@ -1351,7 +1363,7 @@ impl<B: Backend> Qwen35<B> {
                 // A BF16 table under an F32 stream ([`Qwen35::for_inference`]: the table stored
                 // once, for its lookup and this head) is multiplied as its values are, with an F32
                 // result, one product reading it where it lies (`burn_tt::matmul_wide`).
-                let table = self.embed_tokens.weight.val();
+                let table = self.embed_table();
                 if last.dtype() == DType::F32 && table.dtype() == DType::BF16 {
                     let t = table.transpose();
                     return burn_tt::matmul_wide(&last, &t)
@@ -1450,6 +1462,8 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
             &mut model,
             paths,
             &Layout {
+                // With the table on the host the module has no `embed_tokens`, so the file's is
+                // left unused and listed as ignored.
                 remaps: &[(r"^(model\.)?language_model\.", "")],
                 pytorch: true,
                 ignore: &|name| {
@@ -1517,7 +1531,7 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
         let ignored = top
             .ignored
             .into_iter()
-            .filter(|n| !loaded_later(n) && !(host && is_embed_table(n)))
+            .filter(|n| !loaded_later(n))
             .collect();
         Ok((model, Loaded { applied, ignored }))
     }
