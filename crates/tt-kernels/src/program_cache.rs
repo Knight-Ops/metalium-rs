@@ -130,13 +130,15 @@ pub enum Event {
     UnpinAll,
     ClearUnheld,
     Clear,
-    /// A program resident when logging began, as it was: the state a [`replay`] starts from.
+    /// A program resident when logging began, as it was: the state a [`replay`] starts from,
+    /// logged least recently used first (the order eviction takes them in).
     Resident {
         hash: u64,
         words: u32,
         at: u64,
         held: u32,
         protected: bool,
+        pinned: bool,
     },
 }
 
@@ -186,9 +188,10 @@ impl Event {
                 at,
                 held,
                 protected,
+                pinned,
             } => format!(
-                "resident\t{hash}\t{words}\t{at}\t{held}\t{}",
-                *protected as u8
+                "resident\t{hash}\t{words}\t{at}\t{held}\t{}\t{}",
+                *protected as u8, *pinned as u8
             ),
         }
     }
@@ -245,6 +248,7 @@ impl Event {
                 at: n(3)?,
                 held: n(4)? as u32,
                 protected: b(5)?,
+                pinned: b(6)?,
             },
             _ => return None,
         })
@@ -362,27 +366,33 @@ impl ProgramCache {
         self.log = match (on, self.log.take()) {
             (false, _) => None,
             (true, Some(log)) => Some(log),
-            (true, None) => Some(
-                self.resident
-                    .iter()
-                    .map(|r| Event::Resident {
-                        hash: r.hash,
-                        words: r.words.len() as u32,
-                        at: r.at,
-                        held: r.held,
-                        protected: r.protected,
-                    })
-                    .collect(),
-            ),
+            (true, None) => {
+                let mut by_use: Vec<&Resident> = self.resident.iter().collect();
+                by_use.sort_by_key(|r| r.last_use);
+                Some(
+                    by_use
+                        .into_iter()
+                        .map(|r| Event::Resident {
+                            hash: r.hash,
+                            words: r.words.len() as u32,
+                            at: r.at,
+                            held: r.held,
+                            protected: r.protected,
+                            pinned: r.pinned,
+                        })
+                        .collect(),
+                )
+            }
         };
     }
 
-    /// Put a program at `at` as a log's [`Event::Resident`] names it ([`replay`]'s start).
-    fn seed(&mut self, words: &Arc<[u32]>, h: u64, at: u64, held: u32, protected: bool) {
+    /// Put a program at `at` as a log's [`Event::Resident`] names it ([`replay`]'s start), used
+    /// after every program seeded before it.
+    fn seed(&mut self, words: &Arc<[u32]>, h: u64, at: u64, [held, protected, pinned]: [u32; 3]) {
         self.restore(words, h, at, true)
             .expect("a log's residents do not overlap");
         let r = self.resident.last_mut().expect("just placed");
-        (r.held, r.protected, r.pinned) = (held, protected, false);
+        (r.held, r.protected, r.pinned) = (held, protected != 0, pinned != 0);
     }
 
     /// What was recorded since the last take, emptied (logging stays as it was).
@@ -930,6 +940,9 @@ pub struct Replayed {
     pub tightest_room: u64,
     /// Holds, protects, releases and restores of a program the replay never placed.
     pub unmapped: u64,
+    /// Placements both made at different addresses: zero when the replay reproduces the
+    /// recording, which a replay under the recording's own policy must.
+    pub moved: u64,
 }
 
 /// Run `events` (one unit's, recorded with [`ProgramCache::set_log`]) again on an empty cache
@@ -983,6 +996,7 @@ pub fn replay(region: Region, events: &[Event], policy: Policy) -> Replayed {
                 }
                 if let (Some(at), Some(now)) = (result.at(), now.at()) {
                     map.insert((at, hash), now);
+                    out.moved += u64::from(at != now);
                 }
             }
             Event::Restore {
@@ -1030,8 +1044,10 @@ pub fn replay(region: Region, events: &[Event], policy: Policy) -> Replayed {
                 at,
                 held,
                 protected,
+                pinned,
             } => {
-                c.seed(&words(hash, n), hash, at, held, protected);
+                let state = [held, protected as u32, pinned as u32];
+                c.seed(&words(hash, n), hash, at, state);
                 map.insert((at, hash), at);
             }
         }
@@ -1395,14 +1411,23 @@ mod tests {
     }
 
     /// A log begun on a cache that already holds programs starts with them: a replay under the
-    /// recording's own policy then does exactly what the cache did (watched failing without
-    /// [`Event::Resident`]: the replay, starting empty, evicted none of the held bytes the
-    /// recording did).
+    /// recording's own policy then does exactly what the cache did, every program where the cache
+    /// put it. Watched failing twice: without [`Event::Resident`] (the replay, starting empty,
+    /// evicted none of the held bytes the recording did), and with the residents seeded by
+    /// address rather than least recently used first (eviction took other victims: 3 programs
+    /// placed elsewhere). The 1.7B's first two logs failed so too.
     #[test]
     fn a_log_begun_mid_life_replays_as_recorded() {
         let mut c = fragmented_capture(Policy::FirstFit, false);
         c.set_capturing(false);
         c.unprotect_all();
+        c.unpin_all();
+        // Recency against address order: the highest-addressed programs used longest ago, so the
+        // first eviction takes the top slot, not the bottom one.
+        for t in (0..16).step_by(2).rev().chain((100..108).rev()) {
+            let w: Arc<[u32]> = prog(t, 64).into();
+            assert!(matches!(c.place_hashed(&w, hash(&w)), Ok(Placed::Hit(_))));
+        }
         c.unpin_all();
         c.set_log(true);
         // Hits on what was there, a hold of one, and new programs into what is left.
@@ -1425,9 +1450,10 @@ mod tests {
                 r.refused,
                 r.refused_now_placed,
                 r.placed_now_refused,
-                r.unmapped
+                r.unmapped,
+                r.moved
             ),
-            (0, 0, 0, 0)
+            (0, 0, 0, 0, 0)
         );
         assert_eq!(r.held_evicted_bytes, c.stats().held_evicted_bytes);
     }
@@ -1566,6 +1592,7 @@ mod log_probe {
                 sum.recorded_restored_bytes += r.recorded_restored_bytes;
                 sum.held_evicted_bytes += r.held_evicted_bytes;
                 sum.unmapped += r.unmapped;
+                sum.moved += r.moved;
                 if r.tightest_room < sum.tightest_room {
                     sum.tightest_room = r.tightest_room;
                     *tightest_unit = u;
@@ -1596,15 +1623,18 @@ mod log_probe {
         let own = &sums[0].0;
         println!(
             "FirstFit reproduces the recording: {}",
-            own.refused_now_placed == 0 && own.placed_now_refused == 0 && own.unmapped == 0
+            own.refused_now_placed == 0
+                && own.placed_now_refused == 0
+                && own.unmapped == 0
+                && own.moved == 0
         );
         println!(
-            "policy     refused  now-placed  newly-refused  restored-MB  recorded-MB  held-evicted-MB  tightest-room  (unit)  unmapped"
+            "policy     refused  now-placed  newly-refused  restored-MB  recorded-MB  held-evicted-MB  tightest-room  (unit)  unmapped     moved"
         );
         let mb = |b: u64| b as f64 / 1e6;
         for (policy, (sum, tightest_unit)) in POLICIES.iter().zip(sums) {
             println!(
-                "{:<10} {:>7}  {:>10}  {:>13}  {:>11.2}  {:>11.2}  {:>15.2}  {:>13}  ({:>4})  {:>8}",
+                "{:<10} {:>7}  {:>10}  {:>13}  {:>11.2}  {:>11.2}  {:>15.2}  {:>13}  ({:>4})  {:>8}  {:>8}",
                 format!("{policy:?}"),
                 sum.refused,
                 sum.refused_now_placed,
@@ -1614,7 +1644,8 @@ mod log_probe {
                 mb(sum.held_evicted_bytes),
                 sum.tightest_room,
                 tightest_unit,
-                sum.unmapped
+                sum.unmapped,
+                sum.moved
             );
         }
     }
