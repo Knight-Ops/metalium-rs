@@ -1312,49 +1312,58 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
         )
     }
 
-    /// [`Qwen35::pretrained`] in F32, [`Qwen35::prepared`] and [`Qwen35::for_inference`] under
-    /// `numerics` with the weight formats `plan`, done **one layer at a time**: each layer is read
-    /// from `paths`, widened, prepared and stored in its format before the next is read, so the
-    /// card never holds more than one layer in F32 beside the stored ones. The same arithmetic as
-    /// the three steps on the whole model, for a model whose F32 or BF16 form does not fit in GDDR
-    /// (a 27B checkpoint is 54 GB in BF16). The output head and the final norm are loaded first,
-    /// with the embedding table, which the plan keeps BF16 as `for_inference` does.
-    ///
-    /// `paths` are the checkpoint's shards, absolute (the model need not be in `vendor/weights`).
+    /// [`Qwen35::pretrained`] in F32, then [`Qwen35::prepared`] and [`Qwen35::for_inference`]
+    /// under `numerics` and `options`, done **one layer at a time**: a layer is read, widened,
+    /// prepared and stored in its format before the next is read. The whole-model path holds every
+    /// layer in F32 at once (a 27B checkpoint is 54 GB already in BF16), this one holds one beside
+    /// the stored layers; the result is the same, bit for bit (`streamed_load`). `paths` are the
+    /// checkpoint's shards, anywhere on disk.
     pub fn streamed(
         config: &Qwen35Config,
         paths: &[std::path::PathBuf],
         numerics: burn_tt::Numerics,
+        options: crate::quant::WeightOptions,
+        device: &B::Device,
+    ) -> Result<(Self, Loaded), LoadError> {
+        let plan = crate::quant::Plan::for_numerics(numerics, options);
+        Self::streamed_with_plan(config, paths, numerics, options, &plan, device)
+    }
+
+    /// [`Qwen35::streamed`] with the weight formats of `plan` in place of the contract's, e.g. a
+    /// per-layer plan (`layers.0.` rules) that keeps the most sensitive layers wider.
+    pub fn streamed_with_plan(
+        config: &Qwen35Config,
+        paths: &[std::path::PathBuf],
+        numerics: burn_tt::Numerics,
+        options: crate::quant::WeightOptions,
         plan: &crate::quant::Plan,
         device: &B::Device,
     ) -> Result<(Self, Loaded), LoadError> {
-        if let Some(absent) = paths.iter().find(|p| !p.exists()) {
-            return Err(LoadError::NotFetched(absent.clone()));
-        }
         let cfg = *config;
         let mut model = Self::new(config, device);
         let layers = std::mem::take(&mut model.layers);
 
-        // The embedding table, the final norm and the output head.
-        let top_ignore = |name: &str| {
-            name.contains("layers.") || name.contains("visual.") || name.starts_with("mtp.")
-        };
+        // First the embedding table, the final norm and the head; the decoder layers, the vision
+        // tower and the MTP head are skipped here.
         let top = load_safetensors_shards(
             &mut model,
             paths,
             &Layout {
                 remaps: &[(r"^(model\.)?language_model\.", "")],
                 pytorch: true,
-                ignore: &top_ignore,
+                ignore: &|name| {
+                    name.contains("layers.") || name.contains("visual.") || name.starts_with("mtp.")
+                },
             },
         )?;
-        let mut applied = top.applied;
         let mut model = model.map(&mut ToF32);
         model.norm.shift();
         let mut model = crate::quant::apply(model, plan, &crate::quant::Native);
+        let mut applied = top.applied;
 
-        // A layer's own tensors reach the bare module paths; everything else in the files is
-        // another layer's, the vision tower's or the MTP head's.
+        // Then each layer as a module of its own: its prefix is cut so its tensors reach the
+        // layer's paths, and everything else in the files is ignored. The renames match the full
+        // name, so they run before the cut.
         const ROOTS: [&str; 5] = [
             "input_layernorm.",
             "post_attention_layernorm.",
@@ -1362,44 +1371,51 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
             "self_attn.",
             "mlp.",
         ];
-        let layer_ignore = |name: &str| !ROOTS.iter().any(|r| name.starts_with(r));
-        for (i, layer) in layers.into_iter().enumerate() {
+        for (i, mut layer) in layers.into_iter().enumerate() {
             let prefix = format!(r"^(model\.)?language_model\.layers\.{i}\.");
-            let mut layer = layer;
-            let loaded = load_safetensors_shards(
+            applied += load_safetensors_shards(
                 &mut layer,
                 paths,
                 &Layout {
-                    // The renames match the full name, so they come before the prefix is cut.
                     remaps: &[
                         (r"\.linear_attn\.A_log$", ".linear_attn.a_log"),
                         (r"\.linear_attn\.conv1d\.weight$", ".linear_attn.conv1d"),
                         (prefix.as_str(), ""),
                     ],
                     pytorch: true,
-                    ignore: &layer_ignore,
+                    ignore: &|name| !ROOTS.iter().any(|r| name.starts_with(r)),
                 },
-            )?;
-            applied += loaded.applied;
+            )?
+            .applied;
             let mut layer = layer.map(&mut ToF32);
             layer.prepare(&cfg);
-            model
-                .layers
-                .push(crate::quant::apply(layer, plan, &crate::quant::Native));
+            // The plan sees the whole model's names (`layers.{i}.…`), as in `for_inference`.
+            let at = format!("layers.{i}");
+            let layer = crate::quant::apply_at(layer, &at, plan, &crate::quant::Native);
+            model.layers.push(layer);
         }
 
+        // As `for_inference` sets them for a model loaded in F32.
         model.numerics = Some(numerics);
         model.stream = Some(DType::F32);
-        if numerics == burn_tt::Numerics::Performance {
+        if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
             model.kv = Some(DType::BF16);
         }
-        Ok((
-            model,
-            Loaded {
-                applied,
-                ignored: top.ignored,
-            },
-        ))
+        // The first pass lists the layers it skipped; those the layer passes loaded are not ignored.
+        let loaded_later = |name: &str| {
+            let name = name
+                .trim_start_matches("model.")
+                .trim_start_matches("language_model.");
+            name.strip_prefix("layers.")
+                .and_then(|rest| rest.split('.').next()?.parse::<usize>().ok())
+                .is_some_and(|i| i < cfg.layers)
+        };
+        let ignored = top
+            .ignored
+            .into_iter()
+            .filter(|n| !loaded_later(n))
+            .collect();
+        Ok((model, Loaded { applied, ignored }))
     }
 }
 
@@ -1814,6 +1830,45 @@ mod tests {
             .into_data()
             .to_vec::<f32>()
             .unwrap()
+    }
+
+    /// Layer by layer ([`Qwen35::streamed_with_plan`]'s order) a plan with per-layer rules gives
+    /// the whole model's formats: `quant::apply_at` shows each layer its `layers.{i}` path. The
+    /// control applies the layers without it; the per-layer rules then miss and the logits move.
+    #[test]
+    fn a_per_layer_plan_applied_one_layer_at_a_time_is_the_whole_model_s() {
+        use crate::quant::{apply, apply_at, Emulated, Format, Plan};
+        let plan = Plan::new()
+            .rule("layers.1.mlp.", Format::Bfp4)
+            .rule("layers.3.", Format::Bfp2)
+            .rule("", Format::Bfp8);
+        let base = Qwen35::<Flex>::new(&TINY, &FlexDevice).map(&mut ToF32);
+        let per_layer = |at: bool| {
+            let mut model = base.clone();
+            let layers = std::mem::take(&mut model.layers);
+            let mut model = apply(model, &plan, &Emulated);
+            for (i, layer) in layers.into_iter().enumerate() {
+                let path = if at {
+                    format!("layers.{i}")
+                } else {
+                    String::new()
+                };
+                model.layers.push(apply_at(layer, &path, &plan, &Emulated));
+            }
+            model
+        };
+        let prompt = [3, 17, 42, 5, 9];
+        let run = |model: &Qwen35<Flex>| {
+            logits(
+                model,
+                &mut model.state(prompt.len(), DType::F32, &FlexDevice),
+                &prompt,
+            )
+        };
+        let whole = run(&apply(base.clone(), &plan, &Emulated));
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&run(&per_layer(true))), bits(&whole));
+        assert_ne!(bits(&run(&per_layer(false))), bits(&whole), "control");
     }
 
     /// The state a prompt leaves (every DeltaNet's convolution inputs and recurrence, every

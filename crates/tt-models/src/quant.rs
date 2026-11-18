@@ -350,8 +350,24 @@ impl<B: Backend, Q: Quantizer<B>> ModuleMapper<B> for Apply<'_, Q> {
 
 /// `model` with every matrix put into the format `plan` names for it.
 pub fn apply<B: Backend, M: Module<B>>(model: M, plan: &Plan, quantizer: &impl Quantizer<B>) -> M {
-    model.map(&mut Apply {
-        path: Vec::new(),
+    apply_at(model, "", plan, quantizer)
+}
+
+/// [`apply`] for one part of a model, `at` being its path in the whole (`layers.3`). The rules
+/// match the whole model's names, so a rule that names a layer (`layers.0.`) still finds its
+/// tensors when the layers are put into their formats one at a time.
+pub fn apply_at<B: Backend, M: Module<B>>(
+    part: M,
+    at: &str,
+    plan: &Plan,
+    quantizer: &impl Quantizer<B>,
+) -> M {
+    part.map(&mut Apply {
+        path: at
+            .split('.')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
         plan,
         quantizer,
     })
