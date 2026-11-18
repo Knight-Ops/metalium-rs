@@ -4,6 +4,7 @@
 
 pub mod gemma4;
 pub mod generate;
+pub mod host_embed;
 pub mod image_input;
 pub mod kv_cache;
 pub mod llama;

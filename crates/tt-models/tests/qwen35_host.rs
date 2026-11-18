@@ -33,6 +33,7 @@ const CHECKPOINT: Qwen35Config = Qwen35Config {
     head_dim: 256,
     rotary_dim: 64,
     rope_theta: 10000000.0,
+    yarn: None,
     linear_k_heads: 16,
     linear_k_dim: 128,
     linear_v_heads: 32,

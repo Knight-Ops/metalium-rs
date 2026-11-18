@@ -121,7 +121,7 @@ impl Lib {
     /// The path must name a genuine `libttsim.so`. Loading an arbitrary shared
     /// object runs its initializers.
     pub unsafe fn load(path: impl AsRef<OsStr>) -> Result<Self, LoadError> {
-        let library = unsafe { Library::new(path) }.map_err(LoadError::Open)?;
+        let library = unsafe { Library::new(path.as_ref()) }.map_err(LoadError::Open)?;
 
         /// Resolve one symbol, naming it in the error rather than losing it.
         macro_rules! sym {

@@ -94,6 +94,10 @@ pub struct WeightOptions {
     /// (`Llama::for_inference`, `burn_tt::attention_wide`): half the bytes a step attends over and
     /// half the cache's GDDR. The reference contract's cache is F32 either way.
     pub f32_kv_cache: bool,
+    /// The embedding table kept in host memory, mapped from the checkpoint, rather than in GDDR
+    /// (`crate::host_embed`): a step uploads its token's row. For an untied head only, where
+    /// nothing on the card reads the table; the rows are the device lookup's bit for bit.
+    pub host_embedding: bool,
 }
 
 /// The format of each named tensor: the first rule whose pattern is a substring of the name wins,

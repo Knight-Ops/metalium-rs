@@ -354,6 +354,36 @@ pub trait FixedShapeDecoder<B: Backend> {
         cache: &Self::Cache,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>);
 
+    /// The model's embedding table when it is kept on the host ([`crate::host_embed`]): a
+    /// [`TracedGenerator`] then uploads each step's and chunk's rows and calls
+    /// [`Self::step_rows`] and [`Self::chunk_rows`], which a model returning it implements.
+    fn host_embedding(&self) -> Option<&crate::host_embed::HostEmbedding> {
+        None
+    }
+
+    /// [`Self::chunk`] from the chunk's embedded rows (`[1, c, hidden]`, F32).
+    fn chunk_rows(
+        &self,
+        _rows: Tensor<B, 3>,
+        _start: Tensor<B, 1, Int>,
+        _last: Tensor<B, 1, Int>,
+        _len: usize,
+        _cache: &Self::Cache,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        unimplemented!("chunk_rows is for a model with a host_embedding")
+    }
+
+    /// [`Self::step`] from the token's embedded row (`[1, 1, hidden]`, F32).
+    fn step_rows(
+        &self,
+        _row: Tensor<B, 3>,
+        _position: Tensor<B, 1, Int>,
+        _len: usize,
+        _cache: &Self::Cache,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        unimplemented!("step_rows is for a model with a host_embedding")
+    }
+
     /// One token (`[1, 1]`) at `position` (`[1]`, below `len`), attending only to the cache's
     /// first `len` positions: its logits `[1, vocab]` and the new state. A step's cost should
     /// follow `len`, not the cache's length (`FixedCache::step_write_within`); for a position
@@ -689,13 +719,77 @@ fn input<B: TracedBackend, const D: usize>(t: &Tensor<B, D, Int>) -> TtTensor {
     t
 }
 
-/// A chunk's three inputs: its tokens, its first position and its last row.
-fn chunk_inputs(tokens: Vec<u32>, chunk: Chunk) -> Vec<InputPayload> {
+/// A chunk's three inputs: its tokens ([`feed_payload`]), its first position and its last row.
+fn chunk_inputs(tokens: InputPayload, chunk: Chunk) -> Vec<InputPayload> {
     vec![
-        InputPayload::Bits(tokens),
+        tokens,
         InputPayload::Bits(vec![chunk.start as u32]),
         InputPayload::Bits(vec![chunk.n as u32 - 1]),
     ]
+}
+
+/// A step's or chunk's first input: its token ids, or their embedding rows when the model keeps
+/// its table on the host ([`FixedShapeDecoder::host_embedding`]).
+enum Feed<B: Backend> {
+    Ids(Tensor<B, 2, Int>),
+    Rows(Tensor<B, 3>),
+}
+
+impl<B: TracedBackend> Feed<B> {
+    /// `c` placeholder tokens (id 0, or zero rows), as a capture or a warm-up runs them.
+    fn zeros<M: FixedShapeDecoder<B>>(model: &M, c: usize, device: &TtDevice) -> Self {
+        match model.host_embedding() {
+            None => Feed::Ids(ids(&vec![0; c], device)),
+            Some(t) => Feed::Rows(Tensor::zeros([1, c, t.hidden()], (device, DType::F32))),
+        }
+    }
+
+    /// The device tensor a trace reads this input from, resident.
+    fn input(&self) -> TtTensor {
+        match self {
+            Feed::Ids(t) => input(t),
+            Feed::Rows(t) => {
+                let t = float(t.clone());
+                t.ensure_resident();
+                t
+            }
+        }
+    }
+
+    fn step<M: FixedShapeDecoder<B>>(
+        &self,
+        model: &M,
+        position: Tensor<B, 1, Int>,
+        len: usize,
+        cache: &M::Cache,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        match self {
+            Feed::Ids(t) => model.step(t.clone(), position, len, cache),
+            Feed::Rows(r) => model.step_rows(r.clone(), position, len, cache),
+        }
+    }
+
+    fn chunk<M: FixedShapeDecoder<B>>(
+        &self,
+        model: &M,
+        start: Tensor<B, 1, Int>,
+        last: Tensor<B, 1, Int>,
+        len: usize,
+        cache: &M::Cache,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        match self {
+            Feed::Ids(t) => model.chunk(t.clone(), start, last, len, cache),
+            Feed::Rows(r) => model.chunk_rows(r.clone(), start, last, len, cache),
+        }
+    }
+}
+
+/// What a replay writes into a [`Feed`]: the ids, or the host table's rows of them.
+fn feed_payload<B: Backend, M: FixedShapeDecoder<B>>(model: &M, tokens: Vec<u32>) -> InputPayload {
+    match model.host_embedding() {
+        None => InputPayload::Bits(tokens),
+        Some(t) => InputPayload::F32(t.rows(&tokens)),
+    }
 }
 
 fn token(out: Vec<OutputPayload>) -> Result<i32, GenerateError> {
@@ -822,18 +916,14 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             // between calls (a weight transposed once for its product, a zero row) is in place
             // before the captures, which then read it rather than make it.
             for &len in &shapes.steps {
-                let (l, state) = model.step(ids(&[0], device), index(0, device), len, cache);
+                let feed = Feed::<B>::zeros(model, 1, device);
+                let (l, state) = feed.step(model, index(0, device), len, cache);
                 cache.set_state(state);
                 let _ = read(l);
             }
             for (c, len) in shapes.chunk_keys() {
-                let (l, state) = model.chunk(
-                    ids(&vec![0; c], device),
-                    index(0, device),
-                    index(0, device),
-                    len,
-                    cache,
-                );
+                let feed = Feed::<B>::zeros(model, c, device);
+                let (l, state) = feed.chunk(model, index(0, device), index(0, device), len, cache);
                 cache.set_state(state);
                 let _ = read(l);
             }
@@ -864,13 +954,13 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         // program cache beside a model's traces.
         let cache = &caches[0];
         for &len in &shapes.steps {
-            let token = ids::<B>(&[0], device);
+            let token = Feed::<B>::zeros(model, 1, device);
             let position = index::<B>(0, device);
-            let (tp, pp) = (input(&token), input(&position));
+            let (tp, pp) = (token.input(), input(&position));
             // The step may be captured twice (a residency plan, then the plan applied: `burn_tt::
             // set_residency`), each run over the same inputs.
             sets[0].capture(Key::Step(len), &[&tp, &pp], || {
-                let (y, state) = model.step(token.clone(), position.clone(), len, cache);
+                let (y, state) = token.step(model, position.clone(), len, cache);
                 let next = greedy(y.clone());
                 (
                     vec![float(y), B::int_native(next.into_primitive())],
@@ -920,13 +1010,12 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         device: &TtDevice,
     ) -> Result<(), GenerateError> {
         for (c, len) in shapes.chunk_keys() {
-            let tokens = ids::<B>(&vec![0; c], device);
+            let tokens = Feed::<B>::zeros(model, c, device);
             let start = index::<B>(0, device);
             let last = index::<B>(0, device);
-            let (tp, sp, lp) = (input(&tokens), input(&start), input(&last));
+            let (tp, sp, lp) = (tokens.input(), input(&start), input(&last));
             set.capture(Key::Chunk { c, len }, &[&tp, &sp, &lp], || {
-                let (y, state) =
-                    model.chunk(tokens.clone(), start.clone(), last.clone(), len, cache);
+                let (y, state) = tokens.chunk(model, start.clone(), last.clone(), len, cache);
                 let next = greedy(y.clone());
                 (
                     vec![float(y), B::int_native(next.into_primitive())],
@@ -999,7 +1088,9 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 .into_iter()
                 .map(|t| t as u32)
                 .collect();
-            out = Some(trace.run_outputs(chunk_inputs(tokens, chunk), &[0])?);
+            out = Some(
+                trace.run_outputs(chunk_inputs(feed_payload(self.model, tokens), chunk), &[0])?,
+            );
         }
         logits(out.expect("a chunk").outputs)
     }
@@ -1049,9 +1140,13 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 .map(|t| t as u32)
                 .collect();
             if i == last {
-                return self.pick(trace, chunk_inputs(tokens, chunk), u);
+                return self.pick(
+                    trace,
+                    chunk_inputs(feed_payload(self.model, tokens), chunk),
+                    u,
+                );
             }
-            trace.run_outputs(chunk_inputs(tokens, chunk), &[])?;
+            trace.run_outputs(chunk_inputs(feed_payload(self.model, tokens), chunk), &[])?;
         }
         unreachable!("a prompt has a chunk")
     }
@@ -1076,7 +1171,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             .get(Key::Step(len))
             .ok_or_else(|| GenerateError::Refused(format!("no step attending to {len}")))?;
         let fixed = vec![
-            InputPayload::Bits(vec![token_in as u32]),
+            feed_payload(self.model, vec![token_in as u32]),
             InputPayload::Bits(vec![position as u32]),
         ];
         self.pick(trace, fixed, u)
@@ -1133,7 +1228,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             .get(Key::Step(len))
             .ok_or_else(|| GenerateError::Refused(format!("no step attending to {len}")))?;
         let fixed = vec![
-            InputPayload::Bits(vec![token as u32]),
+            feed_payload(self.model, vec![token as u32]),
             InputPayload::Bits(vec![position as u32]),
         ];
         logits(trace.run_outputs(fixed, &[0])?.outputs)

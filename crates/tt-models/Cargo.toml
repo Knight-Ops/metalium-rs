@@ -22,6 +22,11 @@ burn-store.workspace = true
 burn-tt.workspace = true
 # The BFP decoders the device's unpacker is modelled by, for the host reference of a quantised model.
 tt-isa.workspace = true
+# The host-resident embedding table (`host_embed`): the checkpoint mapped, its rows widened in
+# parallel.
+memmap2.workspace = true
+rayon.workspace = true
+safetensors.workspace = true
 
 # Decodes the pinned JPEG test inputs (`cargo xtask fetch-weights` also fetches them). Dev-only
 # like the rest of the crate; the workspace's `image` carries no codecs, so this adds one.

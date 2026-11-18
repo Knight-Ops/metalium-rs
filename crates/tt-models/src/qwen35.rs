@@ -41,10 +41,11 @@ use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Bool, DType, Distribution, Int, Tensor, TensorData};
 
 use crate::generate::{eager, EagerDecoder, FixedShapeCache, FixedShapeDecoder, Generation};
+use crate::host_embed::HostEmbedding;
 use crate::kv_cache::{CacheLayout, FixedCache, FixedWrite};
 use crate::llama::{project, repeat_kv, Precision};
 use crate::load::{load_safetensors_shards, weights_files, Layout, LoadError, Loaded};
-use crate::rope::Rope;
+use crate::rope::{Rope, Yarn};
 
 /// The shape of a Qwen3.5 text model.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,6 +59,9 @@ pub struct Qwen35Config {
     pub head_dim: usize,
     pub rotary_dim: usize,
     pub rope_theta: f64,
+    /// YaRN context extension of the rotation, `None` for the trained context
+    /// (`rope_parameters.rope_type: "yarn"`).
+    pub yarn: Option<Yarn>,
     /// Gated DeltaNet: key heads and their width, value heads and theirs, and the convolution's
     /// width in tokens.
     pub linear_k_heads: usize,
@@ -89,6 +93,7 @@ pub const QWEN3_5_4B: Qwen35Config = Qwen35Config {
     head_dim: 256,
     rotary_dim: 64,
     rope_theta: 10_000_000.0,
+    yarn: None,
     linear_k_heads: 16,
     linear_k_dim: 128,
     linear_v_heads: 32,
@@ -118,6 +123,36 @@ impl Qwen35Config {
     /// The same architecture with its first `layers` layers.
     pub fn with_layers(self, layers: usize) -> Self {
         Self { layers, ..self }
+    }
+
+    /// The same architecture with its rotation extended by YaRN.
+    pub fn with_yarn(self, yarn: Yarn) -> Self {
+        Self {
+            yarn: Some(yarn),
+            ..self
+        }
+    }
+
+    /// The rotary tables of positions `start..start + t`: the plain rotation, or YaRN's
+    /// frequencies with its attention factor on both tables.
+    fn rope<B: Backend>(
+        &self,
+        start: usize,
+        t: usize,
+        dtype: DType,
+        device: &B::Device,
+    ) -> Rope<B> {
+        match self.yarn {
+            None => Rope::new(start, t, self.rotary_dim, self.rope_theta, dtype, device),
+            Some(y) => Rope::scaled(
+                start,
+                t,
+                &y.frequencies(self.rotary_dim, self.rope_theta),
+                y.attention_factor(),
+                dtype,
+                device,
+            ),
+        }
     }
 
     /// Whether layer `index` is full attention (else a Gated DeltaNet).
@@ -1001,6 +1036,16 @@ pub struct Qwen35<B: Backend> {
     /// The full-attention layers' KV cache dtype where it is not the stream's: BF16 under the
     /// performance contract ([`Qwen35::for_inference`], as `Llama`'s). Not a parameter.
     kv: Option<DType>,
+    /// The embedding table in host memory ([`crate::quant::WeightOptions::host_embedding`]):
+    /// `embed_tokens` is then a one-row placeholder. Not a parameter.
+    host: Option<std::sync::Arc<HostEmbedding>>,
+}
+
+/// Whether a checkpoint name is the text model's embedding table.
+pub fn is_embed_table(name: &str) -> bool {
+    name.trim_start_matches("model.")
+        .trim_start_matches("language_model.")
+        == "embed_tokens.weight"
 }
 
 /// Widens every float parameter to F32.
@@ -1033,11 +1078,38 @@ impl<B: Backend> Qwen35<B> {
             numerics: None,
             stream: None,
             kv: None,
+            host: None,
         }
     }
 
     pub fn config(&self) -> &Qwen35Config {
         &self.config
+    }
+
+    /// The model with its embedding table in host memory: `table` (the device table's values)
+    /// replaces it, and GDDR keeps a one-row placeholder. Refused for a tied head, whose
+    /// product reads the table on the card.
+    pub fn with_host_embedding(mut self, table: HostEmbedding) -> Result<Self, LoadError> {
+        let cfg = &self.config;
+        if cfg.tied_head {
+            return Err(LoadError::Mismatch(vec![
+                "host embedding: the head is the table, so the table stays on the card".into(),
+            ]));
+        }
+        if (table.vocab(), table.hidden()) != (cfg.vocab, cfg.hidden) {
+            return Err(LoadError::Mismatch(vec![format!(
+                "host embedding: a table of {}x{} for a model of {}x{}",
+                table.vocab(),
+                table.hidden(),
+                cfg.vocab,
+                cfg.hidden
+            )]));
+        }
+        // The final norm's device: reading the table's would initialise a lazy table first.
+        let device = self.norm.weight.val().device();
+        self.embed_tokens = EmbeddingConfig::new(1, cfg.hidden).init(&device);
+        self.host = Some(std::sync::Arc::new(table));
+        Ok(self)
     }
 
     /// The embedding table, `[vocab, hidden]` (also the output head when it is tied).
@@ -1150,8 +1222,31 @@ impl<B: Backend> Qwen35<B> {
 
     /// The embedding rows of `tokens` `[1, t]`, as `[1, t, hidden]`, in the stream's dtype: a BF16
     /// table's rows widened (exactly) to an F32 stream ([`Qwen35::for_inference`]).
+    /// With the table on the host the ids are read back first (eager use only: a traced step
+    /// takes the rows as its input, [`FixedShapeDecoder::step_rows`]).
     pub fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let rows = self.embed_tokens.forward(tokens);
+        let rows = match &self.host {
+            None => self.embed_tokens.forward(tokens),
+            Some(table) => {
+                let device = tokens.device();
+                let ids: Vec<u32> = tokens
+                    .into_data()
+                    .convert::<i64>()
+                    .iter::<i64>()
+                    .map(|t| t as u32)
+                    .collect();
+                let t = ids.len();
+                Tensor::from_data(
+                    TensorData::new(table.rows(&ids), [1, t, table.hidden()]),
+                    &device,
+                )
+            }
+        };
+        self.in_stream(rows)
+    }
+
+    /// `rows` in the stream's dtype (an exact widening from a BF16 table's).
+    fn in_stream(&self, rows: Tensor<B, 3>) -> Tensor<B, 3> {
         match self.stream {
             Some(stream) if rows.dtype() != stream => rows.cast(stream),
             _ => rows,
@@ -1216,7 +1311,7 @@ impl<B: Backend> Qwen35<B> {
             x = x.cast(dtype);
         }
         let cfg = &self.config;
-        let rope = Rope::new(start, t, cfg.rotary_dim, cfg.rope_theta, dtype, &x.device());
+        let rope = cfg.rope(start, t, dtype, &x.device());
         for (layer, s) in self.layers.iter().zip(state.layers.iter_mut()) {
             x = layer.forward(cfg, x, &rope, start, s);
         }
@@ -1342,6 +1437,12 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
         let cfg = *config;
         let mut model = Self::new(config, device);
         let layers = std::mem::take(&mut model.layers);
+        let host = options.host_embedding;
+        if host {
+            // Before the first pass, so the device table is never loaded.
+            model =
+                model.with_host_embedding(HostEmbedding::from_shards(paths, &is_embed_table)?)?;
+        }
 
         // First the embedding table, the final norm and the head; the decoder layers, the vision
         // tower and the MTP head are skipped here.
@@ -1352,7 +1453,10 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
                 remaps: &[(r"^(model\.)?language_model\.", "")],
                 pytorch: true,
                 ignore: &|name| {
-                    name.contains("layers.") || name.contains("visual.") || name.starts_with("mtp.")
+                    name.contains("layers.")
+                        || name.contains("visual.")
+                        || name.starts_with("mtp.")
+                        || (host && is_embed_table(name))
                 },
             },
         )?;
@@ -1413,7 +1517,7 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
         let ignored = top
             .ignored
             .into_iter()
-            .filter(|n| !loaded_later(n))
+            .filter(|n| !loaded_later(n) && !(host && is_embed_table(n)))
             .collect();
         Ok((model, Loaded { applied, ignored }))
     }
@@ -1580,7 +1684,7 @@ impl<B: Backend> Qwen35<B> {
         HybridCache {
             kv,
             recurrent,
-            rope: Rope::table(max_len, cfg.rotary_dim, cfg.rope_theta, dtype, device),
+            rope: cfg.rope(0, max_len, dtype, device),
             positions: Tensor::arange(0..max_len as i64, device),
             max_len,
         }
@@ -1751,6 +1855,42 @@ impl<B: Backend> FixedShapeDecoder<B> for Qwen35<B> {
         let x = self.embed(token);
         self.fixed(x, At::Step(position), len, cache)
     }
+
+    fn host_embedding(&self) -> Option<&HostEmbedding> {
+        self.host.as_deref()
+    }
+
+    fn chunk_rows(
+        &self,
+        rows: Tensor<B, 3>,
+        start: Tensor<B, 1, Int>,
+        last: Tensor<B, 1, Int>,
+        len: usize,
+        cache: &HybridCache<B>,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        let x = self.in_stream(rows);
+        self.fixed(
+            x,
+            At::Chunk {
+                start,
+                last,
+                mask: true,
+            },
+            len,
+            cache,
+        )
+    }
+
+    fn step_rows(
+        &self,
+        row: Tensor<B, 3>,
+        position: Tensor<B, 1, Int>,
+        len: usize,
+        cache: &HybridCache<B>,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 4>>) {
+        let x = self.in_stream(row);
+        self.fixed(x, At::Step(position), len, cache)
+    }
 }
 
 /// A [`Qwen35`] whose chunks run their padding rows through the DeltaNets' recurrence and
@@ -1811,6 +1951,7 @@ mod tests {
         head_dim: 8,
         rotary_dim: 4,
         rope_theta: 10_000.0,
+        yarn: None,
         linear_k_heads: 2,
         linear_k_dim: 8,
         linear_v_heads: 4,
@@ -1962,6 +2103,87 @@ mod tests {
                 assert!(prefill < 1e-4 && decode > 1e-3, "{prefill} {decode}");
             }
         }
+    }
+
+    /// With YaRN the traced path's rotary table (`HybridCache`) and the growing state's
+    /// (`Qwen35::hidden`) are the same tables: the fixed cache steps as the growing state does,
+    /// and the logits are not the plain rotation's (the extension reaches the attention).
+    #[test]
+    fn yarn_reaches_both_paths_alike() {
+        use crate::generate::{generate_fixed, Shapes};
+        // Initialised before the clone (a lazy parameter's clone would draw its own values).
+        let plain = Qwen35::<Flex>::new(&TINY, &FlexDevice).map(&mut ToF32);
+        let mut yarn = plain.clone();
+        yarn.config = TINY.with_yarn(Yarn::new(4.0, 8));
+        let prompt = [3, 17, 40, 9, 22];
+        let growing = yarn.generate(&prompt, 4, Precision::F32, &FlexDevice);
+        let fixed =
+            generate_fixed(&yarn, &prompt, 4, &Shapes::new(16, &[4, 8]), &FlexDevice).unwrap();
+        let w = worst(&growing.logits, &fixed.logits);
+        assert!(w < 1e-4, "{w}");
+        assert_eq!(growing.tokens, fixed.tokens);
+        let unscaled = plain.generate(&prompt, 4, Precision::F32, &FlexDevice);
+        let d = worst(&growing.logits, &unscaled.logits);
+        assert!(d > 1e-3, "YaRN left the logits as they were: {d}");
+    }
+
+    /// A model whose table is on the host gives the device lookup's logits bit for bit, a chunk
+    /// and a step after it (`chunk_rows`, `step_rows` against `chunk`, `step`).
+    #[test]
+    fn host_rows_are_the_device_lookups() {
+        let cfg = Qwen35Config {
+            tied_head: false,
+            ..TINY
+        };
+        // Initialised before the clone (a lazy parameter's clone would draw its own values).
+        let model = Qwen35::<Flex>::new(&cfg, &FlexDevice).map(&mut ToF32);
+        let table = model.embed_table();
+        let values = table.into_data().to_vec::<f32>().unwrap();
+        let dir = std::env::temp_dir().join(format!("qwen35-host-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("embed.safetensors");
+        crate::host_embed::write_table(
+            &path,
+            "embed_tokens.weight",
+            &values,
+            cfg.vocab,
+            cfg.hidden,
+        )
+        .unwrap();
+        let host = model
+            .clone()
+            .with_host_embedding(HostEmbedding::from_shards(&[path], &is_embed_table).unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let int = |v: i32| Tensor::<Flex, 1, Int>::from_data([v], &FlexDevice);
+        let prompt = [5, 60, 2, 33];
+        let rows = |ids: &[u32]| {
+            let t = host.host.as_ref().unwrap();
+            Tensor::<Flex, 3>::from_data(
+                TensorData::new(t.rows(ids), [1, ids.len(), cfg.hidden]),
+                &FlexDevice,
+            )
+        };
+        let values = |t: Tensor<Flex, 2>| t.into_data().to_vec::<f32>().unwrap();
+        let mut a = model.new_cache(16, &FlexDevice);
+        let mut b = host.new_cache(16, &FlexDevice);
+        let (la, sa) = model.chunk(super::ids(&prompt, &FlexDevice), int(0), int(3), 8, &a);
+        let ids: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+        let (lb, sb) = host.chunk_rows(rows(&ids), int(0), int(3), 8, &b);
+        assert_eq!(values(la), values(lb), "chunk");
+        a.set_state(sa);
+        b.set_state(sb);
+        let (la, _) = model.step(super::ids(&[17], &FlexDevice), int(4), 8, &a);
+        let (lb, _) = host.step_rows(rows(&[17]), int(4), 8, &b);
+        assert_eq!(values(la), values(lb), "step");
+        // The eager path reads the ids back and looks them up on the host.
+        let x = model.embed(super::ids(&prompt, &FlexDevice));
+        let y = host.embed(super::ids(&prompt, &FlexDevice));
+        assert_eq!(
+            x.into_data().to_vec::<f32>().unwrap(),
+            y.into_data().to_vec::<f32>().unwrap()
+        );
     }
 
     /// A chunk from position 0 starts from zeros whatever the cache held: a prompt fed after
