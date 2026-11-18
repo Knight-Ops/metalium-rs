@@ -45,8 +45,185 @@ pub struct CacheStats {
     pub misses: u64,
     pub bytes_uploaded: u64,
     pub evictions: u64,
+    /// Evictions of programs some trace held: each costs that trace a restore at its next replay.
+    pub held_evictions: u64,
+    /// Their bytes.
+    pub held_evicted_bytes: u64,
     /// Programs too large to admit.
     pub bypassed: u64,
+}
+
+/// Where a placement puts a program that is not resident ([`ProgramCache::set_policy`]).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum Policy {
+    /// The lowest free range that fits.
+    #[default]
+    FirstFit,
+    /// The smallest free range that fits (the lowest of equals).
+    BestFit,
+    /// First fit, but a capture's programs take the highest free range that fits, at its top.
+    TopDown,
+    /// First fit, but a capture's programs are packed below the region's end or below a program
+    /// the capture protects, in the window that evicts the fewest held bytes (the highest of
+    /// equals), so that what a capture protects stays in few runs.
+    Packed,
+}
+
+/// What a placement or a restore did, as an [`Event`] records it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Outcome {
+    Hit(u64),
+    Upload(u64),
+    Bypass,
+    Full,
+}
+
+impl Outcome {
+    fn of(r: &Result<Placed, CacheError>) -> Self {
+        match r {
+            Ok(Placed::Hit(at)) => Outcome::Hit(*at),
+            Ok(Placed::Upload(at)) => Outcome::Upload(*at),
+            Ok(Placed::Bypass) => Outcome::Bypass,
+            Err(CacheError::Full { .. }) => Outcome::Full,
+        }
+    }
+
+    fn at(self) -> Option<u64> {
+        match self {
+            Outcome::Hit(at) | Outcome::Upload(at) => Some(at),
+            Outcome::Bypass | Outcome::Full => None,
+        }
+    }
+}
+
+/// One call a cache took, recorded while [`ProgramCache::set_log`] is on: the input [`replay`]
+/// runs again under another [`Policy`]. Programs are named by their [`hash`] and word count.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Event {
+    Place {
+        hash: u64,
+        words: u32,
+        held_too: bool,
+        capturing: bool,
+        result: Outcome,
+    },
+    Restore {
+        hash: u64,
+        words: u32,
+        at: u64,
+        evict: bool,
+        result: Outcome,
+    },
+    Hold {
+        hash: u64,
+        at: u64,
+    },
+    Release {
+        hash: u64,
+        at: u64,
+    },
+    Protect {
+        hash: u64,
+        at: u64,
+    },
+    UnprotectAll,
+    UnpinAll,
+    ClearUnheld,
+    Clear,
+}
+
+impl Event {
+    /// One line of tab-separated fields: the kind, then its fields in order ([`Event::parse`]).
+    pub fn line(&self) -> String {
+        let o = |r: &Outcome| match r {
+            Outcome::Hit(at) => format!("hit\t{at}"),
+            Outcome::Upload(at) => format!("upload\t{at}"),
+            Outcome::Bypass => "bypass\t0".into(),
+            Outcome::Full => "full\t0".into(),
+        };
+        match self {
+            Event::Place {
+                hash,
+                words,
+                held_too,
+                capturing,
+                result,
+            } => format!(
+                "place\t{hash}\t{words}\t{}\t{}\t{}",
+                *held_too as u8,
+                *capturing as u8,
+                o(result)
+            ),
+            Event::Restore {
+                hash,
+                words,
+                at,
+                evict,
+                result,
+            } => format!(
+                "restore\t{hash}\t{words}\t{at}\t{}\t{}",
+                *evict as u8,
+                o(result)
+            ),
+            Event::Hold { hash, at } => format!("hold\t{hash}\t{at}"),
+            Event::Release { hash, at } => format!("release\t{hash}\t{at}"),
+            Event::Protect { hash, at } => format!("protect\t{hash}\t{at}"),
+            Event::UnprotectAll => "unprotect_all".into(),
+            Event::UnpinAll => "unpin_all".into(),
+            Event::ClearUnheld => "clear_unheld".into(),
+            Event::Clear => "clear".into(),
+        }
+    }
+
+    /// The event [`Event::line`] wrote, if `line` is one.
+    pub fn parse(line: &str) -> Option<Event> {
+        let f: Vec<&str> = line.split('\t').collect();
+        let n = |i: usize| f.get(i)?.parse::<u64>().ok();
+        let b = |i: usize| Some(n(i)? != 0);
+        let o = |i: usize| {
+            let at = n(i + 1)?;
+            Some(match *f.get(i)? {
+                "hit" => Outcome::Hit(at),
+                "upload" => Outcome::Upload(at),
+                "bypass" => Outcome::Bypass,
+                "full" => Outcome::Full,
+                _ => return None,
+            })
+        };
+        Some(match *f.first()? {
+            "place" => Event::Place {
+                hash: n(1)?,
+                words: n(2)? as u32,
+                held_too: b(3)?,
+                capturing: b(4)?,
+                result: o(5)?,
+            },
+            "restore" => Event::Restore {
+                hash: n(1)?,
+                words: n(2)? as u32,
+                at: n(3)?,
+                evict: b(4)?,
+                result: o(5)?,
+            },
+            "hold" => Event::Hold {
+                hash: n(1)?,
+                at: n(2)?,
+            },
+            "release" => Event::Release {
+                hash: n(1)?,
+                at: n(2)?,
+            },
+            "protect" => Event::Protect {
+                hash: n(1)?,
+                at: n(2)?,
+            },
+            "unprotect_all" => Event::UnprotectAll,
+            "unpin_all" => Event::UnpinAll,
+            "clear_unheld" => Event::ClearUnheld,
+            "clear" => Event::Clear,
+            _ => return None,
+        })
+    }
 }
 
 /// Where a program is, and whether the caller must write it there.
@@ -95,6 +272,11 @@ pub struct ProgramCache {
     /// Moved on whenever a program may have left or lost its holds (an eviction, a
     /// release, a clear): a trace restored at the same count needs no restoring.
     changes: u64,
+    policy: Policy,
+    /// A capture is in progress: its placements follow the [`Policy`]'s capture rule.
+    capturing: bool,
+    /// Every call, while logging ([`ProgramCache::set_log`]).
+    log: Option<Vec<Event>>,
 }
 
 /// Is a role program of `words` words cached on a tile, rather than run from
@@ -129,7 +311,48 @@ impl ProgramCache {
             stats: CacheStats::default(),
             clears: 0,
             changes: 0,
+            policy: Policy::FirstFit,
+            capturing: false,
+            log: None,
         }
+    }
+
+    /// Where programs that are not resident are placed from now on.
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
+
+    pub fn policy(&self) -> Policy {
+        self.policy
+    }
+
+    /// Whether the placements from now on are a capture's ([`Policy`]).
+    pub fn set_capturing(&mut self, capturing: bool) {
+        self.capturing = capturing;
+    }
+
+    /// Record every call from now on ([`Event`]), or stop and drop what was recorded.
+    pub fn set_log(&mut self, on: bool) {
+        self.log = on.then(|| self.log.take().unwrap_or_default());
+    }
+
+    /// What was recorded since the last take, emptied (logging stays as it was).
+    pub fn take_log(&mut self) -> Vec<Event> {
+        self.log.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    fn note(&mut self, event: impl FnOnce(&Self) -> Event) {
+        if let Some(mut log) = self.log.take() {
+            log.push(event(self));
+            self.log = Some(log);
+        }
+    }
+
+    fn hash_at(&self, at: u64) -> u64 {
+        self.resident
+            .iter()
+            .find(|r| r.at == at)
+            .map_or(0, |r| r.hash)
     }
 
     /// Will a program of `words` words be cached rather than bypassed?
@@ -164,6 +387,23 @@ impl ProgramCache {
         h: u64,
         held_too: bool,
     ) -> Result<Placed, CacheError> {
+        let r = self.place_inner(words, h, held_too);
+        self.note(|c| Event::Place {
+            hash: h,
+            words: words.len() as u32,
+            held_too,
+            capturing: c.capturing,
+            result: Outcome::of(&r),
+        });
+        r
+    }
+
+    fn place_inner(
+        &mut self,
+        words: &Arc<[u32]>,
+        h: u64,
+        held_too: bool,
+    ) -> Result<Placed, CacheError> {
         if !self.admits(words.len()) {
             self.stats.bypassed += 1;
             return Ok(Placed::Bypass);
@@ -182,26 +422,16 @@ impl ProgramCache {
             return Ok(Placed::Hit(r.at));
         }
         let bytes = (words.len() as u64 * 4).next_multiple_of(ALIGN);
-        let at = loop {
-            if let Some((&at, _)) = self.free.iter().find(|(_, &len)| len >= bytes) {
-                break at;
-            }
-            // Evict the least recently used program nothing in flight names and the
-            // capture in progress does not hold, those no trace holds first.
-            let victim = self
-                .resident
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| !r.pinned && !r.protected && (r.held == 0 || held_too))
-                .min_by_key(|(_, r)| (r.held > 0, r.last_use))
-                .map(|(i, _)| i)
-                .ok_or(CacheError::Full { bytes })?;
-            self.evict(victim);
+        let packed = (self.policy == Policy::Packed && self.capturing)
+            .then(|| self.packed_window(bytes, held_too))
+            .flatten();
+        let at = if let Some(at) = packed {
+            self.evict_across(at, bytes);
+            at
+        } else {
+            self.free_run(bytes, held_too)?
         };
-        let len = self.free.remove(&at).expect("found above");
-        if len > bytes {
-            self.free.insert(at + bytes, len - bytes);
-        }
+        self.carve(at, bytes);
         self.resident.push(Resident {
             words: words.clone(),
             hash: h,
@@ -218,6 +448,100 @@ impl ProgramCache {
         self.stats.misses += 1;
         self.stats.bytes_uploaded += words.len() as u64 * 4;
         Ok(Placed::Upload(at))
+    }
+
+    /// A free run of `bytes` chosen by the policy, after evicting the least recently used programs
+    /// nothing in flight names and the capture in progress does not hold (those no trace holds
+    /// first) until one fits.
+    fn free_run(&mut self, bytes: u64, held_too: bool) -> Result<u64, CacheError> {
+        loop {
+            if let Some(at) = self.choose_free(bytes) {
+                return Ok(at);
+            }
+            let victim = self
+                .resident
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.pinned && !r.protected && (r.held == 0 || held_too))
+                .min_by_key(|(_, r)| (r.held > 0, r.last_use))
+                .map(|(i, _)| i)
+                .ok_or(CacheError::Full { bytes })?;
+            self.evict(victim);
+        }
+    }
+
+    /// Where in the free ranges the policy puts `bytes`, if any range fits.
+    fn choose_free(&self, bytes: u64) -> Option<u64> {
+        let mut fits = self.free.iter().filter(|(_, &len)| len >= bytes);
+        match (self.policy, self.capturing) {
+            (Policy::BestFit, _) => fits.min_by_key(|(&at, &len)| (len, at)).map(|(&at, _)| at),
+            (Policy::TopDown, true) => fits
+                .max_by_key(|(&at, _)| at)
+                .map(|(&at, &len)| at + len - bytes),
+            _ => fits.next().map(|(&at, _)| at),
+        }
+    }
+
+    /// [`Policy::Packed`]'s window for `bytes`: ending at the region's end or where a protected
+    /// program starts, across nothing pinned or protected (nor held, but with `held_too`), the
+    /// one that evicts the fewest held bytes, the highest of equals.
+    fn packed_window(&self, bytes: u64, held_too: bool) -> Option<u64> {
+        let base = self.region.base.next_multiple_of(ALIGN);
+        let size = |r: &Resident| (r.words.len() as u64 * 4).next_multiple_of(ALIGN);
+        std::iter::once(self.region.end)
+            .chain(self.resident.iter().filter(|r| r.protected).map(|r| r.at))
+            .filter(|&end| end >= base + bytes)
+            .filter_map(|end| {
+                let at = end - bytes;
+                let mut held = 0;
+                for r in &self.resident {
+                    if r.at < end && at < r.at + size(r) {
+                        if r.pinned || r.protected || (r.held > 0 && !held_too) {
+                            return None;
+                        }
+                        if r.held > 0 {
+                            held += size(r);
+                        }
+                    }
+                }
+                Some((held, std::cmp::Reverse(end), at))
+            })
+            .min()
+            .map(|(_, _, at)| at)
+    }
+
+    /// Evict every resident across `[at, at + bytes)`.
+    fn evict_across(&mut self, at: u64, bytes: u64) {
+        let across = |r: &Resident| {
+            let len = (r.words.len() as u64 * 4).next_multiple_of(ALIGN);
+            r.at < at + bytes && at < r.at + len
+        };
+        // Highest index first: each eviction moves the last resident into its index, which is
+        // then never one still to evict.
+        let mut evicted: Vec<usize> = (0..self.resident.len())
+            .filter(|&i| across(&self.resident[i]))
+            .collect();
+        evicted.sort_unstable_by(|a, b| b.cmp(a));
+        for i in evicted {
+            self.evict(i);
+        }
+    }
+
+    /// Take `[at, at + bytes)` out of the free range that holds it.
+    fn carve(&mut self, at: u64, bytes: u64) {
+        let (&start, &len) = self
+            .free
+            .range(..=at)
+            .next_back()
+            .filter(|(&s, &l)| s + l >= at + bytes)
+            .expect("the bytes are free");
+        self.free.remove(&start);
+        if at > start {
+            self.free.insert(start, at - start);
+        }
+        if start + len > at + bytes {
+            self.free.insert(at + bytes, start + len - at - bytes);
+        }
     }
 
     /// Evict resident `i`. The last resident takes its index, and the hash index is mended for
@@ -243,6 +567,10 @@ impl ProgramCache {
         let bytes = (r.words.len() as u64 * 4).next_multiple_of(ALIGN);
         release(&mut self.free, r.at, bytes);
         self.stats.evictions += 1;
+        if r.held > 0 {
+            self.stats.held_evictions += 1;
+            self.stats.held_evicted_bytes += bytes;
+        }
         self.changes += 1;
     }
 
@@ -250,6 +578,10 @@ impl ProgramCache {
     /// placed after it, until [`ProgramCache::release`]. Returns whether one
     /// is there.
     pub fn hold(&mut self, at: u64) -> bool {
+        self.note(|c| Event::Hold {
+            hash: c.hash_at(at),
+            at,
+        });
         match self.resident.iter_mut().find(|r| r.at == at) {
             Some(r) => {
                 r.held += 1;
@@ -275,6 +607,10 @@ impl ProgramCache {
 
     /// One trace no longer names the program at `at`.
     pub fn release(&mut self, at: u64) {
+        self.note(|c| Event::Release {
+            hash: c.hash_at(at),
+            at,
+        });
         if let Some(r) = self.resident.iter_mut().find(|r| r.at == at) {
             r.held = r.held.saturating_sub(1);
             self.changes += 1;
@@ -290,6 +626,10 @@ impl ProgramCache {
     /// The capture in progress holds the program at `at`: it stays until
     /// [`ProgramCache::unprotect_all`].
     pub fn protect(&mut self, at: u64) {
+        self.note(|c| Event::Protect {
+            hash: c.hash_at(at),
+            at,
+        });
         if let Some(r) = self.resident.iter_mut().find(|r| r.at == at) {
             r.protected = true;
         }
@@ -297,6 +637,7 @@ impl ProgramCache {
 
     /// The capture ended: its programs are held as any trace's are.
     pub fn unprotect_all(&mut self) {
+        self.note(|_| Event::UnprotectAll);
         for r in &mut self.resident {
             r.protected = false;
         }
@@ -316,6 +657,24 @@ impl ProgramCache {
     /// [`CacheError::Full`] if a pinned or protected program lies across them, or any does and
     /// not `evict` (a queued replay may run it: the caller drains first).
     pub fn restore(
+        &mut self,
+        words: &Arc<[u32]>,
+        h: u64,
+        at: u64,
+        evict: bool,
+    ) -> Result<Placed, CacheError> {
+        let r = self.restore_inner(words, h, at, evict);
+        self.note(|_| Event::Restore {
+            hash: h,
+            words: words.len() as u32,
+            at,
+            evict,
+            result: Outcome::of(&r),
+        });
+        r
+    }
+
+    fn restore_inner(
         &mut self,
         words: &Arc<[u32]>,
         h: u64,
@@ -353,29 +712,9 @@ impl ProgramCache {
         {
             return Err(CacheError::Full { bytes });
         }
-        // Highest index first: each eviction moves the last resident into its index, which is
-        // then never one still to evict.
-        let mut evicted: Vec<usize> = (0..self.resident.len())
-            .filter(|&i| across(&self.resident[i]))
-            .collect();
-        evicted.sort_unstable_by(|a, b| b.cmp(a));
-        for i in evicted {
-            self.evict(i);
-        }
-        // Every byte across it is free now, in one coalesced range.
-        let (&start, &len) = self
-            .free
-            .range(..=at)
-            .next_back()
-            .filter(|(&s, &l)| s + l >= at + bytes)
-            .expect("the evicted bytes are free");
-        self.free.remove(&start);
-        if at > start {
-            self.free.insert(start, at - start);
-        }
-        if start + len > at + bytes {
-            self.free.insert(at + bytes, start + len - at - bytes);
-        }
+        // Every byte across it is free then, in one coalesced range.
+        self.evict_across(at, bytes);
+        self.carve(at, bytes);
         self.resident.push(Resident {
             words: words.clone(),
             hash: h,
@@ -396,6 +735,7 @@ impl ProgramCache {
 
     /// Nothing in flight names any program any more.
     pub fn unpin_all(&mut self) {
+        self.note(|_| Event::UnpinAll);
         for r in &mut self.resident {
             r.pinned = false;
         }
@@ -404,6 +744,7 @@ impl ProgramCache {
     /// Evict everything no trace holds: room made at once, as
     /// [`ProgramCache::clear`] would, but for the programs a trace names.
     pub fn clear_unheld(&mut self) {
+        self.note(|_| Event::ClearUnheld);
         while let Some(i) = self.resident.iter().position(|r| r.held == 0) {
             self.evict(i);
         }
@@ -412,11 +753,16 @@ impl ProgramCache {
     /// Forget everything: the tile was reset, and what is in its L1 is no
     /// longer the host's to vouch for.
     pub fn clear(&mut self) {
+        self.note(|_| Event::Clear);
         let (stats, clears, changes) = (self.stats, self.clears + 1, self.changes + 1);
+        let (policy, capturing, log) = (self.policy, self.capturing, self.log.take());
         *self = ProgramCache::new(self.region);
         self.stats = stats;
         self.clears = clears;
         self.changes = changes;
+        self.policy = policy;
+        self.capturing = capturing;
+        self.log = log;
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -501,6 +847,126 @@ fn release(free: &mut BTreeMap<u64, u64>, at: u64, len: u64) {
         len += nlen;
     }
     free.insert(at, len);
+}
+
+/// What a [`replay`] of a cache's [`Event`]s did under another policy, beside what the recorded
+/// cache did.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct Replayed {
+    /// Placements the recorded cache refused (`Full`), and of them those the replay placed.
+    pub refused: u64,
+    pub refused_now_placed: u64,
+    /// Placements the recorded cache made that the replay refused.
+    pub placed_now_refused: u64,
+    /// Bytes replays put back ([`ProgramCache::restore`] uploads): what the policy costs the
+    /// traces at replay. Then the recorded cache's.
+    pub restored_bytes: u64,
+    pub recorded_restored_bytes: u64,
+    /// Bytes of held programs evicted.
+    pub held_evicted_bytes: u64,
+    /// The largest run protected programs leave, smallest over the log ([`ProgramCache::room`],
+    /// taken at each protect).
+    pub tightest_room: u64,
+    /// Holds, protects, releases and restores of a program the replay never placed.
+    pub unmapped: u64,
+}
+
+/// Run `events` (one unit's, recorded with [`ProgramCache::set_log`]) again on an empty cache
+/// over `region` under `policy`. Addresses differ from the recording's, so each is mapped by the
+/// address and program the recording placed: the bound on a placement policy before it is built.
+pub fn replay(region: Region, events: &[Event], policy: Policy) -> Replayed {
+    let mut c = ProgramCache::new(region);
+    c.set_policy(policy);
+    let mut map: HashMap<(u64, u64), u64> = HashMap::new();
+    let mut out = Replayed {
+        tightest_room: region.len(),
+        ..Replayed::default()
+    };
+    let words = |hash: u64, n: u32| -> Arc<[u32]> {
+        let mut w = vec![0u32; n as usize];
+        if let Some(first) = w.first_mut() {
+            *first = hash as u32;
+        }
+        if n > 1 {
+            w[1] = (hash >> 32) as u32;
+        }
+        w.into()
+    };
+    let at_of = |map: &HashMap<(u64, u64), u64>, out: &mut Replayed, hash: u64, at: u64| {
+        let found = map.get(&(at, hash)).copied();
+        if found.is_none() {
+            out.unmapped += 1;
+        }
+        found
+    };
+    for e in events {
+        match *e {
+            Event::Place {
+                hash,
+                words: n,
+                held_too,
+                capturing,
+                result,
+            } => {
+                c.set_capturing(capturing);
+                let r = c.place_hashed_evicting(&words(hash, n), hash, held_too);
+                let now = Outcome::of(&r);
+                match (result, now.at()) {
+                    (Outcome::Full, Some(_)) => {
+                        out.refused += 1;
+                        out.refused_now_placed += 1;
+                    }
+                    (Outcome::Full, None) => out.refused += 1,
+                    (recorded, None) if recorded.at().is_some() => out.placed_now_refused += 1,
+                    _ => {}
+                }
+                if let (Some(at), Some(now)) = (result.at(), now.at()) {
+                    map.insert((at, hash), now);
+                }
+            }
+            Event::Restore {
+                hash,
+                words: n,
+                at,
+                evict,
+                result,
+            } => {
+                if let Outcome::Upload(_) = result {
+                    out.recorded_restored_bytes += n as u64 * 4;
+                }
+                if let Some(now) = at_of(&map, &mut out, hash, at) {
+                    if let Ok(Placed::Upload(_)) = c.restore(&words(hash, n), hash, now, evict) {
+                        out.restored_bytes += n as u64 * 4;
+                    }
+                }
+            }
+            Event::Hold { hash, at } => {
+                if let Some(now) = at_of(&map, &mut out, hash, at) {
+                    c.hold(now);
+                }
+            }
+            Event::Release { hash, at } => {
+                if let Some(now) = at_of(&map, &mut out, hash, at) {
+                    c.release(now);
+                }
+            }
+            Event::Protect { hash, at } => {
+                if let Some(now) = at_of(&map, &mut out, hash, at) {
+                    c.protect(now);
+                    out.tightest_room = out.tightest_room.min(c.room().largest);
+                }
+            }
+            Event::UnprotectAll => c.unprotect_all(),
+            Event::UnpinAll => c.unpin_all(),
+            Event::ClearUnheld => c.clear_unheld(),
+            Event::Clear => {
+                c.clear();
+                map.clear();
+            }
+        }
+    }
+    out.held_evicted_bytes = c.stats().held_evicted_bytes;
+    out
 }
 
 #[cfg(test)]
@@ -808,6 +1274,88 @@ mod tests {
         };
         assert!(other >= at + 256 || other + 256 <= at);
     }
+
+    /// A 4 KiB cache whose even 256-byte slots another trace holds and whose odd ones are free,
+    /// then a capture of eight 256-byte programs under `policy`, each protected as it lands.
+    fn fragmented_capture(policy: Policy, log: bool) -> ProgramCache {
+        let mut c = ProgramCache::new(region(0x1000));
+        c.set_log(log);
+        c.set_policy(policy);
+        let mut slots = Vec::new();
+        for t in 0..16 {
+            let Ok(Placed::Upload(at)) = c.place(&prog(t, 64)) else {
+                panic!("the cache fills in order")
+            };
+            slots.push(at);
+        }
+        for &at in slots.iter().step_by(2) {
+            c.hold(at);
+        }
+        c.unpin_all();
+        c.clear_unheld();
+        c.set_capturing(true);
+        for t in 100..108 {
+            let w: Arc<[u32]> = prog(t, 64).into();
+            let at = match c.place_hashed_evicting(&w, hash(&w), true) {
+                Ok(Placed::Upload(at)) => at,
+                other => panic!("placed: {other:?}"),
+            };
+            c.hold(at);
+            c.protect(at);
+        }
+        c
+    }
+
+    #[test]
+    fn first_fit_scatters_a_capture_and_packing_keeps_a_run() {
+        // First fit (and the others that place in free ranges) puts the capture in the odd
+        // gaps: nothing larger than one slot is left beside it.
+        for policy in [Policy::FirstFit, Policy::BestFit, Policy::TopDown] {
+            let c = fragmented_capture(policy, false);
+            assert_eq!(c.room().largest, 256, "{policy:?}");
+            assert_eq!(c.stats().held_evictions, 0, "{policy:?}");
+        }
+        // Packed: one run at the top, at the cost of the held programs under it.
+        let c = fragmented_capture(Policy::Packed, false);
+        let room = c.room();
+        assert_eq!((room.protected, room.largest), (2048, 2048));
+        let s = c.stats();
+        assert_eq!((s.held_evictions, s.held_evicted_bytes), (4, 1024));
+    }
+
+    #[test]
+    fn a_log_reads_back_and_replays_as_recorded() {
+        let mut c = fragmented_capture(Policy::FirstFit, true);
+        c.set_capturing(false);
+        c.unprotect_all();
+        // A replay of the first trace puts back what the capture took (nothing, here).
+        let w: Arc<[u32]> = prog(0, 64).into();
+        let at = c.resident_at(0x14_1000).map(|_| 0x14_1000).unwrap();
+        assert_eq!(c.restore(&w, hash(&w), at, true), Ok(Placed::Hit(at)));
+        let log = c.take_log();
+        assert!(c.take_log().is_empty(), "taken");
+        for e in &log {
+            assert_eq!(Event::parse(&e.line()).as_ref(), Some(e), "{}", e.line());
+        }
+        assert_eq!(Event::parse("bogus\t1"), None);
+        let same = replay(region(0x1000), &log, Policy::FirstFit);
+        assert_eq!(
+            (
+                same.refused,
+                same.placed_now_refused,
+                same.unmapped,
+                same.tightest_room
+            ),
+            (0, 0, 0, 256)
+        );
+        assert_eq!(same.restored_bytes, same.recorded_restored_bytes);
+        let packed = replay(region(0x1000), &log, Policy::Packed);
+        assert_eq!(
+            (packed.tightest_room, packed.held_evicted_bytes),
+            (2048, 1024)
+        );
+        assert_eq!(packed.unmapped, 0);
+    }
 }
 
 #[cfg(test)]
@@ -867,5 +1415,71 @@ mod restore_cost {
             start.elapsed() / n,
             c.stats.evictions
         );
+    }
+}
+
+#[cfg(test)]
+mod log_probe {
+    use super::*;
+
+    /// Not a gate: a recorded log (`TT_GEN_PROGRAM_LOG` in `silicon_bench_models`) run again
+    /// under every policy, summed over the units (`TT_PROGRAM_LOG=<file> cargo test -p
+    /// tt-kernels --release replay_program_log -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "reads a recorded log"]
+    fn replay_program_log() {
+        let path = std::env::var("TT_PROGRAM_LOG").expect("TT_PROGRAM_LOG=<file>");
+        let text = std::fs::read_to_string(&path).expect("the log");
+        let mut units: BTreeMap<usize, Vec<Event>> = BTreeMap::new();
+        for line in text.lines() {
+            let (u, e) = line.split_once('\t').expect("unit<TAB>event");
+            let e = Event::parse(e).unwrap_or_else(|| panic!("not an event: {line}"));
+            units.entry(u.parse().expect("a unit")).or_default().push(e);
+        }
+        let events: usize = units.values().map(Vec::len).sum();
+        println!("{path}: {events} events on {} units", units.len());
+        println!(
+            "policy     refused  now-placed  newly-refused  restored-MB  recorded-MB  held-evicted-MB  tightest-room  (unit)  unmapped"
+        );
+        for policy in [
+            Policy::FirstFit,
+            Policy::BestFit,
+            Policy::TopDown,
+            Policy::Packed,
+        ] {
+            let mut sum = Replayed {
+                tightest_room: u64::MAX,
+                ..Replayed::default()
+            };
+            let mut tightest_unit = 0;
+            for (&u, events) in &units {
+                let r = replay(tt_isa::l1::PROGRAM_CACHE, events, policy);
+                sum.refused += r.refused;
+                sum.refused_now_placed += r.refused_now_placed;
+                sum.placed_now_refused += r.placed_now_refused;
+                sum.restored_bytes += r.restored_bytes;
+                sum.recorded_restored_bytes += r.recorded_restored_bytes;
+                sum.held_evicted_bytes += r.held_evicted_bytes;
+                sum.unmapped += r.unmapped;
+                if r.tightest_room < sum.tightest_room {
+                    sum.tightest_room = r.tightest_room;
+                    tightest_unit = u;
+                }
+            }
+            let mb = |b: u64| b as f64 / 1e6;
+            println!(
+                "{:<10} {:>7}  {:>10}  {:>13}  {:>11.2}  {:>11.2}  {:>15.2}  {:>13}  ({:>4})  {:>8}",
+                format!("{policy:?}"),
+                sum.refused,
+                sum.refused_now_placed,
+                sum.placed_now_refused,
+                mb(sum.restored_bytes),
+                mb(sum.recorded_restored_bytes),
+                mb(sum.held_evicted_bytes),
+                sum.tightest_room,
+                tightest_unit,
+                sum.unmapped
+            );
+        }
     }
 }

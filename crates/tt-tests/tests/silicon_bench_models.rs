@@ -1715,6 +1715,13 @@ fn traced_generation_stream_ceiling() {
         );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = bench_model(m, true);
+        // `TT_GEN_PROGRAM_LOG=<file>`: every unit's program cache calls through the builds and the
+        // generations, one `unit<TAB>event` a line (`tt_kernels::program_cache::Event`), for a
+        // placement policy's bound (`program_cache::replay`, the probe `replay_program_log`).
+        let program_log = std::env::var("TT_GEN_PROGRAM_LOG").ok();
+        if program_log.is_some() {
+            burn_tt::probe_program_log(d, true).unwrap();
+        }
         // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
         let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
             v.split(',').map(|n| n.trim().parse().unwrap()).collect()
@@ -1826,6 +1833,21 @@ fn traced_generation_stream_ceiling() {
                 "host",
                 Stats::of(step),
             );
+        }
+        if let Some(path) = &program_log {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            for (u, events) in burn_tt::probe_program_log(d, false)
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
+                for e in events {
+                    let _ = writeln!(out, "{u}\t{}", e.line());
+                }
+            }
+            std::fs::write(path, out).unwrap();
+            println!("PROGRAM LOG written to {path}");
         }
         // In the device's process (a fork), where the probe counted.
         if contiguous.is_some() {

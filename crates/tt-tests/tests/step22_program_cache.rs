@@ -149,6 +149,8 @@ impl<T: tt_device::Transport> SessionLike for Session<T> {
             misses: c1.misses - c0.misses,
             bytes_uploaded: c1.bytes_uploaded - c0.bytes_uploaded,
             evictions: c1.evictions - c0.evictions,
+            held_evictions: c1.held_evictions - c0.held_evictions,
+            held_evicted_bytes: c1.held_evicted_bytes - c0.held_evicted_bytes,
             bypassed: c1.bypassed - c0.bypassed,
         };
         (l1 - l0, delta, got)

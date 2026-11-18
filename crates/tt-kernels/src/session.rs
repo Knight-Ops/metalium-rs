@@ -1047,6 +1047,9 @@ pub struct Session<T: Transport> {
     /// Moves on whenever a tile's state is lost -- a reset, a mover restart --
     /// which every trace captured before is [`TraceError::Stale`] against.
     epoch: u64,
+    /// Units recovered after a failed queue ([`Session::recover`]): a measured candidate that
+    /// moves it failed on the card.
+    recoveries: u64,
     /// Whatever keeps each unit's crash-cleanup write registered beyond the
     /// first (on silicon, one driver file descriptor per tile: the driver keeps
     /// one cleanup write per descriptor).
@@ -3113,6 +3116,7 @@ impl<T: Transport> Session<T> {
             traces: Default::default(),
             next_trace: 0,
             epoch: 0,
+            recoveries: 0,
             _cleanup: Vec::new(),
         };
         let (_, wedged) = healthy_tiles(&candidates, want, |(x, y)| {
@@ -5807,6 +5811,8 @@ impl<T: Transport> Session<T> {
         }
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
+            let capturing = self.capture.is_some();
+            self.units[u].programs.set_capturing(capturing);
             let placed = {
                 let Session {
                     dev, units, ttinsn, ..
@@ -6130,6 +6136,8 @@ impl<T: Transport> Session<T> {
         use crate::program_cache::{CacheError, Placed};
         let words: Arc<[u32]> = program.iter().map(|i| i.word()).collect();
         let hash = crate::program_cache::hash(&words);
+        let capturing = self.capture.is_some();
+        self.units[u].programs.set_capturing(capturing);
         for attempt in 0..2 {
             let Session { dev, units, .. } = self;
             let unit = &mut units[u];
@@ -9806,6 +9814,7 @@ impl<T: Transport> Session<T> {
     /// After a failed queue: restart the mover of a unit whose list failed, and
     /// reset and restart the roles of a unit whose kernel did.
     fn recover(&mut self, failed: &[(usize, bool)]) {
+        self.recoveries += 1;
         for &(u, kernel) in failed {
             if kernel {
                 self.units[u].resident = None;
@@ -10226,18 +10235,38 @@ impl<T: Transport> Session<T> {
             s.unprofiled(|s| {
                 // Copies enough that a candidate's trace runs ~[`MEASURE_SPAN_US`]: a small product's
                 // differences are otherwise inside a replay's noise.
+                // A run that fails on the card is named before it ends the measurement: its
+                // recovery resets tiles, which makes every trace captured so far stale, so what
+                // failed must not be lost (two builds ended so, unnamed, 2026-11-17 and -18).
+                let named = |c: tensor::BlockChoice, e: TensorError| {
+                    eprintln!(
+                        "TT_MATMUL_BLOCK=measured: {:?} on {} units: candidate {:?} {:?} failed on \
+                         the card, the measurement ends: {e}",
+                        q.tiles, q.units, c.block, c.reuse
+                    );
+                    e
+                };
                 let kept = (s.block_stream, s.reuse);
+                let recoveries = s.recoveries;
                 s.block_stream = tensor::BlockStream::Fixed(first.block);
                 let single = s
                     .set_operand_reuse(first.reuse)
                     .and_then(|()| s.replay_time(a, b, route, fidelity, budget, 1));
                 s.block_stream = kept.0;
                 s.set_operand_reuse(kept.1)?;
+                let single = single.map_err(|e| named(first, e))?;
+                if let (Err(cause), true) = (&single, s.recoveries != recoveries) {
+                    return Err(named(
+                        first,
+                        TensorError::Shape(format!("a tile was reset: {cause}")),
+                    ));
+                }
                 let copies = match single {
-                    Ok(Ok(us)) => {
+                    Ok(us) => {
                         ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
                     }
-                    _ => 1,
+                    // Timed again below with the others, where a refusal is recorded.
+                    Err(_) => 1,
                 };
                 // Each candidate, its score and its time, us.
                 type Timed = Vec<(tensor::BlockChoice, f64, f64)>;
@@ -10249,8 +10278,18 @@ impl<T: Transport> Session<T> {
                 let mut refused: Vec<(tensor::BlockChoice, String)> = Vec::new();
                 let once = |s: &mut Self, c: tensor::BlockChoice| {
                     let fixed = tensor::BlockStream::Fixed(c.block);
-                    let us =
-                        s.time_candidate(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
+                    let recoveries = s.recoveries;
+                    let us = s
+                        .time_candidate(a, b, route, fidelity, budget, fixed, c.reuse, copies)
+                        .map_err(|e| named(c, e))?;
+                    // A run that failed inside the capture comes back as one that did not
+                    // capture, but its recovery reset tiles: a failure of the card, not a skip.
+                    if let (Err(cause), true) = (&us, s.recoveries != recoveries) {
+                        return Err(named(
+                            c,
+                            TensorError::Shape(format!("a tile was reset: {cause}")),
+                        ));
+                    }
                     Ok::<_, TensorError>(
                         us.map(|us| (scores.map_or(us, |f| f(c.block, c.reuse, us)), us)),
                     )
@@ -11321,6 +11360,34 @@ impl<T: Transport> Session<T> {
         self.units.iter().map(|u| u.programs.stats()).collect()
     }
 
+    /// Record every unit's program cache calls from now on, or stop
+    /// ([`crate::program_cache::Event`]): the input of a placement policy's bound
+    /// ([`crate::program_cache::replay`]). Dev-facing.
+    #[doc(hidden)]
+    pub fn set_program_log(&mut self, on: bool) {
+        for unit in &mut self.units {
+            unit.programs.set_log(on);
+        }
+    }
+
+    /// What each unit's program cache recorded since the last take, in unit order, emptied.
+    #[doc(hidden)]
+    pub fn take_program_log(&mut self) -> Vec<Vec<crate::program_cache::Event>> {
+        self.units
+            .iter_mut()
+            .map(|u| u.programs.take_log())
+            .collect()
+    }
+
+    /// Where every unit's program cache places programs from now on
+    /// ([`crate::program_cache::Policy`]). Dev-facing.
+    #[doc(hidden)]
+    pub fn set_program_policy(&mut self, policy: crate::program_cache::Policy) {
+        for unit in &mut self.units {
+            unit.programs.set_policy(policy);
+        }
+    }
+
     /// Shrink every unit's program cache to its first `bytes`, emptied: for
     /// gates that need it to fill (`step34_batching`). Waits for queued work
     /// first, since what is resident is forgotten.
@@ -11329,10 +11396,12 @@ impl<T: Transport> Session<T> {
         self.sync()?;
         let full = tt_isa::l1::PROGRAM_CACHE;
         for unit in &mut self.units {
+            let policy = unit.programs.policy();
             unit.programs = ProgramCache::new(tt_isa::l1::Region {
                 end: full.base + bytes.min(full.len()),
                 ..full
             });
+            unit.programs.set_policy(policy);
         }
         Ok(())
     }

@@ -952,6 +952,27 @@ pub fn probe_restored_bytes(device: TtDevice) -> Result<(u64, u64), TtError> {
     server::run(device, |e, _| e.probe_restored_bytes())
 }
 
+/// What every unit's program cache on `device` recorded since the last call, in unit order, and
+/// logging on or off from here (`tt_kernels::program_cache::Event`): the input
+/// `tt_kernels::program_cache::replay` bounds a placement policy with. Dev-facing.
+#[doc(hidden)]
+pub fn probe_program_log(
+    device: TtDevice,
+    on: bool,
+) -> Result<Vec<Vec<tt_kernels::program_cache::Event>>, TtError> {
+    server::run(device, move |e, _| e.probe_program_log(on))
+}
+
+/// Where every unit's program cache on `device` places programs from now on
+/// (`tt_kernels::program_cache::Policy`). Dev-facing.
+#[doc(hidden)]
+pub fn set_program_policy(
+    device: TtDevice,
+    policy: tt_kernels::program_cache::Policy,
+) -> Result<(), TtError> {
+    server::run(device, move |e, _| e.set_program_policy(policy))
+}
+
 /// Every unit's NC waits since they were last taken, in tile cycles, zeroed: what B's waits for
 /// its writer core are made of (`tt_kernels::session::Session::probe_nc_waits`; counted only by
 /// firmware built with the profile feature). Dev-facing.
