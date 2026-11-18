@@ -799,6 +799,18 @@ impl ProgramCache {
         }
     }
 
+    /// [`ProgramCache::clear`], over `region` from now on: a gate's smaller cache. Its counters go
+    /// on (a trace's holds and restore stamp name the cache's earlier life, so it restores).
+    pub fn resize(&mut self, region: Region) {
+        self.clear();
+        let mut resized = ProgramCache::new(region);
+        resized.stats = self.stats;
+        (resized.clears, resized.changes) = (self.clears, self.changes);
+        (resized.policy, resized.capturing) = (self.policy, self.capturing);
+        resized.log = self.log.take();
+        *self = resized;
+    }
+
     /// Forget everything: the tile was reset, and what is in its L1 is no
     /// longer the host's to vouch for.
     pub fn clear(&mut self) {

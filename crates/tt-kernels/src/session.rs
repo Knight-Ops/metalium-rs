@@ -899,6 +899,10 @@ pub struct Session<T: Transport> {
     /// Stored weights laid by column (`tensor::Layout::ByColumn`;
     /// [`Session::set_column_weights`]).
     column_weights: bool,
+    /// Activations laid by row (`tensor::Layout::ByRow`; [`Session::set_row_activations`]), and
+    /// in the gate's mode however short (`TT_ACT_ROWS=all`).
+    row_activations: bool,
+    row_everywhere: bool,
     /// [`Session::set_even_deal`].
     even_deal: bool,
     /// [`Session::set_read_ahead_early`].
@@ -3023,6 +3027,8 @@ impl<T: Transport> Session<T> {
             // 1.7B decode step ~10% faster on card 1, bit for bit, with prefill, eager blocks and
             // GDDR unchanged (the weight held once). `TT_WEIGHT_COLUMNS=0` turns it off.
             column_weights: std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0"),
+            row_activations: std::env::var("TT_ACT_ROWS").is_ok_and(|v| v == "1" || v == "all"),
+            row_everywhere: std::env::var("TT_ACT_ROWS").is_ok_and(|v| v == "all"),
             // On by default since 2026-11-07 (`docs/plans/decode-bytes-in-flight.md`, "X10:
             // evenness"; the owner's call over its narrow kill): a 1.7B decode step 10.04 / 11.20 ->
             // 9.82 / 10.98 ms on card 1, bit for bit. `TT_EVEN_DEAL=0` turns it off.
@@ -3604,8 +3610,11 @@ impl<T: Transport> Session<T> {
         let w4 = self.dev.alloc_window(WindowKind::FourGib)?;
         let window = self.dev.alloc_window(WindowKind::TwoMib)?;
         let dram = self.dev.dram_grid(&window)?;
+        let mut alloc = DramAlloc::new(&dram);
+        alloc.set_row_activations(self.row_activations);
+        alloc.set_row_activations_everywhere(self.row_everywhere);
         self.dram = Some(DramState {
-            alloc: DramAlloc::new(&dram),
+            alloc,
             dram,
             image: b_image,
             nc_image,
@@ -3804,6 +3813,18 @@ impl<T: Transport> Session<T> {
     pub fn set_column_weights(&mut self, on: bool) -> Result<(), TensorError> {
         self.column_weights = on;
         self.push_prefetch_cap()
+    }
+
+    /// Lay activations by row from now on (`tensor::Layout::ByRow`, `docs/plans/a-by-row.md`):
+    /// every tensor an op allocates (`DramTensor::alloc_elem`) of at least as many tile rows as
+    /// channels and two tile columns, so a product reads its `A` a row a request. Stored weights
+    /// keep [`Session::stored_layout`]'s. Opt-in while it is built (`TT_ACT_ROWS=1` at open;
+    /// `TT_ACT_ROWS=all`, a gate's mode, lays every grid of two tile columns so).
+    pub fn set_row_activations(&mut self, on: bool) {
+        self.row_activations = on;
+        if let Some(d) = self.dram.as_mut() {
+            d.alloc.set_row_activations(on);
+        }
     }
 
     /// Deal a one-row product's in-span columns over its prefetching units too (X10;
@@ -4298,9 +4319,9 @@ impl<T: Transport> Session<T> {
         values: Src<'_>,
         tiles: usize,
     ) -> Result<Option<()>, TensorError> {
-        // The DMA's records read interleaved tensors only; a weight laid by column goes tile by
-        // tile through its slots.
-        if self.staging().is_none() || t.placement.layout() == tensor::Layout::ByColumn {
+        // The DMA's records read interleaved tensors only; a weight laid by column, or an
+        // activation by row, goes tile by tile through its slots.
+        if self.staging().is_none() || t.placement.layout() != tensor::Layout::Interleaved {
             return Ok(None);
         }
         let stride = tensor::row_major_stride(t.cols);
@@ -4742,7 +4763,7 @@ impl<T: Transport> Session<T> {
         t.expect_fp32_slots("read as 32-bit datums")?;
         if self.capture.is_some()
             || self.staging().is_none()
-            || t.placement.layout() == tensor::Layout::ByColumn
+            || t.placement.layout() != tensor::Layout::Interleaved
         {
             return Ok(None);
         }
@@ -5561,6 +5582,7 @@ impl<T: Transport> Session<T> {
         let start = self.mark();
         // Every unit's cache has the same bounds (`limit_program_cache`).
         let cache = self.units[0].programs.region().len();
+        let is_linked = linked.is_some();
         let mut per_unit: Vec<std::collections::VecDeque<Option<Segment>>> = match linked {
             Some(groups) => groups
                 .into_iter()
@@ -5594,6 +5616,11 @@ impl<T: Transport> Session<T> {
                 .collect::<Result<_, _>>()?,
         };
         self.stage(HostStage::Segments, start);
+        if is_linked {
+            let start = self.mark();
+            self.place_linked(&per_unit)?;
+            self.stage(HostStage::Place, start);
+        }
         // With more than one unit, a barrier on each unit this op ran on, after
         // its share, since the next op may read what any of them wrote; a unit
         // it did not run on enqueues nothing, and catches up before its next
@@ -5766,6 +5793,81 @@ impl<T: Transport> Session<T> {
     /// the queue drains), its kernels reserved, its list enqueued. A kernel
     /// that would write what queued runs read (`Resident::needs_idle`) waits
     /// for the unit to drain first, as does a full program cache.
+    /// Place `seg`'s programs in unit `u`'s cache, pinned (`place_programs`), draining the unit
+    /// first where what its queued lists pin leaves no room: each kernel's three addresses.
+    fn place_segment(
+        &mut self,
+        u: usize,
+        seg: &Segment,
+    ) -> Result<Vec<[(u32, u32); 3]>, TensorError> {
+        let capturing = self.capture.is_some();
+        self.units[u].programs.set_capturing(capturing);
+        let placed = {
+            let Session {
+                dev, units, ttinsn, ..
+            } = self;
+            let unit = &mut units[u];
+            let w = unit.resident.as_ref().unwrap().window();
+            let in_flight = !unit.queued.is_empty();
+            match place_programs(
+                dev,
+                w,
+                unit.tile,
+                &mut unit.programs,
+                seg,
+                in_flight,
+                *ttinsn,
+            ) {
+                Ok(p) => Ok(p),
+                Err(PlaceError::Full) => Err(()),
+                Err(PlaceError::Failed(e)) => return Err(e),
+            }
+        };
+        match placed {
+            Ok(p) => Ok(p),
+            Err(()) => {
+                let d0 = self.mark();
+                self.drain_unit(u)?;
+                self.stage(HostStage::Drain, d0);
+                let Session {
+                    dev, units, ttinsn, ..
+                } = self;
+                let unit = &mut units[u];
+                let w = unit.resident.as_ref().unwrap().window();
+                Ok(place_programs(
+                    dev,
+                    w,
+                    unit.tile,
+                    &mut unit.programs,
+                    seg,
+                    false,
+                    *ttinsn,
+                )?)
+            }
+        }
+    }
+
+    /// An op whose units hand each other data by credits (`linked`): every unit's lists' programs
+    /// placed before any list is queued. One that does not fit is then refused with nothing of
+    /// the op on the card; refused after its partners' lists were queued, they waited for it until
+    /// the run timed out, and the recovery's reset made every trace stale (a measured candidate's,
+    /// `1795029493`: `down` at 1,024 rows, `[5, 8, 9]` pulled, refused on one unit). The queueing
+    /// then finds each program resident and pinned.
+    fn place_linked(
+        &mut self,
+        per_unit: &[std::collections::VecDeque<Option<Segment>>],
+    ) -> Result<(), TensorError> {
+        for (u, q) in per_unit.iter().enumerate() {
+            for seg in q.iter().flatten() {
+                if seg.resident && !seg.kernels.is_empty() {
+                    self.ensure_unit(u)?;
+                    self.place_segment(u, seg)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_segment(&mut self, u: usize, seg: &Segment, budget: u64) -> Result<(), TensorError> {
         if self.capture.is_some() && !seg.kernel_roles.is_empty() && !seg.resident {
             return Err(TraceError::NotResident.into());
@@ -5811,43 +5913,7 @@ impl<T: Transport> Session<T> {
         }
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
-            let capturing = self.capture.is_some();
-            self.units[u].programs.set_capturing(capturing);
-            let placed = {
-                let Session {
-                    dev, units, ttinsn, ..
-                } = self;
-                let unit = &mut units[u];
-                let w = unit.resident.as_ref().unwrap().window();
-                let in_flight = !unit.queued.is_empty();
-                match place_programs(
-                    dev,
-                    w,
-                    unit.tile,
-                    &mut unit.programs,
-                    seg,
-                    in_flight,
-                    *ttinsn,
-                ) {
-                    Ok(p) => Ok(p),
-                    Err(PlaceError::Full) => Err(()),
-                    Err(PlaceError::Failed(e)) => return Err(e),
-                }
-            };
-            let placed = match placed {
-                Ok(p) => p,
-                Err(()) => {
-                    let d0 = self.mark();
-                    self.drain_unit(u)?;
-                    self.stage(HostStage::Drain, d0);
-                    let Session {
-                        dev, units, ttinsn, ..
-                    } = self;
-                    let unit = &mut units[u];
-                    let w = unit.resident.as_ref().unwrap().window();
-                    place_programs(dev, w, unit.tile, &mut unit.programs, seg, false, *ttinsn)?
-                }
-            };
+            let placed = self.place_segment(u, seg)?;
             for (&at, p) in seg.kernels.iter().zip(placed) {
                 for (t, (addr, len)) in p.into_iter().enumerate() {
                     entries[at][2 + 2 * t] = addr;
@@ -11396,14 +11462,31 @@ impl<T: Transport> Session<T> {
         self.sync()?;
         let full = tt_isa::l1::PROGRAM_CACHE;
         for unit in &mut self.units {
-            let policy = unit.programs.policy();
-            unit.programs = ProgramCache::new(tt_isa::l1::Region {
+            unit.programs.resize(tt_isa::l1::Region {
                 end: full.base + bytes.min(full.len()),
                 ..full
             });
-            unit.programs.set_policy(policy);
         }
         Ok(())
+    }
+
+    /// [`Session::limit_program_cache`] for unit `u` alone: a gate's way to make one unit of an
+    /// op refuse its programs while the others take theirs.
+    #[doc(hidden)]
+    pub fn limit_unit_program_cache(&mut self, u: usize, bytes: u64) -> Result<(), TensorError> {
+        self.sync()?;
+        let full = tt_isa::l1::PROGRAM_CACHE;
+        self.units[u].programs.resize(tt_isa::l1::Region {
+            end: full.base + bytes.min(full.len()),
+            ..full
+        });
+        Ok(())
+    }
+
+    /// How many times units were recovered after a failed queue (`Session::recover`). Dev-facing.
+    #[doc(hidden)]
+    pub fn probe_recoveries(&self) -> u64 {
+        self.recoveries
     }
 
     /// Give the timestamper `bytes` of L1 at the top of the program cache instead of the
