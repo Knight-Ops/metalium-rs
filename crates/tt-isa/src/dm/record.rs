@@ -250,10 +250,6 @@ impl PrefetchCursor {
         if !slot_agrees(&b, slot as u64) {
             return Err(super::error::RANGE);
         }
-        // Its cursor walks interleaved tiles, or a span by column: never a `B` laid by row.
-        if b.by_row {
-            return Err(super::error::LAYOUT);
-        }
         let span = gather_span(rec, &b, flags, b_at, kt, j0, cols, slot)?;
         let thin = (flags >> GATHER_ROWS_SHIFT) & 0x1f;
         if thin > 16 || (thin != 0 && a_t) {
@@ -1499,7 +1495,9 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             //
             // An untransposed `A` laid by row is read a row a request, out of line too
             // ([`BSpan::of_rows`]), before `B` (in line or by its span): its rows are whole runs in
-            // GDDR and in L1. Read down a column, it takes the walk ([`gather_by_column`]).
+            // GDDR and in L1. Any other operand laid by row takes the loops below as an interleaved
+            // one does: its cursor steps along one channel ([`TensorRef::cursor`]), and a tile
+            // read down a column is found by [`TensorRef::tile_in`].
             let a_rows = !resident && a.by_row && !a_t;
             let b_span = !b_resident
                 && l1_by_column(rec, 3)
@@ -1507,8 +1505,8 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 && (resident || a.col_tiles == 0);
             if !b_span
                 && (l1_by_column(rec, 1)
-                    || (!resident && (a.col_tiles != 0 || (a.by_row && a_t)))
-                    || (!b_resident && (b.col_tiles != 0 || b.by_row || l1_by_column(rec, 3))))
+                    || (!resident && a.col_tiles != 0)
+                    || (!b_resident && (b.col_tiles != 0 || l1_by_column(rec, 3))))
             {
                 let slots = [a_slot as u32, b_slot as u32];
                 return gather_by_column(rec, &a, &b, slots, &mut |e| sink.entry(e));
@@ -3929,24 +3927,64 @@ mod tests {
         }
     }
 
-    /// A read ahead refuses a `B` laid by row (its cursor walks interleaved tiles), read in place
-    /// it is walked; a span past its row's last column is refused before anything is read.
+    /// A [`GATHER`]'s operand laid by row and read a tile at a time (`B`, or a transposed `A`)
+    /// is read as its interleaved twin, tile for tile, and a read ahead of such a `B`
+    /// ([`PrefetchCursor`]) gives exactly the record's reads; a span past its row's last column
+    /// is refused before anything is read.
     #[test]
-    fn a_tensor_laid_by_row_is_refused_where_it_cannot_be_read() {
+    fn a_gather_reads_any_other_operand_laid_by_row_as_its_twin() {
         let a = TensorRef {
             n: 1,
             ct: 1,
             ..TensorRef::default()
         };
-        let b = by_row(8, 4, 0, 0);
-        let mut ahead = gather_of(GATHER_A_RESIDENT | GATHER_PREFETCH, &a, &b, 0, 1, 2, 0, 4);
+        let b_bf16 = gather_b_format(crate::tile::L1Format::Bf16).unwrap();
+        for (flags, slot) in [(0, 0), (b_bf16, BF16_TILE_SLOT as u32)] {
+            let b = by_row(3, 9, 9, slot);
+            let twin = TensorRef { by_row: false, ..b };
+            let bytes = gather_b_slot(flags).unwrap() as u32;
+            let rec = |b: &TensorRef| gather_of(flags | GATHER_A_RESIDENT, &a, b, 0, 1, 5, 2, 6);
+            let laid = expanded_reads(&rec(&b)).unwrap();
+            let plain = expanded_reads(&rec(&twin)).unwrap();
+            assert_eq!(
+                by_tile(&laid, &b, bytes),
+                by_tile(&plain, &twin, bytes),
+                "B"
+            );
+            let mut ahead = rec(&b);
+            ahead[0][1] |= GATHER_PREFETCH;
+            let pumped: Vec<_> = PrefetchCursor::new(&ahead)
+                .unwrap()
+                .expect("a read ahead")
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(pumped, expanded_reads(&ahead).unwrap(), "read ahead");
+        }
+        // Transposed `A` (FP32), beside an interleaved `B`.
+        let b = TensorRef {
+            n: 8,
+            ct: 8,
+            channels: [0, 1, 2, 3, 4, 5, 6, 7],
+            base: [0x100_0000; 8],
+            ..TensorRef::default()
+        };
+        let a = by_row(3, 9, 0, 0);
+        let twin = TensorRef { by_row: false, ..a };
+        let rec = |a: &TensorRef| gather_of(1, a, &b, 2, 4, 6, 0, 2);
+        let split = |reads: Vec<[u32; 8]>| -> Vec<[u32; 8]> {
+            reads.into_iter().filter(|e| e[3] < 0x100_0000).collect()
+        };
+        let laid = split(expanded_reads(&rec(&a)).unwrap());
+        let plain = split(expanded_reads(&rec(&twin)).unwrap());
+        assert!(laid.iter().all(|e| e[0] == op::READ_TRANSPOSED));
+        let size = TILE_SLOT as u32;
         assert_eq!(
-            PrefetchCursor::new(&ahead).map(|c| c.is_some()),
-            Err(super::super::error::LAYOUT)
+            by_tile(&laid, &a, size),
+            by_tile(&plain, &twin, size),
+            "A transposed"
         );
-        ahead[0][1] &= !GATHER_PREFETCH;
-        assert!(expanded_reads(&ahead).is_ok(), "read in place, walked");
         // A view from column 2 of 4 cannot give a row of 3.
+        let b = by_row(8, 4, 0, 0);
         let a = by_row(8, 4, 2, 0);
         let rec = gather_of(0, &a, &b, 0, 1, 3, 0, 1);
         assert_eq!(expanded_reads(&rec), Err(super::super::error::RANGE));
