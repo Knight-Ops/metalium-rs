@@ -44,10 +44,18 @@ pieces in turn).
 
     Kill was "above ~130 cycles a tile": at a model's row length it is 57.9, 4.1x. With 181 cycles a tile saved (the
     bound assumed 212), the bound is ~2.1-3.1 ms of a 128-token chunk (8-12%).
-- [ ] **P1: every record arm accepts a by-row tensor.** `SCATTER`, `WRITE_RUN` / `READ_RUN`, `SELECT_ROWS`,
-  `SCATTER_ROWS`, `FILL_PAD` / `PAD_WRITE`, each dispatched once a record to a by-row walk (a row's run is one
-  channel). `encoded::validate` / `guard` follow the expansion. Host tests: every arm on a by-row tensor against its
-  interleaved twin, the same bytes.
+- [x] **P1: every record arm accepts a by-row tensor** (2026-11-18). Not arm by arm: every arm addresses a tensor
+  through three things, and each learned the layout.
+  - `TensorRef::cursor`: a by-row tensor's cursor (`row_cursor`, once a row, out of line) is the interleaved step over
+    one channel (`Cursor::k`, `Cursor::n` 1), so the per-tile step has no test; `tile_in` sends a by-row tensor to
+    `tile_by_row` (out of line).
+  - `READ_RUN` / `WRITE_RUN`'s plain run starts a new cursor where it wraps to the next row (inside the wrap branch).
+  - Encoded reads need nothing: they encode entries after the expansion.
+  - Host test `every_record_addresses_a_tensor_laid_by_row_as_its_interleaved_twin`: `SCATTER`, `READ_RUN` (across
+    rows, broadcast down and across, read as it lies, column-major, transposed), `WRITE_RUN`, `SELECT_ROWS`,
+    `SCATTER_ROWS` (face rows, a whole tile row), `FILL_PAD`, `PAD_WRITE`, FP32 and BF16, each entry's tile and byte
+    equal to its interleaved twin's (each layout's inverse from its definition). Three mutations each caught.
+  - Room at the tightest (profile + encoded-guard): `dm_b` 1,596 bytes, `dm_nc` 604 (from 2,640 / 1,560).
 - [ ] **P2: host placement.** `tensor::Layout::ByRow`; `Placement` keeps a layout rather than `by_column`; `slot`,
   `tensor_ref`, `alloc_laid`; `alloc_elem` lays by row under the session's switch for `rows >= n`. Views keep their
   parent's layout. The DMA fast paths skip by-row tensors as they do by-column ones. Placement test (every tile its

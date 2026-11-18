@@ -1428,32 +1428,28 @@ mod log_probe {
     #[test]
     #[ignore = "reads a recorded log"]
     fn replay_program_log() {
-        let path = std::env::var("TT_PROGRAM_LOG").expect("TT_PROGRAM_LOG=<file>");
-        let text = std::fs::read_to_string(&path).expect("the log");
-        let mut units: BTreeMap<usize, Vec<Event>> = BTreeMap::new();
-        for line in text.lines() {
-            let (u, e) = line.split_once('\t').expect("unit<TAB>event");
-            let e = Event::parse(e).unwrap_or_else(|| panic!("not an event: {line}"));
-            units.entry(u.parse().expect("a unit")).or_default().push(e);
-        }
-        let events: usize = units.values().map(Vec::len).sum();
-        println!("{path}: {events} events on {} units", units.len());
-        println!(
-            "policy     refused  now-placed  newly-refused  restored-MB  recorded-MB  held-evicted-MB  tightest-room  (unit)  unmapped"
-        );
-        for policy in [
+        use std::io::BufRead;
+        const POLICIES: [Policy; 4] = [
             Policy::FirstFit,
             Policy::BestFit,
             Policy::TopDown,
             Policy::Packed,
-        ] {
-            let mut sum = Replayed {
+        ];
+        let path = std::env::var("TT_PROGRAM_LOG").expect("TT_PROGRAM_LOG=<file>");
+        let file = std::io::BufReader::new(std::fs::File::open(&path).expect("the log"));
+        // Each policy's sums, and its tightest room with the unit that had it.
+        let mut sums = [(
+            Replayed {
                 tightest_room: u64::MAX,
                 ..Replayed::default()
-            };
-            let mut tightest_unit = 0;
-            for (&u, events) in &units {
-                let r = replay(tt_isa::l1::PROGRAM_CACHE, events, policy);
+            },
+            0usize,
+        ); 4];
+        let (mut events, mut units, mut total) = (Vec::new(), 0usize, 0usize);
+        let mut unit: Option<usize> = None;
+        let mut flush = |u: usize, events: &mut Vec<Event>| {
+            for (policy, (sum, tightest_unit)) in POLICIES.iter().zip(sums.iter_mut()) {
+                let r = replay(tt_isa::l1::PROGRAM_CACHE, events, *policy);
                 sum.refused += r.refused;
                 sum.refused_now_placed += r.refused_now_placed;
                 sum.placed_now_refused += r.placed_now_refused;
@@ -1463,10 +1459,35 @@ mod log_probe {
                 sum.unmapped += r.unmapped;
                 if r.tightest_room < sum.tightest_room {
                     sum.tightest_room = r.tightest_room;
-                    tightest_unit = u;
+                    *tightest_unit = u;
                 }
             }
-            let mb = |b: u64| b as f64 / 1e6;
+            events.clear();
+        };
+        // The log is written a unit at a time (`silicon_bench_models`): each unit is replayed as
+        // its last event is read.
+        for line in file.lines() {
+            let line = line.expect("a line");
+            let (u, e) = line.split_once('\t').expect("unit<TAB>event");
+            let u: usize = u.parse().expect("a unit");
+            if unit.is_some_and(|v| v != u) {
+                flush(unit.unwrap(), &mut events);
+                units += 1;
+            }
+            unit = Some(u);
+            events.push(Event::parse(e).unwrap_or_else(|| panic!("not an event: {line}")));
+            total += 1;
+        }
+        if let Some(u) = unit {
+            flush(u, &mut events);
+            units += 1;
+        }
+        println!("{path}: {total} events on {units} units");
+        println!(
+            "policy     refused  now-placed  newly-refused  restored-MB  recorded-MB  held-evicted-MB  tightest-room  (unit)  unmapped"
+        );
+        let mb = |b: u64| b as f64 / 1e6;
+        for (policy, (sum, tightest_unit)) in POLICIES.iter().zip(sums) {
             println!(
                 "{:<10} {:>7}  {:>10}  {:>13}  {:>11.2}  {:>11.2}  {:>15.2}  {:>13}  ({:>4})  {:>8}",
                 format!("{policy:?}"),
