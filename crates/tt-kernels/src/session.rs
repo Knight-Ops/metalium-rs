@@ -6296,6 +6296,17 @@ impl<T: Transport> Session<T> {
         for u in 0..self.units.len() {
             self.ensure_unit(u)?;
         }
+        // The capture lays its programs out in a cache holding only what live traces hold (none
+        // in flight: synced above). Programs left from before -- eager ops', a dropped trace's --
+        // were hits wherever they lay, and the capture protects them there: a second build of
+        // the 1.7B kept the dropped first build's addresses, its programs spread over the cache
+        // with 122 KB free in runs of at most 7 KB, and a product's 24 KB list was refused
+        // (run `1795037344`). Its first build, laid out among those of its measurements, held.
+        // Laid out afresh, the 1.7B's 128-token generation also restores 0.99 MB of programs, not
+        // 1.85 (27.71 -> 26.49 ms, ABBA, 2026-11-19).
+        for unit in &mut self.units {
+            unit.programs.clear_unheld();
+        }
         let units = self
             .units
             .iter_mut()
@@ -11453,6 +11464,13 @@ impl<T: Transport> Session<T> {
             .iter_mut()
             .map(|u| u.programs.take_log())
             .collect()
+    }
+
+    /// What the programs traces hold leave of unit `u`'s program cache, and the largest run the
+    /// capture in progress leaves ([`crate::program_cache::Room`]). Dev-facing.
+    #[doc(hidden)]
+    pub fn program_room(&self, u: usize) -> crate::program_cache::Room {
+        self.units[u].programs.room()
     }
 
     /// Where every unit's program cache places programs from now on

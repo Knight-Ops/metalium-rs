@@ -1816,11 +1816,12 @@ fn traced_generation_stream_ceiling() {
         let samples = env("TT_GEN_SAMPLES", SAMPLES);
         for len in prompts {
             let p = gen_prompt(len, config.vocab);
-            let (mut prefill, mut step) = (Vec::new(), Vec::new());
+            let (mut prefill, mut step, mut restored) = (Vec::new(), Vec::new(), Vec::new());
             // Every generation's tokens, against the first's: a schedule that changes them fails
             // here, and the digest compares runs (a probe against its baseline) bit for bit.
             let mut first: Option<Vec<i32>> = None;
             for i in 0..WARMUPS + samples {
+                let r0 = burn_tt::probe_restored_bytes(d).unwrap();
                 // With `TT_PROBE_NC_WAITS=1`, NC's waits over one measured generation (firmware
                 // built with the profile feature): what B's waits for its writer are made of.
                 let nc_waits = nc_waits && i == WARMUPS;
@@ -1838,6 +1839,10 @@ fn traced_generation_stream_ceiling() {
                 if i >= WARMUPS {
                     prefill.push(ms(out.times[0]));
                     step.push(median_ms(&out.times[1..]));
+                    // Program bytes the generation's replays put back (host and B movers): what
+                    // the traces' layout in the program caches costs it.
+                    let r1 = burn_tt::probe_restored_bytes(d).unwrap();
+                    restored.push((r1.0 - r0.0 + r1.1 - r0.1) as f64);
                 }
             }
             let tokens = first.unwrap_or_default();
@@ -1871,6 +1876,14 @@ fn traced_generation_stream_ceiling() {
                 "ms",
                 "host",
                 Stats::of(step),
+            );
+            report(
+                &format!(
+                    "{name} stream ceiling ({tag}), {len}-token prompt, restored program bytes"
+                ),
+                "bytes",
+                "host",
+                Stats::of(restored),
             );
         }
         write_log();

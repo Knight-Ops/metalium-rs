@@ -230,3 +230,49 @@ fn evicted_programs_run_correctly_when_they_return() {
         );
     });
 }
+
+/// A capture lays its programs out from a cache that holds only what live traces hold: the
+/// programs an eager op left are not hits the capture keeps where they lay. Kept, they split what
+/// the capture leaves free: a second build of the 1.7B kept its dropped first build's addresses,
+/// and with 122 KB free in runs of at most 7 KB a product's 24 KB list was refused (run
+/// `1795037344`). Here the free space a capture leaves is one run, during the capture and in
+/// a second capture after the first is released.
+#[test]
+fn a_capture_leaves_its_free_space_in_one_run() {
+    with_session(|s| {
+        let abs = tt_kernels::tensor::Eltwise {
+            kind: tt_kernels::sfpu::ops::kind_sfpu::ABS,
+            scalar: 0.0,
+            scalar2: 0.0,
+        };
+        let a = s.upload(&floats(1, 64 * 64), 64, 64).unwrap();
+        let b = s.upload(&floats(2, 64 * 64), 64, 64).unwrap();
+        let one_run = |s: &mut Session<_>, what: &str| {
+            let room = s.program_room(0);
+            assert!(
+                room.protected > 0,
+                "{what}: the capture protects its programs"
+            );
+            assert_eq!(
+                room.largest,
+                room.region - room.protected,
+                "{what}: the free space is one run ({room:?})"
+            );
+        };
+        for round in ["first capture", "a capture after one released"] {
+            // An eager op's programs, resident below where the capture's would go.
+            let e = s.eltwise(abs, &a, None).unwrap();
+            s.free(e).unwrap();
+            s.begin_trace().unwrap();
+            let c = s
+                .matmul_dram(&a, false, &b, false, ROUTE, Fidelity::HiFi4, BUDGET)
+                .unwrap();
+            one_run(s, round);
+            let id = s.end_trace().unwrap();
+            s.free(c).unwrap();
+            s.release_trace(id).unwrap();
+        }
+        s.free(a).unwrap();
+        s.free(b).unwrap();
+    });
+}
