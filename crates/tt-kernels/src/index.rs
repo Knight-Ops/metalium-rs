@@ -356,7 +356,8 @@ pub(crate) fn scatter_rows_work(dst: &DramTensor, n: usize, values_tiles: usize)
 
 /// `values`' rows written over rows of `dst` in place, `dst` row `indices[i]`
 /// becoming `values` row `i` -- Burn's `scatter_nd` with `Assign` over whole
-/// rows, a cache write at a position the card holds -- with no host address:
+/// rows, a cache write at a position the card holds (an FP32, BF16 or block-float cache) -- with
+/// no host address:
 /// each batch reads one tile of 32 indices and the values' tile row, and NC's
 /// [`record::SCATTER_ROWS`] turns them into the destination's face-row
 /// writes. `indices` is a resident I32 tensor, `[1, n]` or (`column`) `[n,
@@ -457,16 +458,21 @@ pub(crate) fn scatter_rows_jobs(
         .map(|p| p * n / parts..(p + 1) * n / parts)
         .collect();
     let dst_ref = dst.tensor_ref().encode();
-    // A BF16 tensor's rows are 32-byte face-rows (a BF16 KV cache); no other packed one is taken.
+    // A BF16 tensor's rows are 32-byte face-rows (a BF16 KV cache); a block-float tensor's are
+    // its face-rows' datums and their exponents (a BFP8 or BFP4 KV cache,
+    // `docs/plans/block-float-kv.md` K1), the values staged as tiles of the same format.
     let half = match dst.elem {
         Elem::BF16 => record::SCATTER_ROWS_BF16,
-        Elem::Packed(_) => {
-            return Err(TensorError::Elem {
-                op: "a resident row scatter".into(),
-                got: dst.elem,
-                wants: Elem::F32,
-            })
-        }
+        Elem::Packed(format) => match record::scatter_rows_bfp(format.l1()) {
+            Some(flags) => flags,
+            None => {
+                return Err(TensorError::Elem {
+                    op: "a resident row scatter".into(),
+                    got: dst.elem,
+                    wants: Elem::F32,
+                })
+            }
+        },
         _ => 0,
     };
     let flags = half

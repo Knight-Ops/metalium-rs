@@ -878,6 +878,14 @@ pub fn render(
                     if m.name == "float_matmul" {
                         impls.push_str("if let Some(output) = crate::ops::bfp_matmul(&lhs, &rhs) { return output; }\n");
                     }
+                    // Attention over a block-float cache reads it as it lies: not decoded first.
+                    if m.name == "attention" {
+                        impls.push_str("if crate::ops::module::reads_block_float(&query, &key, &value, attn_bias.as_ref()) { return crate::ops::module::attention(query, key, value, mask, attn_bias, options); }\n");
+                    }
+                    // A block-float cache's write moves encoded rows: not decoded and cast again.
+                    if m.name == "float_scatter_nd" {
+                        impls.push_str("if let Some(output) = crate::ops::bfp_scatter_nd(&_data, &_indices, &_values, _reduction) { return output; }\n");
+                    }
                     for name in &floats {
                         impls.push_str(&format!(
                             "let {name} = crate::ops::bfp_compute_input({name});\n"

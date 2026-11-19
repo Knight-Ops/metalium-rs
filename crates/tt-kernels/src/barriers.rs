@@ -499,6 +499,7 @@ fn analysis_threads(ops: usize) -> usize {
 
 /// The dependencies and barrier classes of capture `c`, whose units are at `coords`.
 pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
+    let mut clock = crate::residency::Clock::new();
     // Each (op, unit)'s footprint: independent per op, so on every core in runs of ops.
     let foot = |rec: &crate::trace::OpRecord| {
         let mut per: BTreeMap<u16, Vec<Access>> = BTreeMap::new();
@@ -549,6 +550,7 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
         .flat_map(|per| per.values().flatten())
         .filter(|a| !matches!(a, Access::Range { .. }))
         .count() as u64;
+    clock.lap("footprints");
     // What is written anywhere: only those ranges are tracked.
     let mut memory = Memory::default();
     for per in &feet {
@@ -590,6 +592,7 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
             }
         }
     }
+    clock.lap("written");
     // The latest op each unit ran so far: what "everything" means for an unplaced move.
     let mut latest: BTreeMap<u16, u32> = BTreeMap::new();
     // The ops since an unplaced move or an all-GDDR read, which every later write must follow.
@@ -660,18 +663,21 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
         }
         deps_all.push(op_deps);
     }
+    clock.lap("dependencies");
     // Keep barriers greedily: op `k` joins the run since the last kept barrier unless one of its
     // units depends on another unit's op in that run.
     let mut classes = Vec::with_capacity(feet.len().saturating_sub(1));
     let mut start = 0u32;
+    // The units of the ops `start..k`, grown as `k` goes on.
+    let mut since: BTreeSet<u16> = feet
+        .first()
+        .map(|p| p.keys().copied().collect())
+        .unwrap_or_default();
     for (k, deps) in deps_all.iter().enumerate().skip(1) {
-        let since: BTreeSet<u16> = feet[start as usize..k]
-            .iter()
-            .flat_map(|p| p.keys().copied())
-            .collect();
         let needs = deps.values().any(|d| d.values().any(|&j| j >= start));
         if !needs {
             classes.push(Class::Unneeded);
+            since.extend(feet[k].keys().copied());
             continue;
         }
         let full = deps.iter().any(|(u, d)| {
@@ -684,7 +690,14 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
         });
         classes.push(if full { Class::Full } else { Class::Sparse });
         start = k as u32;
+        since = feet[k].keys().copied().collect();
     }
+    clock.lap("classes");
+    let accesses: usize = feet.iter().flat_map(|p| p.values()).map(Vec::len).sum();
+    clock.report_as(&format!(
+        "barriers ({} ops, {accesses} accesses)",
+        feet.len()
+    ));
     Analysis {
         ops,
         deps: deps_all,

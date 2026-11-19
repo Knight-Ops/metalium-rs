@@ -223,9 +223,17 @@ fn decode_contained(
     usable: u32,
     e: [u32; 8],
 ) -> std::result::Result<(), u32> {
-    if let Entry::Move { descriptor, .. } = Entry::decode(usable, e)? {
-        contained(arena, e[0], descriptor.l1, descriptor.range.len())
-            .map_err(|_| dm::error::RANGE)?;
+    match Entry::decode(usable, e)? {
+        Entry::Move { descriptor, .. } => {
+            contained(arena, e[0], descriptor.l1, descriptor.range.len())
+                .map_err(|_| dm::error::RANGE)?;
+        }
+        Entry::CopyBytes { src, dst, count } => {
+            for at in [src, dst] {
+                contained(arena, e[0], at, count as u64).map_err(|_| dm::error::RANGE)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

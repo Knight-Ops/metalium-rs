@@ -729,6 +729,11 @@ impl FloatTensorOps<TtBackend> for TtBackend {
         {
             let result_storage =
                 crate::ops::bfp_result_storage("float_scatter_nd", &storage_inputs);
+            if let Some(output) =
+                crate::ops::bfp_scatter_nd(&_data, &_indices, &_values, _reduction)
+            {
+                return output;
+            }
             let _data = crate::ops::bfp_compute_input(_data);
             let _values = crate::ops::bfp_compute_input(_values);
             return crate::ops::bfp_compute_result(
@@ -4182,6 +4187,9 @@ impl ModuleOps<TtBackend> for TtBackend {
         {
             let result_storage = crate::ops::bfp_result_storage("attention", &storage_inputs);
             drop(storage_inputs);
+            if crate::ops::module::reads_block_float(&query, &key, &value, attn_bias.as_ref()) {
+                return crate::ops::module::attention(query, key, value, mask, attn_bias, options);
+            }
             let query = crate::ops::bfp_compute_input(query);
             let key = crate::ops::bfp_compute_input(key);
             let value = crate::ops::bfp_compute_input(value);

@@ -1126,7 +1126,11 @@ fn weight_image_job(
 ) -> tensor::Job {
     use tt_isa::dm::op;
     let host_move = [
-        if upload { op::HOST_READ } else { op::HOST_WRITE },
+        if upload {
+            op::HOST_READ
+        } else {
+            op::HOST_WRITE
+        },
         host as u32,
         (host >> 32) as u32,
         0,
@@ -2792,7 +2796,11 @@ impl CaptureTimes {
 
     fn report_as(&self, what: &str) {
         if self.on {
-            let parts: Vec<String> = self.laps.iter().map(|(w, t)| format!("{w} {t:.2} s")).collect();
+            let parts: Vec<String> = self
+                .laps
+                .iter()
+                .map(|(w, t)| format!("{w} {t:.2} s"))
+                .collect();
             eprintln!("tt-kernels {what} ({} ops): {}", self.ops, parts.join(", "));
         }
     }
@@ -4071,11 +4079,10 @@ impl<T: Transport> Session<T> {
             return Err(TensorError::Shape("an empty weight image".into()));
         }
         let grid = [image.rows.div_ceil(32), image.cols.div_ceil(32)];
-        let placement = self.dram_state()?.alloc.alloc_laid(
-            grid,
-            image.format.slot_bytes(),
-            image.layout,
-        )?;
+        let placement =
+            self.dram_state()?
+                .alloc
+                .alloc_laid(grid, image.format.slot_bytes(), image.layout)?;
         let ranges = placement.extent_ranges();
         for (range, bytes) in ranges.iter().zip(&image.channels) {
             if bytes.len() as u64 != range.len() {
@@ -4177,9 +4184,9 @@ impl<T: Transport> Session<T> {
                 let ExtentDir::Down(dst) = &mut data else {
                     unreachable!("download");
                 };
-                self.staging().expect("checked above").with_bytes(&mut |buf| {
-                    dst[at..at + n].copy_from_slice(&buf[off..off + n])
-                });
+                self.staging()
+                    .expect("checked above")
+                    .with_bytes(&mut |buf| dst[at..at + n].copy_from_slice(&buf[off..off + n]));
             }
             at += n;
         }
@@ -6928,7 +6935,11 @@ impl<T: Transport> Session<T> {
             .iter()
             .map(|u| (u.tile.x(), u.tile.y()))
             .collect();
-        times.lap(if capture.planned { "verify plan" } else { "make plan" });
+        times.lap(if capture.planned {
+            "verify plan"
+        } else {
+            "make plan"
+        });
         let barriers = (prune || crate::barriers::probe_dir().is_some())
             .then(|| crate::barriers::analyse(&capture, &coords));
         times.lap("barrier analysis");
@@ -8031,6 +8042,29 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn copy(&mut self, t: &DramTensor) -> Result<DramTensor, TensorError> {
+        // A block-float tensor's slots are its format's, which the run records do not step by:
+        // its tiles are copied as they lie into slots of the same size and layout (a block-float
+        // KV cache's eager write, `docs/plans/block-float-kv.md` K3).
+        if let Some(src) = t.as_bfp() {
+            let placement = self.dram_state()?.alloc.alloc_laid(
+                t.grid(),
+                src.format().slot_bytes(),
+                t.placement.layout(),
+            )?;
+            let out = DramTensor::from_bfp(crate::bfp::BfpTensor::from_parts(
+                t.rows,
+                t.cols,
+                src.format(),
+                placement,
+            ));
+            let dst = out.as_bfp().expect("a block-float tensor");
+            if let Err(e) = self.copy_into_bfp(&src, &dst) {
+                let _ = self.free(out);
+                return Err(e);
+            }
+            out.set_pad(t.pad());
+            return Ok(out);
+        }
         let units = self.spread_for(tiles_of(t));
         let work = tensor::copy(&mut self.dram_state()?.alloc, t, units)?;
         let out = self.execute_on(work, units, RESET_BUDGET)?;

@@ -100,7 +100,8 @@ impl Record {
                 if *rows == 0 || *cols == 0 || *slot_bytes == 0 || slot_bytes % 64 != 0 {
                     return Err(format!("{name}: empty or unaligned image"));
                 }
-                if channels.is_empty() || channels.iter().any(|c| c.len() % *slot_bytes as usize != 0)
+                if channels.is_empty()
+                    || channels.iter().any(|c| c.len() % *slot_bytes as usize != 0)
                 {
                     return Err(format!("{name}: a channel is not a whole number of slots"));
                 }
@@ -225,7 +226,10 @@ impl Reader {
         self.read += len + 8;
         let got = parallel_hash(&body);
         if got != want {
-            return Err(format!("weight cache: record {} does not hash", self.records));
+            return Err(format!(
+                "weight cache: record {} does not hash",
+                self.records
+            ));
         }
         self.payload = fnv1a64_continue(self.payload, &got.to_le_bytes());
         self.records += 1;
@@ -349,7 +353,8 @@ impl Writer {
         file.write_all(MAGIC).map_err(io)?;
         file.write_all(&VERSION.to_le_bytes()).map_err(io)?;
         let id = identity.bytes();
-        file.write_all(&(id.len() as u32).to_le_bytes()).map_err(io)?;
+        file.write_all(&(id.len() as u32).to_le_bytes())
+            .map_err(io)?;
         file.write_all(&id).map_err(io)?;
         file.write_all(&identity.checksum().to_le_bytes())
             .map_err(io)?;
@@ -520,12 +525,7 @@ pub fn model_identity(paths: &[PathBuf]) -> Result<String, String> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        lines.push(format!(
-            "{} {} {}",
-            path.display(),
-            meta.len(),
-            modified
-        ));
+        lines.push(format!("{} {} {}", path.display(), meta.len(), modified));
     }
     Ok(lines.join("\n"))
 }

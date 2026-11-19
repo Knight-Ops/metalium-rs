@@ -4218,9 +4218,14 @@ impl SrcRoute {
     /// Whether the kernel's unpacker can transpose this route's `B` as it unpacks it
     /// (`record::GATHER_B_UNPACK_TRANSPOSE`, [`tt_isa::unpacker::stage_transpose`]): an FP32 `B` on
     /// the TF32 route, and a BF16 `B` moved to `SrcA` as is, whose faces `Haloize_mode` transposes
-    /// as it does an FP32 one's (roadmap W1; gate `step272_transposed_bf16_b`). A BFP `B` is not.
+    /// as it does an FP32 one's (roadmap W1; gate `step272_transposed_bf16_b`), and a block-float
+    /// `B` (BFP8, BFP4, BFP2), decoded into `SrcA` and transposed there alike (a block-float KV
+    /// cache's keys, `docs/plans/block-float-kv.md` K2; gate `step277_transposed_bfp_b`).
     pub fn unpacks_transposed_b(self) -> bool {
-        self == SrcRoute::Tf32FromFp32 || self.packed_b() == Some(TileFormat::BF16)
+        self == SrcRoute::Tf32FromFp32
+            || self
+                .packed_b()
+                .is_some_and(|b| b == TileFormat::BF16 || crate::bfp::BfpFormat::of(b).is_some())
     }
 
     /// `A`'s format where it is packed ([`SrcRoute::Edges`]).

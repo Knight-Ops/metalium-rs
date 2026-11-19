@@ -1636,12 +1636,10 @@ impl Qwen35<burn_tt::Tt> {
         device: &burn_tt::TtDevice,
     ) -> Result<(Self, Loaded), LoadError> {
         let plan = crate::quant::Plan::for_numerics(numerics, options);
-        let (channels, columns) = burn_tt::weight_layout(*device).map_err(|e| {
-            LoadError::Store(format!("weight cache: the card's layout: {e}"))
-        })?;
+        let (channels, columns) = burn_tt::weight_layout(*device)
+            .map_err(|e| LoadError::Store(format!("weight cache: the card's layout: {e}")))?;
         let identity = crate::weight_cache::Identity {
-            model: crate::weight_cache::model_identity(paths)
-                .map_err(LoadError::Store)?,
+            model: crate::weight_cache::model_identity(paths).map_err(LoadError::Store)?,
             plan: plan.cache_key(),
             layout: layout_stamp(config, options, channels, columns),
         };
@@ -1675,14 +1673,16 @@ impl Qwen35<burn_tt::Tt> {
                     Err(CacheLoad::Fail(e)) => return Err(e),
                 }
             }
-            None if cache.exists() => miss("für ein anderes Modell, einen anderen Plan oder eine ältere Version".into()),
+            None if cache.exists() => {
+                miss("für ein anderes Modell, einen anderen Plan oder eine ältere Version".into())
+            }
             None => miss("noch keine Datei".into()),
         }
         let (model, loaded) =
             Self::streamed_with_plan(config, paths, numerics, options, &plan, device)?;
         let started = std::time::Instant::now();
-        let mut writer = crate::weight_cache::Writer::create(cache, &identity)
-            .map_err(LoadError::Store)?;
+        let mut writer =
+            crate::weight_cache::Writer::create(cache, &identity).map_err(LoadError::Store)?;
         let records = model.write_cache(&mut writer)?;
         writer.finish().map_err(LoadError::Store)?;
         let bytes = std::fs::metadata(cache).map(|m| m.len()).unwrap_or(0);
@@ -1794,11 +1794,12 @@ impl Qwen35<burn_tt::Tt> {
         if options.host_embedding {
             model = model
                 .with_host_embedding(
-                    HostEmbedding::from_shards(paths, &is_embed_table)
-                        .map_err(CacheLoad::Fail)?,
+                    HostEmbedding::from_shards(paths, &is_embed_table).map_err(CacheLoad::Fail)?,
                 )
                 .map_err(CacheLoad::Fail)?;
-        } else if let Some(weight) = take_matrix(&mut images, &mut values, "embed_tokens.weight", device)? {
+        } else if let Some(weight) =
+            take_matrix(&mut images, &mut values, "embed_tokens.weight", device)?
+        {
             model.embed_tokens = Some(Embedding {
                 weight: Param::from_tensor(weight),
             });
@@ -1812,15 +1813,12 @@ impl Qwen35<burn_tt::Tt> {
                 &mut values,
             )?);
         }
-        model.norm = centered(
-            &mut values,
-            "norm.weight",
-            config.eps,
-            device,
-        )?;
+        model.norm = centered(&mut values, "norm.weight", config.eps, device)?;
         if !config.tied_head {
             let weight = take_matrix(&mut images, &mut values, "lm_head.weight", device)?
-                .ok_or_else(|| CacheLoad::Fail(LoadError::Store("lm_head.weight missing".into())))?;
+                .ok_or_else(|| {
+                    CacheLoad::Fail(LoadError::Store("lm_head.weight missing".into()))
+                })?;
             model.lm_head = Some(Linear {
                 weight: Param::from_tensor(weight),
                 bias: None,
@@ -1842,10 +1840,13 @@ impl Qwen35<burn_tt::Tt> {
         if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
             model.kv = Some(DType::BF16);
         }
-        Ok((model, Loaded {
-            applied: n,
-            ignored: Vec::new(),
-        }))
+        Ok((
+            model,
+            Loaded {
+                applied: n,
+                ignored: Vec::new(),
+            },
+        ))
     }
 
     /// Every parameter into `writer`; the number of records.
@@ -1934,10 +1935,7 @@ impl ModuleVisitor<burn_tt::Tt> for CacheWriter<'_> {
     fn exit_module(&mut self, _name: &str, _container: &str) {
         self.path.pop();
     }
-    fn visit_float<const D: usize>(
-        &mut self,
-        param: &Param<Tensor<burn_tt::Tt, D>>,
-    ) {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<burn_tt::Tt, D>>) {
         if self.error.is_some() {
             return;
         }
@@ -2027,11 +2025,7 @@ fn tensor_from_values<const D: usize>(
         0 => tensor,
         1 => tensor.cast(DType::BF16),
         2 => tensor.cast(DType::F16),
-        _ => {
-            return Err(CacheLoad::Fail(LoadError::Store(format!(
-                "dtype {dtype}"
-            ))))
-        }
+        _ => return Err(CacheLoad::Fail(LoadError::Store(format!("dtype {dtype}")))),
     })
 }
 
@@ -2056,9 +2050,8 @@ fn require_matrix(
     name: &str,
     device: &burn_tt::TtDevice,
 ) -> Result<Tensor<burn_tt::Tt, 2>, CacheLoad> {
-    take_matrix(images, values, name, device)?.ok_or_else(|| {
-        CacheLoad::Fail(LoadError::Store(format!("weight cache: {name} missing")))
-    })
+    take_matrix(images, values, name, device)?
+        .ok_or_else(|| CacheLoad::Fail(LoadError::Store(format!("weight cache: {name} missing"))))
 }
 
 fn vector(
@@ -2135,9 +2128,7 @@ fn layer_from_cache(
             tensor_from_values::<3>(dtype, dims, data, device)?
         };
         let taps = match take_values(values, &p("linear_attn.taps"))? {
-            Some((dtype, dims, data)) => {
-                Some(tensor_from_values::<3>(dtype, dims, data, device)?)
-            }
+            Some((dtype, dims, data)) => Some(tensor_from_values::<3>(dtype, dims, data, device)?),
             None => None,
         };
         let one = |values: &mut std::collections::HashMap<String, (u8, Vec<usize>, Vec<f32>)>,
@@ -2167,11 +2158,7 @@ fn layer_from_cache(
             q_scale: q_scale.map(Param::from_tensor),
             k_scale: k_scale.map(Param::from_tensor),
             norm: GatedNorm {
-                weight: Param::from_tensor(vector(
-                    values,
-                    &p("linear_attn.norm.weight"),
-                    device,
-                )?),
+                weight: Param::from_tensor(vector(values, &p("linear_attn.norm.weight"), device)?),
                 eps: config.eps,
             },
             out_proj: linear_of(matrix(images, values, "linear_attn.out_proj.weight")?),
@@ -2661,7 +2648,11 @@ mod tests {
         };
         model.visit(&mut names);
         let has = |n: &str| names.names.iter().any(|p| p == n);
-        assert!(has("layers.0.linear_attn.in_proj.weight"), "{:?}", names.names);
+        assert!(
+            has("layers.0.linear_attn.in_proj.weight"),
+            "{:?}",
+            names.names
+        );
         assert!(has("layers.0.mlp.gate_up.weight"), "{:?}", names.names);
         assert!(has("layers.1.self_attn.qkv.weight"), "{:?}", names.names);
         assert!(names.names.iter().all(|p| !p.contains("gate_proj")));

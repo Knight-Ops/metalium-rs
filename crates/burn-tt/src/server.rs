@@ -151,10 +151,7 @@ pub trait Engine {
         Err(unsupported())
     }
     /// `id` as the bytes it occupies in GDDR ([`Engine::upload_bfp_image`] writes them back).
-    fn download_bfp_image(
-        &mut self,
-        _id: BufferId,
-    ) -> Result<tt_kernels::bfp::BfpImage, TtError> {
+    fn download_bfp_image(&mut self, _id: BufferId) -> Result<tt_kernels::bfp::BfpImage, TtError> {
         Err(unsupported())
     }
     /// A new buffer holding `image`'s bytes in `image`'s layout.
@@ -1672,7 +1669,7 @@ impl DramBuffers {
     }
 
     /// [`Session::scatter_rows`]: a 32-bit table, or a two-byte one (a BF16 KV cache) whose
-    /// rows move whole; a BFP one refused.
+    /// rows move whole, or a block-float one taking rows of its format.
     pub fn scatter_rows<T: tt_device::Transport>(
         &mut self,
         s: &mut Session<T>,
@@ -1693,12 +1690,15 @@ impl DramBuffers {
         Ok(self.insert_any(c))
     }
 
-    fn refuse_bfp_scatter(&self, buffers: [BufferId; 2]) -> Result<(), TtError> {
-        match buffers.iter().any(|&b| self.is_bfp(b)) {
-            true => Err(TtError::Device(
-                "a row scatter of a BFP table is not implemented".into(),
+    /// A block-float table takes rows of its own format (encoded rows, `record::SCATTER_ROWS`
+    /// with a block-float format, `docs/plans/block-float-kv.md` K1), and only a block-float
+    /// table takes them; the session refuses two formats by name.
+    fn refuse_bfp_scatter(&self, [table, values]: [BufferId; 2]) -> Result<(), TtError> {
+        match self.is_bfp(table) == self.is_bfp(values) {
+            true => Ok(()),
+            false => Err(TtError::Device(
+                "a row scatter takes block-float rows into a block-float table only".into(),
             )),
-            false => Ok(()),
         }
     }
 
@@ -4245,10 +4245,7 @@ impl Engine for KmdEngine {
     fn weight_layout(&mut self) -> Result<(usize, bool), TtError> {
         self.session.weight_layout().map_err(TtError::from)
     }
-    fn download_bfp_image(
-        &mut self,
-        id: BufferId,
-    ) -> Result<tt_kernels::bfp::BfpImage, TtError> {
+    fn download_bfp_image(&mut self, id: BufferId) -> Result<tt_kernels::bfp::BfpImage, TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?

@@ -132,13 +132,18 @@ fn plan_slots(tiles: [usize; 3], kv_slot: u64) -> Option<Slots> {
     })
 }
 
-/// The route of a job over keys and values of `kv` (F32 or BF16) and its `kv_slot`: TF32 for F32
-/// ones, a BF16 `B` moved as is otherwise (`SrcRoute::Edges`; its product the widened `B`'s, bit
-/// for bit, gate `step270`).
+/// The route of a job over keys and values of `kv` (F32, BF16 or a block float) and its `kv_slot`:
+/// TF32 for F32 ones, a packed `B` moved as is otherwise (`SrcRoute::Edges`; its product the
+/// widened `B`'s, bit for bit, gates `step270`, `step277`).
 fn kv_route(kv: Elem) -> Option<SrcRoute> {
     match kv {
         Elem::F32 => Some(SrcRoute::Tf32FromFp32),
         Elem::BF16 => SrcRoute::edges(TileFormat::FP32, TileFormat::BF16),
+        // A block-float cache's (`docs/plans/block-float-kv.md` K3): decoded into `Src` as it
+        // lies, the keys transposed by the unpacker (`step277`).
+        Elem::Packed(f) if crate::bfp::BfpFormat::of(f).is_some() => {
+            SrcRoute::edges(TileFormat::FP32, f)
+        }
         _ => None,
     }
 }
@@ -390,8 +395,12 @@ pub fn attention_rows(
     if route != SrcRoute::Tf32FromFp32 {
         return Err(shape_error(format!("route {route:?}")));
     }
-    let route = kv_route(k.elem)
-        .ok_or_else(|| shape_error(format!("keys and values of {:?}: F32 or BF16", k.elem)))?;
+    let route = kv_route(k.elem).ok_or_else(|| {
+        shape_error(format!(
+            "keys and values of {:?}: F32, BF16 or a block float",
+            k.elem
+        ))
+    })?;
     let packed = route.packed_b().is_some();
     // The mover transposes FP32 datums alone: BF16 keys are transposed by the unpacker.
     if packed && !unpack_b {

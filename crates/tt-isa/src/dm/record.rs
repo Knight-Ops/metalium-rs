@@ -51,8 +51,9 @@ pub const GATHER_A_RESIDENT: u32 = 1 << 25;
 /// [`GATHER`]'s flag for a transposed `B` (bit 1) whose tiles the kernel's unpacker transposes:
 /// tile `(kk, j)` of `op(B)` is `B`'s tile `(j, kk)` read as it lies (`op::READ`, not
 /// `op::READ_TRANSPOSED`), so the mover moves whole tiles and transposes nothing. Refused
-/// without bit 1. With a packed `B` only for BF16, each tile read whole from its own slot
-/// (roadmap W1: a tied table's head `last @ table^T`, a BF16 cache's `q k^T`).
+/// without bit 1. A packed `B` (BF16, or a block float) has each tile read whole from its own
+/// slot (roadmap W1: a tied table's head `last @ table^T`, a BF16 cache's `q k^T`; a block-float
+/// cache's, `docs/plans/block-float-kv.md` K2).
 pub const GATHER_B_UNPACK_TRANSPOSE: u32 = 1 << 26;
 /// [`GATHER`]'s flag for a prefetch: RISCV B issues the record's reads on
 /// [`super::TXN_PREFETCH`], not its own ID, so nothing but an [`super::op::WAIT`] with
@@ -72,7 +73,7 @@ pub const GATHER_STREAM: u32 = 1 << 28;
 /// (`b_at + (kk * cols + j) * slot`: more tiles in a ring than an FP32 `B`'s,
 /// `docs/completed-plans/bf16-weight-storage.md` A5b), where the kernel unpacks it in its own format
 /// (`tt_kernels::matmul::SrcRoute::Tf32WithB`). A packed `B` is untransposed only (not bit 1),
-/// but for BF16 transposed by the kernel ([`GATHER_B_UNPACK_TRANSPOSE`]); with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
+/// but transposed by the kernel ([`GATHER_B_UNPACK_TRANSPOSE`]: BF16, and the block floats); with every other flag, and in a [`PrefetchCursor`], as an FP32 `B` is. Its tensor's padding is
 /// the writer's (zero for a stored weight): nothing is filled.
 pub const GATHER_B_FORMAT_SHIFT: u32 = 29;
 /// [`GATHER`]'s bits that hold `B`'s format code.
@@ -153,9 +154,7 @@ pub const fn gather_a_packed(flags: u32) -> bool {
 /// BF16, as it lies, for the kernel's unpacker to transpose ([`GATHER_B_UNPACK_TRANSPOSE`]; a BF16
 /// face is moved to `SrcA` as is and transposed there as an FP32 one is, roadmap W1).
 const fn gather_b_transpose_refused(flags: u32) -> bool {
-    gather_b_packed(flags)
-        && flags & 2 != 0
-        && (flags & GATHER_B_UNPACK_TRANSPOSE == 0 || flags & GATHER_B_FORMAT_MASK != GATHER_B_BF16)
+    gather_b_packed(flags) && flags & 2 != 0 && flags & GATHER_B_UNPACK_TRANSPOSE == 0
 }
 /// [`GATHER`]'s flags for a `B` stored BF16 (a weight in half the bytes) beside an FP32 `A`:
 /// [`gather_b_format`] of BF16, code 1.
@@ -466,6 +465,48 @@ pub const SCATTER_ROWS: u32 = 0x1A;
 pub const SCATTER_ROWS_COLUMN: u32 = 1 << 1;
 /// [`SCATTER_ROWS`]'s flag for a tensor of BF16 slots (a BF16 KV cache): 32-byte face-rows.
 pub const SCATTER_ROWS_BF16: u32 = 1;
+/// [`SCATTER_ROWS`]'s bits 24-26: a tensor of block-float tiles (a BFP8 or BFP4 KV cache), by
+/// [`GATHER_FORMATS`]' code, its slots that format's ([`crate::format::TileFormat::slot_bytes`];
+/// the reference names none, as a [`GATHER`]'s packed operand does). The staged values are tiles
+/// of the same format at the [`TILE_SLOT`] stride. A row of a block-float tile is its two
+/// face-rows of datums and their two exponent bytes, which no other row shares, so each is
+/// written alone: the datums' face-rows, then the exponents, one byte each. A write's L1 end
+/// must be congruent to its GDDR end mod 16; a piece whose staged bytes are not is first copied
+/// ([`op::COPY_BYTES`]) to an aside at the destination's offset mod 16, in the staged slot's
+/// tail past the tile ([`SCATTER_ROWS_ASIDE`]): 32 bytes for each index and face-row half, the
+/// exponent's 16 then the datums', so no aside is used twice in a record.
+pub const SCATTER_ROWS_BFP_SHIFT: u32 = 24;
+/// [`SCATTER_ROWS`]'s bits that hold a block-float format's code.
+pub const SCATTER_ROWS_BFP_MASK: u32 = 0b111 << SCATTER_ROWS_BFP_SHIFT;
+/// Where a [`SCATTER_ROWS_BFP_SHIFT`] record's asides begin in each staged slot: past a BFP8 tile
+/// (1,104 bytes), and 32 indices of two halves of 32 bytes end at 4,096, inside the slot.
+pub const SCATTER_ROWS_ASIDE: u32 = 2048;
+/// A [`SCATTER_ROWS_BFP_SHIFT`] code's face-row datum bytes and slot bytes, for codes 2-4 of
+/// [`GATHER_FORMATS`] (BFP8, BFP4, BFP2): constants, so the movers compute no tile image.
+const SCATTER_ROWS_BFP_ROWS: [(u32, u64); 3] = [
+    scatter_rows_bfp_row(GATHER_FORMATS[2]),
+    scatter_rows_bfp_row(GATHER_FORMATS[3]),
+    scatter_rows_bfp_row(GATHER_FORMATS[4]),
+];
+const fn scatter_rows_bfp_row(f: crate::tile::L1Format) -> (u32, u64) {
+    assert!(f.has_exponent_section());
+    (
+        f.datum_bits() * 2,
+        crate::format::TileFormat::new(f).slot_bytes(),
+    )
+}
+/// [`SCATTER_ROWS`]'s flags for a tensor of block-float `format` tiles, or `None` for a format
+/// that is not one (BFP8, BFP4, BFP2).
+pub const fn scatter_rows_bfp(format: crate::tile::L1Format) -> Option<u32> {
+    use crate::tile::L1Format as F;
+    match format {
+        F::Bfp8 | F::Bfp4 | F::Bfp2 => match gather_format_code(format) {
+            Some(code) => Some(code << SCATTER_ROWS_BFP_SHIFT),
+            None => None,
+        },
+        _ => None,
+    }
+}
 /// The bits of a [`SCATTER_ROWS`] index range ([`scatter_rows_range`]).
 const SCATTER_ROWS_RANGE: u32 = 0x3f << 8 | 0x3f << 16;
 
@@ -1589,7 +1630,13 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         }
         SCATTER_ROWS if WRITES => {
             let [_, idx_at, count, bound, j0, cols, stage_at, flags] = h;
-            if flags & !(SCATTER_ROWS_BF16 | SCATTER_ROWS_COLUMN | SCATTER_ROWS_RANGE) != 0 {
+            if flags
+                & !(SCATTER_ROWS_BF16
+                    | SCATTER_ROWS_COLUMN
+                    | SCATTER_ROWS_RANGE
+                    | SCATTER_ROWS_BFP_MASK)
+                != 0
+            {
                 return Err(super::error::RANGE);
             }
             // The indices written: a range of them, or (none given) all.
@@ -1607,10 +1654,15 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             if half != (x.slot != 0) {
                 return Err(super::error::RANGE);
             }
-            // A face-row's bytes: 64 for FP32, 32 for BF16; a tile's slot in `X` likewise.
-            let (row_bytes, slot) = match half {
-                true => (32, x.slot_bytes()),
-                false => (64, TILE_SLOT),
+            // A block float's code (BFP8, BFP4 or BFP2), never with BF16's flag.
+            let bfp = (flags & SCATTER_ROWS_BFP_MASK) >> SCATTER_ROWS_BFP_SHIFT;
+            // A face-row's bytes: 64 for FP32, 32 for BF16, a block float's datums (16, 8 or 4);
+            // a tile's slot in `X` likewise.
+            let (row_bytes, slot) = match (half, bfp) {
+                (true, 0) => (32, x.slot_bytes()),
+                (false, 0) => (64, TILE_SLOT),
+                (false, 2..=4) => SCATTER_ROWS_BFP_ROWS[bfp as usize - 2],
+                _ => return Err(super::error::RANGE),
             };
             // As `SELECT_ROWS`: every index checked before any write, each
             // read again where it is used, 32-bit arithmetic throughout.
@@ -1644,11 +1696,36 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 let mut row = x.cursor(v / 32, j0)?;
                 for j in 0..cols {
                     let (ch, off) = row.next_with_slot(slot)?;
+                    let staged = stage_at + j * TILE_SLOT as u32;
                     for half in 0..core::hint::black_box(2) {
-                        let to = off + face_row(v % 32, half);
-                        let from = stage_at + j * TILE_SLOT as u32 + face_row(r, half);
-                        sink.entry([op::WRITE, ch, port, to, from, row_bytes, 0, 0])?;
-                        port = if port + 1 == PORTS { 0 } else { port + 1 };
+                        if bfp == 0 {
+                            let to = off + face_row(v % 32, half);
+                            let from = staged + face_row(r, half);
+                            sink.entry([op::WRITE, ch, port, to, from, row_bytes, 0, 0])?;
+                            port = if port + 1 == PORTS { 0 } else { port + 1 };
+                            continue;
+                        }
+                        // The face-row's number in the tile (its exponent's), at the
+                        // destination and staged: the datums from `DATA + 64`, the exponents
+                        // from `DATA`.
+                        let number = |r: u32| (r / 16 * 2 + half) * 16 + r % 16;
+                        let (nv, nr) = (number(v % 32), number(r));
+                        let aside = staged + SCATTER_ROWS_ASIDE + (r * 2 + half) * 32;
+                        let mut piece = |to: u32, from: u32, len: u32, aside: u32| {
+                            let e = block_float_piece(ch, port, to, from, len, aside);
+                            if e[0][0] != 0 {
+                                sink.entry(e[0])?;
+                            }
+                            port = if port + 1 == PORTS { 0 } else { port + 1 };
+                            sink.entry(e[1])
+                        };
+                        piece(
+                            off + DATA + 64 + nv * row_bytes,
+                            staged + DATA + 64 + nr * row_bytes,
+                            row_bytes,
+                            aside + 16,
+                        )?;
+                        piece(off + DATA + nv, staged + DATA + nr, 1, aside)?;
                     }
                 }
             }
@@ -1681,6 +1758,29 @@ fn expand_for<const READS: bool, const WRITES: bool>(
         _ => return Err(super::error::OP),
     }
     Ok(())
+}
+
+/// One piece of a block-float row's [`SCATTER_ROWS`] write: `len` bytes staged at `from` to GDDR
+/// offset `to` of channel `ch`, through `port`. The [`op::WRITE`], and before it (else a zero
+/// entry) the [`op::COPY_BYTES`] that moves the bytes to `aside + to % 16` first where `from` is
+/// not congruent to `to` mod 16.
+#[inline(never)]
+fn block_float_piece(
+    ch: u32,
+    port: u32,
+    to: u32,
+    from: u32,
+    len: u32,
+    aside: u32,
+) -> [[u32; 8]; 2] {
+    if (to ^ from) % 16 == 0 {
+        return [[0; 8], [op::WRITE, ch, port, to, from, len, 0, 0]];
+    }
+    let at = aside + to % 16;
+    [
+        [op::COPY_BYTES, from, at, len, 0, 0, 0, 0],
+        [op::WRITE, ch, port, to, at, len, 0, 0],
+    ]
 }
 
 /// [`SELECT_ROWS`]'s and [`SCATTER_ROWS`]'s shared header checks: `count`
@@ -2096,6 +2196,10 @@ mod tests {
                     GATHER_A_RESIDENT | GATHER_B_BF16,
                     GATHER_A_RESIDENT | gather_rows(5) | GATHER_B_BF16,
                     GATHER_A_RESIDENT | GATHER_B_BF16 | 2 | GATHER_B_UNPACK_TRANSPOSE,
+                    GATHER_A_RESIDENT
+                        | gather_b_format(crate::tile::L1Format::Bfp8).unwrap()
+                        | 2
+                        | GATHER_B_UNPACK_TRANSPOSE,
                 ] {
                     let head = |f: u32| [GATHER, f | kt << 8, 0x2_0000, 0x6_0000, 0, 1, j0, cols];
                     let rec = |f: u32| {
@@ -2151,10 +2255,7 @@ mod tests {
             (GATHER_A_RESIDENT | GATHER_STREAM, t(2, 4)),
             (GATHER_A_RESIDENT | GATHER_B_BF16 | 2, t(2, 4)),
             (
-                GATHER_A_RESIDENT
-                    | gather_b_format(crate::tile::L1Format::Bfp8).unwrap()
-                    | 2
-                    | GATHER_B_UNPACK_TRANSPOSE,
+                GATHER_A_RESIDENT | gather_b_format(crate::tile::L1Format::Bfp8).unwrap() | 2,
                 t(2, 4),
             ),
         ] {
@@ -2338,8 +2439,8 @@ mod tests {
     /// [`super::super::BF16_TILE_SLOT`] from where a BF16 tensor keeps it (slot `t / n` of 2,112
     /// bytes on channel `t % n`), into a 2,112-byte L1 slot of its own (an FP32 `B`'s ring holds
     /// half the tiles in the same bytes), and `A`'s entries are untouched -- whole, thin, transposed, resident, streamed. A transposed BF16
-    /// `B` is read as it lies for the kernel's unpacker to transpose ([`GATHER_B_UNPACK_TRANSPOSE`]);
-    /// read transposed by the mover, or in another packed format, it is refused.
+    /// `B` is read as it lies for the kernel's unpacker to transpose ([`GATHER_B_UNPACK_TRANSPOSE`]),
+    /// as is a block-float one; a packed `B` read transposed by the mover is refused.
     #[test]
     fn a_bf16_b_reads_its_own_slots_whole() {
         use super::super::BF16_TILE_SLOT;
@@ -2419,12 +2520,35 @@ mod tests {
         }
         assert!(cases > 50);
         let bfp8 = gather_b_format(crate::tile::L1Format::Bfp8).unwrap();
-        for bad in [
-            GATHER_B_BF16 | 2,
-            bfp8 | 2,
-            bfp8 | 2 | GATHER_B_UNPACK_TRANSPOSE,
-        ] {
+        for bad in [GATHER_B_BF16 | 2, bfp8 | 2] {
             assert_eq!(gather(bad), Err(super::super::error::RANGE), "{bad:#x}");
+        }
+        // A block-float `B` the unpacker transposes (a BFP KV cache's keys,
+        // `docs/plans/block-float-kv.md` K2) is read as it lies too: each tile its whole slot, to
+        // an L1 slot of that size, the tile the transposed gather names.
+        for format in [crate::tile::L1Format::Bfp8, crate::tile::L1Format::Bfp4] {
+            let code = gather_b_format(format).unwrap();
+            let slot = crate::format::TileFormat::new(format).slot_bytes() as u32;
+            let f32_b = gather(2 | GATHER_B_UNPACK_TRANSPOSE).unwrap();
+            let got = gather(code | 2 | GATHER_B_UNPACK_TRANSPOSE).unwrap();
+            let first_b = f32_b.iter().position(|e| e[4] >= 0x6_0000).unwrap();
+            assert_eq!(got.len(), f32_b.len());
+            for (n, e) in got[first_b..].iter().enumerate() {
+                let (kk, j) = (n as u32 / cols, n as u32 % cols);
+                let tile = b.first + (j0 + j) * b.ct + kk;
+                let (at, c) = (tile / b.n as u32, (tile % b.n as u32) as usize);
+                assert_eq!(
+                    [e[0], e[1], e[3], e[4], e[5]],
+                    [
+                        op::READ,
+                        b.channels[c] as u32,
+                        b.base[c] + at * slot,
+                        0x6_0000 + (kk * cols + j) * slot,
+                        slot
+                    ],
+                    "{format:?}, B tile {n}"
+                );
+            }
         }
     }
 
@@ -2900,6 +3024,128 @@ mod tests {
                 expand_writes(&rec, l1_of(&values), |_| Ok(())),
                 Err(crate::dm::error::RANGE)
             );
+        }
+    }
+
+    /// A block-float tensor's rows (a BFP8, BFP4 or BFP2 KV cache's write,
+    /// `docs/plans/block-float-kv.md` K1): the expansion's entries, run against an L1 and a GDDR
+    /// of bytes (`COPY_BYTES` inside L1, `WRITE`s out), put each staged row's datums and its two
+    /// exponents in its destination row, where the tile image says (`TileImage`'s offsets,
+    /// independently of `expand`'s arithmetic), and write no other byte. Every write is congruent
+    /// mod 16; a copy goes to the staged slot's tail, and no aside is written twice. Indices of
+    /// every residue mod 32 are among them, so both straight writes and copied ones are made.
+    #[test]
+    fn scatter_rows_writes_block_float_rows_and_their_exponents() {
+        use crate::tile::{L1Format, TileImage};
+        let values: std::vec::Vec<u32> = (0..32u32).map(|r| (r * 37 + 5) % 100).collect();
+        let (j0, cols, count, bound) = (1u32, 3u32, values.len() as u32, 100u32);
+        for format in [L1Format::Bfp8, L1Format::Bfp4, L1Format::Bfp2] {
+            let tile = crate::format::TileFormat::new(format);
+            let image: TileImage = tile.image();
+            let slot = tile.slot_bytes();
+            let mut x = t(3, 5);
+            x.first = 2;
+            let flags = scatter_rows_bfp(format).unwrap();
+            for range in [0, scatter_rows_range(3..29)] {
+                let rec = scatter(x, bound, count, j0, cols, flags | range);
+                let mut got = std::vec::Vec::new();
+                expand_writes(&rec, l1_of(&values), |e| {
+                    got.push(e);
+                    Ok(())
+                })
+                .unwrap();
+                let staged = |at: u32| (at.wrapping_mul(2_654_435_761) >> 11) as u8;
+                let mut l1 = std::collections::HashMap::<u32, u8>::new();
+                let mut asides = std::collections::HashSet::<u32>::new();
+                let mut gddr = std::collections::HashMap::<(u32, u32), u8>::new();
+                let mut copies = 0;
+                for e in &got {
+                    match e[0] {
+                        op::COPY_BYTES => {
+                            copies += 1;
+                            let j = (e[2] - STAGE) / TILE_SLOT as u32;
+                            let tail = STAGE + j * TILE_SLOT as u32 + SCATTER_ROWS_ASIDE;
+                            assert!(e[2] >= tail && e[2] + e[3] <= tail + 2048, "{e:x?}");
+                            for b in 0..e[3] {
+                                let v = *l1.get(&(e[1] + b)).unwrap_or(&staged(e[1] + b));
+                                assert!(asides.insert(e[2] + b), "an aside written twice: {e:x?}");
+                                l1.insert(e[2] + b, v);
+                            }
+                        }
+                        op::WRITE => {
+                            assert_eq!(e[3] % 16, e[4] % 16, "{e:x?}");
+                            for b in 0..e[5] {
+                                let v = *l1.get(&(e[4] + b)).unwrap_or(&staged(e[4] + b));
+                                assert!(gddr.insert((e[1], e[3] + b), v).is_none(), "{e:x?}");
+                            }
+                        }
+                        other => panic!("entry {other:#x}"),
+                    }
+                }
+                assert!(copies > 0, "{format:?}: some piece needs its aside");
+                let rows: std::vec::Vec<(usize, u32)> = values
+                    .iter()
+                    .enumerate()
+                    .filter(|&(r, _)| range == 0 || (3..29).contains(&r))
+                    .map(|(r, &v)| (r, v))
+                    .collect();
+                let mut want_bytes = 0;
+                for &(r, v) in &rows {
+                    for j in 0..cols {
+                        let (ch, off) = x.tile_in(v / 32, j0 + j, slot).unwrap();
+                        let from = STAGE + j * TILE_SLOT as u32;
+                        let mut bytes = std::collections::BTreeSet::new();
+                        for c in 0..32usize {
+                            let to_i = crate::dm::face_index((v % 32) as usize, c);
+                            let from_i = crate::dm::face_index(r, c);
+                            let (te, fe) = (
+                                image.exponent_byte_offset(to_i).unwrap() as u32,
+                                image.exponent_byte_offset(from_i).unwrap() as u32,
+                            );
+                            assert_eq!(
+                                gddr[&(ch, off + te)],
+                                staged(from + fe),
+                                "{format:?} row {v} exponent of column {c}"
+                            );
+                            bytes.insert(te);
+                            let bits = format.datum_bits() as usize;
+                            let (td, fd) = (
+                                image.datum_bit_offset(to_i) / 8,
+                                image.datum_bit_offset(from_i) / 8,
+                            );
+                            // A datum's byte (BFP4 and BFP2 share one between neighbours of a face-row).
+                            assert_eq!(
+                                gddr[&(ch, off + td as u32)],
+                                staged(from + fd as u32),
+                                "{format:?} row {v} column {c}, {bits} bits"
+                            );
+                            bytes.insert(td as u32);
+                        }
+                        want_bytes += bytes.len();
+                    }
+                }
+                assert_eq!(
+                    gddr.len(),
+                    want_bytes,
+                    "{format:?}: only the rows' bytes are written"
+                );
+            }
+            // A block-float flag beside BF16's, on a tensor naming BF16 slots, or naming a format
+            // without exponents, writes nothing.
+            let mut bf16 = x;
+            bf16.slot = BF16_TILE_SLOT as u32;
+            let no_exponents =
+                gather_format_code(L1Format::Bf16).unwrap() << SCATTER_ROWS_BFP_SHIFT;
+            for rec in [
+                scatter(x, bound, count, j0, cols, flags | SCATTER_ROWS_BF16),
+                scatter(bf16, bound, count, j0, cols, flags),
+                scatter(x, bound, count, j0, cols, no_exponents),
+            ] {
+                assert_eq!(
+                    expand_writes(&rec, l1_of(&values), |_| Ok(())),
+                    Err(crate::dm::error::RANGE)
+                );
+            }
         }
     }
 

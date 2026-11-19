@@ -500,6 +500,13 @@ pub mod op {
     /// ([`super::encoded::validate`]). Only an image built with `fast-reads` runs it
     /// ([`super::caps::FAST_READS`]); B only.
     pub const READ_ENCODED: u32 = 0x4A;
+    /// RISCV NC copies 1..=16 bytes inside the data arena: `[COPY_BYTES, src, dst, count, 0, 0, 0,
+    /// 0]`. A GDDR write needs its L1 and GDDR ends congruent mod 16, so a write whose staged
+    /// bytes sit at another offset is copied first to an aside at the destination's: a block-float
+    /// row's exponent bytes, or a BFP4 face-row, in [`record::SCATTER_ROWS`]. It waits for nothing:
+    /// the bytes are NC's own staging, landed before the credit its list waited on, and each
+    /// aside is a write's own (the record never reuses one before the writer's credit pop).
+    pub const COPY_BYTES: u32 = 0x4B;
     /// L1 -> DRAM.
     pub const WRITE: u32 = 2;
     /// L1 -> another Tensix tile's L1: `[WRITE_L1, x, y, to, from, len, 0, 0]`, [`WRITE`]'s
@@ -808,6 +815,7 @@ impl Mover {
                     && op != op::WRITE_L1
                     && op != op::WRITE_L1_MCAST
                     && op != op::CHECK_FLAGS
+                    && op != op::COPY_BYTES
                     && !matches!(record::direction(op), Some(record::Direction::Write))
             }
             _ => {
@@ -815,6 +823,7 @@ impl Mover {
                     || op == op::WRITE_L1
                     || op == op::WRITE_L1_MCAST
                     || op == op::CHECK_FLAGS
+                    || op == op::COPY_BYTES
                     || op == op::WAIT
                     || op == op::CB
                     || op == op::CREDIT
@@ -1054,6 +1063,8 @@ pub enum Entry {
         dst_stride: u32,
         halfwords: bool,
     },
+    /// [`op::COPY_BYTES`].
+    CopyBytes { src: u32, dst: u32, count: u32 },
     Released {
         target: u16,
         which: crate::dataflow::Release,
@@ -1218,6 +1229,23 @@ impl Entry {
                 src_stride: w[4],
                 dst_stride: w[5],
                 halfwords: width == 2,
+            });
+        }
+        if w[0] == op::COPY_BYTES {
+            if w[3] == 0 || w[3] > 16 || w[4..].iter().any(|&v| v != 0) {
+                return Err(error::LENGTH);
+            }
+            for at in [w[1], w[2]] {
+                if (at as u64) < crate::l1::LISTED.base
+                    || at as u64 + w[3] as u64 > crate::l1::LISTED.end
+                {
+                    return Err(error::ALIGNMENT);
+                }
+            }
+            return Ok(Self::CopyBytes {
+                src: w[1],
+                dst: w[2],
+                count: w[3],
             });
         }
         if w[0] == op::WRITE_L1_MCAST {

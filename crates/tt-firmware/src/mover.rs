@@ -1361,6 +1361,20 @@ fn exec(me: (u8, u8), usable: u32, w: [u32; 8]) -> Result<(), u32> {
             }
             publish();
         }
+        Entry::CopyBytes { src, dst, count } => {
+            if !IS_NC {
+                return Err(dm::error::DIRECTION);
+            }
+            for n in 0..count {
+                // SAFETY: decode checks both ranges lie inside the listed region.
+                unsafe {
+                    let value = core::ptr::read_volatile((src + n) as *const u8);
+                    core::ptr::write_volatile((dst + n) as *mut u8, value);
+                }
+            }
+            // The write that reads the aside goes out through the NoC: the bytes land first.
+            publish();
+        }
         Entry::Buffer {
             stream,
             action,

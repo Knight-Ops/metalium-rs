@@ -679,6 +679,35 @@ impl TtTensor {
                     stored_dims(&self.cell.shape.to_vec()).expect("callers check the rank");
                 if let Some(v) = &self.cell.strided {
                     v.src.current();
+                    // A view of block-float tiles is made plain from its source decoded: the
+                    // moves and repacks below copy FP32 words.
+                    let decoded;
+                    let v = if v.src.buffer.storage != crate::storage::StorageFormat::F32
+                        && v.src.buffer.storage != crate::storage::StorageFormat::Bf16
+                    {
+                        let src = &v.src.buffer;
+                        let (id, dims) =
+                            server::cast_bfp(self.device, src.id, [src.rows, src.cols], None);
+                        decoded = Strided {
+                            src: DramRef {
+                                buffer: Arc::new(Buffer {
+                                    id,
+                                    device: self.device,
+                                    rows: dims[0],
+                                    cols: dims[1],
+                                    parent: None,
+                                    storage: crate::storage::StorageFormat::F32,
+                                    plain: Default::default(),
+                                }),
+                                transposed: v.src.transposed,
+                                generation: 0,
+                            },
+                            ..v.clone()
+                        };
+                        &decoded
+                    } else {
+                        v
+                    };
                     let shape = self.cell.shape.to_vec();
                     if let Some(moves) = v.tile_moves(&shape, &shape) {
                         let (id, dims) =

@@ -41,21 +41,15 @@ fn with_session(f: impl FnOnce(&mut Session<Transport<'_>>)) {
 }
 
 fn round_trip(s: &mut Session<Transport<'_>>, rows: usize, cols: usize, format: BfpFormat) {
-    let values: Vec<f32> = (0..rows * cols)
-        .map(|i| ((i % 13) as f32) - 6.0)
-        .collect();
+    let values: Vec<f32> = (0..rows * cols).map(|i| ((i % 13) as f32) - 6.0).collect();
     let input = s.upload(&values, rows, cols).unwrap();
     let stored = s.store_bfp(&input, format).unwrap();
-    let image = s
-        .download_bfp_image(&stored.as_bfp().unwrap())
-        .unwrap();
+    let image = s.download_bfp_image(&stored.as_bfp().unwrap()).unwrap();
     let decoded = s.download_bfp(&stored.as_bfp().unwrap()).unwrap();
     let restored = s.upload_bfp_image(&image).unwrap();
     let again = s.download_bfp(&restored.as_bfp().unwrap()).unwrap();
     assert_eq!(decoded, again);
-    let back = s
-        .download_bfp_image(&restored.as_bfp().unwrap())
-        .unwrap();
+    let back = s.download_bfp_image(&restored.as_bfp().unwrap()).unwrap();
     assert_eq!(image.channels, back.channels);
     assert_eq!(image.layout, back.layout);
 }

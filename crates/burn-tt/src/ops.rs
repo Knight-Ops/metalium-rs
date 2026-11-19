@@ -3014,9 +3014,20 @@ pub mod float {
         }
         // A BF16 `B` (a BF16 KV cache's keys or values) is read as it lies, the product over its
         // exact values with an F32 result: bit for bit the widened `B`'s.
-        let wide_rhs = rhs.dtype() == DType::BF16
-            && rhs.is_storable()
-            && rhs.storage_format() == crate::storage::StorageFormat::F32;
+        let wide_rhs = rhs.is_storable()
+            && match (rhs.dtype(), rhs.storage_format()) {
+                (DType::BF16, crate::storage::StorageFormat::F32) => true,
+                // A block-float `B` (a BFP8 or BFP4 KV cache's keys or values,
+                // `docs/plans/block-float-kv.md` K3), read as it lies: the product of its
+                // decoded values.
+                (
+                    DType::F32,
+                    crate::storage::StorageFormat::Bfp8
+                    | crate::storage::StorageFormat::Bfp4
+                    | crate::storage::StorageFormat::Bfp2,
+                ) => true,
+                _ => false,
+            };
         if !(lhs.is_stored_f32() && (rhs.is_stored_f32() || wide_rhs)) {
             return None;
         }
@@ -3063,7 +3074,8 @@ pub mod float {
         // A half operand's blocks are read where they lie, as whole tiles of its buffer: no row
         // gather moves two-byte rows into padded blocks (`Session::matmul_dram_batched_with`).
         let whole = |v: &crate::views::Strided, blocks: &[crate::Block]| {
-            !crate::tensor::is_half(t.dtype())
+            (!crate::tensor::is_half(t.dtype())
+                && t.storage_format() == crate::storage::StorageFormat::F32)
                 || blocks
                     .iter()
                     .all(|b| half_block_fits(v, b, &shape[shape.len() - 2..]))
@@ -3171,6 +3183,16 @@ pub mod float {
         dim2: usize,
     ) -> FloatTensor<TtBackend> {
         let tensor = if tensor.shape().num_dims() > 2 {
+            // A block-float tensor's swap is a view of its tiles where one is (a block-float KV
+            // cache's heads, `docs/plans/block-float-kv.md` K3): its readers take the tiles as
+            // they lie, and anything that makes it plain decodes the source first.
+            if tensor.storage_format() != crate::storage::StorageFormat::F32
+                && tensor.as_strided().is_some()
+            {
+                if let Some(v) = swapped_strided(&tensor, dim1, dim2) {
+                    return v;
+                }
+            }
             bfp_compute_input(tensor)
         } else {
             tensor
@@ -3230,6 +3252,14 @@ pub mod float {
             && (tensor.is_transposed()
                 || tensor.stored() != crate::tensor::stored_dims(&shape.to_vec()))
         {
+            // A view of the stored tiles where one is (a block-float KV cache's rows read as
+            // heads, `docs/plans/block-float-kv.md` K3): its readers take the tiles as they lie,
+            // and anything that makes it plain decodes the source first (`TtTensor::to_dram`).
+            if let Some(v) = tensor.as_strided().filter(|_| !tensor.is_transposed()) {
+                if let Some(r) = v.reshaped(&tensor.shape().to_vec(), &shape.to_vec()) {
+                    return TtTensor::view(r, shape, tensor.dtype(), tensor.device);
+                }
+            }
             bfp_compute_input(tensor)
         } else {
             tensor
@@ -4409,6 +4439,7 @@ pub fn set_softmax_rows_auto() {
 }
 pub use exact_matmul::set_chunk_products as set_exact_matmul_chunk_products;
 mod index;
+pub(crate) use index::bfp_scatter_nd;
 mod interpolate;
 mod nhwc;
 pub(crate) mod norm;
@@ -4596,10 +4627,10 @@ pub mod module {
     }
 
     /// `a @ b` for an F32 `a` and a `b` of F32 or BF16 (attention's keys or values over a BF16
-    /// cache): a BF16 `b` read as it lies by the batched product, else widened once (bit for bit
-    /// the same product).
+    /// cache), or stored block-float (over a BFP8 or BFP4 cache): a BF16 or block-float `b` read
+    /// as it lies by the batched product, else widened once (bit for bit the same product).
     fn wide_product(a: TtTensor, b: TtTensor) -> TtTensor {
-        if b.dtype() != DType::BF16 {
+        if b.dtype() != DType::BF16 && block_float(&b).is_none() {
             return float::float_matmul(a, b);
         }
         if let Some(t) = float::batched_matmul(&a, &b) {
@@ -4607,9 +4638,41 @@ pub mod module {
         }
         let b = {
             let _part = crate::report::part("attention/widen");
-            cast_native(b, DType::F32)
+            match block_float(&b) {
+                Some(_) => b.with_storage(crate::storage::StorageFormat::F32),
+                None => cast_native(b, DType::F32),
+            }
         };
         float::float_matmul(a, b)
+    }
+
+    /// Whether [`attention`] takes these operands as they are: F32 queries over keys and values
+    /// stored in one block-float format (a BFP8 or BFP4 KV cache,
+    /// `docs/plans/block-float-kv.md` K3), which its products read where they lie, and no bias
+    /// stored otherwise. The generated adapter then does not decode them first.
+    pub(crate) fn reads_block_float(
+        query: &TtTensor,
+        key: &TtTensor,
+        value: &TtTensor,
+        bias: Option<&TtTensor>,
+    ) -> bool {
+        query.dtype() == DType::F32
+            && query.storage_format() == crate::storage::StorageFormat::F32
+            && bias.is_none_or(|b| b.storage_format() == crate::storage::StorageFormat::F32)
+            && block_float(key).is_some()
+            && block_float(key) == block_float(value)
+    }
+
+    /// The block-float format `t` is stored in, if any (a BFP8 or BFP4 KV cache's keys or values,
+    /// logical F32).
+    fn block_float(t: &TtTensor) -> Option<tt_kernels::bfp::BfpFormat> {
+        use crate::storage::StorageFormat as S;
+        match (t.dtype(), t.storage_format()) {
+            (DType::F32, S::Bfp8) => Some(tt_kernels::bfp::BfpFormat::Bfp8),
+            (DType::F32, S::Bfp4) => Some(tt_kernels::bfp::BfpFormat::Bfp4),
+            (DType::F32, S::Bfp2) => Some(tt_kernels::bfp::BfpFormat::Bfp2),
+            _ => None,
+        }
     }
 
     /// The bottom-right causal mask of `[b, h, sq, _]` queries over
@@ -4690,9 +4753,16 @@ pub mod module {
         use tt_kernels::attention::{fits_as, Item};
         use tt_kernels::tensor::Elem;
         let device = query.device;
-        // F32 keys and values, or BF16 ones (a BF16 KV cache) read as they lie.
+        // F32 keys and values, or BF16 ones (a BF16 KV cache) or block-float ones (a BFP8 or
+        // BFP4 KV cache) read as they lie.
         let kv = match (key.dtype(), value.dtype()) {
-            (DType::F32, DType::F32) => Elem::F32,
+            (DType::F32, DType::F32) => match (block_float(key), block_float(value)) {
+                (None, None) => Elem::F32,
+                (Some(k), Some(v)) if k == v => {
+                    Elem::Packed(tt_isa::format::TileFormat::new(k.l1_format()))
+                }
+                _ => return None,
+            },
             (DType::BF16, DType::BF16) => Elem::BF16,
             _ => return None,
         };

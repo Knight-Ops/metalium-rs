@@ -339,7 +339,9 @@ fn native_of(tensor: &crate::TtTensor) -> crate::TtTensor {
 }
 
 #[cfg(feature = "fusion")]
-fn native_of(tensor: &burn_fusion::FusionTensor<crate::fusion::TtFusionRuntime>) -> crate::TtTensor {
+fn native_of(
+    tensor: &burn_fusion::FusionTensor<crate::fusion::TtFusionRuntime>,
+) -> crate::TtTensor {
     crate::fusion::resolve_float_tensor(tensor)
 }
 

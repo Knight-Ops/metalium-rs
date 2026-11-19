@@ -302,6 +302,49 @@ fn scatter_nd(
     restack(&updated, data.shape().to_vec())
 }
 
+/// `scatter_nd(Assign)` into a table stored block-float (a BFP8 or BFP4 KV cache,
+/// `docs/plans/block-float-kv.md` K3), its result stored as the table is: F32 values cast to
+/// the table's format and written as encoded rows by one row scatter, bit for bit the table
+/// decoded, written and cast again (a block-float row shares nothing with another). `None` for
+/// anything else, which the decoding adapter then runs.
+pub(crate) fn bfp_scatter_nd(
+    data: &TtTensor,
+    indices: &TtTensor,
+    values: &TtTensor,
+    reduction: IndexingUpdateOp,
+) -> Option<TtTensor> {
+    use crate::storage::StorageFormat as S;
+    if reduction != IndexingUpdateOp::Assign
+        || data.dtype() != DType::F32
+        || values.dtype() != DType::F32
+        || !matches!(data.storage_format(), S::Bfp8 | S::Bfp4 | S::Bfp2)
+        || values.storage_format() != S::F32
+        || indices.dtype() != DType::I32
+    {
+        return None;
+    }
+    let nd = nd_geometry("float_scatter_nd", data, indices, "");
+    if values.shape().to_vec() != nd.out_shape
+        || values.device != data.device
+        || !values.is_storable()
+    {
+        return None;
+    }
+    let free = |t: &TtTensor, shape: &[usize]| {
+        crate::tensor::stored_dims(&t.shape().to_vec()) == crate::tensor::stored_dims(shape)
+            && !t.is_view()
+            && !t.is_transposed()
+    };
+    // The table only as a free view of its own buffer: a repack would decode it.
+    if !free(data, &[nd.rows, nd.rest]) {
+        return None;
+    }
+    let table = restack(data, vec![nd.rows, nd.rest]);
+    let rows = restack(values, vec![nd.n, nd.rest]);
+    let updated = scatter_rows_native(data, indices, &table, &rows, &nd)?;
+    Some(restack(&updated, data.shape().to_vec()))
+}
+
 /// `scatter_nd(Assign)` as one row scatter on the card (`Session::scatter_rows`):
 /// a copy of `table` (`[P, R]`) with `rows[j]` written at row `flat[j]`, the
 /// last writer winning, no mask pass over the table. With one coordinate
@@ -334,8 +377,20 @@ fn scatter_rows_native(
     };
     let t = plain_dram(table);
     let words = |d: &crate::tensor::DramRef| d.buffer.storage == crate::storage::StorageFormat::F32;
+    // A table stored block-float (a BFP8 or BFP4 KV cache, `docs/plans/block-float-kv.md` K3):
+    // the rows are cast to its format and moved as encoded rows, which are the rows the whole
+    // table's cast would hold (a block-float row shares nothing with another).
+    let block_float = matches!(
+        t.buffer.storage,
+        crate::storage::StorageFormat::Bfp8
+            | crate::storage::StorageFormat::Bfp4
+            | crate::storage::StorageFormat::Bfp2
+    );
+    if block_float && data.dtype() != DType::F32 {
+        return None;
+    }
     let index_dims = if column { [nd.n, 1] } else { [1, nd.n] };
-    if !words(&t)
+    if !(words(&t) || block_float)
         || !words(&i)
         || [t.buffer.rows, t.buffer.cols] != [nd.rows, nd.rest]
         || [i.buffer.rows, i.buffer.cols] != index_dims
@@ -347,7 +402,7 @@ fn scatter_rows_native(
     let in_place = !t.transposed
         && t.buffer.parent.is_none()
         && crate::server::donated_since(t.buffer.id).is_some();
-    let block = in_place
+    let block = (in_place && !block_float)
         .then(|| super::block_view(rows))
         .flatten()
         .filter(|(w, dims)| *dims == [nd.n, nd.rest] && w.base[0] % 32 == 0 && w.base[1] % 32 == 0);
@@ -365,6 +420,13 @@ fn scatter_rows_native(
             if !words(&v) || [v.buffer.rows, v.buffer.cols] != [nd.n, nd.rest] {
                 return None;
             }
+            let v = match block_float {
+                true => TtTensor::on_device(v, vec![nd.n, nd.rest].into(), DType::F32, device)
+                    .with_storage(t.buffer.storage)
+                    .to_dram()
+                    .clone(),
+                false => v,
+            };
             let arg = crate::server::BlockArg {
                 id: v.buffer.id,
                 at: [0, 0],
@@ -399,6 +461,28 @@ fn scatter_rows_native(
         column,
         [nd.rows, nd.rest],
     );
+    // A block-float table's copy holds tiles of its format.
+    if block_float {
+        let dram = crate::tensor::DramRef {
+            buffer: std::sync::Arc::new(crate::tensor::Buffer {
+                id,
+                device,
+                rows: dims[0],
+                cols: dims[1],
+                parent: None,
+                storage: t.buffer.storage,
+                plain: Default::default(),
+            }),
+            transposed: false,
+            generation: 0,
+        };
+        return Some(TtTensor::on_device(
+            dram,
+            vec![nd.rows, nd.rest].into(),
+            data.dtype(),
+            device,
+        ));
+    }
     Some(device_result_shaped(
         device,
         id,
