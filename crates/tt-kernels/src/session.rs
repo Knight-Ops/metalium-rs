@@ -899,10 +899,6 @@ pub struct Session<T: Transport> {
     /// Stored weights laid by column (`tensor::Layout::ByColumn`;
     /// [`Session::set_column_weights`]).
     column_weights: bool,
-    /// Activations laid by row (`tensor::Layout::ByRow`; [`Session::set_row_activations`]), and
-    /// in the gate's mode however short (`TT_ACT_ROWS=all`).
-    row_activations: bool,
-    row_everywhere: bool,
     /// [`Session::set_even_deal`].
     even_deal: bool,
     /// [`Session::set_read_ahead_early`].
@@ -3027,8 +3023,6 @@ impl<T: Transport> Session<T> {
             // 1.7B decode step ~10% faster on card 1, bit for bit, with prefill, eager blocks and
             // GDDR unchanged (the weight held once). `TT_WEIGHT_COLUMNS=0` turns it off.
             column_weights: std::env::var("TT_WEIGHT_COLUMNS").map_or(true, |v| v != "0"),
-            row_activations: std::env::var("TT_ACT_ROWS").is_ok_and(|v| v == "1" || v == "all"),
-            row_everywhere: std::env::var("TT_ACT_ROWS").is_ok_and(|v| v == "all"),
             // On by default since 2026-11-07 (`docs/plans/decode-bytes-in-flight.md`, "X10:
             // evenness"; the owner's call over its narrow kill): a 1.7B decode step 10.04 / 11.20 ->
             // 9.82 / 10.98 ms on card 1, bit for bit. `TT_EVEN_DEAL=0` turns it off.
@@ -3610,11 +3604,8 @@ impl<T: Transport> Session<T> {
         let w4 = self.dev.alloc_window(WindowKind::FourGib)?;
         let window = self.dev.alloc_window(WindowKind::TwoMib)?;
         let dram = self.dev.dram_grid(&window)?;
-        let mut alloc = DramAlloc::new(&dram);
-        alloc.set_row_activations(self.row_activations);
-        alloc.set_row_activations_everywhere(self.row_everywhere);
         self.dram = Some(DramState {
-            alloc,
+            alloc: DramAlloc::new(&dram),
             dram,
             image: b_image,
             nc_image,
@@ -3813,28 +3804,6 @@ impl<T: Transport> Session<T> {
     pub fn set_column_weights(&mut self, on: bool) -> Result<(), TensorError> {
         self.column_weights = on;
         self.push_prefetch_cap()
-    }
-
-    /// Lay activations by row from now on (`tensor::Layout::ByRow`, `docs/plans/a-by-row.md`):
-    /// every tensor an op allocates (`DramTensor::alloc_elem`) of at least as many tile rows as
-    /// channels and two tile columns, so a product reads its `A` a row a request. Stored weights
-    /// keep [`Session::stored_layout`]'s. Opt-in while it is built (`TT_ACT_ROWS=1` at open;
-    /// `TT_ACT_ROWS=all`, a gate's mode, lays every grid of two tile columns so).
-    pub fn set_row_activations(&mut self, on: bool) {
-        self.row_activations = on;
-        if let Some(d) = self.dram.as_mut() {
-            d.alloc.set_row_activations(on);
-        }
-    }
-
-    /// [`Session::set_row_activations`] in a gate's mode: every grid of two tile columns laid by
-    /// row, however short (`TT_ACT_ROWS=all`), so every op meets the layout. Not for speed.
-    #[doc(hidden)]
-    pub fn set_row_activations_everywhere(&mut self, on: bool) {
-        self.row_everywhere = on;
-        if let Some(d) = self.dram.as_mut() {
-            d.alloc.set_row_activations_everywhere(on);
-        }
     }
 
     /// Deal a one-row product's in-span columns over its prefetching units too (X10;
@@ -4329,8 +4298,8 @@ impl<T: Transport> Session<T> {
         values: Src<'_>,
         tiles: usize,
     ) -> Result<Option<()>, TensorError> {
-        // The DMA's records read interleaved tensors only; a weight laid by column, or an
-        // activation by row, goes tile by tile through its slots.
+        // The DMA's records read interleaved tensors only; a weight laid by column goes tile by
+        // tile through its slots.
         if self.staging().is_none() || t.placement.layout() != tensor::Layout::Interleaved {
             return Ok(None);
         }

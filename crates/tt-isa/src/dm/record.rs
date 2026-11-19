@@ -569,11 +569,6 @@ pub const fn is_record(op: u32) -> bool {
 /// consecutive slots on `channels[c % n]`, from slot `(c / n) * col_tiles` of the region there,
 /// row `r` at slot `(c / n) * col_tiles + r`. The tiles are the same as interleaved ones; only
 /// where they sit differs. Every other record refuses such a reference ([`super::error::LAYOUT`]).
-///
-/// **By row** (`by_row`, [`REF_BY_ROW`]; `docs/plans/a-by-row.md`): an activation laid for a
-/// [`GATHER`] that reads it as `A`, a row a request. Tile `t` is row `r = t / ct` and column
-/// `c = t % ct`; row `r`'s `ct` tiles are consecutive slots on `channels[r % n]`, from slot
-/// `(r / n) * ct` of the region there. FP32 or BF16 slots. Every other record refuses it.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct TensorRef {
     pub n: u8,
@@ -583,8 +578,6 @@ pub struct TensorRef {
     pub ct: u32,
     /// `0`: interleaved. Otherwise laid by column, each column this many tiles long.
     pub col_tiles: u32,
-    /// Laid by row (never with `col_tiles`).
-    pub by_row: bool,
     /// The bytes of each tile's slot in GDDR: `0` for [`TILE_SLOT`] (an FP32 tile, and every
     /// tensor before slots were named), or [`BF16_TILE_SLOT`] for a tensor of BF16 tiles in
     /// slots of their own size (roadmap W1, native BF16 arithmetic). [`READ_RUN`], [`WRITE_RUN`],
@@ -607,9 +600,6 @@ pub const REF_BY_COLUMN: u32 = 2;
 /// `B` by column reads it so (`tt_kernels::matmul::slots_layout`); the sum's order is unchanged.
 pub const REF_L1_BY_COLUMN: u32 = 4;
 
-/// Word 4 of a tensor reference's first entry: the tensor is laid by row ([`TensorRef::by_row`]).
-pub const REF_BY_ROW: u32 = 8;
-
 impl TensorRef {
     /// `[n, channels (four bits each), first, ct, flags, col_tiles, slot, 0]` and the bases:
     /// `flags` is [`REF_BY_COLUMN`] for a tensor laid by column, else 0, as is `col_tiles`;
@@ -621,8 +611,6 @@ impl TensorRef {
         }
         let flags = if self.col_tiles != 0 {
             REF_BY_COLUMN
-        } else if self.by_row {
-            REF_BY_ROW
         } else {
             0
         };
@@ -644,7 +632,7 @@ impl TensorRef {
     /// The inverse of [`TensorRef::encode`]. `n` may be 0 only for a tensor
     /// that is never read (a record's absent operand); whether each channel is one
     /// the chip has is checked on every entry the tensor produces. Of word 4 only
-    /// [`REF_BY_COLUMN`] and [`REF_BY_ROW`] are the tensor's; the other bits are its reader's.
+    /// [`REF_BY_COLUMN`] is the tensor's; the other bits are its reader's.
     pub fn decode(w: [[u32; 8]; 2]) -> Result<Self, u32> {
         let [m, base] = w;
         if m[0] > 8 || m[3] > MAX_EXTENT {
@@ -659,12 +647,7 @@ impl TensorRef {
         } else {
             0
         };
-        // By row, a grid of rows: one with no columns names nothing, and neither layout is both.
-        let by_row = m[4] & REF_BY_ROW != 0;
-        if by_row && (col_tiles != 0 || m[3] == 0) {
-            return Err(super::error::RANGE);
-        }
-        // A slot is FP32's (0) or BF16's; a BF16 tensor is interleaved or by row.
+        // A slot is FP32's (0) or BF16's; a BF16 tensor is interleaved.
         if m[6] != 0 && (m[6] != BF16_TILE_SLOT as u32 || col_tiles != 0) {
             return Err(super::error::RANGE);
         }
@@ -679,7 +662,6 @@ impl TensorRef {
             first: m[2],
             ct: m[3],
             col_tiles,
-            by_row,
             slot: m[6],
         })
     }
@@ -714,46 +696,11 @@ impl TensorRef {
         if self.n == 0 {
             return Err(super::error::RANGE);
         }
-        if self.by_row {
-            return self.tile_by_row(i, j, slot);
-        }
         let t = self.first + i * self.ct + j;
         let (s, c) = (t / self.n as u32, t % self.n as u32);
         let offset = (self.base[c as usize] as u64) + s as u64 * slot;
         let offset = u32::try_from(offset).map_err(|_| super::error::RANGE)?;
         Ok((self.channels[c as usize] as u32, offset))
-    }
-}
-
-impl TensorRef {
-    /// [`TensorRef::tile_in`] of a tensor laid by row: row `r` on `channels[r % n]`, column `c`
-    /// at slot `(r / n) * ct + c` there.
-    #[cold]
-    #[inline(never)]
-    fn tile_by_row(&self, i: u32, j: u32, slot: u64) -> Result<(u32, u32), u32> {
-        let t = self.first + i * self.ct + j;
-        let (r, c, n) = (t / self.ct, t % self.ct, self.n as u32);
-        let k = (r % n) as usize & 7;
-        let offset = self.base[k] as u64 + ((r / n) as u64 * self.ct as u64 + c as u64) * slot;
-        let offset = u32::try_from(offset).map_err(|_| super::error::RANGE)?;
-        Ok((self.channels[k] as u32, offset))
-    }
-
-    /// [`TensorRef::cursor`] of a tensor laid by row: along its row, one channel, a slot a tile
-    /// (the interleaved step over a single channel). It ends at the row's end: a walk that goes
-    /// on to the next row starts another ([`READ_RUN`]).
-    #[cold]
-    #[inline(never)]
-    fn row_cursor(&self, i: u32, j: u32) -> Cursor<'_> {
-        let t = self.first + i * self.ct + j;
-        let (r, c, n) = (t / self.ct, t % self.ct, self.n as u32);
-        Cursor {
-            x: self,
-            k: r % n,
-            n: 1,
-            slot: (r / n) * self.ct + c,
-            c: 0,
-        }
     }
 }
 
@@ -763,36 +710,20 @@ impl TensorRef {
 /// divide's 6-33 (`BabyRISCV/README.md:51`). The mover's gathers and
 /// scatters walk rows. (Before the firmware could divide, the software
 /// division this replaced was most of a gathered tile's cost, checklist 9.14.)
-///
-/// Its channels are `x`'s from `k` on, `n` of them: all of an interleaved tensor's (`k` 0), or
-/// one row's of a tensor laid by row (`n` 1, so each step is the next slot).
 struct Cursor<'a> {
     x: &'a TensorRef,
-    k: u32,
-    n: u32,
     slot: u32,
     c: u32,
 }
 
 impl TensorRef {
-    /// Once a row, so out of line: its body at every walk cost the movers' images ~1 KiB each.
-    #[inline(never)]
     fn cursor(&self, i: u32, j: u32) -> Result<Cursor<'_>, u32> {
         if self.n == 0 {
             return Err(super::error::RANGE);
         }
-        if self.by_row {
-            return Ok(self.row_cursor(i, j));
-        }
         let t = self.first + i * self.ct + j;
         let (slot, c) = (t / self.n as u32, t % self.n as u32);
-        Ok(Cursor {
-            x: self,
-            k: 0,
-            n: self.n as u32,
-            slot,
-            c,
-        })
+        Ok(Cursor { x: self, slot, c })
     }
 }
 
@@ -806,13 +737,12 @@ impl Cursor<'_> {
 
     #[inline(always)]
     fn next_with_slot(&mut self, stride: u64) -> Result<(u32, u32), u32> {
-        // `k + c < n <= 8` (`TensorRef::decode`), so the mask only spares a bounds check.
-        let c = (self.k + self.c) as usize & 7;
+        let c = self.c as usize;
         let offset = (self.x.base[c] as u64) + self.slot as u64 * stride;
         let offset = u32::try_from(offset).map_err(|_| super::error::RANGE)?;
         let at = (self.x.channels[c] as u32, offset);
         self.c += 1;
-        if self.c == self.n {
+        if self.c == self.x.n as u32 {
             self.c = 0;
             self.slot += 1;
         }
@@ -917,58 +847,6 @@ impl BSpan {
             runs: cols,
             bytes,
             stride: col_bytes,
-            pieces: bytes.div_ceil(piece),
-            piece,
-        })
-    }
-
-    /// The span of an `A` laid by row ([`TensorRef::by_row`]): rows `i0..i0 + rows` of its view
-    /// from its first column, `kt` tiles each, one run a row at `a_at + i * kt * slot` (the
-    /// order an `A` already takes in L1). The same addressing as [`BSpan::of_columns`] with a row
-    /// for a column: run `r` on `channels[r % n]`, `(r / n)` rows of `ct` slots from its base.
-    /// Refuses a block that leaves its grid's row, or whose last byte on any channel is past
-    /// what an offset names.
-    #[cold]
-    #[inline(never)]
-    fn of_rows(
-        a: &TensorRef,
-        a_at: u32,
-        i0: u32,
-        rows: u32,
-        kt: u32,
-        slot: u32,
-        piece: u32,
-    ) -> Result<Self, u32> {
-        if a.n == 0 || !a.by_row || piece == 0 {
-            return Err(super::error::LAYOUT);
-        }
-        let ends = |a: u32, n: u32| a.checked_add(n).ok_or(super::error::RANGE);
-        let (r0, c0) = (ends(a.first / a.ct, i0)?, a.first % a.ct);
-        if ends(c0, kt)? > a.ct {
-            return Err(super::error::RANGE);
-        }
-        ends(r0, rows)?;
-        let bytes = kt.checked_mul(slot).ok_or(super::error::RANGE)?;
-        let (n, slot64) = (a.n as u32, slot as u64);
-        let row_bytes = a.ct as u64 * slot64;
-        // Each channel's furthest byte is in its last row of the block.
-        for k in 0..rows.min(n) {
-            let r = r0 + rows - 1 - k;
-            let end = a.base[(r % n) as usize] as u64
-                + (r / n) as u64 * row_bytes
-                + c0 as u64 * slot64
-                + bytes as u64;
-            if end > u32::MAX as u64 + 1 {
-                return Err(super::error::RANGE);
-            }
-        }
-        Ok(BSpan {
-            ch: r0,
-            off: c0 as u64 * slot64,
-            l1: a_at,
-            runs: rows,
-            bytes,
-            stride: row_bytes,
             pieces: bytes.div_ceil(piece),
             piece,
         })
@@ -1165,7 +1043,7 @@ fn walk_by_column(
     w: &ColumnWalk,
     emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    let (size, n, by_column, by_row) = (TILE_SLOT as u32, x.n as u32, x.col_tiles != 0, x.by_row);
+    let (size, n, by_column) = (TILE_SLOT as u32, x.n as u32, x.col_tiles != 0);
     if n == 0 {
         return Err(super::error::RANGE);
     }
@@ -1174,24 +1052,16 @@ fn walk_by_column(
     // the kernel transposes ([`GATHER_B_UNPACK_TRANSPOSE`]) goes.
     let slot = w.slot;
     // A tile's slot is `(g * per + r) * slot` on channel `c`: by column, `g` its column group,
-    // `per` a column's tiles and `r` its row; by row, `g` its row group, `per` a row's tiles and
-    // `r` its column; interleaved, `g` its slot (`per` 1, `r` 0). Each next tile is a step, the
-    // channel carrying into `g`: down a column by column, a row; along a row by row, a column;
-    // down a column by row, a channel; along a row, a channel; interleaved down a column, `ct`
-    // tiles. One loop body for every walk (the B image's room).
-    let (dr, dc, dg) = match (by_column, by_row, down) {
-        (true, _, true) | (_, true, false) => (1, 0, 0),
-        (_, true, true) => (0, 1, 0),
-        (false, false, true) => (0, x.ct % n, x.ct / n),
-        (true, _, false) | (false, false, false) => (0, 1, 0),
+    // `per` a column's tiles and `r` its row; interleaved, `g` its slot (`per` 1, `r` 0). Each
+    // next tile is a step, the channel carrying into `g`: down a column by column, a row; along
+    // a row, a channel; interleaved down a column, `ct` tiles. One loop body for every walk (the
+    // B image's room).
+    let (dr, dc, dg) = match (by_column, down) {
+        (true, true) => (1, 0, 0),
+        (false, true) => (0, x.ct % n, x.ct / n),
+        (_, false) => (0, 1, 0),
     };
-    let per = if by_column {
-        x.col_tiles
-    } else if by_row {
-        x.ct
-    } else {
-        1
-    };
+    let per = if by_column { x.col_tiles } else { 1 };
     for o in 0..w.outer {
         let (i, j) = if down {
             (w.c0, w.r0 + o)
@@ -1207,12 +1077,6 @@ fn walk_by_column(
                 return Err(super::error::RANGE);
             }
             (r, col % n, col / n)
-        } else if by_row {
-            let (row, col) = (t / x.ct, t % x.ct);
-            if !down && col.checked_add(w.inner).is_none_or(|e| e > x.ct) {
-                return Err(super::error::RANGE);
-            }
-            (col, row % n, row / n)
         } else {
             (0, t % n, t / n)
         };
@@ -1325,20 +1189,6 @@ fn gather_span_reads(
     emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
 ) -> Result<(), u32> {
     (0..span.count()).try_for_each(|n| emit(span.read_by_column(b, n)))
-}
-
-/// A [`GATHER`]'s `A` laid by row, read a row a request ([`BSpan::of_rows`]): `[a_at, i0, rows,
-/// kt, slot]`. Out of line with all it calls, so the arm keeps one call for the layout.
-#[cold]
-#[inline(never)]
-fn gather_a_rows(
-    a: &TensorRef,
-    flags: u32,
-    [a_at, i0, rows, kt, slot]: [u32; 5],
-    emit: &mut dyn FnMut([u32; 8]) -> Result<(), u32>,
-) -> Result<(), u32> {
-    let span = BSpan::of_rows(a, a_at, i0, rows, kt, slot, BSpan::piece(flags, slot))?;
-    (0..span.count()).try_for_each(|n| emit(span.read_by_column(a, n)))
 }
 
 fn extent(v: u32) -> Result<u32, u32> {
@@ -1492,13 +1342,6 @@ fn expand_for<const READS: bool, const WRITES: bool>(
             // A `B` taken into L1 by column ([`BSpan`]) beside an interleaved (or resident) `A`
             // stays too: `A`'s tiles take the loop below ([`Sink::read`]), and `B`'s span, checked
             // before anything is read, is read out of line after them ([`gather_span_reads`]).
-            //
-            // An untransposed `A` laid by row is read a row a request, out of line too
-            // ([`BSpan::of_rows`]), before `B` (in line or by its span): its rows are whole runs in
-            // GDDR and in L1. Any other operand laid by row takes the loops below as an interleaved
-            // one does: its cursor steps along one channel ([`TensorRef::cursor`]), and a tile
-            // read down a column is found by [`TensorRef::tile_in`].
-            let a_rows = !resident && a.by_row && !a_t;
             let b_span = !b_resident
                 && l1_by_column(rec, 3)
                 && !l1_by_column(rec, 1)
@@ -1516,11 +1359,7 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                 true => gather_span(rec, &b, flags, b_at, kt, j0, cols, b_slot as u32)?,
                 false => None,
             };
-            if a_rows {
-                let block = [a_at, i0, rows, kt, a_slot as u32];
-                gather_a_rows(&a, flags, block, &mut |e| sink.entry(e))?;
-            }
-            for i in (0..rows).filter(|_| !resident && !a_rows) {
+            for i in (0..rows).filter(|_| !resident) {
                 let mut row = if a_t {
                     None
                 } else {
@@ -1656,10 +1495,6 @@ fn expand_for<const READS: bool, const WRITES: bool>(
                     j += 1;
                     if j == ct {
                         (i, j) = (i + 1, 0);
-                        // Laid by row, the next row is on another channel.
-                        if let (true, Some(r)) = (x.by_row, run.as_mut()) {
-                            *r = x.cursor(i, 0)?;
-                        }
                     }
                 }
                 let slot = at + n * TILE_SLOT as u32;
@@ -3494,500 +3329,6 @@ mod tests {
         }
         out.sort_unstable();
         out
-    }
-
-    /// A tensor laid by row ([`TensorRef::by_row`]) over `n` channels, `ct` tiles a row, its view
-    /// from tile `first`, in slots of `slot` bytes (`0` FP32's).
-    fn by_row(n: u8, ct: u32, first: u32, slot: u32) -> TensorRef {
-        let mut x = TensorRef {
-            n,
-            first,
-            ct,
-            by_row: true,
-            slot,
-            ..TensorRef::default()
-        };
-        for c in 0..n as usize {
-            (x.channels[c], x.base[c]) = (7 - c as u8, 0x40_0000 + 0x10_0000 * c as u32);
-        }
-        x
-    }
-
-    /// Where tile `(r, c)` of a tensor laid by row sits, from the layout's definition
-    /// (`docs/plans/a-by-row.md`): row `r` on channel `r % n`, its column `c` at slot
-    /// `(r / n) * ct + c` there.
-    fn by_row_oracle(x: &TensorRef, r: u32, c: u32, slot: u32) -> (u32, u32) {
-        let n = x.n as u32;
-        let k = (r % n) as usize;
-        (
-            x.channels[k] as u32,
-            x.base[k] + ((r / n) * x.ct + c) * slot,
-        )
-    }
-
-    /// A [`GATHER`] of `op(A)`'s rows `i0..i0 + rows` and `B`'s columns `j0..j0 + cols`, `kt`
-    /// deep, `A` into `0x8_0000` and `B` into `0x2_0000`.
-    #[allow(clippy::too_many_arguments)]
-    fn gather_of(
-        flags: u32,
-        a: &TensorRef,
-        b: &TensorRef,
-        i0: u32,
-        rows: u32,
-        kt: u32,
-        j0: u32,
-        cols: u32,
-    ) -> Vec<[u32; 8]> {
-        let (a, b) = (a.encode(), b.encode());
-        let h = [
-            GATHER,
-            flags | kt << 8,
-            0x8_0000,
-            0x2_0000,
-            i0,
-            rows,
-            j0,
-            cols,
-        ];
-        Vec::from([h, a[0], a[1], b[0], b[1]])
-    }
-
-    /// A reference laid by row survives its encoding, in FP32 or BF16 slots; a walk along any
-    /// row from any column, or down any column, finds each tile where the layout puts it; a walk
-    /// past a row's end is refused, not read from the next; neither layout is both, and a grid
-    /// of no columns names nothing.
-    #[test]
-    fn a_tensor_laid_by_row_puts_each_row_in_one_channel() {
-        for (n, ct, first) in [(8u8, 20u32, 0u32), (3, 7, 14), (1, 3, 0), (8, 64, 9 * 64)] {
-            for slot in [0, BF16_TILE_SLOT as u32] {
-                let x = by_row(n, ct, first, slot);
-                let w = x.encode();
-                assert_eq!(w[0][4], REF_BY_ROW);
-                assert_eq!(TensorRef::decode(w), Ok(x));
-            }
-            let x = by_row(n, ct, first, 0);
-            let r_first = first / ct;
-            for slot in [TILE_SLOT as u32, 2112] {
-                for r0 in 0..10 {
-                    for c0 in 0..ct {
-                        let inner = ct - c0;
-                        let got = walked(&x, r0, c0, 1, inner, slot).unwrap();
-                        let want: Vec<_> = (0..inner)
-                            .map(|k| by_row_oracle(&x, r_first + r0, c0 + k, slot))
-                            .collect();
-                        let at: Vec<_> = got.iter().map(|e| (e[1], e[3])).collect();
-                        assert_eq!(at, want, "row {r0}, from {c0}, slot {slot}");
-                        assert_eq!(
-                            walked(&x, r0, c0, 1, inner + 1, slot),
-                            Err(super::super::error::RANGE),
-                            "past the row"
-                        );
-                    }
-                }
-            }
-            // Down column `c`, rows `r0..`: the transposed reader's walk.
-            for c in 0..ct {
-                let mut got = Vec::new();
-                let walk = ColumnWalk {
-                    r0: c,
-                    c0: 0,
-                    outer: 1,
-                    inner: 11,
-                    at: 0,
-                    slot: TILE_SLOT as u32,
-                    transposed: Some(op::READ_TRANSPOSED),
-                    thin: 0,
-                };
-                walk_by_column(&x, &walk, &mut |e| {
-                    got.push((e[1], e[3]));
-                    Ok(())
-                })
-                .unwrap();
-                let want: Vec<_> = (0..11)
-                    .map(|r| by_row_oracle(&x, r_first + r, c, TILE_SLOT as u32))
-                    .collect();
-                assert_eq!(got, want, "down column {c}");
-            }
-        }
-        let range = Err(super::super::error::RANGE);
-        let mut w = by_row(8, 4, 0, 0).encode();
-        w[0][4] |= REF_BY_COLUMN;
-        w[0][5] = 2;
-        assert_eq!(TensorRef::decode(w), range, "both layouts");
-        let mut w = by_row(8, 4, 0, 0).encode();
-        w[0][3] = 0;
-        assert_eq!(TensorRef::decode(w), range, "no columns");
-    }
-
-    /// A [`GATHER`] over an `A` laid by row reads each of its rows as one run, in pieces of one
-    /// request each taken from the rows in turn: exactly the 64-byte units a read a tile moves
-    /// (tile `(i, kk)` from where the layout puts it into `a_at + (i * kt + kk) * slot`), for
-    /// FP32 and BF16 tiles, a view that starts inside the grid, and a ragged last row (read as
-    /// whole tiles). `B`'s reads are what they are beside a resident `A`. Transposed, `A` is
-    /// walked a tile at a time.
-    #[test]
-    fn a_gather_reads_an_a_laid_by_row_a_row_a_request() {
-        let a_bf16 = gather_a_format(crate::tile::L1Format::Bf16).unwrap();
-        let b_bf16 = gather_b_format(crate::tile::L1Format::Bf16).unwrap();
-        let b = TensorRef {
-            n: 8,
-            ct: 48,
-            channels: [0, 1, 2, 3, 4, 5, 6, 7],
-            base: [0x100_0000; 8],
-            ..TensorRef::default()
-        };
-        for (a_flags, ref_slot) in [(0, 0), (a_bf16, BF16_TILE_SLOT as u32)] {
-            let slot = gather_a_slot(a_flags).unwrap() as u32;
-            for (n, ct, first, i0, rows, kt, thin) in [
-                (8u8, 64u32, 0u32, 0u32, 4u32, 32u32, 0u32),
-                (8, 64, 0, 5, 9, 16, 0),
-                (8, 256, 2 * 256, 3, 2, 64, 0),
-                (3, 7, 1, 2, 5, 6, 0),
-                (8, 16, 0, 0, 3, 16, 9),
-            ] {
-                // A packed `A` names no ragged row (`gather_a_slot`).
-                if thin != 0 && a_flags != 0 {
-                    continue;
-                }
-                let what = std::format!("slot {slot}, n {n}, ct {ct}, first {first}, i0 {i0}");
-                let a = by_row(n, ct, first, ref_slot);
-                let flags = a_flags | b_bf16 | gather_rows(thin);
-                let rec = gather_of(flags, &a, &b, i0, rows, kt, 4, 3);
-                let reads = expanded_reads(&rec).unwrap_or_else(|e| panic!("{what}: {e}"));
-                // `B` lies at and above `0x100_0000` in GDDR, `A` below.
-                let (b_reads, a_reads): (Vec<[u32; 8]>, Vec<[u32; 8]>) =
-                    reads.into_iter().partition(|e| e[3] >= 0x100_0000);
-                let mut oracle = Vec::new();
-                for i in 0..rows {
-                    for kk in 0..kt {
-                        let t = first + (i0 + i) * ct + kk;
-                        let (ch, off) = by_row_oracle(&a, t / ct, t % ct, slot);
-                        let to = 0x8_0000 + (i * kt + kk) * slot;
-                        oracle.push([op::READ, ch, 0, off, to, slot, 0, 0]);
-                    }
-                }
-                let (got, want) = (units_moved(&a_reads), units_moved(&oracle));
-                let first_diff = got.iter().zip(&want).position(|(g, w)| g != w);
-                assert!(
-                    got == want,
-                    "{what}: {} units against {}, first differing {:?}: {:?} against {:?}",
-                    got.len(),
-                    want.len(),
-                    first_diff,
-                    first_diff.map(|i| got[i]),
-                    first_diff.map(|i| want[i])
-                );
-                assert!(
-                    a_reads
-                        .iter()
-                        .all(|e| e[5] <= crate::noc::niu::MAX_REQUEST_BYTES),
-                    "{what}: one request a read"
-                );
-                // The rows' first pieces first: a unit's rows on their channels at once.
-                let firsts: Vec<_> = a_reads.iter().take(rows as usize).map(|e| e[4]).collect();
-                let want: Vec<_> = (0..rows).map(|i| 0x8_0000 + i * kt * slot).collect();
-                assert_eq!(firsts, want, "{what}: pieces in turn");
-                let mut resident = rec.clone();
-                resident[0][1] |= GATHER_A_RESIDENT;
-                assert_eq!(b_reads, expanded_reads(&resident).unwrap(), "{what}");
-            }
-        }
-        // Transposed (FP32): tile `(i, kk)` of `op(A)` is `A`'s `(kk, i0 + i)`, walked.
-        let a = by_row(3, 9, 0, 0);
-        let rec = gather_of(1 | b_bf16, &a, &b, 2, 4, 6, 0, 2);
-        let reads = expanded_reads(&rec).unwrap();
-        let mut oracle = Vec::new();
-        for i in 0..4 {
-            for kk in 0..6 {
-                let (ch, off) = by_row_oracle(&a, kk, 2 + i, TILE_SLOT as u32);
-                let to = 0x8_0000 + (i * 6 + kk) * TILE_SLOT as u32;
-                oracle.push((op::READ_TRANSPOSED, ch, off, to));
-            }
-        }
-        let got: Vec<_> = reads
-            .iter()
-            .filter(|e| e[0] == op::READ_TRANSPOSED)
-            .map(|e| (e[0], e[1], e[3], e[4]))
-            .collect();
-        assert_eq!(got, oracle, "transposed");
-    }
-
-    /// `(tile, byte within it)` of the GDDR byte at `off` on channel `ch` of `x` (`slot` bytes a
-    /// tile): each layout's inverse, from its definition.
-    fn tile_at(x: &TensorRef, ch: u32, off: u32, slot: u32) -> (u32, u32) {
-        let (n, ct) = (x.n as u32, x.ct);
-        let k = x.channels[..n as usize]
-            .iter()
-            .position(|&c| c as u32 == ch)
-            .expect("one of the tensor's channels") as u32;
-        let rel = off - x.base[k as usize];
-        let (s, within) = (rel / slot, rel % slot);
-        let t = if x.by_row {
-            ((s / ct) * n + k) * ct + s % ct
-        } else {
-            s * n + k
-        };
-        (t, within)
-    }
-
-    /// A record's entries with each GDDR access named by `(tile, byte)` of `x` instead of
-    /// `(channel, offset)`: what a record over a tensor laid by row and one over its interleaved
-    /// twin must agree on, entry for entry.
-    fn by_tile(entries: &[[u32; 8]], x: &TensorRef, slot: u32) -> Vec<[u32; 8]> {
-        let gddr = [
-            op::READ,
-            op::WRITE,
-            op::READ_TRANSPOSED,
-            op::READ_BROADCAST_COL,
-        ];
-        entries
-            .iter()
-            .map(|&e| {
-                if !gddr.contains(&e[0]) {
-                    return e;
-                }
-                let (t, within) = tile_at(x, e[1], e[3], slot);
-                [e[0], t, e[2], within, e[4], e[5], e[6], e[7]]
-            })
-            .collect()
-    }
-
-    /// Every record that reads or writes a tensor addresses one laid by row
-    /// ([`TensorRef::by_row`]) exactly as its interleaved twin, tile for tile and byte for byte:
-    /// [`SCATTER`]; [`READ_RUN`] plain across rows, broadcast down or across, column-major and
-    /// transposed; [`WRITE_RUN`]; [`SELECT_ROWS`]; [`SCATTER_ROWS`] by face rows and as whole
-    /// tiles; [`FILL_PAD`] and [`PAD_WRITE`]. FP32 and BF16 where the record takes both. (A
-    /// [`GATHER`]'s by-row `A` reads differently, a row a request:
-    /// `a_gather_reads_an_a_laid_by_row_a_row_a_request`.)
-    #[test]
-    fn every_record_addresses_a_tensor_laid_by_row_as_its_interleaved_twin() {
-        type Expand = fn(&[[u32; 8]], &[u32]) -> Result<Vec<[u32; 8]>, u32>;
-        let both: Expand = |rec, _| {
-            let mut out = Vec::new();
-            expand(rec, |e| {
-                out.push(e);
-                Ok(())
-            })?;
-            Ok(out)
-        };
-        let reads: Expand = |rec, values| {
-            let mut out = Vec::new();
-            expand_reads(rec, l1_of(values), |e| {
-                out.push(e);
-                Ok(())
-            })?;
-            Ok(out)
-        };
-        let writes: Expand = |rec, values| {
-            let mut out = Vec::new();
-            expand_writes(rec, l1_of(values), |e| {
-                out.push(e);
-                Ok(())
-            })?;
-            Ok(out)
-        };
-        let distinct: Vec<u32> = (0..9).map(|r| (r * 37 + 5) % 160).collect();
-        let whole_row: Vec<u32> = (64..96).collect();
-        for (n, ct, rows) in [(8u8, 6u32, 20u32), (3, 7, 9), (1, 4, 5)] {
-            for slot in [0, BF16_TILE_SLOT as u32] {
-                let x = by_row(n, ct, 0, slot);
-                let twin = TensorRef { by_row: false, ..x };
-                let bytes = x.slot_bytes() as u32;
-                let fp32 = slot == 0;
-                let tiles = rows * ct;
-                let mut cases: Vec<(&str, [u32; 8], Expand, &[u32])> = Vec::from([
-                    (
-                        "scatter",
-                        [SCATTER, 0x8_0000, TILE_SLOT as u32, 2, 3, 1, ct - 1, 0],
-                        both,
-                        &[][..],
-                    ),
-                    (
-                        "read run across rows",
-                        [READ_RUN, 3, tiles - 5, 0x8_0000, 0, 0, 0, 0],
-                        both,
-                        &[],
-                    ),
-                    (
-                        "read run broadcast down",
-                        [READ_RUN, 1, 3 * ct, 0x8_0000, 1, ct, 0, 0],
-                        both,
-                        &[],
-                    ),
-                    (
-                        "read run read as it lies across",
-                        [READ_RUN, 2, 9, 0x8_0000, READ_RUN_COL_AS_IT_LIES, 3, 0, 0],
-                        both,
-                        &[],
-                    ),
-                    (
-                        "read run column-major",
-                        [READ_RUN, 1, rows + 3, 0x8_0000, 4, ct, rows, 0],
-                        both,
-                        &[],
-                    ),
-                    (
-                        "write run",
-                        [WRITE_RUN, 4, tiles - 4, 0x8_0000, 0, 0, 0, 0],
-                        writes,
-                        &[],
-                    ),
-                    (
-                        "select rows",
-                        [
-                            SELECT_ROWS,
-                            IDX,
-                            9,
-                            rows * 32,
-                            1,
-                            ct - 1,
-                            STAGE,
-                            u32::from(!fp32) * SELECT_ROWS_BF16,
-                        ],
-                        reads,
-                        &distinct,
-                    ),
-                    (
-                        "scatter rows",
-                        [
-                            SCATTER_ROWS,
-                            IDX,
-                            9,
-                            rows * 32,
-                            0,
-                            ct,
-                            STAGE,
-                            u32::from(!fp32) * SCATTER_ROWS_BF16,
-                        ],
-                        writes,
-                        &distinct,
-                    ),
-                    (
-                        "scatter rows, a whole tile row",
-                        [
-                            SCATTER_ROWS,
-                            IDX,
-                            32,
-                            rows * 32,
-                            1,
-                            ct - 1,
-                            STAGE,
-                            u32::from(!fp32) * SCATTER_ROWS_BF16,
-                        ],
-                        writes,
-                        &whole_row,
-                    ),
-                ]);
-                if fp32 {
-                    cases.extend([
-                        (
-                            "read run broadcast across",
-                            [READ_RUN, 2, 9, 0x8_0000, 2, 3, 0, 0],
-                            both,
-                            &[][..],
-                        ),
-                        (
-                            "read run transposed",
-                            [READ_RUN, 0, 4, 0x8_0000, 8, 2, 0, 0],
-                            both,
-                            &[],
-                        ),
-                        (
-                            "fill pad",
-                            [FILL_PAD, 7, 0, ct + rows - 1, 5, 9, STAGE, rows],
-                            both,
-                            &[],
-                        ),
-                        (
-                            "pad write",
-                            [PAD_WRITE, 7, 1, ct + rows - 2, 5, 9, STAGE, rows],
-                            writes,
-                            &[],
-                        ),
-                    ]);
-                }
-                for (what, head, expand_with, values) in cases {
-                    let what = std::format!("{what}: n {n}, ct {ct}, slot {bytes}");
-                    let rec_of = |x: &TensorRef| {
-                        let [m0, m1] = x.encode();
-                        [head, m0, m1]
-                    };
-                    let laid = expand_with(&rec_of(&x), values)
-                        .unwrap_or_else(|e| panic!("{what}: by row refused, {e}"));
-                    let plain = expand_with(&rec_of(&twin), values)
-                        .unwrap_or_else(|e| panic!("{what}: interleaved refused, {e}"));
-                    assert!(!laid.is_empty(), "{what}");
-                    assert_eq!(
-                        by_tile(&laid, &x, bytes),
-                        by_tile(&plain, &twin, bytes),
-                        "{what}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// A [`GATHER`]'s operand laid by row and read a tile at a time (`B`, or a transposed `A`)
-    /// is read as its interleaved twin, tile for tile, and a read ahead of such a `B`
-    /// ([`PrefetchCursor`]) gives exactly the record's reads; a span past its row's last column
-    /// is refused before anything is read.
-    #[test]
-    fn a_gather_reads_any_other_operand_laid_by_row_as_its_twin() {
-        let a = TensorRef {
-            n: 1,
-            ct: 1,
-            ..TensorRef::default()
-        };
-        let b_bf16 = gather_b_format(crate::tile::L1Format::Bf16).unwrap();
-        for (flags, slot) in [(0, 0), (b_bf16, BF16_TILE_SLOT as u32)] {
-            let b = by_row(3, 9, 9, slot);
-            let twin = TensorRef { by_row: false, ..b };
-            let bytes = gather_b_slot(flags).unwrap() as u32;
-            let rec = |b: &TensorRef| gather_of(flags | GATHER_A_RESIDENT, &a, b, 0, 1, 5, 2, 6);
-            let laid = expanded_reads(&rec(&b)).unwrap();
-            let plain = expanded_reads(&rec(&twin)).unwrap();
-            assert_eq!(
-                by_tile(&laid, &b, bytes),
-                by_tile(&plain, &twin, bytes),
-                "B"
-            );
-            let mut ahead = rec(&b);
-            ahead[0][1] |= GATHER_PREFETCH;
-            let pumped: Vec<_> = PrefetchCursor::new(&ahead)
-                .unwrap()
-                .expect("a read ahead")
-                .map(|r| r.unwrap())
-                .collect();
-            assert_eq!(pumped, expanded_reads(&ahead).unwrap(), "read ahead");
-        }
-        // Transposed `A` (FP32), beside an interleaved `B`.
-        let b = TensorRef {
-            n: 8,
-            ct: 8,
-            channels: [0, 1, 2, 3, 4, 5, 6, 7],
-            base: [0x100_0000; 8],
-            ..TensorRef::default()
-        };
-        let a = by_row(3, 9, 0, 0);
-        let twin = TensorRef { by_row: false, ..a };
-        let rec = |a: &TensorRef| gather_of(1, a, &b, 2, 4, 6, 0, 2);
-        let split = |reads: Vec<[u32; 8]>| -> Vec<[u32; 8]> {
-            reads.into_iter().filter(|e| e[3] < 0x100_0000).collect()
-        };
-        let laid = split(expanded_reads(&rec(&a)).unwrap());
-        let plain = split(expanded_reads(&rec(&twin)).unwrap());
-        assert!(laid.iter().all(|e| e[0] == op::READ_TRANSPOSED));
-        let size = TILE_SLOT as u32;
-        assert_eq!(
-            by_tile(&laid, &a, size),
-            by_tile(&plain, &twin, size),
-            "A transposed"
-        );
-        // A view from column 2 of 4 cannot give a row of 3.
-        let b = by_row(8, 4, 0, 0);
-        let a = by_row(8, 4, 2, 0);
-        let rec = gather_of(0, &a, &b, 0, 1, 3, 0, 1);
-        assert_eq!(expanded_reads(&rec), Err(super::super::error::RANGE));
     }
 
     /// The retired mark of X9's two-copy layout ([`REF_LAID_FOR_READER`]) costs the hot arm

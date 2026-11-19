@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W2: `A` laid by row killed](#w2-a-laid-by-row-killed-the-cards-products-no-faster-its-elementwise-ops-slower-2026-11-19-card-0) | 2026-11-19 | P4 lost: the 1.7B's prefill **+4.8% at 256 tokens, +3.4-6.4% at 512-2,000**, ViT-Tiny +62%, ResNet-18 +43% (ABBA). On the card the products' requests fell 2.6x and they ran +2%: `A`'s requests did not bind them in the model; elementwise ops on tensors laid by row lost 25-27% (a row's tiles on one channel). The vision models lost on the host (no DMA path). Deleted |
 | [W2: default prefill chunks for a cache's length](#w2-default-prefill-chunks-for-a-caches-length-2026-11-19-card-0) | 2026-11-19 | `Shapes::for_cache`: `64,128,256` under 2,048 positions, then powers of two to 1,024 under the scores' cap and half the cache. At 2,048 positions 512 / 1,024 / 2,000-token prompts **-9.0 / -11.5 / -14.1%** (ABBA), short ones within noise. Killed by the 0.5% line under 2,048: a chunk past 256 costs a 256-token prompt ~1% there (more programs restored), for 11-13% at 496-1,000 tokens. A chunk the cache's length loses everywhere. Not for Qwen3.5's row-stepped DeltaNets |
 | [W2: a capture's programs in the program cache](#w2-a-captures-programs-in-the-program-cache-the-capture-clear-kept-packing-killed-2026-11-19-card-0) | 2026-11-19 | a capture begins in a cache cleared of what no trace holds: the bench's second build no longer inherits the first's scattered addresses (an intermittent refusal), and the 1.7B's 128-token prefill **27.71 -> 26.49 ms** (-4.4%, ABBA; 1.85 -> 0.99 MB of programs restored a generation), the rest within 0.25%. Packing a capture's programs lost live (+11.9% at 128 tokens), BestFit and TopDown trade one prompt for another; all three deleted, with the offline replay (faithful only under the recording's own policy). A replay pays ~1.25 ms a MB restored |
 | [W2: short-chunk follow-ups](#w2-short-chunk-follow-ups-gateups-choice-as-request-bound-and-512--1024-token-chunks-2026-11-17-card-0) | 2026-11-17 | `gate\|up`'s slower block: at 128 rows the program cache's fragmentation refuses the best (open), at 256 the candidate list missed it (fixed, `[4,8,9]` pulled: the 1.7B's 256-token prefill **1.036x**). `A` read a row a request bounded at 2.5-3.6 ms a 128-token chunk. 512- and 1,024-token chunks fit and pay 1.14-1.21x at 512-2,000 tokens. A wedge during one build's measurement, not reproduced |
@@ -448,6 +449,42 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W2: `A` laid by row killed: the card's products no faster, its elementwise ops slower (2026-11-19, card 0)
+
+P4 of [a-by-row.md](../completed-plans/a-by-row.md) (the roadmap box "`A` laid by row"): activations of at least 8 tile
+rows and two tile columns laid by row (`TT_ACT_ROWS=1`), so a product reads its `A` a row a request. P0-P3 had passed
+(the strip probe 239.1 -> 57.9 cycles a tile at a model's row length; ttsim gates in all three read modes, `step276`
+and `step12_mnist` on card 0, conformance under `TT_ACT_ROWS=all` with no unexpected failure). Performance contract,
+host-timed, ABBA by process (A interleaved, B by row; runs A `1795091055` / `1795092308`, B `1795093980` /
+`1795095799`, B `1795097586` / `1795099405`, A `1795101175` / `1795102430`):
+
+| bench, ms | A | B | B against A |
+|---|---|---|--:|
+| 1.7B prefill, 32 tokens (512 positions) | 18.55, 18.62 | 18.75, 18.68 | +0.7% |
+| 1.7B prefill, 128 tokens (its `A` stays interleaved) | 27.42, 26.51 | 26.76, 26.90 | -0.5% (not apart) |
+| 1.7B prefill, 256 tokens (512 positions) | 43.25, 44.30 | 45.69, 46.01 | **+4.8%** |
+| 1.7B prefill, 256 / 512 / 1,024 / 2,000 tokens (2,048 positions, chunks to 1,024) | 43.27 / 85.80 / 192.79 / 493.01, 43.16 / 85.22 / 192.28 / 492.45 | 45.14 / 89.60 / 199.20 / 524.58, 45.65 / 87.16 / 198.93 / 524.15 | **+5.0 / +3.4 / +3.4 / +6.4%** |
+| 1.7B decode step after 32 / 128 / 256 tokens | 7.82 / 8.28 / 8.77 | 7.88 / 8.37 / 8.80 | +0.8 / +1.0 / +0.4% |
+| ViT-Tiny forward | 7.27, 7.30 | 11.82, 11.85 | **+62%** |
+| ResNet-18 forward | 10.94, 10.96 | 15.51, 15.74 | **+43%** |
+| Qwen3.5-4B prefill, 32 / 128 / 256 tokens (16-row chunks: nothing laid by row) | 405.1 / 1,620.7 / 3,241.6 | 404.3 / 1,616.7 / 3,232.7 | -0.2% |
+
+**Where it went** (profile mode, one process an arm):
+- **The 1.7B, on the card** (`1795104226` / `1795104936`): a 256-token chunk's replay 40.36 -> 42.11 ms. The products'
+  read requests fell 2.6x (192,000 -> 75,072) and their `A` bytes 297.7 -> 167.9 MB, and they ran 2,412 -> 2,461 us
+  (+2%): `A`'s request cost, which the strip probe and P0's "576 -> 336 us a layer with `A` free" bounded, was not what
+  bound them in the model. The elementwise ops over tensors laid by row lost 25-27% (`tt_silu_mul` 361 -> 460 us, rope
+  + cast 286 -> 360, the `q|k|v` product with its ropes 169 -> 212): a unit's tiles of one row sit on one channel
+  instead of eight.
+- **ViT-Tiny, on the host** (`1795104160` / `1795104182`): the card's replay is the same (6,942 / 6,917 us). A tensor
+  laid by row skips the DMA transfer path (`dma_upload` / `dma_download` take interleaved tensors only) and goes
+  tile by tile through its slots; the image is tall enough to be laid by row.
+
+Killed (the plan's rule: any default slower by more than 0.5%). `TT_ACT_ROWS`, `REF_BY_ROW`, `BSpan::of_rows`, the
+by-row cursor and walks, `Layout::ByRow`, `probe_row_shift`, the strip probe's by-row case and `step276` deleted; the
+B mover's room back to 3,964 bytes at its tightest image (profile + `encoded-guard`). Kept: the wedge fix that shipped
+beside P2 (`Session::place_linked`). Row in [failed-approaches](failed-approaches.md).
 
 ## W2: default prefill chunks for a cache's length (2026-11-19, card 0)
 

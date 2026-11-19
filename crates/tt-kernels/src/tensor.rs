@@ -127,13 +127,6 @@ pub enum Layout {
     /// [`tt_isa::dm::record::GATHER`] reads it on the card; host paths address it by
     /// [`Placement::slot`].
     ByColumn,
-    /// An activation laid by row (`docs/plans/a-by-row.md`, [`tt_isa::dm::record::REF_BY_ROW`]):
-    /// row `r`'s tiles consecutive on channel `r % n`, from slot `(r / n) * cols` there. A
-    /// product reads its rows as `A` a row a request; every other record addresses it tile for
-    /// tile as an interleaved one. Only for grids of at least `n` tile rows and two tile columns
-    /// ([`DramAlloc::set_row_activations`]): fewer rows would leave channels idle under a
-    /// product's re-reads of `A`, and a one-column grid laid by row is interleaved anyway.
-    ByRow,
 }
 
 impl Layout {
@@ -169,8 +162,6 @@ pub struct Placement {
     /// Laid by column ([`Layout::ByColumn`]): the grid's `[rows, columns]` in tiles; `None`
     /// interleaved.
     by_column: Option<[usize; 2]>,
-    /// Laid by row ([`Layout::ByRow`]): the grid's `[rows, columns]` in tiles.
-    by_row: Option<[usize; 2]>,
     /// Did this placement allocate its slots? A view ([`DramTensor::rows_view`])
     /// did not, and freeing it gives nothing back.
     owned: bool,
@@ -187,10 +178,9 @@ impl Placement {
 
     /// How its tiles are dealt ([`Layout`]).
     pub fn layout(&self) -> Layout {
-        match (self.by_column, self.by_row) {
-            (Some(_), _) => Layout::ByColumn,
-            (None, Some(_)) => Layout::ByRow,
-            (None, None) => Layout::Interleaved,
+        match self.by_column {
+            Some(_) => Layout::ByColumn,
+            None => Layout::Interleaved,
         }
     }
 
@@ -205,9 +195,6 @@ impl Placement {
             }
             None => 0,
         };
-        if let Some([_, cols]) = self.by_row {
-            assert_eq!(ct, cols, "a tensor laid by row is named with its own grid");
-        }
         // An interleaved tensor of BF16 slots names them, so a record that steps by its slots
         // (`READ_RUN`, `WRITE_RUN`, `SCATTER`) steps by 2,112 bytes and every other record refuses
         // it. A packed tensor laid by column, or of BFP slots, names none: only a `GATHER` reads
@@ -225,7 +212,6 @@ impl Placement {
             first: self.first as u32,
             ct: ct as u32,
             col_tiles,
-            by_row: self.by_row.is_some(),
             slot,
             ..TensorRef::default()
         };
@@ -234,10 +220,7 @@ impl Placement {
             r.base[i] = *b as u32;
         }
         // The control: the card reads by the reference's layout, so a rotated one misreads.
-        let shift = |probe: &std::sync::atomic::AtomicBool| {
-            probe.load(std::sync::atomic::Ordering::Relaxed)
-        };
-        if (col_tiles != 0 && shift(&PROBE_COLUMN_SHIFT)) || (r.by_row && shift(&PROBE_ROW_SHIFT)) {
+        if col_tiles != 0 && PROBE_COLUMN_SHIFT.load(std::sync::atomic::Ordering::Relaxed) {
             let n = self.channels.len();
             r.channels[..n].rotate_left(1);
             r.base[..n].rotate_left(1);
@@ -262,16 +245,12 @@ impl Placement {
         assert!(t < self.tiles, "tile {t} of {}", self.tiles);
         let t = t + self.first;
         let n = self.channels.len();
-        let (c, i) = match (self.by_column, self.by_row) {
-            (Some([rows, cols]), _) => {
+        let (c, i) = match self.by_column {
+            Some([rows, cols]) => {
                 let (r, col) = (t / cols, t % cols);
                 (col % n, ((col / n) * rows + r) as u64)
             }
-            (None, Some([_, cols])) => {
-                let (r, col) = (t / cols, t % cols);
-                (r % n, ((r / n) * cols + col) as u64)
-            }
-            (None, None) => (t % n, (t / n) as u64),
+            None => (t % n, (t / n) as u64),
         };
         self.channels[c]
             .range(self.base[c] + i * self.slot_bytes, self.slot_bytes)
@@ -370,11 +349,6 @@ pub struct DramAlloc {
     serial: u64,
     /// A capture's own freed slots, while it reuses them ([`DramAlloc::start_pool`]).
     pool: Option<Pool>,
-    /// Activations laid by row ([`DramAlloc::set_row_activations`]).
-    row_activations: bool,
-    /// Every activation grid of two tile columns laid by row, however short
-    /// ([`DramAlloc::set_row_activations_everywhere`]).
-    row_everywhere: bool,
 }
 
 /// A paused capture's log and pool ([`DramAlloc::suspend`]).
@@ -417,8 +391,6 @@ impl DramAlloc {
             log: None,
             serial: 0,
             pool: None,
-            row_activations: false,
-            row_everywhere: false,
         }
     }
 
@@ -553,7 +525,6 @@ impl DramAlloc {
             tiles: 1,
             first: 0,
             by_column: None,
-            by_row: None,
             owned: true,
             serial: self.serial - 1,
         })
@@ -581,59 +552,13 @@ impl DramAlloc {
                 let mut p = self.alloc_slots(cols.div_ceil(n) * n * rows, slot_bytes)?;
                 debug_assert_eq!(p.slots, (cols.div_ceil(n) * rows) as u64);
                 (p.tiles, p.by_column) = (tiles, Some([rows, cols]));
-                self.relog(&p);
-                Ok(p)
-            }
-            // Each channel holds whole rows: `rows.div_ceil(n) * cols` slots.
-            Layout::ByRow => {
-                if tiles == 0 {
-                    return Err(TensorError::Shape("an empty grid laid by row".into()));
+                if let Some(log) = &mut self.log {
+                    if let Some(last) = log.last_mut().filter(|l| l.serial == p.serial) {
+                        *last = p.clone();
+                    }
                 }
-                let n = self.channels.len();
-                let mut p = self.alloc_slots(rows.div_ceil(n) * n * cols, slot_bytes)?;
-                debug_assert_eq!(p.slots, (rows.div_ceil(n) * cols) as u64);
-                (p.tiles, p.by_row) = (tiles, Some([rows, cols]));
-                self.relog(&p);
                 Ok(p)
             }
-        }
-    }
-
-    /// The log's last placement, if it is `p`'s, as `p` now is (laid otherwise than
-    /// [`DramAlloc::alloc_slots`] logged it).
-    fn relog(&mut self, p: &Placement) {
-        if let Some(log) = &mut self.log {
-            if let Some(last) = log.last_mut().filter(|l| l.serial == p.serial) {
-                *last = p.clone();
-            }
-        }
-    }
-
-    /// Lay activations by row from now on ([`Layout::ByRow`], [`DramTensor::alloc_elem`]):
-    /// each grid of at least as many tile rows as channels and two tile columns.
-    pub fn set_row_activations(&mut self, on: bool) {
-        self.row_activations = on;
-    }
-
-    /// Whether activations are laid by row ([`DramAlloc::set_row_activations`]).
-    pub fn row_activations(&self) -> bool {
-        self.row_activations
-    }
-
-    /// A gate's mode: every activation grid of two tile columns laid by row, however few its rows
-    /// (`TT_ACT_ROWS=all`), so that every op meets the layout, not only those a tall chunk
-    /// reaches. Not a performance setting: short grids leave channels idle.
-    #[doc(hidden)]
-    pub fn set_row_activations_everywhere(&mut self, on: bool) {
-        self.row_everywhere = on;
-    }
-
-    /// How [`DramTensor::alloc_elem`] lays a `[rows, cols]`-tile grid.
-    pub(crate) fn activation_layout(&self, [rows, cols]: [usize; 2]) -> Layout {
-        let tall = rows >= self.channels.len() || self.row_everywhere;
-        match self.row_activations && tall && cols >= 2 {
-            true => Layout::ByRow,
-            false => Layout::Interleaved,
         }
     }
 
@@ -705,7 +630,6 @@ impl DramAlloc {
             tiles,
             first: 0,
             by_column: None,
-            by_row: None,
             owned: true,
             serial: self.serial - 1,
         };
@@ -954,7 +878,7 @@ impl DramTensor {
     /// slots (2,112 bytes a tile, half an FP32 tile's), which its reference names
     /// ([`tt_isa::dm::record::TensorRef::slot`]); every other elem an FP32 tile's.
     pub fn alloc_elem(alloc: &mut DramAlloc, rows: usize, cols: usize, elem: Elem) -> Result<Self> {
-        let grid = [rows.div_ceil(32).max(1), cols.div_ceil(32).max(1)];
+        let tiles = rows.div_ceil(32).max(1) * cols.div_ceil(32).max(1);
         let slot = match elem {
             Elem::BF16 => tt_isa::dm::BF16_TILE_SLOT,
             _ => TILE_SLOT,
@@ -963,7 +887,7 @@ impl DramTensor {
             rows,
             cols,
             elem,
-            placement: alloc.alloc_laid(grid, slot, alloc.activation_layout(grid))?,
+            placement: alloc.alloc_slots(tiles, slot)?,
             pad: std::cell::Cell::new(Pad::Undefined),
         };
         t.set_pad(Pad::Undefined);
@@ -1115,10 +1039,8 @@ impl DramTensor {
     ) -> Result<()> {
         let t = self;
         let img = matmul::TILE_IMAGE_BYTES;
-        // Laid by column or by row: each tile to its own slot ([`Placement::slot`]). The bulk
-        // write below lays tiles interleaved (an activation laid by row went there, and the
-        // card's reads of it disagreed with the host's round trip, which agreed with itself).
-        if t.placement.layout() != Layout::Interleaved {
+        // Laid by column: each tile to its own slot (a weight's, written once).
+        if t.placement.by_column.is_some() {
             for (tile, image) in images.chunks_exact(img).enumerate() {
                 let s = t.placement.slot(tile);
                 let r = s
@@ -1225,7 +1147,7 @@ impl DramTensor {
         // from each of two faces, not 4 KiB per tile.
         if self.placement.first != 0
             || self.placement.tiles < 2 * self.placement.channels.len()
-            || self.placement.layout() != Layout::Interleaved
+            || self.placement.by_column.is_some()
         {
             let [rt, ct] = self.grid();
             let mut packed = vec![0u8; self.placement.tiles * 4096];
@@ -2057,16 +1979,6 @@ pub(crate) fn contiguous_b_reads(
 /// Phase C1's negative control (`step268_column_weights`): a weight laid by column named with its
 /// channels rotated by one, so each column is read from the next column's channel. Host paths
 /// (writes, downloads) still address it by [`Placement::slot`].
-/// The by-row twin of [`PROBE_COLUMN_SHIFT`]: a by-row tensor's references name its channels
-/// rotated by one, so a record reads another row's tiles (a gate's control, never a result).
-static PROBE_ROW_SHIFT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Turn [`PROBE_ROW_SHIFT`] on or off.
-#[doc(hidden)]
-pub fn probe_row_shift(on: bool) {
-    PROBE_ROW_SHIFT.store(on, std::sync::atomic::Ordering::SeqCst);
-}
-
 static PROBE_COLUMN_SHIFT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -9536,128 +9448,6 @@ mod contiguous_b {
             contiguous_b_bytes(&header(stream | 2)).is_err(),
             "a transposed `B`"
         );
-    }
-}
-
-#[cfg(test)]
-mod by_row_tests {
-    use super::*;
-    use tt_isa::dm::record;
-    use tt_isa::dram::Dram;
-
-    /// The card's address of every tile of `p` (`[rows, cols]` tiles), from its reference
-    /// expanded as one `READ_RUN` (`tt_isa::dm::record`'s own walk): `(channel, offset)`.
-    fn card_addresses(p: &Placement, rows: usize, cols: usize) -> Vec<(u8, u64)> {
-        let [m0, m1] = p.tensor_ref(cols).encode();
-        let rec = [
-            [
-                record::READ_RUN,
-                0,
-                (rows * cols) as u32,
-                0x8_0000,
-                0,
-                0,
-                0,
-                0,
-            ],
-            m0,
-            m1,
-        ];
-        let mut out = Vec::new();
-        record::expand(&rec, |e| {
-            out.push((e[1] as u8, e[3] as u64));
-            Ok(())
-        })
-        .unwrap();
-        out
-    }
-
-    /// `docs/plans/a-by-row.md` P2: a grid laid by row puts tile `(r, c)` on channel `r % n` at
-    /// slot `(r / n) * cols + c` of the region there (the layout's definition, the oracle here),
-    /// every tile in a slot of its own inside regions of `rows.div_ceil(n) * cols` slots, on a
-    /// whole chip and a harvested one. The card's walk of its reference finds every tile where
-    /// the host's [`Placement::slot`] does, and the rotated control does not. A row view names
-    /// the same slots; another width is refused a reference.
-    #[test]
-    fn a_grid_laid_by_row_holds_each_tile_once_where_host_and_card_find_it() {
-        for mask in [0xFFu8, 0b1011_0110] {
-            let dram = Dram::from_usable_mask(mask);
-            let mut a = DramAlloc::new(&dram);
-            let n = a.channel_count();
-            for (rows, cols, slot) in [(16usize, 64usize, 2112u64), (9, 7, TILE_SLOT), (5, 2, 2112)]
-            {
-                let what = format!("mask {mask:#x}, [{rows}, {cols}] tiles, slot {slot}");
-                let p = a.alloc_laid([rows, cols], slot, Layout::ByRow).unwrap();
-                assert_eq!(p.layout(), Layout::ByRow);
-                assert_eq!(p.tiles(), rows * cols, "{what}");
-                assert_eq!(p.slots, (rows.div_ceil(n) * cols) as u64, "{what}");
-                let mut seen = std::collections::HashSet::new();
-                let mut host = Vec::new();
-                for r in 0..rows {
-                    for c in 0..cols {
-                        let s = p.slot(r * cols + c);
-                        let k = r % n;
-                        let want = p.base[k] + ((r / n) * cols + c) as u64 * slot;
-                        assert_eq!(s.channel(), p.channels[k], "{what}: ({r}, {c}) channel");
-                        assert_eq!(s.offset(), want, "{what}: ({r}, {c}) offset");
-                        assert!(want + slot <= p.base[k] + p.slots * slot, "{what}: inside");
-                        assert!(seen.insert((k, want)), "{what}: ({r}, {c}) shares a slot");
-                        host.push((s.channel().index(), s.offset()));
-                    }
-                }
-                let x = p.tensor_ref(cols);
-                assert!(x.by_row && x.col_tiles == 0, "{what}");
-                assert_eq!(
-                    x.slot != 0,
-                    slot == 2112,
-                    "{what}: a BF16 grid names its slots"
-                );
-                assert_eq!(
-                    card_addresses(&p, rows, cols),
-                    host,
-                    "{what}: the card's walk"
-                );
-                probe_row_shift(true);
-                let rotated = card_addresses(&p, rows, cols);
-                probe_row_shift(false);
-                if n > 1 {
-                    assert_ne!(rotated, host, "{what}: the control misreads");
-                }
-                let v = p.borrowed_tiles(cols, (rows - 1) * cols);
-                for t in 0..(rows - 1) * cols {
-                    assert_eq!(v.slot(t), p.slot(t + cols), "{what}: view tile {t}");
-                }
-                let wrong = std::panic::catch_unwind(|| p.tensor_ref(cols + 1));
-                assert!(wrong.is_err(), "{what}: another width misnames it");
-                a.free(&p);
-            }
-        }
-    }
-
-    /// Activations are laid by row only when asked, and only grids of at least as many tile
-    /// rows as channels and two tile columns: a 128-token chunk's `[4, 64]` and a decode step's
-    /// `[1, 64]` stay interleaved on 8 channels, a 256-token chunk's `[8, 64]` does not.
-    #[test]
-    fn an_activation_is_laid_by_row_only_where_asked_and_tall_enough() {
-        let mut a = DramAlloc::new(&Dram::from_usable_mask(0xFF));
-        let tall = DramTensor::alloc_elem(&mut a, 256, 2048, Elem::BF16).unwrap();
-        assert_eq!(tall.placement.layout(), Layout::Interleaved, "not asked");
-        a.set_row_activations(true);
-        for (rows, cols, want) in [
-            (256, 2048, Layout::ByRow),
-            (2000, 2048, Layout::ByRow),
-            (128, 2048, Layout::Interleaved),
-            (1, 2048, Layout::Interleaved),
-            (256, 32, Layout::Interleaved),
-            (256, 33, Layout::ByRow),
-        ] {
-            let t = DramTensor::alloc_elem(&mut a, rows, cols, Elem::BF16).unwrap();
-            assert_eq!(t.placement.layout(), want, "[{rows}, {cols}]");
-        }
-        let mut seven = DramAlloc::new(&Dram::from_usable_mask(0b0111_1111));
-        seven.set_row_activations(true);
-        let t = DramTensor::alloc_elem(&mut seven, 7 * 32, 64, Elem::F32).unwrap();
-        assert_eq!(t.placement.layout(), Layout::ByRow, "7 rows on 7 channels");
     }
 }
 

@@ -441,59 +441,28 @@ fn mover_gather_rate() {
             let mut marked = by_column;
             marked[0][4] |= record::REF_L1_BY_COLUMN;
             let b_resident = flags | record::GATHER_B_RESIDENT;
-            // Roadmap W2, `A` laid by row (`docs/plans/a-by-row.md`): its strip read a row a
-            // request (`BSpan::of_rows`), alone and beside `B` read a column a request.
-            let by_row = TensorRef {
-                ct: KT,
-                by_row: true,
-                ..tensor
-            }
-            .encode();
             let cases = [
                 (
                     "B by column, a tile a read",
                     flags,
-                    a,
                     by_column,
                     ROWS * KT + KT * COLS,
                 ),
                 (
                     "B by column, a column a read",
                     flags,
-                    a,
                     marked,
                     ROWS * KT + KT * COLS,
                 ),
                 (
                     "B by column, resident (A only)",
                     b_resident,
-                    a,
                     by_column,
                     ROWS * KT,
                 ),
-                (
-                    "B interleaved, resident (A only)",
-                    b_resident,
-                    a,
-                    b,
-                    ROWS * KT,
-                ),
-                (
-                    "A by row, B resident (A only)",
-                    b_resident,
-                    by_row,
-                    b,
-                    ROWS * KT,
-                ),
-                (
-                    "A by row, B by column a column a read",
-                    flags,
-                    by_row,
-                    marked,
-                    ROWS * KT + KT * COLS,
-                ),
+                ("B interleaved, resident (A only)", b_resident, b, ROWS * KT),
             ];
-            for (what, flags, a, b, tiles) in cases {
+            for (what, flags, b, tiles) in cases {
                 let list: Vec<Entry> = (0..RECORDS)
                     .flat_map(|r| {
                         [
@@ -521,48 +490,6 @@ fn mover_gather_rate() {
                 let cycles = list_cycles(one.d, &one.w, &mut one.m, &list);
                 report(
                     &format!("gather rate: {what}, cycles a {slot}-byte tile's bytes"),
-                    "cycles",
-                    "device",
-                    cycles.map(|c| c / tiles),
-                );
-            }
-            // Rows as long as a model's (`A` `[128, 2048]` is 64 tiles a row): two rows of
-            // `LONG` tiles a record, `B` resident, interleaved and by row.
-            const LONG: u32 = 48;
-            assert!(a_at + 2 * LONG * slot <= L1 + L1_SPAN);
-            let long_flags = (flags & !(KT << 8)) | LONG << 8 | record::GATHER_B_RESIDENT;
-            for (what, a) in [
-                ("A interleaved", TensorRef { ct: LONG, ..tensor }),
-                (
-                    "A by row",
-                    TensorRef {
-                        ct: LONG,
-                        by_row: true,
-                        ..tensor
-                    },
-                ),
-            ] {
-                let a = a.encode();
-                let list: Vec<Entry> = (0..RECORDS)
-                    .flat_map(|r| {
-                        [
-                            [record::GATHER, long_flags, a_at, b_at, r * 2, 2, 0, COLS],
-                            a[0],
-                            a[1],
-                            b[0],
-                            b[1],
-                        ]
-                    })
-                    .collect();
-                for rec in list.chunks(record::len(record::GATHER)) {
-                    record::expand_reads(rec, |_| 0, |_| Ok(())).unwrap();
-                }
-                let tiles = (RECORDS * 2 * LONG) as f64;
-                let cycles = list_cycles(one.d, &one.w, &mut one.m, &list);
-                report(
-                    &format!(
-                        "gather rate: {what}, {LONG}-tile rows (A only), cycles a {slot}-byte tile's bytes"
-                    ),
                     "cycles",
                     "device",
                     cycles.map(|c| c / tiles),

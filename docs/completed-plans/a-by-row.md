@@ -1,8 +1,11 @@
 # `A` laid by row, read a row a request
 
-Roadmap W2's box "`A` laid by row" ([roadmap](roadmap.md)): a matmul's activation operand `A` is read by B's mover a
+**Status: killed at P4 (2026-11-19); the code is deleted.** Kept for its findings: see P4 below and
+[failed-approaches](../learnings/failed-approaches.md).
+
+Roadmap W2's box "`A` laid by row" ([roadmap](../plans/roadmap.md)): a matmul's activation operand `A` is read by B's mover a
 tile a request today, interleaved over the channels (tile `t` on channel `t % n`). A weight `B` is already stored by
-column and read a column a request (`BSpan`, [decode-bytes-in-flight.md](decode-bytes-in-flight.md) C1, the
+column and read a column a request (`BSpan`, [decode-bytes-in-flight.md](../plans/decode-bytes-in-flight.md) C1, the
 2026-11-14 log). This plan does the same for `A`: activations laid by row, so that a block's `A` strip is one run a row.
 
 **Why:** at the 1.7B's 128-256-token prefill, `A`'s reads are the lever left in the products (P0 of the short-chunk box,
@@ -66,15 +69,21 @@ pieces in turn).
   **Defect found by P3's gate, not P2's tests:** `write_images` / `download_any` special-cased only by-column
   placements, so a by-row tensor's upload and download laid tiles interleaved, consistently with each other; the
   card's reads disagreed. Every non-interleaved placement now goes tile by tile.
-- [ ] **P3: gates.** Done on ttsim: `step276_rows_activations` (eltwise, product with `A` by row and `B` by row, both
-  reductions, a chained product, a row view, a transposed `A`; `m` 64 / 128 / 200 / 256; the session's rule and every
-  grid; the rotated control) in the safe, `fast-reads` and `fast-reads` + `encoded-guard` images, with `step172` /
-  `step173`. Left: card 0 (with the BF16 casts, silicon only), conformance under `TT_ACT_ROWS=all`, `step12_mnist`.
-  Planned: A ttsim gate (safe, `fast-reads`, `fast-reads` + `encoded-guard`): every op class writing and
-  reading a by-row tensor, products at `m` = 64 / 128 / 256 with ragged rows followed by a reduction and a matmul,
-  bit for bit against interleaved; the rotated control gives other bits. Card 0. `step172` / `step173` in all three
-  read modes, firmware lints with and without `profile`, `step12_mnist`, conformance.
-- [ ] **P4: the model A/B** (ABBA by process, card 0, performance contract): the 1.7B's prefill at 32 / 128 / 256
-  (and the bucket default's larger chunks), decode, ViT-Tiny, ResNet-18, Qwen3.5-4B's prefill. Kill: under 3% of a
-  128-token chunk, or any default slower by more than 0.5%. Win: on by default (`TT_ACT_ROWS=0` off). Loss: a row in
-  `failed-approaches.md`, the knob and the code deleted.
+- [x] **P3: gates** (2026-11-19). ttsim: `step276_rows_activations` (eltwise, product with `A` by row and `B` by row,
+  both reductions, a chained product, a row view, a transposed `A`; `m` 64 / 128 / 200 / 256; the session's rule and
+  every grid; the rotated control) in the safe, `fast-reads` and `fast-reads` + `encoded-guard` images, with `step172`
+  / `step173`. Card 0: `step276` with the BF16 casts (its first silicon run found the gate's own defect: it downloaded
+  the packed BF16 tensor, which has no host readback; it now compares the cast back, widened on the card exactly);
+  `step12_mnist` with `TT_ACT_ROWS` unset and `=all`, 8 of 8 each. Burn conformance under `TT_ACT_ROWS=all` (ttsim):
+  3,025 run, 52 expected failures, none unexpected (`1795087900`).
+- [x] **P4: the model A/B** (2026-11-19, ABBA by process, card 0, performance contract;
+  [log](../learnings/performance-log.md#w2-a-laid-by-row-killed-the-cards-products-no-faster-its-elementwise-ops-slower-2026-11-19-card-0)):
+  **killed.** The 1.7B's prefill +4.8% at 256 tokens (512 positions) and +5.0 / +3.4 / +3.4 / +6.4% at 256 / 512 /
+  1,024 / 2,000 (2,048 positions, chunks to 1,024), decode +0.4-1.0%, ViT-Tiny +62%, ResNet-18 +43%, Qwen3.5-4B (16-row
+  chunks, nothing laid by row) -0.2%. Profiled: on the card a 256-token chunk 40.36 -> 42.11 ms; the products' read
+  requests fell 2.6x and their `A` bytes 298 -> 168 MB, and they ran +2%, so `A`'s request cost did not bind them in
+  the model (P0's bound came from a strip probe and from `A` skipped altogether, which also removes its bytes and
+  waits); elementwise ops on tensors laid by row lost 25-27% (a unit's tiles of one row on one channel, not eight). The
+  vision models lost on the host: a tensor laid by row skips the DMA transfer path. The knob, the encoding, the cursor
+  and walks, the placement, the probe's case and `step276` deleted; `Session::place_linked` (the wedge fix shipped with
+  P2) kept. Row in [failed-approaches](../learnings/failed-approaches.md).

@@ -3591,7 +3591,6 @@ mod tests {
             first: 0,
             ct,
             col_tiles: 0,
-            by_row: false,
             slot: 0,
         };
         let [a0, a1] = record::TensorRef::default().encode();
