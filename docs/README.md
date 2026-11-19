@@ -119,6 +119,7 @@ Plans whose checklists are closed move here as a record, with their evidence. Th
 - [`mixed-bfp-storage.md`](completed-plans/mixed-bfp-storage.md): the delivered BFP8/4/2 storage and training contract.
 - [`ttinsn-push-experiment.md`](completed-plans/ttinsn-push-experiment.md) and [`ttinsn-push.md`](completed-plans/ttinsn-push.md): the `.ttinsn` experiment (2.77x, result go) and the fused push from the host, the default since 2026-10-25.
 - [`decode-host-cost.md`](completed-plans/decode-host-cost.md): roadmap Track 2 items 3 and 4 (2026-10-14): jobs counted per Burn op, a native `cat`, cache writes as a tile copy, slices and swaps as views.
+- [`a-by-row.md`](completed-plans/a-by-row.md): activations laid by row so a product reads `A` a row a request (P0-P3 built and gated, killed at P4 on 2026-11-19: the products no faster in the model, elementwise ops slower; the code deleted).
 
 ---
 

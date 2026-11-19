@@ -952,6 +952,17 @@ pub fn probe_restored_bytes(device: TtDevice) -> Result<(u64, u64), TtError> {
     server::run(device, |e, _| e.probe_restored_bytes())
 }
 
+/// What every unit's program cache on `device` recorded since the last call, in unit order, and
+/// logging on or off from here (`tt_kernels::program_cache::Event`): what a failed build's
+/// program caches did. Dev-facing.
+#[doc(hidden)]
+pub fn probe_program_log(
+    device: TtDevice,
+    on: bool,
+) -> Result<Vec<Vec<tt_kernels::program_cache::Event>>, TtError> {
+    server::run(device, move |e, _| e.probe_program_log(on))
+}
+
 /// Every unit's NC waits since they were last taken, in tile cycles, zeroed: what B's waits for
 /// its writer core are made of (`tt_kernels::session::Session::probe_nc_waits`; counted only by
 /// firmware built with the profile feature). Dev-facing.

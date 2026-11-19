@@ -157,10 +157,8 @@ fn traced_generation_equals_the_eager_one_at_long_context() {
         for (what, config) in configs() {
             with_device(every_tile(), |d| {
                 let model = Llama::<TtBackend>::new(&config, &d);
-                // A chunk's attention holds its scores `[rows, max_len]` several times over (the
-                // composition's softmax): the largest chunk shrinks as the cache grows, 512 at
-                // 8,192 positions, 128 at 32,768, so they take the same GDDR.
-                let largest = (512 * 8192 / max_len).max(64);
+                // The largest chunk the scores allow (512 at 8,192 positions, 128 at 32,768).
+                let largest = tt_models::generate::score_cap(max_len);
                 let shapes = Shapes::new(max_len, &[64, largest]);
                 let g = traced(&model, &shapes, &d);
                 let gb = |(fullest, all): (u64, u64)| {

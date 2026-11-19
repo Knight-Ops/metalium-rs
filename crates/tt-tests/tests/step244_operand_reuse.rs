@@ -308,6 +308,79 @@ fn a_planned_capture_shares_and_leaves_the_session_sharing() {
     });
 }
 
+/// A shared product one of whose units cannot take its programs is refused with nothing of it
+/// queued: its partners do not wait for a unit that never runs, nothing is recovered, and a
+/// trace captured before still replays. (Refused on the last unit after the others' lists were
+/// queued, the partners waited until the run timed out and the recovery's reset made every
+/// trace stale: a measured candidate's, `1795029493`.) Then, the unit's cache whole again, the
+/// shared product is the unshared one bit for bit.
+#[test]
+fn a_shared_product_refused_on_one_unit_queues_nothing() {
+    with_session(4, |s| {
+        s.set_block_stream(BlockStream::Fixed([2, 2, 3]));
+        let a = s.upload(&values(96 * 256, 5), 96, 256).unwrap();
+        let b = s.upload(&values(256 * 320, 6), 256, 320).unwrap();
+        let (plain, _) = product(s, &a, false, &b, false, Fidelity::HiFi4, Reuse::Off);
+        s.begin_trace().unwrap();
+        let kept = s
+            .matmul_dram(
+                &a,
+                false,
+                &b,
+                false,
+                SrcRoute::Tf32FromFp32,
+                Fidelity::HiFi4,
+                BUDGET * 40,
+            )
+            .unwrap();
+        let id = s.end_trace().unwrap();
+        // The last unit's cache too small for any of its programs: a capture refuses them.
+        s.limit_unit_program_cache(3, 1024).unwrap();
+        let pull = Reuse::Pull {
+            holders: 1,
+            b_holders: None,
+        };
+        s.set_operand_reuse(pull).unwrap();
+        let recovered = s.probe_recoveries();
+        s.begin_trace().unwrap();
+        let refused = s.matmul_dram(
+            &a,
+            false,
+            &b,
+            false,
+            SrcRoute::Tf32FromFp32,
+            Fidelity::HiFi4,
+            BUDGET * 40,
+        );
+        let ended = s.end_trace();
+        assert!(
+            refused.is_err() || ended.is_err(),
+            "a unit that cannot take its programs refuses the capture"
+        );
+        if let Ok(z) = refused {
+            let _ = s.free(z);
+        }
+        if let Ok(t) = ended {
+            let _ = s.release_trace(t);
+        }
+        assert_eq!(s.probe_recoveries(), recovered, "nothing was recovered");
+        s.limit_unit_program_cache(3, tt_isa::l1::PROGRAM_CACHE.len())
+            .unwrap();
+        s.set_operand_reuse(Reuse::Off).unwrap();
+        s.replay(id).unwrap();
+        same(&plain, &s.download(&kept).unwrap(), "the earlier trace");
+        s.free(kept).unwrap();
+        s.release_trace(id).unwrap();
+        let (after, copies) = product(s, &a, false, &b, false, Fidelity::HiFi4, pull);
+        assert!(copies > 0, "the product after the refusal shared nothing");
+        same(&plain, &after, "after the refusal");
+        assert!(
+            credit_words(s).iter().all(|w| w.iter().all(|&x| x == 0)),
+            "a credit word left counted"
+        );
+    });
+}
+
 /// Three block rows over seven units: groups of two and one unit idle, with two holders of
 /// `B` a column group of three.
 #[test]
