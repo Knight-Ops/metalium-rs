@@ -22,7 +22,7 @@
 //! **Negative control:** the attention of the values before they were stored block-float differs
 //! from the cache's, so equal bits above say the products read the stored values.
 
-use burn::tensor::{module::attention, Bool, DType, IndexingUpdateOp, Int, Tensor, TensorData};
+use burn::tensor::{module::attention, Bool, IndexingUpdateOp, Int, Tensor, TensorData};
 use burn_tensor::ops::AttentionModuleOptions;
 use burn_tt::storage::{StorageFormat, TensorStorageExt};
 use burn_tt::{device_time, TileChoice, TtBackend};
