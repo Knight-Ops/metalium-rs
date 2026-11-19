@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W2: default prefill chunks for a cache's length](#w2-default-prefill-chunks-for-a-caches-length-2026-11-19-card-0) | 2026-11-19 | `Shapes::for_cache`: `64,128,256` under 2,048 positions, then powers of two to 1,024 under the scores' cap and half the cache. At 2,048 positions 512 / 1,024 / 2,000-token prompts **-9.0 / -11.5 / -14.1%** (ABBA), short ones within noise. Killed by the 0.5% line under 2,048: a chunk past 256 costs a 256-token prompt ~1% there (more programs restored), for 11-13% at 496-1,000 tokens. A chunk the cache's length loses everywhere. Not for Qwen3.5's row-stepped DeltaNets |
 | [W2: a capture's programs in the program cache](#w2-a-captures-programs-in-the-program-cache-the-capture-clear-kept-packing-killed-2026-11-19-card-0) | 2026-11-19 | a capture begins in a cache cleared of what no trace holds: the bench's second build no longer inherits the first's scattered addresses (an intermittent refusal), and the 1.7B's 128-token prefill **27.71 -> 26.49 ms** (-4.4%, ABBA; 1.85 -> 0.99 MB of programs restored a generation), the rest within 0.25%. Packing a capture's programs lost live (+11.9% at 128 tokens), BestFit and TopDown trade one prompt for another; all three deleted, with the offline replay (faithful only under the recording's own policy). A replay pays ~1.25 ms a MB restored |
 | [W2: short-chunk follow-ups](#w2-short-chunk-follow-ups-gateups-choice-as-request-bound-and-512--1024-token-chunks-2026-11-17-card-0) | 2026-11-17 | `gate\|up`'s slower block: at 128 rows the program cache's fragmentation refuses the best (open), at 256 the candidate list missed it (fixed, `[4,8,9]` pulled: the 1.7B's 256-token prefill **1.036x**). `A` read a row a request bounded at 2.5-3.6 ms a 128-token chunk. 512- and 1,024-token chunks fit and pay 1.14-1.21x at 512-2,000 tokens. A wedge during one build's measurement, not reproduced |
 | [W2: short-chunk products mapped before building](#w2-short-chunk-products-mapped-before-building-spreading-refuted-as-cost-the-lever-2026-11-17-card-0) | 2026-11-17 | P0 of the box, a probe only: the slope that chooses blocks is 12-26% under a product's span in a chunk (copies merged, no barrier); timed behind barriers, 88+ units lose at 128 rows with `A` (668 against 576 us a layer) and without it (498 against 336). `A`'s reads on today's blocks bound -5.8 / -6.0 ms a 128 / 256-token chunk; the model's `gate\|up` runs a slower block than the best (~1.0 / 1.9 ms) |
@@ -447,6 +448,69 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W2: default prefill chunks for a cache's length (2026-11-19, card 0)
+
+The roadmap box "prefill buckets of 512 and 1,024" (item 3 of the short-chunk follow-ups): a generator had no default
+chunks, and every caller passed its own (the benches `64,128,256`, or 64). Now `generate::Shapes::for_cache(max_len)`:
+powers of two from 64 up to the largest dividing the cache that is no more than 256 rows below 2,048 positions
+(`LONG_CACHE`), 1,024 from there (`LARGEST_DEFAULT_CHUNK`), the scores' cap (`generate::score_cap`, step224's
+`512 * 8192 / max_len`, at least 64, moved beside it) and half the cache. The benches' defaults are it (`TT_GEN_BUCKETS`,
+`TT_GEN_CHUNKS` override). Performance contract, the 1.7B, `traced_generation_stream_ceiling`, host-timed, 16 new
+tokens, at the capture clear's commit (`1eb4519`).
+
+**The table, one process a cell** (prefill ms, medians of 9 samples, 5 at 4,096 and 8,192 positions):
+
+| cache | chunks | 128 | 256 | 512 | 1,000-1,024 | 2,000 | 4,000 | 8,000 | GDDR free | run |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| 512 | 64-256 | 25.72 | 44.00 | 93.51 (496) | | | | | 30.58 GB | `1795048651` |
+| 512 | 64-512 | 26.36 | 43.98 | 81.95 (496) | | | | | 30.35 | `1795049053` |
+| 1,024 | 64-256 | 28.39 | 42.90 | 92.94 | 215.70 | | | | 29.91 | `1795049594` |
+| 1,024 | 64-512 | 27.39 | 42.80 | 82.59 | 189.97 | | | | 29.28 | `1795050105` |
+| 1,024 | 64-1,024 | 27.32 | 43.42 | 81.80 | 193.99 | | | | 28.67 | `1795050884` |
+| 2,048 | 64-256 | 28.08 | 43.36 | 93.32 | 217.63 | 574.03 | | | 28.44 | `1795051928` |
+| 2,048 | 64-512 | 27.85 | 43.36 | 85.82 | 194.41 | 512.73 | | | 27.33 | `1795052630` |
+| 2,048 | 64-1,024 | 28.01 | 43.40 | 85.97 | 192.35 | 492.84 | | | 25.70 | `1795053724` |
+| 2,048 | 64, 256, 1,024 | **42.76** | 43.15 | 190.93 | 191.58 | 492.52 | | | 27.43 | `1795055401` |
+| 4,096 | 64-256 | | 43.89 | | 217.66 | 575.60 | 1,728.5 | | 26.01 | `1795056486` |
+| 4,096 | 64-512 | | 43.90 | | 194.07 | 511.24 | 1,601.4 | | 24.04 | `1795057474` |
+| 4,096 | 64-1,024 | | 43.73 | | 192.57 | 493.24 | 1,522.7 | | 20.78 | `1795059079` |
+| 8,192 | 64-256 | | 44.42 | | 225.01 | | 1,736.2 | 5,278.5 | 21.51 | `1795061945` |
+| 8,192 | 64-512 | | 44.44 | | 192.77 | | 1,599.3 | 5,008.0 | 18.00 | `1795063242` |
+| 8,192 | 64-1,024 | | 44.77 | | 194.41 | | 1,525.4 | 4,736.4 | 11.82 | `1795065388` |
+
+Decode was unchanged by the chunks in every cell (8.2-8.3 ms after a 128-token prompt, 18.2-18.4 after 1,024, 23.0-23.2
+after 4,000). Every build with a 1,024 chunk was clean (the 1,024-row wedge of `1794944223` did not recur, 9 builds).
+Dropping 128 (`64,256,1,024`) costs a 128-token prompt 1.5x: out. The program bytes a generation restores moved
+with the trace count (0.7-4.4 MB), the cost the roadmap box "the programs a generation restores" is about.
+
+**The close calls, ABBA by process** (prefill ms, A / B / B / A):
+
+| cache | A against B | 128 | 256 | 512 | 1,000-1,024 | 2,000 | runs |
+|---|---|--:|--:|--:|--:|--:|---|
+| 512 | 64-256 / +512 | 26.93, 26.95 / 26.55, 26.71 | 43.54, 43.52 / **44.04, 43.78** | 93.24, 93.23 / 81.26, 81.74 (496) | | | `1795069347`, `1795069751`, `1795070294`, `1795070848` |
+| 1,024 | 64-512 / +1,024 | 27.07, 27.07 / **27.39, 27.65** | 43.23, 42.99 / 42.91, 43.03 | 82.66, 82.58 / 83.05, 82.19 | 189.88, 189.95 / **194.04, 193.51** | | `1795071248`, `1795072025`, `1795073072`, `1795074123` |
+| 2,048 | 64-512 / +1,024 | 28.04, 28.08 / 28.06, 28.02 | 43.54, 43.55 / 43.42, 43.55 | 85.59, 84.85 / 86.08, 85.02 | 194.19, 192.67 / 192.37, 192.04 | 512.25, 509.79 / 492.92, 492.09 | `1795074898`, `1795076003`, `1795077669`, `1795079294` |
+| 1,024 | 64-256 / 64-512 | 27.35, 27.93 / 27.31, 27.26 | 42.97, 42.76 / **43.30, 43.40** | 93.08, 93.04 / 82.33, 82.52 | 216.10, 216.29 / 189.78, 189.86 | | `1795080456`, `1795080967`, `1795081743`, `1795082520` |
+| 2,048 | 64-256 / 64-1,024 | 28.30, 27.42 / 28.20, 28.16 | 43.18, 43.79 / 43.64, 43.59 | 93.18, 93.86 / 85.05, 85.08 | 217.02, 218.35 / 193.01, 192.39 | 573.28, 574.99 / 493.37, 492.59 | `1795083035`, `1795083731`, `1795085391`, `1795087057` |
+
+- **A chunk the cache's length loses** where shorter ones do not: +0.9% at 256 tokens (512 positions), +1.7% / +2.0%
+  at 128 / 1,000 tokens (1,024 positions), for nothing at 1,024. The default stops at half the cache.
+- **Under 2,048 positions a chunk past 256 costs a 256-token prompt ~1%** (+0.9% at 512 positions, +1.1% at 1,024:
+  both B runs above both A), with more programs restored (0.95 -> 1.2 MB at 1,024): over the 0.5% kill line, so those
+  caches keep `64,128,256`, giving up 11-13% at 496-1,000 tokens (a caller with long prompts passes its chunks; the
+  restores' box is what would let them have both).
+- **From 2,048 positions buckets to 1,024 pass:** 128 and 256 tokens within the processes' spread (A brackets B), and
+  512 / 1,024 / 2,000 tokens **-9.0 / -11.5 / -14.1%** (93.5 -> 85.1, 217.7 -> 192.7, 574.1 -> 493.0 ms). At 4,096 the
+  table gives 1,024-4,000 tokens -11.5 / -14.3 / -11.9% with 256 unchanged; at 8,192 the scores' cap stops at 512
+  (-14.3 / -7.9 / -5.1% at 1,024 / 4,000 / 8,000 tokens). The 1,024 chunk costs GDDR (1.6 GB at 2,048 positions, 3.3
+  at 4,096, 6.2 at 8,192 where the cap refuses it).
+- **Not for every decoder:** Qwen3.5-4B's DeltaNets step a chunk's recurrence a row at a time (`qwen35.rs`, ops in
+  proportion to a chunk's rows), so its bench keeps its 16-row chunks and the planned Qwen check at 2,048 was not run;
+  the default is documented as an attention decoder's.
+
+Gates: `generate::tests::the_default_chunks_fit_every_cache` (every power-of-two cache to 32,768 and odd ones accepted
+by `checked`, the measured sets pinned); step224's long-context gates (card 0, the shared `score_cap`).
 
 ## W2: a capture's programs in the program cache: the capture clear kept, packing killed (2026-11-19, card 0)
 

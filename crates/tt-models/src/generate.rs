@@ -432,6 +432,28 @@ pub fn schedule(len: usize, buckets: &[usize]) -> Vec<Chunk> {
     out
 }
 
+/// The largest chunk [`Shapes::for_cache`] feeds a prompt in, where the cache and its scores
+/// allow ([`score_cap`]), from [`LONG_CACHE`] positions. Measured on the 1.7B (2026-11-19, card
+/// 0, the performance contract): buckets to 1,024 against `64,128,256` at 2,048 positions took
+/// 9.0 / 11.5 / 14.1% off 512 / 1,024 / 2,000-token prompts and left 128 and 256 within noise
+/// (ABBA); 2,048 rows were not measured.
+pub const LARGEST_DEFAULT_CHUNK: usize = 1024;
+
+/// The shortest cache whose default chunks go past 256 rows. Below it a longer chunk's trace cost
+/// a 256-token prompt more than 0.5% (the 1.7B, ABBA by process: +0.9% with a 512 bucket at 512
+/// positions, +1.1% at 1,024, from the programs the extra trace makes the others restore) for
+/// 11-13% off 496-1,000-token prompts; a caller with long prompts passes its chunks.
+pub const LONG_CACHE: usize = 2048;
+
+/// The largest chunk a cache of `max_len` positions should take for its attention scores: a
+/// chunk's attention holds its scores, `[rows, max_len]`, several times over (the composition's
+/// softmax), so the largest chunk shrinks as the cache grows to keep that GDDR the same: 512 rows
+/// at 8,192 positions, 128 at 32,768, never under 64. `step224` builds the 1.7B at 32,768
+/// positions so.
+pub fn score_cap(max_len: usize) -> usize {
+    (512 * 8192 / max_len.max(1)).max(64)
+}
+
 /// The shapes a generation's steps come in: the cache's length, the chunk sizes a prompt is fed
 /// in ([`schedule`]), the lengths a decode step attends to (a step at `position` attends to the
 /// smallest length above it), and the lengths a chunk attends to (a chunk attends to the smallest
@@ -458,6 +480,35 @@ impl Shapes {
             prefixes: steps.clone(),
             steps,
         }
+    }
+
+    /// [`Self::new`] with the default chunks for a cache of `max_len` positions: powers of two
+    /// from 64 up to the largest that divides the cache (as [`schedule`] needs) and is no more
+    /// than 256 rows (from [`LONG_CACHE`] positions, [`LARGEST_DEFAULT_CHUNK`]), [`score_cap`] and
+    /// half the cache. A cache under 128 positions is one chunk; one that 64 does not divide is
+    /// refused by name when a generator is built.
+    ///
+    /// Half the cache, measured on the 1.7B (2026-11-19, card 0, ABBA by process): a chunk the
+    /// cache's length beside the others cost 128- and 1,000-token prompts 1.7% and 2.0% at 1,024
+    /// positions, where half the cache did not. The defaults are for decoders whose chunk is a few
+    /// products whatever its rows; a decoder with a recurrence stepped a row at a time (Qwen3.5's
+    /// DeltaNets) traces ops in proportion to a chunk's rows, and chooses its own.
+    pub fn for_cache(max_len: usize) -> Self {
+        let largest = if max_len < LONG_CACHE {
+            256
+        } else {
+            LARGEST_DEFAULT_CHUNK
+        };
+        let cap = largest.min(score_cap(max_len)).min((max_len / 2).max(64));
+        let sizes: Vec<usize> = std::iter::successors(Some(64usize), |c| c.checked_mul(2))
+            .take_while(|&c| c <= cap)
+            .collect();
+        let chunks = match sizes.iter().rev().find(|&&c| max_len % c == 0) {
+            Some(&largest) => sizes.into_iter().take_while(|&c| c <= largest).collect(),
+            None if max_len < 64 => vec![max_len],
+            None => vec![64],
+        };
+        Self::new(max_len, &chunks)
     }
 
     /// The same, with decode steps attending to `steps` positions (the cache's length is added).
@@ -1166,6 +1217,59 @@ mod tests {
         assert_eq!(schedule(13, &[4, 8]), [c(0, 8, 8), c(8, 5, 8)]);
         assert_eq!(schedule(16, &[4, 8]), [c(0, 8, 8), c(8, 8, 8)]);
         assert_eq!(schedule(300, &[64, 256]), [c(0, 256, 256), c(256, 44, 64)]);
+    }
+
+    /// Every cache a generator is built for gets default chunks it accepts, under the scores'
+    /// cap; one 64 does not divide is refused by name.
+    #[test]
+    fn the_default_chunks_fit_every_cache() {
+        let mut caches: Vec<usize> = std::iter::successors(Some(64usize), |l| Some(l * 2))
+            .take_while(|&l| l <= 32_768)
+            .collect();
+        caches.extend([16, 48, 192, 320, 1_000 * 64, 4_032]);
+        for max_len in caches {
+            let shapes = Shapes::for_cache(max_len).checked().unwrap();
+            let largest = *shapes.chunks.last().unwrap();
+            assert!(
+                largest
+                    <= score_cap(max_len)
+                        .min(if max_len < LONG_CACHE {
+                            256
+                        } else {
+                            LARGEST_DEFAULT_CHUNK
+                        })
+                        .min(max_len / 2)
+                        .max(max_len.min(64))
+            );
+            assert_eq!(max_len % largest, 0, "{max_len}");
+            assert!(
+                shapes.chunks[0] == 64 || shapes.chunks == [max_len],
+                "{max_len}"
+            );
+        }
+        let pow2 = |hi: usize| -> Vec<usize> {
+            std::iter::successors(Some(64usize), |c| Some(c * 2))
+                .take_while(|&c| c <= hi)
+                .collect()
+        };
+        // The measured defaults (2026-11-19): 256 rows under 2,048 positions, then half the
+        // cache, 1,024 rows, the scores' cap.
+        assert_eq!(Shapes::for_cache(512).chunks, pow2(256));
+        assert_eq!(Shapes::for_cache(1024).chunks, pow2(256));
+        assert_eq!(Shapes::for_cache(2048).chunks, pow2(1024));
+        assert_eq!(Shapes::for_cache(4096).chunks, pow2(1024));
+        assert_eq!(Shapes::for_cache(8192).chunks, pow2(512));
+        assert_eq!(Shapes::for_cache(16_384).chunks, pow2(256));
+        assert_eq!(Shapes::for_cache(128).chunks, [64]);
+        assert_eq!(Shapes::for_cache(64).chunks, [64]);
+        assert_eq!(Shapes::for_cache(320).chunks, [64]);
+        assert_eq!(Shapes::for_cache(32_768).chunks, [64, 128]);
+        assert_eq!(Shapes::for_cache(16).chunks, [16]);
+        assert!(matches!(
+            Shapes::for_cache(100).checked(),
+            Err(GenerateError::Refused(_))
+        ));
+        assert_eq!([8192, 32_768, 1 << 20].map(score_cap), [512, 128, 64]);
     }
 
     #[test]

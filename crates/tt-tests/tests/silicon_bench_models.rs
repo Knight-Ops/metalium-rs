@@ -904,7 +904,7 @@ fn smollm2_decode_with_the_embedding_lookup() {
 ///
 /// Two things are measured:
 /// 1. **What the traces cost together:** the step and the chunks (`TT_GEN_BUCKETS`, default
-///    `64,128,256`) over a cache of `TT_GEN_MAX_LEN` positions (default 512), captured in one
+///    the cache's, `Shapes::for_cache`: `64,128,256` at 512) over a cache of `TT_GEN_MAX_LEN` positions (default 512), captured in one
 ///    attachment. The report gives the program-cache bytes held on the fullest unit and the trace
 ///    streams' GDDR bytes. A capture that does not fit fails its attachment for good, so the bench
 ///    then stops and names the sizes.
@@ -999,9 +999,11 @@ fn traced_generation() {
             );
         }
     }
+    // The chunk sizes a prompt is fed in (`TT_GEN_BUCKETS`; default the cache's,
+    // `Shapes::for_cache`).
     let buckets: Vec<usize> = std::env::var("TT_GEN_BUCKETS")
         .map(|v| v.split(',').map(|b| b.trim().parse().unwrap()).collect())
-        .unwrap_or_else(|_| vec![64, 128, 256]);
+        .unwrap_or_else(|_| tt_models::generate::Shapes::for_cache(max_len).chunks);
     let run = GenRun {
         name,
         config,
@@ -1543,7 +1545,8 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
 /// could stay in L1 between ops; `docs/completed-plans/planned-l1-residency.md` Phase 1).
 ///
 /// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
-/// cache with 64-token chunks (or the comma-separated `TT_GEN_CHUNKS`); prompts of 32 and 256
+/// cache with the cache's default chunks (`Shapes::for_cache`, or the comma-separated
+/// `TT_GEN_CHUNKS`); prompts of 32 and 256
 /// tokens (or the comma-separated `TT_GEN_PROMPTS`), `TT_GEN_NEW` tokens each, each timed for its
 /// prefill and its median decode step over `TT_GEN_SAMPLES` samples (default 9). Chunks attend to
 /// the step lengths (or the comma-separated `TT_GEN_PREFIXES`, `none` for the whole cache).
@@ -1741,10 +1744,12 @@ fn traced_generation_stream_ceiling() {
             std::fs::write(path, out).unwrap();
             println!("PROGRAM LOG written to {path}");
         };
-        // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
-        let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
-            v.split(',').map(|n| n.trim().parse().unwrap()).collect()
-        });
+        // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`; default the cache's,
+        // `Shapes::for_cache`).
+        let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or_else(
+            |_| Shapes::for_cache(max_len).chunks,
+            |v| v.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        );
         // The lengths a chunk attends to (`TT_GEN_PREFIXES`, comma-separated; `none` for the
         // whole cache, as before `docs/plans/long-context.md` D2; default the step lengths).
         let shapes = match std::env::var("TT_GEN_PREFIXES").as_deref() {
