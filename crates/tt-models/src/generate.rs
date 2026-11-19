@@ -24,6 +24,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::progress::{report, Progress};
+
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Int, Tensor, TensorData, TensorPrimitive};
 use burn_tt::{
@@ -301,12 +303,18 @@ pub(crate) fn eager<B: Backend>(
     };
     let mut out = Generation::new(steps);
     out.step(|| forward(ids(prompt)));
+    report(Progress::Prefill { done: 1, total: 1 });
     match continuation {
         None => {
             assert!(steps >= 1);
             for step in 0..steps {
                 let next = argmax(out.logits.last().expect("one prediction per step")) as i32;
                 out.tokens.push(next);
+                report(Progress::Token {
+                    done: step + 1,
+                    total: steps,
+                    token: next,
+                });
                 if step + 1 < steps {
                     out.step(|| forward(ids(&[next])));
                 }
@@ -721,7 +729,7 @@ fn input<B: TracedBackend, const D: usize>(t: &Tensor<B, D, Int>) -> TtTensor {
 
 /// `TT_BUILD_TIMES=1`: how long a generator's warm-up run or capture of one key took, and how
 /// many times the capture ran the model (a residency plan runs it two or three times).
-fn build_time(what: std::fmt::Arguments, since: Instant, runs: usize) {
+pub(crate) fn build_time(what: std::fmt::Arguments, since: Instant, runs: usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var("TT_BUILD_TIMES").as_deref() == Ok("1")) {
         eprintln!(
@@ -941,7 +949,11 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 let (l, state) = feed.chunk(model, index(0, device), index(0, device), len, cache);
                 cache.set_state(state);
                 let _ = read(l);
-                build_time(format_args!("warm-up Chunk {{ c: {c}, len: {len} }}"), t0, 1);
+                build_time(
+                    format_args!("warm-up Chunk {{ c: {c}, len: {len} }}"),
+                    t0,
+                    1,
+                );
             }
         }
         let mut sets = Vec::with_capacity(caches.len());
@@ -969,6 +981,9 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         // ([`Self::decode_token`]): its sort's programs, all held by a capture, would not fit the
         // program cache beside a model's traces.
         let cache = &caches[0];
+        // Every trace this build captures, for the progress reports.
+        let traces = shapes.steps.len() + shapes.chunk_keys().len();
+        let captured = std::cell::Cell::new(0);
         for &len in &shapes.steps {
             let token = Feed::<B>::zeros(model, 1, device);
             let position = index::<B>(0, device);
@@ -986,6 +1001,12 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 )
             })?;
             build_time(format_args!("capture Step({len})"), t0, runs.get());
+            captured.set(captured.get() + 1);
+            report(Progress::Trace {
+                done: captured.get(),
+                total: traces,
+                key: format!("Step({len})"),
+            });
         }
 
         let prefill = caches.len() - 1;
@@ -1004,7 +1025,8 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 Err(e) => return Err(e.into()),
             },
         };
-        let captured = Self::capture_chunks(model, &shapes, &mut sets[prefill], cache, device);
+        let at = (captured.get(), traces);
+        let captured = Self::capture_chunks(model, &shapes, &mut sets[prefill], cache, device, at);
         if let Some(was) = was {
             burn_tt::set_capture_reuse(*device, was)?;
         }
@@ -1027,6 +1049,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         set: &mut SharedStateTraces<Key>,
         cache: &M::Cache,
         device: &TtDevice,
+        (mut done, total): (usize, usize),
     ) -> Result<(), GenerateError> {
         for (c, len) in shapes.chunk_keys() {
             let tokens = Feed::<B>::zeros(model, c, device);
@@ -1043,7 +1066,17 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                     state.into_iter().map(float).collect(),
                 )
             })?;
-            build_time(format_args!("capture Chunk {{ c: {c}, len: {len} }}"), t0, runs.get());
+            build_time(
+                format_args!("capture Chunk {{ c: {c}, len: {len} }}"),
+                t0,
+                runs.get(),
+            );
+            done += 1;
+            report(Progress::Trace {
+                done,
+                total,
+                key: format!("Chunk {{ c: {c}, len: {len} }}"),
+            });
         }
         Ok(())
     }
@@ -1156,6 +1189,10 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         let chunks = schedule(prompt.len(), &self.shapes.chunks);
         let last = chunks.len() - 1;
         for (i, chunk) in chunks.into_iter().enumerate() {
+            report(Progress::Prefill {
+                done: i,
+                total: last + 1,
+            });
             let trace = self.chunk_trace(chunk);
             let tokens = padded(prompt, chunk)
                 .into_iter()
@@ -1215,11 +1252,18 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         let mut next = self.prefill_token(prompt, draws.draw())?;
         out.times.push(t0.elapsed());
         out.tokens.push(next);
+        let token = |done, token| Progress::Token {
+            done,
+            total: steps,
+            token,
+        };
+        report(token(1, next));
         for step in 1..steps {
             let t0 = Instant::now();
             next = self.decode_token(next, prompt.len() + step - 1, draws.draw())?;
             out.times.push(t0.elapsed());
             out.tokens.push(next);
+            report(token(step + 1, next));
         }
         Ok(out)
     }

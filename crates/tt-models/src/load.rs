@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use burn::module::Module;
 use burn::tensor::backend::Backend;
-use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+use burn_store::{ModuleSnapshot, SafetensorsStore};
 
 /// Where `cargo xtask fetch-weights --model <model>` puts a model's weights.
 pub fn weights_path(model: &str) -> PathBuf {
@@ -110,6 +110,55 @@ pub fn load_safetensors<B: Backend, M: Module<B>>(
 /// [`load_safetensors`] for a checkpoint split over several files (`model-00001-of-00002...`):
 /// each shard is applied in turn, and the checks are made over all of them, so a parameter is
 /// missing only when no shard has it, and a file tensor unused only when nothing consumed it.
+/// The tensor names of each shard, read from the headers once (the files are mapped, no data is
+/// read): what lets a part of a model be loaded from only the shards that hold it
+/// ([`ShardNames::holding`]) instead of opening every shard for every part.
+pub struct ShardNames(Vec<(PathBuf, Vec<(String, u64)>)>);
+
+impl ShardNames {
+    pub fn read(paths: &[PathBuf]) -> Result<Self, LoadError> {
+        if let Some(absent) = paths.iter().find(|p| !p.exists()) {
+            return Err(LoadError::NotFetched(absent.clone()));
+        }
+        let names = paths
+            .iter()
+            .map(|path| {
+                let err = |e: &dyn fmt::Display| LoadError::Store(format!("{}: {e}", path.display()));
+                let file = std::fs::File::open(path).map_err(|e| err(&e))?;
+                // SAFETY: the checkpoint is read only and is not written while it is loaded.
+                let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| err(&e))?;
+                let st = safetensors::SafeTensors::deserialize(&map).map_err(|e| err(&e))?;
+                let names = st
+                    .tensors()
+                    .into_iter()
+                    .map(|(n, v)| (n, v.data().len() as u64))
+                    .collect();
+                Ok((path.clone(), names))
+            })
+            .collect::<Result<_, LoadError>>()?;
+        Ok(Self(names))
+    }
+
+    /// The shards holding a tensor `wanted` names, in the given order.
+    pub fn holding(&self, wanted: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+        self.0
+            .iter()
+            .filter(|(_, names)| names.iter().any(|(n, _)| wanted(n)))
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    /// The bytes of every tensor `wanted` names, as stored in the files.
+    pub fn bytes(&self, wanted: impl Fn(&str) -> bool) -> u64 {
+        self.0
+            .iter()
+            .flat_map(|(_, names)| names.iter())
+            .filter(|(n, _)| wanted(n))
+            .map(|(_, b)| b)
+            .sum()
+    }
+}
+
 pub fn load_safetensors_shards<B: Backend, M: Module<B>>(
     model: &mut M,
     paths: &[PathBuf],
@@ -125,7 +174,7 @@ pub fn load_safetensors_shards<B: Backend, M: Module<B>>(
     for path in paths {
         let mut store = SafetensorsStore::from_file(path);
         if layout.pytorch {
-            store = store.with_from_adapter(PyTorchToBurnAdapter);
+            store = store.with_from_adapter(crate::pytorch_adapter::PyTorchAdapter);
         }
         for (from, to) in layout.remaps {
             store = store.with_key_remapping(*from, *to);

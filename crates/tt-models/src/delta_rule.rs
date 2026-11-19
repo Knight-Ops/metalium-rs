@@ -98,7 +98,11 @@ impl<B: Backend> Triangles<B> {
         Self {
             later: wide(rows.clone().lower(cols.clone())),
             not_below: wide(rows.clone().lower_equal(cols.clone())),
-            eye: rows.equal(cols).float().unsqueeze::<4>().expand([1, heads, c, c]),
+            eye: rows
+                .equal(cols)
+                .float()
+                .unsqueeze::<4>()
+                .expand([1, heads, c, c]),
         }
     }
 }
@@ -213,22 +217,19 @@ mod tests {
 
     /// Random inputs as a Gated DeltaNet makes them: unit keys and queries, `β` in (0, 1), the
     /// decay's log in (-1, 0), and the last `pad` rows padding (`g = 0`, `β = 0`).
-    fn inputs(
-        heads: usize,
-        t: usize,
-        kd: usize,
-        vd: usize,
-        pad: usize,
-    ) -> [Tensor<Flex, 4>; 5] {
+    fn inputs(heads: usize, t: usize, kd: usize, vd: usize, pad: usize) -> [Tensor<Flex, 4>; 5] {
         let d = FlexDevice;
         let r = |s: [usize; 4]| Tensor::<Flex, 4>::random(s, Distribution::Normal(0.0, 1.0), &d);
         let q = unit(r([1, heads, t, kd])).mul_scalar((kd as f32).powf(-0.5));
         let k = unit(r([1, heads, t, kd]));
         let v = r([1, heads, t, vd]);
-        let keep: Vec<f32> = (0..t).map(|i| if i < t - pad { 1.0 } else { 0.0 }).collect();
+        let keep: Vec<f32> = (0..t)
+            .map(|i| if i < t - pad { 1.0 } else { 0.0 })
+            .collect();
         let keep = Tensor::<Flex, 4>::from_data(TensorData::new(keep, [1, 1, t, 1]), &d)
             .expand([1, heads, t, 1]);
-        let u = |lo, hi| Tensor::<Flex, 4>::random([1, heads, t, 1], Distribution::Uniform(lo, hi), &d);
+        let u =
+            |lo, hi| Tensor::<Flex, 4>::random([1, heads, t, 1], Distribution::Uniform(lo, hi), &d);
         let beta = u(0.0, 1.0) * keep.clone();
         let g = u(-1.0, 0.0) * keep;
         [q, k, v, g, beta]
@@ -250,11 +251,7 @@ mod tests {
                 Distribution::Normal(0.0, 1.0),
                 &FlexDevice,
             );
-            let decay = g
-                .clone()
-                .exp()
-                .swap_dims(1, 2)
-                .expand([1, t, heads, kd]);
+            let decay = g.clone().exp().swap_dims(1, 2).expand([1, t, heads, kd]);
             let mut s_loop = s0.clone();
             let want = by_token(
                 q.clone(),

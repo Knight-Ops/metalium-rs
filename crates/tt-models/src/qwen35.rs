@@ -883,12 +883,17 @@ fn concat<B: Backend>(parts: &[Linear<B>]) -> Linear<B> {
         })
         .collect();
     let width: usize = datas.iter().map(|(_, c)| c).sum();
-    let mut out = Vec::with_capacity(rows * width);
-    for r in 0..rows {
+    // Row by row in parallel: each output row is the parts' rows side by side. A 27B layer's
+    // `gate|up` is 5120 rows of 2 x 17408 floats; one thread took seconds for it.
+    use rayon::prelude::*;
+    let mut out = vec![0f32; rows * width];
+    out.par_chunks_mut(width).enumerate().for_each(|(r, row)| {
+        let mut at = 0;
         for (v, cols) in &datas {
-            out.extend_from_slice(&v[r * cols..(r + 1) * cols]);
+            row[at..at + cols].copy_from_slice(&v[r * cols..(r + 1) * cols]);
+            at += cols;
         }
-    }
+    });
     drop(datas);
     let whole = Tensor::<B, 2>::from_data(TensorData::new(out, [rows, width]), &device);
     Linear {
@@ -1282,12 +1287,11 @@ impl<B: Backend> Qwen35<B> {
     /// The residual stream's dtype: the embedding table's, unless [`Qwen35::for_inference`] stored
     /// the table in another.
     fn stream_dtype(&self) -> DType {
-        self.stream
-            .unwrap_or_else(|| match &self.embed_tokens {
-                Some(table) => table.weight.val().dtype(),
-                // The host table's rows are F32.
-                None => DType::F32,
-            })
+        self.stream.unwrap_or_else(|| match &self.embed_tokens {
+            Some(table) => table.weight.val().dtype(),
+            // The host table's rows are F32.
+            None => DType::F32,
+        })
     }
 
     /// The full-attention layers' KV cache dtype: [`Qwen35::for_inference`]'s choice, else the
@@ -1342,8 +1346,8 @@ impl<B: Backend> Qwen35<B> {
         }
         let cfg = &self.config;
         let rope = cfg.rope(start, t, dtype, &x.device());
-        let chunked = (self.chunked_delta() && t > 1)
-            .then(|| Tensor::arange(0..t as i64, &x.device()));
+        let chunked =
+            (self.chunked_delta() && t > 1).then(|| Tensor::arange(0..t as i64, &x.device()));
         for (layer, s) in self.layers.iter().zip(state.layers.iter_mut()) {
             x = layer.forward(cfg, x, &rope, start, s, chunked.as_ref());
         }
@@ -1509,11 +1513,22 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
             "self_attn.",
             "mlp.",
         ];
-        for (i, mut layer) in layers.into_iter().enumerate() {
+        use crate::generate::build_time;
+        use std::time::Instant;
+        // Each layer from the shards that hold it (one or two of a large checkpoint's), not all.
+        let shards = crate::load::ShardNames::read(paths)?;
+        let own = |i: usize, n: &str| {
+            n.trim_start_matches("model.")
+                .trim_start_matches("language_model.")
+                .starts_with(&format!("layers.{i}."))
+        };
+        let read = |i: usize, mut layer: Layer<B>| -> Result<(Layer<B>, usize), LoadError> {
             let prefix = format!(r"^(model\.)?language_model\.layers\.{i}\.");
-            applied += load_safetensors_shards(
+            let layer_paths = shards.holding(|n| own(i, n));
+            let t0 = Instant::now();
+            let applied = load_safetensors_shards(
                 &mut layer,
-                paths,
+                &layer_paths,
                 &Layout {
                     remaps: &[
                         (r"\.linear_attn\.A_log$", ".linear_attn.a_log"),
@@ -1525,12 +1540,59 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
                 },
             )?
             .applied;
-            let mut layer = layer.map(&mut ToF32);
-            layer.prepare(&cfg);
-            // The plan sees the whole model's names (`layers.{i}.…`), as in `for_inference`.
-            let at = format!("layers.{i}");
-            let layer = crate::quant::apply_at(layer, &at, plan, &crate::quant::Native);
-            model.layers.push(layer);
+            build_time(format_args!("layer {i}: read"), t0, 1);
+            Ok((layer, applied))
+        };
+        // Reading the next layer overlaps preparing and quantizing this one: a reader thread
+        // stays one layer ahead (the channel holds one), so the host holds at most two layers in
+        // F32 at a time. The layers arrive in order; the first error ends both sides.
+        let mut last = Instant::now();
+        std::thread::scope(|scope| -> Result<(), LoadError> {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let read = &read;
+            scope.spawn(move || {
+                for (i, layer) in layers.into_iter().enumerate() {
+                    let out = read(i, layer);
+                    let failed = out.is_err();
+                    if tx.send((i, out)).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+            for (i, out) in rx {
+                let (layer, n) = out?;
+                applied += n;
+                let t0 = Instant::now();
+                let mut layer = layer.map(&mut ToF32);
+                build_time(format_args!("layer {i}: to F32"), t0, 1);
+                let t0 = Instant::now();
+                layer.prepare(&cfg);
+                build_time(format_args!("layer {i}: prepare"), t0, 1);
+                let t0 = Instant::now();
+                // The plan sees the whole model's names (`layers.{i}.…`), as in `for_inference`.
+                let at = format!("layers.{i}");
+                let layer = crate::quant::apply_at(layer, &at, plan, &crate::quant::Native);
+                build_time(format_args!("layer {i}: quantize"), t0, 1);
+                model.layers.push(layer);
+                // The time since the last layer was done: with the overlap, what a layer costs.
+                crate::progress::report(crate::progress::Progress::Layer {
+                    done: i + 1,
+                    total: cfg.layers,
+                    name: format!("layers.{i}"),
+                    kind: if cfg.is_full(i) { "Attention" } else { "DeltaNet" },
+                    bytes: shards.bytes(|n| own(i, n)),
+                    secs: last.elapsed().as_secs_f64(),
+                });
+                last = Instant::now();
+            }
+            Ok(())
+        })?;
+        if model.layers.len() != cfg.layers {
+            return Err(LoadError::Store(format!(
+                "the reader stopped after {} of {} layers",
+                model.layers.len(),
+                cfg.layers
+            )));
         }
 
         // As `for_inference` sets them for a model loaded in F32.
