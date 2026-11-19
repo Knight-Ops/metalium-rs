@@ -166,9 +166,6 @@ fn run(c: &Case, which: usize, rows: bool) -> (Vec<u32>, [u64; 3]) {
     let _ = f32_bits(call());
     let (out, report) = burn_tt::with_report(call);
     burn_tt::set_attention_rows(true);
-    if std::env::var_os("DBG_REPORT").is_some() {
-        eprintln!("REPORT {} rows {rows} which {which}: {report:?}", c.what);
-    }
     assert_native_model(&report);
     let jobs = |p: &str| report.op(p).map_or(0, |s| s.jobs);
     let composed = ["attention/qk", "attention/softmax", "attention/pv"]

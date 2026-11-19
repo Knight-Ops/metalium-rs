@@ -1,4 +1,3 @@
-
 # Block-float KV cache: keys and values stored BFP8 or BFP4
 
 ## The format
@@ -11,4 +10,4 @@ bytes are the encoding of the F32 cache whatever order the rows came in.
 
 ## Not done
 
-Flash attention: BFP2 per-layer formats
+Flash attention, BFP2, per-layer formats.

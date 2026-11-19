@@ -1674,9 +1674,9 @@ impl Qwen35<burn_tt::Tt> {
                 }
             }
             None if cache.exists() => {
-                miss("für ein anderes Modell, einen anderen Plan oder eine ältere Version".into())
+                miss("made for another checkpoint, plan or format version".into())
             }
-            None => miss("noch keine Datei".into()),
+            None => miss("no file yet".into()),
         }
         let (model, loaded) =
             Self::streamed_with_plan(config, paths, numerics, options, &plan, device)?;
