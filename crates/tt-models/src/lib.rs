@@ -19,3 +19,4 @@ pub mod qwen35;
 pub mod resnet;
 pub mod rope;
 pub mod vit;
+pub mod weight_cache;

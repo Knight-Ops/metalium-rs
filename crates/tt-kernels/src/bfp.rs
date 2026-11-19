@@ -57,6 +57,21 @@ impl BfpFormat {
     }
 }
 
+/// One weight as it lies in GDDR after [`crate::session::Session::store_bfp`]: each channel's
+/// whole extent (`slots * slot_bytes`), in the allocator's channel order, including a by-column
+/// layout's empty columns and each slot's alignment tail. Uploading it
+/// ([`crate::session::Session::upload_bfp_image`]) allocates the same layout and writes these
+/// bytes back. The tails past a tile image are whatever the packer left; a product reads the
+/// image, and a round trip keeps both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BfpImage {
+    pub rows: usize,
+    pub cols: usize,
+    pub format: BfpFormat,
+    pub layout: crate::tensor::Layout,
+    pub channels: Vec<Vec<u8>>,
+}
+
 /// A matrix of resident packed tiles, each four 16x16 faces. Every consecutive
 /// 16 face-ordered datums shares an exponent. Padding is explicitly zero.
 /// Fields are private so shape/format cannot be changed without conversion.

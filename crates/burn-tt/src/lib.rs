@@ -71,9 +71,9 @@ pub use report::{
     strictly, with_report, OpStat, Report, ServerStat,
 };
 pub use server::{
-    attach, device_traffic, mesh_execution, AttachGuard, BlockArg, BufferId, DramBuffers, Elem,
-    Engine, GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind, OutputPayload,
-    PowArg, Serve, SortedBuffers, TraceRun,
+    attach, device_traffic, mesh_execution, weight_layout, AttachGuard, BlockArg, BufferId,
+    DramBuffers, Elem, Engine, GenericTraceRun, InputPayload, KmdEngine, MeshEngine, OutputKind,
+    OutputPayload, PowArg, Serve, SortedBuffers, TraceRun,
 };
 #[cfg(feature = "fusion")]
 pub use tensor::TtHandle;

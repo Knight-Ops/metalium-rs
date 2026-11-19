@@ -505,6 +505,11 @@ impl Shapes {
         self
     }
 
+    /// One decode trace, for the whole cache. The chunk traces are unchanged.
+    pub fn one_decode(self) -> Self {
+        self.with_steps(&[])
+    }
+
     /// The same, with chunks attending to `prefixes` positions (the cache's length is added):
     /// `&[]` has every chunk attend to the whole cache. Each length below the cache's adds a
     /// trace for each chunk size it can hold.
@@ -1006,9 +1011,15 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             // The step may be captured twice (a residency plan, then the plan applied: `burn_tt::
             // set_residency`), each run over the same inputs.
             let (t0, runs) = (Instant::now(), std::cell::Cell::new(0));
+            let pass = std::cell::Cell::new(t0);
             let key = format!("Step({len})");
             sets[0].capture(Key::Step(len), &[&tp, &pp], || {
+                // The end of the run before (its host work included) is the start of this one.
+                if runs.get() > 0 {
+                    stage(&key, Stage::Capture(runs.get()), Some(pass.get()));
+                }
                 runs.set(runs.get() + 1);
+                pass.set(Instant::now());
                 stage(&key, Stage::Capture(runs.get()), None);
                 let (y, state) = token.step(model, position.clone(), len, cache);
                 let next = greedy(y.clone());
@@ -1018,7 +1029,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 )
             })?;
             build_time(format_args!("capture Step({len})"), t0, runs.get());
-            stage(&key, Stage::Capture(runs.get()), Some(t0));
+            stage(&key, Stage::Capture(runs.get()), Some(pass.get()));
             captured.set(captured.get() + 1);
             report(Progress::Trace {
                 done: captured.get(),
@@ -1075,9 +1086,15 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             let last = index::<B>(0, device);
             let (tp, sp, lp) = (tokens.input(), input(&start), input(&last));
             let (t0, runs) = (Instant::now(), std::cell::Cell::new(0));
+            let pass = std::cell::Cell::new(t0);
             let key = format!("Chunk {{ c: {c}, len: {len} }}");
             set.capture(Key::Chunk { c, len }, &[&tp, &sp, &lp], || {
+                // The end of the run before (its host work included) is the start of this one.
+                if runs.get() > 0 {
+                    stage(&key, Stage::Capture(runs.get()), Some(pass.get()));
+                }
                 runs.set(runs.get() + 1);
+                pass.set(Instant::now());
                 stage(&key, Stage::Capture(runs.get()), None);
                 let (y, state) = tokens.chunk(model, start.clone(), last.clone(), len, cache);
                 let next = greedy(y.clone());
@@ -1091,7 +1108,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 t0,
                 runs.get(),
             );
-            stage(&key, Stage::Capture(runs.get()), Some(t0));
+            stage(&key, Stage::Capture(runs.get()), Some(pass.get()));
             done += 1;
             report(Progress::Trace { done, total, key });
         }
@@ -1371,6 +1388,7 @@ mod tests {
         assert_eq!(Shapes::new(8, &[8, 4, 8]).checked().unwrap().chunks, [4, 8]);
         let shapes = Shapes::new(512, &[64]);
         assert_eq!(shapes.steps, [64, 128, 256, 512]);
+        assert_eq!(shapes.clone().one_decode().steps, [512]);
         assert_eq!(
             [0, 63, 64, 300, 511].map(|p| shapes.step_len(p)),
             [64, 64, 128, 512, 512]

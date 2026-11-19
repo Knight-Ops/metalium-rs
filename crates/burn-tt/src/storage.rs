@@ -233,6 +233,142 @@ impl<B: StorageBackend, const D: usize> TensorStorageExt for Tensor<B, D> {
     }
 }
 
+/// A stored BFP weight's GDDR image, in the shape a cache file records.
+#[derive(Clone, Debug)]
+pub struct WeightImageParts {
+    pub rows: u32,
+    pub cols: u32,
+    /// 8, 4 or 2.
+    pub format: u8,
+    /// 0 interleaved, 1 by column.
+    pub layout: u8,
+    pub slot_bytes: u32,
+    pub channels: Vec<Vec<u8>>,
+}
+
+/// [`bfp_image`] as [`WeightImageParts`], `Ok(None)` when `tensor` is not stored BFP.
+pub fn bfp_image_parts<const D: usize>(
+    tensor: &Tensor<crate::Tt, D>,
+) -> Result<Option<WeightImageParts>, crate::TtError> {
+    let Some(image) = bfp_image(tensor)? else {
+        return Ok(None);
+    };
+    Ok(Some(WeightImageParts {
+        rows: image.rows as u32,
+        cols: image.cols as u32,
+        format: match image.format {
+            tt_kernels::bfp::BfpFormat::Bfp8 => 8,
+            tt_kernels::bfp::BfpFormat::Bfp4 => 4,
+            tt_kernels::bfp::BfpFormat::Bfp2 => 2,
+        },
+        layout: match image.layout {
+            tt_kernels::tensor::Layout::ByColumn => 1,
+            tt_kernels::tensor::Layout::Interleaved => 0,
+        },
+        slot_bytes: image.format.slot_bytes() as u32,
+        channels: image.channels,
+    }))
+}
+
+/// The GDDR image of a stored BFP weight, `Ok(None)` when `tensor` is not one.
+/// A fused tensor is resolved first, so the image is what the card holds.
+pub fn bfp_image<const D: usize>(
+    tensor: &Tensor<crate::Tt, D>,
+) -> Result<Option<tt_kernels::bfp::BfpImage>, crate::TtError> {
+    let TensorPrimitive::Float(tensor) = tensor.clone().into_primitive() else {
+        return Ok(None);
+    };
+    native_of(&tensor).bfp_image()
+}
+
+/// [`tensor_from_bfp_image`] from the fields a weight-cache record stores.
+pub fn tensor_from_bfp_parts(
+    device: &crate::TtDevice,
+    rows: usize,
+    cols: usize,
+    format: u8,
+    layout: u8,
+    slot_bytes: u32,
+    channels: Vec<Vec<u8>>,
+) -> Result<Tensor<crate::Tt, 2>, crate::TtError> {
+    let format = match format {
+        8 => tt_kernels::bfp::BfpFormat::Bfp8,
+        4 => tt_kernels::bfp::BfpFormat::Bfp4,
+        2 => tt_kernels::bfp::BfpFormat::Bfp2,
+        _ => {
+            return Err(crate::TtError::Device(format!(
+                "weight format {format} is not BFP2/4/8"
+            )))
+        }
+    };
+    if format.slot_bytes() != slot_bytes as u64 {
+        return Err(crate::TtError::Device(format!(
+            "slot {slot_bytes} is not {}",
+            format.slot_bytes()
+        )));
+    }
+    let layout = match layout {
+        0 => tt_kernels::tensor::Layout::Interleaved,
+        1 => tt_kernels::tensor::Layout::ByColumn,
+        _ => return Err(crate::TtError::Device(format!("weight layout {layout}"))),
+    };
+    tensor_from_bfp_image(
+        device,
+        tt_kernels::bfp::BfpImage {
+            rows,
+            cols,
+            format,
+            layout,
+            channels,
+        },
+    )
+}
+
+/// `image` as a logical F32 matrix on `device`, in `image`'s layout.
+pub fn tensor_from_bfp_image(
+    device: &crate::TtDevice,
+    image: tt_kernels::bfp::BfpImage,
+) -> Result<Tensor<crate::Tt, 2>, crate::TtError> {
+    let native = crate::TtTensor::from_bfp_image(*device, image)?;
+    Ok(Tensor::from_primitive(TensorPrimitive::Float(fuse(native))))
+}
+
+#[cfg(not(feature = "fusion"))]
+fn native_of(tensor: &crate::TtTensor) -> crate::TtTensor {
+    tensor.clone()
+}
+
+#[cfg(feature = "fusion")]
+fn native_of(tensor: &burn_fusion::FusionTensor<crate::fusion::TtFusionRuntime>) -> crate::TtTensor {
+    crate::fusion::resolve_float_tensor(tensor)
+}
+
+#[cfg(not(feature = "fusion"))]
+fn fuse(tensor: crate::TtTensor) -> crate::TtTensor {
+    tensor
+}
+
+#[cfg(feature = "fusion")]
+fn fuse(tensor: crate::TtTensor) -> burn_fusion::FusionTensor<crate::fusion::TtFusionRuntime> {
+    use burn_tensor::TensorMetadata;
+    let device = tensor.device;
+    let shape = tensor.shape();
+    let dtype = tensor.dtype();
+    let client = burn_fusion::get_client::<crate::TtBackend>(&device);
+    let id = client.register_tensor_handle(crate::TtHandle::Tensor(tensor));
+    burn_fusion::Client::change_client_float::<crate::TtBackend>(
+        burn_ir::TensorIr {
+            id,
+            shape,
+            dtype,
+            status: burn_ir::TensorStatus::ReadWrite,
+        },
+        client.clone(),
+        client,
+        burn_fusion::stream::StreamId::current(),
+    )
+}
+
 /// A shared model can name storage boundaries without requiring every backend
 /// to implement BFP. Select `F32Policy` explicitly on ordinary backends.
 pub trait PrecisionPolicy<B: burn_backend::Backend> {

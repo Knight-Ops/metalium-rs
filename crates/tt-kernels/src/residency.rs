@@ -234,12 +234,13 @@ pub(crate) fn signatures(c: &Capture) -> Vec<String> {
 
 /// Unit stream `uc`'s entries `r`, with the sections of the `PAIR_CALL`s among them.
 pub(crate) fn entries_with_sections(uc: &UnitCapture, r: &std::ops::Range<usize>) -> u64 {
-    let sections: u64 = uc
-        .pair_calls
-        .iter()
-        .enumerate()
-        .filter(|&(_, at)| r.contains(at))
-        .map(|(i, _)| u64::from(uc.sections[2 * i] + uc.sections[2 * i + 1]))
+    // The calls among `r` by their stream entries, not by a search of every call (an op's
+    // entries are few, a capture's calls many).
+    let end = r.end.min(uc.stream.len());
+    let sections: u64 = (r.start.min(end)..end)
+        .filter(|&at| uc.stream[at][0] == tt_isa::dm::op::PAIR_CALL)
+        .filter_map(|at| uc.pair_at(at))
+        .map(|i| u64::from(uc.sections[2 * i] + uc.sections[2 * i + 1]))
         .sum();
     r.len() as u64 + sections
 }
@@ -490,8 +491,7 @@ impl Graph {
                 let mut i = 0;
                 while i < stream.len() {
                     if stream[i][0] == op::PAIR_CALL {
-                        if let Some(p) = uc.pair_calls.iter().position(|&at| at == range.start + i)
-                        {
+                        if let Some(p) = uc.pair_at(range.start + i) {
                             for section in uc.pending_sections.iter().skip(2 * p).take(2) {
                                 unattributed += walk(section, &mut access);
                             }
@@ -720,7 +720,7 @@ impl Plan {
     /// Plan `g` for a unit arena ending at `data_end`: the tensors whose every use `capable` gives an
     /// L1 path (the op and its use), placed so each layer of `g`'s period runs at the same
     /// addresses, in a region of [`cap`].
-    pub fn make(g: &Graph, data_end: u64, capable: impl Fn(&Op, &Use) -> bool) -> Plan {
+    pub fn make(g: &Graph, data_end: u64, capable: impl Fn(&Op, &Use) -> bool + Sync) -> Plan {
         Self::make_within(g, cap(g, data_end), capable)
     }
 
@@ -734,7 +734,7 @@ impl Plan {
     /// spares more GDDR bytes is kept (the periodic one on a tie). Where a class finds no room,
     /// each is planned again leaving out first what spares least a byte, not what holds the most
     /// region longest, and the same rule keeps one.
-    pub fn make_within(g: &Graph, budget: u64, capable: impl Fn(&Op, &Use) -> bool) -> Plan {
+    pub fn make_within(g: &Graph, budget: u64, capable: impl Fn(&Op, &Use) -> bool + Sync) -> Plan {
         Self::make_rows(g, budget, Rows::Multicast, capable)
     }
 
@@ -743,11 +743,40 @@ impl Plan {
         g: &Graph,
         budget: u64,
         rows: Rows,
-        capable: impl Fn(&Op, &Use) -> bool,
+        capable: impl Fn(&Op, &Use) -> bool + Sync,
     ) -> Plan {
+        let mut clock = Clock::new();
         let period = period(&g.ops.iter().map(|o| &o.signature).collect::<Vec<_>>());
+        clock.lap("period");
+        clock.report("period");
         let make = |period, leave| Self::make_inner(g, budget, rows, &capable, period, leave);
-        let pinned = make(period, LeaveOut::Longest);
+        // Every candidate at once, each on its own thread; which are kept is decided below as
+        // before, from the pinned one.
+        let (pinned, unpinned, pinned_spared, unpinned_spared) = if period.is_some() {
+            std::thread::scope(|scope| {
+                let make = &make;
+                let a = scope.spawn(move || make(None, LeaveOut::Longest));
+                let b = scope.spawn(move || make(period, LeaveOut::LeastSpared));
+                let c = scope.spawn(move || make(None, LeaveOut::LeastSpared));
+                let pinned = make(period, LeaveOut::Longest);
+                let join = |h: std::thread::ScopedJoinHandle<'_, Plan>| {
+                    h.join().expect("a plan candidate's thread panicked")
+                };
+                (pinned, Some(join(a)), Some(join(b)), Some(join(c)))
+            })
+        } else {
+            (make(period, LeaveOut::Longest), None, None, None)
+        };
+        let mut unpinned = unpinned;
+        let mut pinned_spared = pinned_spared;
+        let mut unpinned_spared = unpinned_spared;
+        let mut make = |period: Option<Period>, leave| match (period.is_some(), leave) {
+            (false, LeaveOut::Longest) => unpinned.take(),
+            (true, LeaveOut::LeastSpared) => pinned_spared.take(),
+            (false, LeaveOut::LeastSpared) => unpinned_spared.take(),
+            _ => None,
+        }
+        .unwrap_or_else(|| Self::make_inner(g, budget, rows, &capable, period, leave));
         let room = |p: &Plan| p.place.contains(&Place::Gddr(Reason::Room));
         // Pinning costs tensors where a repeat's two live at once, one stays in GDDR, or a class
         // takes its room in every repeat while the tensors themselves would share it (a layer's
@@ -803,6 +832,7 @@ impl Plan {
         period: Option<Period>,
         leave: LeaveOut,
     ) -> Plan {
+        let mut clock = Clock::new();
         let (neediest, _) = neediest(g);
         // Each tensor on its own first.
         let mut reason: Vec<Option<Reason>> = g
@@ -831,6 +861,7 @@ impl Plan {
                 }
             })
             .collect();
+        clock.lap("reasons");
         let dropped: BTreeSet<usize> = (0..g.tensors.len())
             .filter(|&t| {
                 reason[t] == Some(Reason::NeverRead) && g.tensors[t].uses.iter().all(|u| u.plain)
@@ -882,10 +913,19 @@ impl Plan {
             }
         }
         classes.retain(|m| reason[m[0]].is_none());
-        // Place, and drop the costliest class until the rest fit.
+        clock.lap("classes");
+        // Place, and drop the costliest class until the rest fit. What placing reads of each
+        // class (its bytes, first op, which others it lives beside) is made once for the loop:
+        // remade for each drop it was cubic in the classes, 9 minutes of a 64-layer step's plan.
+        let fit = Assigner::new(g, &classes);
+        clock.lap("meet");
+        let (n_classes, mut drops) = (classes.len(), 0usize);
+        let mut ids: Vec<usize> = (0..classes.len()).collect();
         loop {
-            let (offsets, region) = assign(g, &classes);
+            let (offsets, region) = fit.assign(&ids);
             if region <= budget || classes.is_empty() {
+                clock.lap("place");
+                clock.note(format!("{n_classes} classes, {drops} dropped"));
                 let mut place: Vec<Place> = reason
                     .iter()
                     .map(|r| Place::Gddr(r.unwrap_or(Reason::Room)))
@@ -915,6 +955,13 @@ impl Plan {
                         .collect(),
                     _ => BTreeMap::new(),
                 };
+                clock.lap("held");
+                clock.report(match (period.is_some(), leave) {
+                    (true, LeaveOut::Longest) => "pinned, longest",
+                    (true, LeaveOut::LeastSpared) => "pinned, least spared",
+                    (false, LeaveOut::Longest) => "unpinned, longest",
+                    (false, LeaveOut::LeastSpared) => "unpinned, least spared",
+                });
                 return Plan {
                     place,
                     region,
@@ -967,6 +1014,8 @@ impl Plan {
                 reason[t] = Some(Reason::Room);
             }
             classes.remove(worst);
+            ids.remove(worst);
+            drops += 1;
         }
     }
 
@@ -1793,8 +1842,176 @@ fn class_bytes(g: &Graph, members: &[usize]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Where a plan's making spends its time, printed with `TT_CAPTURE_TIMES=1`.
+struct Clock {
+    on: bool,
+    at: std::time::Instant,
+    laps: Vec<String>,
+}
+
+impl Clock {
+    fn new() -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("TT_CAPTURE_TIMES").as_deref() == Ok("1"));
+        Self {
+            on,
+            at: std::time::Instant::now(),
+            laps: Vec::new(),
+        }
+    }
+
+    fn lap(&mut self, what: &str) {
+        if self.on {
+            self.laps.push(format!("{what} {:.2} s", self.at.elapsed().as_secs_f64()));
+            self.at = std::time::Instant::now();
+        }
+    }
+
+    fn note(&mut self, what: String) {
+        if self.on {
+            self.laps.push(what);
+        }
+    }
+
+    fn report(&self, what: &str) {
+        if self.on {
+            eprintln!("tt-kernels plan candidate ({what}): {}", self.laps.join(", "));
+        }
+    }
+}
+
+/// [`assign`] made once for many subsets of the same classes: each class's bytes and first op,
+/// and which classes live beside which (any two members' lifetimes meet) as a bitset. A subset
+/// in its classes' order places exactly as [`assign`] of those classes: the same order (first op,
+/// bytes, then position), the same conflicts.
+struct Assigner {
+    bytes: Vec<u64>,
+    start: Vec<usize>,
+    /// Row `c`, `words` words: bit `d` set when `c` and `d` live at once.
+    meet: Vec<u64>,
+    words: usize,
+}
+
+impl Assigner {
+    fn new(g: &Graph, classes: &[Vec<usize>]) -> Self {
+        let n = classes.len();
+        let lives: Vec<Vec<(usize, usize)>> = classes
+            .iter()
+            .map(|m| {
+                let mut l: Vec<(usize, usize)> =
+                    m.iter().filter_map(|&t| g.tensors[t].lifetime()).collect();
+                l.sort_unstable();
+                l
+            })
+            .collect();
+        let hull: Vec<Option<(usize, usize)>> = lives
+            .iter()
+            .map(|l| Some((l.iter().map(|x| x.0).min()?, l.iter().map(|x| x.1).max()?)))
+            .collect();
+        let bytes = classes.iter().map(|m| class_bytes(g, m)).collect();
+        let start = lives
+            .iter()
+            .map(|l| l.iter().map(|x| x.0).min().unwrap_or(0))
+            .collect();
+        let words = n.div_ceil(64).max(1);
+        let mut meet = vec![0u64; n * words];
+        // Two lists sorted by start meet if some pair does: step past whichever ends first.
+        let meets = |a: &[(usize, usize)], b: &[(usize, usize)]| {
+            let (mut i, mut j) = (0, 0);
+            while i < a.len() && j < b.len() {
+                let ((sa, ea), (sb, eb)) = (a[i], b[j]);
+                if sa <= eb && sb <= ea {
+                    return true;
+                }
+                if ea < sb {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            false
+        };
+        let row = |c: usize, out: &mut [u64]| {
+            let Some((hs, he)) = hull[c] else { return };
+            for d in 0..n {
+                let Some((ds, de)) = hull[d] else { continue };
+                if d != c && hs <= de && ds <= he && meets(&lives[c], &lives[d]) {
+                    out[d / 64] |= 1 << (d % 64);
+                }
+            }
+        };
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |t| t.get())
+            .min(n / 64)
+            .max(1);
+        if threads == 1 {
+            for (c, out) in meet.chunks_mut(words).enumerate() {
+                row(c, out);
+            }
+        } else {
+            let per = n.div_ceil(threads);
+            std::thread::scope(|scope| {
+                let row = &row;
+                for (k, rows) in meet.chunks_mut(per * words).enumerate() {
+                    scope.spawn(move || {
+                        for (i, out) in rows.chunks_mut(words).enumerate() {
+                            row(k * per + i, out);
+                        }
+                    });
+                }
+            });
+        }
+        Self {
+            bytes,
+            start,
+            meet,
+            words,
+        }
+    }
+
+    /// [`assign`] of the classes `ids` (indices into those it was made of, in their order):
+    /// each one's offset, in `ids`' order, and the region's bytes.
+    fn assign(&self, ids: &[usize]) -> (Vec<u64>, u64) {
+        let mut order: Vec<usize> = (0..ids.len()).collect();
+        order.sort_by_key(|&k| (self.start[ids[k]], std::cmp::Reverse(self.bytes[ids[k]]), k));
+        let mut placed = vec![0u64; self.words];
+        let mut at_of = vec![0u64; self.bytes.len()];
+        let mut offsets = vec![0u64; ids.len()];
+        let mut region = 0;
+        let mut conflicts: Vec<(u64, u64)> = Vec::new();
+        for k in order {
+            let c = ids[k];
+            conflicts.clear();
+            let row = &self.meet[c * self.words..(c + 1) * self.words];
+            for (w, (&m, &p)) in row.iter().zip(&placed).enumerate() {
+                let mut x = m & p;
+                while x != 0 {
+                    let d = w * 64 + x.trailing_zeros() as usize;
+                    x &= x - 1;
+                    conflicts.push((at_of[d], at_of[d] + self.bytes[d]));
+                }
+            }
+            let bytes = self.bytes[c];
+            let mut candidates: Vec<u64> = std::iter::once(0)
+                .chain(conflicts.iter().map(|&(_, end)| end.div_ceil(ALIGN) * ALIGN))
+                .collect();
+            candidates.sort_unstable();
+            let at = candidates
+                .into_iter()
+                .find(|&at| conflicts.iter().all(|&(s, e)| at + bytes <= s || at >= e))
+                .expect("past every conflict fits");
+            at_of[c] = at;
+            offsets[k] = at;
+            region = region.max(at + bytes);
+            placed[c / 64] |= 1 << (c % 64);
+        }
+        (offsets, region)
+    }
+}
+
 /// First fit of `classes` over their members' lifetimes, earliest first: each class's offset, and
 /// the region's bytes.
+#[cfg(test)]
 fn assign(g: &Graph, classes: &[Vec<usize>]) -> (Vec<u64>, u64) {
     let lives: Vec<Vec<(usize, usize)>> = classes
         .iter()
@@ -1853,6 +2070,53 @@ mod tests {
 
     /// A graph from ops given as `(signature, [(tensor, unit, writes, tiles)])`, each tensor
     /// internal, of `tiles` tiles.
+    /// The assigner made once places every subset as `assign` of that subset does: the drops
+    /// of a plan's loop, and subsets that skip classes in the middle.
+    #[test]
+    fn the_assigner_places_any_subset_as_assign_does() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let (n_tensors, n_ops) = (240usize, 120usize);
+        let tiles: Vec<usize> = (0..n_tensors).map(|_| 1 + next(6) as usize).collect();
+        // Each tensor written at one op and read at a later one (or the same), on unit 0.
+        type Owned = (usize, usize, bool, Vec<u32>);
+        let mut per_op: Vec<Vec<Owned>> = vec![Vec::new(); n_ops];
+        for t in 0..n_tensors {
+            let a = next(n_ops as u64) as usize;
+            let b = (a + next(12) as usize).min(n_ops - 1);
+            per_op[a].push((t, 0, true, vec![0]));
+            per_op[b].push((t, 0, false, vec![0]));
+        }
+        let owned: Vec<Vec<Access>> = per_op
+            .iter()
+            .map(|v| v.iter().map(|(t, u, w, ts)| (*t, *u, *w, ts.as_slice())).collect())
+            .collect();
+        let ops: Vec<(&str, &[Access])> = owned.iter().map(|v| ("op", v.as_slice())).collect();
+        let g = graph(&tiles, &ops);
+        // Classes of one to four tensors, members in any order.
+        let mut classes: Vec<Vec<usize>> = Vec::new();
+        let mut t = 0;
+        while t < n_tensors {
+            let k = (1 + next(4) as usize).min(n_tensors - t);
+            classes.push((t..t + k).rev().collect());
+            t += k;
+        }
+        let fit = Assigner::new(&g, &classes);
+        let mut ids: Vec<usize> = (0..classes.len()).collect();
+        let mut subset = classes.clone();
+        while !ids.is_empty() {
+            assert_eq!(fit.assign(&ids), assign(&g, &subset));
+            let drop = next(ids.len() as u64) as usize;
+            ids.remove(drop);
+            subset.remove(drop);
+        }
+    }
+
     fn graph(tiles: &[usize], ops: &[(&str, &[Access])]) -> Graph {
         let mut tensors: Vec<Tensor> = tiles
             .iter()

@@ -178,6 +178,16 @@ impl Plan {
         }
     }
 
+    /// The rules, one a line, for a weight-cache checksum. The first matching rule wins, so the
+    /// order is part of the plan.
+    pub fn cache_key(&self) -> String {
+        self.rules
+            .iter()
+            .map(|(pattern, format)| format!("{pattern} {format:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn format(&self, name: &str) -> Format {
         self.rules
             .iter()

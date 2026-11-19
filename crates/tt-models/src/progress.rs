@@ -31,6 +31,15 @@ pub enum Progress {
         stage: Stage,
         secs: Option<f64>,
     },
+    /// The GDDR-image weight cache ([`crate::qwen35::Qwen35::streamed_cached`]): bytes of the
+    /// file read and uploaded (or written), records so far, seconds since the stage began.
+    Cache {
+        stage: CacheStage,
+        done: u64,
+        total: u64,
+        records: usize,
+        secs: f64,
+    },
     /// Prompt chunks fed.
     Prefill { done: usize, total: usize },
     /// Tokens generated after the prompt, the last one given.
@@ -39,6 +48,19 @@ pub enum Progress {
         total: usize,
         token: i32,
     },
+}
+
+/// What the weight cache is doing ([`Progress::Cache`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CacheStage {
+    /// A file that matches is being uploaded; `total` is its length.
+    Read,
+    /// No usable file (the reason); the weights are packed from the checkpoint.
+    Miss(String),
+    /// The packed weights are being written for the next start; `total` is 0 until finished.
+    Write,
+    /// Finished: `done` bytes in `secs`.
+    Done { wrote: bool },
 }
 
 /// What a trace's build is doing ([`Progress::TraceStage`]).

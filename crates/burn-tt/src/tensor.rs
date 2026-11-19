@@ -234,6 +234,52 @@ impl TtTensor {
         }
     }
 
+    /// This tensor's GDDR image when it is stored BFP, `None` otherwise.
+    pub fn bfp_image(&self) -> Result<Option<tt_kernels::bfp::BfpImage>, crate::TtError> {
+        if !matches!(
+            self.storage_format(),
+            crate::storage::StorageFormat::Bfp8
+                | crate::storage::StorageFormat::Bfp4
+                | crate::storage::StorageFormat::Bfp2
+        ) {
+            return Ok(None);
+        }
+        let id = self.to_dram().buffer.id;
+        crate::server::download_bfp_image(self.device, id).map(Some)
+    }
+
+    /// A logical F32 matrix whose storage is `image`, the bytes left as they were packed.
+    pub fn from_bfp_image(
+        device: TtDevice,
+        image: tt_kernels::bfp::BfpImage,
+    ) -> Result<Self, crate::TtError> {
+        let storage = match image.format {
+            tt_kernels::bfp::BfpFormat::Bfp8 => crate::storage::StorageFormat::Bfp8,
+            tt_kernels::bfp::BfpFormat::Bfp4 => crate::storage::StorageFormat::Bfp4,
+            tt_kernels::bfp::BfpFormat::Bfp2 => crate::storage::StorageFormat::Bfp2,
+        };
+        let (rows, cols) = (image.rows, image.cols);
+        let (id, _) = crate::server::upload_bfp_image(device, image)?;
+        Ok(Self::on_device(
+            DramRef {
+                buffer: Arc::new(Buffer {
+                    id,
+                    device,
+                    rows,
+                    cols,
+                    parent: None,
+                    storage,
+                    plain: Default::default(),
+                }),
+                transposed: false,
+                generation: 0,
+            },
+            Shape::new([rows, cols]),
+            DType::F32,
+            device,
+        ))
+    }
+
     /// An F32 tensor of `shape` that is the view `v` of a device buffer: a
     /// plain device tensor if the view is one, else a strided view
     /// materialised when an op needs it as a matrix.

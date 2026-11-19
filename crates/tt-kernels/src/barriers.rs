@@ -26,7 +26,7 @@
 //! not either); **sparse** where each unit of the next op depends on some, not all, of the units
 //! since; **full** otherwise.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use tt_isa::dm::{op, record};
@@ -303,10 +303,34 @@ struct Seg {
 /// writes orders nothing).
 #[derive(Default)]
 struct Memory {
-    spaces: HashMap<Space, BTreeMap<u64, Seg>>,
+    /// By [`Space::index`]: a vector, not a hash map -- hashing the space of every access was
+    /// a sixth of a 64-layer capture's host time.
+    spaces: Vec<Option<BTreeMap<u64, Seg>>>,
+}
+
+impl Space {
+    /// Dense: the GDDR channels first, then the units' L1s.
+    fn index(self) -> usize {
+        match self {
+            Space::Gddr(c) => usize::from(c),
+            Space::L1(u) => 256 + usize::from(u),
+        }
+    }
 }
 
 impl Memory {
+    fn get_mut(&mut self, space: Space) -> Option<&mut BTreeMap<u64, Seg>> {
+        self.spaces.get_mut(space.index())?.as_mut()
+    }
+
+    fn entry(&mut self, space: Space) -> &mut BTreeMap<u64, Seg> {
+        let i = space.index();
+        if self.spaces.len() <= i {
+            self.spaces.resize_with(i + 1, || None);
+        }
+        self.spaces[i].get_or_insert_with(BTreeMap::new)
+    }
+
     /// Split so that a segment starts at `at`, if one covers it.
     fn split(map: &mut BTreeMap<u64, Seg>, at: u64) {
         let Some((&start, seg)) = map.range(..at).next_back() else {
@@ -332,7 +356,7 @@ impl Memory {
         apply: bool,
     ) {
         let (lo, hi) = (range.start, range.end);
-        let Some(map) = self.spaces.get_mut(&space) else {
+        let Some(map) = self.get_mut(space) else {
             return;
         };
         Self::split(map, lo);
@@ -380,7 +404,7 @@ fn range_accesses(
     let mut i = 0;
     while i < stream.len() {
         if stream[i][0] == op::PAIR_CALL {
-            match uc.pair_calls.iter().position(|&at| at == range.start + i) {
+            match uc.pair_at(range.start + i) {
                 Some(p) => {
                     for section in uc.pending_sections.iter().skip(2 * p).take(2) {
                         accesses(section, coords, out);
@@ -466,13 +490,17 @@ pub(crate) fn others_touch_l1(
     })
 }
 
+/// Threads for `ops` ops' footprints: one per 256 ops, up to the host's cores.
+fn analysis_threads(ops: usize) -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    (ops / 256).clamp(1, cores)
+}
+
 /// The dependencies and barrier classes of capture `c`, whose units are at `coords`.
 pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
-    // Each (op, unit)'s footprint.
-    let mut feet: Vec<BTreeMap<u16, Vec<Access>>> = Vec::with_capacity(c.ops.len());
-    let mut ops = Vec::with_capacity(c.ops.len());
-    let mut unknown = 0u64;
-    for rec in &c.ops {
+    // Each (op, unit)'s footprint: independent per op, so on every core in runs of ops.
+    let foot = |rec: &crate::trace::OpRecord| {
         let mut per: BTreeMap<u16, Vec<Access>> = BTreeMap::new();
         let mut units = Vec::new();
         for (u, (uc, range)) in c.units.iter().zip(&rec.entries).enumerate() {
@@ -488,14 +516,39 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
                 accesses(&c.units[*u].stream[r.clone()], coords, out);
             }
         }
-        unknown += per
-            .values()
-            .flatten()
-            .filter(|a| !matches!(a, Access::Range { .. }))
-            .count() as u64;
-        feet.push(per);
-        ops.push((rec.label, rec.what, units));
+        (per, (rec.label, rec.what, units))
+    };
+    let threads = analysis_threads(c.ops.len());
+    let mut both: Vec<(BTreeMap<u16, Vec<Access>>, _)> = Vec::with_capacity(c.ops.len());
+    if threads <= 1 {
+        both.extend(c.ops.iter().map(foot));
+    } else {
+        let per = c.ops.len().div_ceil(threads);
+        let foot = &foot;
+        let runs: Vec<Vec<_>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = c
+                .ops
+                .chunks(per)
+                .map(|run| scope.spawn(move || run.iter().map(foot).collect::<Vec<_>>()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a footprint thread panicked"))
+                .collect()
+        });
+        both.extend(runs.into_iter().flatten());
     }
+    let mut feet: Vec<BTreeMap<u16, Vec<Access>>> = Vec::with_capacity(both.len());
+    let mut ops = Vec::with_capacity(both.len());
+    for (per, op) in both {
+        feet.push(per);
+        ops.push(op);
+    }
+    let unknown = feet
+        .iter()
+        .flat_map(|per| per.values().flatten())
+        .filter(|a| !matches!(a, Access::Range { .. }))
+        .count() as u64;
     // What is written anywhere: only those ranges are tracked.
     let mut memory = Memory::default();
     for per in &feet {
@@ -507,7 +560,7 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
                 write: true,
             } = *a
             {
-                let map = memory.spaces.entry(space).or_default();
+                let map = memory.entry(space);
                 Memory::split(map, lo);
                 Memory::split(map, hi);
                 // Fill the gaps in `lo..hi` with fresh segments.
@@ -569,12 +622,12 @@ pub(crate) fn analyse(c: &Capture, coords: &[(u8, u8)]) -> Analysis {
                     } => {
                         if write && matches!(space, Space::Gddr(_)) && !gddr_readers_all.is_empty()
                         {
-                            add(&mut d, &gddr_readers_all.clone());
+                            add(&mut d, &gddr_readers_all);
                         }
                         memory.touch(space, lo..hi, write, (u, k32), &mut d, false);
                     }
                     Access::AllGddr | Access::Unknown => {
-                        add(&mut d, &latest.clone());
+                        add(&mut d, &latest);
                     }
                 }
             }
@@ -963,6 +1016,7 @@ pub(crate) fn prune(c: &mut Capture, keep: &[bool]) -> Result<Pruned, String> {
         for p in uc.pair_calls.iter_mut() {
             *p = map[*p];
         }
+        uc.pair_calls_moved();
         uc.stream = stream;
         uc.barriers_accounted = runs as u32;
     }

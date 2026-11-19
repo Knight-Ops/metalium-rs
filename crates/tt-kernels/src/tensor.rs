@@ -271,6 +271,19 @@ impl Placement {
             .map(move |(c, &b)| (c.index(), b, bytes))
     }
 
+    /// [`Placement::extents`] as the ranges a host copy reads and writes. Every channel's range
+    /// has the same length (`slots * slot_bytes`), including a by-column layout's empty columns.
+    pub(crate) fn extent_ranges(&self) -> Vec<tt_isa::dram::DramRange> {
+        self.channels
+            .iter()
+            .zip(&self.base)
+            .map(|(c, &b)| {
+                c.range(b, self.slots * self.slot_bytes)
+                    .expect("a placement's extent is inside its channel")
+            })
+            .collect()
+    }
+
     /// Bytes a tile's slot takes.
     pub(crate) fn slot_bytes(&self) -> u64 {
         self.slot_bytes

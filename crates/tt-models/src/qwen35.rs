@@ -32,7 +32,7 @@
 //! Text only: the checkpoint's vision tower (`model.visual.*`) and its multi-token-prediction head
 //! (`mtp.*`) are left in the file, by name ([`Qwen35::pretrained`]).
 
-use burn::module::{Module, ModuleMapper, Param};
+use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn::tensor::activation::{sigmoid, silu};
 use burn::tensor::backend::Backend;
@@ -1623,6 +1623,575 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
     }
 }
 
+impl Qwen35<burn_tt::Tt> {
+    /// [`Qwen35::streamed`] with a GDDR-image cache at `cache`. A file whose checksum matches
+    /// this checkpoint, plan and card layout is uploaded unchanged. Anything else is packed on
+    /// the card and written there for the next start.
+    pub fn streamed_cached(
+        config: &Qwen35Config,
+        paths: &[std::path::PathBuf],
+        numerics: burn_tt::Numerics,
+        options: crate::quant::WeightOptions,
+        cache: &std::path::Path,
+        device: &burn_tt::TtDevice,
+    ) -> Result<(Self, Loaded), LoadError> {
+        let plan = crate::quant::Plan::for_numerics(numerics, options);
+        let (channels, columns) = burn_tt::weight_layout(*device).map_err(|e| {
+            LoadError::Store(format!("weight cache: the card's layout: {e}"))
+        })?;
+        let identity = crate::weight_cache::Identity {
+            model: crate::weight_cache::model_identity(paths)
+                .map_err(LoadError::Store)?,
+            plan: plan.cache_key(),
+            layout: layout_stamp(config, options, channels, columns),
+        };
+        use crate::progress::{report, CacheStage, Progress};
+        let started = std::time::Instant::now();
+        let miss = |why: String| {
+            report(Progress::Cache {
+                stage: CacheStage::Miss(why),
+                done: 0,
+                total: 0,
+                records: 0,
+                secs: 0.0,
+            })
+        };
+        match crate::weight_cache::Reader::open(cache, &identity).map_err(LoadError::Store)? {
+            Some(reader) => {
+                match Self::from_cache(config, paths, numerics, options, reader, device) {
+                    Ok(loaded) => {
+                        eprintln!(
+                            "weight cache: hit {} in {:.1} s",
+                            cache.display(),
+                            started.elapsed().as_secs_f64()
+                        );
+                        return Ok(loaded);
+                    }
+                    Err(CacheLoad::Corrupt(why)) => {
+                        eprintln!("weight cache: {why}; packing again");
+                        miss(why);
+                        let _ = std::fs::remove_file(cache);
+                    }
+                    Err(CacheLoad::Fail(e)) => return Err(e),
+                }
+            }
+            None if cache.exists() => miss("für ein anderes Modell, einen anderen Plan oder eine ältere Version".into()),
+            None => miss("noch keine Datei".into()),
+        }
+        let (model, loaded) =
+            Self::streamed_with_plan(config, paths, numerics, options, &plan, device)?;
+        let started = std::time::Instant::now();
+        let mut writer = crate::weight_cache::Writer::create(cache, &identity)
+            .map_err(LoadError::Store)?;
+        let records = model.write_cache(&mut writer)?;
+        writer.finish().map_err(LoadError::Store)?;
+        let bytes = std::fs::metadata(cache).map(|m| m.len()).unwrap_or(0);
+        report(Progress::Cache {
+            stage: CacheStage::Done { wrote: true },
+            done: bytes,
+            total: bytes,
+            records,
+            secs: started.elapsed().as_secs_f64(),
+        });
+        eprintln!(
+            "weight cache: wrote {} ({:.1} GB) in {:.1} s",
+            cache.display(),
+            bytes as f64 / 1e9,
+            started.elapsed().as_secs_f64()
+        );
+        Ok((model, loaded))
+    }
+
+    fn from_cache(
+        config: &Qwen35Config,
+        paths: &[std::path::PathBuf],
+        numerics: burn_tt::Numerics,
+        options: crate::quant::WeightOptions,
+        reader: crate::weight_cache::Reader,
+        device: &burn_tt::TtDevice,
+    ) -> Result<(Self, Loaded), CacheLoad> {
+        let mut reader = reader;
+        use crate::weight_cache::Record;
+        use std::collections::HashMap;
+        let mut images = HashMap::<String, Tensor<burn_tt::Tt, 2>>::new();
+        let mut values = HashMap::<String, (u8, Vec<usize>, Vec<f32>)>::new();
+        use crate::progress::{report, CacheStage, Progress};
+        let started = std::time::Instant::now();
+        let mut n = 0;
+        // A reader thread reads and hashes record i+1 while record i is uploaded. Two records
+        // in flight bound the memory to the two largest matrices plus the one being uploaded.
+        let outcome = std::thread::scope(|scope| -> Result<(), CacheLoad> {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(Record, u64, u64), String>>(2);
+            scope.spawn(move || loop {
+                let next = reader.next_record();
+                let (done, total) = reader.progress();
+                let item = match next {
+                    Ok(Some(r)) => Ok((r, done, total)),
+                    Ok(None) => break,
+                    Err(e) => Err(e),
+                };
+                let failed = item.is_err();
+                if tx.send(item).is_err() || failed {
+                    break;
+                }
+            });
+            for item in rx {
+                let (record, done, total) = item.map_err(CacheLoad::Corrupt)?;
+                n += 1;
+                match record {
+                    Record::Image {
+                        name,
+                        format,
+                        layout,
+                        rows,
+                        cols,
+                        slot_bytes,
+                        channels,
+                    } => {
+                        let tensor = burn_tt::storage::tensor_from_bfp_parts(
+                            device,
+                            rows as usize,
+                            cols as usize,
+                            format,
+                            layout,
+                            slot_bytes,
+                            channels,
+                        )
+                        .map_err(|e| CacheLoad::Corrupt(format!("{name}: {e}")))?;
+                        images.insert(name, tensor);
+                    }
+                    Record::Values {
+                        name,
+                        dtype,
+                        dims,
+                        values: data,
+                    } => {
+                        values.insert(
+                            name,
+                            (dtype, dims.into_iter().map(|d| d as usize).collect(), data),
+                        );
+                    }
+                }
+                report(Progress::Cache {
+                    stage: CacheStage::Read,
+                    done,
+                    total,
+                    records: n,
+                    secs: started.elapsed().as_secs_f64(),
+                });
+            }
+            Ok(())
+        });
+        outcome?;
+        report(Progress::Cache {
+            stage: CacheStage::Done { wrote: false },
+            done: 0,
+            total: 0,
+            records: n,
+            secs: started.elapsed().as_secs_f64(),
+        });
+        let mut model = Self::shell(config, device);
+        if options.host_embedding {
+            model = model
+                .with_host_embedding(
+                    HostEmbedding::from_shards(paths, &is_embed_table)
+                        .map_err(CacheLoad::Fail)?,
+                )
+                .map_err(CacheLoad::Fail)?;
+        } else if let Some(weight) = take_matrix(&mut images, &mut values, "embed_tokens.weight", device)? {
+            model.embed_tokens = Some(Embedding {
+                weight: Param::from_tensor(weight),
+            });
+        }
+        for i in 0..config.layers {
+            model.layers.push(layer_from_cache(
+                config,
+                i,
+                device,
+                &mut images,
+                &mut values,
+            )?);
+        }
+        model.norm = centered(
+            &mut values,
+            "norm.weight",
+            config.eps,
+            device,
+        )?;
+        if !config.tied_head {
+            let weight = take_matrix(&mut images, &mut values, "lm_head.weight", device)?
+                .ok_or_else(|| CacheLoad::Fail(LoadError::Store("lm_head.weight missing".into())))?;
+            model.lm_head = Some(Linear {
+                weight: Param::from_tensor(weight),
+                bias: None,
+            });
+        }
+        if !images.is_empty() || !values.is_empty() {
+            return Err(CacheLoad::Fail(LoadError::Store(format!(
+                "weight cache: unused {}",
+                images
+                    .keys()
+                    .chain(values.keys())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))));
+        }
+        model.numerics = Some(numerics);
+        model.stream = Some(DType::F32);
+        if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
+            model.kv = Some(DType::BF16);
+        }
+        Ok((model, Loaded {
+            applied: n,
+            ignored: Vec::new(),
+        }))
+    }
+
+    /// Every parameter into `writer`; the number of records.
+    fn write_cache(&self, writer: &mut crate::weight_cache::Writer) -> Result<usize, LoadError> {
+        let mut visitor = CacheWriter {
+            writer,
+            error: None,
+            path: Vec::new(),
+            records: 0,
+            started: std::time::Instant::now(),
+        };
+        self.visit(&mut visitor);
+        let records = visitor.records;
+        visitor.error.map_or(Ok(records), Err)
+    }
+
+    /// The architecture with no weights allocated. A cache hit fills it from the file.
+    fn shell(config: &Qwen35Config, device: &burn_tt::TtDevice) -> Self {
+        config.check();
+        Self {
+            embed_tokens: None,
+            layers: Vec::new(),
+            norm: CenteredNorm::new(config.hidden, config.eps, device),
+            lm_head: None,
+            config: *config,
+            numerics: None,
+            stream: None,
+            kv: None,
+            host: None,
+        }
+    }
+}
+
+enum CacheLoad {
+    /// The file does not hash, or a record is not a weight image. The caller packs again.
+    Corrupt(String),
+    Fail(LoadError),
+}
+
+fn layout_stamp(
+    config: &Qwen35Config,
+    options: crate::quant::WeightOptions,
+    channels: usize,
+    columns: bool,
+) -> String {
+    format!(
+        "channels={channels} columns={} layers={} hidden={} ff={} vocab={} heads={} kv={} \
+         head={} rotary={} rope={} yarn={} lk={} lkd={} lv={} lvd={} conv={} full={} eps={} \
+         tied={} host={} mlp4={}",
+        u8::from(columns),
+        config.layers,
+        config.hidden,
+        config.ff,
+        config.vocab,
+        config.heads,
+        config.kv_heads,
+        config.head_dim,
+        config.rotary_dim,
+        config.rope_theta,
+        config.yarn.map(|y| y.factor).unwrap_or(0.0),
+        config.linear_k_heads,
+        config.linear_k_dim,
+        config.linear_v_heads,
+        config.linear_v_dim,
+        config.conv_kernel,
+        config.full_every,
+        config.eps,
+        u8::from(config.tied_head),
+        u8::from(options.host_embedding),
+        u8::from(options.mlp_bfp4),
+    )
+}
+
+struct CacheWriter<'a> {
+    writer: &'a mut crate::weight_cache::Writer,
+    error: Option<LoadError>,
+    path: Vec<String>,
+    records: usize,
+    started: std::time::Instant,
+}
+
+impl ModuleVisitor<burn_tt::Tt> for CacheWriter<'_> {
+    fn enter_module(&mut self, name: &str, _container: &str) {
+        self.path.push(name.to_string());
+    }
+    fn exit_module(&mut self, _name: &str, _container: &str) {
+        self.path.pop();
+    }
+    fn visit_float<const D: usize>(
+        &mut self,
+        param: &Param<Tensor<burn_tt::Tt, D>>,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let name = self.path.join(".");
+        let tensor = param.val();
+        let record = match burn_tt::storage::bfp_image_parts(&tensor) {
+            Err(e) => {
+                self.error = Some(LoadError::Store(format!("{name}: {e}")));
+                return;
+            }
+            Ok(Some(image)) => crate::weight_cache::Record::Image {
+                name,
+                format: image.format,
+                layout: image.layout,
+                rows: image.rows,
+                cols: image.cols,
+                slot_bytes: image.slot_bytes,
+                channels: image.channels,
+            },
+            Ok(None) => {
+                let dtype = match tensor.dtype() {
+                    DType::F32 => 0,
+                    DType::BF16 => 1,
+                    DType::F16 => 2,
+                    other => {
+                        self.error = Some(LoadError::Store(format!(
+                            "{name}: {other:?} is not a cached dtype"
+                        )));
+                        return;
+                    }
+                };
+                let dims = tensor.dims().into_iter().map(|d| d as u32).collect();
+                let values = tensor
+                    .into_data()
+                    .convert::<f32>()
+                    .into_vec::<f32>()
+                    .expect("a float parameter");
+                crate::weight_cache::Record::Values {
+                    name,
+                    dtype,
+                    dims,
+                    values,
+                }
+            }
+        };
+        if let Err(e) = self.writer.push(&record) {
+            self.error = Some(LoadError::Store(e));
+            return;
+        }
+        self.records += 1;
+        crate::progress::report(crate::progress::Progress::Cache {
+            stage: crate::progress::CacheStage::Write,
+            done: self.writer.written(),
+            total: 0,
+            records: self.records,
+            secs: self.started.elapsed().as_secs_f64(),
+        });
+    }
+}
+
+/// A cached parameter's dtype code, dims and logical floats ([`crate::weight_cache::Record::Values`]).
+type CachedValues = (u8, Vec<usize>, Vec<f32>);
+
+fn take_values(
+    values: &mut std::collections::HashMap<String, CachedValues>,
+    name: &str,
+) -> Result<Option<CachedValues>, CacheLoad> {
+    Ok(values.remove(name))
+}
+
+fn tensor_from_values<const D: usize>(
+    dtype: u8,
+    dims: Vec<usize>,
+    data: Vec<f32>,
+    device: &burn_tt::TtDevice,
+) -> Result<Tensor<burn_tt::Tt, D>, CacheLoad> {
+    if dims.len() != D {
+        return Err(CacheLoad::Fail(LoadError::Store(format!(
+            "rank {} where {D} was expected",
+            dims.len()
+        ))));
+    }
+    let mut shape = [0; D];
+    shape.copy_from_slice(&dims);
+    let tensor = Tensor::from_data(TensorData::new(data, shape), device);
+    Ok(match dtype {
+        0 => tensor,
+        1 => tensor.cast(DType::BF16),
+        2 => tensor.cast(DType::F16),
+        _ => {
+            return Err(CacheLoad::Fail(LoadError::Store(format!(
+                "dtype {dtype}"
+            ))))
+        }
+    })
+}
+
+fn take_matrix(
+    images: &mut std::collections::HashMap<String, Tensor<burn_tt::Tt, 2>>,
+    values: &mut std::collections::HashMap<String, (u8, Vec<usize>, Vec<f32>)>,
+    name: &str,
+    device: &burn_tt::TtDevice,
+) -> Result<Option<Tensor<burn_tt::Tt, 2>>, CacheLoad> {
+    if let Some(tensor) = images.remove(name) {
+        return Ok(Some(tensor));
+    }
+    let Some((dtype, dims, data)) = take_values(values, name)? else {
+        return Ok(None);
+    };
+    tensor_from_values(dtype, dims, data, device).map(Some)
+}
+
+fn require_matrix(
+    images: &mut std::collections::HashMap<String, Tensor<burn_tt::Tt, 2>>,
+    values: &mut std::collections::HashMap<String, (u8, Vec<usize>, Vec<f32>)>,
+    name: &str,
+    device: &burn_tt::TtDevice,
+) -> Result<Tensor<burn_tt::Tt, 2>, CacheLoad> {
+    take_matrix(images, values, name, device)?.ok_or_else(|| {
+        CacheLoad::Fail(LoadError::Store(format!("weight cache: {name} missing")))
+    })
+}
+
+fn vector(
+    values: &mut std::collections::HashMap<String, (u8, Vec<usize>, Vec<f32>)>,
+    name: &str,
+    device: &burn_tt::TtDevice,
+) -> Result<Tensor<burn_tt::Tt, 1>, CacheLoad> {
+    let (dtype, dims, data) = take_values(values, name)?.ok_or_else(|| {
+        CacheLoad::Fail(LoadError::Store(format!("weight cache: {name} missing")))
+    })?;
+    tensor_from_values(dtype, dims, data, device)
+}
+
+fn centered(
+    values: &mut std::collections::HashMap<String, (u8, Vec<usize>, Vec<f32>)>,
+    name: &str,
+    eps: f64,
+    device: &burn_tt::TtDevice,
+) -> Result<CenteredNorm<burn_tt::Tt>, CacheLoad> {
+    Ok(CenteredNorm {
+        weight: Param::from_tensor(vector(values, name, device)?),
+        eps,
+        shifted: true,
+    })
+}
+
+fn linear_of(weight: Tensor<burn_tt::Tt, 2>) -> Linear<burn_tt::Tt> {
+    Linear {
+        weight: Param::from_tensor(weight),
+        bias: None,
+    }
+}
+
+fn layer_from_cache(
+    config: &Qwen35Config,
+    index: usize,
+    device: &burn_tt::TtDevice,
+    images: &mut std::collections::HashMap<String, Tensor<burn_tt::Tt, 2>>,
+    values: &mut std::collections::HashMap<String, (u8, Vec<usize>, Vec<f32>)>,
+) -> Result<Layer<burn_tt::Tt>, CacheLoad> {
+    let p = |suffix: &str| format!("layers.{index}.{suffix}");
+    let matrix = |images: &mut _, values: &mut _, suffix: &str| {
+        require_matrix(images, values, &p(suffix), device)
+    };
+    let optional = |images: &mut _, values: &mut _, suffix: &str| {
+        take_matrix(images, values, &p(suffix), device)
+    };
+    let norm = |values: &mut _, suffix: &str| centered(values, &p(suffix), config.eps, device);
+    let full = config.is_full(index);
+    let self_attn = if full {
+        Some(GatedAttention {
+            q_proj: optional(images, values, "self_attn.q_proj.weight")?.map(linear_of),
+            k_proj: optional(images, values, "self_attn.k_proj.weight")?.map(linear_of),
+            v_proj: optional(images, values, "self_attn.v_proj.weight")?.map(linear_of),
+            qkv: optional(images, values, "self_attn.qkv.weight")?.map(linear_of),
+            o_proj: linear_of(matrix(images, values, "self_attn.o_proj.weight")?),
+            q_norm: norm(values, "self_attn.q_norm.weight")?,
+            k_norm: norm(values, "self_attn.k_norm.weight")?,
+        })
+    } else {
+        None
+    };
+    let linear_attn = if full {
+        None
+    } else {
+        let conv = {
+            let (dtype, dims, data) =
+                take_values(values, &p("linear_attn.conv1d"))?.ok_or_else(|| {
+                    CacheLoad::Fail(LoadError::Store(format!(
+                        "weight cache: {} missing",
+                        p("linear_attn.conv1d")
+                    )))
+                })?;
+            tensor_from_values::<3>(dtype, dims, data, device)?
+        };
+        let taps = match take_values(values, &p("linear_attn.taps"))? {
+            Some((dtype, dims, data)) => {
+                Some(tensor_from_values::<3>(dtype, dims, data, device)?)
+            }
+            None => None,
+        };
+        let one = |values: &mut std::collections::HashMap<String, (u8, Vec<usize>, Vec<f32>)>,
+                   suffix: &str|
+         -> Result<Option<Tensor<burn_tt::Tt, 1>>, CacheLoad> {
+            match take_values(values, &p(suffix))? {
+                Some((dtype, dims, data)) => {
+                    Ok(Some(tensor_from_values::<1>(dtype, dims, data, device)?))
+                }
+                None => Ok(None),
+            }
+        };
+        let neg_rate = one(values, "linear_attn.neg_rate")?;
+        let q_scale = one(values, "linear_attn.q_scale")?;
+        let k_scale = one(values, "linear_attn.k_scale")?;
+        Some(GatedDeltaNet {
+            in_proj_qkv: optional(images, values, "linear_attn.in_proj_qkv.weight")?.map(linear_of),
+            in_proj_z: optional(images, values, "linear_attn.in_proj_z.weight")?.map(linear_of),
+            in_proj_b: optional(images, values, "linear_attn.in_proj_b.weight")?.map(linear_of),
+            in_proj_a: optional(images, values, "linear_attn.in_proj_a.weight")?.map(linear_of),
+            in_proj: optional(images, values, "linear_attn.in_proj.weight")?.map(linear_of),
+            conv1d: Param::from_tensor(conv),
+            taps: taps.map(Param::from_tensor),
+            a_log: Param::from_tensor(vector(values, &p("linear_attn.a_log"), device)?),
+            dt_bias: Param::from_tensor(vector(values, &p("linear_attn.dt_bias"), device)?),
+            neg_rate: neg_rate.map(Param::from_tensor),
+            q_scale: q_scale.map(Param::from_tensor),
+            k_scale: k_scale.map(Param::from_tensor),
+            norm: GatedNorm {
+                weight: Param::from_tensor(vector(
+                    values,
+                    &p("linear_attn.norm.weight"),
+                    device,
+                )?),
+                eps: config.eps,
+            },
+            out_proj: linear_of(matrix(images, values, "linear_attn.out_proj.weight")?),
+        })
+    };
+    let layer = Layer {
+        input_layernorm: norm(values, "input_layernorm.weight")?,
+        self_attn,
+        linear_attn,
+        post_attention_layernorm: norm(values, "post_attention_layernorm.weight")?,
+        mlp: Mlp {
+            gate_proj: optional(images, values, "mlp.gate_proj.weight")?.map(linear_of),
+            up_proj: optional(images, values, "mlp.up_proj.weight")?.map(linear_of),
+            down_proj: linear_of(matrix(images, values, "mlp.down_proj.weight")?),
+            gate_up: optional(images, values, "mlp.gate_up.weight")?.map(linear_of),
+        },
+    };
+    Ok(layer)
+}
+
 impl<B: Backend> EagerDecoder<B> for Qwen35<B> {
     fn generate(
         &self,
@@ -2065,6 +2634,39 @@ mod tests {
         eps: 1e-6,
         tied_head: true,
     };
+
+    #[test]
+    fn a_prepared_layer_stores_the_fused_matrices() {
+        let model = Qwen35::<Flex>::new(&TINY, &FlexDevice)
+            .map(&mut ToF32)
+            .prepared();
+        struct Names {
+            path: Vec<String>,
+            names: Vec<String>,
+        }
+        impl ModuleVisitor<Flex> for Names {
+            fn enter_module(&mut self, name: &str, _: &str) {
+                self.path.push(name.to_string());
+            }
+            fn exit_module(&mut self, _: &str, _: &str) {
+                self.path.pop();
+            }
+            fn visit_float<const D: usize>(&mut self, _: &Param<Tensor<Flex, D>>) {
+                self.names.push(self.path.join("."));
+            }
+        }
+        let mut names = Names {
+            path: Vec::new(),
+            names: Vec::new(),
+        };
+        model.visit(&mut names);
+        let has = |n: &str| names.names.iter().any(|p| p == n);
+        assert!(has("layers.0.linear_attn.in_proj.weight"), "{:?}", names.names);
+        assert!(has("layers.0.mlp.gate_up.weight"), "{:?}", names.names);
+        assert!(has("layers.1.self_attn.qkv.weight"), "{:?}", names.names);
+        assert!(names.names.iter().all(|p| !p.contains("gate_proj")));
+        assert!(names.names.iter().all(|p| !p.contains("in_proj_qkv")));
+    }
 
     fn logits(model: &Qwen35<Flex>, state: &mut State<Flex>, ids: &[i32]) -> Vec<f32> {
         model

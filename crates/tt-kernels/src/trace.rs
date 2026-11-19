@@ -275,6 +275,11 @@ pub(crate) struct UnitCapture {
     /// `pending_sections[2 i]` and `[2 i + 1]`, its offsets filled in when they
     /// are stored.
     pub(crate) pair_calls: Vec<usize>,
+    /// `pair_calls` inverted (a call's stream position → its index), built on first use by
+    /// [`UnitCapture::pair_at`], kept up to date by [`UnitCapture::push_pair_call`] and dropped
+    /// by [`UnitCapture::pair_calls_moved`]. Searching `pair_calls` at every call made a
+    /// capture's analysis and store quadratic in its calls: a 64-layer step took minutes.
+    pub(crate) pair_index: std::sync::OnceLock<std::collections::HashMap<usize, usize>>,
     /// The unit's entries, in order, generations and barrier targets relative.
     pub(crate) stream: Vec<[u32; 8]>,
     /// The resident's last generation when the capture began: the stream's
@@ -298,6 +303,36 @@ pub(crate) struct UnitCapture {
 }
 
 impl UnitCapture {
+    /// The index in `pair_calls` (its sections `2 i`, `2 i + 1`) of the `PAIR_CALL` at stream
+    /// position `at`, if one is there. `pair_calls` is in section order, which a moved block
+    /// leaves out of stream order, so this is a map, not a search.
+    pub(crate) fn pair_at(&self, at: usize) -> Option<usize> {
+        self.pair_index
+            .get_or_init(|| {
+                self.pair_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &p)| (p, k))
+                    .collect()
+            })
+            .get(&at)
+            .copied()
+    }
+
+    /// A `PAIR_CALL` is about to be pushed at the stream's end.
+    pub(crate) fn push_pair_call(&mut self) {
+        let (at, k) = (self.stream.len(), self.pair_calls.len());
+        self.pair_calls.push(at);
+        if let Some(index) = self.pair_index.get_mut() {
+            index.insert(at, k);
+        }
+    }
+
+    /// `pair_calls` were moved in place: the index is built again on next use.
+    pub(crate) fn pair_calls_moved(&mut self) {
+        self.pair_index = std::sync::OnceLock::new();
+    }
+
     /// Entries setting role `thread`'s descriptor to `d`, where the stream has not
     /// already: all but the program's address and length, which each `KERNEL` entry
     /// writes itself.
@@ -452,6 +487,7 @@ impl Capture {
         for p in uc.pair_calls.iter_mut() {
             *p = at(*p);
         }
+        uc.pair_calls_moved();
         if earlier {
             uc.stream[to..block.end].rotate_right(len);
         } else {
@@ -530,6 +566,7 @@ impl Capture {
                 *p += n;
             }
         }
+        uc.pair_calls_moved();
         for (k, op) in self.ops.iter_mut().enumerate() {
             let r = &mut op.entries[u];
             if k == owner {

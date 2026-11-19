@@ -1095,6 +1095,73 @@ struct QueuedList {
 /// hugepage on silicon (`tt_kmd::host`); a transfer larger moves in parts.
 const HOST_DMA_STAGING: usize = 1 << 30;
 
+/// One side of a weight-image copy ([`Session::copy_extent`]).
+enum ExtentDir<'a> {
+    Up(&'a [u8]),
+    Down(&'a mut [u8]),
+}
+
+impl ExtentDir<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Up(bytes) => bytes.len(),
+            Self::Down(bytes) => bytes.len(),
+        }
+    }
+
+    fn is_up(&self) -> bool {
+        matches!(self, Self::Up(_))
+    }
+}
+
+/// One chunk of a weight image between pinned host memory and a GDDR extent.
+/// An upload is B reading the host and NC writing GDDR. A download is one list
+/// on B: the read, a wait until it has landed, then the write to the host.
+fn weight_image_job(
+    range: tt_isa::dram::DramRange,
+    host: u64,
+    l1: u64,
+    len: u32,
+    upload: bool,
+) -> tensor::Job {
+    use tt_isa::dm::op;
+    let host_move = [
+        if upload { op::HOST_READ } else { op::HOST_WRITE },
+        host as u32,
+        (host >> 32) as u32,
+        0,
+        l1 as u32,
+        len,
+        0,
+        0,
+    ];
+    let dram = [
+        if upload { op::WRITE } else { op::READ },
+        range.channel().index() as u32,
+        0,
+        range.offset() as u32,
+        l1 as u32,
+        len,
+        0,
+        0,
+    ];
+    if upload {
+        vec![tensor::Step::Transfer {
+            what: "weight image upload",
+            depth: 1,
+            batches: vec![tensor::TransferBatch {
+                read: vec![host_move],
+                write: vec![dram],
+            }],
+        }]
+    } else {
+        vec![tensor::Step::List {
+            what: "weight image download",
+            entries: vec![dram, [op::WAIT, 0, 0, 0, 0, 0, 0, 0], host_move],
+        }]
+    }
+}
+
 /// Fewest tiles an upload or write takes by the card's DMA: every one. Queued,
 /// a 50-tile upload costs the host ~19 us, a 2-tile one through the BAR 66.
 const HOST_DMA_MIN_UPLOAD: usize = 1;
@@ -2691,20 +2758,47 @@ fn take_nc_log<T: Transport>(
     Ok((log, lost))
 }
 
-/// Where each of `uc`'s `PAIR_CALL`s sits in its stream → its index in `pair_calls` (its
-/// sections `2 i`, `2 i + 1`): built once a unit, so a walk over the stream finds a call's
-/// sections in O(1). (`pair_calls` is in section order, not always in stream order: a block
-/// moved by the barrier pass keeps its sections' indices.) Searching the list at every call made
-/// a capture's store quadratic in its calls: a 64-layer step spent minutes on it.
-fn pair_index(uc: &trace::UnitCapture) -> std::collections::HashMap<usize, usize> {
-    uc.pair_calls.iter().enumerate().map(|(k, &at)| (at, k)).collect()
+/// Where a capture's end spends its host time, printed with `TT_CAPTURE_TIMES=1`: a profile
+/// of the single thread that ends a capture, where `perf` is not to hand.
+struct CaptureTimes {
+    on: bool,
+    ops: usize,
+    at: std::time::Instant,
+    laps: Vec<(&'static str, f64)>,
 }
 
-fn op_stamps(
-    uc: &trace::UnitCapture,
-    pairs: &std::collections::HashMap<usize, usize>,
-    range: core::ops::Range<usize>,
-) -> [u32; 3] {
+impl CaptureTimes {
+    fn new(ops: usize) -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("TT_CAPTURE_TIMES").as_deref() == Ok("1"));
+        Self {
+            on,
+            ops,
+            at: std::time::Instant::now(),
+            laps: Vec::new(),
+        }
+    }
+
+    fn lap(&mut self, what: &'static str) {
+        if self.on {
+            self.laps.push((what, self.at.elapsed().as_secs_f64()));
+            self.at = std::time::Instant::now();
+        }
+    }
+
+    fn report(&self) {
+        self.report_as("capture end");
+    }
+
+    fn report_as(&self, what: &str) {
+        if self.on {
+            let parts: Vec<String> = self.laps.iter().map(|(w, t)| format!("{w} {t:.2} s")).collect();
+            eprintln!("tt-kernels {what} ({} ops): {}", self.ops, parts.join(", "));
+        }
+    }
+}
+
+fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
         detail,
@@ -2756,7 +2850,7 @@ fn op_stamps(
         let head = uc.stream[i][0];
         if head == tt_isa::dm::op::PAIR_CALL {
             waits += 2;
-            if let Some(&k) = pairs.get(&i) {
+            if let Some(k) = uc.pair_at(i) {
                 if let Some(reader) = uc.pending_sections.get(2 * k) {
                     waits += chunks(reader.len());
                     add(reader);
@@ -2879,7 +2973,6 @@ fn shape_of(queues: &[Vec<Step>]) -> u64 {
 /// its sections (B runs the reader's, NC the writer's).
 fn op_bytes(
     uc: &trace::UnitCapture,
-    pairs: &std::collections::HashMap<usize, usize>,
     range: core::ops::Range<usize>,
     bytes: &mut crate::profile_mode::OpBytes,
 ) {
@@ -2888,7 +2981,7 @@ fn op_bytes(
         let head = uc.stream[i][0];
         let n = (tt_isa::dm::record::len(head) as usize).max(1);
         if head == tt_isa::dm::op::PAIR_CALL {
-            if let Some(&k) = pairs.get(&i) {
+            if let Some(k) = uc.pair_at(i) {
                 for section in uc.pending_sections.iter().skip(2 * k).take(2) {
                     bytes.count(section);
                 }
@@ -3935,6 +4028,197 @@ impl<T: Transport> Session<T> {
                 Ok(bytes)
             })
             .collect()
+    }
+
+    /// `input` as it lies in GDDR ([`crate::bfp::BfpImage`]). The card's DMA when a staging
+    /// buffer is pinned, otherwise the BAR.
+    pub fn download_bfp_image(
+        &mut self,
+        input: &crate::bfp::BfpTensor,
+    ) -> Result<crate::bfp::BfpImage, TensorError> {
+        self.refuse_while_capturing("download")?;
+        self.sync()?;
+        let mut channels = Vec::new();
+        for range in input.placement.extent_ranges() {
+            let mut bytes = vec![0u8; range.len() as usize];
+            self.copy_extent_down(range, &mut bytes)?;
+            channels.push(bytes);
+        }
+        Ok(crate::bfp::BfpImage {
+            rows: input.rows(),
+            cols: input.cols(),
+            format: input.format(),
+            layout: input.placement.layout(),
+            channels,
+        })
+    }
+
+    /// A new BFP weight holding `image`'s bytes in the layout they were downloaded from.
+    /// The card's DMA when a staging buffer is pinned, otherwise the BAR.
+    pub fn upload_bfp_image(
+        &mut self,
+        image: &crate::bfp::BfpImage,
+    ) -> Result<DramTensor, TensorError> {
+        self.refuse_while_capturing("upload BFP image")?;
+        let n = self.dram_state()?.alloc.channel_count();
+        if image.channels.len() != n {
+            return Err(TensorError::Shape(format!(
+                "a weight image of {} channels on a chip with {n}",
+                image.channels.len()
+            )));
+        }
+        if image.rows == 0 || image.cols == 0 {
+            return Err(TensorError::Shape("an empty weight image".into()));
+        }
+        let grid = [image.rows.div_ceil(32), image.cols.div_ceil(32)];
+        let placement = self.dram_state()?.alloc.alloc_laid(
+            grid,
+            image.format.slot_bytes(),
+            image.layout,
+        )?;
+        let ranges = placement.extent_ranges();
+        for (range, bytes) in ranges.iter().zip(&image.channels) {
+            if bytes.len() as u64 != range.len() {
+                self.dram_state()?.alloc.free(&placement);
+                return Err(TensorError::Shape(format!(
+                    "a weight image's channel has {} bytes where the layout takes {}",
+                    bytes.len(),
+                    range.len()
+                )));
+            }
+        }
+        for (range, bytes) in ranges.into_iter().zip(&image.channels) {
+            if let Err(e) = self.copy_extent_up(range, bytes) {
+                self.dram_state()?.alloc.free(&placement);
+                return Err(e);
+            }
+        }
+        Ok(DramTensor::from_bfp(crate::bfp::BfpTensor::from_parts(
+            image.rows,
+            image.cols,
+            image.format,
+            placement,
+        )))
+    }
+
+    /// How many DRAM channels a weight stored now is dealt across, and whether stored weights
+    /// are laid by column ([`Session::set_column_weights`]). A cache of weight images is tied
+    /// to both.
+    pub fn weight_layout(&mut self) -> Result<(usize, bool), TensorError> {
+        Ok((
+            self.dram_state()?.alloc.channel_count(),
+            self.column_weights,
+        ))
+    }
+
+    /// `data` into `range` (the same length). The card reads a pinned chunk and writes GDDR;
+    /// no pinned memory, and the bytes go through the BAR.
+    fn copy_extent_up(
+        &mut self,
+        range: tt_isa::dram::DramRange,
+        data: &[u8],
+    ) -> Result<(), TensorError> {
+        self.copy_extent(range, ExtentDir::Up(data))
+    }
+
+    /// `range` into `data` (the same length). The card reads GDDR and writes a pinned chunk;
+    /// no pinned memory, and the bytes come through the BAR.
+    fn copy_extent_down(
+        &mut self,
+        range: tt_isa::dram::DramRange,
+        data: &mut [u8],
+    ) -> Result<(), TensorError> {
+        self.copy_extent(range, ExtentDir::Down(data))
+    }
+
+    fn copy_extent(
+        &mut self,
+        range: tt_isa::dram::DramRange,
+        mut data: ExtentDir<'_>,
+    ) -> Result<(), TensorError> {
+        if data.len() as u64 != range.len() {
+            return Err(TensorError::Shape(format!(
+                "copying {} bytes through a {}-byte extent",
+                data.len(),
+                range.len()
+            )));
+        }
+        if self.staging().is_none() {
+            return self.copy_extent_bar(range, &mut data);
+        }
+        let chunk = (tt_isa::l1::DATA.len() as usize) & !63;
+        let l1 = tt_isa::l1::DATA.base;
+        let upload = data.is_up();
+        let mut at = 0;
+        while at < data.len() {
+            let n = (data.len() - at).min(chunk);
+            let off = self.staging_aligned(n)?;
+            if upload {
+                let ExtentDir::Up(src) = &data else {
+                    unreachable!("upload");
+                };
+                let src = &src[at..at + n];
+                self.staging()
+                    .expect("checked above")
+                    .with_bytes(&mut |buf| buf[off..off + n].copy_from_slice(src));
+            }
+            let host = self.staging().expect("checked above").noc_address() + off as u64;
+            let sub = range
+                .channel()
+                .range(range.offset() + at as u64, n as u64)
+                .ok_or_else(|| TensorError::Shape("weight image range overflow".into()))?;
+            self.staging_busy = true;
+            self.submit_jobs(
+                vec![weight_image_job(sub, host, l1, n as u32, upload)],
+                RESET_BUDGET,
+            )?;
+            if !upload {
+                self.sync()?;
+                let ExtentDir::Down(dst) = &mut data else {
+                    unreachable!("download");
+                };
+                self.staging().expect("checked above").with_bytes(&mut |buf| {
+                    dst[at..at + n].copy_from_slice(&buf[off..off + n])
+                });
+            }
+            at += n;
+        }
+        if data.is_up() {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    fn copy_extent_bar(
+        &mut self,
+        range: tt_isa::dram::DramRange,
+        data: &mut ExtentDir<'_>,
+    ) -> Result<(), TensorError> {
+        let Session { dev, dram, .. } = self;
+        let d = dram
+            .as_mut()
+            .ok_or_else(|| TensorError::Shape("GDDR is not enabled".into()))?;
+        match data {
+            ExtentDir::Up(bytes) => dev.dram_write(&d.w4, range, bytes)?,
+            ExtentDir::Down(bytes) => dev.dram_read(&d.w4, range, bytes)?,
+        }
+        Ok(())
+    }
+
+    /// `bytes` of the staging ring from the next 64-byte boundary, syncing first if they
+    /// would wrap onto memory a queued transfer may still read.
+    fn staging_aligned(&mut self, bytes: usize) -> Result<usize, TensorError> {
+        let align = tt_isa::dram::ALIGN as usize;
+        if self.staging_at + align + bytes > HOST_DMA_STAGING {
+            if self.staging_busy {
+                self.sync()?;
+            }
+            self.staging_at = 0;
+        }
+        let pad = (align - (self.staging_at % align)) % align;
+        let at = self.staging_at + pad;
+        self.staging_at = at + bytes;
+        Ok(at)
     }
 
     pub fn repack_bf16(
@@ -6104,7 +6388,7 @@ impl<T: Transport> Session<T> {
                     out.pending_sections.push(words);
                 }
                 out.sections.extend(counts);
-                out.pair_calls.push(out.stream.len());
+                out.push_pair_call();
                 out.stream.push([
                     op::PAIR_CALL,
                     0,
@@ -6410,7 +6694,7 @@ impl<T: Transport> Session<T> {
             for (k, e) in uc.stream[r.clone()].iter().enumerate() {
                 out.push(*e);
                 if e[0] == tt_isa::dm::op::PAIR_CALL {
-                    if let Some(i) = uc.pair_calls.iter().position(|&at| at == r.start + k) {
+                    if let Some(i) = uc.pair_at(r.start + k) {
                         for part in &uc.pending_sections[2 * i..2 * i + 2] {
                             out.extend_from_slice(part);
                         }
@@ -6551,6 +6835,7 @@ impl<T: Transport> Session<T> {
         let Some(mut capture) = self.capture.take() else {
             return Err(TraceError::NotCapturing.into());
         };
+        let mut times = CaptureTimes::new(capture.ops.len());
         let allocs = self
             .dram
             .as_mut()
@@ -6600,6 +6885,7 @@ impl<T: Transport> Session<T> {
         }
         // A planned capture is its plan's or refused; a plain one, with residency on, plans the
         // next ([`Session::begin_trace_planned`]).
+        times.lap("finish streams");
         let refused = match capture.applied.clone() {
             Some(applied) if capture.planned => applied.verify(&capture, &allocs).err(),
             None if capture.planned => Some(
@@ -6642,8 +6928,10 @@ impl<T: Transport> Session<T> {
             .iter()
             .map(|u| (u.tile.x(), u.tile.y()))
             .collect();
+        times.lap(if capture.planned { "verify plan" } else { "make plan" });
         let barriers = (prune || crate::barriers::probe_dir().is_some())
             .then(|| crate::barriers::analyse(&capture, &coords));
+        times.lap("barrier analysis");
         self.last_prune = None;
         self.last_credits = None;
         if let (true, Some(a)) = (prune, &barriers) {
@@ -6662,7 +6950,10 @@ impl<T: Transport> Session<T> {
                 self.last_prune = Some(crate::barriers::prune(&mut capture, &keep));
             }
         }
+        times.lap("keep/credit/prune");
         let result = self.store_trace(capture);
+        times.lap("store trace");
+        times.report();
         if let (Some(a), Ok(id)) = (&barriers, &result) {
             crate::barriers::write_probe(id.0, a);
         }
@@ -6708,11 +6999,10 @@ impl<T: Transport> Session<T> {
         } = capture;
         // What each op could stamp in each detail of the profile mode, on its busiest unit: what
         // sizes a profiled replay's window (`profile_mode`).
-        let pairs: Vec<_> = units.iter().map(pair_index).collect();
         for op in &mut ops {
             let mut most = [0u32; 3];
-            for ((uc, pairs), range) in units.iter().zip(&pairs).zip(&op.entries) {
-                let s = op_stamps(uc, pairs, range.clone());
+            for (uc, range) in units.iter().zip(&op.entries) {
+                let s = op_stamps(uc, range.clone());
                 most = core::array::from_fn(|d| most[d].max(s[d]));
             }
             op.stamps = most;
@@ -6760,16 +7050,16 @@ impl<T: Transport> Session<T> {
                     holes.sort_by_key(|r| r.start);
                     let mut from = range.start;
                     for r in holes {
-                        op_bytes(uc, &pairs[u], from..r.start, own);
+                        op_bytes(uc, from..r.start, own);
                         from = r.end;
                     }
-                    op_bytes(uc, &pairs[u], from..range.end, own);
+                    op_bytes(uc, from..range.end, own);
                 }
                 // What its lists read ahead is its own too: counted again only where a list
                 // lies outside its entries (moved to before the ops it runs under).
                 for (u, r) in &op.ahead {
                     let mut ahead = crate::profile_mode::OpBytes::default();
-                    op_bytes(&units[*u], &pairs[*u], r.clone(), &mut ahead);
+                    op_bytes(&units[*u], r.clone(), &mut ahead);
                     let own = &op.entries[*u];
                     if !(own.start <= r.start && r.end <= own.end) {
                         per_unit[*u].add(&ahead);
@@ -6929,11 +7219,12 @@ impl<T: Transport> Session<T> {
             let r = self.units[u].resident.as_ref().unwrap();
             r.generation().wrapping_sub(uc.generation_base)
         };
-        let Session { dev, dram, .. } = self;
-        let d = dram.as_mut().expect("checked at the capture's start");
         // Each unit's on its own channel where there are enough, so the
         // movers' reads of their streams spread out.
-        let region = d.alloc.alloc_on(u % d.alloc.channel_count(), end)?;
+        let region = {
+            let d = self.dram_state()?;
+            d.alloc.alloc_on(u % d.alloc.channel_count(), end)?
+        };
         let range = region.region().expect("a one-channel placement");
         let (channel, base) = (range.channel().index() as u32, range.offset());
         let mut stream = uc.stream.clone();
@@ -6959,9 +7250,9 @@ impl<T: Transport> Session<T> {
         for (section, &at) in uc.pending_sections.iter().zip(&offsets) {
             put(at, section);
         }
-        if let Err(e) = dev.dram_write(&d.w4, range, &bytes) {
-            d.alloc.free(&region);
-            return Err(e.into());
+        if let Err(e) = self.store_bytes(range, &bytes) {
+            self.dram_state()?.alloc.free(&region);
+            return Err(e);
         }
         let mut composition = own;
         composition.add(&uc.sections_composition);
@@ -7104,6 +7395,27 @@ impl<T: Transport> Session<T> {
     /// Keep trace unit `u`'s programs in GDDR, each once, and build the `READ` that puts each back
     /// ([`trace::UnitTrace::restore_reads`]), unless mover restores are off. A program's GDDR
     /// offset has its L1 address's 64-byte residue, as a `READ` needs (`Descriptor::decode`).
+    /// A trace's stream or programs into GDDR: through the card's DMA (a pinned chunk the card
+    /// reads), the BAR only without a staging buffer or with `TT_STREAM_BAR=1`. The BAR's 256-bit
+    /// stores ran at ~0.15 GB/s and were half of a 64-layer capture's host time.
+    fn store_bytes(
+        &mut self,
+        range: tt_isa::dram::DramRange,
+        bytes: &[u8],
+    ) -> Result<(), TensorError> {
+        static BAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bar = *BAR.get_or_init(|| std::env::var("TT_STREAM_BAR").as_deref() == Ok("1"));
+        if bar {
+            let Session { dev, dram, .. } = self;
+            let d = dram
+                .as_mut()
+                .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))?;
+            dev.dram_write(&d.w4, range, bytes)?;
+            return Ok(());
+        }
+        self.copy_extent_up(range, bytes)
+    }
+
     fn store_programs(&mut self, u: usize, t: &mut trace::UnitTrace) -> Result<(), TensorError> {
         if t.programs.is_empty() || !self.mover_restore {
             return Ok(());
@@ -7116,11 +7428,10 @@ impl<T: Transport> Session<T> {
             offsets.push(start);
             end = start + 4 * words.len() as u64;
         }
-        let Session { dev, dram, .. } = self;
-        let d = dram
-            .as_mut()
-            .ok_or_else(|| TensorError::Shape("GDDR is not enabled on this session".into()))?;
-        let region = d.alloc.alloc_on(u % d.alloc.channel_count(), end)?;
+        let region = {
+            let d = self.dram_state()?;
+            d.alloc.alloc_on(u % d.alloc.channel_count(), end)?
+        };
         let range = region.region().expect("a one-channel placement");
         let mut bytes = vec![0u8; range.len() as usize];
         let corrupt = PROBE_CORRUPT_STORE.load(std::sync::atomic::Ordering::Relaxed);
@@ -7130,9 +7441,9 @@ impl<T: Transport> Session<T> {
                 bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
-        if let Err(e) = dev.dram_write(&d.w4, range, &bytes) {
-            d.alloc.free(&region);
-            return Err(e.into());
+        if let Err(e) = self.store_bytes(range, &bytes) {
+            self.dram_state()?.alloc.free(&region);
+            return Err(e);
         }
         let (channel, base) = (range.channel().index() as u32, range.offset());
         t.restore_reads = t
@@ -10843,7 +11154,9 @@ impl<T: Transport> Session<T> {
         }
         // Where the plan pass's ops planned below: the whole arena, or a region it kept.
         let kept = c.region_base.unwrap_or(end);
+        let mut times = CaptureTimes::new(c.ops.len());
         let g = Graph::from_capture(c, allocs);
+        times.lap("graph");
         // The region takes at most what leaves every op laid out as here (`cap`), nor more than
         // `residency_region` (`docs/completed-plans/planned-l1-residency.md` 2h). A pass that kept one (an
         // earlier plan's, a fixed one, `TT_L1_REGION`) plans in what it kept, every op already
@@ -10858,14 +11171,18 @@ impl<T: Transport> Session<T> {
         // A row its readers take whole on many units goes as `residency_rows` says: held by a few
         // of them by default, since every producer multicasting it to all of them serializes
         // (`docs/completed-plans/planned-l1-residency.md` 2e, 2f).
+        times.lap("cap");
         let mut plan = Plan::make_rows(&g, budget, self.residency_rows, |_, u| u.plain);
+        times.lap("make_rows");
         if !self.residency_drop {
             plan.dropped.clear();
         }
         if crate::residency::probing() {
             crate::residency::keep(g.clone(), plan.clone());
         }
-        plan.check(&g).ok()?;
+        let checked = plan.check(&g);
+        times.lap("check");
+        checked.ok()?;
         // The planned capture keeps the whole budget, not only what the plan uses: every op is
         // laid out as here either way, and a model's traces then share one arena end, so their
         // programs, which name addresses planned in it, are one set in the program cache. Kept to
@@ -10882,7 +11199,10 @@ impl<T: Transport> Session<T> {
             .iter()
             .map(|u| (u.tile.x(), u.tile.y()))
             .collect();
-        Applied::new(g, plan, shapes, base, coords).map(std::sync::Arc::new)
+        let applied = Applied::new(g, plan, shapes, base, coords).map(std::sync::Arc::new);
+        times.lap("applied");
+        times.report_as("plan");
+        applied
     }
 
     /// Change the plan the next [`Session::begin_trace_planned`] applies, unchecked: a gate's

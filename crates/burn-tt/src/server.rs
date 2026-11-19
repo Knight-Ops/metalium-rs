@@ -145,6 +145,25 @@ pub trait Engine {
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
+    /// The DRAM channels a stored weight is dealt across, and whether new weights are laid
+    /// by column. A cache of [`tt_kernels::bfp::BfpImage`]s is tied to both.
+    fn weight_layout(&mut self) -> Result<(usize, bool), TtError> {
+        Err(unsupported())
+    }
+    /// `id` as the bytes it occupies in GDDR ([`Engine::upload_bfp_image`] writes them back).
+    fn download_bfp_image(
+        &mut self,
+        _id: BufferId,
+    ) -> Result<tt_kernels::bfp::BfpImage, TtError> {
+        Err(unsupported())
+    }
+    /// A new buffer holding `image`'s bytes in `image`'s layout.
+    fn upload_bfp_image(
+        &mut self,
+        _image: tt_kernels::bfp::BfpImage,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        Err(unsupported())
+    }
     /// A logical F32 buffer stored as BF16 (`store`: `Session::store_bf16`, half the bytes, read
     /// by a product as its `B`) or such a buffer widened back to F32 (`Session::widen_bf16`).
     fn cast_bf16_storage(
@@ -1040,6 +1059,24 @@ impl DramBuffers {
             let t = s.bfp_to_f32(&t).map_err(error)?;
             Ok(self.insert(t))
         }
+    }
+
+    pub fn download_bfp_image<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        id: BufferId,
+    ) -> Result<tt_kernels::bfp::BfpImage, TtError> {
+        let t = self.bfp(id)?;
+        s.download_bfp_image(&t).map_err(TtError::from)
+    }
+
+    pub fn upload_bfp_image<T: tt_device::Transport>(
+        &mut self,
+        s: &mut Session<T>,
+        image: &tt_kernels::bfp::BfpImage,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        let t = s.upload_bfp_image(image).map_err(TtError::from)?;
+        Ok(self.insert(t))
     }
 
     pub fn cast_bf16_storage<T: tt_device::Transport>(
@@ -3262,6 +3299,56 @@ pub(crate) fn cast_bfp(
     )
 }
 
+/// Channels and column layout of weights stored on `device` now.
+pub fn weight_layout(device: TtDevice) -> Result<(usize, bool), TtError> {
+    try_run(device, |engine, _| engine.weight_layout()).and_then(|layout| layout)
+}
+
+/// `id`'s GDDR image. `id` is the buffer the caller named, remapped on the server.
+pub fn download_bfp_image(
+    device: TtDevice,
+    id: BufferId,
+) -> Result<tt_kernels::bfp::BfpImage, TtError> {
+    try_run(device, move |engine, ids| {
+        engine.download_bfp_image(ids.get(id)?)
+    })
+    .and_then(|image| image)
+}
+
+/// A new buffer holding `image`. The id is the caller's, freed with the tensor that owns it.
+pub fn upload_bfp_image(
+    device: TtDevice,
+    image: tt_kernels::bfp::BfpImage,
+) -> Result<(BufferId, [usize; 2]), TtError> {
+    let dims = [image.rows, image.cols];
+    let id = name(dims);
+    let result = try_run(device, move |engine, ids| {
+        let made = engine.upload_bfp_image(image).and_then(|(e, got)| {
+            if got == dims {
+                Ok(e)
+            } else {
+                engine.free(e);
+                Err(TtError::Device(format!(
+                    "a weight image of {got:?} where {dims:?} was expected"
+                )))
+            }
+        });
+        if let Err(why) = &made {
+            ids.failed.get_or_insert_with(|| {
+                Arc::new(TtError::Op {
+                    what: "upload weight image".into(),
+                    device,
+                    cause: Arc::new(why.clone()),
+                })
+            });
+        }
+        let report = made.clone().map(|_| ());
+        ids.map.insert(id, made.map_err(Arc::new));
+        report
+    });
+    result.and_then(|report| report.map(|()| (id, dims)))
+}
+
 /// [`Engine::cast_bf16_storage`]: `id` stored as BF16, or widened back to F32.
 pub(crate) fn cast_bf16_storage(
     device: TtDevice,
@@ -4154,6 +4241,27 @@ impl Engine for KmdEngine {
             .as_mut()
             .ok_or_else(unsupported)?
             .cast_bfp(&mut self.session, id, format)
+    }
+    fn weight_layout(&mut self) -> Result<(usize, bool), TtError> {
+        self.session.weight_layout().map_err(TtError::from)
+    }
+    fn download_bfp_image(
+        &mut self,
+        id: BufferId,
+    ) -> Result<tt_kernels::bfp::BfpImage, TtError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .download_bfp_image(&mut self.session, id)
+    }
+    fn upload_bfp_image(
+        &mut self,
+        image: tt_kernels::bfp::BfpImage,
+    ) -> Result<(BufferId, [usize; 2]), TtError> {
+        self.buffers
+            .as_mut()
+            .ok_or_else(unsupported)?
+            .upload_bfp_image(&mut self.session, &image)
     }
     fn cast_bf16_storage(
         &mut self,
