@@ -1579,7 +1579,11 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
                     done: i + 1,
                     total: cfg.layers,
                     name: format!("layers.{i}"),
-                    kind: if cfg.is_full(i) { "Attention" } else { "DeltaNet" },
+                    kind: if cfg.is_full(i) {
+                        "Attention"
+                    } else {
+                        "DeltaNet"
+                    },
                     bytes: shards.bytes(|n| own(i, n)),
                     secs: last.elapsed().as_secs_f64(),
                 });

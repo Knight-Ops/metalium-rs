@@ -25,6 +25,12 @@ pub enum Progress {
         total: usize,
         key: String,
     },
+
+    TraceStage {
+        key: String,
+        stage: Stage,
+        secs: Option<f64>,
+    },
     /// Prompt chunks fed.
     Prefill { done: usize, total: usize },
     /// Tokens generated after the prompt, the last one given.
@@ -33,6 +39,14 @@ pub enum Progress {
         total: usize,
         token: i32,
     },
+}
+
+/// What a trace's build is doing ([`Progress::TraceStage`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Stage {
+    WarmUp,
+    /// The `n`th capture pass, from 1.
+    Capture(usize),
 }
 
 type Hook = Box<dyn Fn(&Progress) + Send + Sync>;

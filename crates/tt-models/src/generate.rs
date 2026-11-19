@@ -24,7 +24,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::progress::{report, Progress};
+use crate::progress::{report, Progress, Stage};
 
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Int, Tensor, TensorData, TensorPrimitive};
@@ -729,6 +729,15 @@ fn input<B: TracedBackend, const D: usize>(t: &Tensor<B, D, Int>) -> TtTensor {
 
 /// `TT_BUILD_TIMES=1`: how long a generator's warm-up run or capture of one key took, and how
 /// many times the capture ran the model (a residency plan runs it two or three times).
+/// [`Progress::TraceStage`] for `key`: started (`since: None`) or finished, timed from `since`.
+fn stage(key: &str, stage: Stage, since: Option<Instant>) {
+    report(Progress::TraceStage {
+        key: key.into(),
+        stage,
+        secs: since.map(|t| t.elapsed().as_secs_f64()),
+    });
+}
+
 pub(crate) fn build_time(what: std::fmt::Arguments, since: Instant, runs: usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var("TT_BUILD_TIMES").as_deref() == Ok("1")) {
@@ -937,14 +946,19 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             // before the captures, which then read it rather than make it.
             for &len in &shapes.steps {
                 let t0 = Instant::now();
+                let key = format!("Step({len})");
+                stage(&key, Stage::WarmUp, None);
                 let feed = Feed::<B>::zeros(model, 1, device);
                 let (l, state) = feed.step(model, index(0, device), len, cache);
                 cache.set_state(state);
                 let _ = read(l);
                 build_time(format_args!("warm-up Step({len})"), t0, 1);
+                stage(&key, Stage::WarmUp, Some(t0));
             }
             for (c, len) in shapes.chunk_keys() {
                 let t0 = Instant::now();
+                let key = format!("Chunk {{ c: {c}, len: {len} }}");
+                stage(&key, Stage::WarmUp, None);
                 let feed = Feed::<B>::zeros(model, c, device);
                 let (l, state) = feed.chunk(model, index(0, device), index(0, device), len, cache);
                 cache.set_state(state);
@@ -954,6 +968,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                     t0,
                     1,
                 );
+                stage(&key, Stage::WarmUp, Some(t0));
             }
         }
         let mut sets = Vec::with_capacity(caches.len());
@@ -991,8 +1006,10 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             // The step may be captured twice (a residency plan, then the plan applied: `burn_tt::
             // set_residency`), each run over the same inputs.
             let (t0, runs) = (Instant::now(), std::cell::Cell::new(0));
+            let key = format!("Step({len})");
             sets[0].capture(Key::Step(len), &[&tp, &pp], || {
                 runs.set(runs.get() + 1);
+                stage(&key, Stage::Capture(runs.get()), None);
                 let (y, state) = token.step(model, position.clone(), len, cache);
                 let next = greedy(y.clone());
                 (
@@ -1001,6 +1018,7 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 )
             })?;
             build_time(format_args!("capture Step({len})"), t0, runs.get());
+            stage(&key, Stage::Capture(runs.get()), Some(t0));
             captured.set(captured.get() + 1);
             report(Progress::Trace {
                 done: captured.get(),
@@ -1057,8 +1075,10 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             let last = index::<B>(0, device);
             let (tp, sp, lp) = (tokens.input(), input(&start), input(&last));
             let (t0, runs) = (Instant::now(), std::cell::Cell::new(0));
+            let key = format!("Chunk {{ c: {c}, len: {len} }}");
             set.capture(Key::Chunk { c, len }, &[&tp, &sp, &lp], || {
                 runs.set(runs.get() + 1);
+                stage(&key, Stage::Capture(runs.get()), None);
                 let (y, state) = tokens.chunk(model, start.clone(), last.clone(), len, cache);
                 let next = greedy(y.clone());
                 (
@@ -1071,12 +1091,9 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
                 t0,
                 runs.get(),
             );
+            stage(&key, Stage::Capture(runs.get()), Some(t0));
             done += 1;
-            report(Progress::Trace {
-                done,
-                total,
-                key: format!("Chunk {{ c: {c}, len: {len} }}"),
-            });
+            report(Progress::Trace { done, total, key });
         }
         Ok(())
     }

@@ -123,7 +123,8 @@ impl ShardNames {
         let names = paths
             .iter()
             .map(|path| {
-                let err = |e: &dyn fmt::Display| LoadError::Store(format!("{}: {e}", path.display()));
+                let err =
+                    |e: &dyn fmt::Display| LoadError::Store(format!("{}: {e}", path.display()));
                 let file = std::fs::File::open(path).map_err(|e| err(&e))?;
                 // SAFETY: the checkpoint is read only and is not written while it is loaded.
                 let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| err(&e))?;

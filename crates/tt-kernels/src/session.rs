@@ -2691,7 +2691,20 @@ fn take_nc_log<T: Transport>(
     Ok((log, lost))
 }
 
-fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3] {
+/// Where each of `uc`'s `PAIR_CALL`s sits in its stream → its index in `pair_calls` (its
+/// sections `2 i`, `2 i + 1`): built once a unit, so a walk over the stream finds a call's
+/// sections in O(1). (`pair_calls` is in section order, not always in stream order: a block
+/// moved by the barrier pass keeps its sections' indices.) Searching the list at every call made
+/// a capture's store quadratic in its calls: a 64-layer step spent minutes on it.
+fn pair_index(uc: &trace::UnitCapture) -> std::collections::HashMap<usize, usize> {
+    uc.pair_calls.iter().enumerate().map(|(k, &at)| (at, k)).collect()
+}
+
+fn op_stamps(
+    uc: &trace::UnitCapture,
+    pairs: &std::collections::HashMap<usize, usize>,
+    range: core::ops::Range<usize>,
+) -> [u32; 3] {
     use crate::profile_mode::{Detail, ProfileOptions};
     let options = |detail| ProfileOptions {
         detail,
@@ -2743,7 +2756,7 @@ fn op_stamps(uc: &trace::UnitCapture, range: core::ops::Range<usize>) -> [u32; 3
         let head = uc.stream[i][0];
         if head == tt_isa::dm::op::PAIR_CALL {
             waits += 2;
-            if let Some(k) = uc.pair_calls.iter().position(|&at| at == i) {
+            if let Some(&k) = pairs.get(&i) {
                 if let Some(reader) = uc.pending_sections.get(2 * k) {
                     waits += chunks(reader.len());
                     add(reader);
@@ -2866,6 +2879,7 @@ fn shape_of(queues: &[Vec<Step>]) -> u64 {
 /// its sections (B runs the reader's, NC the writer's).
 fn op_bytes(
     uc: &trace::UnitCapture,
+    pairs: &std::collections::HashMap<usize, usize>,
     range: core::ops::Range<usize>,
     bytes: &mut crate::profile_mode::OpBytes,
 ) {
@@ -2874,7 +2888,7 @@ fn op_bytes(
         let head = uc.stream[i][0];
         let n = (tt_isa::dm::record::len(head) as usize).max(1);
         if head == tt_isa::dm::op::PAIR_CALL {
-            if let Some(k) = uc.pair_calls.iter().position(|&at| at == i) {
+            if let Some(&k) = pairs.get(&i) {
                 for section in uc.pending_sections.iter().skip(2 * k).take(2) {
                     bytes.count(section);
                 }
@@ -6694,10 +6708,11 @@ impl<T: Transport> Session<T> {
         } = capture;
         // What each op could stamp in each detail of the profile mode, on its busiest unit: what
         // sizes a profiled replay's window (`profile_mode`).
+        let pairs: Vec<_> = units.iter().map(pair_index).collect();
         for op in &mut ops {
             let mut most = [0u32; 3];
-            for (uc, range) in units.iter().zip(&op.entries) {
-                let s = op_stamps(uc, range.clone());
+            for ((uc, pairs), range) in units.iter().zip(&pairs).zip(&op.entries) {
+                let s = op_stamps(uc, pairs, range.clone());
                 most = core::array::from_fn(|d| most[d].max(s[d]));
             }
             op.stamps = most;
@@ -6745,16 +6760,16 @@ impl<T: Transport> Session<T> {
                     holes.sort_by_key(|r| r.start);
                     let mut from = range.start;
                     for r in holes {
-                        op_bytes(uc, from..r.start, own);
+                        op_bytes(uc, &pairs[u], from..r.start, own);
                         from = r.end;
                     }
-                    op_bytes(uc, from..range.end, own);
+                    op_bytes(uc, &pairs[u], from..range.end, own);
                 }
                 // What its lists read ahead is its own too: counted again only where a list
                 // lies outside its entries (moved to before the ops it runs under).
                 for (u, r) in &op.ahead {
                     let mut ahead = crate::profile_mode::OpBytes::default();
-                    op_bytes(&units[*u], r.clone(), &mut ahead);
+                    op_bytes(&units[*u], &pairs[*u], r.clone(), &mut ahead);
                     let own = &op.entries[*u];
                     if !(own.start <= r.start && r.end <= own.end) {
                         per_unit[*u].add(&ahead);

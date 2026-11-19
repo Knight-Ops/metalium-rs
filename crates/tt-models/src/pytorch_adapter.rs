@@ -107,7 +107,9 @@ mod tests {
             (257, 1, DType::F32),
         ] {
             let size = dtype.size();
-            let bytes: Vec<u8> = (0..rows * cols * size).map(|i| (i * 7 + i / 3) as u8).collect();
+            let bytes: Vec<u8> = (0..rows * cols * size)
+                .map(|i| (i * 7 + i / 3) as u8)
+                .collect();
             let data = TensorData::from_bytes_vec(bytes, vec![rows, cols], dtype);
             let snapshot = |d: TensorData| {
                 TensorSnapshot::from_data(
@@ -117,13 +119,20 @@ mod tests {
                     Default::default(),
                 )
             };
-            let ours = PyTorchAdapter.adapt(&snapshot(data.clone())).to_data().unwrap();
+            let ours = PyTorchAdapter
+                .adapt(&snapshot(data.clone()))
+                .to_data()
+                .unwrap();
             let theirs = PyTorchToBurnAdapter
                 .adapt(&snapshot(data))
                 .to_data()
                 .unwrap();
             assert_eq!(ours.shape, theirs.shape, "{rows}x{cols}");
-            assert_eq!(ours.as_bytes(), theirs.as_bytes(), "{rows}x{cols} {dtype:?}");
+            assert_eq!(
+                ours.as_bytes(),
+                theirs.as_bytes(),
+                "{rows}x{cols} {dtype:?}"
+            );
         }
     }
 }
