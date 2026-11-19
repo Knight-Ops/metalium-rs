@@ -12,6 +12,7 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W2: a capture's programs in the program cache](#w2-a-captures-programs-in-the-program-cache-the-capture-clear-kept-packing-killed-2026-11-19-card-0) | 2026-11-19 | a capture begins in a cache cleared of what no trace holds: the bench's second build no longer inherits the first's scattered addresses (an intermittent refusal), and the 1.7B's 128-token prefill **27.71 -> 26.49 ms** (-4.4%, ABBA; 1.85 -> 0.99 MB of programs restored a generation), the rest within 0.25%. Packing a capture's programs lost live (+11.9% at 128 tokens), BestFit and TopDown trade one prompt for another; all three deleted, with the offline replay (faithful only under the recording's own policy). A replay pays ~1.25 ms a MB restored |
 | [W2: short-chunk follow-ups](#w2-short-chunk-follow-ups-gateups-choice-as-request-bound-and-512--1024-token-chunks-2026-11-17-card-0) | 2026-11-17 | `gate\|up`'s slower block: at 128 rows the program cache's fragmentation refuses the best (open), at 256 the candidate list missed it (fixed, `[4,8,9]` pulled: the 1.7B's 256-token prefill **1.036x**). `A` read a row a request bounded at 2.5-3.6 ms a 128-token chunk. 512- and 1,024-token chunks fit and pay 1.14-1.21x at 512-2,000 tokens. A wedge during one build's measurement, not reproduced |
 | [W2: short-chunk products mapped before building](#w2-short-chunk-products-mapped-before-building-spreading-refuted-as-cost-the-lever-2026-11-17-card-0) | 2026-11-17 | P0 of the box, a probe only: the slope that chooses blocks is 12-26% under a product's span in a chunk (copies merged, no barrier); timed behind barriers, 88+ units lose at 128 rows with `A` (668 against 576 us a layer) and without it (498 against 336). `A`'s reads on today's blocks bound -5.8 / -6.0 ms a 128 / 256-token chunk; the model's `gate\|up` runs a slower block than the best (~1.0 / 1.9 ms) |
 | [W2: the KV cache's chunk write as whole tiles](#w2-the-kv-caches-chunk-write-as-whole-tiles-2026-11-17-card-0) | 2026-11-17 | a 32-index batch that is one tile row is written as tiles, decided on the card: a layer's write 192.6 / 377.3 -> **29.3 / 48.8 us** at 128 / 256 tokens; the 1.7B's prefill **1.11 / 1.15 / 1.18x** at 32 / 128 / 256 tokens (4,573 tokens/s at 128), decode unchanged. Also: a measured choice skips a candidate that does not capture instead of falling back to `Auto` for the whole product |
@@ -446,6 +447,71 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W2: a capture's programs in the program cache: the capture clear kept, packing killed (2026-11-19, card 0)
+
+The roadmap box "a capture's programs packed, not first fit" (item 2 of the short-chunk follow-ups). Performance
+contract, the 1.7B, `traced_generation_stream_ceiling`, host-timed, 16 new tokens. Two meters were added first: a
+program-cache log (`TT_GEN_PROGRAM_LOG=<file>`, every unit's placements, restores, holds and evictions, written
+also when a build fails) and the program bytes a generation restores (now reported a prompt by the bench).
+
+**The offline replay could only check itself.** `program_cache::replay` ran a recorded log again under another
+placement policy (1,024-position cache, buckets to 512, 291M events on 120 units). Under the recording's own policy
+it reproduced the recording (every placement at its address, 147.64 MB restored as recorded; its leftover
+"unmapped" events were releases of addresses the recording had already evicted, no-ops there too). Under any other
+policy it diverged: a refusal makes the session clear the cache and retry, or take another candidate, and that
+reaction is not in the log. It predicted `Packed` would restore 133.26 MB; live, `Packed` restored 153.60.
+
+**`Packed` live (killed).** A capture's programs packed below the region's end or below a protected program,
+evicting the fewest held bytes. It placed the candidates first fit refused, and cost the traces' restores:
+
+| prompt, ms | first fit (`1795038151`) | `Packed` (`1795039043`) |
+|---|--:|--:|
+| 128 | 27.86 | 31.17 (+11.9%) |
+| 256 | 44.49 | 46.21 (+3.9%) |
+| 512 | 85.53 | 84.06 (-1.7%) |
+| 1,000 | 195.28 | 201.50 (+3.2%) |
+
+**A refusal in the bench's second build, and the fix: a capture begins in a cache cleared of what no trace
+holds.** The bucket table's 1,024-cache cell with chunks to 512 failed once (`1795037344`; it passed twice on
+rerun). The bench builds a generator twice; the second build reuses the first's measured blocks and kept the
+dropped first build's program addresses (they were hits wherever they lay, and the capture protected them there).
+Its programs spread over the cache, 122 KB free in runs of at most 7 KB, and a product's 24 KB list was refused.
+`Session::begin_capture` now calls `clear_unheld` on every unit (the queue is synced there, so nothing in flight
+names an unheld program). ttsim gate `step22::a_capture_leaves_its_free_space_in_one_run` (watched failing without
+it). A/B, ABBA by process, 4 runs a side, medians:
+
+| host ms | without (`1795042295`, `1795043781`, `1795044261`, `1795045718`) | with (`1795042808`, `1795043294`, `1795044742`, `1795045230`) |
+|---|--:|--:|
+| 1.7B prefill, 32 tokens | 18.48 | 18.50 (+0.1%) |
+| 1.7B prefill, 128 tokens | 27.71 (27.58-28.71) | **26.49** (26.46-26.76; -4.4%, every run apart) |
+| 1.7B prefill, 256 tokens | 44.04 | 44.03 |
+| decode step, 32 / 128 / 256 | 7.81 / 8.28 / 8.77 | 7.82 / 8.26 / 8.75 |
+| ViT-Tiny, traced | 7.260 | 7.248 |
+| ResNet-18, traced | 10.970 | 10.945 |
+
+The blocks chosen differ from process to process in both arms alike, so the gain is not a block. **It is restores:**
+with the restore meter, one run a side (`1795046288` without, `1795046694` with), a 128-token generation restores
+0.99 MB of programs against 1.85, and a 256-token one 2.13 against 1.98 (its prefill unchanged). Kept: the
+default.
+
+**BestFit and TopDown live (killed)**, on top of the capture clear, one run each:
+
+| policy | 32 | 128 | 256 tokens, ms | restored MB at 128 / 256 |
+|---|--:|--:|--:|--:|
+| first fit (the A/B's "with") | 18.50 | 26.49 | 44.03 | 0.99 / 2.13 |
+| BestFit (`1795047111`) | 18.55 | 26.96 (+1.8%) | 43.11 (-2.1%) | 1.44 / 1.39 |
+| TopDown (`1795047509`) | 18.67 (+1.0%) | 26.48 | 44.25 (+0.5%) | 0.79 / 2.37 |
+
+Each wins one prompt and loses another, as its restores move. **A replay pays ~1.25 ms a MB of programs restored**
+(~0.8 GB/s; the capture clear at 128 tokens -0.85 MB / -1.07 ms, BestFit at 256 -0.74 MB / -0.92 ms): a generation
+restores 0.8-2.4 MB, 1-3 ms of a 26-44 ms prefill, and which traces' programs overlap decides it, not a placement
+rule. That is the lever left (a roadmap box), not packing: `[4,8,12]` at 128 rows would save ~0.8 ms and a policy
+that admits it costs more in restores.
+
+Deleted with this: `program_cache::Policy` (`BestFit`, `TopDown`, `Packed`), the bench's `TT_GEN_PROGRAM_POLICY`,
+`burn_tt::set_program_policy`, the replay and its probe. Kept: the log, and the restore meter. Rows in
+[failed-approaches.md](failed-approaches.md).
 
 ## W2: short-chunk follow-ups: `gate|up`'s choice, `A`'s request bound, and 512 / 1,024-token chunks (2026-11-17, card 0)
 

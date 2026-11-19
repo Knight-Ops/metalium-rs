@@ -1716,13 +1716,13 @@ fn traced_generation_stream_ceiling() {
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = bench_model(m, true);
         // `TT_GEN_PROGRAM_LOG=<file>`: every unit's program cache calls through the builds and the
-        // generations, one `unit<TAB>event` a line (`tt_kernels::program_cache::Event`), for a
-        // placement policy's bound (`program_cache::replay`, the probe `replay_program_log`).
+        // generations, one `unit<TAB>event` a line (`tt_kernels::program_cache::Event`): what
+        // placed, evicted and refused each program.
         let program_log = std::env::var("TT_GEN_PROGRAM_LOG").ok();
         if program_log.is_some() {
             burn_tt::probe_program_log(d, true).unwrap();
         }
-        // Written at the end, and where a build fails (a refusal the replay is to reproduce).
+        // Written at the end, and where a build fails (the refusal, with what led to it).
         let write_log = || {
             let Some(path) = &program_log else {
                 return;
@@ -1741,20 +1741,6 @@ fn traced_generation_stream_ceiling() {
             std::fs::write(path, out).unwrap();
             println!("PROGRAM LOG written to {path}");
         };
-        // `TT_GEN_PROGRAM_POLICY=first|best|top|packed`: where every unit's program cache places
-        // programs (`tt_kernels::program_cache::Policy`; default first fit).
-        if let Ok(v) = std::env::var("TT_GEN_PROGRAM_POLICY") {
-            use tt_kernels::program_cache::Policy;
-            let policy = match v.as_str() {
-                "first" => Policy::FirstFit,
-                "best" => Policy::BestFit,
-                "top" => Policy::TopDown,
-                "packed" => Policy::Packed,
-                other => panic!("TT_GEN_PROGRAM_POLICY={other}: first, best, top or packed"),
-            };
-            burn_tt::set_program_policy(d, policy).unwrap();
-            println!("BENCH {{\"kind\":\"conditions\",\"program_policy\":\"{v}\"}}");
-        }
         // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
         let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
             v.split(',').map(|n| n.trim().parse().unwrap()).collect()

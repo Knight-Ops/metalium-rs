@@ -645,13 +645,6 @@ pub trait Engine {
     ) -> Result<Vec<Vec<tt_kernels::program_cache::Event>>, TtError> {
         Err(no_traces())
     }
-    /// Where every unit's program cache places programs from now on.
-    fn set_program_policy(
-        &mut self,
-        _policy: tt_kernels::program_cache::Policy,
-    ) -> Result<(), TtError> {
-        Err(no_traces())
-    }
     /// Overwrite `input`'s values, replay `trace`, and read `output` back:
     /// one round trip.
     fn run_trace(
@@ -4695,13 +4688,6 @@ impl Engine for KmdEngine {
         let log = self.session.take_program_log();
         self.session.set_program_log(on);
         Ok(log)
-    }
-    fn set_program_policy(
-        &mut self,
-        policy: tt_kernels::program_cache::Policy,
-    ) -> Result<(), TtError> {
-        self.session.set_program_policy(policy);
-        Ok(())
     }
     fn has_pending_plan(&mut self) -> Result<bool, TtError> {
         Ok(self.session.has_pending_plan())

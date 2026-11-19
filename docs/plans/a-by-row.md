@@ -66,10 +66,6 @@ pieces in turn).
   **Defect found by P3's gate, not P2's tests:** `write_images` / `download_any` special-cased only by-column
   placements, so a by-row tensor's upload and download laid tiles interleaved, consistently with each other; the
   card's reads disagreed. Every non-interleaved placement now goes tile by tile.
-- [ ] **P2 as planned:** `tensor::Layout::ByRow`; `Placement` keeps a layout rather than `by_column`; `slot`,
-  `tensor_ref`, `alloc_laid`; `alloc_elem` lays by row under the session's switch for `rows >= n`. Views keep their
-  parent's layout. The DMA fast paths skip by-row tensors as they do by-column ones. Placement test (every tile its
-  own slot, full and harvested grids) and the rotated-channel control. Opt-in `TT_ACT_ROWS=1` during the build.
 - [ ] **P3: gates.** Done on ttsim: `step276_rows_activations` (eltwise, product with `A` by row and `B` by row, both
   reductions, a chained product, a row view, a transposed `A`; `m` 64 / 128 / 200 / 256; the session's rule and every
   grid; the rotated control) in the safe, `fast-reads` and `fast-reads` + `encoded-guard` images, with `step172` /

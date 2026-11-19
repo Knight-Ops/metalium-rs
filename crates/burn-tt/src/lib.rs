@@ -82,7 +82,7 @@ pub use tensor::{TtQTensor, TtTensor};
 pub use trace::{
     gddr_free_bytes, host_stage_times, probe_captures, probe_nc_waits, probe_program_log,
     probe_restored_bytes, set_capture_reuse, set_count_trace_bytes, set_l1_region,
-    set_profile_buffer, set_program_policy, set_residency, set_state_in_place,
+    set_profile_buffer, set_residency, set_state_in_place,
 };
 pub use trace::{
     SetFootprint, SharedStateTraces, StepTiming, Trace, TracedInference, TracedTrainingStep,

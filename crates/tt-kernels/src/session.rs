@@ -5810,8 +5810,6 @@ impl<T: Transport> Session<T> {
         u: usize,
         seg: &Segment,
     ) -> Result<Vec<[(u32, u32); 3]>, TensorError> {
-        let capturing = self.capture.is_some();
-        self.units[u].programs.set_capturing(capturing);
         let placed = {
             let Session {
                 dev, units, ttinsn, ..
@@ -6212,8 +6210,6 @@ impl<T: Transport> Session<T> {
         use crate::program_cache::{CacheError, Placed};
         let words: Arc<[u32]> = program.iter().map(|i| i.word()).collect();
         let hash = crate::program_cache::hash(&words);
-        let capturing = self.capture.is_some();
-        self.units[u].programs.set_capturing(capturing);
         for attempt in 0..2 {
             let Session { dev, units, .. } = self;
             let unit = &mut units[u];
@@ -11448,8 +11444,8 @@ impl<T: Transport> Session<T> {
     }
 
     /// Record every unit's program cache calls from now on, or stop
-    /// ([`crate::program_cache::Event`]): the input of a placement policy's bound
-    /// ([`crate::program_cache::replay`]). Dev-facing.
+    /// ([`crate::program_cache::Event`]): what placed, evicted and refused each program.
+    /// Dev-facing.
     #[doc(hidden)]
     pub fn set_program_log(&mut self, on: bool) {
         for unit in &mut self.units {
@@ -11471,15 +11467,6 @@ impl<T: Transport> Session<T> {
     #[doc(hidden)]
     pub fn program_room(&self, u: usize) -> crate::program_cache::Room {
         self.units[u].programs.room()
-    }
-
-    /// Where every unit's program cache places programs from now on
-    /// ([`crate::program_cache::Policy`]). Dev-facing.
-    #[doc(hidden)]
-    pub fn set_program_policy(&mut self, policy: crate::program_cache::Policy) {
-        for unit in &mut self.units {
-            unit.programs.set_policy(policy);
-        }
     }
 
     /// Shrink every unit's program cache to its first `bytes`, emptied: for
