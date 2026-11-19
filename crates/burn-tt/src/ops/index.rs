@@ -422,7 +422,7 @@ fn scatter_rows_native(
             }
             let v = match block_float {
                 true => TtTensor::on_device(v, vec![nd.n, nd.rest].into(), DType::F32, device)
-                    .with_storage(t.buffer.storage)
+                    .with_row_storage(t.buffer.storage)
                     .to_dram()
                     .clone(),
                 false => v,

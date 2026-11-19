@@ -175,6 +175,17 @@ impl<B: Backend> FixedCache<B> {
         self.state = state;
     }
 
+    /// Every state tensor through `f` (a cache stored in another format: the same shapes).
+    pub fn map_state(mut self, f: impl Fn(Tensor<B, 4>) -> Tensor<B, 4>) -> Self {
+        self.state = self.state.into_iter().map(|t| {
+            let dims = t.dims();
+            let t = f(t);
+            assert_eq!(t.dims(), dims, "the cache's shape");
+            t
+        }).collect();
+        self
+    }
+
     /// Layer `i`'s keys and values, as stored ([`Self::layout`]).
     pub fn layer(&self, i: usize) -> (Tensor<B, 4>, Tensor<B, 4>) {
         (self.state[2 * i].clone(), self.state[2 * i + 1].clone())

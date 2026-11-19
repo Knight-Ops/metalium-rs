@@ -297,8 +297,9 @@ fn sim_factory(
             &mut self,
             id: burn_tt::BufferId,
             format: Option<tt_kernels::bfp::BfpFormat>,
+            rows: bool,
         ) -> Result<(burn_tt::BufferId, [usize; 2]), TtError> {
-            self.buffers.cast_bfp(&mut self.session, id, format)
+            self.buffers.cast_bfp(&mut self.session, id, format, rows)
         }
         fn supports_dram(&self) -> bool {
             true

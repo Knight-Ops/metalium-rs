@@ -1056,6 +1056,54 @@ pub struct Qwen35<B: Backend> {
     /// The embedding table in host memory ([`crate::quant::WeightOptions::host_embedding`]):
     /// `embed_tokens` is then `None`. Not a parameter.
     host: Option<std::sync::Arc<HostEmbedding>>,
+    /// The KV cache stored block-float ([`crate::quant::WeightOptions::kv_block_float`]): what
+    /// [`FixedShapeDecoder::new_cache`] does to a new cache's keys and values. Not a parameter.
+    kv_store: Option<KvStore>,
+}
+
+/// How a new KV cache's keys and values are stored when the model keeps them block-float: the
+/// backend's storage conversion, made where the backend is known to have one
+/// (`burn_tt::storage::StorageBackend`) and kept without the backend in its type, so the model's
+/// module derive passes over it.
+#[derive(Clone)]
+struct KvStore {
+    format: burn_tt::storage::BfpFormat,
+    store: std::sync::Arc<
+        dyn Fn(Box<dyn std::any::Any>) -> Box<dyn std::any::Any> + Send + Sync,
+    >,
+}
+
+impl std::fmt::Debug for KvStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KvStore({:?})", self.format)
+    }
+}
+
+impl KvStore {
+    fn of<B: burn_tt::storage::StorageBackend>(format: burn_tt::storage::BfpFormat) -> Self {
+        use burn_tt::storage::{StorageFormat, TensorStorageExt};
+        let storage = match format {
+            burn_tt::storage::BfpFormat::Bfp8 => StorageFormat::Bfp8,
+            burn_tt::storage::BfpFormat::Bfp4 => StorageFormat::Bfp4,
+            burn_tt::storage::BfpFormat::Bfp2 => StorageFormat::Bfp2,
+        };
+        Self {
+            format,
+            store: std::sync::Arc::new(move |t: Box<dyn std::any::Any>| {
+                let t = *t
+                    .downcast::<Tensor<B, 4>>()
+                    .expect("a cache tensor of the model's backend");
+                // Interleaved, as the row scatter that writes it takes it.
+                Box::new(t.with_row_storage(storage)) as Box<dyn std::any::Any>
+            }),
+        }
+    }
+
+    fn store<B: Backend>(&self, t: Tensor<B, 4>) -> Tensor<B, 4> {
+        *(self.store)(Box::new(t))
+            .downcast::<Tensor<B, 4>>()
+            .expect("a cache tensor of the model's backend")
+    }
 }
 
 /// Whether a checkpoint name is the text model's embedding table.
@@ -1095,6 +1143,7 @@ impl<B: Backend> Qwen35<B> {
             numerics: None,
             stream: None,
             kv: None,
+            kv_store: None,
             host: None,
         }
     }
@@ -1400,6 +1449,30 @@ impl<B: Backend> Qwen35<B> {
 }
 
 impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
+    /// The KV cache the contract keeps: under the performance contract BF16, F32 with
+    /// [`WeightOptions::f32_kv_cache`], or block-float with [`WeightOptions::kv_block_float`]
+    /// (keys and values F32 as they are made, stored block-float as they are written).
+    ///
+    /// [`WeightOptions::f32_kv_cache`]: crate::quant::WeightOptions::f32_kv_cache
+    /// [`WeightOptions::kv_block_float`]: crate::quant::WeightOptions::kv_block_float
+    fn set_kv(&mut self, numerics: burn_tt::Numerics, options: crate::quant::WeightOptions) {
+        let performance = numerics == burn_tt::Numerics::Performance;
+        self.kv_store = None;
+        match options.kv_block_float.filter(|_| performance) {
+            Some(format) => {
+                self.kv = Some(DType::F32);
+                self.kv_store = Some(KvStore::of::<B>(format));
+            }
+            None if performance && !options.f32_kv_cache => self.kv = Some(DType::BF16),
+            None => {}
+        }
+    }
+
+    /// The block-float format the KV cache is stored in, if any.
+    pub fn kv_block_float(&self) -> Option<burn_tt::storage::BfpFormat> {
+        self.kv_store.as_ref().map(|s| s.format)
+    }
+
     /// The model as inference runs it under the numeric contract `numerics` (ADR 0006): every
     /// matrix in the contract's format ([`crate::quant::Plan::for_numerics`]: BF16 under the
     /// reference contract, BFP8 under the performance one, BFP4 `gate|up` with
@@ -1423,10 +1496,8 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
         model.numerics = Some(numerics);
         model.stream = Some(stream);
         // The performance contract's KV cache is BF16, as `Llama`'s
-        // ([`crate::quant::WeightOptions::f32_kv_cache`] opts out).
-        if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
-            model.kv = Some(DType::BF16);
-        }
+        // ([`crate::quant::WeightOptions::f32_kv_cache`] opts out), or block-float.
+        model.set_kv(numerics, options);
         model
     }
 
@@ -1602,9 +1673,7 @@ impl<B: burn_tt::storage::StorageBackend> Qwen35<B> {
         // As `for_inference` sets them for a model loaded in F32.
         model.numerics = Some(numerics);
         model.stream = Some(DType::F32);
-        if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
-            model.kv = Some(DType::BF16);
-        }
+        model.set_kv(numerics, options);
         // The first pass lists the layers it skipped; those the layer passes loaded are not ignored.
         let loaded_later = |name: &str| {
             let name = name
@@ -1837,9 +1906,7 @@ impl Qwen35<burn_tt::Tt> {
         }
         model.numerics = Some(numerics);
         model.stream = Some(DType::F32);
-        if numerics == burn_tt::Numerics::Performance && !options.f32_kv_cache {
-            model.kv = Some(DType::BF16);
-        }
+        model.set_kv(numerics, options);
         Ok((
             model,
             Loaded {
@@ -1875,6 +1942,7 @@ impl Qwen35<burn_tt::Tt> {
             numerics: None,
             stream: None,
             kv: None,
+            kv_store: None,
             host: None,
         }
     }
@@ -2488,7 +2556,11 @@ impl<B: Backend> FixedShapeDecoder<B> for Qwen35<B> {
     /// A cache whose keys and values are in the contract's dtype ([`Qwen35::kv_dtype`]), its
     /// rotary table in the stream's.
     fn new_cache(&self, max_len: usize, device: &B::Device) -> HybridCache<B> {
-        self.hybrid_cache_as(max_len, self.stream_dtype(), self.kv_dtype(), device)
+        let mut cache = self.hybrid_cache_as(max_len, self.stream_dtype(), self.kv_dtype(), device);
+        if let Some(store) = &self.kv_store {
+            cache.kv = cache.kv.map(|kv| kv.map_state(|t| store.store(t)));
+        }
+        cache
     }
 
     fn chunk(

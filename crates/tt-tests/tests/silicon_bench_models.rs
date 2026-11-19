@@ -1091,6 +1091,7 @@ fn bench_contract() -> (burn_tt::Numerics, tt_models::quant::WeightOptions) {
             untied_head,
             f32_kv_cache,
             host_embedding: false,
+            kv_block_float: None,
         },
     )
 }

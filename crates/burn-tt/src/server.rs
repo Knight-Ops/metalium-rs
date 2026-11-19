@@ -137,11 +137,13 @@ pub trait Engine {
     fn cast_block(&mut self, _a: BlockArg, _bf16: bool) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
-    /// Explicit physical BFP storage conversion. None widens to F32.
+    /// Explicit physical BFP storage conversion. None widens to F32. `rows`: interleaved, for a
+    /// tensor a row scatter writes (a block-float KV cache), not laid as a stored weight.
     fn cast_bfp(
         &mut self,
         _id: BufferId,
         _format: Option<tt_kernels::bfp::BfpFormat>,
+        _rows: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         Err(unsupported())
     }
@@ -1046,10 +1048,17 @@ impl DramBuffers {
         s: &mut Session<T>,
         id: BufferId,
         format: Option<tt_kernels::bfp::BfpFormat>,
+        rows: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         let error = |e: tt_kernels::tensor::TensorError| TtError::from(e);
         if let Some(format) = format {
-            let t = s.store_bfp(self.get(id)?, format).map_err(error)?;
+            let t = match rows {
+                true => s
+                    .bfp_from_f32(self.get(id)?, format)
+                    .map(tt_kernels::tensor::DramTensor::from_bfp),
+                false => s.store_bfp(self.get(id)?, format),
+            }
+            .map_err(error)?;
             Ok(self.insert(t))
         } else {
             let t = self.bfp(id)?;
@@ -3284,18 +3293,21 @@ pub(crate) fn cast_block(device: TtDevice, a: BlockArg, bf16: bool) -> (BufferId
     )
 }
 
+/// `id` stored as `format` (laid as a stored weight, or interleaved with `rows`: a tensor a row
+/// scatter writes), or decoded to F32 (`format` `None`).
 pub(crate) fn cast_bfp(
     device: TtDevice,
     id: BufferId,
     dims: [usize; 2],
     format: Option<tt_kernels::bfp::BfpFormat>,
+    rows: bool,
 ) -> (BufferId, [usize; 2]) {
     submit(
         "cast_bfp",
         device,
         dims,
         move || format!("BFP storage {format:?}"),
-        move |engine, ids| engine.cast_bfp(ids.get(id)?, format),
+        move |engine, ids| engine.cast_bfp(ids.get(id)?, format, rows),
     )
 }
 
@@ -4236,11 +4248,12 @@ impl Engine for KmdEngine {
         &mut self,
         id: BufferId,
         format: Option<tt_kernels::bfp::BfpFormat>,
+        rows: bool,
     ) -> Result<(BufferId, [usize; 2]), TtError> {
         self.buffers
             .as_mut()
             .ok_or_else(unsupported)?
-            .cast_bfp(&mut self.session, id, format)
+            .cast_bfp(&mut self.session, id, format, rows)
     }
     fn weight_layout(&mut self) -> Result<(usize, bool), TtError> {
         self.session.weight_layout().map_err(TtError::from)

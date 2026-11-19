@@ -190,6 +190,14 @@ pub fn set_state_in_place(on: bool) {
     STATE_IN_PLACE.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Whether a state tensor's storage may be written in place by a trace: unpacked, or block-float
+/// (a block-float KV cache, `docs/plans/block-float-kv.md`: written by row scatters, copied back
+/// by `copy_into` slot for slot).
+fn state_storage(t: &TtTensor) -> bool {
+    use crate::storage::StorageFormat as S;
+    matches!(t.storage_format(), S::F32 | S::Bfp8 | S::Bfp4 | S::Bfp2)
+}
+
 /// The buffers a capture owns as its state while its step runs ([`server::donate`]), given
 /// back when it is dropped, so an error or a panic inside the step cannot leave one donated.
 #[derive(Default)]
@@ -385,9 +393,10 @@ impl TracedInference {
                     "state tensors must belong to the trace device".into(),
                 ));
             }
-            if !t.is_storable() || t.storage_format() != crate::storage::StorageFormat::F32 {
+            if !t.is_storable() || !state_storage(t) {
                 return Err(TtError::Device(
-                    "state written in place must be storable, unpacked tensors".into(),
+                    "state written in place must be storable tensors, unpacked or block-float"
+                        .into(),
                 ));
             }
             let d = t.to_dram();
@@ -710,9 +719,9 @@ impl<K: Ord + Copy + std::fmt::Debug> SharedStateTraces<K> {
                     "shared state must belong to one device".into(),
                 ));
             }
-            if !t.is_storable() || t.storage_format() != crate::storage::StorageFormat::F32 {
+            if !t.is_storable() || !state_storage(t) {
                 return Err(TtError::Device(
-                    "shared state must be storable, unpacked tensors".into(),
+                    "shared state must be storable tensors, unpacked or block-float".into(),
                 ));
             }
             t.ensure_resident();

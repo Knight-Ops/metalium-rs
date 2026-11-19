@@ -48,6 +48,17 @@ impl TtTensor {
     /// Convert logical F32 to explicit single-card physical storage, or a logical BF16 tensor to
     /// BFP and back ([`TtTensor::bf16_with_storage`]). No source host cache is retained.
     pub fn with_storage(self, format: StorageFormat) -> Self {
+        self.stored_as(format, false)
+    }
+
+    /// [`Self::with_storage`] for a tensor written by rows (a block-float KV cache,
+    /// `docs/plans/block-float-kv.md`): interleaved, as a row scatter takes it, rather than laid
+    /// by column as a stored weight is (`Session::store_bfp`).
+    pub fn with_row_storage(self, format: StorageFormat) -> Self {
+        self.stored_as(format, true)
+    }
+
+    fn stored_as(self, format: StorageFormat, rows: bool) -> Self {
         let _op = crate::report::enter("with_storage", true);
         if self.dtype() == DType::BF16 {
             return self.bf16_with_storage(format);
@@ -88,7 +99,7 @@ impl TtTensor {
                 format == StorageFormat::Bf16,
             )
         } else {
-            crate::server::cast_bfp(input.device, src.buffer.id, dims, format.packed())
+            crate::server::cast_bfp(input.device, src.buffer.id, dims, format.packed(), rows)
         };
         let dram = DramRef {
             buffer: Arc::new(Buffer {
@@ -148,10 +159,21 @@ pub trait StorageBackend: burn_backend::Backend {
         format: StorageFormat,
     ) -> Self::FloatTensorPrimitive;
     fn storage_format(tensor: &Self::FloatTensorPrimitive) -> StorageFormat;
+    /// [`StorageBackend::with_storage`] for a tensor written by rows (a block-float KV cache):
+    /// laid out as a row scatter takes it. By default the same as `with_storage`.
+    fn with_row_storage(
+        tensor: Self::FloatTensorPrimitive,
+        format: StorageFormat,
+    ) -> Self::FloatTensorPrimitive {
+        Self::with_storage(tensor, format)
+    }
 }
 impl StorageBackend for TtBackend {
     fn with_storage(t: TtTensor, f: StorageFormat) -> TtTensor {
         t.with_storage(f)
+    }
+    fn with_row_storage(t: TtTensor, f: StorageFormat) -> TtTensor {
+        t.with_row_storage(f)
     }
     fn storage_format(t: &TtTensor) -> StorageFormat {
         t.storage_format()
@@ -188,34 +210,47 @@ impl<B: StorageBackend, C: burn_autodiff::checkpoint::strategy::CheckpointStrate
 #[cfg(feature = "fusion")]
 impl StorageBackend for burn_fusion::Fusion<TtBackend> {
     fn with_storage(t: Self::FloatTensorPrimitive, f: StorageFormat) -> Self::FloatTensorPrimitive {
-        // Resolving executes pending work before the cast. Register a new
-        // handle afterward, so fusers cannot remove the compression boundary.
-        let client = t.client.clone();
-        let stream = t.stream;
-        let native = crate::fusion::resolve_float_tensor(&t).with_storage(f);
-        let shape = native.shape();
-        let dtype = native.dtype();
-        let id = client.register_tensor_handle(crate::TtHandle::Tensor(native));
-        burn_fusion::Client::change_client_float::<TtBackend>(
-            burn_ir::TensorIr {
-                id,
-                shape,
-                dtype,
-                status: burn_ir::TensorStatus::ReadWrite,
-            },
-            client.clone(),
-            client,
-            stream,
-        )
+        fusion_stored(t, |native| native.with_storage(f))
+    }
+    fn with_row_storage(t: Self::FloatTensorPrimitive, f: StorageFormat) -> Self::FloatTensorPrimitive {
+        fusion_stored(t, |native| native.with_row_storage(f))
     }
     fn storage_format(t: &Self::FloatTensorPrimitive) -> StorageFormat {
         crate::fusion::resolve_float_tensor(t).storage_format()
     }
 }
 
+/// A fused tensor cast by `cast`. Resolving executes pending work before the cast. Register a new
+/// handle afterward, so fusers cannot remove the compression boundary.
+#[cfg(feature = "fusion")]
+fn fusion_stored(
+    t: <burn_fusion::Fusion<TtBackend> as burn_backend::BackendTypes>::FloatTensorPrimitive,
+    cast: impl FnOnce(TtTensor) -> TtTensor,
+) -> <burn_fusion::Fusion<TtBackend> as burn_backend::BackendTypes>::FloatTensorPrimitive {
+    let client = t.client.clone();
+    let stream = t.stream;
+    let native = cast(crate::fusion::resolve_float_tensor(&t));
+    let shape = native.shape();
+    let dtype = native.dtype();
+    let id = client.register_tensor_handle(crate::TtHandle::Tensor(native));
+    burn_fusion::Client::change_client_float::<TtBackend>(
+        burn_ir::TensorIr {
+            id,
+            shape,
+            dtype,
+            status: burn_ir::TensorStatus::ReadWrite,
+        },
+        client.clone(),
+        client,
+        stream,
+    )
+}
+
 /// Import this trait for `Tensor::with_storage` and `storage_format`.
 pub trait TensorStorageExt: Sized {
     fn with_storage(self, format: StorageFormat) -> Self;
+    /// [`TensorStorageExt::with_storage`] for a tensor written by rows (a block-float KV cache).
+    fn with_row_storage(self, format: StorageFormat) -> Self;
     fn storage_format(&self) -> StorageFormat;
 }
 impl<B: StorageBackend, const D: usize> TensorStorageExt for Tensor<B, D> {
@@ -224,6 +259,12 @@ impl<B: StorageBackend, const D: usize> TensorStorageExt for Tensor<B, D> {
             panic!("BFP requires a logical float tensor")
         };
         Tensor::from_primitive(TensorPrimitive::Float(B::with_storage(t, f)))
+    }
+    fn with_row_storage(self, f: StorageFormat) -> Self {
+        let TensorPrimitive::Float(t) = self.into_primitive() else {
+            panic!("BFP requires a logical float tensor")
+        };
+        Tensor::from_primitive(TensorPrimitive::Float(B::with_row_storage(t, f)))
     }
     fn storage_format(&self) -> StorageFormat {
         let TensorPrimitive::Float(t) = self.clone().into_primitive() else {

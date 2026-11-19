@@ -98,6 +98,12 @@ pub struct WeightOptions {
     /// (`crate::host_embed`): a step uploads its token's row. For an untied head only, where
     /// nothing on the card reads the table; the rows are the device lookup's bit for bit.
     pub host_embedding: bool,
+    /// Under the performance contract, the full-attention layers' KV cache stored block-float
+    /// (BFP8 or BFP4, `docs/plans/block-float-kv.md`): a position's keys and values in about a half
+    /// or a quarter of a BF16 cache's bytes, written as encoded rows and read where they lie by
+    /// attention, the arithmetic F32 on the values they decode to. `None`: BF16 (or F32 with
+    /// [`Self::f32_kv_cache`]). Qwen3.5 only.
+    pub kv_block_float: Option<burn_tt::storage::BfpFormat>,
 }
 
 /// The format of each named tensor: the first rule whose pattern is a substring of the name wins,
