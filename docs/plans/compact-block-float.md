@@ -11,7 +11,10 @@ Block-float tiles stored in GDDR without their header and slot padding.
 
 - Tile `i` of a channel's extent lies at `base + 16 + i * 1088` (BFP8), so it is always 16 mod 64.
 - It is read to `slot + 16` in L1, which is also 16 mod 64, so every transfer stays congruent mod 64.
-- The header bytes in L1 are not written. The unpacker skips them (`(1 + DigestSize) * 16` bytes).
+- The header bytes in L1 are not written. The unpacker skips them (`(1 + DigestSize) * 16` bytes):
+  `step280_compact_block_float` unpacks BFP8, BFP4 and BFP2 tiles the same under any header bytes
+  (card 0).
+- L1 slots keep their size: the packer writes a tile's header in front of its data.
 - Writes back to GDDR (`store_bfp`, the pack output, a KV row's `SCATTER_ROWS`) use the same offsets.
 
 ## Gains (Qwen3.8-27B, gate/up BFP4, the rest BFP8, embedding in host memory)

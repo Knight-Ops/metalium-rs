@@ -7750,6 +7750,12 @@ impl<T: Transport> Session<T> {
         id: TraceId,
     ) -> Result<Vec<Option<trace::UnitFootprint>>, TensorError> {
         let t = self.traces.get(&id.0).ok_or(TraceError::Unknown(id.0))?;
+        let held = t
+            .freed
+            .iter()
+            .flat_map(|p| p.extents().map(|(_, _, len)| len))
+            .sum::<u64>()
+            + t.pool.iter().map(|&(_, _, len)| len).sum::<u64>();
         Ok(t.units
             .iter()
             .zip(&self.units)
@@ -7775,6 +7781,7 @@ impl<T: Transport> Session<T> {
                         .sum(),
                     cache_held_bytes: unit.programs.held_bytes(),
                     cache_bytes: region.end - region.base,
+                    trace_held_bytes: held,
                 })
             })
             .collect())

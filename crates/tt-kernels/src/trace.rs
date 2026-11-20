@@ -257,6 +257,9 @@ pub struct UnitFootprint {
     /// Bytes held in the cache by every trace on the unit, and the cache's size.
     pub cache_held_bytes: u64,
     pub cache_bytes: u64,
+    /// GDDR bytes of the tensors the whole trace holds until its release (its captured
+    /// intermediates freed since, and its capture's pool), the same on every unit.
+    pub trace_held_bytes: u64,
 }
 
 /// One unit's share of a capture in progress.

@@ -1052,6 +1052,17 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
         // ([`Self::decode_token`]): its sort's programs, all held by a capture, would not fit the
         // program cache beside a model's traces.
         let cache = &caches[0];
+        // The steps reuse their own intermediates' GDDR as the chunks do (`TT_STEP_REUSE=0` turns
+        // it off): a step holds about one layer's intermediates, not every layer's (the 27B's
+        // step 2.0 GB -> 0.1 GB; the same logits bit for bit, decode as fast).
+        let step_reuse = match std::env::var("TT_STEP_REUSE").ok().as_deref() {
+            Some("0") => None,
+            asked => match burn_tt::set_capture_reuse(*device, true) {
+                Ok(was) => Some(was),
+                Err(TtError::Unsupported { .. }) if asked != Some("1") => None,
+                Err(e) => return Err(e.into()),
+            },
+        };
         // Every trace this build captures, for the progress reports.
         let traces = shapes.steps.len() + shapes.chunk_keys().len();
         let captured = std::cell::Cell::new(0);
@@ -1089,6 +1100,9 @@ impl<'m, B: TracedBackend, M: FixedShapeDecoder<B>> TracedGenerator<'m, M, B> {
             });
         }
 
+        if let Some(was) = step_reuse {
+            burn_tt::set_capture_reuse(*device, was)?;
+        }
         let prefill = caches.len() - 1;
         let cache = &caches[prefill];
         // A chunk's traces reuse their own intermediates' GDDR (`burn_tt::set_capture_reuse`,
