@@ -4414,6 +4414,39 @@ static SOFTMAX_ROWS: std::sync::LazyLock<std::sync::atomic::AtomicU8> =
             _ => SOFTMAX_ROWS_AUTO,
         })
     });
+/// Attention over keys in blocks of this many positions (a multiple of 32, `0` off): the scores
+/// of one block at a time, combined by an online softmax, instead of a row over every position.
+/// Opt-in (`TT_ATTENTION_BLOCK`, [`set_attention_block`]); see [`module::attention`].
+static ATTENTION_BLOCK: std::sync::LazyLock<std::sync::atomic::AtomicUsize> =
+    std::sync::LazyLock::new(|| {
+        let n = std::env::var("TT_ATTENTION_BLOCK")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        std::sync::atomic::AtomicUsize::new(n / 32 * 32)
+    });
+
+/// Attention past `block` positions computed a block of keys at a time (`Some(n)`, rounded down to
+/// a multiple of 32) or as one row of scores over every position (`None`, the default),
+/// process-wide. A block's scores are all the GDDR the rows take (a prefill chunk of `t` rows at
+/// `len` positions holds `heads t len` scores and their exponentials otherwise), at the cost of
+/// each `exp` taken twice and the division moved after `pv`: not bit for bit the row's softmax.
+/// Eager and traced runs agree as long as the setting does not change between them.
+pub fn set_attention_block(block: Option<usize>) {
+    ATTENTION_BLOCK.store(
+        block.map_or(0, |n| n / 32 * 32),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// The block [`set_attention_block`] set, if any.
+pub fn attention_block() -> Option<usize> {
+    match ATTENTION_BLOCK.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
 const SOFTMAX_ROWS_OFF: u8 = 0;
 const SOFTMAX_ROWS_ON: u8 = 1;
 const SOFTMAX_ROWS_AUTO: u8 = 2;
@@ -4541,6 +4574,20 @@ pub mod module {
                 return cast_native(out, dtype);
             }
         }
+        if let (Some(m), None, None, false, Some(block)) = (
+            &mask,
+            &attn_bias,
+            options.softcap,
+            options.is_causal,
+            attention_block(),
+        ) {
+            if ks[2] > block {
+                let _part = part("attention/blocks");
+                let out = blocked_attention(query, key, value, m, scale, block);
+                let _part = part("attention/narrow");
+                return cast_native(out, dtype);
+            }
+        }
         let scores = {
             let _part = part("attention/qk");
             wide_product(query, float::float_transpose(key))
@@ -4629,6 +4676,65 @@ pub mod module {
     /// `a @ b` for an F32 `a` and a `b` of F32 or BF16 (attention's keys or values over a BF16
     /// cache), or stored block-float (over a BFP8 or BFP4 cache): a BF16 or block-float `b` read
     /// as it lies by the batched product, else widened once (bit for bit the same product).
+    /// Attention over `key` and `value` a block of `block` positions at a time
+    /// ([`set_attention_block`]): each block's scores `q kᵀ`, scaled and masked (its columns of
+    /// `mask`, a masked score a large finite negative so a block masked for a row gives that row
+    /// weight 0 once combined), the block's row maximum `m_j`, `p = exp(s - m_j)`, its row sum
+    /// `l_j` and `o_j = p v_j`; the blocks combined as they come (`M = max(m, m_j)`,
+    /// `o = o exp(m - M) + o_j exp(m_j - M)`, `l` likewise), and `o / l` at the end. The products
+    /// read each block of the keys and values where it lies (a view of the cache, block float or
+    /// BF16 as `wide_product` takes them); only one block's scores are held.
+    fn blocked_attention(
+        query: TtTensor,
+        key: TtTensor,
+        value: TtTensor,
+        mask: &TtTensor,
+        scale: f64,
+        block: usize,
+    ) -> TtTensor {
+        let ks = key.shape().to_vec();
+        let ms = mask.shape().to_vec();
+        let len = ks[2];
+        let full = |n: usize| burn_backend::Slice::new(0, Some(n as isize), 1);
+        let range = |a: usize, b: usize| burn_backend::Slice::new(a as isize, Some(b as isize), 1);
+        let mut acc: Option<(TtTensor, TtTensor, TtTensor)> = None;
+        let mut j0 = 0;
+        while j0 < len {
+            let j1 = (j0 + block).min(len);
+            let rows = [full(ks[0]), full(ks[1]), range(j0, j1), full(ks[3])];
+            let kj = float::float_slice(key.clone(), &rows);
+            let vj = float::float_slice(value.clone(), &rows);
+            let mj = bool::bool_slice(
+                mask.clone(),
+                &[full(ms[0]), full(ms[1]), full(ms[2]), range(j0, j1)],
+            );
+            let s = wide_product(query.clone(), float::float_transpose(kj));
+            let s = float::float_scale_mask_fill(s, scale.into(), mj, (-1.0e30f32).into());
+            let mx = float::float_max_dim(s.clone(), 3);
+            let p = float::float_sub_exp(s, mx.clone());
+            let l = float::float_sum_dim(p.clone(), 3);
+            let o = wide_product(p, vj);
+            acc = Some(match acc {
+                None => (mx, l, o),
+                Some((m0, l0, o0)) => {
+                    let mn =
+                        float::float_max_dim(float::float_cat(vec![m0.clone(), mx.clone()], 3), 3);
+                    let a = float::float_sub_exp(m0, mn.clone());
+                    let b = float::float_sub_exp(mx, mn.clone());
+                    let l = float::float_add(
+                        float::float_mul(l0, a.clone()),
+                        float::float_mul(l, b.clone()),
+                    );
+                    let o = float::float_add(float::float_mul(o0, a), float::float_mul(o, b));
+                    (mn, l, o)
+                }
+            });
+            j0 = j1;
+        }
+        let (_, l, o) = acc.expect("a nonempty key");
+        float::float_div(o, l)
+    }
+
     fn wide_product(a: TtTensor, b: TtTensor) -> TtTensor {
         if b.dtype() != DType::BF16 && block_float(&b).is_none() {
             return float::float_matmul(a, b);

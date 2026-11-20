@@ -511,6 +511,27 @@ impl DramAlloc {
         self.log.take().unwrap_or_default()
     }
 
+    /// [`DramAlloc::alloc_on`] `channel` when it has the room, else on the channel with the
+    /// longest free run that holds `bytes`: a trace's stream names its channel, so any one serves,
+    /// and the preferred one (a unit's own, spreading the movers' reads) can be the one the
+    /// weights fill first.
+    pub fn alloc_on_any(&mut self, channel: usize, bytes: u64) -> Result<Placement> {
+        match self.alloc_on(channel, bytes) {
+            Ok(p) => Ok(p),
+            Err(e) => {
+                let len = bytes.div_ceil(TILE_SLOT).max(1) * TILE_SLOT;
+                let longest = |c: usize| self.free[c].values().copied().max().unwrap_or(0);
+                match (0..self.channels.len())
+                    .filter(|&c| longest(c) >= len)
+                    .max_by_key(|&c| longest(c))
+                {
+                    Some(c) => self.alloc_on(c, bytes),
+                    None => Err(e),
+                }
+            }
+        }
+    }
+
     /// `bytes` contiguous on channel `channel` (an index into the chip's
     /// channels), in whole slots: a trace's stream (`crate::trace`).
     pub fn alloc_on(&mut self, channel: usize, bytes: u64) -> Result<Placement> {
@@ -7354,6 +7375,35 @@ mod tests {
         TRANSFER_SIDE_MAX,
     };
     use crate::kind;
+
+    /// A trace stream's channel when it has the room, else the channel with the longest free run:
+    /// with channel 0 filled to under the stream's length, the stream lands elsewhere, whole, and
+    /// on a channel that has room it lands there as before.
+    #[test]
+    fn a_stream_goes_to_another_channel_when_its_own_is_full() {
+        let mut alloc = DramAlloc::new(&tt_isa::dram::Dram::FULL);
+        let room = |a: &DramAlloc, c: usize| a.free[c].values().copied().max().unwrap_or(0);
+        let stream = 64 * TILE_SLOT;
+        // Fill channel 0 until less than the stream is left.
+        while room(&alloc, 0) >= stream {
+            let take = (room(&alloc, 0) - stream / 2).max(TILE_SLOT);
+            alloc.alloc_on(0, take).unwrap();
+        }
+        assert!(
+            alloc.alloc_on(0, stream).is_err(),
+            "channel 0 has no run that long"
+        );
+        let placed = alloc.alloc_on_any(0, stream).unwrap();
+        let (channel, _, len) = placed.extents().next().unwrap();
+        assert_ne!(channel, 0);
+        assert!(len >= stream);
+        let own = alloc.alloc_on_any(3, stream).unwrap();
+        assert_eq!(
+            own.extents().next().unwrap().0,
+            3,
+            "its own channel when it fits"
+        );
+    }
 
     /// A placement allocated after a snapshot was free then, though its slots were in use at the
     /// snapshot: what held them was freed and reused since. Before that rule, a slot in use at a

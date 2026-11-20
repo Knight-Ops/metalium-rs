@@ -5736,7 +5736,7 @@ impl<T: Transport> Session<T> {
                         Some(&r) => r,
                         None => {
                             let held = dram.alloc.suspend();
-                            let placed = dram.alloc.alloc_on(u % channels, bytes);
+                            let placed = dram.alloc.alloc_on_any(u % channels, bytes);
                             dram.alloc.resume(held);
                             let (channel, off, _) = placed?
                                 .extents()
@@ -7294,7 +7294,7 @@ impl<T: Transport> Session<T> {
         // movers' reads of their streams spread out.
         let region = {
             let d = self.dram_state()?;
-            d.alloc.alloc_on(u % d.alloc.channel_count(), end)?
+            d.alloc.alloc_on_any(u % d.alloc.channel_count(), end)?
         };
         let range = region.region().expect("a one-channel placement");
         let (channel, base) = (range.channel().index() as u32, range.offset());
@@ -7501,7 +7501,7 @@ impl<T: Transport> Session<T> {
         }
         let region = {
             let d = self.dram_state()?;
-            d.alloc.alloc_on(u % d.alloc.channel_count(), end)?
+            d.alloc.alloc_on_any(u % d.alloc.channel_count(), end)?
         };
         let range = region.region().expect("a one-channel placement");
         let mut bytes = vec![0u8; range.len() as usize];

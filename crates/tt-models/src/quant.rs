@@ -111,6 +111,9 @@ pub struct WeightOptions {
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     rules: Vec<(String, Format)>,
+    /// A name the plan goes by (`qd1`), the first line of its [`Plan::cache_key`] when given, so
+    /// a weight cache made under it says which plan it holds.
+    name: Option<String>,
 }
 
 impl Plan {
@@ -121,6 +124,33 @@ impl Plan {
     pub fn rule(mut self, pattern: &str, format: Format) -> Self {
         self.rules.push((pattern.to_string(), format));
         self
+    }
+
+    /// `rules` ahead of every rule the plan has, in their order: exceptions to a contract's plan
+    /// ([`Plan::for_numerics`]), e.g. `layers.37.mlp.gate_up.` kept BFP8 or `layers.3.mlp.down_proj.`
+    /// stored BFP4. A pattern is a substring of the module path, so a layer's rule names it with
+    /// its dots on both sides (`layers.3.` is not `layers.37.`).
+    pub fn with_overrides(mut self, rules: impl IntoIterator<Item = (String, Format)>) -> Self {
+        let mut first: Vec<_> = rules.into_iter().collect();
+        first.append(&mut self.rules);
+        self.rules = first;
+        self
+    }
+
+    /// The plan named `name`: the name heads its [`Plan::cache_key`] (`plan <name>`), so a weight
+    /// cache's header records it beside the rules.
+    pub fn named(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The rules in order, the first match winning.
+    pub fn rules(&self) -> &[(String, Format)] {
+        &self.rules
     }
 
     /// Every matrix stored BF16 ([`Format::Bf16Stored`]) but the embedding table, whose rows a
@@ -186,10 +216,16 @@ impl Plan {
 
     /// The rules, one a line, for a weight-cache checksum. The first matching rule wins, so the
     /// order is part of the plan.
+    /// An unnamed plan's key is its rules alone, as before names were given.
     pub fn cache_key(&self) -> String {
-        self.rules
+        let rules = self
+            .rules
             .iter()
-            .map(|(pattern, format)| format!("{pattern} {format:?}"))
+            .map(|(pattern, format)| format!("{pattern} {format:?}"));
+        self.name
+            .iter()
+            .map(|n| format!("plan {n}"))
+            .chain(rules)
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -507,5 +543,32 @@ mod tests {
             Format::Bf16
         );
         assert_eq!(plan.format("embed_tokens.weight"), Format::F32);
+    }
+
+    /// Exceptions go ahead of a contract's rules and win over them; a layer's pattern with both
+    /// dots names that layer only. A name heads the cache key, and an unnamed plan's key is its
+    /// rules' (so caches made before names stay valid).
+    #[test]
+    fn overrides_win_over_the_contract_and_a_name_heads_the_cache_key() {
+        let options = WeightOptions {
+            mlp_bfp4: true,
+            ..WeightOptions::default()
+        };
+        let contract = Plan::for_numerics(burn_tt::Numerics::Performance, options);
+        let plan = contract.clone().with_overrides([
+            ("layers.3.mlp.gate_up.".to_string(), Format::Bfp8),
+            ("layers.3.mlp.down_proj.".to_string(), Format::Bfp4),
+        ]);
+        assert_eq!(plan.format("layers.3.mlp.gate_up.weight"), Format::Bfp8);
+        assert_eq!(plan.format("layers.37.mlp.gate_up.weight"), Format::Bfp4);
+        assert_eq!(plan.format("layers.3.mlp.down_proj.weight"), Format::Bfp4);
+        assert_eq!(plan.format("layers.30.mlp.down_proj.weight"), Format::Bfp8);
+        assert_eq!(plan.format("embed_tokens.weight"), Format::Bf16);
+        assert_eq!(plan.rules().len(), contract.rules().len() + 2);
+        let named = plan.clone().named("qx");
+        assert_eq!(named.name(), Some("qx"));
+        assert_eq!(named.cache_key(), format!("plan qx\n{}", plan.cache_key()));
+        assert!(!contract.cache_key().starts_with("plan "));
+        assert_ne!(named.cache_key(), plan.cache_key());
     }
 }

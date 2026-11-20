@@ -1706,6 +1706,21 @@ impl Qwen35<burn_tt::Tt> {
         device: &burn_tt::TtDevice,
     ) -> Result<(Self, Loaded), LoadError> {
         let plan = crate::quant::Plan::for_numerics(numerics, options);
+        Self::streamed_cached_with_plan(config, paths, numerics, options, &plan, cache, device)
+    }
+
+    /// [`Qwen35::streamed_cached`] with the weight formats of `plan` (as
+    /// [`Qwen35::streamed_with_plan`]): the cache's header covers the plan's key, its name first
+    /// when it has one, so a cache made under another plan is a miss and is rebuilt.
+    pub fn streamed_cached_with_plan(
+        config: &Qwen35Config,
+        paths: &[std::path::PathBuf],
+        numerics: burn_tt::Numerics,
+        options: crate::quant::WeightOptions,
+        plan: &crate::quant::Plan,
+        cache: &std::path::Path,
+        device: &burn_tt::TtDevice,
+    ) -> Result<(Self, Loaded), LoadError> {
         let (channels, columns) = burn_tt::weight_layout(*device)
             .map_err(|e| LoadError::Store(format!("weight cache: the card's layout: {e}")))?;
         let identity = crate::weight_cache::Identity {
@@ -1749,7 +1764,7 @@ impl Qwen35<burn_tt::Tt> {
             None => miss("no file yet".into()),
         }
         let (model, loaded) =
-            Self::streamed_with_plan(config, paths, numerics, options, &plan, device)?;
+            Self::streamed_with_plan(config, paths, numerics, options, plan, device)?;
         let started = std::time::Instant::now();
         let mut writer =
             crate::weight_cache::Writer::create(cache, &identity).map_err(LoadError::Store)?;

@@ -283,6 +283,26 @@ Part 2's unsplit baseline and fallback.
       alone could split a row over units: exact in any order, once signed zeros and NaN payloads are shown to agree);
     - attention's `pv` is now the largest part of a chunk of 512 (77 of 286 ms before this work).
 
+## Attention in blocks of keys (opt-in)
+
+`burn_tt::set_attention_block(Some(n))` (or `TT_ATTENTION_BLOCK`) applies to a masked `attention` longer than `n`
+positions. It runs one block of `n` keys at a time:
+
+1. `s = q k_j^T`, then the scale and the mask (masked scores are `-1e30`);
+2. the row maximum `m_j`, then `p = SUB_EXP(s, m_j)` and its row sum `l_j`;
+3. `o_j = p v_j`;
+4. combined with what came before: `M = max(m, m_j)`, `o = o e^(m-M) + o_j e^(m_j-M)`, and `l` the same way.
+
+The result is `o / l`. Each block of K and V is a view that the batched product reads where it lies, BF16 or block
+float.
+
+- **Gain:** a prefill chunk holds the scores of one block, not a row over the whole cache. At chunk 256 that is
+  107 MB at blocks of 2,048 instead of 1.7 GB at 32K positions or 27 GB at 512K.
+- **Accuracy** (`step279_blocked_attention`), measured against an exact f64 attention:
+  - blocks: 2.6e-3 (F32 cache) and 0.98e-3 (BFP8 cache);
+  - row softmax: 3.1e-3 and 1.28e-3.
+- **Traces:** a Qwen3.5 is traced equal to eager, bit for bit.
+
 ## Part 2: flash-decode past the fit limit
 
 - **A run** is one L1-resident block of a head's positions, today's job without the `DIV`: `qk`, the scale and mask,
