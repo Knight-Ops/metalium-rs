@@ -1047,6 +1047,9 @@ pub struct Session<T: Transport> {
     /// Moves on whenever a tile's state is lost -- a reset, a mover restart --
     /// which every trace captured before is [`TraceError::Stale`] against.
     epoch: u64,
+    /// Units recovered after a failed queue ([`Session::recover`]): a measured candidate that
+    /// moves it failed on the card.
+    recoveries: u64,
     /// Whatever keeps each unit's crash-cleanup write registered beyond the
     /// first (on silicon, one driver file descriptor per tile: the driver keeps
     /// one cleanup write per descriptor).
@@ -3228,6 +3231,7 @@ impl<T: Transport> Session<T> {
             traces: Default::default(),
             next_trace: 0,
             epoch: 0,
+            recoveries: 0,
             _cleanup: Vec::new(),
         };
         let (_, wedged) = healthy_tiles(&candidates, want, |(x, y)| {
@@ -4601,7 +4605,7 @@ impl<T: Transport> Session<T> {
     ) -> Result<Option<()>, TensorError> {
         // The DMA's records read interleaved tensors only; a weight laid by column goes tile by
         // tile through its slots.
-        if self.staging().is_none() || t.placement.layout() == tensor::Layout::ByColumn {
+        if self.staging().is_none() || t.placement.layout() != tensor::Layout::Interleaved {
             return Ok(None);
         }
         let stride = tensor::row_major_stride(t.cols);
@@ -5043,7 +5047,7 @@ impl<T: Transport> Session<T> {
         t.expect_fp32_slots("read as 32-bit datums")?;
         if self.capture.is_some()
             || self.staging().is_none()
-            || t.placement.layout() == tensor::Layout::ByColumn
+            || t.placement.layout() != tensor::Layout::Interleaved
         {
             return Ok(None);
         }
@@ -5862,6 +5866,7 @@ impl<T: Transport> Session<T> {
         let start = self.mark();
         // Every unit's cache has the same bounds (`limit_program_cache`).
         let cache = self.units[0].programs.region().len();
+        let is_linked = linked.is_some();
         let mut per_unit: Vec<std::collections::VecDeque<Option<Segment>>> = match linked {
             Some(groups) => groups
                 .into_iter()
@@ -5895,6 +5900,11 @@ impl<T: Transport> Session<T> {
                 .collect::<Result<_, _>>()?,
         };
         self.stage(HostStage::Segments, start);
+        if is_linked {
+            let start = self.mark();
+            self.place_linked(&per_unit)?;
+            self.stage(HostStage::Place, start);
+        }
         // With more than one unit, a barrier on each unit this op ran on, after
         // its share, since the next op may read what any of them wrote; a unit
         // it did not run on enqueues nothing, and catches up before its next
@@ -6067,6 +6077,79 @@ impl<T: Transport> Session<T> {
     /// the queue drains), its kernels reserved, its list enqueued. A kernel
     /// that would write what queued runs read (`Resident::needs_idle`) waits
     /// for the unit to drain first, as does a full program cache.
+    /// Place `seg`'s programs in unit `u`'s cache, pinned (`place_programs`), draining the unit
+    /// first where what its queued lists pin leaves no room: each kernel's three addresses.
+    fn place_segment(
+        &mut self,
+        u: usize,
+        seg: &Segment,
+    ) -> Result<Vec<[(u32, u32); 3]>, TensorError> {
+        let placed = {
+            let Session {
+                dev, units, ttinsn, ..
+            } = self;
+            let unit = &mut units[u];
+            let w = unit.resident.as_ref().unwrap().window();
+            let in_flight = !unit.queued.is_empty();
+            match place_programs(
+                dev,
+                w,
+                unit.tile,
+                &mut unit.programs,
+                seg,
+                in_flight,
+                *ttinsn,
+            ) {
+                Ok(p) => Ok(p),
+                Err(PlaceError::Full) => Err(()),
+                Err(PlaceError::Failed(e)) => return Err(e),
+            }
+        };
+        match placed {
+            Ok(p) => Ok(p),
+            Err(()) => {
+                let d0 = self.mark();
+                self.drain_unit(u)?;
+                self.stage(HostStage::Drain, d0);
+                let Session {
+                    dev, units, ttinsn, ..
+                } = self;
+                let unit = &mut units[u];
+                let w = unit.resident.as_ref().unwrap().window();
+                Ok(place_programs(
+                    dev,
+                    w,
+                    unit.tile,
+                    &mut unit.programs,
+                    seg,
+                    false,
+                    *ttinsn,
+                )?)
+            }
+        }
+    }
+
+    /// An op whose units hand each other data by credits (`linked`): every unit's lists' programs
+    /// placed before any list is queued. One that does not fit is then refused with nothing of
+    /// the op on the card; refused after its partners' lists were queued, they waited for it until
+    /// the run timed out, and the recovery's reset made every trace stale (a measured candidate's,
+    /// `1795029493`: `down` at 1,024 rows, `[5, 8, 9]` pulled, refused on one unit). The queueing
+    /// then finds each program resident and pinned.
+    fn place_linked(
+        &mut self,
+        per_unit: &[std::collections::VecDeque<Option<Segment>>],
+    ) -> Result<(), TensorError> {
+        for (u, q) in per_unit.iter().enumerate() {
+            for seg in q.iter().flatten() {
+                if seg.resident && !seg.kernels.is_empty() {
+                    self.ensure_unit(u)?;
+                    self.place_segment(u, seg)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_segment(&mut self, u: usize, seg: &Segment, budget: u64) -> Result<(), TensorError> {
         if self.capture.is_some() && !seg.kernel_roles.is_empty() && !seg.resident {
             return Err(TraceError::NotResident.into());
@@ -6112,41 +6195,7 @@ impl<T: Transport> Session<T> {
         }
         let mut entries = seg.entries.clone();
         if seg.resident && !seg.kernels.is_empty() {
-            let placed = {
-                let Session {
-                    dev, units, ttinsn, ..
-                } = self;
-                let unit = &mut units[u];
-                let w = unit.resident.as_ref().unwrap().window();
-                let in_flight = !unit.queued.is_empty();
-                match place_programs(
-                    dev,
-                    w,
-                    unit.tile,
-                    &mut unit.programs,
-                    seg,
-                    in_flight,
-                    *ttinsn,
-                ) {
-                    Ok(p) => Ok(p),
-                    Err(PlaceError::Full) => Err(()),
-                    Err(PlaceError::Failed(e)) => return Err(e),
-                }
-            };
-            let placed = match placed {
-                Ok(p) => p,
-                Err(()) => {
-                    let d0 = self.mark();
-                    self.drain_unit(u)?;
-                    self.stage(HostStage::Drain, d0);
-                    let Session {
-                        dev, units, ttinsn, ..
-                    } = self;
-                    let unit = &mut units[u];
-                    let w = unit.resident.as_ref().unwrap().window();
-                    place_programs(dev, w, unit.tile, &mut unit.programs, seg, false, *ttinsn)?
-                }
-            };
+            let placed = self.place_segment(u, seg)?;
             for (&at, p) in seg.kernels.iter().zip(placed) {
                 for (t, (addr, len)) in p.into_iter().enumerate() {
                     entries[at][2 + 2 * t] = addr;
@@ -6516,6 +6565,17 @@ impl<T: Transport> Session<T> {
         self.sync()?;
         for u in 0..self.units.len() {
             self.ensure_unit(u)?;
+        }
+        // The capture lays its programs out in a cache holding only what live traces hold (none
+        // in flight: synced above). Programs left from before -- eager ops', a dropped trace's --
+        // were hits wherever they lay, and the capture protects them there: a second build of
+        // the 1.7B kept the dropped first build's addresses, its programs spread over the cache
+        // with 122 KB free in runs of at most 7 KB, and a product's 24 KB list was refused
+        // (run `1795037344`). Its first build, laid out among those of its measurements, held.
+        // Laid out afresh, the 1.7B's 128-token generation also restores 0.99 MB of programs, not
+        // 1.85 (27.71 -> 26.49 ms, ABBA, 2026-11-19).
+        for unit in &mut self.units {
+            unit.programs.clear_unheld();
         }
         let units = self
             .units
@@ -10166,6 +10226,7 @@ impl<T: Transport> Session<T> {
     /// After a failed queue: restart the mover of a unit whose list failed, and
     /// reset and restart the roles of a unit whose kernel did.
     fn recover(&mut self, failed: &[(usize, bool)]) {
+        self.recoveries += 1;
         for &(u, kernel) in failed {
             if kernel {
                 self.units[u].resident = None;
@@ -10431,13 +10492,40 @@ impl<T: Transport> Session<T> {
         reuse: tensor::Reuse,
         copies: usize,
     ) -> Result<f64, TensorError> {
+        self.time_candidate(a, b, route, fidelity, budget, block, reuse, copies)?
+            .map_err(|cause| {
+                TensorError::Shape(format!("a measured candidate did not capture: {cause}"))
+            })
+    }
+
+    /// [`Session::time_product`], with a candidate that does not capture (`Err(cause)` inside:
+    /// its programs or buffers do not fit, say) told apart from a failure of the card or the
+    /// session (`Err` outside), so a measurement can skip the one and stop for the other.
+    #[allow(clippy::too_many_arguments)]
+    fn time_candidate(
+        &mut self,
+        a: (&DramTensor, bool),
+        b: (&DramTensor, bool),
+        route: SrcRoute,
+        fidelity: Fidelity,
+        budget: u64,
+        block: tensor::BlockStream,
+        reuse: tensor::Reuse,
+        copies: usize,
+    ) -> Result<Result<f64, String>, TensorError> {
         let kept = (self.block_stream, self.reuse);
         self.block_stream = block;
         let copies = copies.max(1);
         let r = self.set_operand_reuse(reuse).and_then(|()| {
-            let once = self.replay_time(a, b, route, fidelity, budget, copies)?;
-            let twice = self.replay_time(a, b, route, fidelity, budget, 2 * copies)?;
-            Ok(((twice - once) / copies as f64).max(f64::MIN_POSITIVE))
+            let once = match self.replay_time(a, b, route, fidelity, budget, copies)? {
+                Ok(us) => us,
+                Err(cause) => return Ok(Err(cause)),
+            };
+            let twice = match self.replay_time(a, b, route, fidelity, budget, 2 * copies)? {
+                Ok(us) => us,
+                Err(cause) => return Ok(Err(cause)),
+            };
+            Ok(Ok(((twice - once) / copies as f64).max(f64::MIN_POSITIVE)))
         });
         self.block_stream = kept.0;
         self.set_operand_reuse(kept.1)?;
@@ -10445,7 +10533,7 @@ impl<T: Transport> Session<T> {
     }
 
     /// The median replay of a trace of `copies` products `op(A) @ op(B)` back to back, us
-    /// ([`Session::time_product`]).
+    /// ([`Session::time_product`]); `Err(cause)` inside when the products did not capture.
     fn replay_time(
         &mut self,
         (a, a_transposed): (&DramTensor, bool),
@@ -10454,7 +10542,7 @@ impl<T: Transport> Session<T> {
         fidelity: Fidelity,
         budget: u64,
         copies: usize,
-    ) -> Result<f64, TensorError> {
+    ) -> Result<Result<f64, String>, TensorError> {
         let arena_end = crate::l1::arena().end;
         self.begin_trace()?;
         // Its own capture plans in the whole arena; the products, where they would.
@@ -10473,16 +10561,18 @@ impl<T: Transport> Session<T> {
         let id = self.end_trace();
         let id = match (made, id) {
             (Ok(()), Ok(id)) => id,
-            (_, id) => {
+            (made, id) => {
+                let cause = match (&made, &id) {
+                    (Err(e), _) | (Ok(()), Err(e)) => e.to_string(),
+                    (Ok(()), Ok(_)) => unreachable!(),
+                };
                 if let Ok(id) = id {
                     let _ = self.release_trace(id);
                 }
                 for out in outs {
                     let _ = self.free(out);
                 }
-                return Err(TensorError::Shape(
-                    "a measured candidate did not capture".into(),
-                ));
+                return Ok(Err(cause));
             }
         };
         let mut times = Vec::with_capacity(MEASURE_RUNS);
@@ -10501,7 +10591,7 @@ impl<T: Transport> Session<T> {
         let released = self.release_trace(id);
         ran.and(released)?;
         times.sort_by(f64::total_cmp);
-        Ok(times[times.len() / 2])
+        Ok(Ok(times[times.len() / 2]))
     }
 
     /// Under [`tensor::BlockStream::Measured`], time the candidates of `op(A) @ op(B)`'s question
@@ -10557,31 +10647,76 @@ impl<T: Transport> Session<T> {
             s.unprofiled(|s| {
                 // Copies enough that a candidate's trace runs ~[`MEASURE_SPAN_US`]: a small product's
                 // differences are otherwise inside a replay's noise.
+                // A run that fails on the card is named before it ends the measurement: its
+                // recovery resets tiles, which makes every trace captured so far stale, so what
+                // failed must not be lost (two builds ended so, unnamed, 2026-11-17 and -18).
+                let named = |c: tensor::BlockChoice, e: TensorError| {
+                    eprintln!(
+                        "TT_MATMUL_BLOCK=measured: {:?} on {} units: candidate {:?} {:?} failed on \
+                         the card, the measurement ends: {e}",
+                        q.tiles, q.units, c.block, c.reuse
+                    );
+                    e
+                };
                 let kept = (s.block_stream, s.reuse);
+                let recoveries = s.recoveries;
                 s.block_stream = tensor::BlockStream::Fixed(first.block);
                 let single = s
                     .set_operand_reuse(first.reuse)
                     .and_then(|()| s.replay_time(a, b, route, fidelity, budget, 1));
                 s.block_stream = kept.0;
                 s.set_operand_reuse(kept.1)?;
-                let copies = single.map_or(1, |us| {
-                    ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
-                });
+                let single = single.map_err(|e| named(first, e))?;
+                if let (Err(cause), true) = (&single, s.recoveries != recoveries) {
+                    return Err(named(
+                        first,
+                        TensorError::Shape(format!("a tile was reset: {cause}")),
+                    ));
+                }
+                let copies = match single {
+                    Ok(us) => {
+                        ((MEASURE_SPAN_US / us).ceil() as usize).clamp(1, MEASURE_COPIES_MOST)
+                    }
+                    // Timed again below with the others, where a refusal is recorded.
+                    Err(_) => 1,
+                };
                 // Each candidate, its score and its time, us.
                 type Timed = Vec<(tensor::BlockChoice, f64, f64)>;
                 let mut timed: Timed = Vec::new();
+                // The candidates that did not capture, and why: skipped, not the measurement's
+                // end. Which candidates a climb reaches depends on the times, so stopping at the
+                // first that does not fit left a product on `Auto`'s block in some processes
+                // and not others (the 1.7B's 128-row `down`: [2,2,3] for [2,12,3], 2026-11-17).
+                let mut refused: Vec<(tensor::BlockChoice, String)> = Vec::new();
                 let once = |s: &mut Self, c: tensor::BlockChoice| {
                     let fixed = tensor::BlockStream::Fixed(c.block);
-                    let us =
-                        s.time_product(a, b, route, fidelity, budget, fixed, c.reuse, copies)?;
-                    Ok::<_, TensorError>((scores.map_or(us, |f| f(c.block, c.reuse, us)), us))
+                    let recoveries = s.recoveries;
+                    let us = s
+                        .time_candidate(a, b, route, fidelity, budget, fixed, c.reuse, copies)
+                        .map_err(|e| named(c, e))?;
+                    // A run that failed inside the capture comes back as one that did not
+                    // capture, but its recovery reset tiles: a failure of the card, not a skip.
+                    if let (Err(cause), true) = (&us, s.recoveries != recoveries) {
+                        return Err(named(
+                            c,
+                            TensorError::Shape(format!("a tile was reset: {cause}")),
+                        ));
+                    }
+                    Ok::<_, TensorError>(
+                        us.map(|us| (scores.map_or(us, |f| f(c.block, c.reuse, us)), us)),
+                    )
                 };
-                let time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
-                    if timed.len() >= MEASURE_MOST || timed.iter().any(|(t, ..)| *t == c) {
+                let mut time = |s: &mut Self, timed: &mut Timed, c: tensor::BlockChoice| {
+                    if timed.len() + refused.len() >= MEASURE_MOST
+                        || timed.iter().any(|(t, ..)| *t == c)
+                        || refused.iter().any(|(t, _)| *t == c)
+                    {
                         return Ok(());
                     }
-                    let (score, us) = once(s, c)?;
-                    timed.push((c, score, us));
+                    match once(s, c)? {
+                        Ok((score, us)) => timed.push((c, score, us)),
+                        Err(cause) => refused.push((c, cause)),
+                    }
                     Ok::<(), TensorError>(())
                 };
                 // The fastest first; equal scores in the order timed.
@@ -10592,6 +10727,13 @@ impl<T: Transport> Session<T> {
                 };
                 for &c in &candidates {
                     time(s, &mut timed, c)?;
+                }
+                if timed.is_empty() {
+                    let (c, cause) = &refused[0];
+                    return Err(TensorError::Shape(format!(
+                        "no candidate captured ({:?} did not: {cause})",
+                        c.block
+                    )));
                 }
                 // Climbs: from each of the fastest listed, one step at a time while a step gains.
                 let starts: Vec<_> = ranked(&timed).into_iter().take(MEASURE_STARTS).collect();
@@ -10629,7 +10771,13 @@ impl<T: Transport> Session<T> {
                 if finalists.len() > 1 {
                     for _ in 1..MEASURE_ROUNDS {
                         for (c, scored, us) in &mut finalists {
-                            let (score, t) = once(s, *c)?;
+                            // It captured once; not again would be the session's fault.
+                            let (score, t) = once(s, *c)?.map_err(|cause| {
+                                TensorError::Shape(format!(
+                                    "{:?} captured, then did not: {cause}",
+                                    c.block
+                                ))
+                            })?;
                             scored.push(score);
                             us.push(t);
                         }
@@ -10644,7 +10792,31 @@ impl<T: Transport> Session<T> {
                     .iter()
                     .min_by(|x, y| median(&x.1).total_cmp(&median(&y.1)))
                     .expect("one finalist");
-                Ok::<_, TensorError>((chosen.0, [timed[0].2, median(&chosen.2)]))
+                for (i, (c, cause)) in refused.iter().enumerate() {
+                    eprintln!(
+                        "TT_MATMUL_BLOCK=measured: {:?} on {} units: candidate {} of {} that did \
+                         not capture, skipped: {:?} {:?}: {cause}",
+                        q.tiles,
+                        q.units,
+                        i + 1,
+                        refused.len(),
+                        c.block,
+                        c.reuse
+                    );
+                }
+                // `Auto`'s own time, if it captured (it is the first listed).
+                let auto = timed
+                    .iter()
+                    .find(|t| t.0 == first)
+                    .map_or(f64::NAN, |t| t.2);
+                tensor::note_trials(
+                    q,
+                    (
+                        timed.iter().map(|t| (t.0, t.2)).collect(),
+                        refused.iter().map(|r| r.0).collect(),
+                    ),
+                );
+                Ok::<_, TensorError>((chosen.0, [auto, median(&chosen.2)]))
             })
         });
         let (choice, times) = match timed.and_then(|r| r).and_then(|r| r) {
@@ -11609,6 +11781,32 @@ impl<T: Transport> Session<T> {
         self.units.iter().map(|u| u.programs.stats()).collect()
     }
 
+    /// Record every unit's program cache calls from now on, or stop
+    /// ([`crate::program_cache::Event`]): what placed, evicted and refused each program.
+    /// Dev-facing.
+    #[doc(hidden)]
+    pub fn set_program_log(&mut self, on: bool) {
+        for unit in &mut self.units {
+            unit.programs.set_log(on);
+        }
+    }
+
+    /// What each unit's program cache recorded since the last take, in unit order, emptied.
+    #[doc(hidden)]
+    pub fn take_program_log(&mut self) -> Vec<Vec<crate::program_cache::Event>> {
+        self.units
+            .iter_mut()
+            .map(|u| u.programs.take_log())
+            .collect()
+    }
+
+    /// What the programs traces hold leave of unit `u`'s program cache, and the largest run the
+    /// capture in progress leaves ([`crate::program_cache::Room`]). Dev-facing.
+    #[doc(hidden)]
+    pub fn program_room(&self, u: usize) -> crate::program_cache::Room {
+        self.units[u].programs.room()
+    }
+
     /// Shrink every unit's program cache to its first `bytes`, emptied: for
     /// gates that need it to fill (`step34_batching`). Waits for queued work
     /// first, since what is resident is forgotten.
@@ -11617,12 +11815,31 @@ impl<T: Transport> Session<T> {
         self.sync()?;
         let full = tt_isa::l1::PROGRAM_CACHE;
         for unit in &mut self.units {
-            unit.programs = ProgramCache::new(tt_isa::l1::Region {
+            unit.programs.resize(tt_isa::l1::Region {
                 end: full.base + bytes.min(full.len()),
                 ..full
             });
         }
         Ok(())
+    }
+
+    /// [`Session::limit_program_cache`] for unit `u` alone: a gate's way to make one unit of an
+    /// op refuse its programs while the others take theirs.
+    #[doc(hidden)]
+    pub fn limit_unit_program_cache(&mut self, u: usize, bytes: u64) -> Result<(), TensorError> {
+        self.sync()?;
+        let full = tt_isa::l1::PROGRAM_CACHE;
+        self.units[u].programs.resize(tt_isa::l1::Region {
+            end: full.base + bytes.min(full.len()),
+            ..full
+        });
+        Ok(())
+    }
+
+    /// How many times units were recovered after a failed queue (`Session::recover`). Dev-facing.
+    #[doc(hidden)]
+    pub fn probe_recoveries(&self) -> u64 {
+        self.recoveries
     }
 
     /// Give the timestamper `bytes` of L1 at the top of the program cache instead of the

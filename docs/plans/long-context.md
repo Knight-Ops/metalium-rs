@@ -167,7 +167,10 @@ Part 2's unsplit baseline and fallback.
     was refused ("a list's programs do not fit", 82 KB free once evictable programs go, 4.7 KB needed). They now
     evict as the kernels' programs do (`place_programs`); a replay restores them as it does its programs. Still
     open: placement is first fit without compaction, so programs a capture protects can leave a run too small for
-    a program that fits the bytes (seen with `step226`'s cache cut to the larger trace exactly).
+    a program that fits the bytes (seen with `step226`'s cache cut to the larger trace exactly). **2026-11-19:** a
+    capture now begins by clearing what no live trace holds (`Session::begin_capture`), so it no longer inherits a
+    dropped trace's addresses; packing a capture's programs (`Packed`) lost live
+    ([log](../learnings/performance-log.md#w2-a-captures-programs-in-the-program-cache-the-capture-clear-kept-packing-killed-2026-11-19-card-0)).
   - Measured (card 0, `1792808294` -> `1792809099` -> `1792809505`,
     [log](../learnings/performance-log.md#a-long-prompts-prefill-chunks-attend-to-a-prefix-the-gqa-mask-read-as-a-block-2026-10-24-card-0)):
     a 1.7B chunk of 64 at 8,192 positions 293 -> 187 ms with D3 (the gather was 36%), then each chunk at its prefix:

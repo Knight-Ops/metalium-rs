@@ -244,7 +244,8 @@ fn attention_over_block_float_keys_and_values_is_their_decoded_values_bit_for_bi
 
 /// A fixed cache's write into a block-float cache: `[heads len, dim]` rows, head `h`'s row at
 /// `h len + position` (what `FixedCache` writes head-major), at positions of every kind (a face's
-/// first row, its last, the next tile's), and a chunk's rows.
+/// first row, its last, the next tile's), a chunk's rows, and a chunk of whole tile rows
+/// (written a tile at a time).
 #[test]
 fn a_block_float_cache_write_is_the_f32_write_cast() {
     with_device(Config::default(), |d| {
@@ -262,6 +263,8 @@ fn a_block_float_cache_write_is_the_f32_write_cast() {
                 vec![16],
                 vec![33],
                 (40..72).collect(),
+                // A whole tile row a head (`len` is a multiple of 32): the tile-row write.
+                (64..96).collect(),
             ]
             .into_iter()
             .enumerate()

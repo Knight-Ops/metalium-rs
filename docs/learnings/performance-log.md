@@ -12,6 +12,12 @@ The chronology is the [Change log](#change-log).
 | Section | Date | Note |
 |---|---|---|
 | [Change log](#change-log) | 2026-10-02 to 2026-10-10 | table newest first, then dated `###` subsections (2026-10-04, 2026-10-06) |
+| [W2: `A` laid by row killed](#w2-a-laid-by-row-killed-the-cards-products-no-faster-its-elementwise-ops-slower-2026-11-19-card-0) | 2026-11-19 | P4 lost: the 1.7B's prefill **+4.8% at 256 tokens, +3.4-6.4% at 512-2,000**, ViT-Tiny +62%, ResNet-18 +43% (ABBA). On the card the products' requests fell 2.6x and they ran +2%: `A`'s requests did not bind them in the model; elementwise ops on tensors laid by row lost 25-27% (a row's tiles on one channel). The vision models lost on the host (no DMA path). Deleted |
+| [W2: default prefill chunks for a cache's length](#w2-default-prefill-chunks-for-a-caches-length-2026-11-19-card-0) | 2026-11-19 | `Shapes::for_cache`: `64,128,256` under 2,048 positions, then powers of two to 1,024 under the scores' cap and half the cache. At 2,048 positions 512 / 1,024 / 2,000-token prompts **-9.0 / -11.5 / -14.1%** (ABBA), short ones within noise. Killed by the 0.5% line under 2,048: a chunk past 256 costs a 256-token prompt ~1% there (more programs restored), for 11-13% at 496-1,000 tokens. A chunk the cache's length loses everywhere. Not for Qwen3.5's row-stepped DeltaNets |
+| [W2: a capture's programs in the program cache](#w2-a-captures-programs-in-the-program-cache-the-capture-clear-kept-packing-killed-2026-11-19-card-0) | 2026-11-19 | a capture begins in a cache cleared of what no trace holds: the bench's second build no longer inherits the first's scattered addresses (an intermittent refusal), and the 1.7B's 128-token prefill **27.71 -> 26.49 ms** (-4.4%, ABBA; 1.85 -> 0.99 MB of programs restored a generation), the rest within 0.25%. Packing a capture's programs lost live (+11.9% at 128 tokens), BestFit and TopDown trade one prompt for another; all three deleted, with the offline replay (faithful only under the recording's own policy). A replay pays ~1.25 ms a MB restored |
+| [W2: short-chunk follow-ups](#w2-short-chunk-follow-ups-gateups-choice-as-request-bound-and-512--1024-token-chunks-2026-11-17-card-0) | 2026-11-17 | `gate\|up`'s slower block: at 128 rows the program cache's fragmentation refuses the best (open), at 256 the candidate list missed it (fixed, `[4,8,9]` pulled: the 1.7B's 256-token prefill **1.036x**). `A` read a row a request bounded at 2.5-3.6 ms a 128-token chunk. 512- and 1,024-token chunks fit and pay 1.14-1.21x at 512-2,000 tokens. A wedge during one build's measurement, not reproduced |
+| [W2: short-chunk products mapped before building](#w2-short-chunk-products-mapped-before-building-spreading-refuted-as-cost-the-lever-2026-11-17-card-0) | 2026-11-17 | P0 of the box, a probe only: the slope that chooses blocks is 12-26% under a product's span in a chunk (copies merged, no barrier); timed behind barriers, 88+ units lose at 128 rows with `A` (668 against 576 us a layer) and without it (498 against 336). `A`'s reads on today's blocks bound -5.8 / -6.0 ms a 128 / 256-token chunk; the model's `gate\|up` runs a slower block than the best (~1.0 / 1.9 ms) |
+| [W2: the KV cache's chunk write as whole tiles](#w2-the-kv-caches-chunk-write-as-whole-tiles-2026-11-17-card-0) | 2026-11-17 | a 32-index batch that is one tile row is written as tiles, decided on the card: a layer's write 192.6 / 377.3 -> **29.3 / 48.8 us** at 128 / 256 tokens; the 1.7B's prefill **1.11 / 1.15 / 1.18x** at 32 / 128 / 256 tokens (4,573 tokens/s at 128), decode unchanged. Also: a measured choice skips a candidate that does not capture instead of falling back to `Auto` for the whole product |
 | [Qwen3.5-4B's prefill and decode by op class](#qwen35-4bs-prefill-and-decode-by-op-class-2026-11-16-card-0) | 2026-11-16 | a 16-token chunk is **216 ms** on the card (~74 tokens/s at 128 tokens): the DeltaNets' token-at-a-time recurrence 126 ms (58%, 3,457 small products), barriers 43 ms over 5,688 ops, weight products only 24.5 ms. A decode step 35.5 ms: weight products 13.2 ms at 404 GB/s, the other 945 ops 22.3 ms |
 | [The 1.7B's prefill by op class, at today's contract](#the-17bs-prefill-by-op-class-at-todays-contract-2026-11-16-card-0) | 2026-11-16 | a 128 / 256-token chunk is 29.6 / 50.0 ms on the card: products 55 / 48% (on 32-74 of 120 units, `A` re-read 23-59x: 2.9 GB of `A` a 128-token chunk against 87 MB of activations), **the KV cache's row scatter 16 / 18%** (192 / 377 us a layer for 1 / 2 MB, ~5 GB/s, control-bound), norms 11 / 7%, softmax 7 / 14%, barriers 10 / 6% |
 | [W2: `A`'s reads inline beside a weight read by column](#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0) | 2026-11-15 | the cheaper route chosen over the gather-ahead (deferred): a gather with a `B` span keeps `A`'s tiles in the inline loop. Strip 197.7 -> **191.3 cycles** a tile; H1 default 70.4 / 98.5 -> 70.2 / 99.2, multicast 78.9 / 94.8 -> **79.7 / 96.2**; the 1.7B unchanged. Small, no regression, kept; `A` laid by row is the large share left |
@@ -443,6 +449,349 @@ establish held-out accuracy or convergence. The F32 golden remains unchanged.
 All masters changed, tested gradients/master updates stayed F32, training had
 no intermediate downloads, and changed-image traces matched fresh execution
 bit-for-bit. Named precision boundaries are shared model code, not a Burn fork.
+
+## W2: `A` laid by row killed: the card's products no faster, its elementwise ops slower (2026-11-19, card 0)
+
+P4 of [a-by-row.md](../completed-plans/a-by-row.md) (the roadmap box "`A` laid by row"): activations of at least 8 tile
+rows and two tile columns laid by row (`TT_ACT_ROWS=1`), so a product reads its `A` a row a request. P0-P3 had passed
+(the strip probe 239.1 -> 57.9 cycles a tile at a model's row length; ttsim gates in all three read modes, `step276`
+and `step12_mnist` on card 0, conformance under `TT_ACT_ROWS=all` with no unexpected failure). Performance contract,
+host-timed, ABBA by process (A interleaved, B by row; runs A `1795091055` / `1795092308`, B `1795093980` /
+`1795095799`, B `1795097586` / `1795099405`, A `1795101175` / `1795102430`):
+
+| bench, ms | A | B | B against A |
+|---|---|---|--:|
+| 1.7B prefill, 32 tokens (512 positions) | 18.55, 18.62 | 18.75, 18.68 | +0.7% |
+| 1.7B prefill, 128 tokens (its `A` stays interleaved) | 27.42, 26.51 | 26.76, 26.90 | -0.5% (not apart) |
+| 1.7B prefill, 256 tokens (512 positions) | 43.25, 44.30 | 45.69, 46.01 | **+4.8%** |
+| 1.7B prefill, 256 / 512 / 1,024 / 2,000 tokens (2,048 positions, chunks to 1,024) | 43.27 / 85.80 / 192.79 / 493.01, 43.16 / 85.22 / 192.28 / 492.45 | 45.14 / 89.60 / 199.20 / 524.58, 45.65 / 87.16 / 198.93 / 524.15 | **+5.0 / +3.4 / +3.4 / +6.4%** |
+| 1.7B decode step after 32 / 128 / 256 tokens | 7.82 / 8.28 / 8.77 | 7.88 / 8.37 / 8.80 | +0.8 / +1.0 / +0.4% |
+| ViT-Tiny forward | 7.27, 7.30 | 11.82, 11.85 | **+62%** |
+| ResNet-18 forward | 10.94, 10.96 | 15.51, 15.74 | **+43%** |
+| Qwen3.5-4B prefill, 32 / 128 / 256 tokens (16-row chunks: nothing laid by row) | 405.1 / 1,620.7 / 3,241.6 | 404.3 / 1,616.7 / 3,232.7 | -0.2% |
+
+**Where it went** (profile mode, one process an arm):
+- **The 1.7B, on the card** (`1795104226` / `1795104936`): a 256-token chunk's replay 40.36 -> 42.11 ms. The products'
+  read requests fell 2.6x (192,000 -> 75,072) and their `A` bytes 297.7 -> 167.9 MB, and they ran 2,412 -> 2,461 us
+  (+2%): `A`'s request cost, which the strip probe and P0's "576 -> 336 us a layer with `A` free" bounded, was not what
+  bound them in the model. The elementwise ops over tensors laid by row lost 25-27% (`tt_silu_mul` 361 -> 460 us, rope
+  + cast 286 -> 360, the `q|k|v` product with its ropes 169 -> 212): a unit's tiles of one row sit on one channel
+  instead of eight.
+- **ViT-Tiny, on the host** (`1795104160` / `1795104182`): the card's replay is the same (6,942 / 6,917 us). A tensor
+  laid by row skips the DMA transfer path (`dma_upload` / `dma_download` take interleaved tensors only) and goes
+  tile by tile through its slots; the image is tall enough to be laid by row.
+
+Killed (the plan's rule: any default slower by more than 0.5%). `TT_ACT_ROWS`, `REF_BY_ROW`, `BSpan::of_rows`, the
+by-row cursor and walks, `Layout::ByRow`, `probe_row_shift`, the strip probe's by-row case and `step276` deleted; the
+B mover's room back to 3,964 bytes at its tightest image (profile + `encoded-guard`). Kept: the wedge fix that shipped
+beside P2 (`Session::place_linked`). Row in [failed-approaches](failed-approaches.md).
+
+## W2: default prefill chunks for a cache's length (2026-11-19, card 0)
+
+The roadmap box "prefill buckets of 512 and 1,024" (item 3 of the short-chunk follow-ups): a generator had no default
+chunks, and every caller passed its own (the benches `64,128,256`, or 64). Now `generate::Shapes::for_cache(max_len)`:
+powers of two from 64 up to the largest dividing the cache that is no more than 256 rows below 2,048 positions
+(`LONG_CACHE`), 1,024 from there (`LARGEST_DEFAULT_CHUNK`), the scores' cap (`generate::score_cap`, step224's
+`512 * 8192 / max_len`, at least 64, moved beside it) and half the cache. The benches' defaults are it (`TT_GEN_BUCKETS`,
+`TT_GEN_CHUNKS` override). Performance contract, the 1.7B, `traced_generation_stream_ceiling`, host-timed, 16 new
+tokens, at the capture clear's commit (`1eb4519`).
+
+**The table, one process a cell** (prefill ms, medians of 9 samples, 5 at 4,096 and 8,192 positions):
+
+| cache | chunks | 128 | 256 | 512 | 1,000-1,024 | 2,000 | 4,000 | 8,000 | GDDR free | run |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| 512 | 64-256 | 25.72 | 44.00 | 93.51 (496) | | | | | 30.58 GB | `1795048651` |
+| 512 | 64-512 | 26.36 | 43.98 | 81.95 (496) | | | | | 30.35 | `1795049053` |
+| 1,024 | 64-256 | 28.39 | 42.90 | 92.94 | 215.70 | | | | 29.91 | `1795049594` |
+| 1,024 | 64-512 | 27.39 | 42.80 | 82.59 | 189.97 | | | | 29.28 | `1795050105` |
+| 1,024 | 64-1,024 | 27.32 | 43.42 | 81.80 | 193.99 | | | | 28.67 | `1795050884` |
+| 2,048 | 64-256 | 28.08 | 43.36 | 93.32 | 217.63 | 574.03 | | | 28.44 | `1795051928` |
+| 2,048 | 64-512 | 27.85 | 43.36 | 85.82 | 194.41 | 512.73 | | | 27.33 | `1795052630` |
+| 2,048 | 64-1,024 | 28.01 | 43.40 | 85.97 | 192.35 | 492.84 | | | 25.70 | `1795053724` |
+| 2,048 | 64, 256, 1,024 | **42.76** | 43.15 | 190.93 | 191.58 | 492.52 | | | 27.43 | `1795055401` |
+| 4,096 | 64-256 | | 43.89 | | 217.66 | 575.60 | 1,728.5 | | 26.01 | `1795056486` |
+| 4,096 | 64-512 | | 43.90 | | 194.07 | 511.24 | 1,601.4 | | 24.04 | `1795057474` |
+| 4,096 | 64-1,024 | | 43.73 | | 192.57 | 493.24 | 1,522.7 | | 20.78 | `1795059079` |
+| 8,192 | 64-256 | | 44.42 | | 225.01 | | 1,736.2 | 5,278.5 | 21.51 | `1795061945` |
+| 8,192 | 64-512 | | 44.44 | | 192.77 | | 1,599.3 | 5,008.0 | 18.00 | `1795063242` |
+| 8,192 | 64-1,024 | | 44.77 | | 194.41 | | 1,525.4 | 4,736.4 | 11.82 | `1795065388` |
+
+Decode was unchanged by the chunks in every cell (8.2-8.3 ms after a 128-token prompt, 18.2-18.4 after 1,024, 23.0-23.2
+after 4,000). Every build with a 1,024 chunk was clean (the 1,024-row wedge of `1794944223` did not recur, 9 builds).
+Dropping 128 (`64,256,1,024`) costs a 128-token prompt 1.5x: out. The program bytes a generation restores moved
+with the trace count (0.7-4.4 MB), the cost the roadmap box "the programs a generation restores" is about.
+
+**The close calls, ABBA by process** (prefill ms, A / B / B / A):
+
+| cache | A against B | 128 | 256 | 512 | 1,000-1,024 | 2,000 | runs |
+|---|---|--:|--:|--:|--:|--:|---|
+| 512 | 64-256 / +512 | 26.93, 26.95 / 26.55, 26.71 | 43.54, 43.52 / **44.04, 43.78** | 93.24, 93.23 / 81.26, 81.74 (496) | | | `1795069347`, `1795069751`, `1795070294`, `1795070848` |
+| 1,024 | 64-512 / +1,024 | 27.07, 27.07 / **27.39, 27.65** | 43.23, 42.99 / 42.91, 43.03 | 82.66, 82.58 / 83.05, 82.19 | 189.88, 189.95 / **194.04, 193.51** | | `1795071248`, `1795072025`, `1795073072`, `1795074123` |
+| 2,048 | 64-512 / +1,024 | 28.04, 28.08 / 28.06, 28.02 | 43.54, 43.55 / 43.42, 43.55 | 85.59, 84.85 / 86.08, 85.02 | 194.19, 192.67 / 192.37, 192.04 | 512.25, 509.79 / 492.92, 492.09 | `1795074898`, `1795076003`, `1795077669`, `1795079294` |
+| 1,024 | 64-256 / 64-512 | 27.35, 27.93 / 27.31, 27.26 | 42.97, 42.76 / **43.30, 43.40** | 93.08, 93.04 / 82.33, 82.52 | 216.10, 216.29 / 189.78, 189.86 | | `1795080456`, `1795080967`, `1795081743`, `1795082520` |
+| 2,048 | 64-256 / 64-1,024 | 28.30, 27.42 / 28.20, 28.16 | 43.18, 43.79 / 43.64, 43.59 | 93.18, 93.86 / 85.05, 85.08 | 217.02, 218.35 / 193.01, 192.39 | 573.28, 574.99 / 493.37, 492.59 | `1795083035`, `1795083731`, `1795085391`, `1795087057` |
+
+- **A chunk the cache's length loses** where shorter ones do not: +0.9% at 256 tokens (512 positions), +1.7% / +2.0%
+  at 128 / 1,000 tokens (1,024 positions), for nothing at 1,024. The default stops at half the cache.
+- **Under 2,048 positions a chunk past 256 costs a 256-token prompt ~1%** (+0.9% at 512 positions, +1.1% at 1,024:
+  both B runs above both A), with more programs restored (0.95 -> 1.2 MB at 1,024): over the 0.5% kill line, so those
+  caches keep `64,128,256`, giving up 11-13% at 496-1,000 tokens (a caller with long prompts passes its chunks; the
+  restores' box is what would let them have both).
+- **From 2,048 positions buckets to 1,024 pass:** 128 and 256 tokens within the processes' spread (A brackets B), and
+  512 / 1,024 / 2,000 tokens **-9.0 / -11.5 / -14.1%** (93.5 -> 85.1, 217.7 -> 192.7, 574.1 -> 493.0 ms). At 4,096 the
+  table gives 1,024-4,000 tokens -11.5 / -14.3 / -11.9% with 256 unchanged; at 8,192 the scores' cap stops at 512
+  (-14.3 / -7.9 / -5.1% at 1,024 / 4,000 / 8,000 tokens). The 1,024 chunk costs GDDR (1.6 GB at 2,048 positions, 3.3
+  at 4,096, 6.2 at 8,192 where the cap refuses it).
+- **Not for every decoder:** Qwen3.5-4B's DeltaNets step a chunk's recurrence a row at a time (`qwen35.rs`, ops in
+  proportion to a chunk's rows), so its bench keeps its 16-row chunks and the planned Qwen check at 2,048 was not run;
+  the default is documented as an attention decoder's.
+
+Gates: `generate::tests::the_default_chunks_fit_every_cache` (every power-of-two cache to 32,768 and odd ones accepted
+by `checked`, the measured sets pinned); step224's long-context gates (card 0, the shared `score_cap`).
+
+## W2: a capture's programs in the program cache: the capture clear kept, packing killed (2026-11-19, card 0)
+
+The roadmap box "a capture's programs packed, not first fit" (item 2 of the short-chunk follow-ups). Performance
+contract, the 1.7B, `traced_generation_stream_ceiling`, host-timed, 16 new tokens. Two meters were added first: a
+program-cache log (`TT_GEN_PROGRAM_LOG=<file>`, every unit's placements, restores, holds and evictions, written
+also when a build fails) and the program bytes a generation restores (now reported a prompt by the bench).
+
+**The offline replay could only check itself.** `program_cache::replay` ran a recorded log again under another
+placement policy (1,024-position cache, buckets to 512, 291M events on 120 units). Under the recording's own policy
+it reproduced the recording (every placement at its address, 147.64 MB restored as recorded; its leftover
+"unmapped" events were releases of addresses the recording had already evicted, no-ops there too). Under any other
+policy it diverged: a refusal makes the session clear the cache and retry, or take another candidate, and that
+reaction is not in the log. It predicted `Packed` would restore 133.26 MB; live, `Packed` restored 153.60.
+
+**`Packed` live (killed).** A capture's programs packed below the region's end or below a protected program,
+evicting the fewest held bytes. It placed the candidates first fit refused, and cost the traces' restores:
+
+| prompt, ms | first fit (`1795038151`) | `Packed` (`1795039043`) |
+|---|--:|--:|
+| 128 | 27.86 | 31.17 (+11.9%) |
+| 256 | 44.49 | 46.21 (+3.9%) |
+| 512 | 85.53 | 84.06 (-1.7%) |
+| 1,000 | 195.28 | 201.50 (+3.2%) |
+
+**A refusal in the bench's second build, and the fix: a capture begins in a cache cleared of what no trace
+holds.** The bucket table's 1,024-cache cell with chunks to 512 failed once (`1795037344`; it passed twice on
+rerun). The bench builds a generator twice; the second build reuses the first's measured blocks and kept the
+dropped first build's program addresses (they were hits wherever they lay, and the capture protected them there).
+Its programs spread over the cache, 122 KB free in runs of at most 7 KB, and a product's 24 KB list was refused.
+`Session::begin_capture` now calls `clear_unheld` on every unit (the queue is synced there, so nothing in flight
+names an unheld program). ttsim gate `step22::a_capture_leaves_its_free_space_in_one_run` (watched failing without
+it). A/B, ABBA by process, 4 runs a side, medians:
+
+| host ms | without (`1795042295`, `1795043781`, `1795044261`, `1795045718`) | with (`1795042808`, `1795043294`, `1795044742`, `1795045230`) |
+|---|--:|--:|
+| 1.7B prefill, 32 tokens | 18.48 | 18.50 (+0.1%) |
+| 1.7B prefill, 128 tokens | 27.71 (27.58-28.71) | **26.49** (26.46-26.76; -4.4%, every run apart) |
+| 1.7B prefill, 256 tokens | 44.04 | 44.03 |
+| decode step, 32 / 128 / 256 | 7.81 / 8.28 / 8.77 | 7.82 / 8.26 / 8.75 |
+| ViT-Tiny, traced | 7.260 | 7.248 |
+| ResNet-18, traced | 10.970 | 10.945 |
+
+The blocks chosen differ from process to process in both arms alike, so the gain is not a block. **It is restores:**
+with the restore meter, one run a side (`1795046288` without, `1795046694` with), a 128-token generation restores
+0.99 MB of programs against 1.85, and a 256-token one 2.13 against 1.98 (its prefill unchanged). Kept: the
+default.
+
+**BestFit and TopDown live (killed)**, on top of the capture clear, one run each:
+
+| policy | 32 | 128 | 256 tokens, ms | restored MB at 128 / 256 |
+|---|--:|--:|--:|--:|
+| first fit (the A/B's "with") | 18.50 | 26.49 | 44.03 | 0.99 / 2.13 |
+| BestFit (`1795047111`) | 18.55 | 26.96 (+1.8%) | 43.11 (-2.1%) | 1.44 / 1.39 |
+| TopDown (`1795047509`) | 18.67 (+1.0%) | 26.48 | 44.25 (+0.5%) | 0.79 / 2.37 |
+
+Each wins one prompt and loses another, as its restores move. **A replay pays ~1.25 ms a MB of programs restored**
+(~0.8 GB/s; the capture clear at 128 tokens -0.85 MB / -1.07 ms, BestFit at 256 -0.74 MB / -0.92 ms): a generation
+restores 0.8-2.4 MB, 1-3 ms of a 26-44 ms prefill, and which traces' programs overlap decides it, not a placement
+rule. That is the lever left (a roadmap box), not packing: `[4,8,12]` at 128 rows would save ~0.8 ms and a policy
+that admits it costs more in restores.
+
+Deleted with this: `program_cache::Policy` (`BestFit`, `TopDown`, `Packed`), the bench's `TT_GEN_PROGRAM_POLICY`,
+`burn_tt::set_program_policy`, the replay and its probe. Kept: the log, and the restore meter. Rows in
+[failed-approaches.md](failed-approaches.md).
+
+## W2: short-chunk follow-ups: `gate|up`'s choice, `A`'s request bound, and 512 / 1,024-token chunks (2026-11-17, card 0)
+
+The next items after P0 (below), and the owner's question whether larger prefill chunks fit. Performance contract,
+the 1.7B, `traced_generation_stream_ceiling`, host-timed. A new meter: `tensor::measured_trials`, every candidate
+a measurement timed and every one refused. `TT_GEN_MEASURED_TRIALS=1` prints them beside each measured choice, and
+every refused candidate is now named with its cause, not only the first.
+
+**Why the model runs `gate|up` on a slower block: two causes.**
+- **At 128 rows, the program cache's fragmentation.** The model's capture refuses `[4,8,12]` (`1794942089`,
+  `1794943173`): "the list needs 41,232 bytes in 7 programs; the capture in progress holds 64,864 of its 245,760
+  bytes, and the largest run it leaves is 14,960". Three quarters of the cache are free, but the capture's own
+  programs are spread through it, placed first-fit into gaps that other traces' programs left and then lost, so no
+  run is long enough for the block's largest program. A fresh process has the room. `down`'s `[3,16,4]` /
+  `[3,16,5]` meet the same refusal (35,264 bytes). What it costs: `[4,8,12]` 165.5 against `[4,12,9]` 200.6 us
+  (P0's spans), ~35 us a layer, **~0.8 ms of a 128-token chunk (~3%)**. Not built: packing a capture's programs
+  (rather than first fit) trades against the restores other traces pay at replay, so it needs its own bound.
+- **At 256 rows, the candidate list.** Even a fresh process's climb never reaches `[4,8,9]` pulled: `[4,4,9]`
+  pulled is listed, and its `K` steps 5 and 6 gain nothing, so the climb stops before 8. **Fixed:** `([4, 8, 9],
+  true)` joins `tensor::SHORT_MEASURED_BLOCKS`. The model now chooses it, 249 us against `[8,4,7]`'s 309 (measured).
+
+| host ms, A/B by process | old list (`1794949741`, `1794951131`) | with `[4,8,9]` pulled (`1794948335`, `1794949023`, `1794950438`) |
+|---|---|---|
+| 1.7B prefill, 256 tokens | 45.47, 46.03 | 44.22, 44.03, 44.19: **1.036x** (5,795 tokens/s) |
+| 1.7B prefill, 128 tokens | 27.81, 27.95 | 27.28, 27.53, 27.96 (the same choice) |
+| decode step, 128 / 256 | 8.28 / 8.75, 8.23 / 8.71 | 8.24 / 8.72, 8.22 / 8.73, 8.22 / 8.68 |
+| ViT-Tiny, traced | 7.241, 7.236 | 7.253, 7.292, 7.227 (+0.25%) |
+| ResNet-18, traced | 10.657, 10.632, 10.838 | 10.817, 10.860, 10.822, 10.864 |
+
+ResNet-18 cannot be moved by it. No ResNet question times `[4,8,9]` in either arm (trials, `1794952049` /
+`1794952318`): its short products are 2 tile rows, or 8 tile columns, and the block folds to the listed `[4,4,9]`.
+Its 10.63-10.86 ms is the measurement's own spread between processes (near ties choose differently: the two A runs
+differ in `[2,144,16]`'s block), worth knowing beside any ResNet-18 A/B. `step245_measured_block` checks the
+trials kept (ttsim; card 0 4 of 4, `1794952416`).
+
+**`A` read a row a request, bounded** (`silicon_bench_memory::mover_gather_rate`, `--profile`, `1794941983`): an
+`A`-only interleaved strip costs **304 cycles a 2,112-byte tile**. A strip whose weight is read a column a request
+costs 191 a tile overall, ~92 for the weight's share, the rate an `A` laid by row would read at. With each product's
+`A` tiles a unit and P0's `A`-skip savings, the bound at 128 rows on the model's blocks is `qkv` ~27, `o` ~16,
+`gate|up` ~52 (~6 on `[4,8,12]`), `down` ~54 us: **~100-150 us a layer, 2.5-3.6 ms of a 25.9 ms chunk (10-14%)**.
+It needs every activation writer to lay `A` by row, the large build the backlog box names. Not started: the owner's
+call.
+
+**512- and 1,024-token chunks fit, and pay.** A 2,048-position cache, 16 new tokens, prefill in ms:
+
+| prompt | chunks up to 256 (`1794942490`) | up to 512 (`1794943173`) | up to 1,024 (`1794946718`) | 1,024 only (`1794946004`) |
+|---|--:|--:|--:|--:|
+| 128 | 28.35 | 28.31 | 27.38 | |
+| 256 | 46.01 | 46.20 | 45.03 | |
+| 512 | 97.68 | **85.49** (1.14x) | 87.65 | |
+| 1,024 | 224.6 | **193.9** (1.16x) | 194.7 | **185.0** (1.21x) |
+| 2,000 | 588.0 | 513.3 (1.15x) | **495.5** (1.19x) | |
+
+Decode steps are the same in every column (8.2-8.8 ms to 256 positions, 9.9 at 512, 18.2 at 1,024+). A prompt is fed
+as today: chunks of the largest bucket, then the smallest that covers the rest (`generate::schedule`). The
+bench's default buckets stay 64 / 128 / 256 over a 512-position cache. The 1,024 chunk is 185.0 ms as the only trace
+and 194.7 beside every other bucket's traces: more traces, more programs restored a replay.
+
+**A defect met, not yet reproduced.** The first run with every bucket to 1,024 (`1794944223`) failed its build. A
+candidate's run during the 1,024-row measurement failed. Its recovery reset four tiles of one row, found wedged in
+`Src` and fed, and a reset makes every trace captured before it stale, the 1,024 chunk's capture included. The
+same configuration passed twice since (`1794946004`, `1794946718`). The failing candidate was not named then; every
+refusal now is. Recovering in place would need a reattach (an attachment's error is sticky).
+
+## W2: short-chunk products mapped before building: spreading refuted, `A`'s cost the lever (2026-11-17, card 0)
+
+Roadmap W2's box "Short-chunk products", P0: measurement only, because earlier attempts to spread the work lost. The
+probe `silicon_probe_performance_contract::prefill_map` (`--profile` build, performance contract: BF16 `A`, BFP8 `B`,
+HiFi2) takes the 1.7B's four products at 128 and 256 rows, one process a shape (`1794928260`, `1794928577`,
+`1794929427`, `1794931467`, `1794931867`, `1794932716`, `1794935246`, `1794938195`, at `ca5de20` plus the probe). For
+each shape it times:
+- every block a measured choice can reach, as the measurement times it: 814-1,560 blocks a shape, none refused;
+- a shortlist (the process's own choice, the best reachable, the best three on 88+ units, and the model's own block),
+  each with nothing skipped, `A`'s gathers skipped, and every gather skipped.
+
+**Which number to trust.** The measurement chooses blocks by a slope: copies back to back, less one copy. Barrier
+pruning merges copies that do not depend on each other into one op of the trace, so the slope never pays a barrier.
+A product in a chunk does. On the model's own blocks the slope is **12-26% under the chunk's span** (`1794886832`).
+The probe also times each copy after the first in a trace with pruning off (`later`), each behind a barrier as in a
+chunk. That is within 0-9% of the chunk for `qkv`, `gate|up` and `down` at both sizes. `o` is 16-18% under: in the
+chunk its `A` is attention's output. Every number below is `later`, us. The skips do what they claim (`A`'s bytes ->
+0 with `B`'s unchanged, then both -> 0).
+
+| a layer, us (sum of the four products) | 128 rows | 256 rows |
+|---|--:|--:|
+| the model's own blocks (the chunk's spans) | 576 (615) | 840 (868) |
+| the best block of all, every gather | **535** | **762** |
+| the best on 88+ units, every gather | 668 | 811 |
+| the best on 88+ units, `A`'s gathers skipped | 498 | 564 |
+| today's narrow blocks (26-64 units), `A`'s gathers skipped | **336** | 592 |
+| narrow, no gathers | 274 | 550 |
+| 88+ units, no gathers | 172 | 312 |
+
+| 128 rows, `later` us (units) | today | 88+ units | today, no `A` | 88+, no `A` | today, no gathers |
+|---|--:|--:|--:|--:|--:|
+| `qkv` [128,2048]@[2048,6144] | 102.8 (32) | 125.3 (96, pulled) | 64.1 | 83.6 | 60.4 |
+| `o` [128,2048]@[2048,2048] | 61.9 (32) | 77.8 (88) | 38.8 | 48.8 | 24.0 |
+| `gate\|up` [128,2048]@[2048,16384] | 165.5 (43); the model's [4,12,9] 200.6 | 213.3 (114, pulled) | 125.8 | 197.1 | 113.3 |
+| `down` [128,8192]@[8192,2048] | 204.6 (44) | 252.0 (88, pulled) | 107.6 | 168.3 | 75.8 |
+
+**What it says** (the plan's decision gate; 3% of today's 25.9 ms chunk is ~32 us a layer):
+- **Spreading the work loses again.** At 128 rows the best blocks on 88+ units are slower than today's with every
+  gather (668 against 576) and with `A`'s gathers skipped (498 against 336). A narrower row block re-reads the
+  weight (`o` at 88 units reads `B` twice), and the pulled ones pay for `A`'s handoff even when `A`'s bytes are 6x
+  fewer (`down` pulled: 6.5 MB of `A`, yet 78 us comes back without it). At 256 rows only `gate|up` gains from more
+  units (below). An "every unit" build is not supported. The gather-free kernel (172 / 312 on 88+ units) is the only
+  place the grid pays, and it is not reachable while the operands still have to be read.
+- **`A`'s reads on today's blocks are the lever:** 576 -> 336 us a layer at 128 rows with them free (bound -5.8 ms, a
+  22% chunk), 840 -> 592 at 256 (-6.0 ms, 14%). The gather-free kernel is well below both (274 / 550), so the kernel
+  is not the bound. These products already read GDDR at 250-420 GB/s, `A` and `B` together (`down`: 85 MB in 205
+  us). How much of `A`'s cost is per-request and how much is bytes is not known yet: `mover_gather_rate` bounds
+  the first (the backlog box "`A` laid by row, read a row a request").
+- **The model's `gate|up` runs a slower block than the best.** A fresh process measures `[4,8,12]` (151.8 us slope,
+  165.5 later); the model's capture measures and keeps `[4,12,9]` (171.4 slope there, 200.6 later), with no candidate
+  refused. At 256 rows the best is `[4,8,10]` pulled on 104 units (253.1), the model's `[8,4,7]` (323.5). The best
+  block of all over the model's: 41.7 / 77.7 us a layer (**~1.0 / 1.9 ms, 3.9 / 4.4% of the chunk**), nearly all
+  `gate|up`'s. Not yet known: whether the model's arena leaves those blocks out, or its context times them slower.
+- **Today's multicast does not engage** at these shapes (`TT_OPERAND_REUSE=mcast TT_CONTRACT_GRID=10x12`,
+  `prefill_products`, `1794939310`): the measured choice keeps the same unicast blocks, `A`'s bytes unchanged.
+
+**Decision (recorded before any build):** P1b ("`A` once over every unit") is not built: the occupancy half of it
+loses at 128 rows with or without `A`. Two cheaper items clear 3%, both probes before code:
+1. why the model's capture chooses `gate|up`'s slower block (its arena or its timing), then fix the choice;
+2. `A`'s per-request cost, bounded with `mover_gather_rate`, before the "`A` read a row a request" build.
+
+## W2: the KV cache's chunk write as whole tiles (2026-11-17, card 0)
+
+Roadmap W2's box from the 1.7B's profile (below): a prefill chunk's keys and values went through `SCATTER_ROWS` as
+32-byte face-row writes, 192 / 377 us a layer at 128 / 256 tokens. **The change** is in the record's write expansion
+alone (`record::expand_for`, shared by NC's firmware): a 32-index batch that is one whole tile row (32 consecutive
+indices from a multiple of 32, each written by this record) goes as one `op::WRITE` of the tile's data per column,
+from the staged value tile (already the destination's bytes in face order) to the cache tile. Anything else (decode's
+one index, 16-token buckets, a misaligned start, a gap, a repeat) takes the row path as before. The decision is made
+on the card from the indices in L1, because a replay's start position is a trace input. There is no new record and
+no host change.
+
+**Gates:** the record test `scatter_rows_writes_a_whole_tile_row_as_tiles` applies the writes to a byte model of
+GDDR. It covers aligned starts 0-96 in F32 and BF16, with and without a range; row-path cases at starts 36 and 48,
+31 indices, a gap, a swapped pair and a split batch; and, as a negative control, tile writes forced at start 36 that
+fail the byte check. A 16-aligned bug got past the first version, and start 48 was added to catch it. `step189`'s
+`a_chunk_s_rows_land_whole_at_any_start_a_replay_finds` replays one trace at every aligned and 16-misaligned start,
+for F32 and BF16 caches of 1 and 4 tile columns, bit for bit, on ttsim and card 0. Silicon `1794879638`: 43 of 43
+(`step189`, `step199`, `step273`, `step187`, the `step269` smoke, `step12_mnist`). `dm_nc` has 1,652 bytes free in
+the tightest build.
+
+**Prediction (stated before building):** a layer's write 192 / 377 -> at most 40 / 70 us, and the prefill at least
+1.12x / 1.15x at 128 / 256 tokens. Kill if a layer's write is not under 100 us or the gain is under 3%.
+
+**ABBA, end to end** (`traced_generation_stream_ceiling`, `TT_GEN_PROMPTS=32,128,256 TT_GEN_CHUNKS=64,128,256`,
+performance contract, card 0). The firmware was swapped with `TT_FIRMWARE_OVERRIDE` from two worktrees at paths of
+equal length (the embedded source path moves the images' layout otherwise):
+
+| ms, host-timed | 32 tokens | 128 | 256 | decode step 32 / 128 / 256 |
+|---|--:|--:|--:|---|
+| parent (A) `1794880224` / `1794881482` | 20.49 / 20.38 | 31.68 / 32.67 | 53.51 / 53.42 | 7.87 / 8.30 / 8.75; 7.79 / 8.23 / 8.71 |
+| tile write, host and firmware `1794882068` | **18.48** | **27.99** | **45.31** | 7.81 / 8.26 / 8.72 |
+| speedup | 1.11x | 1.15x | 1.18x | unchanged |
+
+That is **4,573 tokens/s at 128 tokens** (3,978 on the parent), 1,732 at 32 and 5,650 at 256. The two firmware-only
+B arms (`1794880649`, `1794881055`) agree on every cell whose products were fully measured: 18.46 / 18.50 at 32,
+27.76 at 128, 45.94 at 256. Their other cells ran some products on `Auto`'s block (below).
+
+**Profiled** (`1794886832`, the 2026-11-16 command): a layer's write **192.6 -> 29.3 us** at 128 tokens and
+**377.3 -> 48.8** at 256 (6.6x / 7.7x; 36 / 43 GB/s for 1 / 2 MB, still on 64 units). Its control time went 2,108 ->
+165 us a chunk and the writer's wait 2,063 -> 109. The chunk on the card is **29.6 -> 25.9 ms** and **50.0 -> 42.1**.
+The whole difference is the write's; nothing else moved. The prediction is met and the kill does not fire. Qwen3.5's
+16-token chunks and every decode step never qualify: they test the batch and take the row path unchanged. The
+Qwen3.5 A/B was not run.
+
+**A measured choice no longer ends at a candidate that does not capture.** Two of the B arms' cells were slow
+because `Session::measure_product` returned at the first candidate whose timing trace failed to capture ("a
+measured candidate did not capture"), leaving the whole product on `Auto`'s block for that process. In those cells
+that was `down` at 128 and 256 rows and `gate|up` at 128: `down` at 128 rows ran `[2,2,3]` for `[2,12,3]`. The same
+line is in earlier runs (`1794639138`, `1794641348`, `1794755772`, `1794757160`), so some past prefill numbers carry
+it. The measurement now skips such a candidate, says which and why on stderr, and fails only if no candidate
+captures. The probe `silicon_probe_performance_contract::prefill_blocks_capture` timed every block a climb can reach
+alone (`1794882561`): all 3,310 blocks of `down` at 128 / 256 rows and `gate|up` at 128 captured. A refusal
+therefore depends on what the model holds while it measures, not on the block. `step245_measured_block` passes on
+ttsim (5 of 5) and card 0 (4 of 4, `1794887658`).
 
 ## Qwen3.5-4B's prefill and decode by op class (2026-11-16, card 0)
 

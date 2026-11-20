@@ -35,7 +35,7 @@ const CONFIG: Qwen35Config = Qwen35Config {
 )]
 fn a_block_float_cache_generates_traced_as_eager() {
     let prompts = [5, 70].map(|n| ladder_support::prompt(n, CONFIG.vocab));
-    let shapes = Shapes::new(128, &[8, 16]).with_prefixes(&[]);
+    let shapes = Shapes::new(128, &[8, 16, 32]).with_prefixes(&[]);
     let steps = 6;
     let config = Config {
         tiles: Some(burn_tt::TileChoice::All),
@@ -66,7 +66,11 @@ fn a_block_float_cache_generates_traced_as_eager() {
             let kv = cache.kv().expect("a full-attention layer").state();
             assert!(!kv.is_empty());
             for t in kv {
-                assert_eq!(t.storage_format(), storage, "{format:?}: the cache's keys and values");
+                assert_eq!(
+                    t.storage_format(),
+                    storage,
+                    "{format:?}: the cache's keys and values"
+                );
             }
             let g = ladder_support::traced(&m, &shapes, &d);
             for (p, bf16) in prompts.iter().zip(&bf16_logits) {
@@ -93,7 +97,8 @@ fn a_block_float_cache_generates_traced_as_eager() {
 }
 
 /// The same model through the fusion backend (`burn_tt::Tt`, what `codeki-tensix` runs): traced
-/// against eager, a BF16 cache and a BFP8 one, each with chunks of 16 into a cache of 128.
+/// against eager, a BF16 cache and a BFP8 one, each with chunks of 16 and of 32 (whole tile
+/// rows, written a tile at a time) into a cache of 128.
 #[test]
 #[cfg_attr(
     not(feature = "silicon"),
@@ -102,7 +107,7 @@ fn a_block_float_cache_generates_traced_as_eager() {
 fn through_fusion_a_block_float_cache_generates_traced_as_eager() {
     use tt_models::generate::TracedGenerator;
     let prompt = ladder_support::prompt(70, CONFIG.vocab);
-    let shapes = Shapes::new(128, &[16]).with_prefixes(&[]);
+    let shapes = Shapes::new(128, &[16, 32]).with_prefixes(&[]);
     let config = Config {
         tiles: Some(burn_tt::TileChoice::All),
         ..Config::default()
@@ -122,7 +127,11 @@ fn through_fusion_a_block_float_cache_generates_traced_as_eager() {
             let eager = generate_fixed(&m, &prompt, 4, &shapes, &d).unwrap();
             assert_eq!(got.tokens, eager.tokens, "{kv:?}: tokens");
             for (a, b) in got.logits.iter().zip(&eager.logits) {
-                assert_eq!(ladder_support::bits(a), ladder_support::bits(b), "{kv:?}: logits");
+                assert_eq!(
+                    ladder_support::bits(a),
+                    ladder_support::bits(b),
+                    "{kv:?}: logits"
+                );
             }
             eprintln!("fusion, {kv:?}: traced = eager, tokens {:?}", got.tokens);
         }

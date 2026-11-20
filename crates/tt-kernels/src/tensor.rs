@@ -3043,6 +3043,29 @@ pub(crate) fn note_measured(
     measurements().insert(q, (choice, times));
 }
 
+/// Every candidate a measurement timed, with its time in us (the first time where it was timed
+/// again), and the candidates that did not capture: what a choice was made from.
+pub type Trials = (Vec<(BlockChoice, f64)>, Vec<BlockChoice>);
+
+fn trials() -> std::sync::MutexGuard<'static, std::collections::HashMap<BlockQuestion, Trials>> {
+    static TRIALS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<BlockQuestion, Trials>>,
+    > = std::sync::OnceLock::new();
+    TRIALS.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Keep what `q`'s measurement timed ([`measured_trials`]).
+pub(crate) fn note_trials(q: BlockQuestion, t: Trials) {
+    trials().insert(q, t);
+}
+
+/// What `q`'s measurement timed in this process, if it was measured: which candidates a choice
+/// saw is a matter of the times (a climb follows them), so a block chosen in one context and
+/// not another is told apart here (reached and slower, or never reached).
+pub fn measured_trials(q: &BlockQuestion) -> Option<Trials> {
+    trials().get(q).cloned()
+}
+
 /// Every question measured in this process, its choice, and `[Auto's, the choice's]` times, us.
 pub fn measured() -> Vec<(BlockQuestion, Option<BlockChoice>, Option<[f64; 2]>)> {
     measurements()
@@ -3054,6 +3077,7 @@ pub fn measured() -> Vec<(BlockQuestion, Option<BlockChoice>, Option<[f64; 2]>)>
 /// Forget every measurement: a gate's, to measure again.
 pub fn forget_measured() {
     measurements().clear();
+    trials().clear();
 }
 
 /// The question of a `[mt, kt, nt]`-tile product whose other paths are `[mc, kc, nc]` chunks
@@ -3159,7 +3183,12 @@ pub const SHORT_ROWS: usize = 8;
 /// of [`MEASURED_BLOCKS`] is four rows or more, so at 64 rows none fitted and only
 /// `Auto`'s block and a climb from it were timed: the climb stops at `K` chunks of 4-5 where these
 /// stream 8-16, and a 1.7B layer's four 64-row products ran 835 us against these blocks' 691.
-pub const SHORT_MEASURED_BLOCKS: [([usize; 3], bool); 11] = [
+/// Re-swept at the performance contract (BF16 `A`, BFP8 `B`, HiFi2; every block a climb can reach,
+/// `silicon_probe_performance_contract::prefill_map`, card 0, 2026-11-17, `1794928260`-`1794938195`):
+/// the 1.7B's eight products at 128 and 256 rows chose within 2% of their sweep's best but the
+/// 256-row `gate|up`, `[8,4,8]` at 276 us against `[4,8,9]` pulled at 252.6; `[4,4,9]` pulled is
+/// listed, and a climb from it stops at `K` chunks of 5 and 6, which gain nothing.
+pub const SHORT_MEASURED_BLOCKS: [([usize; 3], bool); 12] = [
     ([2, 8, 9], false),
     ([2, 16, 3], false),
     ([1, 16, 2], false),
@@ -3171,6 +3200,7 @@ pub const SHORT_MEASURED_BLOCKS: [([usize; 3], bool); 11] = [
     ([4, 8, 4], false),
     ([4, 4, 10], false),
     ([4, 4, 9], true),
+    ([4, 8, 9], true),
 ];
 
 /// The sides and `K` chunks a measured climb steps between ([`block_stream_neighbours`]).

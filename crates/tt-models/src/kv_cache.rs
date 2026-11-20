@@ -177,12 +177,16 @@ impl<B: Backend> FixedCache<B> {
 
     /// Every state tensor through `f` (a cache stored in another format: the same shapes).
     pub fn map_state(mut self, f: impl Fn(Tensor<B, 4>) -> Tensor<B, 4>) -> Self {
-        self.state = self.state.into_iter().map(|t| {
-            let dims = t.dims();
-            let t = f(t);
-            assert_eq!(t.dims(), dims, "the cache's shape");
-            t
-        }).collect();
+        self.state = self
+            .state
+            .into_iter()
+            .map(|t| {
+                let dims = t.dims();
+                let t = f(t);
+                assert_eq!(t.dims(), dims, "the cache's shape");
+                t
+            })
+            .collect();
         self
     }
 

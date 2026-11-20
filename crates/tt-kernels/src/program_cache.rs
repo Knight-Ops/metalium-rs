@@ -45,8 +45,184 @@ pub struct CacheStats {
     pub misses: u64,
     pub bytes_uploaded: u64,
     pub evictions: u64,
+    /// Evictions of programs some trace held: each costs that trace a restore at its next replay.
+    pub held_evictions: u64,
+    /// Their bytes.
+    pub held_evicted_bytes: u64,
     /// Programs too large to admit.
     pub bypassed: u64,
+}
+
+/// What a placement or a restore did, as an [`Event`] records it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Outcome {
+    Hit(u64),
+    Upload(u64),
+    Bypass,
+    Full,
+}
+
+impl Outcome {
+    fn of(r: &Result<Placed, CacheError>) -> Self {
+        match r {
+            Ok(Placed::Hit(at)) => Outcome::Hit(*at),
+            Ok(Placed::Upload(at)) => Outcome::Upload(*at),
+            Ok(Placed::Bypass) => Outcome::Bypass,
+            Err(CacheError::Full { .. }) => Outcome::Full,
+        }
+    }
+}
+
+/// One call a cache took, recorded while [`ProgramCache::set_log`] is on (what a failed build of
+/// `silicon_bench_models` writes, `TT_GEN_PROGRAM_LOG`). Programs are named by their [`hash`] and
+/// word count.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Event {
+    Place {
+        hash: u64,
+        words: u32,
+        held_too: bool,
+        result: Outcome,
+    },
+    Restore {
+        hash: u64,
+        words: u32,
+        at: u64,
+        evict: bool,
+        result: Outcome,
+    },
+    Hold {
+        hash: u64,
+        at: u64,
+    },
+    Release {
+        hash: u64,
+        at: u64,
+    },
+    Protect {
+        hash: u64,
+        at: u64,
+    },
+    UnprotectAll,
+    UnpinAll,
+    ClearUnheld,
+    Clear,
+    /// A program resident when logging began, as it was: the state the log starts from, least
+    /// recently used first (the order eviction takes them in).
+    Resident {
+        hash: u64,
+        words: u32,
+        at: u64,
+        held: u32,
+        protected: bool,
+        pinned: bool,
+    },
+}
+
+impl Event {
+    /// One line of tab-separated fields: the kind, then its fields in order ([`Event::parse`]).
+    pub fn line(&self) -> String {
+        let o = |r: &Outcome| match r {
+            Outcome::Hit(at) => format!("hit\t{at}"),
+            Outcome::Upload(at) => format!("upload\t{at}"),
+            Outcome::Bypass => "bypass\t0".into(),
+            Outcome::Full => "full\t0".into(),
+        };
+        match self {
+            Event::Place {
+                hash,
+                words,
+                held_too,
+                result,
+            } => format!("place\t{hash}\t{words}\t{}\t{}", *held_too as u8, o(result)),
+            Event::Restore {
+                hash,
+                words,
+                at,
+                evict,
+                result,
+            } => format!(
+                "restore\t{hash}\t{words}\t{at}\t{}\t{}",
+                *evict as u8,
+                o(result)
+            ),
+            Event::Hold { hash, at } => format!("hold\t{hash}\t{at}"),
+            Event::Release { hash, at } => format!("release\t{hash}\t{at}"),
+            Event::Protect { hash, at } => format!("protect\t{hash}\t{at}"),
+            Event::UnprotectAll => "unprotect_all".into(),
+            Event::UnpinAll => "unpin_all".into(),
+            Event::ClearUnheld => "clear_unheld".into(),
+            Event::Clear => "clear".into(),
+            Event::Resident {
+                hash,
+                words,
+                at,
+                held,
+                protected,
+                pinned,
+            } => format!(
+                "resident\t{hash}\t{words}\t{at}\t{held}\t{}\t{}",
+                *protected as u8, *pinned as u8
+            ),
+        }
+    }
+
+    /// The event [`Event::line`] wrote, if `line` is one.
+    pub fn parse(line: &str) -> Option<Event> {
+        let f: Vec<&str> = line.split('\t').collect();
+        let n = |i: usize| f.get(i)?.parse::<u64>().ok();
+        let b = |i: usize| Some(n(i)? != 0);
+        let o = |i: usize| {
+            let at = n(i + 1)?;
+            Some(match *f.get(i)? {
+                "hit" => Outcome::Hit(at),
+                "upload" => Outcome::Upload(at),
+                "bypass" => Outcome::Bypass,
+                "full" => Outcome::Full,
+                _ => return None,
+            })
+        };
+        Some(match *f.first()? {
+            "place" => Event::Place {
+                hash: n(1)?,
+                words: n(2)? as u32,
+                held_too: b(3)?,
+                result: o(4)?,
+            },
+            "restore" => Event::Restore {
+                hash: n(1)?,
+                words: n(2)? as u32,
+                at: n(3)?,
+                evict: b(4)?,
+                result: o(5)?,
+            },
+            "hold" => Event::Hold {
+                hash: n(1)?,
+                at: n(2)?,
+            },
+            "release" => Event::Release {
+                hash: n(1)?,
+                at: n(2)?,
+            },
+            "protect" => Event::Protect {
+                hash: n(1)?,
+                at: n(2)?,
+            },
+            "unprotect_all" => Event::UnprotectAll,
+            "unpin_all" => Event::UnpinAll,
+            "clear_unheld" => Event::ClearUnheld,
+            "clear" => Event::Clear,
+            "resident" => Event::Resident {
+                hash: n(1)?,
+                words: n(2)? as u32,
+                at: n(3)?,
+                held: n(4)? as u32,
+                protected: b(5)?,
+                pinned: b(6)?,
+            },
+            _ => return None,
+        })
+    }
 }
 
 /// Where a program is, and whether the caller must write it there.
@@ -95,6 +271,8 @@ pub struct ProgramCache {
     /// Moved on whenever a program may have left or lost its holds (an eviction, a
     /// release, a clear): a trace restored at the same count needs no restoring.
     changes: u64,
+    /// Every call, while logging ([`ProgramCache::set_log`]).
+    log: Option<Vec<Event>>,
 }
 
 /// Is a role program of `words` words cached on a tile, rather than run from
@@ -129,7 +307,53 @@ impl ProgramCache {
             stats: CacheStats::default(),
             clears: 0,
             changes: 0,
+            log: None,
         }
+    }
+
+    /// Record every call from now on ([`Event`]), or stop and drop what was recorded. A log
+    /// begun on a cache that holds programs starts with them ([`Event::Resident`]).
+    pub fn set_log(&mut self, on: bool) {
+        self.log = match (on, self.log.take()) {
+            (false, _) => None,
+            (true, Some(log)) => Some(log),
+            (true, None) => {
+                let mut by_use: Vec<&Resident> = self.resident.iter().collect();
+                by_use.sort_by_key(|r| r.last_use);
+                Some(
+                    by_use
+                        .into_iter()
+                        .map(|r| Event::Resident {
+                            hash: r.hash,
+                            words: r.words.len() as u32,
+                            at: r.at,
+                            held: r.held,
+                            protected: r.protected,
+                            pinned: r.pinned,
+                        })
+                        .collect(),
+                )
+            }
+        };
+    }
+
+    /// What was recorded since the last take, emptied (logging stays as it was).
+    pub fn take_log(&mut self) -> Vec<Event> {
+        self.log.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    fn note(&mut self, event: impl FnOnce(&Self) -> Event) {
+        if let Some(mut log) = self.log.take() {
+            log.push(event(self));
+            self.log = Some(log);
+        }
+    }
+
+    fn hash_at(&self, at: u64) -> u64 {
+        self.resident
+            .iter()
+            .find(|r| r.at == at)
+            .map_or(0, |r| r.hash)
     }
 
     /// Will a program of `words` words be cached rather than bypassed?
@@ -164,6 +388,22 @@ impl ProgramCache {
         h: u64,
         held_too: bool,
     ) -> Result<Placed, CacheError> {
+        let r = self.place_inner(words, h, held_too);
+        self.note(|_| Event::Place {
+            hash: h,
+            words: words.len() as u32,
+            held_too,
+            result: Outcome::of(&r),
+        });
+        r
+    }
+
+    fn place_inner(
+        &mut self,
+        words: &Arc<[u32]>,
+        h: u64,
+        held_too: bool,
+    ) -> Result<Placed, CacheError> {
         if !self.admits(words.len()) {
             self.stats.bypassed += 1;
             return Ok(Placed::Bypass);
@@ -182,26 +422,8 @@ impl ProgramCache {
             return Ok(Placed::Hit(r.at));
         }
         let bytes = (words.len() as u64 * 4).next_multiple_of(ALIGN);
-        let at = loop {
-            if let Some((&at, _)) = self.free.iter().find(|(_, &len)| len >= bytes) {
-                break at;
-            }
-            // Evict the least recently used program nothing in flight names and the
-            // capture in progress does not hold, those no trace holds first.
-            let victim = self
-                .resident
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| !r.pinned && !r.protected && (r.held == 0 || held_too))
-                .min_by_key(|(_, r)| (r.held > 0, r.last_use))
-                .map(|(i, _)| i)
-                .ok_or(CacheError::Full { bytes })?;
-            self.evict(victim);
-        };
-        let len = self.free.remove(&at).expect("found above");
-        if len > bytes {
-            self.free.insert(at + bytes, len - bytes);
-        }
+        let at = self.free_run(bytes, held_too)?;
+        self.carve(at, bytes);
         self.resident.push(Resident {
             words: words.clone(),
             hash: h,
@@ -218,6 +440,60 @@ impl ProgramCache {
         self.stats.misses += 1;
         self.stats.bytes_uploaded += words.len() as u64 * 4;
         Ok(Placed::Upload(at))
+    }
+
+    /// The lowest free run of `bytes`, after evicting the least recently used programs
+    /// nothing in flight names and the capture in progress does not hold (those no trace holds
+    /// first) until one fits.
+    fn free_run(&mut self, bytes: u64, held_too: bool) -> Result<u64, CacheError> {
+        loop {
+            if let Some((&at, _)) = self.free.iter().find(|(_, &len)| len >= bytes) {
+                return Ok(at);
+            }
+            let victim = self
+                .resident
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.pinned && !r.protected && (r.held == 0 || held_too))
+                .min_by_key(|(_, r)| (r.held > 0, r.last_use))
+                .map(|(i, _)| i)
+                .ok_or(CacheError::Full { bytes })?;
+            self.evict(victim);
+        }
+    }
+
+    /// Evict every resident across `[at, at + bytes)`.
+    fn evict_across(&mut self, at: u64, bytes: u64) {
+        let across = |r: &Resident| {
+            let len = (r.words.len() as u64 * 4).next_multiple_of(ALIGN);
+            r.at < at + bytes && at < r.at + len
+        };
+        // Highest index first: each eviction moves the last resident into its index, which is
+        // then never one still to evict.
+        let mut evicted: Vec<usize> = (0..self.resident.len())
+            .filter(|&i| across(&self.resident[i]))
+            .collect();
+        evicted.sort_unstable_by(|a, b| b.cmp(a));
+        for i in evicted {
+            self.evict(i);
+        }
+    }
+
+    /// Take `[at, at + bytes)` out of the free range that holds it.
+    fn carve(&mut self, at: u64, bytes: u64) {
+        let (&start, &len) = self
+            .free
+            .range(..=at)
+            .next_back()
+            .filter(|(&s, &l)| s + l >= at + bytes)
+            .expect("the bytes are free");
+        self.free.remove(&start);
+        if at > start {
+            self.free.insert(start, at - start);
+        }
+        if start + len > at + bytes {
+            self.free.insert(at + bytes, start + len - at - bytes);
+        }
     }
 
     /// Evict resident `i`. The last resident takes its index, and the hash index is mended for
@@ -243,6 +519,10 @@ impl ProgramCache {
         let bytes = (r.words.len() as u64 * 4).next_multiple_of(ALIGN);
         release(&mut self.free, r.at, bytes);
         self.stats.evictions += 1;
+        if r.held > 0 {
+            self.stats.held_evictions += 1;
+            self.stats.held_evicted_bytes += bytes;
+        }
         self.changes += 1;
     }
 
@@ -250,6 +530,10 @@ impl ProgramCache {
     /// placed after it, until [`ProgramCache::release`]. Returns whether one
     /// is there.
     pub fn hold(&mut self, at: u64) -> bool {
+        self.note(|c| Event::Hold {
+            hash: c.hash_at(at),
+            at,
+        });
         match self.resident.iter_mut().find(|r| r.at == at) {
             Some(r) => {
                 r.held += 1;
@@ -275,6 +559,10 @@ impl ProgramCache {
 
     /// One trace no longer names the program at `at`.
     pub fn release(&mut self, at: u64) {
+        self.note(|c| Event::Release {
+            hash: c.hash_at(at),
+            at,
+        });
         if let Some(r) = self.resident.iter_mut().find(|r| r.at == at) {
             r.held = r.held.saturating_sub(1);
             self.changes += 1;
@@ -290,6 +578,10 @@ impl ProgramCache {
     /// The capture in progress holds the program at `at`: it stays until
     /// [`ProgramCache::unprotect_all`].
     pub fn protect(&mut self, at: u64) {
+        self.note(|c| Event::Protect {
+            hash: c.hash_at(at),
+            at,
+        });
         if let Some(r) = self.resident.iter_mut().find(|r| r.at == at) {
             r.protected = true;
         }
@@ -297,6 +589,7 @@ impl ProgramCache {
 
     /// The capture ended: its programs are held as any trace's are.
     pub fn unprotect_all(&mut self) {
+        self.note(|_| Event::UnprotectAll);
         for r in &mut self.resident {
             r.protected = false;
         }
@@ -316,6 +609,24 @@ impl ProgramCache {
     /// [`CacheError::Full`] if a pinned or protected program lies across them, or any does and
     /// not `evict` (a queued replay may run it: the caller drains first).
     pub fn restore(
+        &mut self,
+        words: &Arc<[u32]>,
+        h: u64,
+        at: u64,
+        evict: bool,
+    ) -> Result<Placed, CacheError> {
+        let r = self.restore_inner(words, h, at, evict);
+        self.note(|_| Event::Restore {
+            hash: h,
+            words: words.len() as u32,
+            at,
+            evict,
+            result: Outcome::of(&r),
+        });
+        r
+    }
+
+    fn restore_inner(
         &mut self,
         words: &Arc<[u32]>,
         h: u64,
@@ -353,29 +664,9 @@ impl ProgramCache {
         {
             return Err(CacheError::Full { bytes });
         }
-        // Highest index first: each eviction moves the last resident into its index, which is
-        // then never one still to evict.
-        let mut evicted: Vec<usize> = (0..self.resident.len())
-            .filter(|&i| across(&self.resident[i]))
-            .collect();
-        evicted.sort_unstable_by(|a, b| b.cmp(a));
-        for i in evicted {
-            self.evict(i);
-        }
-        // Every byte across it is free now, in one coalesced range.
-        let (&start, &len) = self
-            .free
-            .range(..=at)
-            .next_back()
-            .filter(|(&s, &l)| s + l >= at + bytes)
-            .expect("the evicted bytes are free");
-        self.free.remove(&start);
-        if at > start {
-            self.free.insert(start, at - start);
-        }
-        if start + len > at + bytes {
-            self.free.insert(at + bytes, start + len - at - bytes);
-        }
+        // Every byte across it is free then, in one coalesced range.
+        self.evict_across(at, bytes);
+        self.carve(at, bytes);
         self.resident.push(Resident {
             words: words.clone(),
             hash: h,
@@ -396,6 +687,7 @@ impl ProgramCache {
 
     /// Nothing in flight names any program any more.
     pub fn unpin_all(&mut self) {
+        self.note(|_| Event::UnpinAll);
         for r in &mut self.resident {
             r.pinned = false;
         }
@@ -404,19 +696,34 @@ impl ProgramCache {
     /// Evict everything no trace holds: room made at once, as
     /// [`ProgramCache::clear`] would, but for the programs a trace names.
     pub fn clear_unheld(&mut self) {
+        self.note(|_| Event::ClearUnheld);
         while let Some(i) = self.resident.iter().position(|r| r.held == 0) {
             self.evict(i);
         }
     }
 
+    /// [`ProgramCache::clear`], over `region` from now on: a gate's smaller cache. Its counters go
+    /// on (a trace's holds and restore stamp name the cache's earlier life, so it restores).
+    pub fn resize(&mut self, region: Region) {
+        self.clear();
+        let mut resized = ProgramCache::new(region);
+        resized.stats = self.stats;
+        (resized.clears, resized.changes) = (self.clears, self.changes);
+        resized.log = self.log.take();
+        *self = resized;
+    }
+
     /// Forget everything: the tile was reset, and what is in its L1 is no
     /// longer the host's to vouch for.
     pub fn clear(&mut self) {
+        self.note(|_| Event::Clear);
         let (stats, clears, changes) = (self.stats, self.clears + 1, self.changes + 1);
+        let log = self.log.take();
         *self = ProgramCache::new(self.region);
         self.stats = stats;
         self.clears = clears;
         self.changes = changes;
+        self.log = log;
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -807,6 +1114,96 @@ mod tests {
             panic!("room after it")
         };
         assert!(other >= at + 256 || other + 256 <= at);
+    }
+
+    /// A 4 KiB cache whose even 256-byte slots another trace holds and whose odd ones are free,
+    /// then a capture of eight 256-byte programs, each protected as it lands.
+    fn fragmented_capture(log: bool) -> ProgramCache {
+        let mut c = ProgramCache::new(region(0x1000));
+        c.set_log(log);
+        let mut slots = Vec::new();
+        for t in 0..16 {
+            let Ok(Placed::Upload(at)) = c.place(&prog(t, 64)) else {
+                panic!("the cache fills in order")
+            };
+            slots.push(at);
+        }
+        for &at in slots.iter().step_by(2) {
+            c.hold(at);
+        }
+        c.unpin_all();
+        c.clear_unheld();
+        for t in 100..108 {
+            let w: Arc<[u32]> = prog(t, 64).into();
+            let at = match c.place_hashed_evicting(&w, hash(&w), true) {
+                Ok(Placed::Upload(at)) => at,
+                other => panic!("placed: {other:?}"),
+            };
+            c.hold(at);
+            c.protect(at);
+        }
+        c
+    }
+
+    /// First fit puts a capture in the gaps held programs leave: nothing larger than one slot is
+    /// left beside it, and no held program is evicted. (Packing it instead, at the cost of the
+    /// held programs under it, lost on the card: `docs/learnings/failed-approaches.md`.)
+    #[test]
+    fn first_fit_places_a_capture_in_the_gaps_held_programs_leave() {
+        let c = fragmented_capture(false);
+        assert_eq!(c.room().largest, 256);
+        assert_eq!(c.stats().held_evictions, 0);
+    }
+
+    /// A log begun on a cache that already holds programs starts with them, least recently used
+    /// first (the order eviction takes them in), each with its holds.
+    #[test]
+    fn a_log_begun_mid_life_starts_with_the_residents() {
+        let mut c = fragmented_capture(false);
+        c.unprotect_all();
+        c.unpin_all();
+        // Recency against address order: the highest-addressed programs used longest ago.
+        let order: Vec<u32> = (0..16).step_by(2).rev().chain((100..108).rev()).collect();
+        for &t in &order {
+            let w: Arc<[u32]> = prog(t, 64).into();
+            assert!(matches!(c.place_hashed(&w, hash(&w)), Ok(Placed::Hit(_))));
+        }
+        c.unpin_all();
+        c.set_log(true);
+        let residents: Vec<_> = c
+            .take_log()
+            .into_iter()
+            .map(|e| match e {
+                Event::Resident {
+                    hash,
+                    held,
+                    protected,
+                    pinned,
+                    ..
+                } => (hash, held, protected, pinned),
+                other => panic!("only residents: {other:?}"),
+            })
+            .collect();
+        let want: Vec<_> = order
+            .iter()
+            .map(|&t| (hash(&prog(t, 64)), 1, false, false))
+            .collect();
+        assert_eq!(residents, want);
+    }
+
+    #[test]
+    fn a_log_reads_back() {
+        let mut c = fragmented_capture(true);
+        c.unprotect_all();
+        let w: Arc<[u32]> = prog(0, 64).into();
+        let at = c.resident_at(0x14_1000).map(|_| 0x14_1000).unwrap();
+        assert_eq!(c.restore(&w, hash(&w), at, true), Ok(Placed::Hit(at)));
+        let log = c.take_log();
+        assert!(c.take_log().is_empty(), "taken");
+        for e in &log {
+            assert_eq!(Event::parse(&e.line()).as_ref(), Some(e), "{}", e.line());
+        }
+        assert_eq!(Event::parse("bogus\t1"), None);
     }
 }
 

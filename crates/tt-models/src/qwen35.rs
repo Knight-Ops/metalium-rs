@@ -1068,10 +1068,11 @@ pub struct Qwen35<B: Backend> {
 #[derive(Clone)]
 struct KvStore {
     format: burn_tt::storage::BfpFormat,
-    store: std::sync::Arc<
-        dyn Fn(Box<dyn std::any::Any>) -> Box<dyn std::any::Any> + Send + Sync,
-    >,
+    store: std::sync::Arc<StoreFn>,
 }
+
+/// A tensor in, the same tensor stored in the format out, the backend erased.
+type StoreFn = dyn Fn(Box<dyn std::any::Any>) -> Box<dyn std::any::Any> + Send + Sync;
 
 impl std::fmt::Debug for KvStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -419,6 +419,12 @@ Detail: [prefill-operand-reuse.md](../plans/prefill-operand-reuse.md), [long-con
 - **`A`'s reads inline beside a weight read by column** (W2, 2026-11-15, record test, `step229`, `step274`,
   [log](../learnings/performance-log.md#w2-as-reads-inline-beside-a-weight-read-by-column-2026-11-15-card-0)): H1
   multicast 79.7 / 96.2 TFLOPS (+1.0 / +1.5%), default 70.2 / 99.2; the 1.7B unchanged.
+- **The KV cache's chunk write as whole tiles** (W2, 2026-11-17, record test, `step189`, card 0 `1794879638`,
+  [log](../learnings/performance-log.md#w2-the-kv-caches-chunk-write-as-whole-tiles-2026-11-17-card-0)): a
+  32-index batch that is one tile row is written as tiles, decided on the card each replay. A layer's write 192.6 /
+  377.3 -> 29.3 / 48.8 us at 128 / 256 tokens; the 1.7B's prefill 1.11 / 1.15 / 1.18x at 32 / 128 / 256 tokens,
+  **4,573 tokens/s at 128**; decode unchanged. A measured choice now skips a candidate that does not capture
+  instead of leaving the whole product on `Auto`'s block.
 
 - **No 1.7B prefill regression** (2026-11-09, `1794260351`, [log](../learnings/performance-log.md#w1-bounded-the-performance-contract-on-this-stack-before-any-plumbing-2026-11-09-cards-0-and-1)): `traced_generation` reads 1,098 / 3,084 /
   3,890 tokens/s at 32 / 128 / 256 tokens, against H15's 3,827 at 256. The ~2,090 quoted since 2026-11-03 were

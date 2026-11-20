@@ -686,8 +686,13 @@ impl TtTensor {
                         && v.src.buffer.storage != crate::storage::StorageFormat::Bf16
                     {
                         let src = &v.src.buffer;
-                        let (id, dims) =
-                            server::cast_bfp(self.device, src.id, [src.rows, src.cols], None, false);
+                        let (id, dims) = server::cast_bfp(
+                            self.device,
+                            src.id,
+                            [src.rows, src.cols],
+                            None,
+                            false,
+                        );
                         decoded = Strided {
                             src: DramRef {
                                 buffer: Arc::new(Buffer {

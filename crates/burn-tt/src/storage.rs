@@ -212,7 +212,10 @@ impl StorageBackend for burn_fusion::Fusion<TtBackend> {
     fn with_storage(t: Self::FloatTensorPrimitive, f: StorageFormat) -> Self::FloatTensorPrimitive {
         fusion_stored(t, |native| native.with_storage(f))
     }
-    fn with_row_storage(t: Self::FloatTensorPrimitive, f: StorageFormat) -> Self::FloatTensorPrimitive {
+    fn with_row_storage(
+        t: Self::FloatTensorPrimitive,
+        f: StorageFormat,
+    ) -> Self::FloatTensorPrimitive {
         fusion_stored(t, |native| native.with_row_storage(f))
     }
     fn storage_format(t: &Self::FloatTensorPrimitive) -> StorageFormat {

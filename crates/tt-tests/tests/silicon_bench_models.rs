@@ -362,6 +362,32 @@ fn print_measured(key: &str) {
             "MEASURE {key}: measured {:?} {:?} on {}: {choice:?}; {times}",
             q.tiles, q.transposed, q.units
         );
+        // `TT_GEN_MEASURED_TRIALS=1`: every candidate the measurement timed, fastest first.
+        if std::env::var("TT_GEN_MEASURED_TRIALS").is_ok_and(|v| v == "1") {
+            if let Some((mut timed, refused)) = tt_kernels::tensor::measured_trials(&q) {
+                timed.sort_by(|x, y| x.1.total_cmp(&y.1));
+                let list: Vec<String> = timed
+                    .iter()
+                    .map(|(c, us)| format!("{:?}{} {us:.1}", c.block, reuse_tag(c.reuse)))
+                    .collect();
+                println!(
+                    "MEASURE {key}: trials {:?}: {} timed: {}; {} refused",
+                    q.tiles,
+                    timed.len(),
+                    list.join(", "),
+                    refused.len()
+                );
+            }
+        }
+    }
+}
+
+/// A candidate's operand reuse, short: empty for none.
+fn reuse_tag(r: tt_kernels::tensor::Reuse) -> &'static str {
+    match r {
+        tt_kernels::tensor::Reuse::Off => "",
+        tt_kernels::tensor::Reuse::Pull { .. } => " pull",
+        _ => " other",
     }
 }
 
@@ -878,7 +904,7 @@ fn smollm2_decode_with_the_embedding_lookup() {
 ///
 /// Two things are measured:
 /// 1. **What the traces cost together:** the step and the chunks (`TT_GEN_BUCKETS`, default
-///    `64,128,256`) over a cache of `TT_GEN_MAX_LEN` positions (default 512), captured in one
+///    the cache's, `Shapes::for_cache`: `64,128,256` at 512) over a cache of `TT_GEN_MAX_LEN` positions (default 512), captured in one
 ///    attachment. The report gives the program-cache bytes held on the fullest unit and the trace
 ///    streams' GDDR bytes. A capture that does not fit fails its attachment for good, so the bench
 ///    then stops and names the sizes.
@@ -973,9 +999,11 @@ fn traced_generation() {
             );
         }
     }
+    // The chunk sizes a prompt is fed in (`TT_GEN_BUCKETS`; default the cache's,
+    // `Shapes::for_cache`).
     let buckets: Vec<usize> = std::env::var("TT_GEN_BUCKETS")
         .map(|v| v.split(',').map(|b| b.trim().parse().unwrap()).collect())
-        .unwrap_or_else(|_| vec![64, 128, 256]);
+        .unwrap_or_else(|_| tt_models::generate::Shapes::for_cache(max_len).chunks);
     let run = GenRun {
         name,
         config,
@@ -1519,7 +1547,8 @@ fn traced_generation_on<B: tt_models::generate::TracedBackend>(
 /// could stay in L1 between ops; `docs/completed-plans/planned-l1-residency.md` Phase 1).
 ///
 /// The model is `TT_GEN_MODEL` (default SmolLM2-1.7B-Instruct), over a `TT_GEN_MAX_LEN`-position
-/// cache with 64-token chunks (or the comma-separated `TT_GEN_CHUNKS`); prompts of 32 and 256
+/// cache with the cache's default chunks (`Shapes::for_cache`, or the comma-separated
+/// `TT_GEN_CHUNKS`); prompts of 32 and 256
 /// tokens (or the comma-separated `TT_GEN_PROMPTS`), `TT_GEN_NEW` tokens each, each timed for its
 /// prefill and its median decode step over `TT_GEN_SAMPLES` samples (default 9). Chunks attend to
 /// the step lengths (or the comma-separated `TT_GEN_PREFIXES`, `none` for the whole cache).
@@ -1691,10 +1720,38 @@ fn traced_generation_stream_ceiling() {
         );
         let (m, _) = Llama::<burn_tt::Tt>::pretrained(&config, &name, Precision::F32, &d).unwrap();
         let m = bench_model(m, true);
-        // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`, default 64).
-        let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or(vec![64], |v| {
-            v.split(',').map(|n| n.trim().parse().unwrap()).collect()
-        });
+        // `TT_GEN_PROGRAM_LOG=<file>`: every unit's program cache calls through the builds and the
+        // generations, one `unit<TAB>event` a line (`tt_kernels::program_cache::Event`): what
+        // placed, evicted and refused each program.
+        let program_log = std::env::var("TT_GEN_PROGRAM_LOG").ok();
+        if program_log.is_some() {
+            burn_tt::probe_program_log(d, true).unwrap();
+        }
+        // Written at the end, and where a build fails (the refusal, with what led to it).
+        let write_log = || {
+            let Some(path) = &program_log else {
+                return;
+            };
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            for (u, events) in burn_tt::probe_program_log(d, false)
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
+                for e in events {
+                    let _ = writeln!(out, "{u}\t{}", e.line());
+                }
+            }
+            std::fs::write(path, out).unwrap();
+            println!("PROGRAM LOG written to {path}");
+        };
+        // The chunk sizes a prompt is fed in (`TT_GEN_CHUNKS`; default the cache's,
+        // `Shapes::for_cache`).
+        let chunks: Vec<usize> = std::env::var("TT_GEN_CHUNKS").map_or_else(
+            |_| Shapes::for_cache(max_len).chunks,
+            |v| v.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+        );
         // The lengths a chunk attends to (`TT_GEN_PREFIXES`, comma-separated; `none` for the
         // whole cache, as before `docs/plans/long-context.md` D2; default the step lengths).
         let shapes = match std::env::var("TT_GEN_PREFIXES").as_deref() {
@@ -1710,7 +1767,13 @@ fn traced_generation_stream_ceiling() {
         // `docs/completed-plans/planned-l1-residency.md` 2h).
         let build = |what: &str| {
             let t = std::time::Instant::now();
-            let g = TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap();
+            let g = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                TracedGenerator::<_, burn_tt::Tt>::new(&m, &shapes, &d).unwrap()
+            }))
+            .unwrap_or_else(|p| {
+                write_log();
+                std::panic::resume_unwind(p)
+            });
             report(
                 &format!("{name} stream ceiling ({tag}), {what} build"),
                 "ms",
@@ -1746,11 +1809,12 @@ fn traced_generation_stream_ceiling() {
         let samples = env("TT_GEN_SAMPLES", SAMPLES);
         for len in prompts {
             let p = gen_prompt(len, config.vocab);
-            let (mut prefill, mut step) = (Vec::new(), Vec::new());
+            let (mut prefill, mut step, mut restored) = (Vec::new(), Vec::new(), Vec::new());
             // Every generation's tokens, against the first's: a schedule that changes them fails
             // here, and the digest compares runs (a probe against its baseline) bit for bit.
             let mut first: Option<Vec<i32>> = None;
             for i in 0..WARMUPS + samples {
+                let r0 = burn_tt::probe_restored_bytes(d).unwrap();
                 // With `TT_PROBE_NC_WAITS=1`, NC's waits over one measured generation (firmware
                 // built with the profile feature): what B's waits for its writer are made of.
                 let nc_waits = nc_waits && i == WARMUPS;
@@ -1768,6 +1832,10 @@ fn traced_generation_stream_ceiling() {
                 if i >= WARMUPS {
                     prefill.push(ms(out.times[0]));
                     step.push(median_ms(&out.times[1..]));
+                    // Program bytes the generation's replays put back (host and B movers): what
+                    // the traces' layout in the program caches costs it.
+                    let r1 = burn_tt::probe_restored_bytes(d).unwrap();
+                    restored.push((r1.0 - r0.0 + r1.1 - r0.1) as f64);
                 }
             }
             let tokens = first.unwrap_or_default();
@@ -1802,7 +1870,16 @@ fn traced_generation_stream_ceiling() {
                 "host",
                 Stats::of(step),
             );
+            report(
+                &format!(
+                    "{name} stream ceiling ({tag}), {len}-token prompt, restored program bytes"
+                ),
+                "bytes",
+                "host",
+                Stats::of(restored),
+            );
         }
+        write_log();
         // In the device's process (a fork), where the probe counted.
         if contiguous.is_some() {
             let [moved, ahead] = tt_kernels::tensor::probe_contiguous_b_bytes();

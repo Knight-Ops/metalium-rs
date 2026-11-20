@@ -656,6 +656,13 @@ pub trait Engine {
     fn probe_restored_bytes(&mut self) -> Result<(u64, u64), TtError> {
         Err(no_traces())
     }
+    /// What every unit's program cache recorded since the last call, then logging on or off.
+    fn probe_program_log(
+        &mut self,
+        _on: bool,
+    ) -> Result<Vec<Vec<tt_kernels::program_cache::Event>>, TtError> {
+        Err(no_traces())
+    }
     /// Overwrite `input`'s values, replay `trace`, and read `output` back:
     /// one round trip.
     fn run_trace(
@@ -4791,6 +4798,14 @@ impl Engine for KmdEngine {
             self.session.restored_bytes(),
             self.session.mover_restored_bytes(),
         ))
+    }
+    fn probe_program_log(
+        &mut self,
+        on: bool,
+    ) -> Result<Vec<Vec<tt_kernels::program_cache::Event>>, TtError> {
+        let log = self.session.take_program_log();
+        self.session.set_program_log(on);
+        Ok(log)
     }
     fn has_pending_plan(&mut self) -> Result<bool, TtError> {
         Ok(self.session.has_pending_plan())
