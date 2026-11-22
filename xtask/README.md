@@ -8,7 +8,7 @@ and dependency-free: it shells out to `curl`, `sha256sum`, `rustfmt` and `cargo`
 
 | Task | What it does |
 |---|---|
-| `fetch-ttsim [--force]` | Pinned `libttsim_bh.so`, `_x2.so`, `_x4.so` into `vendor/`, SHA-256 verified. |
+| `fetch-ttsim [--force]` | This host's pinned `libttsim_bh*.so`, `_x2*.so`, `_x4*.so` into `vendor/`, SHA-256 verified: x86-64 by name, aarch64 with the release's `_aarch64` suffix. |
 | `fetch-spec [--force]` | Pinned tt-isa-documentation tree into `vendor/`, verified by content digest. |
 | `fetch-kmd [--force]` | Pinned tt-kmd `ioctl.h` into `vendor/` (the driver ABI `tt-kmd` binds). |
 | `fetch-mnist [--force]` | MNIST into `vendor/mnist/`, decompressed and hash-verified. |

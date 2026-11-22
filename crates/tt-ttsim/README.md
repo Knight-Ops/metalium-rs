@@ -13,15 +13,15 @@ every shippable crate's dependency graph.
 | `LibTtsim` (`transport`) | The `Transport`. Validates every access against a mirror of ttsim's decode map before calling, returning `TransportError` instead of letting ttsim `_Exit`. |
 | `fork_scope(f)` | Runs simulator work in a forked child, so a fatal ttsim error becomes a test failure that names the test. |
 | `outside_fork(f)` | Library work in the parent (a host reference, say) that must not overlap a fork. |
-| `default_lib_path`, `x2_lib_path`, `x4_lib_path` | Single, dual (P300) and four chip builds in `vendor/`. |
+| `default_lib_path`, `x2_lib_path`, `x4_lib_path` | Single, dual (P300) and four chip builds in `vendor/`, with this host's architecture suffix (none on x86-64, `_aarch64` on aarch64). |
 
 ## Environment
 
 | Variable | Overrides |
 |---|---|
-| `TT_TTSIM_LIB` | The single-chip library (default `vendor/libttsim_bh.so`) |
-| `TT_TTSIM_LIB_X2` | The dual-chip library (`vendor/libttsim_bh_x2.so`) |
-| `TT_TTSIM_LIB_X4` | The four-chip library (`vendor/libttsim_bh_x4.so`) |
+| `TT_TTSIM_LIB` | The single-chip library (default `vendor/libttsim_bh*.so` for this host) |
+| `TT_TTSIM_LIB_X2` | The dual-chip library (`vendor/libttsim_bh_x2*.so` for this host) |
+| `TT_TTSIM_LIB_X4` | The four-chip library (`vendor/libttsim_bh_x4*.so` for this host) |
 
 Pointing `TT_TTSIM_LIB_X2` at the single-chip build is how the multi-chip gates are
 checked for vacuity.

@@ -162,8 +162,8 @@ impl Simulator {
     /// Succeeds at most once per process; the second call returns
     /// [`OpenError::AlreadyOpen`] rather than letting `libttsim_init` abort.
     ///
-    /// The path comes from `$TT_TTSIM_LIB` if set, otherwise `vendor/libttsim_bh.so`
-    /// beside the workspace root.
+    /// The path comes from `$TT_TTSIM_LIB` if set, otherwise this host's pinned
+    /// `vendor/libttsim_bh*.so` beside the workspace root.
     pub fn open() -> Result<Self, OpenError> {
         match std::env::var_os(LIB_PATH_ENV) {
             Some(p) => Self::open_path(PathBuf::from(p)),
@@ -374,12 +374,25 @@ pub const fn expected_bar_base(bar: tt_device::Bar) -> u64 {
     }
 }
 
-/// Where `cargo xtask fetch-ttsim` puts the single-chip library.
-pub fn default_lib_path() -> PathBuf {
-    workspace_root().join("vendor").join("libttsim_bh.so")
+/// Suffix of this host's pinned ttsim asset: the x86-64 build has none, the
+/// aarch64 build is `<base>_aarch64.so`. The fetcher picks the same name from
+/// the pins in `PINS.toml`.
+fn lib_arch_suffix() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "_aarch64"
+    } else {
+        ""
+    }
 }
 
-/// The dual-chip (P300) build, overridable with [`LIB_PATH_ENV_X2`].
+/// Where `cargo xtask fetch-ttsim` puts the single-chip library for this host.
+pub fn default_lib_path() -> PathBuf {
+    workspace_root()
+        .join("vendor")
+        .join(format!("libttsim_bh{}.so", lib_arch_suffix()))
+}
+
+/// The dual-chip (P300) build for this host, overridable with [`LIB_PATH_ENV_X2`].
 ///
 /// A separate accessor rather than a `Simulator::open` argument because the
 /// choice is per test binary — the simulator is a process-wide singleton — and
@@ -388,15 +401,19 @@ pub fn default_lib_path() -> PathBuf {
 pub fn x2_lib_path() -> PathBuf {
     match std::env::var_os(LIB_PATH_ENV_X2) {
         Some(p) => PathBuf::from(p),
-        None => workspace_root().join("vendor").join("libttsim_bh_x2.so"),
+        None => workspace_root()
+            .join("vendor")
+            .join(format!("libttsim_bh_x2{}.so", lib_arch_suffix())),
     }
 }
 
-/// The four-chip build (two P300s), overridable with [`LIB_PATH_ENV_X4`].
+/// The four-chip build (two P300s) for this host, overridable with [`LIB_PATH_ENV_X4`].
 pub fn x4_lib_path() -> PathBuf {
     match std::env::var_os(LIB_PATH_ENV_X4) {
         Some(p) => PathBuf::from(p),
-        None => workspace_root().join("vendor").join("libttsim_bh_x4.so"),
+        None => workspace_root()
+            .join("vendor")
+            .join(format!("libttsim_bh_x4{}.so", lib_arch_suffix())),
     }
 }
 
