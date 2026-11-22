@@ -21,5 +21,5 @@ layer.
 ## Getting the library
 
 ```bash
-cargo xtask fetch-ttsim   # vendor/libttsim_bh.so, _x2.so, _x4.so, SHA-256 verified
+cargo xtask fetch-ttsim   # this host's vendor/libttsim_bh*.so, _x2*.so, _x4*.so, SHA-256 verified
 ```

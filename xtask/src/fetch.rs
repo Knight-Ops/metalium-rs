@@ -27,11 +27,11 @@ pub fn fetch_ttsim(force: bool) -> Result<(), String> {
 }
 
 fn fetch_ttsim_asset(asset: &pin::TtsimAsset, force: bool) -> Result<(), String> {
-    let dest = workspace_root().join("vendor").join(asset.name);
+    let dest = workspace_root().join("vendor").join(asset.filename());
 
     if dest.exists() && !force {
         match sha256(&dest) {
-            Ok(h) if h == asset.sha256 => {
+            Ok(h) if h == asset.digest() => {
                 println!("{} is already present and matches the pin", dest.display());
                 return Ok(());
             }
@@ -42,7 +42,7 @@ fn fetch_ttsim_asset(asset: &pin::TtsimAsset, force: bool) -> Result<(), String>
                      is intentional — note that doing so invalidates every gate until \
                      they are re-run.",
                     dest.display(),
-                    asset.sha256
+                    asset.digest()
                 ))
             }
             Err(e) => return Err(e),
@@ -52,7 +52,7 @@ fn fetch_ttsim_asset(asset: &pin::TtsimAsset, force: bool) -> Result<(), String>
     let url = format!(
         "https://github.com/tenstorrent/ttsim/releases/download/{}/{}",
         pin::TTSIM_TAG,
-        asset.name
+        asset.filename()
     );
     println!("fetching {url}");
 
@@ -84,13 +84,14 @@ fn fetch_ttsim_asset(asset: &pin::TtsimAsset, force: bool) -> Result<(), String>
     }
 
     let got = sha256(&tmp)?;
-    if got != asset.sha256 {
+    if got != asset.digest() {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
             "hash mismatch for {}:\n  expected {}\n  got      {got}\n\
              The pinned release asset should be immutable, so this means either the \
              download was corrupted or the tag was moved.",
-            asset.name, asset.sha256
+            asset.filename(),
+            asset.digest()
         ));
     }
 

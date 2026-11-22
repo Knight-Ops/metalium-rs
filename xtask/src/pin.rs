@@ -5,10 +5,41 @@
 
 pub const TTSIM_TAG: &str = "v1.10.9";
 
-/// One release asset of the pinned ttsim tag.
+/// One release asset of the pinned ttsim tag, in both shipped architectures.
 pub struct TtsimAsset {
+    /// The x86-64 asset, which has no suffix in the release.
     pub name: &'static str,
     pub sha256: &'static str,
+    /// The aarch64 asset, named `<base>_aarch64.so` in the same release.
+    pub aarch64_name: &'static str,
+    pub aarch64_sha256: &'static str,
+}
+
+impl TtsimAsset {
+    /// This host's asset name. Other architectures keep the x86-64 fallback of
+    /// the original fetcher; no release asset exists for them.
+    pub fn filename(&self) -> &'static str {
+        if cfg!(target_arch = "aarch64") {
+            self.aarch64_name
+        } else {
+            self.name
+        }
+    }
+
+    /// The digest of [`TtsimAsset::filename`], from the same pin.
+    pub fn digest(&self) -> &'static str {
+        if cfg!(target_arch = "aarch64") {
+            self.aarch64_sha256
+        } else {
+            self.sha256
+        }
+    }
+}
+
+/// The single-chip asset for this host, for callers that only need its name
+/// (the conformance preflight) and cannot depend on `tt-ttsim`.
+pub fn ttsim_single_chip_filename() -> &'static str {
+    TTSIM_ASSETS[0].filename()
 }
 
 /// The simulator builds this repository fetches, all from [`TTSIM_TAG`].
@@ -16,19 +47,26 @@ pub struct TtsimAsset {
 /// One tag covers every build, so the single-chip and dual-chip simulators
 /// cannot drift apart. `bh_x4` joined for Phase 8's sharding gate; `bh_x32`
 /// exists in the same release and is deliberately not pinned until something
-/// needs it.
+/// needs it. Each entry pins one x86-64 and one aarch64 asset; the fetcher and
+/// `tt_ttsim`'s default paths select the same one.
 pub const TTSIM_ASSETS: &[TtsimAsset] = &[
     TtsimAsset {
         name: "libttsim_bh.so",
         sha256: "e6ed2da11718683738d43f14a0bf4f13285b8621697b3165c1eaa240d36cfad5",
+        aarch64_name: "libttsim_bh_aarch64.so",
+        aarch64_sha256: "271338d9fc6ea7e476c97792dbd733819174c9ed6e9aae9b05701d40b18c2909",
     },
     TtsimAsset {
         name: "libttsim_bh_x2.so",
         sha256: "e1ffbaf39c7d071a2f64d7072a586da5f9a7bef55907459edbdb185189d23108",
+        aarch64_name: "libttsim_bh_x2_aarch64.so",
+        aarch64_sha256: "b475280f4dfe3d201c56f29589f82bbe9f5f3395ed28e56e1d50698a28340098",
     },
     TtsimAsset {
         name: "libttsim_bh_x4.so",
         sha256: "942a7a2a210259b77d1c44a7b13ac98fe672aec28d28e4385fcd30f6967756c1",
+        aarch64_name: "libttsim_bh_x4_aarch64.so",
+        aarch64_sha256: "c21dff75df0596ae94de65c57f09af557941ad3703fe4ba7866b38cf1801d08f",
     },
 ];
 
@@ -309,3 +347,26 @@ pub const MNIST_FILES: &[MnistFile] = &[
         sha256: "ff7bcfd416de33731a308c3f266cc351222c34898ecbeaf847f06e48f7ec33f2",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttsim_pins_name_both_architectures() {
+        for asset in TTSIM_ASSETS {
+            assert_eq!(
+                asset.aarch64_name,
+                asset.name.replace(".so", "_aarch64.so"),
+                "aarch64 asset must be the release's suffixed twin"
+            );
+            for digest in [asset.sha256, asset.aarch64_sha256] {
+                assert_eq!(digest.len(), 64, "{digest} is not a SHA-256 digest");
+                assert!(
+                    digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{digest} is not a SHA-256 digest"
+                );
+            }
+        }
+    }
+}

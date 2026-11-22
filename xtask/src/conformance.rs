@@ -396,8 +396,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             pin::BURN_TESTS_CONTENT_SHA256
         ));
     }
-    if !o.silicon && !o.reference_flex && !root.join("vendor/libttsim_bh.so").exists() {
-        return Err("vendor/libttsim_bh.so is missing: run `cargo xtask fetch-ttsim`.".into());
+    let sim = format!("vendor/{}", pin::ttsim_single_chip_filename());
+    if !o.silicon && !o.reference_flex && !root.join(&sim).exists() {
+        return Err(format!("{sim} is missing: run `cargo xtask fetch-ttsim`."));
     }
     if !o.silicon && !o.reference_flex {
         if let Some(s) = o

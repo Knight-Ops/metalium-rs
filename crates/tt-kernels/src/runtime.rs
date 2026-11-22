@@ -1277,7 +1277,6 @@ impl<N: NocId> Resident<N> {
     /// generation so it runs. With `program_at`, the program is already in the
     /// program cache there: the descriptor names it, and no fixed slot is written.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn stage<T: Transport>(
         &self,
         dev: &mut Device<T>,

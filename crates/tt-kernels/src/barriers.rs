@@ -1190,7 +1190,7 @@ pub(crate) fn credit(
             kind: Kind::Remote,
         };
         let mut channels = Vec::new();
-        for u in 0..c.units.len() {
+        for (u, _) in c.units.iter().enumerate() {
             let ran: Vec<usize> = {
                 let mut v: Vec<usize> = (0..n)
                     .filter(|&k| !c.ops[k].entries[u].is_empty())

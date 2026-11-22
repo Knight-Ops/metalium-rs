@@ -194,12 +194,12 @@ fn cnn_trace(dtype: DType) {
                     )
                 })
                 .unwrap();
-                for i in 0..3 {
+                for (i, &label) in split.labels.iter().enumerate().take(3) {
                     let x = Tensor::<AD, 2>::from_data(
                         TensorData::new(image(i), [1, PIXELS]),
                         (&d, dtype),
                     );
-                    let y = Tensor::<AD, 1, Int>::from_data([i32::from(split.labels[i])], &d);
+                    let y = Tensor::<AD, 1, Int>::from_data([i32::from(label)], &d);
                     let loss = loss_fn.forward(reference.forward(x).cast(FloatDType::F32), y);
                     let expected = loss.clone().into_scalar().elem::<f32>();
                     let grads = GradientsParams::from_grads(loss.backward(), &reference);
@@ -210,7 +210,7 @@ fn cnn_trace(dtype: DType) {
                         trace
                             .step(vec![
                                 InputPayload::F32(image(i)),
-                                InputPayload::Bits(vec![u32::from(split.labels[i])]),
+                                InputPayload::Bits(vec![u32::from(label)]),
                             ])
                             .unwrap()
                             .loss
