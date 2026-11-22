@@ -153,6 +153,9 @@ impl Mapping {
         let head = head.min(dst.len());
         self.read(offset, &mut dst[..head]);
         let body = (dst.len() - head) / 16 * 16;
+        // Only the x86-64 SIMD arms below write `done`; the other target's
+        // fallback is the single `!done` read.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut done = false;
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") {
